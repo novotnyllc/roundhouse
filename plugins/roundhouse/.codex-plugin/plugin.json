@@ -1,0 +1,34 @@
+{
+  "name": "roundhouse",
+  "version": "0.1.0",
+  "description": "Machine and infrastructure administration for agent fleets: readiness, inventory, harness/plugin/skill parity, package and dotfile baselines, auth artifacts, SSH transport and diagnosis, privileged install lanes, and UniFi network gear.",
+  "author": {
+    "name": "Claire Novotny LLC",
+    "url": "https://github.com/novotnyllc"
+  },
+  "homepage": "https://github.com/novotnyllc/roundhouse",
+  "repository": "https://github.com/novotnyllc/roundhouse",
+  "license": "MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Roundhouse",
+    "shortDescription": "Fleet readiness, inventory, updates, dotfiles, auth, SSH transport, and network gear",
+    "longDescription": "Roundhouse keeps machines and infrastructure serviceable: fleet readiness and inventory, agent harness/plugin/skill parity, package and dotfile baselines, credential artifacts, SSH transport with diagnosis and enrollment, narrow privileged install lanes, and UniFi network administration. The sibling yardmaster plugin decides and routes work; Roundhouse keeps the engines ready to run it.",
+    "developerName": "Claire Novotny LLC",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Interactive"
+    ],
+    "websiteURL": "https://github.com/novotnyllc/roundhouse",
+    "privacyPolicyURL": "https://github.com/novotnyllc/roundhouse",
+    "termsOfServiceURL": "https://github.com/novotnyllc/roundhouse",
+    "defaultPrompt": [
+      "Check fleet readiness before dispatching work to another machine.",
+      "Inventory the fleet and report drift in runtimes, plugins, and skills.",
+      "Plan and apply pending package updates on the fleet."
+    ],
+    "brandColor": "#7C2D12"
+  }
+}

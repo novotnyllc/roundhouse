@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fleet Chezmoi"
+  short_description: "Inspect and reconcile chezmoi drift"
+  default_prompt: "Use $fleet-chezmoi to inspect chezmoi drift across my fleet."

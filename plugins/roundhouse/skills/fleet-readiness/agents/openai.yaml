@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fleet Readiness"
+  short_description: "Assess readiness across configured machines"
+  default_prompt: "Use $fleet-readiness to assess project, agent, inventory, and authentication readiness across my fleet."

@@ -1,0 +1,2396 @@
+#!/bin/bash -p
+set -euo pipefail
+set +x +v
+
+umask 077
+export LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin
+unset APT_CONFIG BASH_ENV CDPATH ENV GLOBIGNORE IFS PS4 SSH_ASKPASS SSH_AUTH_SOCK SSH_CONFIG TMPDIR \
+  http_proxy https_proxy ftp_proxy all_proxy no_proxy \
+  HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
+
+usage() {
+  printf '%s\n' \
+    'usage: enroll-ssh-posix status|preview BUNDLE MANIFEST_SHA256 REQUEST CA_PUBLIC KRL|preview-revoke REQUEST_SHA256|install BUNDLE MANIFEST_SHA256 REQUEST CA_PUBLIC KRL CONFIRMATION_SHA256|repair BUNDLE MANIFEST_SHA256 REQUEST CA_PUBLIC KRL CONFIRMATION_SHA256|verify REQUEST_SHA256|revoke REQUEST_SHA256 CONFIRMATION_SHA256|self-test' >&2
+  exit 64
+}
+
+emit_status() {
+  printf 'posix-ssh-enrollment-status|1\nstate|%s\nreason|%s\nplatform-boundary|%s\ncontroller-trust|not-activated\nreadiness-authority|local-observation-only\nend-status|\n' \
+    "$1" "$2" "$3"
+}
+
+readonly command=${1:-}
+shift || true
+
+fixture_root=${ROUNDHOUSE_U6_FIXTURE_ROOT:-}
+fixture_platform=${ROUNDHOUSE_U6_FIXTURE_PLATFORM:-}
+if [ -n "$fixture_root" ]; then
+  case $fixture_root in /*) ;; *) emit_status rejected fixture_root_not_absolute fixture; exit 64 ;; esac
+  case /$fixture_root/ in */../*|*/./*) emit_status rejected fixture_root_not_canonical fixture; exit 64 ;; esac
+  [ "$fixture_root" != / ] || { emit_status rejected fixture_root_not_canonical fixture; exit 64; }
+  [ "$(/usr/bin/id -u)" -ne 0 ] || { emit_status rejected fixture_mode_refuses_root fixture; exit 64; }
+  root_prefix=${fixture_root%/}
+  protected_owner=$(/usr/bin/id -un)
+  fixture_mode=true
+  case $fixture_platform in linux|macos|wsl) platform=$fixture_platform ;;
+    *) emit_status rejected invalid_fixture_platform fixture; exit 64 ;;
+  esac
+else
+  root_prefix=
+  protected_owner=root
+  fixture_mode=false
+  case $(/usr/bin/uname -s) in
+    Linux)
+      if [ -r /proc/sys/kernel/osrelease ] &&
+        /usr/bin/grep -Eiq '(microsoft|wsl)' /proc/sys/kernel/osrelease; then platform=wsl
+      else platform=linux
+      fi
+      ;;
+    Darwin) platform=macos ;;
+    *) platform=unknown ;;
+  esac
+fi
+readonly root_prefix protected_owner fixture_mode platform
+[ "$fixture_mode" = false ] || [ "${ROUNDHOUSE_U6_CHILD_TRACE:-}" != 1 ] || set -x
+
+if [ "$platform" = wsl ]; then
+  emit_status unsupported unsupported_security_boundary wsl
+  exit 69
+fi
+case $platform in linux|macos) ;; *) emit_status unsupported unsupported_platform unknown; exit 69 ;; esac
+
+if [ "$fixture_mode" = false ] && [ "$command" != preview ] && [ "$command" != preview-revoke ] &&
+  [ "$command" != status ] && [ "$command" != verify ] && [ "$command" != self-test ] &&
+  [ "$(/usr/bin/id -u)" -ne 0 ]; then
+  emit_status needs_human_enrollment native_human_elevation_required "$platform"
+  exit 77
+fi
+
+case $command in
+  install|repair|revoke)
+    case ${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}${SSH_ORIGINAL_COMMAND:-} in
+      '') ;;
+      *) emit_status rejected remote_enrollment_forbidden "$platform"; exit 65 ;;
+    esac
+    ;;
+esac
+
+readonly config_root=$root_prefix/etc/machine-utilities/ssh
+readonly generations_root=$config_root/generations
+readonly active_link=$config_root/active
+readonly state_root=$root_prefix/var/lib/machine-utilities-ssh
+readonly lifecycle_lock=$state_root/.lifecycle-lock
+readonly transaction_root=$state_root/transaction
+readonly drain_path=$state_root/drain
+readonly state_record=$state_root/enrollment
+readonly sshd_main=$root_prefix/etc/ssh/sshd_config
+readonly dropin_directory=$root_prefix/etc/ssh/sshd_config.d
+readonly dropin_path=$dropin_directory/10-machine-utilities-transport.conf
+readonly native_ca_path=/etc/machine-utilities/ssh/active/fleet-ca.pub
+readonly native_krl_path=/etc/machine-utilities/ssh/active/revoked.krl
+readonly native_principals_path=/etc/machine-utilities/ssh/active/principals/%u
+readonly dispatcher_native_path=/usr/local/libexec/machine-utilities/posix-dispatcher
+readonly dispatcher_path=$root_prefix$dispatcher_native_path
+readonly release_root=$root_prefix/usr/local/libexec/machine-utilities
+readonly release_generations=$release_root/releases
+readonly current_release=$release_root/current
+readonly bootstrap_root=$root_prefix/var/lib/machine-utilities-bootstrap
+readonly ssh_keygen=/usr/bin/ssh-keygen
+readonly sshd_binary=/usr/sbin/sshd
+
+portable_stat() {
+  case $(/usr/bin/uname -s) in
+    Darwin) /usr/bin/stat -f "$1" "$3" 2>/dev/null ;;
+    Linux) /usr/bin/stat -c "$2" "$3" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+file_owner() { portable_stat %Su %U "$1"; }
+file_mode() { portable_stat %Lp %a "$1"; }
+file_size() { portable_stat %z %s "$1"; }
+file_links() { portable_stat %l %h "$1"; }
+file_identity() { portable_stat '%d:%i' '%d:%i' "$1"; }
+
+sha256_file() {
+  if [ -x /usr/bin/sha256sum ]; then
+    /usr/bin/sha256sum "$1" | /usr/bin/awk '{print tolower($1)}'
+  else
+    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print tolower($1)}'
+  fi
+}
+
+sha256_stream() {
+  if [ -x /usr/bin/sha256sum ]; then /usr/bin/sha256sum | /usr/bin/awk '{print tolower($1)}'
+  else /usr/bin/shasum -a 256 | /usr/bin/awk '{print tolower($1)}'
+  fi
+}
+
+exact_mode() {
+  local observed
+  observed=$(file_mode "$1") || return 1
+  observed=$(printf '%s' "$observed" | /usr/bin/sed 's/.*\(...\)$/\1/')
+  [ "$observed" = "$2" ]
+}
+
+safe_permissions() {
+  local observed permissions
+  observed=$(file_mode "$1") || return 1
+  permissions=$(printf '%s' "$observed" | /usr/bin/sed 's/.*\(...\)$/\1/')
+  [ "${#permissions}" -eq 3 ] || return 1
+  case $(printf '%s' "$permissions" | /usr/bin/cut -c 2-3) in *2*|*3*|*6*|*7*) return 1 ;; esac
+}
+
+no_extended_acl() {
+  local candidate=$1 listing
+  if [ "$(/usr/bin/uname -s)" = Darwin ]; then
+    listing=$(/bin/ls -lde "$candidate" 2>/dev/null) || return 1
+    [ "$(printf '%s\n' "$listing" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" -eq 1 ]
+  elif [ -x /usr/bin/getfacl ]; then
+    /usr/bin/getfacl -cp "$candidate" 2>/dev/null | /usr/bin/awk '
+      /^user::/ {u++} /^group::/ {g++} /^other::/ {o++}
+      /^user:[^:]+:/ || /^group:[^:]+:/ || /^mask::/ || /^default:/ {exit 1}
+      END {exit !(u==1&&g==1&&o==1)}'
+  else
+    [ "$fixture_mode" = true ]
+  fi
+}
+
+protected_directory() {
+  [ -d "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$protected_owner" ] &&
+    safe_permissions "$1" && no_extended_acl "$1"
+}
+
+protected_file() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$protected_owner" ] &&
+    safe_permissions "$1" && no_extended_acl "$1" && [ "$(file_links "$1")" -eq 1 ] &&
+    [ "$(file_size "$1")" -le "$2" ]
+}
+
+validate_fixed_ancestors() {
+  local candidate=$1 relative current segment
+  case $candidate in /*) ;; *) return 1 ;; esac
+  if [ "$fixture_mode" = true ]; then
+    case $candidate in "$root_prefix"|"$root_prefix"/*) ;; *) return 1 ;; esac
+    protected_directory "$root_prefix" || return 1
+    relative=${candidate#"$root_prefix"}
+    current=$root_prefix
+  else
+    relative=$candidate
+    current=
+  fi
+  IFS='/' read -r -a path_segments <<<"${relative#/}"
+  for segment in "${path_segments[@]}"; do
+    [ -n "$segment" ] || continue
+    current=$current/$segment
+    [ -e "$current" ] || break
+    [ -d "$current" ] && [ ! -L "$current" ] &&
+      [ "$(file_owner "$current")" = "$protected_owner" ] && safe_permissions "$current" || return 1
+  done
+}
+
+candidate_file() {
+  local candidate=$1 maximum=$2
+  case $candidate in /*) ;; *) return 1 ;; esac
+  protected_file "$candidate" "$maximum" && validate_fixed_ancestors "${candidate%/*}"
+}
+
+durable_sync() {
+  [ "$fixture_mode" = false ] || return 0
+  /bin/sync -f "$1" 2>/dev/null || /bin/sync
+}
+
+ensure_directory() {
+  local candidate=$1 mode=$2 parent
+  if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+    protected_directory "$candidate" && exact_mode "$candidate" "${mode#0}"
+    return
+  fi
+  parent=${candidate%/*}
+  [ "$parent" != "$candidate" ] || return 1
+  [ -d "$parent" ] || ensure_directory "$parent" 0755
+  protected_directory "$parent" || return 1
+  /bin/mkdir "$candidate" && /bin/chmod "$mode" "$candidate"
+  if [ "$fixture_mode" = false ]; then /usr/sbin/chown root:root "$candidate"; fi
+  protected_directory "$candidate" && exact_mode "$candidate" "${mode#0}"
+}
+
+write_atomic() {
+  local destination=$1 mode=$2 temporary
+  temporary=${destination%/*}/.${destination##*/}.$$.$RANDOM
+  [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || return 1
+  /bin/cat >"$temporary" || return 1
+  /bin/chmod "$mode" "$temporary" || { /bin/rm -f "$temporary"; return 1; }
+  if [ "$fixture_mode" = false ]; then /usr/sbin/chown root:root "$temporary" || { /bin/rm -f "$temporary"; return 1; }; fi
+  protected_file "$temporary" 1048576 || { /bin/rm -f "$temporary"; return 1; }
+  durable_sync "$temporary" || { /bin/rm -f "$temporary"; return 1; }
+  /bin/mv -f "$temporary" "$destination" && durable_sync "${destination%/*}"
+}
+
+token() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; }
+valid_account_name() { [[ $1 =~ ^[A-Za-z_][A-Za-z0-9._-]{0,127}$ ]]; }
+valid_home_path() {
+  [ "${#1}" -le 1024 ] && [ "$1" != / ] && [ "${1%/}" = "$1" ] &&
+    [[ $1 =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+  case "$1/" in *//*|*/./*|*/../*) return 1 ;; esac
+}
+domain_name() { [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] && [[ $1 == *.* ]]; }
+digest() { [[ $1 =~ ^[0-9a-f]{64}$ ]]; }
+fingerprint() { [[ $1 =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]]; }
+positive_integer() { [[ $1 =~ ^[1-9][0-9]{0,9}$ ]] && [ "$1" -le 2147483647 ]; }
+
+valid_source() {
+  local source=$1 address prefix octet
+  address=${source%/*}; prefix=${source##*/}
+  [[ $prefix =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+  if [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    [ "$prefix" -le 32 ] || return 1
+    IFS='.' read -r -a octets <<<"$address"
+    for octet in "${octets[@]}"; do [[ $octet =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$octet" -le 255 ] || return 1; done
+  else
+    [ "$prefix" -le 128 ] && [[ $address =~ ^[0-9A-Fa-f:]+$ ]] && [[ $address == *:* ]]
+  fi
+}
+
+valid_sources() {
+  local value=$1 source
+  [ "${#value}" -le 1024 ] || return 1
+  IFS=',' read -r -a source_values <<<"$value"
+  [ "${#source_values[@]}" -ge 1 ] || return 1
+  for source in "${source_values[@]}"; do valid_source "$source" || return 1; done
+}
+
+read_fixed_field() {
+  local source=$1 line_number=$2 expected_name=$3 raw name value extra
+  raw=$(/usr/bin/sed -n "${line_number}p" "$source") || return 1
+  IFS='|' read -r name value extra <<<"$raw"
+  [ "$name" = "$expected_name" ] && [ -n "$value" ] && [ -z "${extra:-}" ] || return 1
+  printf '%s\n' "$value"
+}
+
+request_path=
+request_sha256=
+fleet_domain=
+host_id=
+target_account=
+target_uid=
+target_home=
+primary_ca_fingerprint=
+primary_ca_generation=
+previous_ca_fingerprint=
+previous_ca_generation=
+trust_mode=
+endpoint_principal=
+signing_principal=
+management_sources=
+ca_public_key_sha256=
+krl_generation=
+krl_sha256=
+principals_sha256=
+dispatcher_sha256=
+dropin_sha256=
+release_manifest_sha256=
+renewal_state=
+rotation_state=
+
+render_principals() { printf '%s\n' "$endpoint_principal"; }
+
+render_dropin() {
+  cat <<EOF
+# machine-utilities-owned transport v1
+PermitUserEnvironment no
+
+Match User $target_account
+    TrustedUserCAKeys $native_ca_path
+    RevokedKeys $native_krl_path
+    PubkeyAuthentication yes
+    AuthenticationMethods publickey
+    AuthorizedKeysFile none
+    AuthorizedPrincipalsFile $native_principals_path
+    ForceCommand $dispatcher_native_path
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    HostbasedAuthentication no
+    GSSAPIAuthentication no
+    PermitTTY no
+    X11Forwarding no
+    AllowTcpForwarding no
+    AllowStreamLocalForwarding no
+    AllowAgentForwarding no
+    PermitTunnel no
+    GatewayPorts no
+    PermitOpen none
+    PermitListen none
+    PermitUserRC no
+Match all
+EOF
+}
+
+parse_request_snapshot() {
+  local candidate=$1 original=$2 line_count observed_principals observed_dropin
+  protected_file "$candidate" 16384 && exact_mode "$candidate" 600 || return 1
+  /usr/bin/grep -Eq '^[ -~]+$' "$candidate" || return 1
+  [ "$(/usr/bin/tail -c 1 "$candidate" | /usr/bin/od -An -tuC | /usr/bin/tr -d ' ')" = 10 ] || return 1
+  line_count=$(/usr/bin/wc -l <"$candidate" | /usr/bin/tr -d ' ') || return 1
+  [ "$line_count" -eq 25 ] || return 1
+  [ "$(/usr/bin/sed -n '1p' "$candidate")" = 'posix-ssh-enrollment-request|1' ] &&
+    [ "$(/usr/bin/sed -n '25p' "$candidate")" = 'end-enrollment|' ] || return 1
+  fleet_domain=$(read_fixed_field "$candidate" 2 fleet-domain) || return 1
+  host_id=$(read_fixed_field "$candidate" 3 host-id) || return 1
+  target_account=$(read_fixed_field "$candidate" 4 target-account) || return 1
+  target_uid=$(read_fixed_field "$candidate" 5 target-uid) || return 1
+  [ "$(read_fixed_field "$candidate" 6 platform-boundary)" = "$platform" ] || return 1
+  primary_ca_fingerprint=$(read_fixed_field "$candidate" 7 primary-ca-fingerprint) || return 1
+  primary_ca_generation=$(read_fixed_field "$candidate" 8 primary-ca-generation) || return 1
+  previous_ca_fingerprint=$(read_fixed_field "$candidate" 9 previous-ca-fingerprint) || return 1
+  previous_ca_generation=$(read_fixed_field "$candidate" 10 previous-ca-generation) || return 1
+  trust_mode=$(read_fixed_field "$candidate" 11 trust-mode) || return 1
+  endpoint_principal=$(read_fixed_field "$candidate" 12 endpoint-principal) || return 1
+  signing_principal=$(read_fixed_field "$candidate" 13 signing-principal) || return 1
+  management_sources=$(read_fixed_field "$candidate" 14 management-sources) || return 1
+  ca_public_key_sha256=$(read_fixed_field "$candidate" 15 ca-public-key-sha256) || return 1
+  krl_generation=$(read_fixed_field "$candidate" 16 krl-generation) || return 1
+  krl_sha256=$(read_fixed_field "$candidate" 17 krl-sha256) || return 1
+  principals_sha256=$(read_fixed_field "$candidate" 18 principals-sha256) || return 1
+  dispatcher_sha256=$(read_fixed_field "$candidate" 19 dispatcher-sha256) || return 1
+  dropin_sha256=$(read_fixed_field "$candidate" 20 drop-in-sha256) || return 1
+  release_manifest_sha256=$(read_fixed_field "$candidate" 21 release-manifest-sha256) || return 1
+  renewal_state=$(read_fixed_field "$candidate" 22 renewal-state) || return 1
+  rotation_state=$(read_fixed_field "$candidate" 23 rotation-state) || return 1
+  [ "$(read_fixed_field "$candidate" 24 login-window-service)" = enabled ] || return 1
+  domain_name "$fleet_domain" && token "$host_id" && token "$target_account" &&
+    [[ $target_uid =~ ^[1-9][0-9]{0,9}$ ]] && [ "$target_uid" -le 2147483647 ] &&
+    fingerprint "$primary_ca_fingerprint" && positive_integer "$primary_ca_generation" &&
+    [ "$endpoint_principal" = machine-utilities-posix ] &&
+    [ "$signing_principal" = "$host_id@$fleet_domain" ] && valid_sources "$management_sources" &&
+    digest "$ca_public_key_sha256" && positive_integer "$krl_generation" && digest "$krl_sha256" &&
+    digest "$principals_sha256" && digest "$dispatcher_sha256" && digest "$dropin_sha256" &&
+    digest "$release_manifest_sha256" &&
+    [[ $renewal_state =~ ^(stable|canary-proven)$ ]] || return 1
+  case $trust_mode:$rotation_state in
+    single:stable|single:fleet-canary-proven)
+      [ "$previous_ca_fingerprint" = - ] && [ "$previous_ca_generation" = 0 ] || return 1
+      ;;
+    dual:dual-staged|dual:fleet-canary-proven)
+      fingerprint "$previous_ca_fingerprint" && positive_integer "$previous_ca_generation" &&
+        [ "$previous_ca_generation" -lt "$primary_ca_generation" ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  observed_principals=$(render_principals | sha256_stream) || return 1
+  observed_dropin=$(render_dropin | sha256_stream) || return 1
+  [ "$observed_principals" = "$principals_sha256" ] && [ "$observed_dropin" = "$dropin_sha256" ] || return 1
+  request_path=$original
+  request_sha256=$(sha256_file "$candidate") || return 1
+}
+
+load_request() {
+  local original=$1 snapshot rc=0
+  candidate_file "$original" 16384 && exact_mode "$original" 600 || return 1
+  snapshot=$(/usr/bin/mktemp /tmp/machine-utilities-u6-request.XXXXXX) || return 1
+  /bin/chmod 0600 "$snapshot" || { /bin/rm -f "$snapshot"; return 1; }
+  exec 7<"$original" || { /bin/rm -f "$snapshot"; return 1; }
+  /bin/cat <&7 >"$snapshot" || rc=1
+  exec 7<&-
+  if [ "$rc" -eq 0 ]; then
+    protected_file "$snapshot" 16384 && exact_mode "$snapshot" 600 &&
+      parse_request_snapshot "$snapshot" "$original" || rc=1
+  fi
+  /bin/rm -f "$snapshot" || rc=1
+  [ "$rc" -eq 0 ]
+}
+
+render_dispatcher() {
+  valid_account_name "$target_account" && valid_home_path "$target_home" || return 1
+  cat <<'EOF'
+#!/bin/sh
+set -eu
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH LC_ALL=C LANG=C TZ=UTC
+unset BASH_ENV CDPATH ENV GLOBIGNORE IFS SSH_ASKPASS SSH_AUTH_SOCK SSH_CONFIG
+[ "$#" -eq 0 ] || exit 64
+[ -z "${SSH_ORIGINAL_COMMAND:-}" ] || exit 65
+unset SSH_ORIGINAL_COMMAND
+EOF
+  printf 'exec /usr/bin/env -i HOME=%s USER=%s LOGNAME=%s PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C LANG=C TZ=UTC \\\n' \
+    "$target_home" "$target_account" "$target_account"
+  printf '%s\n' '  /usr/local/libexec/machine-utilities/current/scripts/machine-utilities dispatch-posix-request'
+}
+
+validate_planned_dispatcher() {
+  [ "$(render_dispatcher | sha256_stream)" = "$dispatcher_sha256" ]
+}
+
+validate_installed_dispatcher() {
+  protected_file "$dispatcher_path" 4194304 && exact_mode "$dispatcher_path" 755 &&
+    validate_fixed_ancestors "${dispatcher_path%/*}" &&
+    [ "$(sha256_file "$dispatcher_path")" = "$dispatcher_sha256" ] || return 1
+  [ "$(render_dispatcher | sha256_stream)" = "$dispatcher_sha256" ] &&
+    /usr/bin/cmp -s "$dispatcher_path" <(render_dispatcher)
+}
+
+validate_ca_file() {
+  local candidate=$1 observed fingerprints count
+  candidate_file "$candidate" 32768 || return 1
+  [ "$(sha256_file "$candidate")" = "$ca_public_key_sha256" ] || return 1
+  observed=$("$ssh_keygen" -lf "$candidate" -E sha256 2>/dev/null) || return 1
+  fingerprints=$(printf '%s\n' "$observed" | /usr/bin/awk '{print $2}')
+  count=$(printf '%s\n' "$fingerprints" | /usr/bin/awk 'NF{n++} END{print n+0}')
+  if [ "$trust_mode" = single ]; then
+    [ "$count" -eq 1 ] && [ "$fingerprints" = "$primary_ca_fingerprint" ]
+  else
+    [ "$count" -eq 2 ] && printf '%s\n' "$fingerprints" | /usr/bin/grep -Fqx "$primary_ca_fingerprint" &&
+      printf '%s\n' "$fingerprints" | /usr/bin/grep -Fqx "$previous_ca_fingerprint"
+  fi
+}
+
+validate_krl_file() {
+  local candidate=$1 query_rc
+  candidate_file "$candidate" 16777216 && exact_mode "$candidate" 600 &&
+    [ "$(sha256_file "$candidate")" = "$krl_sha256" ] || return 1
+  set +e
+  "$ssh_keygen" -Q -f "$candidate" "$2" >/dev/null 2>&1
+  query_rc=$?
+  set -e
+  [ "$query_rc" -eq 0 ] || [ "$query_rc" -eq 1 ]
+}
+
+validate_target_account() {
+  local record record_type record_version name_field uid_field home_field
+  local observed_name observed_uid observed_home _password _group_id _gecos _shell extra
+  valid_account_name "$target_account" || return 1
+  if [ "$fixture_mode" = true ]; then
+    record=$root_prefix/native/account
+    protected_file "$record" 4096 && exact_mode "$record" 600 &&
+      validate_fixed_ancestors "${record%/*}" || return 1
+    IFS='|' read -r record_type record_version name_field uid_field home_field extra <"$record" || return 1
+    [ "$record_type" = posix-account ] && [ "$record_version" = 1 ] &&
+      [[ $name_field =~ ^name=.+$ ]] && [[ $uid_field =~ ^uid=.+$ ]] &&
+      [[ $home_field =~ ^home=.+$ ]] && [ -z "${extra:-}" ] || return 1
+    observed_name=${name_field#name=}
+    observed_uid=${uid_field#uid=}
+    observed_home=${home_field#home=}
+    [ "$(/usr/bin/wc -l <"$record" | /usr/bin/tr -d ' ')" -eq 1 ] || return 1
+  elif [ "$platform" = linux ]; then
+    [ -f /usr/bin/getent ] && [ ! -L /usr/bin/getent ] && [ -x /usr/bin/getent ] &&
+      [ "$(file_owner /usr/bin/getent)" = root ] && safe_permissions /usr/bin/getent || return 1
+    record=$(/usr/bin/getent passwd "$target_account" 2>/dev/null) || return 1
+    [[ $record != *$'\n'* ]] || return 1
+    IFS=':' read -r observed_name _password observed_uid _group_id _gecos observed_home _shell extra <<<"$record"
+  else
+    [ -f /usr/bin/id ] && [ ! -L /usr/bin/id ] && [ -x /usr/bin/id ] &&
+      [ "$(file_owner /usr/bin/id)" = root ] && safe_permissions /usr/bin/id || return 1
+    record=$(/usr/bin/id -P "$target_account" 2>/dev/null) || return 1
+    [[ $record != *$'\n'* ]] || return 1
+    IFS=':' read -r observed_name _password observed_uid _group_id _class _change _expire _gecos observed_home _shell extra <<<"$record"
+  fi
+  [ "$observed_name" = "$target_account" ] && [ "$observed_uid" = "$target_uid" ] &&
+    [ "$observed_uid" -ne 0 ] && [ -z "${extra:-}" ] && valid_home_path "$observed_home" || return 1
+  target_home=$observed_home
+}
+
+first_management_address() {
+  local first=${management_sources%%,*}
+  printf '%s\n' "${first%/*}"
+}
+
+non_target_account() {
+  if [ "$target_account" = machineutilitiesnontarget ]; then
+    printf '%s\n' machineutilitiestestaccount
+  else
+    printf '%s\n' machineutilitiesnontarget
+  fi
+}
+
+host_key_fingerprint=
+validate_host_key() {
+  local public_key
+  if [ "$fixture_mode" = true ]; then
+    public_key=$root_prefix/native/ssh_host_ed25519_key.pub
+  else
+    public_key=/etc/ssh/ssh_host_ed25519_key.pub
+  fi
+  protected_file "$public_key" 32768 && validate_fixed_ancestors "${public_key%/*}" || return 1
+  host_key_fingerprint=$("$ssh_keygen" -lf "$public_key" -E sha256 2>/dev/null | /usr/bin/awk 'NR==1{print $2}') || return 1
+  fingerprint "$host_key_fingerprint"
+}
+
+effective_value() {
+  local source=$1 key=$2
+  /usr/bin/awk -v key="$key" '$1==key{if(found++)exit 1;$1="";sub(/^ /,"");value=$0}
+    END{if(found!=1)exit 1;print value}' "$source"
+}
+
+validate_effective_output() {
+  local source=$1 expected
+  [ "$(effective_value "$source" trustedusercakeys)" = "$native_ca_path" ] &&
+    [ "$(effective_value "$source" revokedkeys)" = "$native_krl_path" ] &&
+    [ "$(effective_value "$source" pubkeyauthentication)" = yes ] &&
+    [ "$(effective_value "$source" authenticationmethods)" = publickey ] &&
+    [ "$(effective_value "$source" authorizedkeysfile)" = none ] &&
+    [ "$(effective_value "$source" authorizedprincipalsfile)" = "$native_principals_path" ] &&
+    [ "$(effective_value "$source" forcecommand)" = "$dispatcher_native_path" ] || return 1
+  for expected in \
+    'passwordauthentication no' 'kbdinteractiveauthentication no' 'hostbasedauthentication no' \
+    'gssapiauthentication no' 'permittty no' 'x11forwarding no' 'allowtcpforwarding no' \
+    'allowstreamlocalforwarding no' 'allowagentforwarding no' 'permittunnel no' \
+    'gatewayports no' 'permitopen none' 'permitlisten none' 'permituserrc no' \
+    'permituserenvironment no'; do
+    [ "$(effective_value "$source" "${expected%% *}")" = "${expected#* }" ] || return 1
+  done
+}
+
+validate_non_target_effective_output() {
+  [ "$(effective_value "$1" trustedusercakeys)" != "$native_ca_path" ]
+}
+
+validate_service_posture() {
+  if [ "$fixture_mode" = true ]; then
+    protected_file "$root_prefix/native/service.posture" 1024 &&
+      /usr/bin/grep -Fqx 'login-window|enabled' "$root_prefix/native/service.posture" &&
+      /usr/bin/grep -Fqx 'resident-custom-root-daemon|false' "$root_prefix/native/service.posture"
+  elif [ "$platform" = linux ]; then
+    if [ -x /bin/systemctl ]; then
+      /bin/systemctl is-enabled sshd >/dev/null 2>&1 || /bin/systemctl is-enabled ssh >/dev/null 2>&1
+    else return 1
+    fi
+  else
+    /bin/launchctl print system/com.openssh.sshd >/dev/null 2>&1
+  fi
+}
+
+validate_prospective_sshd() {
+  local stage=$1 prospective effective non_target_effective
+  prospective=$stage/prospective_sshd_config
+  effective=$stage/effective
+  non_target_effective=$stage/non-target-effective
+  render_dropin >"$stage/dropin" || return 1
+  /bin/chmod 0644 "$stage/dropin" || return 1
+  [ "$(sha256_file "$stage/dropin")" = "$dropin_sha256" ] || return 1
+  if [ "$fixture_mode" = true ]; then
+    protected_file "$root_prefix/native/sshd.effective" 65536 &&
+      protected_file "$root_prefix/native/sshd.non-target.effective" 65536 || return 1
+    /bin/cp "$root_prefix/native/sshd.effective" "$effective" &&
+      /bin/cp "$root_prefix/native/sshd.non-target.effective" "$non_target_effective" || return 1
+  else
+    protected_file "$sshd_main" 1048576 && [ -x "$sshd_binary" ] || return 1
+    {
+      printf 'Include %s\n' "$stage/dropin"
+      printf 'Include %s\n' "$sshd_main"
+    } >"$prospective"
+    /bin/chmod 0600 "$prospective"
+    "$sshd_binary" -t -f "$prospective" >/dev/null 2>&1 || return 1
+    "$sshd_binary" -T -f "$prospective" -C \
+      "user=$target_account,host=$host_id,addr=$(first_management_address)" >"$effective" 2>/dev/null || return 1
+    "$sshd_binary" -T -f "$prospective" -C \
+      "user=$(non_target_account),host=$host_id,addr=$(first_management_address)" \
+      >"$non_target_effective" 2>/dev/null || return 1
+  fi
+  validate_effective_output "$effective" && validate_non_target_effective_output "$non_target_effective"
+}
+
+confirmation_digest() {
+  local operation=$1
+  {
+    printf 'posix-ssh-owner-confirmation|1\noperation|%s\nrequest-sha256|%s\n' "$operation" "$request_sha256"
+    printf 'fleet-ca-fingerprint|%s\nca-generation|%s\ntarget-account|%s\ntarget-uid|%s\n' \
+      "$primary_ca_fingerprint" "$primary_ca_generation" "$target_account" "$target_uid"
+    printf 'host-key-fingerprint|%s\nend-confirmation|\n' "$host_key_fingerprint"
+  } | sha256_stream
+}
+
+emit_candidate_receipt() {
+  local operation=$1 confirmation
+  confirmation=$(confirmation_digest "$operation") || return 1
+  printf 'posix-ssh-enrollment-candidate|1\nstate|candidate\noperation|%s\n' "$operation"
+  printf 'unsigned|true\nactivation|false\ncontroller-trust|not-activated\nreadiness|candidate-only\n'
+  printf 'platform-boundary|%s\nfleet-domain|%s\nhost-id|%s\n' "$platform" "$fleet_domain" "$host_id"
+  printf 'target-account|%s\ntarget-uid|%s\nendpoint-principal|%s\nsigning-principal|%s\n' \
+    "$target_account" "$target_uid" "$endpoint_principal" "$signing_principal"
+  printf 'fleet-ca-fingerprint|%s\nca-generation|%s\ntrust-mode|%s\n' \
+    "$primary_ca_fingerprint" "$primary_ca_generation" "$trust_mode"
+  printf 'previous-ca-fingerprint|%s\nprevious-ca-generation|%s\nkrl-generation|%s\n' \
+    "$previous_ca_fingerprint" "$previous_ca_generation" "$krl_generation"
+  printf 'management-sources|%s\nrequest-sha256|%s\nca-public-key-sha256|%s\nkrl-sha256|%s\n' \
+    "$management_sources" "$request_sha256" "$ca_public_key_sha256" "$krl_sha256"
+  printf 'principals-sha256|%s\ndispatcher-sha256|%s\ndrop-in-sha256|%s\n' \
+    "$principals_sha256" "$dispatcher_sha256" "$dropin_sha256"
+  printf 'release-manifest-sha256|%s\n' "$release_manifest_sha256"
+  printf 'protected-host-key-fingerprint|%s\nlogin-window-service|verified\n' "$host_key_fingerprint"
+  printf 'shell|denied\nexec|denied\nscp|denied\npty|denied\nforwarding|denied\ntunneling|denied\nagent-forwarding|denied\nuser-rc|denied\nenvironment|denied\n'
+  printf 'owner-confirmation-sha256|%s\nend-candidate|\n' "$confirmation"
+}
+
+release_bundle=
+release_plugin_root=
+release_entrypoint_digest=
+release_worker_digest=
+release_file_count=0
+release_total_bytes=0
+
+release_manifest_file_digest() {
+  /usr/bin/awk -F '|' -v relative="$1" \
+    '$1=="file"&&$2==relative{if(found++)exit 1;value=$3} END{if(found!=1)exit 1;print value}' \
+    "$release_bundle/bootstrap.manifest"
+}
+
+validate_integrity_manifest() {
+  local integrity=$release_plugin_root/integrity.json relative expected observed records found_worker=false found_entrypoint=false
+  protected_file "$integrity" 1048576 || return 1
+  /usr/bin/grep -Fq '"schema": "roundhouse.integrity"' "$integrity" &&
+    /usr/bin/grep -Fq '"plugin": "machine-utilities"' "$integrity" || return 1
+  records=$(/usr/bin/awk '
+    /"path"[[:space:]]*:/ {
+      if (path != "") exit 1
+      line=$0; sub(/^.*"path"[[:space:]]*:[[:space:]]*"/,"",line); sub(/"[[:space:]]*,?[[:space:]]*$/,"",line)
+      path=line; next
+    }
+    /"sha256"[[:space:]]*:/ {
+      if (path == "") exit 1
+      line=$0; sub(/^.*"sha256"[[:space:]]*:[[:space:]]*"/,"",line); sub(/"[[:space:]]*,?[[:space:]]*$/,"",line)
+      print path "|" line; path=""; count++
+    }
+    END {if(path!=""||count<2)exit 1}
+  ' "$integrity") || return 1
+  while IFS='|' read -r relative expected; do
+    [ -n "$relative" ] && digest "$expected" || return 1
+    case /$relative/ in */../*|*/./*) return 1 ;; esac
+    [ "${#relative}" -le 512 ] && [[ $relative =~ ^[A-Za-z0-9.][A-Za-z0-9._/-]*$ ]] || return 1
+    observed=$(release_manifest_file_digest "plugins/roundhouse/$relative") || return 1
+    [ "$observed" = "$expected" ] &&
+      [ "$(sha256_file "$release_plugin_root/$relative")" = "$expected" ] || return 1
+    [ "$relative" = scripts/machine-utilities ] && found_worker=true
+    [ "$relative" = scripts/enroll-ssh-posix ] && found_entrypoint=true
+  done <<<"$records"
+  [ "$found_worker" = true ] && [ "$found_entrypoint" = true ]
+}
+
+verify_release_bundle() {
+  local candidate=$1 expected_manifest=$2 manifest actual_count=0 actual relative kind expected previous='' size
+  digest "$expected_manifest" || return 1
+  case $candidate in "$bootstrap_root"/staged/"$expected_manifest") ;; *) return 1 ;; esac
+  release_bundle=$candidate
+  manifest=$candidate/bootstrap.manifest
+  protected_directory "$bootstrap_root" && protected_directory "$bootstrap_root/staged" &&
+    protected_directory "$bootstrap_root/receipts" && protected_directory "$candidate" &&
+    protected_file "$bootstrap_root/release-allowed-signers" 16384 &&
+    protected_file "$manifest" 1048576 && protected_file "$candidate/bootstrap.manifest.sig" 32768 || return 1
+  [ "$(sha256_file "$manifest")" = "$expected_manifest" ] || return 1
+  protected_file "$bootstrap_root/receipts/$expected_manifest" 1024 &&
+    [ "$(/usr/bin/sed -n '1p' "$bootstrap_root/receipts/$expected_manifest")" = \
+      "bootstrap|1|manifest-sha256=$expected_manifest|release-principal=machine-utilities-release" ] || return 1
+  [ -x "$ssh_keygen" ] && "$ssh_keygen" -Y verify \
+    -f "$bootstrap_root/release-allowed-signers" -I machine-utilities-release \
+    -n machine-utilities-release -s "$candidate/bootstrap.manifest.sig" \
+    <"$manifest" >/dev/null 2>&1 || return 1
+  release_file_count=0
+  release_total_bytes=0
+  while IFS='|' read -r kind relative expected; do
+    [ "$kind" = file ] && digest "$expected" || return 1
+    [ "${#relative}" -le 512 ] &&
+      [[ $relative =~ ^plugins/roundhouse/[A-Za-z0-9.][A-Za-z0-9._/-]*$ ]] || return 1
+    case /$relative/ in */../*|*/./*) return 1 ;; esac
+    [ -z "$previous" ] || [[ $previous < $relative ]] || return 1
+    previous=$relative
+    actual=$candidate/$relative
+    protected_file "$actual" 33554432 && validate_fixed_ancestors "${actual%/*}" &&
+      [ "$(sha256_file "$actual")" = "$expected" ] || return 1
+    size=$(file_size "$actual") || return 1
+    release_total_bytes=$((release_total_bytes + size))
+    release_file_count=$((release_file_count + 1))
+    [ "$release_file_count" -le 512 ] && [ "$release_total_bytes" -le 134217728 ] || return 1
+  done <"$manifest"
+  [ "$release_file_count" -ge 5 ] || return 1
+  release_plugin_root=$candidate/plugins/machine-utilities
+  protected_directory "$candidate/plugins" && protected_directory "$release_plugin_root" || return 1
+  while IFS= read -r -d '' actual; do
+    relative=${actual#"$candidate/"}
+    [ "${#relative}" -le 512 ] &&
+      [[ $relative =~ ^plugins/roundhouse/[A-Za-z0-9.][A-Za-z0-9._/-]*$ ]] || return 1
+    expected=$(release_manifest_file_digest "$relative") || return 1
+    [ "$(sha256_file "$actual")" = "$expected" ] || return 1
+    actual_count=$((actual_count + 1))
+  done < <(/usr/bin/find "$release_plugin_root" -type f -print0)
+  [ "$actual_count" -eq "$release_file_count" ] || return 1
+  ! /usr/bin/find "$release_plugin_root" \( -type l -o ! -type d ! -type f \) -print | /usr/bin/grep -q . || return 1
+  release_bundle=$candidate
+  release_entrypoint_digest=$(release_manifest_file_digest plugins/roundhouse/scripts/enroll-ssh-posix) || return 1
+  release_worker_digest=$(release_manifest_file_digest plugins/roundhouse/scripts/machine-utilities) || return 1
+  [ "$expected_manifest" = "$release_manifest_sha256" ] &&
+    /bin/bash -n "$release_plugin_root/scripts/enroll-ssh-posix" &&
+    /bin/bash -n "$release_plugin_root/scripts/machine-utilities" &&
+    /usr/bin/grep -Fq 'dispatch-posix-request' "$release_plugin_root/scripts/machine-utilities" &&
+    /usr/bin/grep -Fq 'invoke_fixed_posix_broker()' "$release_plugin_root/scripts/machine-utilities" &&
+    /usr/bin/grep -Fq '/usr/libexec/machine-utilities/posix-broker' \
+      "$release_plugin_root/scripts/machine-utilities" &&
+    /usr/bin/grep -Fq '/usr/local/libexec/machine-utilities/posix-broker' \
+      "$release_plugin_root/scripts/machine-utilities" &&
+    /usr/bin/grep -Fq '/usr/bin/sudo -n "$fixed_broker"' "$release_plugin_root/scripts/machine-utilities" &&
+    validate_integrity_manifest
+}
+
+canonical_script_path() {
+  local source=$1 directory base
+  [ -f "$source" ] && [ ! -L "$source" ] || return 1
+  directory=$(CDPATH='' cd -- "${source%/*}" 2>/dev/null && /bin/pwd -P) || return 1
+  base=${source##*/}
+  printf '%s/%s\n' "$directory" "$base"
+}
+
+require_authenticated_bootstrap_launch() {
+  local operation=$1 expected_manifest=$2 expected_entrypoint=$3 launch_fd nonce launch_path record expected_record running
+  [ "$fixture_mode" = true ] && return 0
+  [ "$(/usr/bin/id -u)" -eq 0 ] || return 1
+  launch_fd=${ROUNDHOUSE_U6_BOOTSTRAP_FD:-}
+  nonce=${ROUNDHOUSE_U6_BOOTSTRAP_NONCE:-}
+  [[ $launch_fd =~ ^[3-9][0-9]?$ ]] && digest "$nonce" || return 1
+  launch_path=$bootstrap_root/launch/$nonce
+  protected_directory "$bootstrap_root/launch" && exact_mode "$bootstrap_root/launch" 700 &&
+    protected_file "$launch_path" 1024 && exact_mode "$launch_path" 600 || return 1
+  [ "$(file_identity "/dev/fd/$launch_fd")" = "$(file_identity "$launch_path")" ] || return 1
+  IFS= read -r record <&"$launch_fd" || return 1
+  expected_record="bootstrap-launch|1|scope=posix-ssh|operation=$operation|manifest-sha256=$expected_manifest|entrypoint-sha256=$expected_entrypoint|nonce=$nonce|release-principal=machine-utilities-release"
+  [ "$record" = "$expected_record" ] || return 1
+  if IFS= read -r record <&"$launch_fd"; then return 1; fi
+  running=$(canonical_script_path "$0") || return 1
+  protected_file "$running" 4194304 && [ "$(sha256_file "$running")" = "$expected_entrypoint" ] || return 1
+  case $operation in
+    install|repair) [ "$running" = "$release_plugin_root/scripts/enroll-ssh-posix" ] || return 1 ;;
+    revoke) case $running in "$release_generations"/"$expected_manifest"/scripts/enroll-ssh-posix) ;; *) return 1 ;; esac ;;
+    *) return 1 ;;
+  esac
+  [ "$(file_identity "$launch_path")" = "$(file_identity "/dev/fd/$launch_fd")" ] || return 1
+  /bin/rm -f "$launch_path" && durable_sync "$bootstrap_root/launch"
+}
+
+preview_inputs() {
+  local bundle=$1 expected_manifest=$2 request=$3 ca_file=$4 krl_file=$5 scratch
+  load_request "$request" && validate_target_account && validate_planned_dispatcher &&
+    verify_release_bundle "$bundle" "$expected_manifest" &&
+    validate_ca_file "$ca_file" && validate_krl_file "$krl_file" "$ca_file" &&
+    validate_host_key && validate_service_posture || return 1
+  scratch=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/machine-utilities-u6-preview.XXXXXX") || return 1
+  /bin/chmod 0700 "$scratch"
+  if ! validate_prospective_sshd "$scratch"; then
+    /bin/rm -f "$scratch/dropin" "$scratch/effective" "$scratch/non-target-effective" "$scratch/prospective_sshd_config" 2>/dev/null || :
+    /bin/rmdir "$scratch" 2>/dev/null || :
+    return 1
+  fi
+  /bin/rm -f "$scratch/dropin" "$scratch/effective" "$scratch/non-target-effective" "$scratch/prospective_sshd_config" 2>/dev/null || return 1
+  /bin/rmdir "$scratch"
+}
+
+u6_failpoint() {
+  [ "$fixture_mode" = true ] || [ -z "${ROUNDHOUSE_U6_FAILPOINT:-}" ] || return 1
+  if [ "${ROUNDHOUSE_U6_FAILPOINT:-}" = "power-loss-$1" ]; then
+    return 98
+  fi
+  if [ "${ROUNDHOUSE_U6_FAILPOINT:-}" = "kill-$1" ]; then
+    /bin/kill -KILL "${BASHPID:-$$}"
+    return 99
+  fi
+  if [ "${ROUNDHOUSE_U6_FAILPOINT:-}" = "term-$1" ]; then
+    /bin/kill -TERM "${BASHPID:-$$}"
+    return 99
+  fi
+  [ "${ROUNDHOUSE_U6_FAILPOINT:-}" != "$1" ] || return 99
+}
+
+process_token() {
+  local pid=$1 token
+  if [ -r "/proc/$pid/stat" ]; then
+    token=$(/usr/bin/awk '{sub(/^.*\) /, ""); print $20; exit}' "/proc/$pid/stat" 2>/dev/null) || return 1
+  else
+    token=$(/bin/ps -o lstart= -p "$pid" 2>/dev/null | /usr/bin/sed 's/^[[:space:]]*//;s/[[:space:]][[:space:]]*/_/g') || return 1
+  fi
+  token "$token" && printf '%s\n' "$token"
+}
+
+lock_pid=
+lock_token=
+lock_operation=
+read_lock() {
+  local record
+  protected_directory "$lifecycle_lock" && exact_mode "$lifecycle_lock" 700 &&
+    protected_file "$lifecycle_lock/owner" 1024 && exact_mode "$lifecycle_lock/owner" 600 || return 1
+  IFS= read -r record <"$lifecycle_lock/owner" || return 1
+  IFS='|' read -r header version lock_pid lock_token lock_operation extra <<<"$record"
+  [ "$header" = lifecycle-lock ] && [ "$version" = 1 ] &&
+    [[ $lock_pid =~ ^[1-9][0-9]{0,9}$ ]] && token "$lock_token" &&
+    [[ $lock_operation =~ ^(install|repair|revoke|recover)$ ]] && [ -z "${extra:-}" ]
+}
+
+lock_matches_snapshot() {
+  local lock=$1 expected_directory_identity=$2 expected_owner_identity=$3
+  [ "$(file_identity "$lock")" = "$expected_directory_identity" ] &&
+    [ "$(file_identity "$lock/owner")" = "$expected_owner_identity" ]
+}
+
+lock_is_live() {
+  local expected_directory_identity=$1 expected_owner_identity=$2 observed='' live=1
+  lock_matches_snapshot "$lifecycle_lock" "$expected_directory_identity" "$expected_owner_identity" || return 2
+  read_lock || return 2
+  lock_matches_snapshot "$lifecycle_lock" "$expected_directory_identity" "$expected_owner_identity" || return 2
+  if /bin/kill -0 "$lock_pid" >/dev/null 2>&1; then
+    if observed=$(process_token "$lock_pid"); then
+      [ "$observed" != "$lock_token" ] || live=0
+    fi
+  fi
+  lock_matches_snapshot "$lifecycle_lock" "$expected_directory_identity" "$expected_owner_identity" || return 2
+  return "$live"
+}
+
+claim_stale_lock() {
+  local state=$1 lock=$2 expected_directory_identity=$3 expected_owner_identity=$4 claim
+  claim=.retiring-owner.${BASHPID:-$$}.$RANDOM
+  (
+    CDPATH='' cd -P "$lock" || exit 74
+    [ "$(file_identity .)" = "$expected_directory_identity" ] &&
+      [ "$(file_identity owner)" = "$expected_owner_identity" ] || exit 74
+    [ ! -e "$claim" ] && [ ! -L "$claim" ] || exit 74
+    /bin/mv owner "$claim" || exit 74
+    if [ "$(file_identity .)" != "$expected_directory_identity" ] ||
+      [ "$(file_identity "$claim")" != "$expected_owner_identity" ]; then
+      if [ ! -e owner ] && [ ! -L owner ]; then /bin/mv "$claim" owner || :; fi
+      exit 74
+    fi
+    /bin/rm -f "$claim" || exit 74
+  ) || return 74
+  [ "$(file_identity "$lock")" = "$expected_directory_identity" ] || return 74
+  /bin/rmdir "$lock" && durable_sync "$state"
+}
+
+replace_classified_stale_lock_fixture() {
+  local replacement_pid replacement_token retired
+  [ "$fixture_mode" = true ] &&
+    [ "${ROUNDHOUSE_U6_TEST_REPLACE_CLASSIFIED_LOCK:-}" = replace ] || return 0
+  retired=$state_root/observed-stale-lock
+  [ ! -e "$retired" ] && [ ! -L "$retired" ] || return 1
+  /bin/mv "$lifecycle_lock" "$retired" || return 1
+  /bin/mkdir "$lifecycle_lock" && /bin/chmod 0700 "$lifecycle_lock" || return 1
+  replacement_pid=${BASHPID:-$$}
+  replacement_token=$(process_token "$replacement_pid") || return 1
+  printf 'lifecycle-lock|1|%s|%s|recover\n' "$replacement_pid" "$replacement_token" |
+    write_atomic "$lifecycle_lock/owner" 0600
+}
+
+retire_stale_lock() {
+  local stale_directory_identity stale_owner_identity
+  stale_directory_identity=$(file_identity "$lifecycle_lock") || return 74
+  stale_owner_identity=$(file_identity "$lifecycle_lock/owner") || return 74
+  if lock_is_live "$stale_directory_identity" "$stale_owner_identity"; then return 75; else
+    [ "$?" -eq 1 ] || return 74
+  fi
+  replace_classified_stale_lock_fixture || return 74
+  [ -e "$transaction_root" ] && [ -d "$transaction_root" ] && [ ! -L "$transaction_root" ] ||
+    [ ! -e "$transaction_root" ] || return 74
+  claim_stale_lock "$state_root" "$lifecycle_lock" "$stale_directory_identity" "$stale_owner_identity"
+}
+
+acquire_lifecycle_lock() {
+  local operation=$1 observed owner_pid
+  if [ -e "$lifecycle_lock" ] || [ -L "$lifecycle_lock" ]; then retire_stale_lock || return $?; fi
+  /bin/mkdir "$lifecycle_lock" || return 75
+  /bin/chmod 0700 "$lifecycle_lock"
+  if [ "$fixture_mode" = false ]; then /usr/sbin/chown root:root "$lifecycle_lock"; fi
+  owner_pid=${BASHPID:-$$}
+  observed=$(process_token "$owner_pid") || { /bin/rmdir "$lifecycle_lock"; return 74; }
+  printf 'lifecycle-lock|1|%s|%s|%s\n' "$owner_pid" "$observed" "$operation" |
+    write_atomic "$lifecycle_lock/owner" 0600 || { /bin/rmdir "$lifecycle_lock" 2>/dev/null || :; return 74; }
+  read_lock && [ "$lock_pid" = "$owner_pid" ] && [ "$lock_token" = "$observed" ]
+}
+
+release_lifecycle_lock() {
+  read_lock && [ "$lock_pid" = "${BASHPID:-$$}" ] || return 1
+  /bin/rm -f "$lifecycle_lock/owner" && /bin/rmdir "$lifecycle_lock" && durable_sync "$state_root"
+}
+
+ensure_layout() {
+  ensure_directory "$config_root" 0755 && ensure_directory "$generations_root" 0755 &&
+    ensure_directory "$state_root" 0700 && ensure_directory "$release_root" 0755 &&
+    ensure_directory "$release_generations" 0755 && ensure_directory "$dropin_directory" 0755
+}
+
+copy_held_file() {
+  local source=$1 destination=$2 expected=$3 mode=$4
+  digest "$expected" && protected_file "$source" 33554432 &&
+    [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+  exec 8<"$source" || return 1
+  /bin/cat <&8 >"$destination" || { exec 8<&-; return 1; }
+  exec 8<&-
+  /bin/chmod "$mode" "$destination" || return 1
+  if [ "$fixture_mode" = false ]; then /usr/sbin/chown root:root "$destination" || return 1; fi
+  protected_file "$destination" 33554432 && [ "$(sha256_file "$destination")" = "$expected" ]
+}
+
+manifest_installed_digest() {
+  local manifest=$1 relative=$2
+  /usr/bin/awk -F '|' -v relative="$relative" \
+    '$1=="file"&&$2==relative{if(found++)exit 1;value=$3} END{if(found!=1)exit 1;print value}' "$manifest"
+}
+
+copy_release_generation() {
+  local destination=$1 kind relative expected source target directory mode
+  [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+  /bin/mkdir "$destination" && /bin/chmod 0755 "$destination"
+  if [ "$fixture_mode" = false ]; then /usr/sbin/chown root:root "$destination"; fi
+  while IFS='|' read -r kind relative expected; do
+    relative=${relative#plugins/roundhouse/}
+    source=$release_plugin_root/$relative
+    target=$destination/$relative
+    directory=${target%/*}
+    ensure_directory "$directory" 0755 || return 1
+    case $relative in
+      scripts/machine-utilities|scripts/collect-posix|scripts/enroll-privilege-posix|scripts/privilege-broker-posix|scripts/test-machine-utilities|scripts/update-integrity|scripts/prepare-ssh-identity|scripts/certify-ssh-node|scripts/enroll-ssh-posix) mode=0755 ;;
+      *) mode=0644 ;;
+    esac
+    copy_held_file "$source" "$target" "$expected" "$mode" || return 1
+  done <"$release_bundle/bootstrap.manifest"
+  copy_held_file "$release_bundle/bootstrap.manifest" "$destination/.release-manifest" \
+    "$release_manifest_sha256" 0644 || return 1
+  printf 'release-generation|1|manifest-sha256=%s|file-count=%s\n' \
+    "$release_manifest_sha256" "$release_file_count" | write_atomic "$destination/.release-generation" 0644
+}
+
+validate_release_generation_at() {
+  local candidate=$1 manifest kind relative expected actual_count=0 actual
+  manifest=$candidate/.release-manifest
+  protected_directory "$candidate" && protected_file "$manifest" 1048576 &&
+    [ "$(sha256_file "$manifest")" = "$release_manifest_sha256" ] &&
+    protected_file "$candidate/.release-generation" 1024 &&
+    [ "$(/usr/bin/sed -n '1p' "$candidate/.release-generation")" = \
+      "release-generation|1|manifest-sha256=$release_manifest_sha256|file-count=$release_file_count" ] || return 1
+  while IFS='|' read -r kind relative expected; do
+    [ "$kind" = file ] && digest "$expected" || return 1
+    relative=${relative#plugins/roundhouse/}
+    actual=$candidate/$relative
+    protected_file "$actual" 33554432 && [ "$(sha256_file "$actual")" = "$expected" ] || return 1
+    actual_count=$((actual_count + 1))
+  done <"$manifest"
+  [ "$actual_count" -eq "$release_file_count" ] &&
+    [ "$(sha256_file "$candidate/scripts/machine-utilities")" = "$release_worker_digest" ] &&
+    [ "$(sha256_file "$candidate/scripts/enroll-ssh-posix")" = "$release_entrypoint_digest" ]
+}
+
+copy_configuration_generation() {
+  local destination=$1 ca_file=$2 krl_file=$3
+  [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+  /bin/mkdir "$destination" && /bin/chmod 0755 "$destination"
+  if [ "$fixture_mode" = false ]; then /usr/sbin/chown root:root "$destination"; fi
+  ensure_directory "$destination/principals" 0755 || return 1
+  copy_held_file "$ca_file" "$destination/fleet-ca.pub" "$ca_public_key_sha256" 0644 &&
+    copy_held_file "$krl_file" "$destination/revoked.krl" "$krl_sha256" 0600 &&
+    copy_held_file "$request_path" "$destination/request" "$request_sha256" 0600 || return 1
+  render_principals | write_atomic "$destination/principals/$target_account" 0644 || return 1
+  [ "$(sha256_file "$destination/principals/$target_account")" = "$principals_sha256" ] || return 1
+  printf 'transport-generation|1\nrequest-sha256|%s\nrelease-manifest-sha256|%s\nca-generation|%s\nkrl-generation|%s\nplatform-boundary|%s\nend-generation|\n' \
+    "$request_sha256" "$release_manifest_sha256" "$primary_ca_generation" "$krl_generation" "$platform" |
+    write_atomic "$destination/generation" 0600
+}
+
+validate_configuration_generation_at() {
+  local candidate=$1
+  protected_directory "$candidate" && protected_directory "$candidate/principals" &&
+    protected_file "$candidate/request" 16384 && [ "$(sha256_file "$candidate/request")" = "$request_sha256" ] &&
+    protected_file "$candidate/fleet-ca.pub" 32768 && [ "$(sha256_file "$candidate/fleet-ca.pub")" = "$ca_public_key_sha256" ] &&
+    protected_file "$candidate/revoked.krl" 16777216 && [ "$(sha256_file "$candidate/revoked.krl")" = "$krl_sha256" ] &&
+    protected_file "$candidate/principals/$target_account" 4096 &&
+    [ "$(sha256_file "$candidate/principals/$target_account")" = "$principals_sha256" ] &&
+    protected_file "$candidate/generation" 4096 &&
+    /usr/bin/grep -Fqx "request-sha256|$request_sha256" "$candidate/generation" &&
+    /usr/bin/grep -Fqx "release-manifest-sha256|$release_manifest_sha256" "$candidate/generation"
+}
+
+atomic_symlink() {
+  local target=$1 destination=$2 temporary host_kernel
+  if [ -e "$destination" ] || [ -L "$destination" ]; then [ -L "$destination" ] || return 1; fi
+  temporary=${destination%/*}/.${destination##*/}.$$.$RANDOM
+  [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || return 1
+  /bin/ln -s "$target" "$temporary" || return 1
+  host_kernel=$(/usr/bin/uname -s) || { /bin/rm -f "$temporary"; return 1; }
+  case $host_kernel in
+    Darwin) /bin/mv -fh "$temporary" "$destination" || { /bin/rm -f "$temporary"; return 1; } ;;
+    Linux) /bin/mv -Tf "$temporary" "$destination" || { /bin/rm -f "$temporary"; return 1; } ;;
+    *) /bin/rm -f "$temporary"; return 1 ;;
+  esac
+  durable_sync "${destination%/*}"
+}
+
+snapshot_artifact() {
+  local name=$1 source=$2 meta data mode target expected
+  meta=$transaction_root/backup/$name.meta
+  data=$transaction_root/backup/$name.data
+  if [ -L "$source" ]; then
+    target=$(/usr/bin/readlink "$source") || return 1
+    [ "${#target}" -ge 1 ] && [ "${#target}" -le 512 ] &&
+      [[ $target =~ ^[A-Za-z0-9._/-]+$ ]] && [[ /$target/ != */../* && /$target/ != */./* ]] || return 1
+    printf 'symlink|%s\n' "$target" | write_atomic "$meta" 0600
+  elif [ -e "$source" ]; then
+    protected_file "$source" 33554432 || return 1
+    mode=$(file_mode "$source"); mode=$(printf '%s' "$mode" | /usr/bin/sed 's/.*\(...\)$/\1/')
+    expected=$(sha256_file "$source") || return 1
+    copy_held_file "$source" "$data" "$expected" 0600 || return 1
+    printf 'file|%s|%s\n' "$mode" "$expected" | write_atomic "$meta" 0600
+  else
+    printf 'absent|-\n' | write_atomic "$meta" 0600
+  fi
+}
+
+restore_artifact() {
+  local name=$1 destination=$2 meta kind first second temporary
+  meta=$transaction_root/backup/$name.meta
+  protected_file "$meta" 1024 && exact_mode "$meta" 600 || return 1
+  IFS='|' read -r kind first second <"$meta" || return 1
+  case $kind in
+    absent)
+      [ "$first" = - ] && [ -z "${second:-}" ] || return 1
+      if [ -L "$destination" ]; then /bin/rm -f "$destination"
+      elif [ -e "$destination" ]; then protected_file "$destination" 33554432 || return 1; /bin/rm -f "$destination"
+      fi
+      ;;
+    symlink)
+      [ -n "$first" ] && [ -z "${second:-}" ] || return 1
+      if [ -e "$destination" ] && [ ! -L "$destination" ]; then protected_file "$destination" 33554432 || return 1; /bin/rm -f "$destination"; fi
+      atomic_symlink "$first" "$destination"
+      ;;
+    file)
+      [[ $first =~ ^[0-7]{3}$ ]] && digest "$second" &&
+        protected_file "$transaction_root/backup/$name.data" 33554432 &&
+        [ "$(sha256_file "$transaction_root/backup/$name.data")" = "$second" ] || return 1
+      temporary=${destination%/*}/.${destination##*/}.restore.$$.$RANDOM
+      [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || return 1
+      copy_held_file "$transaction_root/backup/$name.data" "$temporary" "$second" "0$first" || return 1
+      /bin/mv -f "$temporary" "$destination" && durable_sync "${destination%/*}"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+transaction_operation=
+transaction_phase=
+transaction_request=
+transaction_manifest=
+transaction_account=
+transaction_previous_request=
+
+write_transaction_record() {
+  local phase=$1
+  printf 'posix-ssh-transaction|1\noperation|%s\nphase|%s\nrequest-sha256|%s\nrelease-manifest-sha256|%s\ntarget-account|%s\nprevious-request-sha256|%s\nend-transaction|\n' \
+    "$transaction_operation" "$phase" "$transaction_request" "$transaction_manifest" \
+    "$transaction_account" "$transaction_previous_request" |
+    write_atomic "$transaction_root/intent" 0600 || return 1
+  transaction_phase=$phase
+}
+
+load_transaction_record() {
+  local source=$transaction_root/intent lines
+  protected_directory "$transaction_root" && exact_mode "$transaction_root" 700 &&
+    protected_file "$source" 4096 && exact_mode "$source" 600 || return 1
+  lines=$(/usr/bin/wc -l <"$source" | /usr/bin/tr -d ' ')
+  [ "$lines" -eq 8 ] && [ "$(/usr/bin/sed -n '1p' "$source")" = posix-ssh-transaction'|1' ] &&
+    [ "$(/usr/bin/sed -n '8p' "$source")" = end-transaction'|' ] || return 1
+  transaction_operation=$(read_fixed_field "$source" 2 operation) || return 1
+  transaction_phase=$(read_fixed_field "$source" 3 phase) || return 1
+  transaction_request=$(read_fixed_field "$source" 4 request-sha256) || return 1
+  transaction_manifest=$(read_fixed_field "$source" 5 release-manifest-sha256) || return 1
+  transaction_account=$(read_fixed_field "$source" 6 target-account) || return 1
+  transaction_previous_request=$(read_fixed_field "$source" 7 previous-request-sha256) || return 1
+  [[ $transaction_operation =~ ^(install|repair|revoke)$ ]] &&
+    [[ $transaction_phase =~ ^(intent|drained|snapshotted|prepared|release-active|config-active|policy-active|verified|committed|revoking|revoked)$ ]] &&
+    digest "$transaction_request" && digest "$transaction_manifest" && token "$transaction_account" &&
+    { [ "$transaction_previous_request" = - ] || digest "$transaction_previous_request"; }
+}
+
+validate_backup_closure() {
+  local child name stem kind first second
+  while IFS= read -r -d '' child; do
+    name=${child##*/}
+    case $name in
+      current_release.meta|active.meta|dispatcher.meta|dropin.meta|state.meta)
+        protected_file "$child" 1024 && exact_mode "$child" 600 || return 1
+        ;;
+      current_release.data|active.data|dispatcher.data|dropin.data|state.data)
+        protected_file "$child" 33554432 && exact_mode "$child" 600 || return 1
+        stem=${name%.data}
+        protected_file "$transaction_root/backup/$stem.meta" 1024 || return 1
+        IFS='|' read -r kind first second <"$transaction_root/backup/$stem.meta" || return 1
+        [ "$kind" = file ] && [[ $first =~ ^[0-7]{3}$ ]] && digest "$second" &&
+          [ "$(sha256_file "$child")" = "$second" ] || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done < <(/usr/bin/find "$transaction_root/backup" -mindepth 1 -maxdepth 1 -print0)
+  case $transaction_phase in
+    snapshotted|prepared|release-active|config-active|policy-active|verified|committed|revoking|revoked)
+      for name in current_release active dispatcher dropin state; do
+        protected_file "$transaction_root/backup/$name.meta" 1024 || return 1
+      done
+      ;;
+  esac
+}
+
+begin_transaction() {
+  local operation=$1 previous=$2
+  [ ! -e "$transaction_root" ] && [ ! -L "$transaction_root" ] || return 1
+  /bin/mkdir "$transaction_root" && /bin/chmod 0700 "$transaction_root"
+  if [ "$fixture_mode" = false ]; then /usr/sbin/chown root:root "$transaction_root"; fi
+  ensure_directory "$transaction_root/backup" 0700 || return 1
+  transaction_operation=$operation
+  transaction_phase=intent
+  transaction_request=$request_sha256
+  transaction_manifest=$release_manifest_sha256
+  transaction_account=$target_account
+  transaction_previous_request=$previous
+  write_transaction_record intent
+}
+
+transaction_top_level_valid() {
+  local child name
+  load_transaction_record || return 1
+  while IFS= read -r -d '' child; do
+    name=${child##*/}
+    case $name in intent|backup) ;; *) return 1 ;; esac
+  done < <(/usr/bin/find "$transaction_root" -mindepth 1 -maxdepth 1 -print0)
+  protected_directory "$transaction_root/backup" && validate_backup_closure
+}
+
+remove_owned_tree() {
+  local candidate=$1 child
+  case $candidate in
+    "$transaction_root"|"$generations_root"/.staging-*|"$release_generations"/.staging-*|"$state_root"/.prospective-*) ;;
+    *) return 1 ;;
+  esac
+  [ -d "$candidate" ] && [ ! -L "$candidate" ] && protected_directory "$candidate" || return 1
+  while IFS= read -r -d '' child; do
+    if [ -d "$child" ]; then protected_directory "$child" || return 1
+    else protected_file "$child" 33554432 || return 1
+    fi
+  done < <(/usr/bin/find "$candidate" -mindepth 1 -print0)
+  /usr/bin/find "$candidate" -depth -delete && durable_sync "${candidate%/*}"
+}
+
+cleanup_install_stages() {
+  local config_stage=$generations_root/.staging-$transaction_request release_stage=$release_generations/.staging-$transaction_manifest candidate
+  for candidate in "$config_stage" "$release_stage"; do
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+      [ -d "$candidate" ] && [ ! -L "$candidate" ] && remove_owned_tree "$candidate" || return 1
+    fi
+  done
+  candidate=$state_root/.prospective.$transaction_request
+  if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+    [ -d "$candidate" ] && [ ! -L "$candidate" ] || return 1
+    remove_owned_tree "$candidate" || return 1
+  fi
+  for candidate in \
+    "$release_root/.posix-dispatcher.$transaction_request" \
+    "$dropin_directory/.machine-utilities-transport.$transaction_request" \
+    "$state_root/.enrollment.$transaction_request"; do
+    if [ -L "$candidate" ]; then return 1
+    elif [ -e "$candidate" ]; then protected_file "$candidate" 33554432 || return 1; /bin/rm -f "$candidate" || return 1
+    fi
+  done
+}
+
+finish_transaction_cleanup() {
+  cleanup_install_stages || return 1
+  transaction_top_level_valid || return 1
+  remove_owned_tree "$transaction_root"
+}
+
+render_denial_dropin() {
+  cat <<EOF
+# machine-utilities-owned transport denial v1
+PermitUserEnvironment no
+
+Match User $target_account
+    PubkeyAuthentication no
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AuthenticationMethods publickey
+    AuthorizedKeysFile none
+    AuthorizedPrincipalsFile none
+    ForceCommand /usr/bin/false
+    PermitTTY no
+    X11Forwarding no
+    AllowTcpForwarding no
+    AllowStreamLocalForwarding no
+    AllowAgentForwarding no
+    PermitTunnel no
+    PermitUserRC no
+Match all
+EOF
+}
+
+reload_sshd() {
+  if [ "$fixture_mode" = true ]; then validate_service_posture
+  elif [ "$platform" = linux ]; then
+    "$sshd_binary" -t -f "$sshd_main" >/dev/null 2>&1 || return 1
+    if /bin/systemctl reload sshd >/dev/null 2>&1; then :
+    else /bin/systemctl reload ssh >/dev/null 2>&1; fi
+  else
+    "$sshd_binary" -t -f "$sshd_main" >/dev/null 2>&1 &&
+      /bin/launchctl kickstart -k system/com.openssh.sshd >/dev/null 2>&1
+  fi
+}
+
+install_denial_barrier() {
+  render_denial_dropin | write_atomic "$dropin_path" 0644 && reload_sshd
+}
+
+load_installed_release_metadata() {
+  local candidate=$1 manifest kind relative expected count=0
+  manifest=$candidate/.release-manifest
+  protected_file "$manifest" 1048576 && [ "$(sha256_file "$manifest")" = "$release_manifest_sha256" ] || return 1
+  release_file_count=0
+  release_total_bytes=0
+  release_entrypoint_digest=
+  release_worker_digest=
+  while IFS='|' read -r kind relative expected; do
+    [ "$kind" = file ] && digest "$expected" || return 1
+    case $relative in
+      plugins/roundhouse/scripts/enroll-ssh-posix) release_entrypoint_digest=$expected ;;
+      plugins/roundhouse/scripts/machine-utilities) release_worker_digest=$expected ;;
+    esac
+    count=$((count + 1)); [ "$count" -le 512 ] || return 1
+  done <"$manifest"
+  release_file_count=$count
+  digest "$release_entrypoint_digest" && digest "$release_worker_digest"
+}
+
+validate_current_links() {
+  [ -L "$active_link" ] && [ "$(/usr/bin/readlink "$active_link")" = "generations/$request_sha256" ] &&
+    [ -L "$current_release" ] && [ "$(/usr/bin/readlink "$current_release")" = "releases/$release_manifest_sha256" ]
+}
+
+validate_actual_sshd() {
+  local effective non_target_effective
+  if [ "$fixture_mode" = true ]; then
+    effective=$root_prefix/native/sshd.effective
+    non_target_effective=$root_prefix/native/sshd.non-target.effective
+    protected_file "$effective" 65536 && protected_file "$non_target_effective" 65536 &&
+      validate_effective_output "$effective" && validate_non_target_effective_output "$non_target_effective"
+  else
+    "$sshd_binary" -t -f "$sshd_main" >/dev/null 2>&1 || return 1
+    effective=$state_root/.effective.$$.$RANDOM
+    non_target_effective=$state_root/.non-target-effective.$$.$RANDOM
+    [ ! -e "$effective" ] && [ ! -L "$effective" ] || return 1
+    [ ! -e "$non_target_effective" ] && [ ! -L "$non_target_effective" ] || return 1
+    "$sshd_binary" -T -f "$sshd_main" -C \
+      "user=$target_account,host=$host_id,addr=$(first_management_address)" >"$effective" 2>/dev/null || {
+      /bin/rm -f "$effective"; return 1;
+    }
+    "$sshd_binary" -T -f "$sshd_main" -C \
+      "user=$(non_target_account),host=$host_id,addr=$(first_management_address)" \
+      >"$non_target_effective" 2>/dev/null || {
+      /bin/rm -f "$effective" "$non_target_effective"; return 1;
+    }
+    /bin/chmod 0600 "$effective" "$non_target_effective"
+    if ! validate_effective_output "$effective" || ! validate_non_target_effective_output "$non_target_effective"; then
+      /bin/rm -f "$effective" "$non_target_effective"; return 1
+    fi
+    /bin/rm -f "$effective" "$non_target_effective"
+  fi
+}
+
+validate_active_enrollment() {
+  local expected_request=$1 generation release_generation state_line
+  digest "$expected_request" || return 1
+  validate_target_account && validate_current_links || return 1
+  generation=$generations_root/$request_sha256
+  release_generation=$release_generations/$release_manifest_sha256
+  protected_directory "$generation" && protected_directory "$generation/principals" &&
+    protected_file "$generation/request" 16384 && [ "$(sha256_file "$generation/request")" = "$request_sha256" ] &&
+    protected_file "$generation/fleet-ca.pub" 32768 && protected_file "$generation/revoked.krl" 16777216 &&
+    protected_file "$generation/principals/$target_account" 4096 &&
+    [ "$(sha256_file "$generation/principals/$target_account")" = "$principals_sha256" ] || return 1
+  load_installed_release_metadata "$release_generation" &&
+    validate_release_generation_at "$release_generation" && validate_installed_dispatcher || return 1
+  protected_file "$dropin_path" 65536 && exact_mode "$dropin_path" 644 &&
+    [ "$(sha256_file "$dropin_path")" = "$dropin_sha256" ] || return 1
+  validate_ca_file "$generation/fleet-ca.pub" && validate_krl_file "$generation/revoked.krl" "$generation/fleet-ca.pub" || return 1
+  protected_file "$state_record" 8192 && exact_mode "$state_record" 600 || return 1
+  state_line="active|1|request-sha256=$request_sha256|release-manifest-sha256=$release_manifest_sha256|ca-generation=$primary_ca_generation|krl-generation=$krl_generation|platform=$platform"
+  [ "$(/usr/bin/sed -n '1p' "$state_record")" = "$state_line" ] &&
+    validate_host_key && validate_service_posture && validate_actual_sshd &&
+    [ "$expected_request" = "$request_sha256" ]
+}
+
+load_active_request() {
+  local expected=${1:-} target
+  [ -L "$active_link" ] || return 1
+  target=$(/usr/bin/readlink "$active_link") || return 1
+  [[ $target =~ ^generations/([0-9a-f]{64})$ ]] || return 1
+  [ -z "$expected" ] || [ "${BASH_REMATCH[1]}" = "$expected" ] || return 1
+  load_request "$config_root/$target/request"
+}
+
+write_drain() {
+  local operation=$1
+  printf 'drain|1|operation=%s|request-sha256=%s\n' "$operation" "$request_sha256" |
+    write_atomic "$drain_path" 0600
+}
+
+remove_drain() {
+  protected_file "$drain_path" 1024 && exact_mode "$drain_path" 600 || return 1
+  /bin/rm -f "$drain_path" && durable_sync "$state_root"
+}
+
+rollback_install_transaction() {
+  local rc=0
+  transaction_top_level_valid || return 1
+  target_account=$transaction_account
+  install_denial_barrier || return 1
+  restore_artifact current_release "$current_release" || rc=1
+  restore_artifact active "$active_link" || rc=1
+  restore_artifact dispatcher "$dispatcher_path" || rc=1
+  restore_artifact state "$state_record" || rc=1
+  restore_artifact dropin "$dropin_path" || rc=1
+  [ "$rc" -eq 0 ] && reload_sshd || rc=1
+  cleanup_install_stages || rc=1
+  if [ "$rc" -eq 0 ]; then
+    if [ "$transaction_previous_request" = - ]; then :
+    else
+      load_active_request "$transaction_previous_request" && validate_active_enrollment "$transaction_previous_request" || rc=1
+    fi
+  fi
+  if [ "$rc" -eq 0 ]; then remove_drain || rc=1; fi
+  [ "$rc" -eq 0 ] && finish_transaction_cleanup
+}
+
+previous_primary_fingerprint=
+previous_primary_generation=0
+previous_previous_fingerprint=
+previous_previous_generation=0
+previous_trust_mode=
+previous_krl_generation=0
+previous_krl_sha256=
+previous_rotation_state=
+
+capture_previous_transition_state() {
+  previous_primary_fingerprint=$primary_ca_fingerprint
+  previous_primary_generation=$primary_ca_generation
+  previous_previous_fingerprint=$previous_ca_fingerprint
+  previous_previous_generation=$previous_ca_generation
+  previous_trust_mode=$trust_mode
+  previous_krl_generation=$krl_generation
+  previous_krl_sha256=$krl_sha256
+  previous_rotation_state=$rotation_state
+}
+
+validate_repair_transition() {
+  [ "$request_sha256" != "$transaction_previous_request" ] &&
+    [ "$primary_ca_generation" -ge "$previous_primary_generation" ] &&
+    [ "$krl_generation" -ge "$previous_krl_generation" ] || return 1
+  if [ "$krl_sha256" != "$previous_krl_sha256" ]; then
+    [ "$krl_generation" -gt "$previous_krl_generation" ] || return 1
+  fi
+  if [ "$primary_ca_generation" -eq "$previous_primary_generation" ]; then
+    [ "$primary_ca_fingerprint" = "$previous_primary_fingerprint" ] || return 1
+    if [ "$previous_trust_mode" = dual ] && [ "$trust_mode" = single ]; then
+      [ "$rotation_state" = fleet-canary-proven ] &&
+        [ "$previous_rotation_state" = fleet-canary-proven ] || return 1
+    elif [ "$trust_mode" != "$previous_trust_mode" ] ||
+      [ "$previous_ca_fingerprint" != "$previous_previous_fingerprint" ] ||
+      [ "$previous_ca_generation" != "$previous_previous_generation" ]; then
+      return 1
+    fi
+  else
+    [ "$trust_mode" = dual ] &&
+      [ "$previous_ca_fingerprint" = "$previous_primary_fingerprint" ] &&
+      [ "$previous_ca_generation" = "$previous_primary_generation" ] &&
+      [[ $rotation_state =~ ^(dual-staged|fleet-canary-proven)$ ]] || return 1
+  fi
+}
+
+prepare_install_stages() {
+  local ca_file=$1 krl_file=$2
+  local config_stage=$generations_root/.staging-$request_sha256
+  local release_stage=$release_generations/.staging-$release_manifest_sha256
+  local wrapper_stage=$release_root/.posix-dispatcher.$request_sha256
+  local dropin_stage=$dropin_directory/.machine-utilities-transport.$request_sha256
+  local state_stage=$state_root/.enrollment.$request_sha256
+  local scratch=$state_root/.prospective.$request_sha256
+  for candidate in "$config_stage" "$release_stage" "$wrapper_stage" "$dropin_stage" "$state_stage" "$scratch"; do
+    [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || return 1
+  done
+  copy_configuration_generation "$config_stage" "$ca_file" "$krl_file" &&
+    copy_release_generation "$release_stage" || return 1
+  render_dispatcher | write_atomic "$wrapper_stage" 0755 &&
+    render_dropin | write_atomic "$dropin_stage" 0644 || return 1
+  printf 'active|1|request-sha256=%s|release-manifest-sha256=%s|ca-generation=%s|krl-generation=%s|platform=%s\n' \
+    "$request_sha256" "$release_manifest_sha256" "$primary_ca_generation" "$krl_generation" "$platform" |
+    write_atomic "$state_stage" 0600 || return 1
+  [ "$(sha256_file "$wrapper_stage")" = "$dispatcher_sha256" ] &&
+    [ "$(sha256_file "$dropin_stage")" = "$dropin_sha256" ] &&
+    validate_release_generation_at "$release_stage" || return 1
+  /bin/mkdir "$scratch" && /bin/chmod 0700 "$scratch"
+  if ! validate_prospective_sshd "$scratch"; then return 1; fi
+  /bin/rm -f "$scratch/dropin" "$scratch/effective" "$scratch/non-target-effective" "$scratch/prospective_sshd_config" 2>/dev/null || return 1
+  /bin/rmdir "$scratch" || return 1
+  if "$wrapper_stage" unexpected </dev/null >/dev/null 2>&1; then return 1; fi
+  if SSH_ORIGINAL_COMMAND=anything "$wrapper_stage" </dev/null >/dev/null 2>&1; then return 1; fi
+  if "$release_stage/scripts/machine-utilities" dispatch-posix-request unexpected \
+    </dev/null >/dev/null 2>&1; then return 1; fi
+  durable_sync "$config_stage" && durable_sync "$release_stage" && durable_sync "$release_root" &&
+    durable_sync "$dropin_directory" && durable_sync "$state_root"
+}
+
+activate_install_stages() {
+  local config_stage=$generations_root/.staging-$request_sha256
+  local release_stage=$release_generations/.staging-$release_manifest_sha256
+  local config_final=$generations_root/$request_sha256
+  local release_final=$release_generations/$release_manifest_sha256
+  local wrapper_stage=$release_root/.posix-dispatcher.$request_sha256
+  local dropin_stage=$dropin_directory/.machine-utilities-transport.$request_sha256
+  local state_stage=$state_root/.enrollment.$request_sha256
+  if [ -e "$release_final" ] || [ -L "$release_final" ]; then
+    [ -d "$release_final" ] && [ ! -L "$release_final" ] &&
+      validate_release_generation_at "$release_final" && remove_owned_tree "$release_stage" || return 1
+  else
+    /bin/mv "$release_stage" "$release_final" && durable_sync "$release_generations" || return 1
+  fi
+  if [ -e "$config_final" ] || [ -L "$config_final" ]; then
+    [ -d "$config_final" ] && [ ! -L "$config_final" ] &&
+      validate_configuration_generation_at "$config_final" && remove_owned_tree "$config_stage" || return 1
+  else /bin/mv "$config_stage" "$config_final" && durable_sync "$generations_root" || return 1
+  fi
+  write_transaction_record release-active || return 1
+  u6_failpoint after-release-generation || return $?
+  atomic_symlink "releases/$release_manifest_sha256" "$current_release" || return 1
+  atomic_symlink "generations/$request_sha256" "$active_link" || return 1
+  write_transaction_record config-active || return 1
+  u6_failpoint after-generation-links || return $?
+  /bin/mv -f "$wrapper_stage" "$dispatcher_path" && durable_sync "$release_root" || return 1
+  /bin/mv -f "$dropin_stage" "$dropin_path" && durable_sync "$dropin_directory" || return 1
+  write_transaction_record policy-active || return 1
+  u6_failpoint after-policy-activation || return $?
+  reload_sshd || return 1
+  /bin/mv -f "$state_stage" "$state_record" && durable_sync "$state_root" || return 1
+  validate_active_enrollment "$request_sha256" || return 1
+  write_transaction_record verified || return 1
+  u6_failpoint after-active-verification || return $?
+  write_transaction_record committed || return 1
+  remove_drain || return 1
+  finish_transaction_cleanup
+}
+
+install_transaction() {
+  local operation=$1 bundle=$2 manifest=$3 request=$4 ca_file=$5 krl_file=$6 confirmed=$7 previous=-
+  local candidate_request candidate_confirmation previous_request='' previous_primary previous_generation previous_previous previous_previous_generation_local previous_trust previous_krl previous_krl_digest previous_rotation activation_rc
+  preview_inputs "$bundle" "$manifest" "$request" "$ca_file" "$krl_file" || {
+    emit_status rejected candidate_validation_failed "$platform"; return 65;
+  }
+  candidate_request=$request_sha256
+  candidate_confirmation=$(confirmation_digest "$operation") || return 65
+  [ "$confirmed" = "$candidate_confirmation" ] || {
+    emit_status rejected confirmation_digest_mismatch "$platform"; return 65;
+  }
+  require_authenticated_bootstrap_launch "$operation" "$release_manifest_sha256" "$release_entrypoint_digest" || {
+    emit_status rejected authenticated_bootstrap_required "$platform"; return 77;
+  }
+  ensure_layout || { emit_status rejected protected_path_validation_failed "$platform"; return 65; }
+  acquire_lifecycle_lock "$operation" || {
+    case $? in 75) emit_status draining lifecycle_busy "$platform"; return 75 ;; *) emit_status drifted lifecycle_lock_invalid "$platform"; return 74 ;; esac
+  }
+  install_mutation_traps
+  if [ -e "$transaction_root" ] || [ -L "$transaction_root" ]; then
+    if ! recover_transaction; then release_lifecycle_lock 2>/dev/null || :; emit_status drifted recovery_failed "$platform"; return 74; fi
+  fi
+  if [ -L "$active_link" ]; then
+    load_active_request || { release_lifecycle_lock; emit_status drifted invalid_existing_enrollment "$platform"; return 74; }
+    validate_active_enrollment "$request_sha256" || { release_lifecycle_lock; emit_status drifted invalid_existing_enrollment "$platform"; return 74; }
+    previous_request=$request_sha256
+    previous_primary=$primary_ca_fingerprint; previous_generation=$primary_ca_generation
+    previous_previous=$previous_ca_fingerprint; previous_previous_generation_local=$previous_ca_generation
+    previous_trust=$trust_mode; previous_krl=$krl_generation; previous_krl_digest=$krl_sha256; previous_rotation=$rotation_state
+    previous=$previous_request
+  elif [ -e "$active_link" ]; then
+    release_lifecycle_lock; emit_status drifted invalid_active_link "$platform"; return 74
+  fi
+  if { [ "$operation" = install ] && [ "$previous" != - ]; } ||
+    { [ "$operation" = repair ] && [ "$previous" = - ]; }; then
+    release_lifecycle_lock; emit_status rejected operation_state_mismatch "$platform"; return 65
+  fi
+  preview_inputs "$bundle" "$manifest" "$request" "$ca_file" "$krl_file" &&
+    [ "$request_sha256" = "$candidate_request" ] &&
+    [ "$(confirmation_digest "$operation")" = "$confirmed" ] || {
+      release_lifecycle_lock; emit_status rejected under_lock_candidate_drift "$platform"; return 65;
+    }
+  if [ "$operation" = repair ]; then
+    transaction_previous_request=$previous
+    previous_primary_fingerprint=$previous_primary; previous_primary_generation=$previous_generation
+    previous_previous_fingerprint=$previous_previous; previous_previous_generation=$previous_previous_generation_local
+    previous_trust_mode=$previous_trust; previous_krl_generation=$previous_krl
+    previous_krl_sha256=$previous_krl_digest; previous_rotation_state=$previous_rotation
+    validate_repair_transition || {
+      release_lifecycle_lock; emit_status rejected non_monotonic_rotation_or_krl "$platform"; return 65;
+    }
+  fi
+  begin_transaction "$operation" "$previous" || {
+    release_lifecycle_lock; emit_status drifted transaction_collision "$platform"; return 74;
+  }
+  write_drain "$operation" && write_transaction_record drained || {
+    rollback_install_transaction 2>/dev/null || :; release_lifecycle_lock 2>/dev/null || :
+    emit_status drifted drain_write_failed "$platform"; return 74;
+  }
+  u6_failpoint after-drain || { rollback_install_transaction; release_lifecycle_lock; emit_status drifted rolled_back_after_drain "$platform"; return 74; }
+  snapshot_artifact current_release "$current_release" && snapshot_artifact active "$active_link" &&
+    snapshot_artifact dispatcher "$dispatcher_path" && snapshot_artifact dropin "$dropin_path" &&
+    snapshot_artifact state "$state_record" && write_transaction_record snapshotted || {
+      rollback_install_transaction 2>/dev/null || :; release_lifecycle_lock 2>/dev/null || :
+      emit_status drifted snapshot_failed "$platform"; return 74;
+    }
+  if ! prepare_install_stages "$ca_file" "$krl_file" || ! write_transaction_record prepared; then
+    rollback_install_transaction 2>/dev/null || :; release_lifecycle_lock 2>/dev/null || :
+    emit_status drifted stage_validation_failed "$platform"; return 74
+  fi
+  if activate_install_stages; then
+    release_lifecycle_lock || { emit_status drifted lifecycle_lock_retirement_failed "$platform"; return 74; }
+    clear_mutation_traps
+    emit_status installed local_verification_complete "$platform"
+    return 0
+  else activation_rc=$?
+  fi
+  if [ "$fixture_mode" = true ] && [ "$activation_rc" -eq 98 ] &&
+    [[ ${ROUNDHOUSE_U6_FAILPOINT:-} == power-loss-* ]]; then
+    clear_mutation_traps
+    emit_status fixture simulated_power_loss_durable_state "$platform"
+    return 0
+  fi
+  if rollback_install_transaction; then
+    release_lifecycle_lock || :
+    emit_status drifted activation_failed_previous_restored "$platform"
+  else
+    release_lifecycle_lock 2>/dev/null || :
+    emit_status drifted activation_failed_drained "$platform"
+  fi
+  return 74
+}
+
+validate_revoked_effective() {
+  local effective
+  if [ "$fixture_mode" = true ]; then
+    effective=$root_prefix/native/sshd.revoked.effective
+    protected_file "$effective" 65536 || return 1
+  else
+    effective=$state_root/.revoked-effective.$$.$RANDOM
+    [ ! -e "$effective" ] && [ ! -L "$effective" ] || return 1
+    "$sshd_binary" -T -f "$sshd_main" -C \
+      "user=$target_account,host=$host_id,addr=$(first_management_address)" >"$effective" 2>/dev/null || {
+      /bin/rm -f "$effective"; return 1;
+    }
+    /bin/chmod 0600 "$effective"
+  fi
+  if /usr/bin/grep -Fq "$native_ca_path" "$effective" ||
+    /usr/bin/grep -Fq "$native_krl_path" "$effective" ||
+    /usr/bin/grep -Fq "$dispatcher_native_path" "$effective"; then
+    [ "$fixture_mode" = true ] || /bin/rm -f "$effective"
+    return 1
+  fi
+  [ "$fixture_mode" = true ] || /bin/rm -f "$effective"
+}
+
+complete_revoke_transaction() {
+  local generation=$generations_root/$transaction_request
+  transaction_top_level_valid && [ "$transaction_operation" = revoke ] || return 1
+  target_account=$transaction_account
+  load_request "$generation/request" && [ "$request_sha256" = "$transaction_request" ] || return 1
+  if [ ! -e "$drain_path" ] && [ ! -L "$drain_path" ]; then write_drain revoke || return 1; fi
+  install_denial_barrier || return 1
+  write_transaction_record revoking || return 1
+  u6_failpoint after-revoke-denial || return $?
+  if [ -e "$state_root/active-request" ] || [ -L "$state_root/active-request" ]; then
+    protected_file "$state_root/active-request" 4096 && exact_mode "$state_root/active-request" 600 || return 1
+    return 75
+  fi
+  if [ -L "$active_link" ]; then
+    [ "$(/usr/bin/readlink "$active_link")" = "generations/$transaction_request" ] || return 1
+    /bin/rm -f "$active_link" && durable_sync "$config_root" || return 1
+  elif [ -e "$active_link" ]; then return 1
+  fi
+  if [ -L "$current_release" ]; then
+    [ "$(/usr/bin/readlink "$current_release")" = "releases/$transaction_manifest" ] || return 1
+    /bin/rm -f "$current_release" && durable_sync "$release_root" || return 1
+  elif [ -e "$current_release" ]; then return 1
+  fi
+  if [ -e "$dispatcher_path" ] || [ -L "$dispatcher_path" ]; then
+    protected_file "$dispatcher_path" 4194304 && exact_mode "$dispatcher_path" 755 &&
+      [ "$(sha256_file "$dispatcher_path")" = "$dispatcher_sha256" ] || return 1
+    /bin/rm -f "$dispatcher_path" && durable_sync "$release_root" || return 1
+  fi
+  u6_failpoint after-revoke-endpoint-removal || return $?
+  protected_file "$dropin_path" 65536 && /usr/bin/grep -Fqx \
+    '# machine-utilities-owned transport denial v1' "$dropin_path" || return 1
+  /bin/rm -f "$dropin_path" && durable_sync "$dropin_directory" && reload_sshd || return 1
+  validate_revoked_effective || return 1
+  printf 'revoked|1|request-sha256=%s|release-manifest-sha256=%s|platform=%s|controller-trust=not-activated\n' \
+    "$transaction_request" "$transaction_manifest" "$platform" | write_atomic "$state_record" 0600 || return 1
+  write_transaction_record revoked || return 1
+  u6_failpoint after-revoke-verification || return $?
+  write_transaction_record committed || return 1
+  remove_drain || return 1
+  finish_transaction_cleanup
+}
+
+recover_transaction() {
+  local expected_operation=${1:-recover} expected_request=${2:-} expected_manifest=${3:-}
+  transaction_top_level_valid || return 1
+  [ "$expected_operation" = recover ] || [ "$transaction_operation" = "$expected_operation" ] || return 75
+  [ -z "$expected_request" ] || [ "$transaction_request" = "$expected_request" ] || return 75
+  [ -z "$expected_manifest" ] || [ "$transaction_manifest" = "$expected_manifest" ] || return 75
+  case $transaction_operation:$transaction_phase in
+    install:intent|repair:intent)
+      finish_transaction_cleanup
+      ;;
+    install:drained|repair:drained)
+      target_account=$transaction_account
+      remove_drain && finish_transaction_cleanup
+      ;;
+    install:committed|repair:committed)
+      load_active_request "$transaction_request" && validate_active_enrollment "$transaction_request" &&
+        { [ ! -e "$drain_path" ] || remove_drain; } && finish_transaction_cleanup
+      ;;
+    install:*|repair:*) rollback_install_transaction ;;
+    revoke:*) complete_revoke_transaction ;;
+    *) return 1 ;;
+  esac
+}
+
+load_revoke_request() {
+  local expected=$1
+  if [ -L "$active_link" ]; then load_active_request "$expected"
+  else load_request "$generations_root/$expected/request" && [ "$request_sha256" = "$expected" ]
+  fi
+}
+
+revoke_transaction() {
+  local expected_request=$1 confirmed=$2 confirmation manifest entrypoint rc
+  digest "$expected_request" && digest "$confirmed" || usage
+  [ -d "$state_root" ] && protected_directory "$state_root" || {
+    emit_status revoked already_not_enrolled "$platform"; return 0;
+  }
+  load_revoke_request "$expected_request" && validate_host_key || {
+    emit_status rejected enrollment_not_found_or_drifted "$platform"; return 65;
+  }
+  manifest=$release_manifest_sha256
+  load_installed_release_metadata "$release_generations/$manifest" || {
+    emit_status drifted release_generation_invalid "$platform"; return 74;
+  }
+  entrypoint=$release_entrypoint_digest
+  confirmation=$(confirmation_digest revoke) || return 65
+  [ "$confirmation" = "$confirmed" ] || {
+    emit_status rejected confirmation_digest_mismatch "$platform"; return 65;
+  }
+  require_authenticated_bootstrap_launch revoke "$manifest" "$entrypoint" || {
+    emit_status rejected authenticated_bootstrap_required "$platform"; return 77;
+  }
+  acquire_lifecycle_lock revoke || {
+    case $? in 75) emit_status draining lifecycle_busy "$platform"; return 75 ;; *) emit_status drifted lifecycle_lock_invalid "$platform"; return 74 ;; esac
+  }
+  install_mutation_traps
+  if [ -e "$transaction_root" ] || [ -L "$transaction_root" ]; then
+    load_transaction_record || { release_lifecycle_lock; emit_status drifted transaction_invalid "$platform"; return 74; }
+    [ "$transaction_operation" = revoke ] && [ "$transaction_request" = "$expected_request" ] || {
+      release_lifecycle_lock; emit_status draining different_lifecycle_operation "$platform"; return 75;
+    }
+  else
+    load_revoke_request "$expected_request" && validate_active_enrollment "$expected_request" &&
+      [ "$(confirmation_digest revoke)" = "$confirmed" ] || {
+        release_lifecycle_lock; emit_status rejected under_lock_enrollment_drift "$platform"; return 65;
+      }
+    begin_transaction revoke "$expected_request" &&
+      snapshot_artifact current_release "$current_release" && snapshot_artifact active "$active_link" &&
+      snapshot_artifact dispatcher "$dispatcher_path" && snapshot_artifact dropin "$dropin_path" &&
+      snapshot_artifact state "$state_record" && write_drain revoke && write_transaction_record revoking || {
+        release_lifecycle_lock 2>/dev/null || :; emit_status drifted revoke_intent_failed "$platform"; return 74;
+      }
+  fi
+  if complete_revoke_transaction; then
+    release_lifecycle_lock || { emit_status drifted lifecycle_lock_retirement_failed "$platform"; return 74; }
+    clear_mutation_traps
+    emit_status revoked managed_transport_removed "$platform"
+    return 0
+  else rc=$?
+  fi
+  release_lifecycle_lock 2>/dev/null || :
+  if [ "$rc" -eq 75 ]; then emit_status draining active_request_must_terminalize "$platform"; return 75; fi
+  emit_status drifted revoke_incomplete_transport_denied "$platform"
+  return 74
+}
+
+mutation_exit_handler() {
+  local rc=$?
+  trap - EXIT HUP INT TERM
+  if [ -d "$lifecycle_lock" ] && read_lock 2>/dev/null && [ "$lock_pid" = "${BASHPID:-$$}" ]; then
+    if [ -d "$transaction_root" ] && load_transaction_record 2>/dev/null; then
+      case $transaction_operation in install|repair) rollback_install_transaction >/dev/null 2>&1 || : ;; revoke) : ;; esac
+    fi
+    release_lifecycle_lock >/dev/null 2>&1 || :
+  fi
+  exit "$rc"
+}
+
+install_mutation_traps() {
+  trap mutation_exit_handler EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+clear_mutation_traps() { trap - EXIT HUP INT TERM; }
+
+selftest_root=
+selftest_cleanup() {
+  local marker
+  [ -n "$selftest_root" ] || return 0
+  case $selftest_root in /private/tmp/machine-utilities-u6-selftest.*|/tmp/machine-utilities-u6-selftest.*) ;; *) return 1 ;; esac
+  marker=$selftest_root/.u6-selftest-root
+  [ -f "$marker" ] && [ ! -L "$marker" ] &&
+    [ "$(/usr/bin/sed -n '1p' "$marker")" = machine-utilities-u6-selftest ] || return 1
+  /usr/bin/find "$selftest_root" -depth -delete
+}
+
+selftest_make_bundle() {
+  local root=$1 self=$2 build plugin manifest manifest_digest worker_digest entrypoint_digest pub worker_source
+  build=$root/var/lib/machine-utilities-bootstrap/staged/build
+  plugin=$build/plugins/machine-utilities
+  /bin/mkdir -p "$plugin/.claude-plugin" "$plugin/.codex-plugin" "$plugin/scripts" \
+    "$root/var/lib/machine-utilities-bootstrap/receipts"
+  printf '{"name":"machine-utilities","version":"0.0.0-fixture"}\n' >"$plugin/.claude-plugin/plugin.json"
+  printf '{"name":"machine-utilities","version":"0.0.0-fixture"}\n' >"$plugin/.codex-plugin/plugin.json"
+  /bin/cp "$self" "$plugin/scripts/enroll-ssh-posix"
+  worker_source=${self%/*}/machine-utilities
+  [ -f "$worker_source" ] && [ ! -L "$worker_source" ] || return 1
+  /bin/cp "$worker_source" "$plugin/scripts/machine-utilities"
+  /bin/chmod 0600 "$plugin/scripts/enroll-ssh-posix" "$plugin/scripts/machine-utilities"
+  worker_digest=$(sha256_file "$plugin/scripts/machine-utilities")
+  entrypoint_digest=$(sha256_file "$plugin/scripts/enroll-ssh-posix")
+  cat >"$plugin/integrity.json" <<EOF
+{
+  "files": [
+    {
+      "path": ".claude-plugin/plugin.json",
+      "sha256": "$(sha256_file "$plugin/.claude-plugin/plugin.json")"
+    },
+    {
+      "path": ".codex-plugin/plugin.json",
+      "sha256": "$(sha256_file "$plugin/.codex-plugin/plugin.json")"
+    },
+    {
+      "path": "scripts/enroll-ssh-posix",
+      "sha256": "$entrypoint_digest"
+    },
+    {
+      "path": "scripts/machine-utilities",
+      "sha256": "$worker_digest"
+    }
+  ],
+  "plugin": "machine-utilities",
+  "schema": "roundhouse.integrity",
+  "schema_version": 1,
+  "version": "0.0.0-fixture"
+}
+EOF
+  /usr/bin/find "$root/var/lib/machine-utilities-bootstrap" -type d -exec /bin/chmod 0700 {} +
+  /usr/bin/find "$plugin" -type f -exec /bin/chmod 0600 {} +
+  manifest=$build/bootstrap.manifest
+  (
+    CDPATH='' cd "$build"
+    /usr/bin/find plugins/machine-utilities -type f -print | LC_ALL=C /usr/bin/sort | while IFS= read -r relative; do
+      printf 'file|%s|%s\n' "$relative" "$(sha256_file "$relative")"
+    done
+  ) >"$manifest"
+  /bin/chmod 0600 "$manifest"
+  /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$root/release-signing-key"
+  /usr/bin/ssh-keygen -Y sign -f "$root/release-signing-key" -n machine-utilities-release \
+    "$manifest" >/dev/null 2>&1
+  pub=$(/bin/cat "$root/release-signing-key.pub")
+  printf 'machine-utilities-release %s\n' "$pub" >"$root/var/lib/machine-utilities-bootstrap/release-allowed-signers"
+  /bin/chmod 0600 "$root/var/lib/machine-utilities-bootstrap/release-allowed-signers" "$manifest.sig"
+  manifest_digest=$(sha256_file "$manifest")
+  printf 'bootstrap|1|manifest-sha256=%s|release-principal=machine-utilities-release\n' "$manifest_digest" \
+    >"$root/var/lib/machine-utilities-bootstrap/receipts/$manifest_digest"
+  /bin/chmod 0600 "$root/var/lib/machine-utilities-bootstrap/receipts/$manifest_digest"
+  /bin/mv "$build" "$root/var/lib/machine-utilities-bootstrap/staged/$manifest_digest"
+  printf '%s\n' "$manifest_digest"
+}
+
+selftest_make_native_fixture() {
+  local root=$1 fixture_platform_name=$2 account uid home
+  account=$(/usr/bin/id -un); uid=$(/usr/bin/id -u)
+  case $fixture_platform_name in
+    linux) home=/home/$account ;;
+    macos) home=/Users/$account ;;
+    *) return 1 ;;
+  esac
+  /bin/mkdir -p "$root/native" "$root/input" "$root/etc/ssh"
+  /bin/chmod 0700 "$root/native" "$root/input" "$root/etc" "$root/etc/ssh"
+  /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$root/native/ssh_host_ed25519_key"
+  /bin/chmod 0600 "$root/native/ssh_host_ed25519_key.pub"
+  printf 'login-window|enabled\nresident-custom-root-daemon|false\n' >"$root/native/service.posture"
+  printf 'posix-account|1|name=%s|uid=%s|home=%s\n' "$account" "$uid" "$home" >"$root/native/account"
+  /bin/chmod 0600 "$root/native/service.posture" "$root/native/account"
+}
+
+selftest_make_effective() {
+  local root=$1 account=$2
+  cat >"$root/native/sshd.effective" <<EOF
+trustedusercakeys $native_ca_path
+revokedkeys $native_krl_path
+pubkeyauthentication yes
+authenticationmethods publickey
+authorizedkeysfile none
+authorizedprincipalsfile $native_principals_path
+forcecommand $dispatcher_native_path
+passwordauthentication no
+kbdinteractiveauthentication no
+hostbasedauthentication no
+gssapiauthentication no
+permittty no
+x11forwarding no
+allowtcpforwarding no
+allowstreamlocalforwarding no
+allowagentforwarding no
+permittunnel no
+gatewayports no
+permitopen none
+permitlisten none
+permituserrc no
+permituserenvironment no
+EOF
+  printf 'trustedusercakeys none\n' >"$root/native/sshd.non-target.effective"
+  cat >"$root/native/sshd.revoked.effective" <<EOF
+trustedusercakeys none
+revokedkeys none
+forcecommand none
+pubkeyauthentication yes
+passwordauthentication yes
+fixtureaccount $account
+EOF
+  /bin/chmod 0600 "$root/native/sshd.effective" "$root/native/sshd.non-target.effective" \
+    "$root/native/sshd.revoked.effective"
+}
+
+selftest_sshd_scope() {
+  local root=$1 account=$2 config target_effective non_target_effective
+  config=$root/native/sshd-scope.conf
+  target_effective=$root/native/sshd-scope.target.effective
+  non_target_effective=$root/native/sshd-scope.non-target.effective
+  [ "$target_account" = "$account" ] && [ -x "$sshd_binary" ] || return 1
+  {
+    printf 'HostKey %s\n' "$root/native/ssh_host_ed25519_key"
+    render_dropin
+  } >"$config"
+  /bin/chmod 0600 "$config"
+  "$sshd_binary" -t -f "$config" >/dev/null 2>&1 || return 1
+  "$sshd_binary" -T -f "$config" -C "user=$account,host=fixture,addr=192.0.2.1" \
+    >"$target_effective" 2>/dev/null || return 1
+  "$sshd_binary" -T -f "$config" -C "user=$(non_target_account),host=fixture,addr=192.0.2.1" \
+    >"$non_target_effective" 2>/dev/null || return 1
+  validate_effective_output "$target_effective" &&
+    [ "$(effective_value "$non_target_effective" trustedusercakeys)" = none ] &&
+    validate_non_target_effective_output "$non_target_effective"
+}
+
+selftest_stale_lock_claim() {
+  local root=$1 state lock retired stale_directory_identity stale_owner_identity
+  local replacement_directory_identity replacement_owner_identity
+  state=$root/native/lifecycle-lock-state
+  lock=$state/.lifecycle-lock
+  retired=$state/retired-stale
+  /bin/mkdir "$state" "$lock" && /bin/chmod 0700 "$state" "$lock" || return 1
+  printf '%s\n' stale >"$lock/owner" && /bin/chmod 0600 "$lock/owner" || return 1
+  stale_directory_identity=$(file_identity "$lock") || return 1
+  stale_owner_identity=$(file_identity "$lock/owner") || return 1
+  /bin/mv "$lock" "$retired" || return 1
+  /bin/mkdir "$lock" && /bin/chmod 0700 "$lock" || return 1
+  printf '%s\n' replacement >"$lock/owner" && /bin/chmod 0600 "$lock/owner" || return 1
+  replacement_directory_identity=$(file_identity "$lock") || return 1
+  replacement_owner_identity=$(file_identity "$lock/owner") || return 1
+  if claim_stale_lock "$state" "$lock" "$stale_directory_identity" "$stale_owner_identity"; then return 1; else
+    [ "$?" -eq 74 ] || return 1
+  fi
+  [ "$(file_identity "$retired")" = "$stale_directory_identity" ] &&
+    [ "$(file_identity "$retired/owner")" = "$stale_owner_identity" ] &&
+    [ "$(file_identity "$lock")" = "$replacement_directory_identity" ] &&
+    [ "$(file_identity "$lock/owner")" = "$replacement_owner_identity" ] || return 1
+  claim_stale_lock "$state" "$lock" "$replacement_directory_identity" "$replacement_owner_identity" || return 1
+  [ ! -e "$lock" ] && [ ! -L "$lock" ] || return 1
+  /bin/rm -f "$retired/owner" && /bin/rmdir "$retired" && /bin/rmdir "$state"
+}
+
+selftest_stale_lock_capture_order() {
+  local retired stale_directory_identity stale_owner_identity replacement_directory_identity
+  local replacement_owner_identity replacement_pid replacement_record replacement_token rc
+  [ "$fixture_mode" = true ] && [ ! -e "$state_root" ] && [ ! -L "$state_root" ] || {
+    printf 'enroll-ssh-posix self-test: stale capture initial state failed\n' >&2; return 1;
+  }
+  retired=$state_root/observed-stale-lock
+  /bin/mkdir -p "$state_root" "$lifecycle_lock" && /bin/chmod 0700 "$state_root" "$lifecycle_lock" || {
+    printf 'enroll-ssh-posix self-test: stale capture setup failed\n' >&2; return 1;
+  }
+  printf 'lifecycle-lock|1|2147483647|stale|recover\n' >"$lifecycle_lock/owner"
+  /bin/chmod 0600 "$lifecycle_lock/owner" || return 1
+  stale_directory_identity=$(file_identity "$lifecycle_lock") || return 1
+  stale_owner_identity=$(file_identity "$lifecycle_lock/owner") || return 1
+  if ROUNDHOUSE_U6_TEST_REPLACE_CLASSIFIED_LOCK=replace retire_stale_lock; then rc=0; else rc=$?; fi
+  [ "$rc" -eq 74 ] || { printf 'enroll-ssh-posix self-test: stale capture retirement failed\n' >&2; return 1; }
+  replacement_pid=${BASHPID:-$$}
+  replacement_token=$(process_token "$replacement_pid") || {
+    printf 'enroll-ssh-posix self-test: stale capture process token failed\n' >&2; return 1;
+  }
+  replacement_record="lifecycle-lock|1|$replacement_pid|$replacement_token|recover"
+  replacement_directory_identity=$(file_identity "$lifecycle_lock") || return 1
+  replacement_owner_identity=$(file_identity "$lifecycle_lock/owner") || return 1
+  [ "$(/usr/bin/sed -n '1p' "$lifecycle_lock/owner")" = "$replacement_record" ] &&
+    [ "$(file_identity "$retired")" = "$stale_directory_identity" ] &&
+    [ "$(file_identity "$retired/owner")" = "$stale_owner_identity" ] &&
+    [ "$(file_identity "$lifecycle_lock")" = "$replacement_directory_identity" ] &&
+    [ "$(file_identity "$lifecycle_lock/owner")" = "$replacement_owner_identity" ] || {
+      printf 'enroll-ssh-posix self-test: stale capture snapshot failed\n' >&2; return 1;
+    }
+  lock_is_live "$replacement_directory_identity" "$replacement_owner_identity" || {
+    printf 'enroll-ssh-posix self-test: stale capture live lock failed\n' >&2; return 1;
+  }
+  /bin/rm -f "$lifecycle_lock/owner" "$retired/owner" &&
+    /bin/rmdir "$lifecycle_lock" "$retired" "$state_root"
+}
+
+selftest_make_request() {
+  local root=$1 fixture_platform_name=$2 manifest_digest=$3 ca_file=$4 krl_file=$5 output=$6
+  local primary_generation=${7:-1} previous_fingerprint=${8:--} previous_generation=${9:-0}
+  local trust=${10:-single} requested_krl_generation=${11:-1} requested_renewal=${12:-stable}
+  local requested_rotation=${13:-stable}
+  local account uid home ca_fingerprint ca_digest krl_digest principal_digest wrapper_digest rendered_dropin_digest
+  account=$(/usr/bin/id -un); uid=$(/usr/bin/id -u)
+  case $fixture_platform_name in
+    linux) home=/home/$account ;;
+    macos) home=/Users/$account ;;
+    *) return 1 ;;
+  esac
+  target_account=$account
+  target_home=$home
+  endpoint_principal=machine-utilities-posix
+  principal_digest=$(render_principals | sha256_stream)
+  wrapper_digest=$(render_dispatcher | sha256_stream)
+  rendered_dropin_digest=$(render_dropin | sha256_stream)
+  ca_fingerprint=$(/usr/bin/ssh-keygen -lf "$ca_file" -E sha256 | /usr/bin/awk 'NR==1{print $2}')
+  ca_digest=$(sha256_file "$ca_file"); krl_digest=$(sha256_file "$krl_file")
+  cat >"$output" <<EOF
+posix-ssh-enrollment-request|1
+fleet-domain|fleet.example
+host-id|fixture-$fixture_platform_name
+target-account|$account
+target-uid|$uid
+platform-boundary|$fixture_platform_name
+primary-ca-fingerprint|$ca_fingerprint
+primary-ca-generation|$primary_generation
+previous-ca-fingerprint|$previous_fingerprint
+previous-ca-generation|$previous_generation
+trust-mode|$trust
+endpoint-principal|machine-utilities-posix
+signing-principal|fixture-$fixture_platform_name@fleet.example
+management-sources|192.0.2.0/24,2001:db8::/64
+ca-public-key-sha256|$ca_digest
+krl-generation|$requested_krl_generation
+krl-sha256|$krl_digest
+principals-sha256|$principal_digest
+dispatcher-sha256|$wrapper_digest
+drop-in-sha256|$rendered_dropin_digest
+release-manifest-sha256|$manifest_digest
+renewal-state|$requested_renewal
+rotation-state|$requested_rotation
+login-window-service|enabled
+end-enrollment|
+EOF
+  /bin/chmod 0600 "$output"
+}
+
+selftest_dispatcher_hostile_environment() {
+  local root=$1 installed_wrapper installed_worker fixture probe probe_wrapper worker_wrapper
+  local fake_bin fake_tmp fake_home fake_config fake_identity marker tool frame rc
+  installed_wrapper=$root/usr/local/libexec/machine-utilities/posix-dispatcher
+  installed_worker=$root/usr/local/libexec/machine-utilities/current/scripts/machine-utilities
+  fixture=$root/dispatcher-hostile
+  fake_bin=$fixture/bin
+  fake_tmp=$fixture/tmp
+  fake_home=$fixture/home
+  fake_config=$fixture/config.json
+  fake_identity=$fixture/identity.json
+  marker=$fixture/fake-tool-executed
+  /bin/mkdir -p "$fake_bin" "$fake_tmp" "$fake_home"
+  /bin/chmod 0700 "$fixture" "$fake_bin" "$fake_tmp" "$fake_home"
+  printf '{}\n' >"$fake_config"
+  printf '{}\n' >"$fake_identity"
+  /bin/chmod 0600 "$fake_config" "$fake_identity"
+  for tool in jq mktemp sha256sum sudo; do
+    cat >"$fake_bin/$tool" <<EOF
+#!/bin/sh
+printf '%s\n' '$tool' >>'$marker'
+exit 97
+EOF
+    /bin/chmod 0700 "$fake_bin/$tool"
+  done
+  [ -f "$installed_wrapper" ] && [ ! -L "$installed_wrapper" ] &&
+    [ "$(file_owner "$installed_wrapper")" = "$(/usr/bin/id -un)" ] &&
+    exact_mode "$installed_wrapper" 755 && safe_permissions "$installed_wrapper" &&
+    [ "$(/usr/bin/grep -Fxc \
+      '  /usr/local/libexec/machine-utilities/current/scripts/machine-utilities dispatch-posix-request' \
+      "$installed_wrapper")" -eq 1 ] || return 1
+
+  probe=$fixture/environment-probe
+  cat >"$probe" <<EOF
+#!/bin/sh
+set -eu
+expected_home='$target_home'
+expected_account='$target_account'
+EOF
+  cat >>"$probe" <<'EOF'
+[ "$#" -eq 1 ] && [ "$1" = dispatch-posix-request ] || exit 80
+[ "${HOME:-}" = "$expected_home" ] && [ "${USER:-}" = "$expected_account" ] &&
+  [ "${LOGNAME:-}" = "$expected_account" ] || exit 81
+[ "${PATH:-}" = /usr/sbin:/usr/bin:/sbin:/bin ] && [ "${LC_ALL:-}" = C ] &&
+  [ "${LANG:-}" = C ] && [ "${TZ:-}" = UTC ] || exit 82
+[ -z "${TMPDIR+x}" ] && [ -z "${XDG_CONFIG_HOME+x}" ] &&
+  [ -z "${ROUNDHOUSE_CONFIG+x}" ] && [ -z "${ROUNDHOUSE_IDENTITY+x}" ] || exit 83
+for tool in mktemp jq sha256sum sudo; do
+  resolved=$(command -v "$tool" 2>/dev/null || :)
+  case $resolved in
+    /usr/sbin/$tool|/usr/bin/$tool|/sbin/$tool|/bin/$tool|'') ;;
+    *) exit 84 ;;
+  esac
+done
+[ "$(command -v mktemp)" = /usr/bin/mktemp ] || exit 84
+private_tmp=$(/usr/bin/mktemp -d /tmp/machine-utilities-u6-dispatch-probe.XXXXXX) || exit 85
+case $private_tmp in /tmp/machine-utilities-u6-dispatch-probe.*) ;; *) exit 85 ;; esac
+case $(/usr/bin/uname -s) in
+  Darwin) mode=$(/usr/bin/stat -f %Lp "$private_tmp" 2>/dev/null); owner=$(/usr/bin/stat -f %Su "$private_tmp" 2>/dev/null) ;;
+  Linux) mode=$(/usr/bin/stat -c %a "$private_tmp" 2>/dev/null); owner=$(/usr/bin/stat -c %U "$private_tmp" 2>/dev/null) ;;
+  *) exit 85 ;;
+esac
+mode=$(printf '%s' "$mode" | /usr/bin/sed 's/.*\(...\)$/\1/')
+[ "$mode" = 700 ] && [ "$owner" = "$expected_account" ] || exit 85
+/bin/rmdir "$private_tmp" || exit 85
+printf '%s\n' environment-probe-ok
+exit 73
+EOF
+  /bin/chmod 0700 "$probe"
+  probe_wrapper=$fixture/probe-dispatcher
+  /usr/bin/sed \
+    "s#^  /usr/local/libexec/machine-utilities/current/scripts/machine-utilities dispatch-posix-request\$#  $probe dispatch-posix-request#" \
+    "$installed_wrapper" >"$probe_wrapper"
+  /bin/chmod 0700 "$probe_wrapper"
+  [ "$(/usr/bin/grep -Fxc "  $probe dispatch-posix-request" "$probe_wrapper")" -eq 1 ] || return 1
+  set +e
+  PATH=$fake_bin TMPDIR=$fake_tmp HOME=$fake_home XDG_CONFIG_HOME=$fake_home \
+    ROUNDHOUSE_CONFIG=$fake_config ROUNDHOUSE_IDENTITY=$fake_identity \
+    SSH_ORIGINAL_COMMAND='' "$probe_wrapper" </dev/null >"$fixture/probe.out" 2>"$fixture/probe.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 73 ] && /usr/bin/grep -Fqx environment-probe-ok "$fixture/probe.out" &&
+    [ ! -e "$marker" ] || return 1
+
+  worker_wrapper=$fixture/worker-dispatcher
+  /usr/bin/sed \
+    "s#^  /usr/local/libexec/machine-utilities/current/scripts/machine-utilities dispatch-posix-request\$#  $installed_worker dispatch-posix-request#" \
+    "$installed_wrapper" >"$worker_wrapper"
+  /bin/chmod 0700 "$worker_wrapper"
+  [ "$(/usr/bin/grep -Fxc "  $installed_worker dispatch-posix-request" "$worker_wrapper")" -eq 1 ] || return 1
+  frame=$fixture/digest-mismatch.frame
+  {
+    printf '%s\n' 'posix-dispatch|1' 'mode|ordinary-plan' 'worker-length|1' \
+      'worker-sha256|0000000000000000000000000000000000000000000000000000000000000000' \
+      'request-length|1' \
+      'request-sha256|0000000000000000000000000000000000000000000000000000000000000000' \
+      'end-header|'
+    printf 'ab'
+  } >"$frame"
+  /bin/chmod 0600 "$frame"
+  set +e
+  PATH=$fake_bin TMPDIR=$fake_tmp HOME=$fake_home XDG_CONFIG_HOME=$fake_home \
+    ROUNDHOUSE_CONFIG=$fake_config ROUNDHOUSE_IDENTITY=$fake_identity \
+    SSH_ORIGINAL_COMMAND='' "$worker_wrapper" <"$frame" >"$fixture/worker.out" 2>"$fixture/worker.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 64 ] &&
+    /usr/bin/grep -Fq 'POSIX dispatcher length or digest mismatch' "$fixture/worker.err" &&
+    [ ! -e "$marker" ]
+}
+
+selftest_apply_repair() {
+  local root=$1 fixture_platform_name=$2 self=$3 bundle=$4 manifest=$5
+  local request=$6 ca=$7 krl=$8 label=$9 output confirmation request_digest
+  output=$root/$label.preview
+  if ! ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" preview "$bundle" "$manifest" "$request" "$ca" "$krl" >"$output"; then
+    /bin/cat "$output" >&2
+    return 1
+  fi
+  /usr/bin/grep -Fqx 'operation|repair' "$output" || return 1
+  confirmation=$(/usr/bin/awk -F '|' '$1=="owner-confirmation-sha256"{print $2}' "$output")
+  digest "$confirmation" || return 1
+  if ! ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" repair "$bundle" "$manifest" "$request" "$ca" "$krl" "$confirmation" >"$root/$label.repair"; then
+    /bin/cat "$root/$label.repair" >&2
+    return 1
+  fi
+  /usr/bin/grep -Fqx 'state|installed' "$root/$label.repair" || return 1
+  request_digest=$(sha256_file "$request")
+  ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" verify "$request_digest" >"$root/$label.verify"
+  /usr/bin/grep -Fqx 'state|ready' "$root/$label.verify"
+}
+
+selftest_run_fixture() {
+  local root=$1 fixture_platform_name=$2 self=$3 manifest bundle request ca krl output confirmation request_digest revoke_confirmation rc
+  local krl_two bad_krl request_two request_same_krl_generation same_krl_confirmation revoked_node peer_node revoked_rc peer_rc
+  local new_ca dual_ca krl_three request_dual previous_fingerprint
+  local krl_four request_early early_confirmation
+  selftest_make_native_fixture "$root" "$fixture_platform_name" || {
+    printf 'enroll-ssh-posix self-test: %s native fixture failed\n' "$fixture_platform_name" >&2; return 1;
+  }
+  selftest_stale_lock_claim "$root" || {
+    printf 'enroll-ssh-posix self-test: %s stale lock failed\n' "$fixture_platform_name" >&2; return 1;
+  }
+  if [ "$fixture_platform_name" = linux ]; then
+    ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+      /bin/bash -p -c 'source "$1" status >/dev/null; selftest_stale_lock_capture_order' bash "$self" || {
+        printf 'enroll-ssh-posix self-test: linux stale lock capture failed\n' >&2; return 1;
+      }
+  fi
+  manifest=$(selftest_make_bundle "$root" "$self") || {
+    printf 'enroll-ssh-posix self-test: %s bundle failed\n' "$fixture_platform_name" >&2; return 1;
+  }
+  bundle=$root/var/lib/machine-utilities-bootstrap/staged/$manifest
+  /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$root/input/fleet-ca"
+  ca=$root/input/fleet-ca.pub
+  krl=$root/input/revoked.krl
+  /usr/bin/ssh-keygen -k -f "$krl" /dev/null >/dev/null 2>&1
+  /bin/chmod 0600 "$ca" "$krl"
+  request=$root/input/request
+  selftest_make_request "$root" "$fixture_platform_name" "$manifest" "$ca" "$krl" "$request"
+  if [ "$fixture_platform_name" = linux ]; then selftest_sshd_scope "$root" "$(/usr/bin/id -un)" || {
+    printf 'enroll-ssh-posix self-test: linux sshd scope failed\n' >&2; return 1;
+  }; fi
+  selftest_make_effective "$root" "$(/usr/bin/id -un)"
+  output=$root/preview.out
+  if ! ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" preview "$bundle" "$manifest" "$request" "$ca" "$krl" >"$output"; then
+    /bin/cat "$output" >&2
+    return 1
+  fi
+  /usr/bin/grep -Fqx 'state|candidate' "$output" && /usr/bin/grep -Fqx 'activation|false' "$output" &&
+    /usr/bin/grep -Fqx 'controller-trust|not-activated' "$output" || return 1
+  confirmation=$(/usr/bin/awk -F '|' '$1=="owner-confirmation-sha256"{print $2}' "$output")
+  digest "$confirmation" || return 1
+  /bin/ln "$request" "$root/input/request-hardlink"
+  if ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" preview "$bundle" "$manifest" "$request" "$ca" "$krl" >/dev/null 2>&1; then return 1; fi
+  /bin/rm -f "$root/input/request-hardlink"
+  /bin/ln -s "$request" "$root/input/request-symlink"
+  if ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" preview "$bundle" "$manifest" "$root/input/request-symlink" "$ca" "$krl" >/dev/null 2>&1; then return 1; fi
+  /bin/rm -f "$root/input/request-symlink"
+  /bin/chmod 0777 "$root/input"
+  if ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" preview "$bundle" "$manifest" "$request" "$ca" "$krl" >/dev/null 2>&1; then return 1; fi
+  /bin/chmod 0700 "$root/input"
+  if SSH_ORIGINAL_COMMAND=status ROUNDHOUSE_U6_FIXTURE_ROOT="$root" \
+    ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" "$self" install >/dev/null 2>&1; then return 1; fi
+  if ! ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    ROUNDHOUSE_U6_FAILPOINT=power-loss-after-policy-activation \
+    "$self" install "$bundle" "$manifest" "$request" "$ca" "$krl" "$confirmation" >"$root/kill.out" 2>&1; then
+    /bin/cat "$root/kill.out" >&2
+    return 1
+  fi
+  /usr/bin/grep -Fqx 'state|fixture' "$root/kill.out" || return 1
+  if ! ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" install "$bundle" "$manifest" "$request" "$ca" "$krl" "$confirmation" >"$root/install.out"; then
+    /bin/cat "$root/install.out" >&2
+    return 1
+  fi
+  /usr/bin/grep -Fqx 'state|installed' "$root/install.out" || return 1
+  request_digest=$(sha256_file "$request")
+  ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" verify "$request_digest" >"$root/verify.out"
+  /usr/bin/grep -Fqx 'state|ready' "$root/verify.out" || return 1
+  selftest_dispatcher_hostile_environment "$root"
+
+  revoked_node=$root/input/revoked-node
+  peer_node=$root/input/peer-node
+  /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$revoked_node"
+  /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$peer_node"
+  krl_two=$root/input/revoked-2.krl
+  /usr/bin/ssh-keygen -k -f "$krl_two" "$revoked_node.pub" >/dev/null 2>&1
+  /bin/chmod 0600 "$revoked_node.pub" "$peer_node.pub" "$krl_two"
+  set +e
+  /usr/bin/ssh-keygen -Q -f "$krl_two" "$revoked_node.pub" >/dev/null 2>&1; revoked_rc=$?
+  /usr/bin/ssh-keygen -Q -f "$krl_two" "$peer_node.pub" >/dev/null 2>&1; peer_rc=$?
+  set -e
+  [ "$revoked_rc" -eq 1 ] && [ "$peer_rc" -eq 0 ] || return 1
+  request_same_krl_generation=$root/input/request-krl-same-generation
+  selftest_make_request "$root" "$fixture_platform_name" "$manifest" "$ca" "$krl_two" "$request_same_krl_generation" \
+    1 - 0 single 1 canary-proven fleet-canary-proven
+  ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" preview "$bundle" "$manifest" "$request_same_krl_generation" "$ca" "$krl_two" >"$root/krl-same-generation.preview"
+  same_krl_confirmation=$(/usr/bin/awk -F '|' '$1=="owner-confirmation-sha256"{print $2}' "$root/krl-same-generation.preview")
+  digest "$same_krl_confirmation" || return 1
+  if ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" repair "$bundle" "$manifest" "$request_same_krl_generation" "$ca" "$krl_two" "$same_krl_confirmation" \
+      >"$root/krl-same-generation.repair" 2>&1; then return 1; fi
+  /usr/bin/grep -Fqx 'reason|non_monotonic_rotation_or_krl' "$root/krl-same-generation.repair" || return 1
+  ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" verify "$request_digest" >"$root/krl-same-generation.verify"
+  /usr/bin/grep -Fqx 'state|ready' "$root/krl-same-generation.verify" || return 1
+  request_two=$root/input/request-krl-2
+  selftest_make_request "$root" "$fixture_platform_name" "$manifest" "$ca" "$krl_two" "$request_two" \
+    1 - 0 single 2 canary-proven fleet-canary-proven
+  bad_krl=$root/input/revoked-2-corrupt.krl
+  /bin/cp "$krl_two" "$bad_krl"
+  printf 'corrupt\n' >>"$bad_krl"
+  /bin/chmod 0600 "$bad_krl"
+  if ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" preview "$bundle" "$manifest" "$request_two" "$ca" "$bad_krl" >/dev/null 2>&1; then return 1; fi
+  selftest_apply_repair "$root" "$fixture_platform_name" "$self" "$bundle" "$manifest" \
+    "$request_two" "$ca" "$krl_two" krl-2
+
+  new_ca=$root/input/fleet-ca-2
+  /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$new_ca"
+  dual_ca=$root/input/fleet-ca-dual.pub
+  /bin/cat "$new_ca.pub" "$ca" >"$dual_ca"
+  krl_three=$root/input/revoked-3.krl
+  /bin/cp "$krl_two" "$krl_three"
+  /bin/chmod 0600 "$new_ca.pub" "$dual_ca" "$krl_three"
+  previous_fingerprint=$(/usr/bin/ssh-keygen -lf "$ca" -E sha256 | /usr/bin/awk 'NR==1{print $2}')
+  fingerprint "$previous_fingerprint" || return 1
+  request_dual=$root/input/request-ca-dual
+  selftest_make_request "$root" "$fixture_platform_name" "$manifest" "$dual_ca" "$krl_three" "$request_dual" \
+    2 "$previous_fingerprint" 1 dual 3 canary-proven dual-staged
+  selftest_apply_repair "$root" "$fixture_platform_name" "$self" "$bundle" "$manifest" \
+    "$request_dual" "$dual_ca" "$krl_three" ca-dual
+  request_digest=$(sha256_file "$request_dual")
+
+  krl_four=$root/input/revoked-4.krl
+  /bin/cp "$krl_three" "$krl_four"
+  /bin/chmod 0600 "$krl_four"
+  request_early=$root/input/request-ca-remove-early
+  selftest_make_request "$root" "$fixture_platform_name" "$manifest" "$new_ca.pub" "$krl_four" "$request_early" \
+    2 - 0 single 4 canary-proven fleet-canary-proven
+  ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" preview "$bundle" "$manifest" "$request_early" "$new_ca.pub" "$krl_four" >"$root/ca-remove-early.preview"
+  early_confirmation=$(/usr/bin/awk -F '|' '$1=="owner-confirmation-sha256"{print $2}' "$root/ca-remove-early.preview")
+  digest "$early_confirmation" || return 1
+  if ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" repair "$bundle" "$manifest" "$request_early" "$new_ca.pub" "$krl_four" "$early_confirmation" \
+      >"$root/ca-remove-early.repair" 2>&1; then return 1; fi
+  /usr/bin/grep -Fqx 'reason|non_monotonic_rotation_or_krl' "$root/ca-remove-early.repair" || return 1
+  ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" verify "$request_digest" >"$root/ca-dual-after-rejected-removal.verify"
+  /usr/bin/grep -Fqx 'state|ready' "$root/ca-dual-after-rejected-removal.verify" || return 1
+
+  ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" preview-revoke "$request_digest" >"$root/revoke-preview.out"
+  revoke_confirmation=$(/usr/bin/awk -F '|' '$1=="owner-confirmation-sha256"{print $2}' "$root/revoke-preview.out")
+  digest "$revoke_confirmation" || return 1
+  if ! ROUNDHOUSE_U6_FIXTURE_ROOT="$root" ROUNDHOUSE_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
+    "$self" revoke "$request_digest" "$revoke_confirmation" >"$root/revoke.out"; then
+    /bin/cat "$root/revoke.out" >&2
+    return 1
+  fi
+  /usr/bin/grep -Fqx 'state|revoked' "$root/revoke.out" &&
+    [ ! -e "$root/usr/local/libexec/machine-utilities/posix-dispatcher" ] &&
+    [ ! -e "$root/etc/ssh/sshd_config.d/10-machine-utilities-transport.conf" ] &&
+    [ ! -L "$root/etc/machine-utilities/ssh/active" ] || return 1
+}
+
+self_test() {
+  local self raw_root linux_root macos_root wsl_root
+  [ "${ROUNDHOUSE_U6_SELFTEST_TRACE:-}" != 1 ] || set -x
+  self=$(canonical_script_path "$0") || return 1
+  SSH_CONNECTION=''
+  SSH_CLIENT=''
+  SSH_TTY=''
+  SSH_ORIGINAL_COMMAND=''
+  export SSH_CONNECTION SSH_CLIENT SSH_TTY SSH_ORIGINAL_COMMAND
+  raw_root=$(/usr/bin/mktemp -d /tmp/machine-utilities-u6-selftest.XXXXXX) || return 1
+  selftest_root=$(CDPATH='' cd "$raw_root" && /bin/pwd -P) || return 1
+  printf 'machine-utilities-u6-selftest\n' >"$selftest_root/.u6-selftest-root"
+  /bin/chmod 0700 "$selftest_root"; /bin/chmod 0600 "$selftest_root/.u6-selftest-root"
+  trap 'selftest_cleanup' EXIT HUP INT TERM
+  linux_root=$selftest_root/linux; macos_root=$selftest_root/macos; wsl_root=$selftest_root/wsl
+  /bin/mkdir "$linux_root" "$macos_root" "$wsl_root"
+  /bin/chmod 0700 "$linux_root" "$macos_root" "$wsl_root"
+  selftest_run_fixture "$linux_root" linux "$self"
+  selftest_run_fixture "$macos_root" macos "$self"
+  ROUNDHOUSE_U6_FIXTURE_ROOT="$wsl_root" ROUNDHOUSE_U6_FIXTURE_PLATFORM=wsl \
+    "$self" status >"$selftest_root/wsl.out" 2>/dev/null || [ "$?" -eq 69 ]
+  /usr/bin/grep -Fqx 'reason|unsupported_security_boundary' "$selftest_root/wsl.out" &&
+    ! /usr/bin/find "$wsl_root" -mindepth 1 -print | /usr/bin/grep -q . || return 1
+  trap - EXIT HUP INT TERM
+  selftest_cleanup
+  selftest_root=
+  printf 'enroll-ssh-posix self-test: ok\n'
+}
+
+status_command() {
+  if [ -e "$drain_path" ] || [ -L "$drain_path" ]; then
+    protected_file "$drain_path" 1024 || { emit_status drifted invalid_drain "$platform"; return 74; }
+    emit_status draining lifecycle_in_progress "$platform"
+    return 75
+  fi
+  if [ -L "$active_link" ]; then
+    load_active_request && validate_active_enrollment "$request_sha256" || {
+      emit_status drifted enrollment_validation_failed "$platform"; return 74;
+    }
+    emit_status ready transport_ready_local "$platform"
+  elif [ -e "$state_record" ] && protected_file "$state_record" 8192 &&
+    /usr/bin/grep -Fq 'revoked|1|' "$state_record"; then
+    emit_status revoked managed_transport_removed "$platform"
+  elif [ -e "$active_link" ] || [ -L "$current_release" ] || [ -e "$dispatcher_path" ] || [ -e "$dropin_path" ]; then
+    emit_status drifted partial_enrollment_artifacts "$platform"
+    return 74
+  else
+    emit_status needs_human_enrollment no_managed_transport "$platform"
+  fi
+}
+
+preview_command() {
+  local operation=install
+  [ "$#" -eq 5 ] || usage
+  preview_inputs "$1" "$2" "$3" "$4" "$5" || {
+    emit_status rejected candidate_validation_failed "$platform"; return 65;
+  }
+  [ -L "$active_link" ] && operation=repair
+  emit_candidate_receipt "$operation"
+}
+
+preview_revoke_command() {
+  [ "$#" -eq 1 ] && digest "$1" || usage
+  load_active_request "$1" && validate_active_enrollment "$1" || {
+    emit_status rejected enrollment_not_found_or_drifted "$platform"; return 65;
+  }
+  emit_candidate_receipt revoke
+}
+
+verify_command() {
+  [ "$#" -eq 1 ] && digest "$1" || usage
+  load_active_request "$1" && validate_active_enrollment "$1" || {
+    emit_status drifted enrollment_validation_failed "$platform"; return 74;
+  }
+  [ ! -e "$drain_path" ] && [ ! -L "$drain_path" ] || {
+    emit_status draining lifecycle_in_progress "$platform"; return 75;
+  }
+  emit_status ready transport_ready_local "$platform"
+}
+
+case $command in
+  status) [ "$#" -eq 0 ] || usage; status_command ;;
+  preview) preview_command "$@" ;;
+  preview-revoke) preview_revoke_command "$@" ;;
+  install) [ "$#" -eq 6 ] || usage; install_transaction install "$@" ;;
+  repair) [ "$#" -eq 6 ] || usage; install_transaction repair "$@" ;;
+  verify) verify_command "$@" ;;
+  revoke) [ "$#" -eq 2 ] || usage; revoke_transaction "$@" ;;
+  self-test) [ "$#" -eq 0 ] || usage; self_test ;;
+  *) usage ;;
+esac

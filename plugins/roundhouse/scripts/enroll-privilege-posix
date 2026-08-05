@@ -1,0 +1,3120 @@
+#!/bin/bash
+set -euo pipefail
+
+umask 077
+export LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin
+unset APT_CONFIG BASH_ENV CDPATH ENV GLOBIGNORE \
+  http_proxy https_proxy ftp_proxy all_proxy no_proxy \
+  HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
+
+usage() {
+  printf '%s\n' 'usage: enroll-privilege-posix status|preview|install|revoke' >&2
+  exit 64
+}
+
+result() {
+  printf 'enrollment|1\nstate|%s\nreason|%s\nplatform-boundary|%s\n' \
+    "$1" "$2" "${platform_boundary:-$3}"
+}
+
+fixture_root=${ROUNDHOUSE_U2_FIXTURE_ROOT:-}
+if [ -n "$fixture_root" ]; then
+  case $fixture_root in /*) ;; *) result rejected fixture_root_not_absolute fixture; exit 64 ;; esac
+  case /$fixture_root/ in */../*|*/./*) result rejected fixture_root_not_canonical fixture; exit 64 ;; esac
+  [ "$fixture_root" != / ] || { result rejected fixture_root_not_canonical fixture; exit 64; }
+  [ "$(/usr/bin/id -u)" -ne 0 ] || { result rejected fixture_mode_refuses_root fixture; exit 64; }
+  root_prefix=${fixture_root%/}
+  protected_owner=$(/usr/bin/id -un)
+  case ${ROUNDHOUSE_U2_FIXTURE_PLATFORM:-linux} in
+    linux) platform=linux ;;
+    macos) platform=Darwin ;;
+    *) result rejected fixture_platform_invalid fixture; exit 64 ;;
+  esac
+  fixture_mode=true
+else
+  root_prefix=
+  protected_owner=root
+  fixture_mode=false
+  platform=$(/usr/bin/uname -s)
+  if [ "$platform" = Linux ] && [ -r /proc/sys/kernel/osrelease ] &&
+    /usr/bin/grep -Eiq '(microsoft|wsl)' /proc/sys/kernel/osrelease; then
+    platform=wsl
+  fi
+fi
+
+case $platform in
+  Darwin)
+    platform_boundary=macos
+    required_context=macos-root-v1
+    protected_group=wheel
+    ;;
+  wsl)
+    result unsupported unsupported_security_boundary wsl
+    exit 69
+    ;;
+  Linux|linux)
+    platform_boundary=linux
+    required_context=posix-root-v1
+    protected_group=root
+    ;;
+  *) result unsupported unsupported_platform unknown; exit 69 ;;
+esac
+readonly protected_group
+
+[ "$fixture_mode" = true ] || [ "$(/usr/bin/id -u)" -eq 0 ] || {
+  result needs_human_enrollment authenticated_bootstrap_required "$platform_boundary"
+  exit 77
+}
+
+readonly config_root=$root_prefix/etc/machine-utilities
+readonly state_root=$root_prefix/var/lib/machine-utilities
+if [ "$platform_boundary" = macos ]; then
+  readonly broker_system_path=/usr/local/libexec/machine-utilities/posix-broker
+else
+  readonly broker_system_path=/usr/libexec/machine-utilities/posix-broker
+fi
+readonly broker_path=$root_prefix$broker_system_path
+readonly sudoers_path=$root_prefix/etc/sudoers.d/machine-utilities-posix-broker
+readonly bootstrap_root=$root_prefix/var/lib/machine-utilities-bootstrap
+readonly ssh_keygen=/usr/bin/ssh-keygen
+readonly revocation_reserve_bytes=1048576
+readonly revocation_reserve_provision_bytes=4194304
+readonly revocation_reserve=$state_root/revocation.reserve
+readonly command=${1:-}
+shift || true
+
+render_sudoers_policy() {
+  printf '%s ALL=(root) NOPASSWD:NOSETENV: %s ""\n' "$request_user" "$broker_system_path"
+  if [ "$platform_boundary" = macos ]; then
+    printf '%s ALL=(root) NOPASSWD:NOSETENV: %s --homebrew-bridge-v1 *\n' \
+      "$request_user" "$broker_system_path"
+  fi
+}
+
+portable_stat() {
+  case $(/usr/bin/uname -s) in
+    Darwin) /usr/bin/stat -f "$1" "$3" 2>/dev/null ;;
+    Linux) /usr/bin/stat -c "$2" "$3" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+file_owner() { portable_stat %Su %U "$1"; }
+file_mode() { portable_stat %Lp %a "$1"; }
+file_size() { portable_stat %z %s "$1"; }
+file_blocks() { portable_stat %b %b "$1"; }
+
+capture_current_process_id() {
+  local destination=$1 observed pid_file
+  if [ -n "${BASHPID:-}" ]; then
+    observed=$BASHPID
+  else
+    # Bash 3 keeps $$ bound to the top-level shell even inside a `( ... )`
+    # function body. A directly spawned child observes the actual calling
+    # shell as its PPID. The probe uses only the native system shell and a
+    # protected, single-use file; this is the production path for macOS Bash 3.
+    pid_file=$(/usr/bin/mktemp "$root_prefix/var/lib/.machine-utilities-pid.XXXXXX") || return 1
+    /bin/chmod 0600 "$pid_file" || { /bin/rm -f "$pid_file"; return 1; }
+    protected_file "$pid_file" 128 && exact_mode "$pid_file" 600 || {
+      /bin/rm -f "$pid_file"
+      return 1
+    }
+    if ! /bin/sh -c 'printf "%s\n" "$PPID"' >"$pid_file"; then
+      /bin/rm -f "$pid_file"
+      return 1
+    fi
+    IFS= read -r observed <"$pid_file" || {
+      /bin/rm -f "$pid_file"
+      return 1
+    }
+    /bin/rm -f "$pid_file" || return 1
+  fi
+  [[ $observed =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  printf -v "$destination" '%s' "$observed"
+}
+
+sha256_file() {
+  if [ -x /usr/bin/sha256sum ]; then
+    /usr/bin/sha256sum "$1" | /usr/bin/awk '{print tolower($1)}'
+  else
+    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print tolower($1)}'
+  fi
+}
+
+sha256_stream() {
+  if [ -x /usr/bin/sha256sum ]; then
+    /usr/bin/sha256sum | /usr/bin/awk '{print tolower($1)}'
+  else
+    /usr/bin/shasum -a 256 | /usr/bin/awk '{print tolower($1)}'
+  fi
+}
+
+safe_permissions() {
+  mode=$(file_mode "$1") || return 1
+  permissions=$(printf '%s' "$mode" | /usr/bin/sed 's/.*\(...\)$/\1/')
+  [ "${#permissions}" -eq 3 ] || return 1
+  case $(printf '%s' "$permissions" | /usr/bin/cut -c 2-3) in *2*|*3*|*6*|*7*) return 1 ;; esac
+}
+
+protected_directory() {
+  if [ -d "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$protected_owner" ] &&
+    safe_permissions "$1"; then
+    return 0
+  fi
+  [ "$fixture_mode" = false ] && [ "$platform_boundary" = macos ] && [ -L "$1" ] || return 1
+  [ "$(file_owner "$1")" = root ] && safe_permissions "$1" && protected_directory /private || return 1
+  case $1 in
+    /etc) [ "$(/usr/bin/readlink /etc)" = private/etc ] && protected_directory /private/etc ;;
+    /var) [ "$(/usr/bin/readlink /var)" = private/var ] && protected_directory /private/var ;;
+    *) return 1 ;;
+  esac
+}
+
+protected_file() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$protected_owner" ] &&
+    safe_permissions "$1" && [ "$(file_size "$1")" -le "$2" ]
+}
+
+system_ssh_keygen_digest() {
+  local ancestor
+  for ancestor in /usr /usr/bin; do
+    [ -d "$ancestor" ] && [ ! -L "$ancestor" ] && [ "$(file_owner "$ancestor")" = root ] &&
+      safe_permissions "$ancestor" || return 1
+  done
+  [ -f "$ssh_keygen" ] && [ ! -L "$ssh_keygen" ] && [ -x "$ssh_keygen" ] &&
+    [ "$(file_owner "$ssh_keygen")" = root ] && safe_permissions "$ssh_keygen" &&
+    [ "$(file_size "$ssh_keygen")" -le 33554432 ] || return 1
+  sha256_file "$ssh_keygen"
+}
+
+revocation_reserve_file_valid() {
+  local candidate=$1 observed_size observed_blocks
+  protected_file "$candidate" "$revocation_reserve_provision_bytes" &&
+    exact_mode "$candidate" 600 || return 1
+  observed_size=$(file_size "$candidate") || return 1
+  observed_blocks=$(file_blocks "$candidate") || return 1
+  [[ $observed_blocks =~ ^[0-9]{1,8}$ ]] || return 1
+  [ "$observed_size" -ge "$revocation_reserve_bytes" ] &&
+    [ "$observed_size" -le "$revocation_reserve_provision_bytes" ] &&
+    [ $((observed_blocks * 512)) -ge "$revocation_reserve_bytes" ]
+}
+
+revocation_reserve_valid() {
+  revocation_reserve_file_valid "$revocation_reserve"
+}
+
+ensure_revocation_reserve() {
+  local desired_bytes=${1:-$revocation_reserve_bytes} reserve_tmp
+  if [ -e "$revocation_reserve" ] || [ -L "$revocation_reserve" ]; then
+    revocation_reserve_valid
+    return
+  fi
+  [ "$desired_bytes" -ge "$revocation_reserve_bytes" ] &&
+    [ "$desired_bytes" -le "$revocation_reserve_provision_bytes" ] &&
+    [ $((desired_bytes % 1024)) -eq 0 ] || return 1
+  reserve_tmp=$state_root/.revocation.reserve.pending
+  if [ -e "$reserve_tmp" ] || [ -L "$reserve_tmp" ]; then
+    protected_file "$reserve_tmp" "$revocation_reserve_provision_bytes" &&
+      exact_mode "$reserve_tmp" 600 || return 1
+    /bin/rm -f "$reserve_tmp" && durable_sync "$state_root" || return 1
+  fi
+  if ! /bin/dd if=/dev/zero of="$reserve_tmp" bs=1024 count=$((desired_bytes / 1024)) \
+      >/dev/null 2>&1 ||
+    ! /bin/chmod 0600 "$reserve_tmp" ||
+    { [ "$fixture_mode" = false ] && ! /usr/bin/chown root:"$protected_group" "$reserve_tmp"; } ||
+    ! durable_sync "$reserve_tmp" || ! revocation_reserve_file_valid "$reserve_tmp"; then
+    /bin/rm -f "$reserve_tmp" 2>/dev/null || true
+    durable_sync "$state_root" 2>/dev/null || true
+    return 1
+  fi
+  u2_pause revocation-reserve-prepared || {
+    /bin/rm -f "$reserve_tmp" 2>/dev/null || true
+    durable_sync "$state_root" 2>/dev/null || true
+    return 1
+  }
+  if [ -e "$revocation_reserve" ] || [ -L "$revocation_reserve" ] ||
+    ! /bin/mv "$reserve_tmp" "$revocation_reserve"; then
+    /bin/rm -f "$reserve_tmp" 2>/dev/null || true
+    durable_sync "$state_root" 2>/dev/null || true
+    return 1
+  fi
+  if ! durable_sync "$state_root" || ! revocation_reserve_valid; then
+    /bin/rm -f "$revocation_reserve" 2>/dev/null || true
+    durable_sync "$state_root" 2>/dev/null || true
+    return 1
+  fi
+}
+
+consume_revocation_reserve() {
+  revocation_reserve_valid || return 1
+  /bin/rm -f "$revocation_reserve" && durable_sync "$state_root"
+}
+
+token() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; }
+digest() { [[ $1 =~ ^[0-9a-f]{64}$ ]]; }
+
+https_source_uri() {
+  local uri=$1 authority_and_path path segment
+  [ "${#uri}" -le 1024 ] &&
+    [[ $uri =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~:@+,-]+)*$ ]] || return 1
+  authority_and_path=${uri#https://}
+  case $authority_and_path in
+    */*) path=/${authority_and_path#*/} ;;
+    *) return 0 ;;
+  esac
+  IFS='/' read -r -a uri_segments <<<"${path#/}"
+  for segment in "${uri_segments[@]}"; do [ "$segment" != . ] && [ "$segment" != .. ] || return 1; done
+}
+
+bundle=
+manifest_digest=
+epoch=
+policy_digest=
+constraints_digest=
+verify_bootstrap_bundle() {
+  bundle=$1
+  expected_manifest=${2:-}
+  case $bundle in "$bootstrap_root"/staged/*) ;; *) return 1 ;; esac
+  protected_directory "$bootstrap_root" && protected_directory "$bootstrap_root/staged" &&
+    protected_directory "$bootstrap_root/receipts" && protected_directory "$bundle" &&
+    protected_file "$bootstrap_root/release-allowed-signers" 16384 &&
+    protected_file "$bundle/bootstrap.manifest" 65536 &&
+    protected_file "$bundle/bootstrap.manifest.sig" 16384 || return 1
+  manifest_digest=$(sha256_file "$bundle/bootstrap.manifest") || return 1
+  [ "${bundle##*/}" = "$manifest_digest" ] &&
+    { [ -z "$expected_manifest" ] || [ "$expected_manifest" = "$manifest_digest" ]; } || return 1
+  receipt=$bootstrap_root/receipts/$manifest_digest
+  protected_file "$receipt" 1024 || return 1
+  [ "$(/usr/bin/sed -n '1p' "$receipt")" = \
+    "bootstrap|1|manifest-sha256=$manifest_digest|release-principal=machine-utilities-release" ] || return 1
+  system_ssh_keygen_digest >/dev/null || return 1
+  "$ssh_keygen" -Y verify -f "$bootstrap_root/release-allowed-signers" \
+    -I machine-utilities-release -n machine-utilities-release \
+    -s "$bundle/bootstrap.manifest.sig" <"$bundle/bootstrap.manifest" >/dev/null 2>&1 || return 1
+
+  previous=
+  found_broker=false
+  found_enrollment=false
+  found_policy=false
+  found_constraints=false
+  found_identity=false
+  found_context=false
+  found_apt_config=false
+  found_apt_context=false
+  found_apt_source=false
+  found_source_authority=false
+  found_release=false
+  found_release_signature=false
+  found_macos_context=false
+  macos_package_count=0
+  unexpected_platform_asset=false
+  found_ca=false
+  found_signers=false
+  found_krl=false
+  while IFS='|' read -r kind relative expected_digest; do
+    [ "$kind" = file ] && digest "$expected_digest" || return 1
+    [ "${#relative}" -le 512 ] && [[ $relative =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] &&
+      [[ /$relative/ != */../* && /$relative/ != */./* ]] || return 1
+    [ -z "$previous" ] || [[ $previous < $relative ]] || return 1
+    previous=$relative
+    candidate=$bundle/$relative
+    candidate_maximum=33554432
+    case $relative in macos/packages/*.pkg) candidate_maximum=2147483647 ;; esac
+    protected_file "$candidate" "$candidate_maximum" &&
+      [ "$(sha256_file "$candidate")" = "$expected_digest" ] || return 1
+    case $platform_boundary:$relative in
+      macos:apt.conf|macos:apt.context|macos:apt/*|linux:macos.context|linux:macos/*)
+        unexpected_platform_asset=true
+        ;;
+    esac
+    case $relative in
+      privilege-broker-posix) found_broker=true ;;
+      enroll-privilege-posix) found_enrollment=true ;;
+      policy.actions) found_policy=true ;;
+      policy.constraints) found_constraints=true ;;
+      host.identity) found_identity=true ;;
+      context.canary) found_context=true ;;
+      apt.conf) found_apt_config=true ;;
+      apt.context) found_apt_context=true ;;
+      apt/sources.list.d/roundhouse.sources) found_apt_source=true ;;
+      apt/source-authority) found_source_authority=true ;;
+      apt/metadata/Release) found_release=true ;;
+      apt/metadata/Release.gpg) found_release_signature=true ;;
+      macos.context) found_macos_context=true ;;
+      macos/packages/*.pkg) macos_package_count=$((macos_package_count + 1)) ;;
+      fleet-ca.pub) found_ca=true ;;
+      allowed_signers) found_signers=true ;;
+      revoked.krl) found_krl=true ;;
+    esac
+  done <"$bundle/bootstrap.manifest"
+  [ "$unexpected_platform_asset" = false ] &&
+    [ "$found_broker" = true ] && [ "$found_enrollment" = true ] &&
+    [ "$found_policy" = true ] && [ "$found_constraints" = true ] &&
+    [ "$found_identity" = true ] && [ "$found_context" = true ] && [ "$found_ca" = true ] &&
+    [ "$found_signers" = true ] && [ "$found_krl" = true ] || return 1
+  case $platform_boundary in
+    linux)
+      [ "$found_apt_config" = true ] && [ "$found_apt_context" = true ] &&
+        [ "$found_apt_source" = true ] && [ "$found_source_authority" = true ] &&
+        [ "$found_release" = true ] && [ "$found_release_signature" = true ] &&
+        [ "$found_macos_context" = false ] && [ "$macos_package_count" -eq 0 ] || return 1
+      ;;
+    macos)
+      [ "$found_macos_context" = true ] && [ "$found_apt_config" = false ] &&
+        [ "$found_apt_context" = false ] && [ "$found_apt_source" = false ] &&
+        [ "$found_source_authority" = false ] && [ "$found_release" = false ] &&
+        [ "$found_release_signature" = false ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  if [ "$fixture_mode" = false ]; then
+    [ "$0" = "$bundle/enroll-privilege-posix" ] || return 1
+  fi
+
+  policy_digest=$(sha256_file "$bundle/policy.actions")
+  constraints_digest=$(sha256_file "$bundle/policy.constraints")
+  epoch=$(/usr/bin/sed -n '1s/^constraints|1|generation=\([^|]*\)|policy-sha256=\([^|]*\)$/\1/p' \
+    "$bundle/policy.constraints")
+  bound_policy=$(/usr/bin/sed -n '1s/^constraints|1|generation=\([^|]*\)|policy-sha256=\([^|]*\)$/\2/p' \
+    "$bundle/policy.constraints")
+  [[ $epoch =~ ^[1-9][0-9]{0,9}$ ]] && [ "$bound_policy" = "$policy_digest" ] || return 1
+
+  /usr/bin/awk -F '|' '
+    BEGIN {
+      expected["apt.autoremove.v1"]="posix-root-v1|none"
+      expected["apt.install-package-version.v1"]="posix-root-v1|package-source-version-closure-set-sha256"
+      expected["apt.update-metadata.v1"]="posix-root-v1|none"
+      expected["apt.upgrade-package.v1"]="posix-root-v1|package-source-channel-set-sha256"
+      expected["macos.apply-system-setting.v1"]="macos-root-v1|macos-system-setting-sha256"
+      expected["macos.install-signed-pkg.v1"]="macos-root-v1|macos-signed-pkg-sha256"
+      expected["profile.apply-managed-bundle.v1"]="windows-user-s4u-v1|profile-bundle-set-sha256"
+      expected["profile.inventory-managed-state.v1"]="windows-user-s4u-v1|profile-bundle-set-sha256"
+      expected["winget.install-machine-package.v1"]="windows-system-v1|winget-package-version-set-sha256"
+      expected["winget.inventory-machine.v1"]="windows-system-v1|none"
+      expected["winget.upgrade-machine-package.v1"]="windows-system-v1|winget-package-channel-set-sha256"
+    }
+    $0!~/^[ -~]+$/{exit 1}
+    NR==1{if($0!="policy|1|catalog=1")exit 1;next}
+    {if(NF!=6||$1!="action"||!($2 in expected)||seen[$2]++||($3"|"$5)!=expected[$2]||
+       ($4!="enabled"&&$4!="disabled")||($5=="none"?$6!="-":($6!="-"&&(length($6)!=64||$6!~/^[0-9a-f]+$/)))||
+       (previous!=""&&previous>=$2))exit 1;previous=$2}
+    END{if(NR!=12)exit 1;for(id in expected)if(!seen[id])exit 1}
+  ' "$bundle/policy.actions" || return 1
+
+  /usr/bin/awk -F '|' -v policy_digest="$policy_digest" '
+    function token(v){return v~/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/}
+    function atom(v){return v~/^[A-Za-z0-9][A-Za-z0-9._:+@,-]{0,255}$/}
+    function package_id(v){return v~/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/}
+    function digest(v){return length(v)==64&&v~/^[0-9a-f]+$/}
+    function version(v){return v~/^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$/}
+    function uint(v){return v~/^(0|[1-9][0-9]*)$/&&(v+0)<=2147483647}
+    function team_id(v){return v~/^[A-Z0-9]{10}$/}
+    function app_name(v){return length(v)<=128&&v~/^[A-Za-z0-9][A-Za-z0-9._+() -]*[.]app$/&&v!~/[.][.]/}
+    function setting_value(id,v) {
+      if(id=="timezone")return v~/^[A-Za-z0-9._+-]+(\/[A-Za-z0-9._+-]+){0,2}$/&&length(v)<=255
+      if(id=="network-time-server")return v~/^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/&&v!~/\.\./
+      if(id=="wake-on-network-access"||id=="restart-after-power-failure")return v=="on"||v=="off"
+      if(id=="computer-sleep"||id=="display-sleep")return v=="Never"||(v~/^[1-9][0-9]{0,2}$/&&(v+0)<=180)
+      return 0
+    }
+    $0!~/^[ -~]+$/||length($0)>2048{exit 1}
+    NR==1{if(NF!=4||$1!="constraints"||$2!="1"||$3!~/^generation=[1-9][0-9]{0,9}$/||
+      $4!="policy-sha256="policy_digest)exit 1;next}
+    {if(previous!=""&&previous>=$0)exit 1;previous=$0;
+      membership_action=($1=="profile"?"profile":$2);membership_token=($1=="profile"?$2:$3);
+      if(seen[membership_action SUBSEP membership_token]++)exit 1}
+    $1=="apt-install"{if(NF!=8||$2!="apt.install-package-version.v1"||!token($3)||!atom($4)||
+      !atom($5)||!version($6)||!digest($7)||!digest($8))exit 1;next}
+    $1=="apt-upgrade"{if(NF!=9||$2!="apt.upgrade-package.v1"||!token($3)||!atom($4)||
+      !atom($5)||!version($6)||!version($7)||!uint($8)||!digest($9))exit 1;next}
+    $1=="macos-pkg"{if(NF!=12||$2!="macos.install-signed-pkg.v1"||!token($3)||
+      ($4!="script-free"&&$4!="sealed-cask-payload-v1")||!uint($5)||$5=="0"||
+      !digest($6)||!package_id($7)||!version($8)||!team_id($9)||!digest($10)||
+      !package_id($11)||!version($12))exit 1;next}
+    $1=="macos-cask-app"{if(NF!=4||$2!="macos.install-signed-pkg.v1"||!token($3)||
+      !app_name($4))exit 1;next}
+    $1=="macos-setting"{if(NF!=5||$2!="macos.apply-system-setting.v1"||!token($3)||
+      !setting_value($4,$5))exit 1;next}
+    $1=="profile"{if(NF!=9||!token($2)||$3!~/^S-[0-9]+(-[0-9]+){1,14}$/||!atom($4)||
+      !digest($5)||!digest($6)||($7!="managed-only"&&$7!="managed-and-prune")||
+      !uint($8)||$8=="0"||!uint($9)||$9=="0")exit 1;next}
+    $1=="winget-install"{if(NF!=14||$2!="winget.install-machine-package.v1"||!token($3)||
+      !atom($4)||!atom($5)||!atom($6)||!digest($7)||$8!="machine"||!atom($9)||!atom($10)||
+      !atom($11)||!version($12)||$13!="provider-enforced-manifest-hash"||
+      $14!="source-delegated-all")exit 1;next}
+    $1=="winget-upgrade"{if(NF!=16||$2!="winget.upgrade-machine-package.v1"||!token($3)||
+      !atom($4)||!atom($5)||!atom($6)||!digest($7)||$8!="machine"||!atom($9)||!atom($10)||
+      !atom($11)||!version($12)||!version($13)||!uint($14)||
+      $15!="provider-enforced-manifest-hash"||$16!="source-delegated-all")exit 1;next}
+    {exit 1}
+  ' "$bundle/policy.constraints" || return 1
+  if [ "$platform_boundary" = macos ]; then
+    constraint_package_count=0
+    while IFS='|' read -r kind _ policy_token payload_mode package_size package_digest _ _ _ _ _ _ extra; do
+      [ "$kind" = macos-pkg ] || continue
+      case $payload_mode in script-free|sealed-cask-payload-v1) ;; *) return 1 ;; esac
+      [ -z "$extra" ] || return 1
+      package_path=$bundle/macos/packages/$policy_token.pkg
+      protected_file "$package_path" 2147483647 &&
+        [ "$(file_size "$package_path")" = "$package_size" ] &&
+        [ "$(sha256_file "$package_path")" = "$package_digest" ] &&
+        [ "$(manifest_file_digest "macos/packages/$policy_token.pkg")" = "$package_digest" ] || return 1
+      constraint_package_count=$((constraint_package_count + 1))
+    done <"$bundle/policy.constraints"
+    [ "$constraint_package_count" -eq "$macos_package_count" ] || return 1
+  fi
+}
+
+manifest_file_digest() {
+  /usr/bin/awk -F '|' -v relative="$1" '$1=="file"&&$2==relative{print $3;exit}' \
+    "$bundle/bootstrap.manifest"
+}
+
+copy_manifest_file() {
+  relative=$1
+  destination=$2
+  maximum=33554432
+  case $relative in macos/packages/*.pkg) maximum=2147483647 ;; esac
+  expected=$(manifest_file_digest "$relative")
+  digest "$expected" || return 1
+  source_path=$bundle/$relative
+  protected_file "$source_path" "$maximum" || return 1
+  exec 3<"$source_path" || return 1
+  /bin/cat <&3 >"$destination" || { exec 3<&-; return 1; }
+  exec 3<&-
+  [ "$(sha256_file "$destination")" = "$expected" ] || return 1
+  /bin/chmod 0644 "$destination"
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$destination"; fi
+}
+
+exact_mode() {
+  local observed
+  observed=$(file_mode "$1") || return 1
+  observed=$(printf '%s' "$observed" | /usr/bin/sed 's/.*\(...\)$/\1/')
+  [ "$observed" = "$2" ]
+}
+
+symlink_owner() {
+  /usr/bin/stat -f %Su "$1" 2>/dev/null || /usr/bin/stat -c %U "$1" 2>/dev/null
+}
+
+durable_sync() {
+  if [ -x /usr/bin/sync ]; then /usr/bin/sync
+  else /bin/sync
+  fi
+}
+
+durable_replace() {
+  local temporary=$1 destination=$2 mode=$3
+  /bin/chmod "$mode" "$temporary" || return 1
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$temporary" || return 1; fi
+  durable_sync || return 1
+  /bin/mv -f "$temporary" "$destination" || return 1
+  durable_sync
+}
+
+boot_identity() {
+  local observed
+  if [ -r /proc/sys/kernel/random/boot_id ]; then
+    observed=$(/usr/bin/sed -n '1p' /proc/sys/kernel/random/boot_id) || return 1
+  else
+    observed=$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null) || return 1
+  fi
+  printf '%s\n' "$observed" | sha256_stream
+}
+
+process_start_identity() {
+  local pid=$1 observed
+  [[ $pid =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  if [ -r "/proc/$pid/stat" ]; then
+    # comm is parenthesized and may itself contain whitespace or ')'. Strip
+    # through the final ") " delimiter; starttime (field 22) is then tail
+    # field 20. Raw awk field 22 is not PID-reuse-safe for such names.
+    observed=$(/usr/bin/sed 's/^.*) //' "/proc/$pid/stat" | /usr/bin/awk '{print $20}') || return 1
+    [[ $observed =~ ^[0-9]+$ ]] || return 1
+  else
+    observed=$(/bin/ps -o lstart= -p "$pid" 2>/dev/null) || return 1
+  fi
+  [ -n "$observed" ] || return 1
+  printf '%s\n' "$observed" | sha256_stream
+}
+
+process_identity_live() {
+  local pid=$1 expected_start=$2 observed_start
+  /bin/kill -0 "$pid" 2>/dev/null || return 1
+  observed_start=$(process_start_identity "$pid") || return 1
+  [ "$observed_start" = "$expected_start" ]
+}
+
+validate_host_and_context() {
+  IFS='|' read -r identity_type identity_version host_id enrolled_uid request_user \
+    fleet_domain ca_fingerprint ca_generation host_fingerprint endpoint_principals identity_extra \
+    <"$bundle/host.identity" || return 1
+  [ "$identity_type" = identity ] && [ "$identity_version" = 1 ] && [ -z "$identity_extra" ] &&
+    token "$host_id" && [[ $enrolled_uid =~ ^[1-9][0-9]{0,9}$ ]] && token "$request_user" &&
+    [[ $fleet_domain =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$ ]] &&
+    [[ $ca_fingerprint =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] &&
+    [[ $ca_generation =~ ^[1-9][0-9]{0,9}$ ]] &&
+    [[ $host_fingerprint =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] &&
+    [ "$endpoint_principals" = machine-utilities-posix,machine-utilities-windows ] || return 1
+  [ "$(/usr/bin/wc -l <"$bundle/host.identity" | /usr/bin/tr -d ' ')" = 1 ] || return 1
+  [ "$(/usr/bin/sed -n '1p' "$bundle/context.canary")" = \
+    "context|1|platform=$platform_boundary|required=$required_context|principal=root|console-session=none" ] &&
+    [ "$(/usr/bin/wc -l <"$bundle/context.canary" | /usr/bin/tr -d ' ')" = 1 ] || return 1
+  if [ "$fixture_mode" = false ]; then
+    observed_uid=$(/usr/bin/id -u "$request_user" 2>/dev/null) || return 1
+    [ "$observed_uid" = "$enrolled_uid" ] || return 1
+  fi
+}
+
+validate_protected_ancestors() {
+  local candidate=$1 ancestor
+  case $candidate in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  if [ -n "$root_prefix" ]; then
+    case $candidate in "$root_prefix"|"$root_prefix"/*) ;; *) return 1 ;; esac
+  fi
+  ancestor=${candidate%/*}
+  [ -n "$ancestor" ] || ancestor=/
+  while :; do
+    protected_directory "$ancestor" || return 1
+    if [ -n "$root_prefix" ] && [ "$ancestor" = "$root_prefix" ]; then break; fi
+    [ "$ancestor" = / ] && break
+    ancestor=${ancestor%/*}
+    [ -n "$ancestor" ] || ancestor=/
+  done
+}
+
+path_identity_mode() {
+  file_mode "$1" | /usr/bin/sed 's/.*\(...\)$/\1/'
+}
+
+path_set_digest() {
+  local listing label candidate member relative answer maximum
+  listing=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/machine-utilities-path-set.XXXXXX") || return 1
+  : >"$listing" || { /bin/rm -f "$listing"; return 1; }
+  while [ "$#" -gt 0 ]; do
+    label=$1
+    candidate=$2
+    shift 2
+    validate_protected_ancestors "$candidate" || { /bin/rm -f "$listing"; return 1; }
+    if [ -L "$candidate" ]; then
+      /bin/rm -f "$listing"
+      return 1
+    elif [ -f "$candidate" ]; then
+      protected_file "$candidate" 33554432 || { /bin/rm -f "$listing"; return 1; }
+      printf '%s|file|owner=%s|mode=%s|sha256=%s\n' "$label" "$(file_owner "$candidate")" \
+        "$(path_identity_mode "$candidate")" "$(sha256_file "$candidate")" >>"$listing" || {
+        /bin/rm -f "$listing"
+        return 1
+      }
+    elif [ -d "$candidate" ]; then
+      protected_directory "$candidate" || { /bin/rm -f "$listing"; return 1; }
+      if /usr/bin/find "$candidate" -type l -print | /usr/bin/grep -q . ||
+        /usr/bin/find "$candidate" ! -type d ! -type f -print | /usr/bin/grep -q .; then
+        /bin/rm -f "$listing"
+        return 1
+      fi
+      printf '%s|directory|owner=%s|mode=%s\n' "$label" "$(file_owner "$candidate")" \
+        "$(path_identity_mode "$candidate")" >>"$listing" || { /bin/rm -f "$listing"; return 1; }
+      while IFS= read -r member; do
+        protected_directory "$member" || { /bin/rm -f "$listing"; return 1; }
+        relative=${member#"$candidate"/}
+        printf '%s/%s|directory|owner=%s|mode=%s\n' "$label" "$relative" \
+          "$(file_owner "$member")" "$(path_identity_mode "$member")" >>"$listing" || {
+          /bin/rm -f "$listing"
+          return 1
+        }
+      done < <(/usr/bin/find "$candidate" -mindepth 1 -type d -print | /usr/bin/sort)
+      while IFS= read -r member; do
+        maximum=33554432
+        case $member in */macos/packages/*.pkg) maximum=2147483647 ;; esac
+        protected_file "$member" "$maximum" || { /bin/rm -f "$listing"; return 1; }
+        printf '%s/%s|file|owner=%s|mode=%s|sha256=%s\n' "$label" "${member#"$candidate"/}" \
+          "$(file_owner "$member")" "$(path_identity_mode "$member")" \
+          "$(sha256_file "$member")" >>"$listing" || { /bin/rm -f "$listing"; return 1; }
+      done < <(/usr/bin/find "$candidate" -type f -print | /usr/bin/sort)
+    elif [ ! -e "$candidate" ]; then
+      printf '%s|absent\n' "$label" >>"$listing" || { /bin/rm -f "$listing"; return 1; }
+    else
+      /bin/rm -f "$listing"
+      return 1
+    fi
+  done
+  answer=$(sha256_file "$listing") || { /bin/rm -f "$listing"; return 1; }
+  /bin/rm -f "$listing"
+  printf '%s\n' "$answer"
+}
+
+context_value() {
+  /usr/bin/awk -F '|' -v key="$1" '$1==key{print $2;exit}' "$bundle/apt.context"
+}
+
+context_binary() {
+  local name=$1 context=${2:-apt.context}
+  /usr/bin/awk -F '|' -v name="$name" '$1=="binary"&&$2==name{print $3;exit}' "$bundle/$context"
+}
+
+validate_macos_context() {
+  local dependency name expected_digest
+  /usr/bin/awk -F '|' '
+    BEGIN { binary[2]="chown"; binary[3]="installer"; binary[4]="pkgutil"; binary[5]="pmset"; binary[6]="systemsetup" }
+    $0!~/^[ -~]+$/ { exit 1 }
+    NR==1 { if(NF!=2||$1!="macos-context"||$2!="2")exit 1; next }
+    NR>=2&&NR<=6 { if(NF!=3||$1!="binary"||$2!=binary[NR]||length($3)!=64||$3!~/^[0-9a-f]+$/)exit 1; next }
+    { exit 1 } END { if(NR!=6)exit 1 }
+  ' "$bundle/macos.context" || return 1
+  for name in chown installer pkgutil pmset systemsetup; do
+    case $name in pmset) dependency=$root_prefix/usr/bin/pmset ;; *) dependency=$root_prefix/usr/sbin/$name ;; esac
+    expected_digest=$(context_binary "$name" macos.context) || return 1
+    digest "$expected_digest" && validate_protected_ancestors "$dependency" &&
+      protected_file "$dependency" 33554432 && [ -x "$dependency" ] &&
+      [ "$(sha256_file "$dependency")" = "$expected_digest" ] || return 1
+  done
+}
+
+validate_macos_packages() {
+  local generation_root=${1:-$bundle} package_root package_count=0 file_count=0
+  local kind policy_token package_size package_digest extra package_path member
+  package_root=$generation_root/macos/packages
+  protected_directory "$generation_root/macos" && exact_mode "$generation_root/macos" 755 &&
+    protected_directory "$package_root" && exact_mode "$package_root" 755 || return 1
+  while IFS='|' read -r kind _ policy_token payload_mode package_size package_digest _ _ _ _ _ _ extra; do
+    [ "$kind" = macos-pkg ] || continue
+    case $payload_mode in script-free|sealed-cask-payload-v1) ;; *) return 1 ;; esac
+    [ -z "$extra" ] || return 1
+    package_path=$package_root/$policy_token.pkg
+    protected_file "$package_path" 2147483647 && exact_mode "$package_path" 644 &&
+      [ "$(file_size "$package_path")" = "$package_size" ] &&
+      [ "$(sha256_file "$package_path")" = "$package_digest" ] || return 1
+    package_count=$((package_count + 1))
+  done <"$generation_root/policy.constraints"
+  while IFS= read -r member; do
+    [ -f "$member" ] && [ ! -L "$member" ] || return 1
+    file_count=$((file_count + 1))
+  done < <(/usr/bin/find "$package_root" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  [ "$package_count" -eq "$file_count" ]
+}
+
+validate_apt_source_authority() {
+  local generation_root=$1 expected_generation=$2 source_file keyring authority release signature
+  local source_uri source_suite source_component signed_by signed_by_path signed_by_fingerprint signed_by_extra
+  local authority_uri authority_suite authority_component publisher_fingerprint
+  local keyring_digest release_digest signature_digest member status_file valid_signature
+  local valid_signer valid_primary signature_rc
+  source_file=$generation_root/apt/sources.list.d/roundhouse.sources
+  keyring=$generation_root/apt/trusted.gpg.d/fleet.gpg
+  authority=$generation_root/apt/source-authority
+  release=$generation_root/apt/metadata/Release
+  signature=$generation_root/apt/metadata/Release.gpg
+  protected_file "$generation_root/apt/sources.list" 65536 &&
+    exact_mode "$generation_root/apt/sources.list" 644 &&
+    [ "$(file_size "$generation_root/apt/sources.list")" -eq 0 ] &&
+    protected_directory "$generation_root/apt/sources.list.d" &&
+    exact_mode "$generation_root/apt/sources.list.d" 755 &&
+    protected_file "$source_file" 65536 && exact_mode "$source_file" 644 || return 1
+  while IFS= read -r member; do
+    [ "$member" = "$source_file" ] || return 1
+  done < <(/usr/bin/find "$generation_root/apt/sources.list.d" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  /usr/bin/awk -F ': ' '
+    $0!~/^[ -~]+$/||length($0)>1024{exit 1}
+    NR==1{if($0!="Types: deb")exit 1;next}
+    NR==2{if(NF!=2||$1!="URIs")exit 1;next}
+    NR==3{if(NF!=2||$1!="Suites"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==4{if(NF!=2||$1!="Components"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==5{if(NF!=2||$1!="Signed-By"||$2!~"^/")exit 1;next}
+    NR==6{if($0!="Trusted: no")exit 1;next}
+    {exit 1} END{if(NR!=6)exit 1}
+  ' "$source_file" || return 1
+  source_uri=$(/usr/bin/sed -n '2s/^URIs: //p' "$source_file")
+  https_source_uri "$source_uri" || return 1
+  source_suite=$(/usr/bin/sed -n '3s/^Suites: //p' "$source_file")
+  source_component=$(/usr/bin/sed -n '4s/^Components: //p' "$source_file")
+  signed_by=$(/usr/bin/sed -n '5s/^Signed-By: //p' "$source_file")
+  IFS=' ' read -r signed_by_path signed_by_fingerprint signed_by_extra <<<"$signed_by"
+  [ -z "$signed_by_extra" ] &&
+    [[ $signed_by_fingerprint =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]] &&
+    [ "$signed_by_path" = "$expected_generation/apt/trusted.gpg.d/fleet.gpg" ] || return 1
+  case $signed_by_path in "$root_prefix"/*) ;; *) [ -z "$root_prefix" ] || return 1 ;; esac
+  protected_file "$keyring" 33554432 && exact_mode "$keyring" 644 &&
+    protected_file "$authority" 4096 && exact_mode "$authority" 644 &&
+    protected_directory "$generation_root/apt/metadata" && exact_mode "$generation_root/apt/metadata" 755 &&
+    protected_file "$release" 1048576 && exact_mode "$release" 644 &&
+    protected_file "$signature" 1048576 && exact_mode "$signature" 644 || return 1
+  ! /usr/bin/grep -Eq '^ssh-(rsa|dss|ed25519|ecdsa)[[:space:]]' "$keyring" || return 1
+  /usr/bin/awk -F '|' '
+    $0!~/^[ -~]+$/||length($0)>1024{exit 1}
+    NR==1{if($0!="apt-source-authority|2")exit 1;next}
+    NR==2{if(NF!=2||$1!="source-uri")exit 1;next}
+    NR==3{if(NF!=2||$1!="source-suite"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==4{if(NF!=2||$1!="source-component"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==5{if(NF!=2||$1!="publisher-primary-fingerprint"||$2!~/^([0-9A-F]{40}|[0-9A-F]{64})$/)exit 1;next}
+    NR>=6&&NR<=8{if(NF!=2||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    {exit 1} END{if(NR!=8)exit 1}
+  ' "$authority" || return 1
+  [ "$(/usr/bin/awk -F '|' 'NR>=6{printf "%s%s",sep,$1;sep=","}' "$authority")" = \
+    'keyring-sha256,release-sha256,signature-sha256' ] || return 1
+  authority_uri=$(record_value_from "$authority" source-uri)
+  https_source_uri "$authority_uri" || return 1
+  authority_suite=$(record_value_from "$authority" source-suite)
+  authority_component=$(record_value_from "$authority" source-component)
+  publisher_fingerprint=$(record_value_from "$authority" publisher-primary-fingerprint)
+  keyring_digest=$(record_value_from "$authority" keyring-sha256)
+  release_digest=$(record_value_from "$authority" release-sha256)
+  signature_digest=$(record_value_from "$authority" signature-sha256)
+  [ "$authority_uri" = "$source_uri" ] && [ "$authority_suite" = "$source_suite" ] &&
+    [ "$authority_component" = "$source_component" ] &&
+    [ "$publisher_fingerprint" = "$signed_by_fingerprint" ] &&
+    [ "$keyring_digest" = "$(sha256_file "$keyring")" ] &&
+    [ "$release_digest" = "$(sha256_file "$release")" ] &&
+    [ "$signature_digest" = "$(sha256_file "$signature")" ] || return 1
+  /usr/bin/awk -v expected_suite="$source_suite" -v expected_component="$source_component" '
+    $0!~/^[ -~]+$/||length($0)>4096{exit 1}
+    /^Suite: / {
+      suite_count++
+      value=substr($0,index($0,": ")+2)
+      if(suite_count!=1||value!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1
+      if(value==expected_suite)matches_distribution++
+    }
+    /^Codename: / {
+      codename_count++
+      value=substr($0,index($0,": ")+2)
+      if(codename_count!=1||value!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1
+      if(value==expected_suite)matches_distribution++
+    }
+    /^Components: / {
+      components_count++
+      value=substr($0,length("Components: ")+1)
+      count=split(value,component,/ +/)
+      if(count<1||count>128)exit 1
+      for(i=1;i<=count;i++){
+        if(component[i]!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1
+        if(component[i]==expected_component)matches++
+      }
+    }
+    END{if(suite_count+codename_count<1||matches_distribution!=1||components_count!=1||matches!=1)exit 1}
+  ' "$release" || return 1
+  status_file=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/machine-utilities-gpgv-status.XXXXXX") || return 1
+  /bin/chmod 0600 "$status_file" || { /bin/rm -f "$status_file"; return 1; }
+  if /usr/bin/env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      "$root_prefix/usr/bin/gpgv" --status-fd 3 --keyring "$keyring" "$signature" "$release" \
+      3>"$status_file" >/dev/null 2>&1; then signature_rc=0
+  else signature_rc=$?
+  fi
+  [ "$signature_rc" -eq 0 ] && protected_file "$status_file" 65536 && exact_mode "$status_file" 600 || {
+    /bin/rm -f "$status_file"
+    return 1
+  }
+  valid_signature=$(/usr/bin/awk '
+    $0!~/^[ -~]+$/||length($0)>4096{exit 1}
+    $1=="[GNUPG:]"&&$2=="VALIDSIG" {
+      count++; signer=$3; primary=(NF>=12?$NF:$3)
+    }
+    END{if(count!=1)exit 1;print signer"|"primary}
+  ' "$status_file") || { /bin/rm -f "$status_file"; return 1; }
+  /bin/rm -f "$status_file"
+  IFS='|' read -r valid_signer valid_primary <<<"$valid_signature"
+  [[ $valid_signer =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]] &&
+    [[ $valid_primary =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]] &&
+    [ "$valid_primary" = "$publisher_fingerprint" ]
+}
+
+validate_apt_context() {
+  local apt_architecture apt_config_digest effective_config_digest sources_digest keyrings_digest
+  local preferences_digest source_identities_digest methods_digest compressors_digest helpers_digest
+  local apt_get_digest apt_config_binary_digest apt_cache_digest dpkg_digest dpkg_query_digest
+  local dpkg_deb_digest setsid_digest candidate_generation effective_dump dependency
+  /usr/bin/awk -F '|' '
+    BEGIN {
+      value[2]="architecture"; value[3]="config-file-sha256"; value[4]="effective-config-sha256"
+      value[5]="sources-sha256"; value[6]="keyrings-sha256"; value[7]="preferences-sha256"
+      value[8]="source-identities-sha256"; value[9]="methods-sha256"
+      value[10]="compressors-sha256"; value[11]="helpers-sha256"
+      binary[12]="apt-get"; binary[13]="apt-config"; binary[14]="apt-cache"
+      binary[15]="dpkg"; binary[16]="dpkg-query"; binary[17]="dpkg-deb"; binary[18]="setsid"
+    }
+    $0!~/^[ -~]+$/ { exit 1 }
+    NR==1 { if(NF!=2||$1!="apt-context"||$2!="2")exit 1; next }
+    NR>=2&&NR<=11 { if(NF!=2||$1!=value[NR])exit 1; next }
+    NR>=12&&NR<=18 { if(NF!=3||$1!="binary"||$2!=binary[NR])exit 1; next }
+    { exit 1 }
+    END { if(NR!=18)exit 1 }
+  ' "$bundle/apt.context" || return 1
+  apt_architecture=$(context_value architecture)
+  apt_config_digest=$(context_value config-file-sha256)
+  effective_config_digest=$(context_value effective-config-sha256)
+  sources_digest=$(context_value sources-sha256)
+  keyrings_digest=$(context_value keyrings-sha256)
+  preferences_digest=$(context_value preferences-sha256)
+  source_identities_digest=$(context_value source-identities-sha256)
+  methods_digest=$(context_value methods-sha256)
+  compressors_digest=$(context_value compressors-sha256)
+  helpers_digest=$(context_value helpers-sha256)
+  apt_get_digest=$(context_binary apt-get)
+  apt_config_binary_digest=$(context_binary apt-config)
+  apt_cache_digest=$(context_binary apt-cache)
+  dpkg_digest=$(context_binary dpkg)
+  dpkg_query_digest=$(context_binary dpkg-query)
+  dpkg_deb_digest=$(context_binary dpkg-deb)
+  setsid_digest=$(context_binary setsid)
+  [[ $apt_architecture =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] &&
+    digest "$apt_config_digest" && digest "$effective_config_digest" &&
+    digest "$sources_digest" && digest "$keyrings_digest" && digest "$preferences_digest" &&
+    digest "$source_identities_digest" && digest "$methods_digest" &&
+    digest "$compressors_digest" && digest "$helpers_digest" &&
+    digest "$apt_get_digest" && digest "$apt_config_binary_digest" &&
+    digest "$apt_cache_digest" && digest "$dpkg_digest" && digest "$dpkg_query_digest" &&
+    digest "$dpkg_deb_digest" && digest "$setsid_digest" || return 1
+
+  candidate_generation=$config_root/generations/$epoch
+  /usr/bin/awk -v generation="$candidate_generation" -v methods="$root_prefix/usr/lib/apt/methods" \
+      -v dpkg="$root_prefix/usr/bin/dpkg" -v architecture="$apt_architecture" '
+    BEGIN {
+      expected["Dir::Etc::main \"/dev/null\";"]=1
+      expected["Dir::Etc::parts \"/dev/null\";"]=1
+      expected["Dir::Etc::sourcelist \""generation"/apt/sources.list\";"]=1
+      expected["Dir::Etc::sourceparts \""generation"/apt/sources.list.d\";"]=1
+      expected["Dir::Etc::trusted \""generation"/apt/trusted.gpg\";"]=1
+      expected["Dir::Etc::trustedparts \""generation"/apt/trusted.gpg.d\";"]=1
+      expected["Dir::Etc::preferences \""generation"/apt/preferences\";"]=1
+      expected["Dir::Etc::preferencesparts \""generation"/apt/preferences.d\";"]=1
+      expected["Dir::Bin::methods \""methods"\";"]=1
+      expected["Dir::Bin::dpkg \""dpkg"\";"]=1
+      expected["APT::Architecture \""architecture"\";"]=1
+      expected["Acquire::AllowInsecureRepositories \"false\";"]=1
+      expected["APT::Get::AllowUnauthenticated \"false\";"]=1
+    }
+    $0!~/^[ -~]+$/||!($0 in expected)||seen[$0]++ { exit 1 }
+    END { if(NR!=13)exit 1;for(line in expected)if(!seen[line])exit 1 }
+  ' "$bundle/apt.conf" || return 1
+  [ "$(sha256_file "$bundle/apt.conf")" = "$apt_config_digest" ] &&
+    protected_file "$bundle/apt/effective.dump" 1048576 &&
+    [ "$(sha256_file "$bundle/apt/effective.dump")" = "$effective_config_digest" ] || return 1
+  ! /usr/bin/grep -Eiq '(Pre-Invoke|Post-Invoke|Pre-Install-Pkgs|Proxy::Login|DPkg::Tools::Options|::Command|::Proxy)' \
+    "$bundle/apt.conf" "$bundle/apt/effective.dump" || return 1
+
+  for dependency in "$root_prefix/usr/bin/apt-get" "$root_prefix/usr/bin/apt-config" \
+    "$root_prefix/usr/bin/apt-cache" "$root_prefix/usr/bin/dpkg" "$root_prefix/usr/bin/dpkg-query" \
+    "$root_prefix/usr/bin/dpkg-deb" "$root_prefix/usr/bin/setsid"; do
+    protected_file "$dependency" 33554432 && [ -x "$dependency" ] || return 1
+  done
+  [ "$(sha256_file "$root_prefix/usr/bin/apt-get")" = "$apt_get_digest" ] &&
+    [ "$(sha256_file "$root_prefix/usr/bin/apt-config")" = "$apt_config_binary_digest" ] &&
+    [ "$(sha256_file "$root_prefix/usr/bin/apt-cache")" = "$apt_cache_digest" ] &&
+    [ "$(sha256_file "$root_prefix/usr/bin/dpkg")" = "$dpkg_digest" ] &&
+    [ "$(sha256_file "$root_prefix/usr/bin/dpkg-query")" = "$dpkg_query_digest" ] &&
+    [ "$(sha256_file "$root_prefix/usr/bin/dpkg-deb")" = "$dpkg_deb_digest" ] &&
+    [ "$(sha256_file "$root_prefix/usr/bin/setsid")" = "$setsid_digest" ] || return 1
+  [ "$(path_set_digest source-main "$bundle/apt/sources.list" source-parts "$bundle/apt/sources.list.d")" = "$sources_digest" ] &&
+    [ "$(path_set_digest trusted-main "$bundle/apt/trusted.gpg" trusted-parts "$bundle/apt/trusted.gpg.d")" = "$keyrings_digest" ] &&
+    [ "$(path_set_digest preferences-main "$bundle/apt/preferences" preferences-parts "$bundle/apt/preferences.d")" = "$preferences_digest" ] &&
+    [ "$(path_set_digest methods "$root_prefix/usr/lib/apt/methods")" = "$methods_digest" ] &&
+    [ "$(path_set_digest gzip "$root_prefix/usr/bin/gzip" xz "$root_prefix/usr/bin/xz" \
+      bzip2 "$root_prefix/usr/bin/bzip2" lz4 "$root_prefix/usr/bin/lz4" zstd "$root_prefix/usr/bin/zstd")" = "$compressors_digest" ] &&
+    [ "$(path_set_digest apt-helper "$root_prefix/usr/lib/apt/apt-helper" \
+      apt-solvers "$root_prefix/usr/lib/apt/solvers" apt-planners "$root_prefix/usr/lib/apt/planners" \
+      gpgv "$root_prefix/usr/bin/gpgv")" = "$helpers_digest" ] || return 1
+  validate_apt_source_authority "$bundle" "$candidate_generation" || return 1
+  protected_file "$bundle/apt/source-identities" 65536 &&
+    [ "$(sha256_file "$bundle/apt/source-identities")" = "$source_identities_digest" ] || return 1
+  /usr/bin/awk -F '|' '
+    NR==1{if($0!="source-identities|1")exit 1;next}
+    NF!=3||$1!="source"||$2!~/^[A-Za-z0-9][A-Za-z0-9._:+@,-]{0,255}$/||
+      length($3)!=64||$3!~/^[0-9a-f]+$/||seen[$2]++||(previous!=""&&previous>=$0){exit 1}
+    {previous=$0}
+  ' "$bundle/apt/source-identities" || return 1
+
+  effective_dump=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/machine-utilities-apt-dump.XXXXXX") || return 1
+  if ! /usr/bin/env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      APT_CONFIG="$bundle/apt.conf" "$root_prefix/usr/bin/apt-config" dump >"$effective_dump" 2>/dev/null ||
+    [ "$(sha256_file "$effective_dump")" != "$effective_config_digest" ]; then
+    /bin/rm -f "$effective_dump"
+    return 1
+  fi
+  /bin/rm -f "$effective_dump"
+}
+
+validate_candidate_semantics() {
+  validate_host_and_context && /bin/bash -n "$bundle/privilege-broker-posix" || return 1
+  case $platform_boundary in
+    linux) validate_apt_context || return 1 ;;
+    macos) validate_macos_context || return 1 ;;
+    *) return 1 ;;
+  esac
+  observed_ca=$("$ssh_keygen" -lf "$bundle/fleet-ca.pub" -E sha256 2>/dev/null |
+    /usr/bin/awk 'NR==1{print $2}')
+  [ "$observed_ca" = "$ca_fingerprint" ] || return 1
+}
+
+current_epoch=0
+current_target=absent
+current_policy_digest=absent
+current_constraints_digest=absent
+current_broker_digest=absent
+current_identity_digest=absent
+current_context_digest=absent
+current_platform_context_digest=absent
+current_platform_artifacts_digest=absent
+load_current_generation() {
+  current_epoch=0
+  current_target=absent
+  current_policy_digest=absent
+  current_constraints_digest=absent
+  current_broker_digest=absent
+  current_identity_digest=absent
+  current_context_digest=absent
+  current_platform_context_digest=absent
+  current_platform_artifacts_digest=absent
+  if [ -L "$config_root/active" ]; then
+    current_target=$(/usr/bin/readlink "$config_root/active") || return 1
+    [[ $current_target =~ ^generations/([1-9][0-9]{0,9})$ ]] || return 1
+    current_epoch=${BASH_REMATCH[1]}
+    current_generation=$config_root/$current_target
+    protected_directory "$current_generation" || return 1
+    for current_file in policy.actions policy.constraints broker.sha256 ssh-keygen.sha256 host.identity context.canary; do
+      protected_file "$current_generation/$current_file" 1048576 || return 1
+    done
+    current_policy_digest=$(sha256_file "$current_generation/policy.actions")
+    current_constraints_digest=$(sha256_file "$current_generation/policy.constraints")
+    current_broker_digest=$(/usr/bin/sed -n '1p' "$current_generation/broker.sha256")
+    current_identity_digest=$(sha256_file "$current_generation/host.identity")
+    current_context_digest=$(sha256_file "$current_generation/context.canary")
+    case $platform_boundary in
+      linux)
+        protected_file "$current_generation/apt.context" 1048576 &&
+          protected_file "$current_generation/apt/source-authority" 1048576 || return 1
+        current_platform_context_digest=$(sha256_file "$current_generation/apt.context")
+        current_platform_artifacts_digest=$(sha256_file "$current_generation/apt/source-authority")
+        ;;
+      macos)
+        protected_file "$current_generation/macos.context" 1048576 &&
+          protected_directory "$current_generation/macos/packages" || return 1
+        current_platform_context_digest=$(sha256_file "$current_generation/macos.context")
+        current_platform_artifacts_digest=$(path_set_digest packages "$current_generation/macos/packages")
+        ;;
+      *) return 1 ;;
+    esac
+    digest "$current_broker_digest" || return 1
+  elif [ -e "$config_root/active" ]; then
+    return 1
+  fi
+}
+
+record_value_from() {
+  /usr/bin/awk -F '|' -v key="$2" '$1==key{print $2;exit}' "$1"
+}
+
+validate_public_enrollment_receipt() {
+  local expected_epoch=$1 generation=$2 receipt public_scope receipt_broker receipt_policy
+  local receipt_constraints receipt_identity receipt_context receipt_platform receipt_artifacts receipt_sudoers
+  local receipt_ca receipt_signers receipt_krl receipt_uid receipt_principal receipt_endpoints
+  local expected_context_label expected_artifacts_label
+  receipt=$root_prefix/var/lib/machine-utilities-public/enrollment
+  protected_file "$receipt" 8192 && exact_mode "$receipt" 644 || return 1
+  /usr/bin/awk -F '|' '
+    function digest(v){return length(v)==64&&v~/^[0-9a-f]+$/}
+    $0!~/^[ -~]+$/||length($0)>1024{exit 1}
+    NR==1{if($0!="enrollment-receipt|2")exit 1;next}
+    NR==2{if($0!="state|enrolled")exit 1;next}
+    NR==3{if(NF!=2||$1!="scope"||($2!="fixture"&&$2!="native"))exit 1;next}
+    NR==4{if(NF!=2||$1!="epoch"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+    NR>=5&&NR<=17{if(NF!=2||!digest($2))exit 1;next}
+    NR==18{if(NF!=2||$1!="fleet-ca-fingerprint"||$2!~/^SHA256:[A-Za-z0-9+\/=]+$/||length($2)<50||length($2)>51)exit 1;next}
+    NR==19{if(NF!=2||$1!="protected-uid"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+    NR==20{if(NF!=2||$1!="request-principal"||$2!~/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)exit 1;next}
+    NR==21{if(NF!=2||$1!="endpoint-principals")exit 1;next}
+    {exit 1}
+    END{if(NR!=21)exit 1}
+  ' "$receipt" || return 1
+  # The fixed field order is part of the public contract. Check the labels
+  # separately so the value grammar above cannot accidentally accept aliases.
+  expected_context_label='apt-context-sha256'
+  expected_artifacts_label='source-authority-sha256'
+  if [ "$platform_boundary" = macos ]; then
+    expected_context_label='platform-context-sha256'
+    expected_artifacts_label='platform-artifacts-sha256'
+  fi
+  [ "$(/usr/bin/awk -F '|' 'NR>=5&&NR<=17{printf "%s%s",sep,$1;sep=","}' "$receipt")" = \
+    "manifest-sha256,confirmation-sha256,broker-sha256,policy-sha256,constraints-sha256,host-identity-sha256,context-canary-sha256,$expected_context_label,$expected_artifacts_label,fleet-ca-sha256,allowed-signers-sha256,revoked-krl-sha256,sudoers-sha256" ] || return 1
+  public_scope=$(record_value_from "$receipt" scope)
+  if [ "$fixture_mode" = true ]; then [ "$public_scope" = fixture ] || return 1
+  else [ "$public_scope" = native ] || return 1
+  fi
+  [ "$(record_value_from "$receipt" epoch)" = "$expected_epoch" ] || return 1
+  receipt_broker=$(record_value_from "$receipt" broker-sha256)
+  receipt_policy=$(record_value_from "$receipt" policy-sha256)
+  receipt_constraints=$(record_value_from "$receipt" constraints-sha256)
+  receipt_identity=$(record_value_from "$receipt" host-identity-sha256)
+  receipt_context=$(record_value_from "$receipt" context-canary-sha256)
+  receipt_platform=$(record_value_from "$receipt" "$expected_context_label")
+  receipt_artifacts=$(record_value_from "$receipt" "$expected_artifacts_label")
+  receipt_ca=$(record_value_from "$receipt" fleet-ca-sha256)
+  receipt_signers=$(record_value_from "$receipt" allowed-signers-sha256)
+  receipt_krl=$(record_value_from "$receipt" revoked-krl-sha256)
+  receipt_sudoers=$(record_value_from "$receipt" sudoers-sha256)
+  receipt_uid=$(record_value_from "$receipt" protected-uid)
+  receipt_principal=$(record_value_from "$receipt" request-principal)
+  receipt_endpoints=$(record_value_from "$receipt" endpoint-principals)
+  [ "$receipt_broker" = "$(sha256_file "$broker_path")" ] &&
+    [ "$receipt_broker" = "$(/usr/bin/sed -n '1p' "$generation/broker.sha256")" ] &&
+    [ "$receipt_policy" = "$(sha256_file "$generation/policy.actions")" ] &&
+    [ "$receipt_constraints" = "$(sha256_file "$generation/policy.constraints")" ] &&
+    [ "$receipt_identity" = "$(sha256_file "$generation/host.identity")" ] &&
+    [ "$receipt_context" = "$(sha256_file "$generation/context.canary")" ] &&
+    [ "$receipt_ca" = "$(sha256_file "$config_root/trust/fleet-ca.pub")" ] &&
+    [ "$receipt_signers" = "$(sha256_file "$config_root/trust/allowed_signers")" ] &&
+    [ "$receipt_krl" = "$(sha256_file "$config_root/trust/revoked.krl")" ] &&
+    [ "$receipt_sudoers" = "$(sha256_file "$sudoers_path")" ] || return 1
+  case $platform_boundary in
+    linux)
+      [ "$receipt_platform" = "$(sha256_file "$generation/apt.context")" ] &&
+        [ "$receipt_artifacts" = "$(sha256_file "$generation/apt/source-authority")" ] || return 1
+      ;;
+    macos)
+      [ "$receipt_platform" = "$(sha256_file "$generation/macos.context")" ] &&
+        [ "$receipt_artifacts" = "$(path_set_digest packages "$generation/macos/packages")" ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  IFS='|' read -r identity_type identity_version _identity_host identity_uid identity_principal \
+    _identity_domain identity_ca _identity_ca_generation _identity_host_fingerprint identity_endpoints identity_extra \
+    <"$generation/host.identity" || return 1
+  [ "$identity_type" = identity ] && [ "$identity_version" = 1 ] && [ -z "$identity_extra" ] &&
+    [ "$receipt_uid" = "$identity_uid" ] && [ "$receipt_principal" = "$identity_principal" ] &&
+    [ "$receipt_endpoints" = "$identity_endpoints" ] &&
+    [ "$(record_value_from "$receipt" fleet-ca-fingerprint)" = "$identity_ca" ]
+}
+
+validate_public_canary_receipt() {
+  local expected_epoch=$1 canary scope broker_digest sudoers_digest digest_line sudoers_line
+  canary=$root_prefix/var/lib/machine-utilities-public/canary
+  protected_file "$canary" 4096 && exact_mode "$canary" 644 || return 1
+  /usr/bin/awk -F '|' -v platform="$platform_boundary" '
+    $0!~/^[ -~]+$/||length($0)>512{exit 1}
+    NR==1{if($0!="enrollment-canary|1")exit 1;next}
+    NR==2{if(NF!=2||$1!="scope"||($2!="fixture"&&$2!="native"))exit 1;scope=$2;next}
+    NR==3{if(NF!=2||$1!="complete-sudoers")exit 1;next}
+    NR==4{if(NF!=2||$1!="positive-no-argument")exit 1;next}
+    NR==5{if(NF!=2||$1!="negative-with-argument")exit 1;next}
+    NR==6{if(NF!=2||$1!="negative-direct-unprivileged")exit 1;next}
+    platform=="linux"&&NR==7{if(NF!=2||$1!="epoch"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+    platform=="linux"&&(NR==8||NR==9){if(NF!=2||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    platform=="macos"&&NR==7{if(NF!=2||$1!="negative-direct-installer"||$2!=(scope=="native"?"passed":"fixture-not-run"))exit 1;next}
+    platform=="macos"&&NR==8{if(NF!=2||$1!="negative-root-homebrew"||$2!=(scope=="native"?"passed":"fixture-not-run"))exit 1;next}
+    platform=="macos"&&NR==9{if(NF!=2||$1!="negative-root-shell"||$2!=(scope=="native"?"passed":"fixture-not-run"))exit 1;next}
+    platform=="macos"&&NR==10{if(NF!=2||$1!="epoch"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+    platform=="macos"&&(NR==11||NR==12){if(NF!=2||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    {exit 1} END{if((platform=="linux"&&NR!=9)||(platform=="macos"&&NR!=12))exit 1}
+  ' "$canary" || return 1
+  if [ "$platform_boundary" = macos ]; then digest_line=11; sudoers_line=12
+  else digest_line=8; sudoers_line=9
+  fi
+  [ "$(/usr/bin/sed -n "${digest_line}s/|.*//p" "$canary")" = broker-sha256 ] &&
+    [ "$(/usr/bin/sed -n "${sudoers_line}s/|.*//p" "$canary")" = sudoers-sha256 ] || return 1
+  scope=$(record_value_from "$canary" scope)
+  if [ "$fixture_mode" = true ]; then
+    [ "$scope" = fixture ] &&
+      [ "$(record_value_from "$canary" complete-sudoers)" = fixture-not-run ] &&
+      [ "$(record_value_from "$canary" positive-no-argument)" = fixture-simulated-broker-reached ] &&
+      [ "$(record_value_from "$canary" negative-with-argument)" = fixture-passed ] &&
+      [ "$(record_value_from "$canary" negative-direct-unprivileged)" = fixture-not-run ] || return 1
+    if [ "$platform_boundary" = macos ]; then
+      [ "$(record_value_from "$canary" negative-direct-installer)" = fixture-not-run ] &&
+        [ "$(record_value_from "$canary" negative-root-homebrew)" = fixture-not-run ] &&
+        [ "$(record_value_from "$canary" negative-root-shell)" = fixture-not-run ] || return 1
+    fi
+  else
+    [ "$scope" = native ] &&
+      [ "$(record_value_from "$canary" complete-sudoers)" = passed ] &&
+      [ "$(record_value_from "$canary" positive-no-argument)" = passed ] &&
+      [ "$(record_value_from "$canary" negative-with-argument)" = passed ] &&
+      [ "$(record_value_from "$canary" negative-direct-unprivileged)" = passed ] || return 1
+    if [ "$platform_boundary" = macos ]; then
+      [ "$(record_value_from "$canary" negative-direct-installer)" = passed ] &&
+        [ "$(record_value_from "$canary" negative-root-homebrew)" = passed ] &&
+        [ "$(record_value_from "$canary" negative-root-shell)" = passed ] || return 1
+    fi
+  fi
+  broker_digest=$(record_value_from "$canary" broker-sha256)
+  sudoers_digest=$(record_value_from "$canary" sudoers-sha256)
+  [ "$(record_value_from "$canary" epoch)" = "$expected_epoch" ] &&
+    [ "$broker_digest" = "$(sha256_file "$broker_path")" ] &&
+    [ "$sudoers_digest" = "$(sha256_file "$sudoers_path")" ]
+}
+
+validate_coherent_enrollment() {
+  local expected_epoch=$1 ssh_attestation_mode=$2 generation expected_sudoers generation_policy
+  local generation_bound epoch_line recorded_ssh_keygen_digest
+  [[ $expected_epoch =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  generation=$config_root/generations/$expected_epoch
+  protected_directory "$config_root" && exact_mode "$config_root" 755 &&
+    protected_directory "$config_root/generations" && exact_mode "$config_root/generations" 755 &&
+    protected_directory "$config_root/trust" && exact_mode "$config_root/trust" 755 &&
+    protected_directory "$state_root" && exact_mode "$state_root" 700 &&
+    protected_directory "$root_prefix/var/lib/machine-utilities-public" &&
+    exact_mode "$root_prefix/var/lib/machine-utilities-public" 755 &&
+    protected_directory "$generation" && exact_mode "$generation" 755 || return 1
+  [ -L "$config_root/active" ] && [ "$(symlink_owner "$config_root/active")" = "$protected_owner" ] &&
+    [ "$(/usr/bin/readlink "$config_root/active")" = "generations/$expected_epoch" ] || return 1
+  protected_file "$broker_path" 33554432 && exact_mode "$broker_path" 755 &&
+    protected_file "$sudoers_path" 4096 && exact_mode "$sudoers_path" 440 || return 1
+  for expected_file in policy.actions policy.constraints broker.sha256 broker.version ssh-keygen.sha256 host.identity \
+    context.canary; do
+    protected_file "$generation/$expected_file" 1048576 && exact_mode "$generation/$expected_file" 644 || return 1
+  done
+  case $platform_boundary in
+    linux)
+      for expected_file in apt.conf apt.context; do
+        protected_file "$generation/$expected_file" 1048576 && exact_mode "$generation/$expected_file" 644 || return 1
+      done
+      ;;
+    macos)
+      protected_file "$generation/macos.context" 1048576 &&
+        exact_mode "$generation/macos.context" 644 && validate_macos_packages "$generation" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  for expected_file in fleet-ca.pub allowed_signers revoked.krl; do
+    protected_file "$config_root/trust/$expected_file" 1048576 &&
+      exact_mode "$config_root/trust/$expected_file" 644 || return 1
+  done
+  recorded_ssh_keygen_digest=$(/usr/bin/sed -n '1p' "$generation/ssh-keygen.sha256") || return 1
+  [ "$(/usr/bin/sed -n '1p' "$generation/broker.version")" = 1.0.0 ] &&
+    [ "$(/usr/bin/wc -l <"$generation/broker.version" | /usr/bin/tr -d ' ')" = 1 ] &&
+    [ "$(sha256_file "$broker_path")" = "$(/usr/bin/sed -n '1p' "$generation/broker.sha256")" ] &&
+    [ "$(/usr/bin/wc -l <"$generation/broker.sha256" | /usr/bin/tr -d ' ')" = 1 ] &&
+    digest "$recorded_ssh_keygen_digest" &&
+    [ "$(/usr/bin/wc -l <"$generation/ssh-keygen.sha256" | /usr/bin/tr -d ' ')" = 1 ] &&
+    /bin/bash -n "$broker_path" || return 1
+  case $ssh_attestation_mode in
+    current) [ "$recorded_ssh_keygen_digest" = "$(system_ssh_keygen_digest)" ] || return 1 ;;
+    recorded) ;;
+    *) return 1 ;;
+  esac
+  generation_policy=$(sha256_file "$generation/policy.actions") || return 1
+  IFS='|' read -r epoch_line constraint_version generation_field policy_field constraint_extra \
+    <"$generation/policy.constraints" || return 1
+  generation_bound=${generation_field#generation=}
+  [ "$epoch_line" = constraints ] && [ "$constraint_version" = 1 ] && [ -z "$constraint_extra" ] &&
+    [ "$generation_bound" = "$expected_epoch" ] && [ "$policy_field" = "policy-sha256=$generation_policy" ] || return 1
+  IFS='|' read -r _ _ _ _ request_user_from_identity _ _ _ _ _ _ <"$generation/host.identity" || return 1
+  expected_sudoers=$(request_user=$request_user_from_identity render_sudoers_policy) || return 1
+  [ "$(/bin/cat "$sudoers_path")" = "$expected_sudoers" ] || return 1
+  for state_directory in replay journal audit lock rollback quarantine; do
+    protected_directory "$state_root/$state_directory" && exact_mode "$state_root/$state_directory" 700 || return 1
+  done
+  revocation_reserve_valid || return 1
+  case $platform_boundary in
+    linux) ( bundle=$generation; epoch=$expected_epoch; validate_host_and_context && validate_apt_context ) || return 1 ;;
+    macos) ( bundle=$generation; epoch=$expected_epoch; validate_host_and_context &&
+      validate_macos_context && validate_macos_packages "$generation" ) || return 1 ;;
+    *) return 1 ;;
+  esac
+  validate_public_enrollment_receipt "$expected_epoch" "$generation" &&
+    validate_public_canary_receipt "$expected_epoch"
+}
+
+validate_unenrolled_state() {
+  local path enrollment
+  for path in "$config_root/active" "$broker_path" "$sudoers_path" \
+    "$config_root/trust/fleet-ca.pub" "$config_root/trust/allowed_signers" \
+    "$config_root/trust/revoked.krl" "$root_prefix/var/lib/machine-utilities-public/canary" \
+    "$revocation_reserve"; do
+    [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+  done
+  if [ -d "$config_root/generations" ]; then
+    ! /usr/bin/find "$config_root/generations" -mindepth 1 -maxdepth 1 -print | /usr/bin/grep -q . || return 1
+  elif [ -e "$config_root/generations" ] || [ -L "$config_root/generations" ]; then
+    return 1
+  fi
+  enrollment=$root_prefix/var/lib/machine-utilities-public/enrollment
+  if [ -e "$enrollment" ] || [ -L "$enrollment" ]; then
+    protected_file "$enrollment" 4096 && exact_mode "$enrollment" 644 || return 1
+    /usr/bin/awk -F '|' '
+      NR==1{if($0!="enrollment-receipt|2")exit 1;next}
+      NR==2{if($0!="state|revoked")exit 1;next}
+      NR==3{if(NF!=2||$1!="scope"||($2!="fixture"&&$2!="native"))exit 1;next}
+      NR==4{if(NF!=2||$1!="epoch"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+      NR==5{if(NF!=2||$1!="manifest-sha256"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+      NR==6{if($0!="reason|grant_broker_generation_and_trust_quarantined")exit 1;next}
+      {exit 1} END{if(NR!=6)exit 1}
+    ' "$enrollment" || return 1
+  fi
+}
+
+emit_preview_body() {
+  local candidate_broker candidate_identity candidate_context candidate_platform_context candidate_platform_artifacts candidate_sudoers
+  local candidate_source_uri candidate_source_suite candidate_source_component candidate_publisher_fingerprint
+  candidate_broker=$(manifest_file_digest privilege-broker-posix)
+  candidate_identity=$(manifest_file_digest host.identity)
+  candidate_context=$(manifest_file_digest context.canary)
+  case $platform_boundary in
+    linux)
+      candidate_platform_context=$(manifest_file_digest apt.context)
+      candidate_platform_artifacts=$(manifest_file_digest apt/source-authority)
+      candidate_source_uri=$(record_value_from "$bundle/apt/source-authority" source-uri)
+      candidate_source_suite=$(record_value_from "$bundle/apt/source-authority" source-suite)
+      candidate_source_component=$(record_value_from "$bundle/apt/source-authority" source-component)
+      candidate_publisher_fingerprint=$(record_value_from "$bundle/apt/source-authority" publisher-primary-fingerprint)
+      ;;
+    macos)
+      candidate_platform_context=$(manifest_file_digest macos.context)
+      candidate_platform_artifacts=$(path_set_digest packages "$bundle/macos/packages")
+      ;;
+    *) return 1 ;;
+  esac
+  candidate_sudoers=$(render_sudoers_policy | sha256_stream)
+  printf 'enrollment-preview|2\noperation|install\n'
+  printf 'from-epoch|%s\nto-epoch|%s\nmanifest-sha256|%s\n' "$current_epoch" "$epoch" "$manifest_digest"
+  printf 'change|broker|%s|%s\n' "$current_broker_digest" "$candidate_broker"
+  printf 'change|policy|%s|%s\n' "$current_policy_digest" "$policy_digest"
+  printf 'change|constraints|%s|%s\n' "$current_constraints_digest" "$constraints_digest"
+  printf 'change|host-identity|%s|%s\n' "$current_identity_digest" "$candidate_identity"
+  printf 'change|context-canary|%s|%s\n' "$current_context_digest" "$candidate_context"
+  if [ "$platform_boundary" = linux ]; then
+    printf 'change|apt-context-v2|%s|%s\n' "$current_platform_context_digest" "$candidate_platform_context"
+    printf 'change|apt-source-authority|%s|%s\n' "$current_platform_artifacts_digest" "$candidate_platform_artifacts"
+    printf 'apt-source|uri=%s|suite=%s|component=%s|publisher-primary-fingerprint=%s\n' \
+      "$candidate_source_uri" "$candidate_source_suite" "$candidate_source_component" \
+      "$candidate_publisher_fingerprint"
+  else
+    printf 'change|macos-context-v2|%s|%s\n' "$current_platform_context_digest" "$candidate_platform_context"
+    printf 'change|macos-protected-packages|%s|%s\n' "$current_platform_artifacts_digest" "$candidate_platform_artifacts"
+  fi
+  printf 'sudoers|principal=%s|uid=%s|command=%s|argv=%s|sha256=%s\n' \
+    "$request_user" "$enrolled_uid" "$broker_system_path" \
+    "$([ "$platform_boundary" = macos ] && printf empty+typed-homebrew-cask || printf empty)" \
+    "$candidate_sudoers"
+  printf 'trust|fleet-ca=%s|ca-generation=%s|endpoint-principals=%s\n' \
+    "$ca_fingerprint" "$ca_generation" "$endpoint_principals"
+  /usr/bin/awk -F '|' 'NR>1{printf "candidate-action|%s|%s|%s|%s|%s\n",$2,$3,$4,$5,$6}' \
+    "$bundle/policy.actions"
+  /usr/bin/awk 'NR>1{print "candidate-constraint|"$0}' "$bundle/policy.constraints"
+}
+
+confirmation_digest=
+prepare_preview() {
+  load_current_generation || return 1
+  [ "$epoch" -eq $((current_epoch + 1)) ] || return 1
+  confirmation_digest=$(emit_preview_body | sha256_stream) || return 1
+  digest "$confirmation_digest"
+}
+
+preview_bundle() {
+  emit_preview_body
+  printf 'confirmation-sha256|%s\n' "$confirmation_digest"
+}
+
+validate_os_ancestors() {
+  local ancestor broker_parent
+  if [ -n "$root_prefix" ]; then protected_directory "$root_prefix" || return 1; fi
+  broker_parent=${broker_path%/machine-utilities/posix-broker}
+  for ancestor in "$root_prefix/etc" "$root_prefix/etc/sudoers.d" "$root_prefix/usr" \
+    "$root_prefix/var" "$root_prefix/var/lib"; do
+    protected_directory "$ancestor" || return 1
+  done
+  if [ "$platform_boundary" = macos ]; then
+    if [ -e "$root_prefix/usr/local" ] || [ -L "$root_prefix/usr/local" ]; then
+      protected_directory "$root_prefix/usr/local" && exact_mode "$root_prefix/usr/local" 755 || return 1
+    fi
+    if [ -e "$broker_parent" ] || [ -L "$broker_parent" ]; then
+      protected_directory "$broker_parent" && exact_mode "$broker_parent" 755 || return 1
+    fi
+  else
+    protected_directory "$broker_parent" || return 1
+  fi
+}
+
+created_directories=()
+ensure_application_directory() {
+  local path=$1 mode=$2
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    protected_directory "$path" && exact_mode "$path" "${mode#0}"
+    return
+  fi
+  /bin/mkdir "$path" || return 1
+  created_directories+=("$path")
+  /bin/chmod "$mode" "$path" || return 1
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$path" || return 1; fi
+  protected_directory "$path" && exact_mode "$path" "${mode#0}"
+}
+
+ensure_application_layout() {
+  if [ "$platform_boundary" = macos ]; then
+    ensure_application_directory "$root_prefix/usr/local" 0755 || return 1
+    ensure_application_directory "$root_prefix/usr/local/libexec" 0755 || return 1
+  fi
+  ensure_application_directory "${broker_path%/posix-broker}" 0755 &&
+    ensure_application_directory "$config_root" 0755 &&
+    ensure_application_directory "$config_root/generations" 0755 &&
+    ensure_application_directory "$config_root/trust" 0755 &&
+    ensure_application_directory "$state_root" 0700 || return 1
+  for state_directory in replay journal audit lock rollback quarantine; do
+    ensure_application_directory "$state_root/$state_directory" 0700 || return 1
+  done
+  ensure_application_directory "$root_prefix/var/lib/machine-utilities-public" 0755
+}
+
+remove_created_directories() {
+  local index
+  for ((index=${#created_directories[@]}-1; index>=0; index--)); do
+    /bin/rmdir "${created_directories[$index]}" 2>/dev/null || true
+  done
+}
+
+validate_lifecycle_owner_record() {
+  local owner=$1
+  protected_file "$owner" 2048 && exact_mode "$owner" 600 || return 1
+  /usr/bin/awk -F '|' '
+    NR==1{if($0!="lifecycle-owner|2")exit 1;next}
+    NR==2{if(NF!=2||$1!="boot-id"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    NR==3{if(NF!=2||$1!="pid"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+    NR==4{if(NF!=2||$1!="process-start"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    NR==5{if(NF!=2||$1!="operation"||($2!="install"&&$2!="revoke"&&$2!="recovery"))exit 1;next}
+    {exit 1} END{if(NR!=5)exit 1}
+  ' "$owner"
+}
+
+write_lifecycle_owner() {
+  local directory=$1 operation=$2 owner_tmp boot start owner_pid
+  capture_current_process_id owner_pid || return 1
+  boot=$(boot_identity) || return 1
+  start=$(process_start_identity "$owner_pid") || return 1
+  owner_tmp=$directory/.owner.$owner_pid
+  {
+    printf 'lifecycle-owner|2\nboot-id|%s\npid|%s\nprocess-start|%s\noperation|%s\n' \
+      "$boot" "$owner_pid" "$start" "$operation"
+  } >"$owner_tmp" || return 1
+  durable_replace "$owner_tmp" "$directory/owner" 0600
+}
+
+# Return 0 for a live owner, 1 only for a proved-stale owner, and 2 for an
+# invalid owner record. Callers must never reclaim the third state.
+lifecycle_owner_state() {
+  local directory=$1 owner boot pid start operation current_boot
+  owner=$directory/owner
+  validate_lifecycle_owner_record "$owner" || return 2
+  boot=$(record_value_from "$owner" boot-id)
+  pid=$(record_value_from "$owner" pid)
+  start=$(record_value_from "$owner" process-start)
+  operation=$(record_value_from "$owner" operation)
+  [ -n "$operation" ] || return 2
+  current_boot=$(boot_identity) || return 2
+  [ "$boot" = "$current_boot" ] || return 1
+  process_identity_live "$pid" "$start" && return 0
+  return 1
+}
+
+acquire_lifecycle_guard() {
+  local owner_pid guard_pid guard_rc
+  capture_current_process_id owner_pid || return 74
+  lifecycle_guard=$root_prefix/var/lib/machine-utilities-lifecycle.guard
+  lifecycle_guard_owned=false
+  lifecycle_guard_method=
+  if [ "$fixture_mode" = true ]; then
+    [ -x /usr/bin/shlock ] || return 74
+    if ! /usr/bin/shlock -f "$lifecycle_guard" -p "$owner_pid"; then return 75; fi
+    /bin/chmod 0600 "$lifecycle_guard" || return 74
+    protected_file "$lifecycle_guard" 1024 && exact_mode "$lifecycle_guard" 600 || return 74
+    guard_pid=$(/usr/bin/sed -n '1p' "$lifecycle_guard") || return 74
+    [ "$guard_pid" = "$owner_pid" ] || return 74
+    lifecycle_guard_method=shlock
+    lifecycle_guard_owned=true
+    return 0
+  fi
+  if [ "$platform_boundary" = macos ]; then
+    protected_file /usr/bin/lockf 33554432 && [ -x /usr/bin/lockf ] || return 74
+    [ ! -L "$lifecycle_guard" ] || return 74
+    exec 9>>"$lifecycle_guard" || return 74
+    if /usr/bin/lockf -s -t 0 9; then guard_rc=0
+    else guard_rc=$?
+    fi
+    if [ "$guard_rc" -ne 0 ]; then
+      exec 9>&-
+      [ "$guard_rc" -eq 75 ] && return 75
+      return 74
+    fi
+    /bin/chmod 0600 "$lifecycle_guard" || { exec 9>&-; return 74; }
+    /usr/sbin/chown root:wheel "$lifecycle_guard" || { exec 9>&-; return 74; }
+    protected_file "$lifecycle_guard" 1024 && exact_mode "$lifecycle_guard" 600 || {
+      exec 9>&-
+      return 74
+    }
+    lifecycle_guard_method=lockf
+    lifecycle_guard_owned=true
+    return 0
+  fi
+  protected_file /usr/bin/flock 33554432 && [ -x /usr/bin/flock ] || return 74
+  [ ! -L "$lifecycle_guard" ] || return 74
+  exec 9>>"$lifecycle_guard" || return 74
+  /usr/bin/flock -n 9 || { exec 9>&-; return 75; }
+  /bin/chmod 0600 "$lifecycle_guard" || { exec 9>&-; return 74; }
+  /usr/bin/chown root:"$protected_group" "$lifecycle_guard" || { exec 9>&-; return 74; }
+  protected_file "$lifecycle_guard" 1024 && exact_mode "$lifecycle_guard" 600 || {
+    exec 9>&-
+    return 74
+  }
+  lifecycle_guard_owned=true
+  lifecycle_guard_method=flock
+}
+
+release_lifecycle_guard() {
+  local owner_pid observed
+  [ "${lifecycle_guard_owned:-false}" = true ] || return 0
+  if [ "$lifecycle_guard_method" = shlock ]; then
+    capture_current_process_id owner_pid || return 1
+    observed=$(/usr/bin/sed -n '1p' "$lifecycle_guard" 2>/dev/null || true)
+    if [ "$observed" = "$owner_pid" ]; then /bin/rm -f "$lifecycle_guard"; fi
+  else
+    exec 9>&-
+  fi
+  lifecycle_guard_owned=false
+  lifecycle_guard_method=
+}
+
+cleanup_orphan_lock_prepare() {
+  local member member_name member_count=0 only_member='' temp_pid
+  [ -e "$lifecycle_prepare" ] || [ -L "$lifecycle_prepare" ] || return 0
+  protected_directory "$lifecycle_prepare" && exact_mode "$lifecycle_prepare" 700 || return 2
+  while IFS= read -r member; do
+    member_count=$((member_count + 1))
+    [ "$member_count" -eq 1 ] || return 2
+    [ -f "$member" ] && [ ! -L "$member" ] || return 2
+    only_member=$member
+    member_name=${member##*/}
+    case $member_name in
+      owner)
+        validate_lifecycle_owner_record "$member" || return 2
+        ;;
+      .owner.*)
+        temp_pid=${member_name#.owner.}
+        [[ $temp_pid =~ ^[1-9][0-9]{0,9}$ ]] || return 2
+        protected_file "$member" 2048 && exact_mode "$member" 600 || return 2
+        ;;
+      *) return 2 ;;
+    esac
+  done < <(/usr/bin/find "$lifecycle_prepare" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  if [ "$member_count" -eq 1 ]; then /bin/rm -f "$only_member" || return 2; fi
+  /bin/rmdir "$lifecycle_prepare" && durable_sync
+}
+
+cleanup_retired_lifecycle_directory() {
+  local retired=$1 member owner_state member_count=0
+  [ -e "$retired" ] || [ -L "$retired" ] || return 0
+  protected_directory "$retired" && exact_mode "$retired" 700 || return 1
+  [ ! -e "$retired/transaction" ] && [ ! -L "$retired/transaction" ] || return 1
+  while IFS= read -r member; do
+    member_count=$((member_count + 1))
+    [ "$member_count" -eq 1 ] && [ "$member" = "$retired/owner" ] || return 1
+  done < <(/usr/bin/find "$retired" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  if [ "$member_count" -eq 1 ]; then
+    if lifecycle_owner_state "$retired"; then owner_state=0
+    else owner_state=$?
+    fi
+    [ "$owner_state" -eq 0 ] || [ "$owner_state" -eq 1 ] || return 1
+    /bin/rm -f "$retired/owner" || return 1
+  fi
+  /bin/rmdir "$retired" || return 1
+  durable_sync
+}
+
+cleanup_orphan_transaction_temps() {
+  local directory=$1 member name temp_pid owner_seen=false transaction_seen=false
+  protected_directory "$directory" && exact_mode "$directory" 700 || return 1
+  # Validate the complete member set before deleting anything. An attacker- or
+  # corruption-supplied sibling must leave even otherwise valid transaction
+  # temporaries untouched for fail-closed inspection.
+  while IFS= read -r member; do
+    name=${member##*/}
+    case $name in
+      owner)
+        [ "$owner_seen" = false ] || return 1
+        owner_seen=true
+        ;;
+      transaction)
+        [ "$transaction_seen" = false ] || return 1
+        transaction_seen=true
+        ;;
+      .transaction.*)
+        temp_pid=${name#.transaction.}
+        [[ $temp_pid =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+        protected_file "$member" 4096 && exact_mode "$member" 600 || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done < <(/usr/bin/find "$directory" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  [ "$owner_seen" = true ] || return 1
+  while IFS= read -r member; do
+    name=${member##*/}
+    case $name in .transaction.*) /bin/rm -f "$member" || return 1 ;; esac
+  done < <(/usr/bin/find "$directory" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  durable_sync
+}
+
+validate_lifecycle_directory_members() {
+  local directory=$1 member name owner_seen=false transaction_seen=false
+  protected_directory "$directory" && exact_mode "$directory" 700 || return 1
+  while IFS= read -r member; do
+    name=${member##*/}
+    case $name in
+      owner) [ "$owner_seen" = false ] || return 1; owner_seen=true ;;
+      transaction) [ "$transaction_seen" = false ] || return 1; transaction_seen=true ;;
+      *) return 1 ;;
+    esac
+  done < <(/usr/bin/find "$directory" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  [ "$owner_seen" = true ]
+}
+
+retire_lifecycle_directory() {
+  local canonical=$1 retired=$2 pause_point=$3
+  protected_directory "$canonical" && exact_mode "$canonical" 700 || return 1
+  [ ! -e "$canonical/transaction" ] && [ ! -L "$canonical/transaction" ] || return 1
+  validate_lifecycle_directory_members "$canonical" || return 1
+  [ ! -e "$retired" ] && [ ! -L "$retired" ] || return 1
+  /bin/mv "$canonical" "$retired" || return 1
+  durable_sync || return 1
+  u2_pause "$pause_point" || return 1
+  cleanup_retired_lifecycle_directory "$retired"
+}
+
+retire_recovery_directory() {
+  retire_lifecycle_directory "$lifecycle_recovery" "$lifecycle_recovery_retired" recovery-retired
+}
+
+recover_existing_lifecycle() {
+  local recovery_rc=0 owner_state recovery_owner_operation
+  protected_directory "$lifecycle_recovery" && exact_mode "$lifecycle_recovery" 700 || return 2
+  if lifecycle_owner_state "$lifecycle_recovery"; then owner_state=0
+  else owner_state=$?
+  fi
+  [ "$owner_state" -eq 0 ] || [ "$owner_state" -eq 1 ] || return 2
+  cleanup_orphan_transaction_temps "$lifecycle_recovery" || return 2
+  validate_lifecycle_directory_members "$lifecycle_recovery" || return 2
+  lifecycle_transaction_root=$lifecycle_recovery
+  u2_pause recovery-claimed || return 2
+  if [ -e "$lifecycle_recovery/transaction" ] || [ -L "$lifecycle_recovery/transaction" ]; then
+    if recover_lifecycle_transaction "$lifecycle_recovery"; then recovery_rc=0
+    else recovery_rc=$?
+    fi
+    [ "$recovery_rc" -eq 0 ] || return "$recovery_rc"
+  else
+    [ ! -e "$state_root/draining" ] && [ ! -L "$state_root/draining" ] || return 2
+    recovery_owner_operation=$(record_value_from "$lifecycle_recovery/owner" operation) || return 2
+    if [ "$recovery_owner_operation" = revoke ] && [ -L "$config_root/active" ] &&
+      { [ ! -e "$revocation_reserve" ] && [ ! -L "$revocation_reserve" ]; }; then
+      ensure_revocation_reserve "$revocation_reserve_provision_bytes" || return 2
+    fi
+  fi
+  retire_recovery_directory
+}
+
+park_lifecycle_transaction() {
+  [ "${lifecycle_owned:-false}" = true ] || return 1
+  [ -e "$lifecycle_lock/transaction" ] && [ ! -L "$lifecycle_lock/transaction" ] || return 1
+  [ ! -e "$lifecycle_recovery" ] && [ ! -L "$lifecycle_recovery" ] || return 1
+  /bin/mv "$lifecycle_lock" "$lifecycle_recovery" || return 1
+  durable_sync || return 1
+  lifecycle_owned=false
+  lifecycle_transaction_root=$lifecycle_recovery
+}
+
+acquire_lifecycle_lock() {
+  local owner_state recovery_rc guard_rc owner_pid
+  capture_current_process_id owner_pid || {
+    lifecycle_lock_reason=lifecycle_owner_identity_failed
+    return 74
+  }
+  lifecycle_lock=$root_prefix/var/lib/machine-utilities-lifecycle.lock
+  lifecycle_recovery=$root_prefix/var/lib/machine-utilities-lifecycle.recovery
+  lifecycle_prepare=$root_prefix/var/lib/.machine-utilities-lifecycle.lock.prepare
+  lifecycle_lock_retired=$root_prefix/var/lib/.machine-utilities-lifecycle.lock.retired
+  lifecycle_recovery_retired=$root_prefix/var/lib/.machine-utilities-lifecycle.recovery.retired
+  lifecycle_lock_reason=lifecycle_operation_in_progress
+  if acquire_lifecycle_guard; then guard_rc=0
+  else guard_rc=$?
+  fi
+  case $guard_rc in
+    0) ;;
+    75) lifecycle_lock_reason=lifecycle_operation_in_progress; return 75 ;;
+    *) lifecycle_lock_reason=lifecycle_guard_failed; return 74 ;;
+  esac
+  cleanup_retired_lifecycle_directory "$lifecycle_lock_retired" || {
+    lifecycle_lock_reason=lifecycle_lock_retirement_invalid
+    return 74
+  }
+  cleanup_retired_lifecycle_directory "$lifecycle_recovery_retired" || {
+    lifecycle_lock_reason=lifecycle_recovery_retirement_invalid
+    return 74
+  }
+  cleanup_orphan_lock_prepare || { lifecycle_lock_reason=lifecycle_prepare_invalid; return 74; }
+  if [ -e "$lifecycle_recovery" ] || [ -L "$lifecycle_recovery" ]; then
+    if recover_existing_lifecycle; then recovery_rc=0
+    else recovery_rc=$?
+    fi
+    case $recovery_rc in
+      0) ;;
+      75) lifecycle_lock_reason=active_request_must_settle; return 75 ;;
+      *) lifecycle_lock_reason=lifecycle_recovery_failed; return 74 ;;
+    esac
+  fi
+  if [ -e "$lifecycle_lock" ] || [ -L "$lifecycle_lock" ]; then
+    protected_directory "$lifecycle_lock" && exact_mode "$lifecycle_lock" 700 || {
+      lifecycle_lock_reason=lifecycle_lock_invalid
+      return 74
+    }
+    if lifecycle_owner_state "$lifecycle_lock"; then owner_state=0
+    else owner_state=$?
+    fi
+    case $owner_state in
+      0) lifecycle_lock_reason=lifecycle_owner_inconsistent_with_guard; return 74 ;;
+      1)
+        [ ! -e "$lifecycle_recovery" ] && [ ! -L "$lifecycle_recovery" ] || {
+          lifecycle_lock_reason=lifecycle_recovery_collision
+          return 74
+        }
+        /bin/mv "$lifecycle_lock" "$lifecycle_recovery" || {
+          lifecycle_lock_reason=lifecycle_recovery_publish_failed
+          return 74
+        }
+        durable_sync || { lifecycle_lock_reason=lifecycle_recovery_sync_failed; return 74; }
+        if recover_existing_lifecycle; then recovery_rc=0
+        else recovery_rc=$?
+        fi
+        case $recovery_rc in
+          0) ;;
+          75) lifecycle_lock_reason=active_request_must_settle; return 75 ;;
+          *) lifecycle_lock_reason=lifecycle_recovery_failed; return 74 ;;
+        esac
+        ;;
+      *) lifecycle_lock_reason=lifecycle_owner_invalid; return 74 ;;
+    esac
+  fi
+  /bin/mkdir "$lifecycle_prepare" || { lifecycle_lock_reason=lifecycle_prepare_collision; return 74; }
+  /bin/chmod 0700 "$lifecycle_prepare" || return 74
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$lifecycle_prepare" || return 74; fi
+  u2_pause lifecycle-prepare-before-owner || {
+    lifecycle_lock_reason=fixture_pause_failed
+    return 74
+  }
+  write_lifecycle_owner "$lifecycle_prepare" "$lifecycle_operation" || {
+    lifecycle_lock_reason=lifecycle_owner_write_failed
+    return 74
+  }
+  durable_sync || return 74
+  /bin/mv "$lifecycle_prepare" "$lifecycle_lock" || {
+    lifecycle_lock_reason=lifecycle_lock_publish_failed
+    return 74
+  }
+  durable_sync || return 74
+  lifecycle_owned=true
+  lifecycle_transaction_root=$lifecycle_lock
+  return 0
+}
+
+release_lifecycle_lock() {
+  [ "${lifecycle_owned:-false}" = true ] || return 0
+  if [ -e "$lifecycle_lock/transaction" ] || [ -L "$lifecycle_lock/transaction" ]; then
+    lifecycle_owned=false
+    return 0
+  fi
+  retire_lifecycle_directory "$lifecycle_lock" "$lifecycle_lock_retired" lifecycle-lock-retired || return 1
+  lifecycle_owned=false
+}
+
+write_transaction_phase() {
+  local phase=$1 transaction_tmp owner_pid
+  capture_current_process_id owner_pid || return 1
+  case $phase in intent|drained|waiting|snapshotted|prepared|mutating|quarantining|rolled-back|rollback-finalizing|committed|commit-finalizing) ;;
+    *) return 1 ;;
+  esac
+  transaction_phase=$phase
+  transaction_tmp=$lifecycle_transaction_root/.transaction.$owner_pid
+  {
+    printf 'lifecycle-transaction|1\noperation|%s\ntransaction-id|%s\n' \
+      "$transaction_operation" "$transaction_id"
+    printf 'owner-boot|%s\nowner-pid|%s\nowner-start|%s\n' \
+      "$transaction_boot" "$owner_pid" "$transaction_start"
+    printf 'from-epoch|%s\nto-epoch|%s\nmanifest-sha256|%s\nconfirmation-sha256|%s\nphase|%s\n' \
+      "$transaction_from" "$transaction_to" "$transaction_manifest" \
+      "$transaction_confirmation" "$transaction_phase"
+  } >"$transaction_tmp" || return 1
+  durable_replace "$transaction_tmp" "$lifecycle_transaction_root/transaction" 0600
+}
+
+begin_transaction() {
+  local owner_pid
+  capture_current_process_id owner_pid || return 1
+  transaction_operation=$1
+  transaction_from=$2
+  transaction_to=$3
+  transaction_manifest=$4
+  transaction_confirmation=$5
+  transaction_id="$transaction_operation-$transaction_from-$transaction_to-$transaction_manifest"
+  transaction_boot=$(boot_identity) || return 1
+  transaction_start=$(process_start_identity "$owner_pid") || return 1
+  write_transaction_phase intent
+}
+
+transaction_artifact_absent() {
+  [ ! -e "$1" ] && [ ! -L "$1" ]
+}
+
+preflight_transaction_artifacts() {
+  local candidate
+  for candidate in "$@"; do transaction_artifact_absent "$candidate" || return 1; done
+}
+
+write_artifact_marker() {
+  local directory=$1 mode=$2 marker_tmp
+  marker_tmp=$directory/.lifecycle-transaction.$$
+  printf 'lifecycle-artifact|1|transaction-id=%s\n' "$transaction_id" >"$marker_tmp" || return 1
+  durable_replace "$marker_tmp" "$directory/.lifecycle-transaction" "$mode"
+}
+
+validate_artifact_marker() {
+  local directory=$1 expected_id=$2 mode=$3 marker
+  marker=$directory/.lifecycle-transaction
+  protected_file "$marker" 1024 && exact_mode "$marker" "$mode" || return 1
+  [ "$(/usr/bin/sed -n '1p' "$marker")" = "lifecycle-artifact|1|transaction-id=$expected_id" ] &&
+    [ "$(/usr/bin/wc -l <"$marker" | /usr/bin/tr -d ' ')" = 1 ]
+}
+
+artifact_prepare_path() {
+  printf '%s.prepare\n' "$1"
+}
+
+cleanup_artifact_prepare() {
+  local prepare=$1 expected_parent=$2 expected_id=$3 directory_mode=$4 marker_mode=$5
+  local member name member_count=0 only_member='' temp_pid
+  [ -e "$prepare" ] || [ -L "$prepare" ] || return 0
+  case $prepare in "$expected_parent"/*) ;; *) return 1 ;; esac
+  protected_directory "$prepare" && exact_mode "$prepare" "$directory_mode" || return 1
+  while IFS= read -r member; do
+    member_count=$((member_count + 1))
+    [ "$member_count" -eq 1 ] || return 1
+    only_member=$member
+    name=${member##*/}
+    case $name in
+      .lifecycle-transaction)
+        validate_artifact_marker "$prepare" "$expected_id" "$marker_mode" || return 1
+        ;;
+      .lifecycle-transaction.*)
+        temp_pid=${name#.lifecycle-transaction.}
+        [[ $temp_pid =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+        protected_file "$member" 1024 || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done < <(/usr/bin/find "$prepare" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  if [ "$member_count" -eq 1 ]; then /bin/rm -f "$only_member" || return 1; fi
+  /bin/rmdir "$prepare" && durable_sync
+}
+
+create_marked_transaction_directory() {
+  local directory=$1 directory_mode=$2 marker_mode=$3 pause_point=$4 prepare
+  prepare=$(artifact_prepare_path "$directory") || return 1
+  transaction_artifact_absent "$directory" && transaction_artifact_absent "$prepare" || return 1
+  /bin/mkdir -m "$directory_mode" "$prepare" || return 1
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$prepare" || return 1; fi
+  protected_directory "$prepare" && exact_mode "$prepare" "$directory_mode" || return 1
+  u2_pause "$pause_point" || return 1
+  write_artifact_marker "$prepare" "$marker_mode" || return 1
+  validate_artifact_marker "$prepare" "$transaction_id" "$marker_mode" || return 1
+  durable_sync || return 1
+  /bin/mv "$prepare" "$directory" || return 1
+  durable_sync
+}
+
+clear_transaction() {
+  /bin/rm -f "$lifecycle_transaction_root/transaction" || return 1
+  durable_sync
+}
+
+write_drain() {
+  local expected=$1 existing drain_tmp
+  draining=$state_root/draining
+  if [ -e "$draining" ] || [ -L "$draining" ]; then
+    protected_file "$draining" 2048 && exact_mode "$draining" 600 || return 1
+    existing=$(/bin/cat "$draining") || return 1
+    [ "$existing" = "$expected" ] || return 2
+    drain_owned=true
+    return 0
+  fi
+  drain_tmp=$state_root/.draining.$$
+  printf '%s\n' "$expected" >"$drain_tmp" || return 1
+  /bin/chmod 0600 "$drain_tmp" || return 1
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$drain_tmp" || return 1; fi
+  /bin/mv "$drain_tmp" "$draining" || return 1
+  drain_owned=true
+}
+
+u2_failpoint() {
+  local point=$1
+  [ "$fixture_mode" = true ] || return 0
+  [ "${ROUNDHOUSE_U2_FAILPOINT:-}" = "$point" ] || return 0
+  result drifted "fixture_failpoint_${point//-/_}" linux
+  return 97
+}
+
+snapshot_path() {
+  local label=$1 path=$2 meta_tmp data_tmp mode observed_digest kind
+  meta_tmp=$backup/.$label.meta.$$
+  data_tmp=$backup/.$label.data.$$
+  if [ -L "$path" ]; then
+    kind=symlink
+    printf '%s\n' "$(/usr/bin/readlink "$path")" >"$data_tmp" || return 1
+    durable_replace "$data_tmp" "$backup/$label.data" 0600 || return 1
+    observed_digest=$(sha256_file "$backup/$label.data") || return 1
+    mode=-
+  elif [ -f "$path" ]; then
+    kind='file'
+    mode=$(file_mode "$path" | /usr/bin/sed 's/.*\(...\)$/\1/') || return 1
+    /bin/cp "$path" "$data_tmp" || return 1
+    durable_replace "$data_tmp" "$backup/$label.data" 0600 || return 1
+    observed_digest=$(sha256_file "$backup/$label.data") || return 1
+  elif [ ! -e "$path" ]; then
+    kind=absent
+    mode=-
+    observed_digest=-
+  else
+    return 1
+  fi
+  printf 'snapshot|1|kind=%s|mode=%s|sha256=%s\n' "$kind" "$mode" "$observed_digest" \
+    >"$meta_tmp" || return 1
+  durable_replace "$meta_tmp" "$backup/$label.meta" 0600
+}
+
+atomic_replace_symlink() {
+  local source=$1 destination=$2
+  if /bin/mv -f -T "$source" "$destination" 2>/dev/null; then return 0; fi
+  /bin/mv -f -h "$source" "$destination"
+}
+
+restore_path() {
+  local label=$1 path=$2 kind mode target restore_path_tmp
+  validate_snapshot "$label" || return 1
+  kind=$(snapshot_field "$backup/$label.meta" kind)
+  mode=$(snapshot_field "$backup/$label.meta" mode)
+  case $kind in
+    absent)
+      /bin/rm -f "$path" && durable_sync
+      ;;
+    file)
+      restore_path_tmp=$path.rollback.$transaction_id
+      /bin/rm -f "$restore_path_tmp" || return 1
+      /bin/cp "$backup/$label.data" "$restore_path_tmp" || return 1
+      /bin/chmod "$mode" "$restore_path_tmp" || return 1
+      if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$restore_path_tmp" || return 1; fi
+      durable_sync || return 1
+      /bin/mv -f "$restore_path_tmp" "$path" && durable_sync
+      ;;
+    symlink)
+      target=$(/usr/bin/sed -n '1p' "$backup/$label.data") || return 1
+      restore_path_tmp=$path.rollback.$transaction_id
+      /bin/rm -f "$restore_path_tmp" && /bin/ln -s "$target" "$restore_path_tmp" &&
+        atomic_replace_symlink "$restore_path_tmp" "$path" && durable_sync
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+snapshot_field() {
+  /usr/bin/awk -F '|' -v requested="$2" '
+    NR==1{for(i=3;i<=NF;i++){split($i,pair,"=");if(pair[1]==requested){print substr($i,length(pair[1])+2);exit}}}
+  ' "$1"
+}
+
+snapshot_expected_mode() {
+  case $1 in
+    broker) printf '%s\n' 755 ;;
+    sudoers) printf '%s\n' 440 ;;
+    fleet_ca|allowed_signers|revoked_krl|public_enrollment|public_canary) printf '%s\n' 644 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_snapshot() {
+  local label=$1 meta kind mode stored_digest expected_mode
+  meta=$backup/$label.meta
+  protected_file "$meta" 1024 && exact_mode "$meta" 600 || return 1
+  /usr/bin/awk -F '|' '
+    NR!=1||NF!=5||$1!="snapshot"||$2!="1"||$3!~/^kind=(absent|file|symlink)$/||
+      $4!~/^mode=(-|[0-7]{3})$/||$5!~/^sha256=(-|[0-9a-f]{64})$/{exit 1}
+  ' "$meta" || return 1
+  kind=$(snapshot_field "$meta" kind)
+  mode=$(snapshot_field "$meta" mode)
+  stored_digest=$(snapshot_field "$meta" sha256)
+  case $kind in
+    absent)
+      [ "$mode" = - ] && [ "$stored_digest" = - ] &&
+        [ ! -e "$backup/$label.data" ] && [ ! -L "$backup/$label.data" ]
+      ;;
+    symlink)
+      [ "$label" = active ] && [ "$mode" = - ] && digest "$stored_digest" &&
+        protected_file "$backup/$label.data" 1024 && exact_mode "$backup/$label.data" 600 &&
+        [ "$(sha256_file "$backup/$label.data")" = "$stored_digest" ] &&
+        [ "$(/usr/bin/wc -l <"$backup/$label.data" | /usr/bin/tr -d ' ')" = 1 ] &&
+        [[ $(/usr/bin/sed -n '1p' "$backup/$label.data") =~ ^generations/[1-9][0-9]{0,9}$ ]]
+      ;;
+    file)
+      expected_mode=$(snapshot_expected_mode "$label") || return 1
+      [ "$mode" = "$expected_mode" ] && digest "$stored_digest" &&
+        protected_file "$backup/$label.data" 33554432 && exact_mode "$backup/$label.data" 600 &&
+        [ "$(sha256_file "$backup/$label.data")" = "$stored_digest" ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_backup() {
+  local expected_from=$1 label member name expected_marker_id
+  expected_marker_id=${recovery_id:-$transaction_id}
+  protected_directory "$backup" && exact_mode "$backup" 700 || return 1
+  validate_artifact_marker "$backup" "$expected_marker_id" 600 || return 1
+  for label in active broker sudoers fleet_ca allowed_signers revoked_krl public_enrollment public_canary; do
+    validate_snapshot "$label" || return 1
+  done
+  while IFS= read -r member; do
+    [ -f "$member" ] && [ ! -L "$member" ] || return 1
+    name=${member##*/}
+    case $name in
+      .lifecycle-transaction) ;;
+      active.meta|broker.meta|sudoers.meta|fleet_ca.meta|allowed_signers.meta|revoked_krl.meta|public_enrollment.meta|public_canary.meta) ;;
+      active.data|broker.data|sudoers.data|fleet_ca.data|allowed_signers.data|revoked_krl.data|public_enrollment.data|public_canary.data) ;;
+      *) return 1 ;;
+    esac
+  done < <(/usr/bin/find "$backup" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  if [ "$expected_from" -eq 0 ]; then
+    for label in active broker sudoers fleet_ca allowed_signers revoked_krl public_canary; do
+      [ "$(snapshot_field "$backup/$label.meta" kind)" = absent ] || return 1
+    done
+  else
+    [ "$(snapshot_field "$backup/active.meta" kind)" = symlink ] || return 1
+    [ "$(/usr/bin/sed -n '1p' "$backup/active.data")" = "generations/$expected_from" ] || return 1
+    for label in broker sudoers fleet_ca allowed_signers revoked_krl public_enrollment public_canary; do
+      [ "$(snapshot_field "$backup/$label.meta" kind)" = file ] || return 1
+    done
+  fi
+}
+
+transaction_value() {
+  record_value_from "$1/transaction" "$2"
+}
+
+validate_transaction_record() {
+  local directory=$1 record expected_id transaction_owner_pid
+  record=$directory/transaction
+  protected_file "$record" 4096 && exact_mode "$record" 600 || return 1
+  /usr/bin/awk -F '|' '
+    $0!~/^[ -~]+$/||length($0)>1024{exit 1}
+    NR==1{if($0!="lifecycle-transaction|1")exit 1;next}
+    NR==2{if(NF!=2||$1!="operation"||($2!="install"&&$2!="revoke"))exit 1;next}
+    NR==3{if(NF!=2||$1!="transaction-id")exit 1;next}
+    NR==4{if(NF!=2||$1!="owner-boot"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    NR==5{if(NF!=2||$1!="owner-pid"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+    NR==6{if(NF!=2||$1!="owner-start"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    NR==7{if(NF!=2||$1!="from-epoch"||$2!~/^(0|[1-9][0-9]{0,9})$/)exit 1;next}
+    NR==8{if(NF!=2||$1!="to-epoch"||$2!~/^(0|[1-9][0-9]{0,9})$/)exit 1;next}
+    NR==9{if(NF!=2||$1!="manifest-sha256"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    NR==10{if(NF!=2||$1!="confirmation-sha256"||($2!="-"&&(length($2)!=64||$2!~/^[0-9a-f]+$/)))exit 1;next}
+    NR==11{if(NF!=2||$1!="phase"||$2!~/^(intent|drained|waiting|snapshotted|prepared|mutating|quarantining|rolled-back|rollback-finalizing|committed|commit-finalizing)$/)exit 1;next}
+    {exit 1} END{if(NR!=11)exit 1}
+  ' "$record" || return 1
+  recovery_operation=$(transaction_value "$directory" operation)
+  recovery_id=$(transaction_value "$directory" transaction-id)
+  recovery_from=$(transaction_value "$directory" from-epoch)
+  recovery_to=$(transaction_value "$directory" to-epoch)
+  recovery_manifest=$(transaction_value "$directory" manifest-sha256)
+  recovery_confirmation=$(transaction_value "$directory" confirmation-sha256)
+  recovery_phase=$(transaction_value "$directory" phase)
+  expected_id="$recovery_operation-$recovery_from-$recovery_to-$recovery_manifest"
+  [ "$recovery_id" = "$expected_id" ] || return 1
+  case $recovery_operation in
+    install)
+      [ "$recovery_to" -eq $((recovery_from + 1)) ] && digest "$recovery_confirmation" &&
+        [ "$recovery_phase" != quarantining ]
+      ;;
+    revoke)
+      [ "$recovery_from" -gt 0 ] && [ "$recovery_to" -eq 0 ] &&
+        [ "$recovery_confirmation" = - ] &&
+        [ "$recovery_phase" != snapshotted ] && [ "$recovery_phase" != prepared ] &&
+        [ "$recovery_phase" != mutating ]
+      ;;
+  esac || return 1
+  transaction_operation=$recovery_operation
+  transaction_id=$recovery_id
+  transaction_from=$recovery_from
+  transaction_to=$recovery_to
+  transaction_manifest=$recovery_manifest
+  transaction_confirmation=$recovery_confirmation
+  transaction_phase=$recovery_phase
+  transaction_boot=$(boot_identity) || return 1
+  capture_current_process_id transaction_owner_pid || return 1
+  transaction_start=$(process_start_identity "$transaction_owner_pid") || return 1
+  lifecycle_transaction_root=$directory
+}
+
+validate_drain() {
+  local expected=$1 observed
+  protected_file "$state_root/draining" 2048 && exact_mode "$state_root/draining" 600 || return 1
+  observed=$(/bin/cat "$state_root/draining") || return 1
+  [ "$observed" = "$expected" ]
+}
+
+validate_and_remove_drain() {
+  local expected=$1 may_be_absent=$2 observed
+  if [ ! -e "$state_root/draining" ] && [ ! -L "$state_root/draining" ]; then
+    [ "$may_be_absent" = true ]
+    return
+  fi
+  protected_file "$state_root/draining" 2048 && exact_mode "$state_root/draining" 600 || return 1
+  observed=$(/bin/cat "$state_root/draining") || return 1
+  [ "$observed" = "$expected" ] || return 1
+  /bin/rm -f "$state_root/draining" && durable_sync
+}
+
+remove_known_tree() {
+  local path=$1 expected_parent=$2 expected_id=$3 marker_mode=$4
+  case $path in "$expected_parent"/*) ;; *) return 1 ;; esac
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -d "$path" ] && [ ! -L "$path" ] || return 1
+    validate_artifact_marker "$path" "$expected_id" "$marker_mode" || return 1
+    /bin/rm -rf "$path" || return 1
+    durable_sync
+  fi
+}
+
+cleanup_install_artifacts() {
+  local final_generation=$config_root/generations/$recovery_to
+  local staging=$config_root/generations/.staging-$recovery_to-$recovery_manifest
+  local prefix=$recovery_id temporary
+  case $recovery_phase in
+    committed|commit-finalizing) ;;
+    *) remove_known_tree "$final_generation" "$config_root/generations" "$recovery_id" 644 || return 1 ;;
+  esac
+  if [ -e "$staging" ] || [ -L "$staging" ]; then
+    remove_known_tree "$staging" "$config_root/generations" "$recovery_id" 644 || return 1
+  fi
+  for temporary in "$state_root/.posix-broker.$prefix" "$state_root/.fleet-ca.$prefix" \
+    "$state_root/.allowed-signers.$prefix" "$state_root/.revoked-krl.$prefix" \
+    "$state_root/.sudoers.$prefix" "$state_root/.enrollment-receipt.$prefix" \
+    "$state_root/.canary-receipt.$prefix" "$state_root/.canary-output.$prefix" \
+    "$state_root/.direct-output.$prefix" "$config_root/.active.$prefix" \
+    "$root_prefix/var/lib/machine-utilities-public/.enrollment.$prefix" \
+    "$root_prefix/var/lib/machine-utilities-public/.canary.$prefix"; do
+    if [ -L "$temporary" ]; then
+      [ "$temporary" = "$config_root/.active.$prefix" ] &&
+        [ "$(symlink_owner "$temporary")" = "$protected_owner" ] &&
+        [ "$(/usr/bin/readlink "$temporary")" = "generations/$recovery_to" ] || return 1
+      /bin/rm -f "$temporary" || return 1
+    elif [ -e "$temporary" ]; then
+      protected_file "$temporary" 33554432 || return 1
+      /bin/rm -f "$temporary" || return 1
+    fi
+  done
+  durable_sync
+}
+
+restore_install_snapshot() {
+  local label
+  transaction_id=$recovery_id
+  backup=$state_root/rollback/$recovery_id
+  validate_backup "$recovery_from" || return 1
+  for label in active broker sudoers fleet_ca allowed_signers revoked_krl public_enrollment public_canary; do
+    case $label in
+      active) restore_path "$label" "$config_root/active" ;;
+      broker) restore_path "$label" "$broker_path" ;;
+      sudoers) restore_path "$label" "$sudoers_path" ;;
+      fleet_ca) restore_path "$label" "$config_root/trust/fleet-ca.pub" ;;
+      allowed_signers) restore_path "$label" "$config_root/trust/allowed_signers" ;;
+      revoked_krl) restore_path "$label" "$config_root/trust/revoked.krl" ;;
+      public_enrollment) restore_path "$label" "$root_prefix/var/lib/machine-utilities-public/enrollment" ;;
+      public_canary) restore_path "$label" "$root_prefix/var/lib/machine-utilities-public/canary" ;;
+    esac || return 1
+  done
+}
+
+quarantine_member_ready() {
+  local path=$1 kind=$2 mode=${3:-}
+  case $kind in
+    directory) protected_directory "$path" && { [ -z "$mode" ] || exact_mode "$path" "$mode"; } ;;
+    file) protected_file "$path" 33554432 && { [ -z "$mode" ] || exact_mode "$path" "$mode"; } ;;
+    symlink) [ -L "$path" ] && [ "$(symlink_owner "$path")" = "$protected_owner" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_revoked_receipt() {
+  local expected_epoch=$1 expected_manifest=$2 receipt scope
+  receipt=$root_prefix/var/lib/machine-utilities-public/enrollment
+  protected_file "$receipt" 4096 && exact_mode "$receipt" 644 || return 1
+  /usr/bin/awk -F '|' '
+    NR==1{if($0!="enrollment-receipt|2")exit 1;next}
+    NR==2{if($0!="state|revoked")exit 1;next}
+    NR==3{if(NF!=2||$1!="scope"||($2!="fixture"&&$2!="native"))exit 1;next}
+    NR==4{if(NF!=2||$1!="epoch"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+    NR==5{if(NF!=2||$1!="manifest-sha256"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    NR==6{if($0!="reason|grant_broker_generation_and_trust_quarantined")exit 1;next}
+    {exit 1} END{if(NR!=6)exit 1}
+  ' "$receipt" || return 1
+  scope=$(record_value_from "$receipt" scope)
+  if [ "$fixture_mode" = true ]; then [ "$scope" = fixture ] || return 1
+  else [ "$scope" = native ] || return 1
+  fi
+  [ "$(record_value_from "$receipt" epoch)" = "$expected_epoch" ] &&
+    [ "$(record_value_from "$receipt" manifest-sha256)" = "$expected_manifest" ]
+}
+
+validate_completed_revocation() {
+  local expected_epoch=$1 expected_manifest=$2 quarantine=$3 member name expected_id
+  expected_id=revoke-$expected_epoch-0-$expected_manifest
+  for member in "$broker_path" "$sudoers_path" "$config_root/active" \
+    "$config_root/generations/$expected_epoch" "$config_root/trust/fleet-ca.pub" \
+    "$config_root/trust/allowed_signers" "$config_root/trust/revoked.krl" \
+    "$root_prefix/var/lib/machine-utilities-public/canary"; do
+    [ ! -e "$member" ] && [ ! -L "$member" ] || return 1
+  done
+  protected_directory "$quarantine" && exact_mode "$quarantine" 700 || return 1
+  validate_artifact_marker "$quarantine" "$expected_id" 600 || return 1
+  quarantine_member_ready "$quarantine/generation" directory 755 &&
+    quarantine_member_ready "$quarantine/active" symlink &&
+    [ "$(/usr/bin/readlink "$quarantine/active")" = "generations/$expected_epoch" ] &&
+    quarantine_member_ready "$quarantine/posix-broker" file 755 &&
+    quarantine_member_ready "$quarantine/sudoers" file 440 &&
+    quarantine_member_ready "$quarantine/fleet-ca.pub" file 644 &&
+    quarantine_member_ready "$quarantine/allowed_signers" file 644 &&
+    quarantine_member_ready "$quarantine/revoked.krl" file 644 &&
+    quarantine_member_ready "$quarantine/public-enrollment" file 644 &&
+    quarantine_member_ready "$quarantine/public-canary" file 644 || return 1
+  while IFS= read -r member; do
+    name=${member##*/}
+    case $name in
+      .lifecycle-transaction) ;;
+      generation|active|posix-broker|sudoers|fleet-ca.pub|allowed_signers|revoked.krl|public-enrollment|public-canary) ;;
+      *) return 1 ;;
+    esac
+  done < <(/usr/bin/find "$quarantine" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  validate_revoked_receipt "$expected_epoch" "$expected_manifest"
+}
+
+restore_revoke_quarantine() {
+  local quarantine=$1 index live quarantined
+  local -a live_paths=(
+    "$root_prefix/var/lib/machine-utilities-public/enrollment"
+    "$root_prefix/var/lib/machine-utilities-public/canary"
+    "$sudoers_path" "$broker_path" "$config_root/active"
+    "$config_root/generations/$recovery_from"
+    "$config_root/trust/fleet-ca.pub" "$config_root/trust/allowed_signers" "$config_root/trust/revoked.krl"
+  )
+  local -a quarantine_paths=(
+    "$quarantine/public-enrollment" "$quarantine/public-canary" "$quarantine/sudoers"
+    "$quarantine/posix-broker" "$quarantine/active" "$quarantine/generation"
+    "$quarantine/fleet-ca.pub" "$quarantine/allowed_signers" "$quarantine/revoked.krl"
+  )
+  if [ ! -e "$quarantine" ] && [ ! -L "$quarantine" ]; then
+    validate_coherent_enrollment "$recovery_from" recorded
+    return
+  fi
+  protected_directory "$quarantine" && exact_mode "$quarantine" 700 || return 1
+  validate_artifact_marker "$quarantine" "$recovery_id" 600 || return 1
+  # A non-committed revocation may have published its replacement status just
+  # before dying. It is not old enrollment state and must be removed only after
+  # its exact transaction binding is proved.
+  if { [ -e "${live_paths[0]}" ] || [ -L "${live_paths[0]}" ]; } &&
+    { [ -e "${quarantine_paths[0]}" ] || [ -L "${quarantine_paths[0]}" ]; }; then
+    validate_revoked_receipt "$recovery_from" "$recovery_manifest" || return 1
+    /bin/rm -f "${live_paths[0]}" || return 1
+    durable_sync || return 1
+  fi
+  for ((index=0; index<${#live_paths[@]}; index++)); do
+    live=${live_paths[$index]}
+    quarantined=${quarantine_paths[$index]}
+    if { [ -e "$live" ] || [ -L "$live" ]; } && { [ -e "$quarantined" ] || [ -L "$quarantined" ]; }; then
+      return 1
+    elif [ ! -e "$live" ] && [ ! -L "$live" ] && [ ! -e "$quarantined" ] && [ ! -L "$quarantined" ]; then
+      return 1
+    fi
+  done
+  for ((index=0; index<${#live_paths[@]}; index++)); do
+    live=${live_paths[$index]}
+    quarantined=${quarantine_paths[$index]}
+    if [ -e "$quarantined" ] || [ -L "$quarantined" ]; then
+      /bin/mv "$quarantined" "$live" || return 1
+      durable_sync || return 1
+    fi
+  done
+  validate_coherent_enrollment "$recovery_from" recorded
+}
+
+cleanup_rolled_back_quarantine() {
+  local quarantine=$1 member
+  [ -e "$quarantine" ] || [ -L "$quarantine" ] || return 0
+  protected_directory "$quarantine" && exact_mode "$quarantine" 700 || return 1
+  validate_artifact_marker "$quarantine" "$recovery_id" 600 || return 1
+  while IFS= read -r member; do
+    [ "$member" = "$quarantine/.lifecycle-transaction" ] || return 1
+  done < <(/usr/bin/find "$quarantine" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  /bin/rm -f "$quarantine/.lifecycle-transaction" || return 1
+  /bin/rmdir "$quarantine" || return 1
+  durable_sync
+}
+
+advance_recovery_phase() {
+  write_transaction_phase "$1" || return 1
+  recovery_phase=$1
+}
+
+validate_recovery_old_install() {
+  if [ "$recovery_from" -eq 0 ]; then validate_unenrolled_state
+  else validate_coherent_enrollment "$recovery_from" recorded
+  fi
+}
+
+active_request_in_progress() {
+  [ -e "$state_root/lock/active" ] || [ -L "$state_root/lock/active" ] || return 1
+  protected_directory "$state_root/lock/active" && exact_mode "$state_root/lock/active" 700
+}
+
+recover_install_transaction() {
+  local directory=$1 backup_path backup_prepare staging staging_prepare drain_record
+  backup_path=$state_root/rollback/$recovery_id
+  backup_prepare=$(artifact_prepare_path "$backup_path") || return 1
+  staging=$config_root/generations/.staging-$recovery_to-$recovery_manifest
+  staging_prepare=$(artifact_prepare_path "$staging") || return 1
+  drain_record="draining|2|operation=install|from=$recovery_from|to=$recovery_to|manifest-sha256=$recovery_manifest|confirmation-sha256=$recovery_confirmation"
+  cleanup_artifact_prepare "$backup_prepare" "$state_root/rollback" "$recovery_id" 700 600 || return 1
+  cleanup_artifact_prepare "$staging_prepare" "$config_root/generations" "$recovery_id" 755 644 || return 1
+  case $recovery_phase in
+    waiting)
+      validate_recovery_old_install || return 1
+      validate_drain "$drain_record" || return 1
+      if [ -e "$state_root/lock/active" ] || [ -L "$state_root/lock/active" ]; then
+        active_request_in_progress || return 1
+        return 75
+      fi
+      advance_recovery_phase rolled-back || return 1
+      u2_pause recovery-rolled-back || return 1
+      advance_recovery_phase rollback-finalizing || return 1
+      ;;
+    intent|drained)
+      advance_recovery_phase rolled-back || return 1
+      u2_pause recovery-rolled-back || return 1
+      advance_recovery_phase rollback-finalizing || return 1
+      ;;
+    snapshotted|prepared|mutating)
+      restore_install_snapshot || return 1
+      advance_recovery_phase rolled-back || return 1
+      u2_pause recovery-rolled-back || return 1
+      advance_recovery_phase rollback-finalizing || return 1
+      ;;
+    rolled-back)
+      advance_recovery_phase rollback-finalizing || return 1
+      ;;
+    rollback-finalizing) ;;
+    committed)
+      validate_coherent_enrollment "$recovery_to" current || return 1
+      advance_recovery_phase commit-finalizing || return 1
+      ;;
+    commit-finalizing)
+      validate_coherent_enrollment "$recovery_to" current || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  cleanup_install_artifacts || return 1
+  if [ "$recovery_phase" = rollback-finalizing ] && [ "$recovery_from" -eq 0 ] &&
+    { [ -e "$revocation_reserve" ] || [ -L "$revocation_reserve" ]; }; then
+    protected_file "$revocation_reserve" "$revocation_reserve_provision_bytes" &&
+      exact_mode "$revocation_reserve" 600 || return 1
+    /bin/rm -f "$revocation_reserve" && durable_sync "$state_root" || return 1
+  fi
+  if [ "$recovery_phase" = rollback-finalizing ]; then validate_recovery_old_install || return 1; fi
+  validate_and_remove_drain "$drain_record" true || return 1
+  if [ -e "$backup_path" ] || [ -L "$backup_path" ]; then
+    remove_known_tree "$backup_path" "$state_root/rollback" "$recovery_id" 600 || return 1
+  fi
+}
+
+cleanup_revoke_temporary() {
+  local temporary
+  for temporary in "$state_root/.revoked-status.$recovery_id" \
+    "$root_prefix/var/lib/machine-utilities-public/.enrollment.$recovery_id"; do
+    if [ -e "$temporary" ] || [ -L "$temporary" ]; then
+      protected_file "$temporary" 33554432 || return 1
+      /bin/rm -f "$temporary" || return 1
+    fi
+  done
+  durable_sync
+}
+
+recover_revoke_transaction() {
+  local directory=$1 quarantine quarantine_prepare drain_record
+  quarantine=$state_root/quarantine/revoked-$recovery_from-$recovery_manifest
+  quarantine_prepare=$(artifact_prepare_path "$quarantine") || return 1
+  drain_record="draining|2|operation=revoke|from=$recovery_from|to=0|manifest-sha256=$recovery_manifest"
+  cleanup_artifact_prepare "$quarantine_prepare" "$state_root/quarantine" "$recovery_id" 700 600 || return 1
+  case $recovery_phase in
+    waiting)
+      validate_coherent_enrollment "$recovery_from" recorded || return 1
+      validate_drain "$drain_record" || return 1
+      if [ -e "$state_root/lock/active" ] || [ -L "$state_root/lock/active" ]; then
+        active_request_in_progress || return 1
+        return 75
+      fi
+      advance_recovery_phase rolled-back || return 1
+      u2_pause recovery-rolled-back || return 1
+      advance_recovery_phase rollback-finalizing || return 1
+      ;;
+    intent|drained)
+      validate_coherent_enrollment "$recovery_from" recorded || return 1
+      advance_recovery_phase rolled-back || return 1
+      u2_pause recovery-rolled-back || return 1
+      advance_recovery_phase rollback-finalizing || return 1
+      ;;
+    quarantining)
+      restore_revoke_quarantine "$quarantine" || return 1
+      validate_coherent_enrollment "$recovery_from" recorded || return 1
+      advance_recovery_phase rolled-back || return 1
+      u2_pause recovery-rolled-back || return 1
+      advance_recovery_phase rollback-finalizing || return 1
+      ;;
+    rolled-back)
+      validate_coherent_enrollment "$recovery_from" recorded || return 1
+      advance_recovery_phase rollback-finalizing || return 1
+      ;;
+    rollback-finalizing)
+      validate_coherent_enrollment "$recovery_from" recorded || return 1
+      ;;
+    committed)
+      validate_completed_revocation "$recovery_from" "$recovery_manifest" "$quarantine" || return 1
+      advance_recovery_phase commit-finalizing || return 1
+      ;;
+    commit-finalizing)
+      validate_completed_revocation "$recovery_from" "$recovery_manifest" "$quarantine" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  if [ "$recovery_phase" = rollback-finalizing ]; then
+    cleanup_rolled_back_quarantine "$quarantine" || return 1
+    validate_coherent_enrollment "$recovery_from" recorded || return 1
+  fi
+  validate_and_remove_drain "$drain_record" true || return 1
+  cleanup_revoke_temporary
+}
+
+recover_lifecycle_transaction() {
+  local directory=$1
+  validate_transaction_record "$directory" || return 1
+  if [ "$recovery_operation" = revoke ]; then
+    case $recovery_phase in
+      committed|commit-finalizing) ;;
+      *) ensure_revocation_reserve "$revocation_reserve_provision_bytes" || return 1 ;;
+    esac
+  fi
+  case $recovery_operation in
+    install) recover_install_transaction "$directory" || return $? ;;
+    revoke) recover_revoke_transaction "$directory" || return $? ;;
+    *) return 1 ;;
+  esac
+  /bin/rm -f "$directory/transaction" || return 1
+  durable_sync
+}
+
+u2_pause() {
+  local point=$1 marker=${ROUNDHOUSE_U2_PAUSE_MARKER:-} marker_tmp owner_pid
+  capture_current_process_id owner_pid || return 1
+  [ "$fixture_mode" = true ] || return 0
+  [ "${ROUNDHOUSE_U2_PAUSE_AT:-}" = "$point" ] || return 0
+  case $marker in /*) ;; *) return 1 ;; esac
+  marker_tmp=$marker.$owner_pid.tmp
+  printf 'pause|1|point=%s|pid=%s\n' "$point" "$owner_pid" >"$marker_tmp" || return 1
+  /bin/chmod 0600 "$marker_tmp" || return 1
+  /bin/mv -f "$marker_tmp" "$marker" || return 1
+  while [ ! -e "$marker.continue" ]; do
+    if [ -e "$marker.kill" ]; then kill -9 "$owner_pid"; fi
+    /bin/sleep 1 9>&-
+  done
+  /bin/rm -f "$marker" "$marker.continue"
+}
+
+publish_public_file() {
+  local source=$1 destination=$2 public_root public_tmp suffix
+  public_root=$root_prefix/var/lib/machine-utilities-public
+  suffix=${transaction_id:-$$}
+  public_tmp=$public_root/.$destination.$suffix
+  /bin/cp "$source" "$public_tmp" && /bin/chmod 0644 "$public_tmp" || return 1
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$public_tmp" || return 1; fi
+  durable_sync || return 1
+  /bin/mv -f "$public_tmp" "$public_root/$destination" && durable_sync
+}
+
+run_enrollment_canary() {
+  local canary_output direct_output canary_result direct_result canary_rc direct_rc suffix brew_path
+  suffix=${transaction_id:-$$}
+  canary_output=$state_root/.canary-output.$suffix
+  direct_output=$state_root/.direct-output.$suffix
+  if [ "$fixture_mode" = true ]; then
+    if ROUNDHOUSE_U2_FIXTURE_ROOT="$root_prefix" \
+        ROUNDHOUSE_U2_FIXTURE_PLATFORM="$platform_boundary" \
+        "$broker_path" </dev/null >"$canary_output" 2>/dev/null; then
+      return 1
+    fi
+    /usr/bin/grep -Fqx 'result|1' "$canary_output" || return 1
+    if ROUNDHOUSE_U2_FIXTURE_ROOT="$root_prefix" \
+        ROUNDHOUSE_U2_FIXTURE_PLATFORM="$platform_boundary" "$broker_path" unexpected \
+        </dev/null >/dev/null 2>&1; then
+      return 1
+    fi
+    canary_scope=fixture
+    canary_complete_sudoers=fixture-not-run
+    canary_positive=fixture-simulated-broker-reached
+    canary_negative_argument=fixture-passed
+    canary_negative_direct=fixture-not-run
+    if [ "$platform_boundary" = macos ]; then
+      canary_negative_installer=fixture-not-run
+      canary_negative_homebrew=fixture-not-run
+      canary_negative_shell=fixture-not-run
+    fi
+  else
+    [ -x /usr/bin/sudo ] && [ -x /usr/sbin/visudo ] || return 1
+    /usr/sbin/visudo -cf /etc/sudoers >/dev/null || return 1
+    if canary_result=$(/usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k \
+      "$broker_system_path" </dev/null 2>/dev/null); then canary_rc=0
+    else canary_rc=$?
+    fi
+    [ "$canary_rc" -ne 0 ] || return 1
+    printf '%s\n' "$canary_result" >"$canary_output"
+    /usr/bin/grep -Fqx 'result|1' "$canary_output" || return 1
+    if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k \
+        "$broker_system_path" unexpected </dev/null >/dev/null 2>&1; then
+      return 1
+    fi
+    if direct_result=$(/usr/bin/sudo -n -u "#$enrolled_uid" "$broker_system_path" \
+      </dev/null 2>/dev/null); then direct_rc=0
+    else direct_rc=$?
+    fi
+    [ "$direct_rc" -ne 0 ] || return 1
+    printf '%s\n' "$direct_result" >"$direct_output"
+    /usr/bin/grep -Fqx 'reason|needs_human_enrollment' "$direct_output" || return 1
+    if [ "$platform_boundary" = macos ]; then
+      if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k \
+          "$broker_system_path" --homebrew-bridge-v1 /bin/sh -c : >/dev/null 2>&1; then return 1; fi
+      if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k \
+          /usr/sbin/installer -help >/dev/null 2>&1; then return 1; fi
+      for brew_path in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+        if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k -l \
+            "$brew_path" >/dev/null 2>&1; then return 1; fi
+      done
+      if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k \
+          /bin/sh -c : >/dev/null 2>&1; then return 1; fi
+      canary_negative_installer=passed
+      canary_negative_homebrew=passed
+      canary_negative_shell=passed
+    fi
+    canary_scope=native
+    canary_complete_sudoers=passed
+    canary_positive=passed
+    canary_negative_argument=passed
+    canary_negative_direct=passed
+  fi
+  /bin/rm -f "$canary_output" "$direct_output"
+}
+
+install_bundle() (
+  set -Eeuo pipefail
+  local install_bundle_path=$1 install_manifest_digest=$2 confirmed_digest=$3
+  local lifecycle_lock='' lifecycle_recovery='' lifecycle_prepare='' lifecycle_lock_retired=''
+  local lifecycle_recovery_retired='' lifecycle_transaction_root='' lifecycle_guard='' lifecycle_guard_owned=false
+  local lifecycle_owned=false lifecycle_operation=install preserve_drain=false durable_commit=false
+  local lifecycle_lock_reason='' transaction_started=false rollback_performed=false
+  local backup='' staging='' final_generation='' new_broker='' new_ca='' new_signers='' new_krl='' sudoers_temp=''
+  local receipt_temp='' canary_temp='' draining='' drain_record='' active_temp='' rollback_ok=true drain_owned=false rc
+  local ssh_keygen_digest=''
+  local transaction_operation='' transaction_id='' transaction_boot='' transaction_start='' transaction_from=''
+  local transaction_to='' transaction_manifest='' transaction_confirmation='' transaction_phase=''
+  created_directories=()
+
+  rollback_install_transaction() {
+    set +e
+    [ -n "$lifecycle_transaction_root" ] || return 0
+    if [ ! -e "$lifecycle_transaction_root/transaction" ] &&
+      [ ! -L "$lifecycle_transaction_root/transaction" ]; then return 0; fi
+    validate_transaction_record "$lifecycle_transaction_root" || { rollback_ok=false; return; }
+    case $recovery_phase in
+      committed|commit-finalizing)
+        # Durable commit is authoritative even when a signal arrives before
+        # process-local success bookkeeping. A later guard holder finalizes it.
+        durable_commit=true
+        return 0
+        ;;
+      waiting)
+        preserve_drain=true
+        if [ "$lifecycle_owned" = true ]; then park_lifecycle_transaction || rollback_ok=false; fi
+        return 0
+        ;;
+    esac
+    recover_lifecycle_transaction "$lifecycle_transaction_root" || rollback_ok=false
+    if [ "$rollback_ok" = true ]; then
+      rollback_performed=true
+      transaction_started=false
+      remove_created_directories
+    fi
+  }
+
+  install_exit() {
+    rc=$?
+    trap - EXIT INT TERM HUP
+    if [ "$rc" -ne 0 ]; then
+      rollback_install_transaction
+      if [ "$rollback_performed" = true ]; then result drifted rollback_restored_previous_generation linux
+      elif [ "$transaction_started" = true ] && [ "$preserve_drain" = false ] && [ "$durable_commit" = false ]; then
+        result drifted rollback_failed linux
+        rc=74
+      fi
+    fi
+    if ! release_lifecycle_lock; then
+      [ "$rc" -ne 0 ] || result drifted lifecycle_lock_retirement_failed linux
+      rc=74
+    fi
+    release_lifecycle_guard
+    exit "$rc"
+  }
+  trap install_exit EXIT
+  trap 'exit 130' INT TERM HUP
+
+  verify_bootstrap_bundle "$install_bundle_path" "$install_manifest_digest" || {
+    result rejected authenticated_bootstrap_failed linux
+    exit 65
+  }
+  validate_candidate_semantics || { result rejected candidate_validation_failed linux; exit 65; }
+  prepare_preview || { result rejected non_monotonic_or_drifted_generation linux; exit 65; }
+  [ "$confirmed_digest" = "$confirmation_digest" ] || {
+    result rejected confirmation_digest_mismatch linux
+    exit 65
+  }
+  [ "$fixture_mode" = true ] || [ -z "${ROUNDHOUSE_U2_FAILPOINT:-}" ] || {
+    result rejected fixture_failpoint_not_allowed linux
+    exit 65
+  }
+  validate_os_ancestors || { result rejected os_ancestor_validation_failed linux; exit 65; }
+  if acquire_lifecycle_lock; then lock_rc=0
+  else lock_rc=$?
+  fi
+  case $lock_rc in
+    0) ;;
+    75) result draining "$lifecycle_lock_reason" linux; exit 75 ;;
+    *) result drifted "$lifecycle_lock_reason" linux; exit 74 ;;
+  esac
+  u2_pause lifecycle-lock-held || { result drifted fixture_pause_failed linux; exit 65; }
+
+  # Confirmation is authority over the exact preview, not merely the staged
+  # bytes seen before waiting for the lifecycle lock. Reverify the signature,
+  # candidate closure, current enrollment, and preview while holding the lock.
+  verify_bootstrap_bundle "$install_bundle_path" "$install_manifest_digest" || {
+    result rejected under_lock_authenticated_bootstrap_failed linux
+    exit 65
+  }
+  validate_candidate_semantics || { result rejected under_lock_candidate_validation_failed linux; exit 65; }
+  prepare_preview || { result rejected under_lock_generation_or_state_drift linux; exit 65; }
+  [ "$confirmed_digest" = "$confirmation_digest" ] || {
+    result rejected under_lock_confirmation_digest_mismatch linux
+    exit 65
+  }
+  transaction_id="install-$current_epoch-$epoch-$manifest_digest"
+  backup=$state_root/rollback/$transaction_id
+  staging=$config_root/generations/.staging-$epoch-$manifest_digest
+  final_generation=$config_root/generations/$epoch
+  new_broker=$state_root/.posix-broker.$transaction_id
+  new_ca=$state_root/.fleet-ca.$transaction_id
+  new_signers=$state_root/.allowed-signers.$transaction_id
+  new_krl=$state_root/.revoked-krl.$transaction_id
+  sudoers_temp=$state_root/.sudoers.$transaction_id
+  receipt_temp=$state_root/.enrollment-receipt.$transaction_id
+  canary_temp=$state_root/.canary-receipt.$transaction_id
+  active_temp=$config_root/.active.$transaction_id
+  ensure_application_layout || { result rejected protected_path_validation_failed linux; exit 65; }
+  draining=$state_root/draining
+  preflight_transaction_artifacts "$staging" "$final_generation" "$backup" "$new_broker" "$new_ca" \
+    "$new_signers" "$new_krl" "$sudoers_temp" "$receipt_temp" "$canary_temp" "$active_temp" \
+    "$(artifact_prepare_path "$staging")" "$(artifact_prepare_path "$backup")" \
+    "$config_root/active.rollback.$transaction_id" "$broker_path.rollback.$transaction_id" \
+    "$sudoers_path.rollback.$transaction_id" \
+    "$config_root/trust/fleet-ca.pub.rollback.$transaction_id" \
+    "$config_root/trust/allowed_signers.rollback.$transaction_id" \
+    "$config_root/trust/revoked.krl.rollback.$transaction_id" \
+    "$root_prefix/var/lib/machine-utilities-public/enrollment.rollback.$transaction_id" \
+    "$root_prefix/var/lib/machine-utilities-public/canary.rollback.$transaction_id" \
+    "$state_root/.canary-output.$transaction_id" "$state_root/.direct-output.$transaction_id" \
+    "$root_prefix/var/lib/machine-utilities-public/.enrollment.$transaction_id" \
+    "$root_prefix/var/lib/machine-utilities-public/.canary.$transaction_id" "$draining" || {
+    result drifted transaction_artifact_collision linux
+    exit 74
+  }
+  if [ "$current_epoch" -eq 0 ]; then
+    validate_unenrolled_state || { result drifted incoherent_unenrolled_state linux; exit 65; }
+  else
+    validate_coherent_enrollment "$current_epoch" recorded || {
+      result drifted incoherent_existing_enrollment linux
+      exit 65
+    }
+  fi
+  begin_transaction install "$current_epoch" "$epoch" "$manifest_digest" "$confirmation_digest" || {
+    result drifted transaction_intent_write_failed linux
+    exit 74
+  }
+  transaction_started=true
+
+  drain_record="draining|2|operation=install|from=$current_epoch|to=$epoch|manifest-sha256=$manifest_digest|confirmation-sha256=$confirmation_digest"
+  if write_drain "$drain_record"; then drain_rc=0
+  else drain_rc=$?
+  fi
+  case $drain_rc in
+    0) ;;
+    2) result drifted conflicting_drain linux; exit 65 ;;
+    *) result drifted invalid_drain linux; exit 65 ;;
+  esac
+  write_transaction_phase drained || { result drifted transaction_phase_write_failed linux; exit 74; }
+  if [ -e "$state_root/lock/active" ]; then
+    active_request_in_progress || { result drifted active_lock_invalid linux; exit 65; }
+    write_transaction_phase waiting || { result drifted transaction_phase_write_failed linux; exit 74; }
+    u2_pause lifecycle-waiting-before-park || { result drifted fixture_pause_failed linux; exit 65; }
+    park_lifecycle_transaction || { result drifted lifecycle_park_failed linux; exit 74; }
+    preserve_drain=true
+    u2_pause lifecycle-parked || { result drifted fixture_pause_failed linux; exit 65; }
+    result draining active_request_must_settle linux
+    exit 75
+  fi
+  u2_failpoint after-drain
+
+  create_marked_transaction_directory "$backup" 700 600 backup-prepare-before-marker || {
+    result drifted rollback_snapshot_marker_failed linux
+    exit 74
+  }
+  snapshot_path active "$config_root/active"
+  snapshot_path broker "$broker_path"
+  snapshot_path sudoers "$sudoers_path"
+  snapshot_path fleet_ca "$config_root/trust/fleet-ca.pub"
+  snapshot_path allowed_signers "$config_root/trust/allowed_signers"
+  snapshot_path revoked_krl "$config_root/trust/revoked.krl"
+  snapshot_path public_enrollment "$root_prefix/var/lib/machine-utilities-public/enrollment"
+  snapshot_path public_canary "$root_prefix/var/lib/machine-utilities-public/canary"
+  durable_sync
+  validate_backup "$current_epoch" || { result drifted rollback_snapshot_invalid linux; exit 74; }
+  write_transaction_phase snapshotted || { result drifted transaction_phase_write_failed linux; exit 74; }
+
+  create_marked_transaction_directory "$staging" 755 644 staging-prepare-before-marker || {
+    result drifted staging_marker_failed linux
+    exit 74
+  }
+  if [ "$platform_boundary" = linux ]; then
+    ensure_application_directory "$staging/apt" 0755
+    ensure_application_directory "$staging/apt/sources.list.d" 0755
+    ensure_application_directory "$staging/apt/trusted.gpg.d" 0755
+    ensure_application_directory "$staging/apt/preferences.d" 0755
+    platform_context_relative=apt.context
+  else
+    ensure_application_directory "$staging/macos" 0755
+    ensure_application_directory "$staging/macos/packages" 0755
+    platform_context_relative=macos.context
+  fi
+  for relative in policy.actions policy.constraints host.identity context.canary "$platform_context_relative"; do
+    copy_manifest_file "$relative" "$staging/$relative"
+  done
+  if [ "$platform_boundary" = linux ]; then copy_manifest_file apt.conf "$staging/apt.conf"; fi
+  while IFS='|' read -r kind relative expected; do
+    case $relative in
+      apt/*|macos/packages/*.pkg)
+        case $platform_boundary:$relative in
+          linux:apt/*|macos:macos/packages/*.pkg) ;;
+          *) continue ;;
+        esac
+        destination=$staging/$relative
+        destination_directory=${destination%/*}
+        if [ ! -d "$destination_directory" ]; then ensure_application_directory "$destination_directory" 0755; fi
+        copy_manifest_file "$relative" "$destination"
+        ;;
+    esac
+  done <"$bundle/bootstrap.manifest"
+  ssh_keygen_digest=$(system_ssh_keygen_digest) || { result rejected system_ssh_keygen_drift linux; exit 65; }
+  printf '%s\n' "$(manifest_file_digest privilege-broker-posix)" >"$staging/broker.sha256"
+  printf '%s\n' 1.0.0 >"$staging/broker.version"
+  printf '%s\n' "$ssh_keygen_digest" >"$staging/ssh-keygen.sha256"
+  /bin/chmod 0644 "$staging/broker.sha256" "$staging/broker.version" "$staging/ssh-keygen.sha256"
+  if [ "$fixture_mode" = false ]; then
+    /usr/bin/chown root:"$protected_group" "$staging/broker.sha256" "$staging/broker.version" "$staging/ssh-keygen.sha256"
+  fi
+  [ "$(sha256_file "$staging/policy.actions")" = "$policy_digest" ] &&
+    [ "$(sha256_file "$staging/policy.constraints")" = "$constraints_digest" ] &&
+    [ "$(sha256_file "$staging/$platform_context_relative")" = "$(manifest_file_digest "$platform_context_relative")" ] &&
+    /bin/bash -n "$bundle/privilege-broker-posix" || { result rejected staged_generation_validation_failed linux; exit 65; }
+  if [ "$platform_boundary" = macos ]; then
+    validate_macos_packages "$staging" || { result rejected staged_macos_package_validation_failed macos; exit 65; }
+  fi
+
+  copy_manifest_file privilege-broker-posix "$new_broker"
+  /bin/chmod 0755 "$new_broker"
+  if "$new_broker" arbitrary </dev/null >/dev/null 2>&1; then
+    result rejected broker_argument_canary_failed linux
+    exit 65
+  fi
+  copy_manifest_file fleet-ca.pub "$new_ca"
+  copy_manifest_file allowed_signers "$new_signers"
+  copy_manifest_file revoked.krl "$new_krl"
+  observed_ca=$("$ssh_keygen" -lf "$new_ca" -E sha256 2>/dev/null | /usr/bin/awk 'NR==1{print $2}')
+  [ "$observed_ca" = "$ca_fingerprint" ] || { result rejected fleet_ca_fingerprint_mismatch linux; exit 65; }
+  render_sudoers_policy >"$sudoers_temp"
+  /bin/chmod 0440 "$sudoers_temp"
+  if [ "$fixture_mode" = false ]; then
+    /usr/bin/chown root:"$protected_group" "$sudoers_temp"
+    [ -x /usr/sbin/visudo ] && /usr/sbin/visudo -cf "$sudoers_temp" >/dev/null
+  fi
+
+  durable_sync
+  write_transaction_phase prepared || { result drifted transaction_phase_write_failed linux; exit 74; }
+  write_transaction_phase mutating || { result drifted transaction_phase_write_failed linux; exit 74; }
+  /bin/mv "$staging" "$final_generation"
+  durable_sync
+  u2_failpoint after-generation
+  /bin/mv -f "$new_broker" "$broker_path"
+  durable_sync
+  u2_failpoint after-broker
+  /bin/mv -f "$new_ca" "$config_root/trust/fleet-ca.pub"
+  /bin/mv -f "$new_signers" "$config_root/trust/allowed_signers"
+  /bin/mv -f "$new_krl" "$config_root/trust/revoked.krl"
+  durable_sync
+  u2_failpoint after-trust
+  /bin/mv -f "$sudoers_temp" "$sudoers_path"
+  durable_sync
+  u2_pause install-after-sudoers || { result drifted fixture_pause_failed linux; exit 65; }
+  u2_failpoint after-sudoers
+  /bin/ln -s "generations/$epoch" "$active_temp"
+  atomic_replace_symlink "$active_temp" "$config_root/active"
+  durable_sync
+  u2_pause install-after-active || { result drifted fixture_pause_failed linux; exit 65; }
+  u2_failpoint after-active
+  if [ "$fixture_mode" = false ]; then /usr/sbin/visudo -cf /etc/sudoers >/dev/null; fi
+  [ "$(sha256_file "$broker_path")" = "$(/usr/bin/sed -n '1p' "$final_generation/broker.sha256")" ] || {
+    result drifted post_activation_broker_mismatch linux
+    exit 65
+  }
+  [ "$(/usr/bin/readlink "$config_root/active")" = "generations/$epoch" ] || {
+    result drifted post_activation_pointer_mismatch linux
+    exit 65
+  }
+  exact_mode "$sudoers_path" 440 || {
+    result drifted post_activation_sudoers_mode_mismatch linux
+    exit 65
+  }
+
+  ensure_revocation_reserve "$revocation_reserve_provision_bytes" || {
+    result drifted revocation_reserve_creation_failed linux
+    exit 74
+  }
+  run_enrollment_canary || { result drifted enrollment_canary_failed linux; exit 65; }
+  sudoers_digest=$(sha256_file "$sudoers_path")
+  if [ "$platform_boundary" = linux ]; then
+    platform_context_label='apt-context-sha256'
+    platform_context_digest=$(sha256_file "$final_generation/apt.context")
+    platform_artifacts_label='source-authority-sha256'
+    platform_artifacts_digest=$(sha256_file "$final_generation/apt/source-authority")
+  else
+    platform_context_label='platform-context-sha256'
+    platform_context_digest=$(sha256_file "$final_generation/macos.context")
+    platform_artifacts_label='platform-artifacts-sha256'
+    platform_artifacts_digest=$(path_set_digest packages "$final_generation/macos/packages")
+  fi
+  {
+    printf 'enrollment-receipt|2\nstate|enrolled\nscope|%s\n' "$canary_scope"
+    printf 'epoch|%s\nmanifest-sha256|%s\nconfirmation-sha256|%s\n' "$epoch" "$manifest_digest" "$confirmation_digest"
+    printf 'broker-sha256|%s\npolicy-sha256|%s\nconstraints-sha256|%s\n' \
+      "$(sha256_file "$broker_path")" "$policy_digest" "$constraints_digest"
+    printf 'host-identity-sha256|%s\ncontext-canary-sha256|%s\n%s|%s\n%s|%s\n' \
+      "$(sha256_file "$final_generation/host.identity")" "$(sha256_file "$final_generation/context.canary")" \
+      "$platform_context_label" "$platform_context_digest" \
+      "$platform_artifacts_label" "$platform_artifacts_digest"
+    printf 'fleet-ca-sha256|%s\nallowed-signers-sha256|%s\nrevoked-krl-sha256|%s\n' \
+      "$(sha256_file "$config_root/trust/fleet-ca.pub")" \
+      "$(sha256_file "$config_root/trust/allowed_signers")" \
+      "$(sha256_file "$config_root/trust/revoked.krl")"
+    printf 'sudoers-sha256|%s\nfleet-ca-fingerprint|%s\nprotected-uid|%s\nrequest-principal|%s\n' \
+      "$sudoers_digest" "$ca_fingerprint" "$enrolled_uid" "$request_user"
+    printf 'endpoint-principals|%s\n' "$endpoint_principals"
+  } >"$receipt_temp"
+  {
+    printf 'enrollment-canary|1\nscope|%s\ncomplete-sudoers|%s\n' "$canary_scope" "$canary_complete_sudoers"
+    printf 'positive-no-argument|%s\nnegative-with-argument|%s\nnegative-direct-unprivileged|%s\n' \
+      "$canary_positive" "$canary_negative_argument" "$canary_negative_direct"
+    if [ "$platform_boundary" = macos ]; then
+      printf 'negative-direct-installer|%s\nnegative-root-homebrew|%s\nnegative-root-shell|%s\n' \
+        "$canary_negative_installer" "$canary_negative_homebrew" "$canary_negative_shell"
+    fi
+    printf 'epoch|%s\nbroker-sha256|%s\nsudoers-sha256|%s\n' \
+      "$epoch" "$(sha256_file "$broker_path")" "$sudoers_digest"
+  } >"$canary_temp"
+  publish_public_file "$receipt_temp" enrollment
+  publish_public_file "$canary_temp" canary
+  durable_sync
+  u2_pause install-after-public-receipt || { result drifted fixture_pause_failed linux; exit 65; }
+  u2_failpoint after-public-receipt
+
+  if ! validate_coherent_enrollment "$epoch" current; then
+    if [ "$fixture_mode" = true ]; then
+      set -x
+      validate_coherent_enrollment "$epoch" current || true
+      set +x
+    fi
+    result drifted post_activation_coherence_failed linux
+    exit 74
+  fi
+  write_transaction_phase committed || { result drifted transaction_commit_write_failed linux; exit 74; }
+  u2_pause install-after-committed || { result drifted fixture_pause_failed linux; exit 65; }
+  validate_transaction_record "$lifecycle_transaction_root" &&
+    recover_install_transaction "$lifecycle_transaction_root" || {
+    result drifted transaction_commit_finalization_failed linux
+    exit 74
+  }
+  clear_transaction || { result drifted transaction_clear_failed linux; exit 74; }
+  transaction_started=false
+  release_lifecycle_lock || { result drifted lifecycle_lock_retirement_failed linux; exit 74; }
+  release_lifecycle_guard
+  printf 'enrollment|1\nstate|enrolled\nreason|generation_activated\nplatform-boundary|%s\n' "$platform_boundary"
+  printf 'epoch|%s\nmanifest-sha256|%s\nconfirmation-sha256|%s\n' "$epoch" "$manifest_digest" "$confirmation_digest"
+  printf 'broker-sha256|%s\npolicy-sha256|%s\nconstraints-sha256|%s\n' \
+    "$(sha256_file "$broker_path")" "$policy_digest" "$constraints_digest"
+  printf 'canary-scope|%s\npositive-canary|%s\nnegative-argument-canary|%s\nnegative-direct-canary|%s\ncomplete-sudoers|%s\n' \
+    "$canary_scope" "$canary_positive" "$canary_negative_argument" "$canary_negative_direct" "$canary_complete_sudoers"
+)
+
+revoke_bundle() (
+  set -Eeuo pipefail
+  local revoke_bundle_path=$1 revoke_manifest_digest=$2 expected_epoch=$3
+  local lifecycle_lock='' lifecycle_recovery='' lifecycle_prepare='' lifecycle_lock_retired=''
+  local lifecycle_recovery_retired='' lifecycle_transaction_root='' lifecycle_guard='' lifecycle_guard_owned=false
+  local lifecycle_owned=false lifecycle_operation=revoke preserve_drain=false durable_commit=false
+  local lifecycle_lock_reason=''
+  local transaction_started=false rollback_ok=true drain_owned=false draining='' drain_record='' quarantine=''
+  local public_root=$root_prefix/var/lib/machine-utilities-public status_temp='' rc
+  local transaction_operation='' transaction_id='' transaction_boot='' transaction_start='' transaction_from=''
+  local transaction_to='' transaction_manifest='' transaction_confirmation='' transaction_phase=''
+  created_directories=()
+
+  restore_quarantined() {
+    set +e
+    [ -n "$lifecycle_transaction_root" ] || return 0
+    if [ ! -e "$lifecycle_transaction_root/transaction" ] &&
+      [ ! -L "$lifecycle_transaction_root/transaction" ]; then return 0; fi
+    validate_transaction_record "$lifecycle_transaction_root" || { rollback_ok=false; return; }
+    case $recovery_phase in
+      committed|commit-finalizing) durable_commit=true; return 0 ;;
+      waiting)
+        preserve_drain=true
+        ensure_revocation_reserve "$revocation_reserve_provision_bytes" || rollback_ok=false
+        if [ "$rollback_ok" = true ] && [ "$lifecycle_owned" = true ]; then
+          park_lifecycle_transaction || rollback_ok=false
+        fi
+        return 0
+        ;;
+    esac
+    recover_lifecycle_transaction "$lifecycle_transaction_root" || rollback_ok=false
+    [ "$rollback_ok" = false ] || transaction_started=false
+  }
+  revoke_exit() {
+    rc=$?
+    trap - EXIT INT TERM HUP
+    if [ "$rc" -ne 0 ]; then
+      if [ "$transaction_started" = true ]; then
+        restore_quarantined
+        if [ "$preserve_drain" = true ] || [ "$durable_commit" = true ]; then :
+        elif [ "$rollback_ok" = true ]; then result drifted rollback_restored_enrollment linux
+        else result drifted rollback_failed linux; rc=74
+        fi
+      else
+        if [ "$drain_owned" = true ]; then /bin/rm -f "$draining" 2>/dev/null || true; fi
+        if [ -L "$config_root/active" ] && [ ! -e "$revocation_reserve" ] &&
+          [ ! -L "$revocation_reserve" ]; then
+          ensure_revocation_reserve "$revocation_reserve_provision_bytes" || rc=74
+        fi
+        remove_created_directories
+      fi
+    fi
+    if ! release_lifecycle_lock; then
+      [ "$rc" -ne 0 ] || result drifted lifecycle_lock_retirement_failed linux
+      rc=74
+    fi
+    release_lifecycle_guard
+    exit "$rc"
+  }
+  trap revoke_exit EXIT
+  trap 'exit 130' INT TERM HUP
+
+  verify_bootstrap_bundle "$revoke_bundle_path" "$revoke_manifest_digest" || {
+    result rejected authenticated_bootstrap_failed linux
+    exit 65
+  }
+  [[ $expected_epoch =~ ^[1-9][0-9]{0,9}$ ]] || usage
+  validate_candidate_semantics || { result rejected candidate_validation_failed linux; exit 65; }
+  [ "$epoch" = "$expected_epoch" ] || { result rejected revocation_bundle_epoch_mismatch linux; exit 65; }
+  validate_os_ancestors || { result rejected os_ancestor_validation_failed linux; exit 65; }
+  if acquire_lifecycle_lock; then lock_rc=0
+  else lock_rc=$?
+  fi
+  case $lock_rc in
+    0) ;;
+    75) result draining "$lifecycle_lock_reason" linux; exit 75 ;;
+    *) result drifted "$lifecycle_lock_reason" linux; exit 74 ;;
+  esac
+  u2_pause lifecycle-lock-held || { result drifted fixture_pause_failed linux; exit 65; }
+  verify_bootstrap_bundle "$revoke_bundle_path" "$revoke_manifest_digest" || {
+    result rejected under_lock_authenticated_bootstrap_failed linux
+    exit 65
+  }
+  validate_candidate_semantics || { result rejected under_lock_candidate_validation_failed linux; exit 65; }
+  [ "$epoch" = "$expected_epoch" ] || { result rejected under_lock_revocation_bundle_epoch_mismatch linux; exit 65; }
+  if [ ! -L "$config_root/active" ]; then
+    [ ! -e "$config_root/active" ] || { result drifted invalid_active_generation linux; exit 65; }
+    release_lifecycle_lock || { result drifted lifecycle_lock_retirement_failed linux; exit 74; }
+    release_lifecycle_guard
+    result revoked already_not_enrolled linux
+    exit 0
+  fi
+  active_target=$(/usr/bin/readlink "$config_root/active")
+  [ "$active_target" = "generations/$expected_epoch" ] || {
+    result drifted revocation_generation_mismatch linux
+    exit 65
+  }
+  validate_coherent_enrollment "$expected_epoch" recorded || {
+      result drifted incoherent_existing_enrollment linux
+      exit 65
+  }
+  [ ! -e "$public_root/active" ] || { result draining public_active_request_must_settle linux; exit 75; }
+  consume_revocation_reserve || { result drifted revocation_reserve_release_failed linux; exit 74; }
+  u2_pause revocation-reserve-released || { result drifted fixture_pause_failed linux; exit 65; }
+  transaction_id="revoke-$expected_epoch-0-$revoke_manifest_digest"
+  quarantine=$state_root/quarantine/revoked-$expected_epoch-$revoke_manifest_digest
+  status_temp=$state_root/.revoked-status.$transaction_id
+  ensure_application_directory "$state_root/quarantine" 0700
+  draining=$state_root/draining
+  preflight_transaction_artifacts "$quarantine" "$status_temp" \
+    "$(artifact_prepare_path "$quarantine")" \
+    "$root_prefix/var/lib/machine-utilities-public/.enrollment.$transaction_id" "$draining" || {
+    result drifted transaction_artifact_collision linux
+    exit 74
+  }
+  begin_transaction revoke "$expected_epoch" 0 "$revoke_manifest_digest" - || {
+    result drifted transaction_intent_write_failed linux
+    exit 74
+  }
+  transaction_started=true
+  drain_record="draining|2|operation=revoke|from=$expected_epoch|to=0|manifest-sha256=$revoke_manifest_digest"
+  if write_drain "$drain_record"; then drain_rc=0
+  else drain_rc=$?
+  fi
+  case $drain_rc in
+    0) ;;
+    2) result drifted conflicting_drain linux; exit 65 ;;
+    *) result drifted invalid_drain linux; exit 65 ;;
+  esac
+  write_transaction_phase drained || { result drifted transaction_phase_write_failed linux; exit 74; }
+  if [ -e "$state_root/lock/active" ]; then
+    active_request_in_progress || { result drifted active_lock_invalid linux; exit 65; }
+    write_transaction_phase waiting || { result drifted transaction_phase_write_failed linux; exit 74; }
+    ensure_revocation_reserve "$revocation_reserve_provision_bytes" || {
+      result drifted revocation_reserve_restore_failed linux
+      exit 74
+    }
+    u2_pause lifecycle-waiting-before-park || { result drifted fixture_pause_failed linux; exit 65; }
+    park_lifecycle_transaction || { result drifted lifecycle_park_failed linux; exit 74; }
+    preserve_drain=true
+    u2_pause lifecycle-parked || { result drifted fixture_pause_failed linux; exit 65; }
+    result draining active_request_must_settle linux
+    exit 75
+  fi
+  u2_failpoint after-drain
+
+  [ ! -e "$quarantine" ] && [ ! -L "$quarantine" ] || { result drifted quarantine_exists linux; exit 65; }
+  write_transaction_phase quarantining || { result drifted transaction_phase_write_failed linux; exit 74; }
+  create_marked_transaction_directory "$quarantine" 700 600 quarantine-prepare-before-marker || {
+    result drifted quarantine_marker_failed linux
+    exit 74
+  }
+  [ ! -e "$public_root/enrollment" ] || /bin/mv "$public_root/enrollment" "$quarantine/public-enrollment"
+  [ ! -e "$public_root/canary" ] || /bin/mv "$public_root/canary" "$quarantine/public-canary"
+  /bin/mv "$sudoers_path" "$quarantine/sudoers"
+  durable_sync
+  u2_failpoint revoke-after-sudoers
+  if [ "$fixture_mode" = false ]; then /usr/sbin/visudo -cf /etc/sudoers >/dev/null; fi
+  /bin/mv "$broker_path" "$quarantine/posix-broker"
+  /bin/mv "$config_root/active" "$quarantine/active"
+  /bin/mv "$config_root/generations/$expected_epoch" "$quarantine/generation"
+  for trust_name in fleet-ca.pub allowed_signers revoked.krl; do
+    [ ! -e "$config_root/trust/$trust_name" ] || /bin/mv "$config_root/trust/$trust_name" "$quarantine/$trust_name"
+  done
+  durable_sync
+  u2_pause revoke-after-quarantine || { result drifted fixture_pause_failed linux; exit 65; }
+  u2_failpoint revoke-after-quarantine
+  [ ! -e "$broker_path" ] && [ ! -e "$sudoers_path" ] && [ ! -e "$config_root/active" ] &&
+    [ ! -e "$config_root/generations/$expected_epoch" ] || { result drifted revocation_incomplete linux; exit 65; }
+
+  {
+    printf 'enrollment-receipt|2\nstate|revoked\nscope|%s\n' "$(if [ "$fixture_mode" = true ]; then printf fixture; else printf native; fi)"
+    printf 'epoch|%s\nmanifest-sha256|%s\nreason|grant_broker_generation_and_trust_quarantined\n' \
+      "$expected_epoch" "$revoke_manifest_digest"
+  } >"$status_temp"
+  publish_public_file "$status_temp" enrollment
+  durable_sync
+  u2_failpoint revoke-after-public-status
+  validate_completed_revocation "$expected_epoch" "$revoke_manifest_digest" "$quarantine" || {
+    result drifted post_revocation_coherence_failed linux
+    exit 74
+  }
+  write_transaction_phase committed || { result drifted transaction_commit_write_failed linux; exit 74; }
+  u2_pause revoke-after-committed || { result drifted fixture_pause_failed linux; exit 65; }
+  validate_transaction_record "$lifecycle_transaction_root" &&
+    recover_revoke_transaction "$lifecycle_transaction_root" || {
+    result drifted transaction_commit_finalization_failed linux
+    exit 74
+  }
+  clear_transaction || { result drifted transaction_clear_failed linux; exit 74; }
+  transaction_started=false
+  release_lifecycle_lock || { result drifted lifecycle_lock_retirement_failed linux; exit 74; }
+  release_lifecycle_guard
+  printf 'enrollment|1\nstate|revoked\nreason|grant_broker_generation_and_trust_quarantined\nplatform-boundary|%s\n' \
+    "$platform_boundary"
+  printf 'epoch|%s\nordinary-inventory|preserved\nprotected-journal|preserved\nquarantine|retained\n' "$expected_epoch"
+)
+
+case $command in
+  status)
+    [ "$#" -eq 0 ] || usage
+    if [ -L "$config_root/active" ] && [ -x "$broker_path" ]; then
+      result enrolled protected_generation_present "$platform_boundary"
+    else
+      result needs_human_enrollment broker_not_enrolled "$platform_boundary"
+    fi
+    ;;
+  preview)
+    [ "$#" -eq 1 ] || usage
+    verify_bootstrap_bundle "$1" || {
+      result rejected authenticated_bootstrap_failed linux
+      exit 65
+    }
+    validate_candidate_semantics || {
+      result rejected candidate_validation_failed linux
+      exit 65
+    }
+    prepare_preview || {
+      result rejected non_monotonic_or_drifted_generation linux
+      exit 65
+    }
+    preview_bundle
+    ;;
+  install)
+    [ "$#" -eq 3 ] || usage
+    install_bundle "$1" "$2" "$3"
+    ;;
+  revoke)
+    [ "$#" -eq 3 ] || usage
+    revoke_bundle "$1" "$2" "$3"
+    ;;
+  *) usage ;;
+esac

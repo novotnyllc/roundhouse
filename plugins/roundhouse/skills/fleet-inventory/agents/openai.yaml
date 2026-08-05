@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fleet Inventory"
+  short_description: "Inspect fleet state with structured evidence"
+  default_prompt: "Use $fleet-inventory to inventory my configured machines."

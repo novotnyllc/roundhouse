@@ -1,0 +1,2820 @@
+#!/usr/bin/env bash
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+config=${1:?config path required}
+host_id=${2:?host id required}
+snapshot_id=${3:?snapshot id required}
+sections=${4:-all}
+observed_at=${ROUNDHOUSE_OBSERVED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
+
+has_section() {
+  [ "$sections" = all ] || case ",$sections," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+}
+
+clip() {
+  LC_ALL=C cut -c 1-8192
+}
+
+emit() {
+  kind=$1
+  entity_id=$(printf '%s' "$2" | clip)
+  status=$3
+  confidence=$4
+  data=$5
+  evidence=${6:-[]}
+  errors=${7:-[]}
+  jq -cn \
+    --arg schema roundhouse.inventory \
+    --argjson schema_version 1 \
+    --arg snapshot_id "$snapshot_id" \
+    --arg host_id "$host_id" \
+    --arg kind "$kind" \
+    --arg id "$entity_id" \
+    --arg observed_at "$observed_at" \
+    --arg status "$status" \
+    --arg confidence "$confidence" \
+    --argjson data "$data" \
+    --argjson evidence "$evidence" \
+    --argjson errors "$errors" \
+    '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:$kind,id:$id,observed_at:$observed_at,status:$status,confidence:$confidence,data:$data,evidence:$evidence,errors:$errors}'
+}
+
+emit_package_lines() {
+  manager=$1
+  method=$2
+  jq -Rcn \
+    --arg schema roundhouse.inventory \
+    --argjson schema_version 1 \
+    --arg snapshot_id "$snapshot_id" \
+    --arg host_id "$host_id" \
+    --arg observed_at "$observed_at" \
+    --arg manager "$manager" \
+    --arg method "$method" '
+      inputs | split("\t") as $fields |
+      select(($fields | length) >= 2 and $fields[0] != "") |
+      ($fields[0][0:8192]) as $name |
+      ($fields[1][0:8192]) as $version |
+      (($fields[2] // "")[0:8192]) as $candidate |
+      {
+        schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
+        host_id:$host_id,kind:"package",id:(($manager+":"+$name)[0:8192]),
+        observed_at:$observed_at,status:"present",confidence:"high",
+        data:{
+          manager:$manager,name:$name,installed_version:$version,
+          candidate_version:(if $candidate == "" then null else $candidate end),
+          update_available:($candidate != "" and $candidate != $version)
+        },
+        evidence:[{source:"package-manager",method:$method}],errors:[]
+      }'
+}
+
+join_package_candidates() {
+  installed=$1
+  candidates=$2
+  native_arch=${3:-}
+  awk -F '\t' -v native_arch="$native_arch" '
+    FILENAME == ARGV[1] { candidate[$1] = $2; next }
+    NF >= 2 {
+      name = $1
+      version = candidate[name]
+      if (version == "" && native_arch != "" && name ~ (":" native_arch "$")) {
+        sub(":" native_arch "$", "", name)
+        version = candidate[name]
+      }
+      print $1 "\t" $2 "\t" version
+    }
+  ' "$candidates" "$installed"
+}
+
+expand_home() {
+  case $1 in
+    "~") printf '%s\n' "$HOME" ;;
+    \~/*) printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print tolower($1)}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print tolower($NF)}'
+  fi
+}
+
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print tolower($1)}'
+  else
+    openssl dgst -sha256 | awk '{print tolower($NF)}'
+  fi
+}
+
+file_mode() {
+  value=$(stat -f %Lp "$1" 2>/dev/null) ||
+    value=$(stat -c %a "$1" 2>/dev/null) ||
+    value=unknown
+  printf '%s\n' "$value"
+}
+
+file_owner() {
+  value=$(stat -f %Su "$1" 2>/dev/null) ||
+    value=$(stat -c %U "$1" 2>/dev/null) ||
+    value=unknown
+  printf '%s\n' "$value"
+}
+
+file_size() {
+  value=$(stat -f %z "$1" 2>/dev/null) ||
+    value=$(stat -c %s "$1" 2>/dev/null) ||
+    value=0
+  printf '%s\n' "$value"
+}
+
+file_mtime() {
+  value=$(stat -f %Sm -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null) || {
+    raw=$(stat -c %y "$1" 2>/dev/null) || raw=
+    if [ -n "$raw" ]; then
+      value=$(printf '%s\n' "$raw" | awk '{print $1"T"$2"Z"}')
+    else
+      value=unknown
+    fi
+  }
+  printf '%s\n' "$value"
+}
+
+directory_birth_time() {
+  value=$(stat -f %SB -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null) || value=
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return
+  fi
+  epoch=$(stat -c %W "$1" 2>/dev/null) || epoch=0
+  case $epoch in
+    ''|0|-1|*[!0-9]*) return ;;
+  esac
+  date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true
+}
+
+directory_digest() {
+  root=$1
+  # ponytail: newline-bearing file names are unsupported; skill trees use portable names.
+  find "$root" -type f -not -path '*/.git/*' 2>/dev/null | LC_ALL=C sort |
+    while IFS= read -r file; do
+      printf '%s\t%s\n' "${file#"$root"/}" "$(sha256_file "$file")"
+    done | sha256_stream
+}
+
+sanitize_remote() {
+  sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#; s#^[^/@]+@([^:]+:.*)$#\1#; s#[?].*$##'
+}
+
+canonical_git_source() {
+  canonical=$(sanitize_remote |
+    tr '[:upper:]' '[:lower:]' |
+    sed -E 's#^[a-z][a-z0-9+.-]*://##; s#^git@##; s#^([^/]+):#\1/#; s#/*$##; s#[.]git$##')
+  case $canonical in
+    */*/*) printf '%s\n' "$canonical" ;;
+    */*) printf 'github.com/%s\n' "$canonical" ;;
+    *) printf '%s\n' "$canonical" ;;
+  esac
+}
+
+u2_safe_permissions() {
+  u2_permissions=$(file_mode "$1") || return 1
+  u2_permissions=$(printf '%s' "$u2_permissions" | sed 's/.*\(...\)$/\1/')
+  [ "${#u2_permissions}" -eq 3 ] || return 1
+  case $(printf '%s' "$u2_permissions" | cut -c 2-3) in *2*|*3*|*6*|*7*) return 1 ;; esac
+}
+
+u2_directory_ready() {
+  u2_path=$1
+  u2_owner=$2
+  u2_mode=${3:-}
+  u2_checked_path=$u2_path
+  if [ -L "$u2_path" ]; then
+    [ -z "${u2_root:-}" ] && [ "${platform:-}" = macos ] && [ "$u2_owner" = root ] || return 1
+    [ "$(file_owner "$u2_path")" = root ] && u2_safe_permissions "$u2_path" &&
+      u2_directory_ready /private root || return 1
+    case $u2_path in
+      /etc)
+        [ "$(readlink "$u2_path")" = private/etc ] || return 1
+        u2_checked_path=/private/etc
+        ;;
+      /var)
+        [ "$(readlink "$u2_path")" = private/var ] || return 1
+        u2_checked_path=/private/var
+        ;;
+      *) return 1 ;;
+    esac
+  fi
+  [ -d "$u2_checked_path" ] && [ ! -L "$u2_checked_path" ] &&
+    [ "$(file_owner "$u2_checked_path")" = "$u2_owner" ] &&
+    u2_safe_permissions "$u2_checked_path" || return 1
+  if [ -n "$u2_mode" ]; then
+    u2_observed_mode=$(file_mode "$u2_checked_path" | sed 's/.*\(...\)$/\1/')
+    [ "$u2_observed_mode" = "$u2_mode" ] || return 1
+  fi
+}
+
+u2_file_ready() {
+  u2_path=$1
+  u2_owner=$2
+  u2_maximum=$3
+  u2_mode=${4:-}
+  [ -f "$u2_path" ] && [ ! -L "$u2_path" ] && [ "$(file_owner "$u2_path")" = "$u2_owner" ] &&
+    [ "$(file_size "$u2_path")" -le "$u2_maximum" ] && u2_safe_permissions "$u2_path" || return 1
+  if [ -n "$u2_mode" ]; then
+    u2_observed_mode=$(file_mode "$u2_path" | sed 's/.*\(...\)$/\1/')
+    [ "$u2_observed_mode" = "$u2_mode" ] || return 1
+  fi
+}
+
+u2_validate_protected_ancestors() {
+  u2_ancestor_candidate=$1
+  u2_ancestor_owner=$2
+  case $u2_ancestor_candidate in /*) ;; *) return 1 ;; esac
+  if [ -n "$u2_root" ]; then
+    case $u2_ancestor_candidate in "$u2_root"|"$u2_root"/*) ;; *) return 1 ;; esac
+  fi
+  u2_ancestor=${u2_ancestor_candidate%/*}
+  [ -n "$u2_ancestor" ] || u2_ancestor=/
+  while :; do
+    u2_directory_ready "$u2_ancestor" "$u2_ancestor_owner" || return 1
+    if [ -n "$u2_root" ] && [ "$u2_ancestor" = "$u2_root" ]; then break; fi
+    [ "$u2_ancestor" = / ] && break
+    u2_ancestor=${u2_ancestor%/*}
+    [ -n "$u2_ancestor" ] || u2_ancestor=/
+  done
+}
+
+u2_identity_mode() {
+  file_mode "$1" | sed 's/.*\(...\)$/\1/'
+}
+
+u2_path_set_digest() {
+  u2_owner=$1
+  shift
+  u2_maximum=33554432
+  u2_listing=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-u2-path-set.XXXXXX") || return 1
+  : >"$u2_listing"
+  while [ "$#" -gt 0 ]; do
+    u2_label=$1
+    u2_candidate=$2
+    shift 2
+    u2_validate_protected_ancestors "$u2_candidate" "$u2_owner" || {
+      rm -f "$u2_listing"
+      return 1
+    }
+    if [ -L "$u2_candidate" ]; then
+      rm -f "$u2_listing"
+      return 1
+    elif [ -f "$u2_candidate" ]; then
+      case $u2_candidate in */macos/packages/*.pkg) u2_maximum=2147483647 ;; *) u2_maximum=33554432 ;; esac
+      u2_file_ready "$u2_candidate" "$u2_owner" "$u2_maximum" || { rm -f "$u2_listing"; return 1; }
+      printf '%s|file|owner=%s|mode=%s|sha256=%s\n' "$u2_label" \
+        "$(file_owner "$u2_candidate")" "$(u2_identity_mode "$u2_candidate")" \
+        "$(sha256_file "$u2_candidate")" >>"$u2_listing"
+    elif [ -d "$u2_candidate" ]; then
+      u2_directory_ready "$u2_candidate" "$u2_owner" || { rm -f "$u2_listing"; return 1; }
+      if find "$u2_candidate" -type l -print | grep -q . ||
+        find "$u2_candidate" ! -type d ! -type f -print | grep -q .; then
+        rm -f "$u2_listing"
+        return 1
+      fi
+      printf '%s|directory|owner=%s|mode=%s\n' "$u2_label" "$(file_owner "$u2_candidate")" \
+        "$(u2_identity_mode "$u2_candidate")" >>"$u2_listing"
+      while IFS= read -r u2_member; do
+        u2_directory_ready "$u2_member" "$u2_owner" || { rm -f "$u2_listing"; return 1; }
+        printf '%s/%s|directory|owner=%s|mode=%s\n' "$u2_label" \
+          "${u2_member#"$u2_candidate"/}" "$(file_owner "$u2_member")" \
+          "$(u2_identity_mode "$u2_member")" >>"$u2_listing"
+      done < <(find "$u2_candidate" -mindepth 1 -type d -print | LC_ALL=C sort)
+      while IFS= read -r u2_member; do
+        case $u2_member in */macos/packages/*.pkg) u2_maximum=2147483647 ;; *) u2_maximum=33554432 ;; esac
+        u2_file_ready "$u2_member" "$u2_owner" "$u2_maximum" || exit 1
+        printf '%s/%s|file|owner=%s|mode=%s|sha256=%s\n' "$u2_label" \
+          "${u2_member#"$u2_candidate"/}" "$(file_owner "$u2_member")" \
+          "$(u2_identity_mode "$u2_member")" "$(sha256_file "$u2_member")" >>"$u2_listing"
+      done < <(find "$u2_candidate" -type f -print | LC_ALL=C sort)
+    elif [ ! -e "$u2_candidate" ]; then
+      printf '%s|absent\n' "$u2_label" >>"$u2_listing"
+    else
+      rm -f "$u2_listing"
+      return 1
+    fi
+  done
+  u2_answer=$(sha256_file "$u2_listing") || { rm -f "$u2_listing"; return 1; }
+  rm -f "$u2_listing"
+  printf '%s\n' "$u2_answer"
+}
+
+u2_record_value() {
+  awk -F '|' -v key="$2" '$1==key{print $2;exit}' "$1"
+}
+
+u2_https_source_uri() {
+  u2_uri=$1
+  [ "${#u2_uri}" -le 1024 ] &&
+    [[ $u2_uri =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~:@+,-]+)*$ ]] || return 1
+  u2_authority_and_path=${u2_uri#https://}
+  case $u2_authority_and_path in
+    */*)
+      u2_uri_path=${u2_authority_and_path#*/}
+      IFS='/' read -r -a u2_uri_segments <<EOF
+$u2_uri_path
+EOF
+      for u2_uri_segment in "${u2_uri_segments[@]}"; do
+        [ "$u2_uri_segment" != . ] && [ "$u2_uri_segment" != .. ] || return 1
+      done
+      ;;
+  esac
+}
+
+u2_validate_lifecycle_owner() {
+  u2_lifecycle_directory=$1
+  u2_lifecycle_owner=$2
+  u2_file_ready "$u2_lifecycle_directory/owner" "$u2_lifecycle_owner" 2048 600 || return 1
+  awk -F '|' '
+    NR==1{if($0!="lifecycle-owner|2")exit 1;next}
+    NR==2{if(NF!=2||$1!="boot-id"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    NR==3{if(NF!=2||$1!="pid"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+    NR==4{if(NF!=2||$1!="process-start"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    NR==5{if(NF!=2||$1!="operation"||($2!="install"&&$2!="revoke"&&$2!="recovery"))exit 1;next}
+    {exit 1}END{if(NR!=5)exit 1}
+  ' "$u2_lifecycle_directory/owner"
+}
+
+u2_validate_lifecycle_transaction() {
+  u2_lifecycle_transaction=$1/transaction
+  u2_file_ready "$u2_lifecycle_transaction" "$2" 4096 600 || return 1
+  awk -F '|' '
+    $0!~/^[ -~]+$/||length($0)>1024{exit 1}
+    NR==1{if($0!="lifecycle-transaction|1")exit 1;next}
+    NR==2{if(NF!=2||$1!="operation"||($2!="install"&&$2!="revoke"))exit 1;next}
+    NR==3{if(NF!=2||$1!="transaction-id")exit 1;next}
+    NR==4{if(NF!=2||$1!="owner-boot"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    NR==5{if(NF!=2||$1!="owner-pid"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+    NR==6{if(NF!=2||$1!="owner-start"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    NR==7{if(NF!=2||$1!="from-epoch"||$2!~/^(0|[1-9][0-9]{0,9})$/)exit 1;next}
+    NR==8{if(NF!=2||$1!="to-epoch"||$2!~/^(0|[1-9][0-9]{0,9})$/)exit 1;next}
+    NR==9{if(NF!=2||$1!="manifest-sha256"||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    NR==10{if(NF!=2||$1!="confirmation-sha256"||($2!="-"&&(length($2)!=64||$2!~/^[0-9a-f]+$/)))exit 1;next}
+    NR==11{if(NF!=2||$1!="phase"||$2!~/^(intent|drained|waiting|snapshotted|prepared|mutating|quarantining|rolled-back|rollback-finalizing|committed|commit-finalizing)$/)exit 1;next}
+    {exit 1}END{if(NR!=11)exit 1}
+  ' "$u2_lifecycle_transaction" || return 1
+  u2_transaction_operation=$(u2_record_value "$u2_lifecycle_transaction" operation)
+  u2_transaction_id=$(u2_record_value "$u2_lifecycle_transaction" transaction-id)
+  u2_transaction_from=$(u2_record_value "$u2_lifecycle_transaction" from-epoch)
+  u2_transaction_to=$(u2_record_value "$u2_lifecycle_transaction" to-epoch)
+  u2_transaction_manifest=$(u2_record_value "$u2_lifecycle_transaction" manifest-sha256)
+  u2_transaction_confirmation=$(u2_record_value "$u2_lifecycle_transaction" confirmation-sha256)
+  u2_transaction_phase=$(u2_record_value "$u2_lifecycle_transaction" phase)
+  [ "$u2_transaction_id" = "$u2_transaction_operation-$u2_transaction_from-$u2_transaction_to-$u2_transaction_manifest" ] || return 1
+  case $u2_transaction_operation in
+    install)
+      [ "$u2_transaction_to" -eq $((u2_transaction_from + 1)) ] &&
+        printf '%s' "$u2_transaction_confirmation" | grep -Eq '^[0-9a-f]{64}$' &&
+        [ "$u2_transaction_phase" != quarantining ]
+      ;;
+    revoke)
+      [ "$u2_transaction_from" -gt 0 ] && [ "$u2_transaction_to" -eq 0 ] &&
+        [ "$u2_transaction_confirmation" = - ] && [ "$u2_transaction_phase" != snapshotted ] &&
+        [ "$u2_transaction_phase" != prepared ] && [ "$u2_transaction_phase" != mutating ]
+      ;;
+  esac
+}
+
+u2_validate_drain() {
+  u2_drain=$1
+  u2_drain_owner=$2
+  u2_file_ready "$u2_drain" "$u2_drain_owner" 2048 600 || return 1
+  awk -F '|' '
+    NR!=1||$1!="draining"||$2!="2"{exit 1}
+    $3!~/^operation=(install|revoke)$/||$4!~/^from=(0|[1-9][0-9]{0,9})$/||
+      $5!~/^to=(0|[1-9][0-9]{0,9})$/||$6!~/^manifest-sha256=[0-9a-f]{64}$/{exit 1}
+    $3=="operation=install"{if(NF!=7||$7!~/^confirmation-sha256=[0-9a-f]{64}$/)exit 1;next}
+    $3=="operation=revoke"{if(NF!=6)exit 1;next}
+    {exit 1}
+  ' "$u2_drain"
+}
+
+u2_context_binary() {
+  awk -F '|' -v name="$2" '$1=="binary"&&$2==name{print $3;exit}' "$1"
+}
+
+u2_validate_apt_source_authority() {
+  u2_authority_generation=$1
+  u2_authority_root=$2
+  u2_authority_owner=$3
+  u2_source_file=$u2_authority_generation/apt/sources.list.d/roundhouse.sources
+  u2_keyring=$u2_authority_generation/apt/trusted.gpg.d/fleet.gpg
+  u2_authority_file=$u2_authority_generation/apt/source-authority
+  u2_release=$u2_authority_generation/apt/metadata/Release
+  u2_release_signature=$u2_authority_generation/apt/metadata/Release.gpg
+  u2_file_ready "$u2_authority_generation/apt/sources.list" "$u2_authority_owner" 65536 644 &&
+    [ "$(file_size "$u2_authority_generation/apt/sources.list")" -eq 0 ] &&
+    u2_directory_ready "$u2_authority_generation/apt/sources.list.d" "$u2_authority_owner" 755 &&
+    u2_file_ready "$u2_source_file" "$u2_authority_owner" 65536 644 || return 1
+  while IFS= read -r u2_source_member; do
+    [ "$u2_source_member" = "$u2_source_file" ] || return 1
+  done < <(find "$u2_authority_generation/apt/sources.list.d" -mindepth 1 -maxdepth 1 -print | LC_ALL=C sort)
+  awk -F ': ' '
+    $0!~/^[ -~]+$/||length($0)>1024{exit 1}
+    NR==1{if($0!="Types: deb")exit 1;next}
+    NR==2{if(NF!=2||$1!="URIs")exit 1;next}
+    NR==3{if(NF!=2||$1!="Suites"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==4{if(NF!=2||$1!="Components"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==5{if(NF!=2||$1!="Signed-By"||$2!~"^/")exit 1;next}
+    NR==6{if($0!="Trusted: no")exit 1;next}
+    {exit 1}END{if(NR!=6)exit 1}
+  ' "$u2_source_file" || return 1
+  u2_source_uri=$(sed -n '2s/^URIs: //p' "$u2_source_file")
+  u2_https_source_uri "$u2_source_uri" || return 1
+  u2_source_suite=$(sed -n '3s/^Suites: //p' "$u2_source_file")
+  u2_source_component=$(sed -n '4s/^Components: //p' "$u2_source_file")
+  u2_signed_by=$(sed -n '5s/^Signed-By: //p' "$u2_source_file")
+  IFS=' ' read -r u2_signed_by_path u2_signed_by_fingerprint u2_signed_by_extra <<EOF
+$u2_signed_by
+EOF
+  [ -z "$u2_signed_by_extra" ] &&
+    printf '%s' "$u2_signed_by_fingerprint" | grep -Eq '^([0-9A-F]{40}|[0-9A-F]{64})$' &&
+    [ "$u2_signed_by_path" = "$u2_authority_generation/apt/trusted.gpg.d/fleet.gpg" ] || return 1
+  case $u2_signed_by_path in "$u2_authority_root"/*) ;; *) [ -z "$u2_authority_root" ] || return 1 ;; esac
+  u2_file_ready "$u2_keyring" "$u2_authority_owner" 33554432 644 &&
+    u2_file_ready "$u2_authority_file" "$u2_authority_owner" 4096 644 &&
+    u2_directory_ready "$u2_authority_generation/apt/metadata" "$u2_authority_owner" 755 &&
+    u2_file_ready "$u2_release" "$u2_authority_owner" 1048576 644 &&
+    u2_file_ready "$u2_release_signature" "$u2_authority_owner" 1048576 644 || return 1
+  ! grep -Eq '^ssh-(rsa|dss|ed25519|ecdsa)[[:space:]]' "$u2_keyring" || return 1
+  awk -F '|' '
+    $0!~/^[ -~]+$/||length($0)>1024{exit 1}
+    NR==1{if($0!="apt-source-authority|2")exit 1;next}
+    NR==2{if(NF!=2||$1!="source-uri")exit 1;next}
+    NR==3{if(NF!=2||$1!="source-suite"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==4{if(NF!=2||$1!="source-component"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==5{if(NF!=2||$1!="publisher-primary-fingerprint"||$2!~/^([0-9A-F]{40}|[0-9A-F]{64})$/)exit 1;next}
+    NR>=6&&NR<=8{if(NF!=2||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    {exit 1}END{if(NR!=8)exit 1}
+  ' "$u2_authority_file" || return 1
+  u2_https_source_uri "$(u2_record_value "$u2_authority_file" source-uri)" || return 1
+  [ "$(awk -F '|' 'NR>=6{printf "%s%s",sep,$1;sep=","}' "$u2_authority_file")" = \
+    'keyring-sha256,release-sha256,signature-sha256' ] &&
+    [ "$(u2_record_value "$u2_authority_file" source-uri)" = "$u2_source_uri" ] &&
+    [ "$(u2_record_value "$u2_authority_file" source-suite)" = "$u2_source_suite" ] &&
+    [ "$(u2_record_value "$u2_authority_file" source-component)" = "$u2_source_component" ] &&
+    [ "$(u2_record_value "$u2_authority_file" publisher-primary-fingerprint)" = "$u2_signed_by_fingerprint" ] &&
+    [ "$(u2_record_value "$u2_authority_file" keyring-sha256)" = "$(sha256_file "$u2_keyring")" ] &&
+    [ "$(u2_record_value "$u2_authority_file" release-sha256)" = "$(sha256_file "$u2_release")" ] &&
+    [ "$(u2_record_value "$u2_authority_file" signature-sha256)" = "$(sha256_file "$u2_release_signature")" ] || return 1
+  awk -v expected_suite="$u2_source_suite" -v expected_component="$u2_source_component" '
+    $0!~/^[ -~]+$/||length($0)>4096{exit 1}
+    /^Suite: / {
+      suite_count++;value=substr($0,index($0,": ")+2)
+      if(suite_count!=1||value!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1
+      if(value==expected_suite)matches_distribution++
+    }
+    /^Codename: / {
+      codename_count++;value=substr($0,index($0,": ")+2)
+      if(codename_count!=1||value!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1
+      if(value==expected_suite)matches_distribution++
+    }
+    /^Components: / {
+      components_count++;value=substr($0,length("Components: ")+1)
+      count=split(value,component,/ +/);if(count<1||count>128)exit 1
+      for(i=1;i<=count;i++){
+        if(component[i]!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1
+        if(component[i]==expected_component)matches++
+      }
+    }
+    END{if(suite_count+codename_count<1||matches_distribution!=1||components_count!=1||matches!=1)exit 1}
+  ' "$u2_release" || return 1
+  u2_gpgv_status=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-u2-gpgv-status.XXXXXX") || return 1
+  chmod 0600 "$u2_gpgv_status" || { rm -f "$u2_gpgv_status"; return 1; }
+  if env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      "$u2_authority_root/usr/bin/gpgv" --status-fd 3 --keyring "$u2_keyring" \
+      "$u2_release_signature" "$u2_release" 3>"$u2_gpgv_status" >/dev/null 2>&1; then
+    u2_gpgv_rc=0
+  else
+    u2_gpgv_rc=$?
+  fi
+  [ "$u2_gpgv_rc" -eq 0 ] && u2_file_ready "$u2_gpgv_status" "$u2_authority_owner" 65536 600 || {
+    rm -f "$u2_gpgv_status"
+    return 1
+  }
+  u2_valid_signature=$(awk '
+    $0!~/^[ -~]+$/||length($0)>4096{exit 1}
+    $1=="[GNUPG:]"&&$2=="VALIDSIG"{count++;signer=$3;primary=(NF>=12?$NF:$3)}
+    END{if(count!=1)exit 1;print signer"|"primary}
+  ' "$u2_gpgv_status") || { rm -f "$u2_gpgv_status"; return 1; }
+  rm -f "$u2_gpgv_status"
+  IFS='|' read -r u2_valid_signer u2_valid_primary <<EOF
+$u2_valid_signature
+EOF
+  printf '%s' "$u2_valid_signer" | grep -Eq '^([0-9A-F]{40}|[0-9A-F]{64})$' &&
+    printf '%s' "$u2_valid_primary" | grep -Eq '^([0-9A-F]{40}|[0-9A-F]{64})$' &&
+    [ "$u2_valid_primary" = "$u2_signed_by_fingerprint" ]
+}
+
+u2_validate_apt_context() {
+  u2_generation=$1
+  u2_root=$2
+  u2_owner=$3
+  u2_apt_context=$u2_generation/apt.context
+  u2_apt_config=$u2_generation/apt.conf
+  awk -F '|' '
+    BEGIN {
+      value[2]="architecture";value[3]="config-file-sha256";value[4]="effective-config-sha256"
+      value[5]="sources-sha256";value[6]="keyrings-sha256";value[7]="preferences-sha256"
+      value[8]="source-identities-sha256";value[9]="methods-sha256"
+      value[10]="compressors-sha256";value[11]="helpers-sha256"
+      binary[12]="apt-get";binary[13]="apt-config";binary[14]="apt-cache"
+      binary[15]="dpkg";binary[16]="dpkg-query";binary[17]="dpkg-deb";binary[18]="setsid"
+    }
+    $0!~/^[ -~]+$/{exit 1}
+    NR==1{if(NF!=2||$1!="apt-context"||$2!="2")exit 1;next}
+    NR>=2&&NR<=11{if(NF!=2||$1!=value[NR])exit 1;next}
+    NR>=12&&NR<=18{if(NF!=3||$1!="binary"||$2!=binary[NR])exit 1;next}
+    {exit 1} END{if(NR!=18)exit 1}
+  ' "$u2_apt_context" || return 1
+  u2_architecture=$(u2_record_value "$u2_apt_context" architecture)
+  u2_config_digest=$(u2_record_value "$u2_apt_context" config-file-sha256)
+  u2_effective_digest=$(u2_record_value "$u2_apt_context" effective-config-sha256)
+  u2_sources_digest=$(u2_record_value "$u2_apt_context" sources-sha256)
+  u2_keyrings_digest=$(u2_record_value "$u2_apt_context" keyrings-sha256)
+  u2_preferences_digest=$(u2_record_value "$u2_apt_context" preferences-sha256)
+  u2_source_identities_digest=$(u2_record_value "$u2_apt_context" source-identities-sha256)
+  u2_methods_digest=$(u2_record_value "$u2_apt_context" methods-sha256)
+  u2_compressors_digest=$(u2_record_value "$u2_apt_context" compressors-sha256)
+  u2_helpers_digest=$(u2_record_value "$u2_apt_context" helpers-sha256)
+  for u2_digest_value in "$u2_config_digest" "$u2_effective_digest" "$u2_sources_digest" \
+    "$u2_keyrings_digest" "$u2_preferences_digest" "$u2_source_identities_digest" \
+    "$u2_methods_digest" "$u2_compressors_digest" "$u2_helpers_digest" \
+    "$(u2_context_binary "$u2_apt_context" apt-get)" "$(u2_context_binary "$u2_apt_context" apt-config)" \
+    "$(u2_context_binary "$u2_apt_context" apt-cache)" "$(u2_context_binary "$u2_apt_context" dpkg)" \
+    "$(u2_context_binary "$u2_apt_context" dpkg-query)" "$(u2_context_binary "$u2_apt_context" dpkg-deb)" \
+    "$(u2_context_binary "$u2_apt_context" setsid)"; do
+    printf '%s' "$u2_digest_value" | grep -Eq '^[0-9a-f]{64}$' || return 1
+  done
+  printf '%s' "$u2_architecture" | grep -Eq '^[a-z0-9][a-z0-9_-]{0,31}$' || return 1
+  awk -v generation="$u2_generation" -v methods="$u2_root/usr/lib/apt/methods" \
+      -v dpkg="$u2_root/usr/bin/dpkg" -v architecture="$u2_architecture" '
+    BEGIN {
+      expected["Dir::Etc::main \"/dev/null\";"]=1;expected["Dir::Etc::parts \"/dev/null\";"]=1
+      expected["Dir::Etc::sourcelist \""generation"/apt/sources.list\";"]=1
+      expected["Dir::Etc::sourceparts \""generation"/apt/sources.list.d\";"]=1
+      expected["Dir::Etc::trusted \""generation"/apt/trusted.gpg\";"]=1
+      expected["Dir::Etc::trustedparts \""generation"/apt/trusted.gpg.d\";"]=1
+      expected["Dir::Etc::preferences \""generation"/apt/preferences\";"]=1
+      expected["Dir::Etc::preferencesparts \""generation"/apt/preferences.d\";"]=1
+      expected["Dir::Bin::methods \""methods"\";"]=1;expected["Dir::Bin::dpkg \""dpkg"\";"]=1
+      expected["APT::Architecture \""architecture"\";"]=1
+      expected["Acquire::AllowInsecureRepositories \"false\";"]=1
+      expected["APT::Get::AllowUnauthenticated \"false\";"]=1
+    }
+    $0!~/^[ -~]+$/||!($0 in expected)||seen[$0]++{exit 1}
+    END{if(NR!=13)exit 1;for(line in expected)if(!seen[line])exit 1}
+  ' "$u2_apt_config" || return 1
+  [ "$(sha256_file "$u2_apt_config")" = "$u2_config_digest" ] || return 1
+  ! grep -Eiq '(Pre-Invoke|Post-Invoke|Pre-Install-Pkgs|Proxy::Login|DPkg::Tools::Options|::Command|::Proxy)' \
+    "$u2_apt_config" || return 1
+  for u2_binary in apt-get apt-config apt-cache dpkg dpkg-query dpkg-deb setsid; do
+    u2_binary_path=$u2_root/usr/bin/$u2_binary
+    u2_file_ready "$u2_binary_path" "$u2_owner" 33554432 || return 1
+    [ -x "$u2_binary_path" ] &&
+      [ "$(sha256_file "$u2_binary_path")" = "$(u2_context_binary "$u2_apt_context" "$u2_binary")" ] || return 1
+  done
+  [ "$(u2_path_set_digest "$u2_owner" source-main "$u2_generation/apt/sources.list" \
+    source-parts "$u2_generation/apt/sources.list.d")" = "$u2_sources_digest" ] &&
+    [ "$(u2_path_set_digest "$u2_owner" trusted-main "$u2_generation/apt/trusted.gpg" \
+      trusted-parts "$u2_generation/apt/trusted.gpg.d")" = "$u2_keyrings_digest" ] &&
+    [ "$(u2_path_set_digest "$u2_owner" preferences-main "$u2_generation/apt/preferences" \
+      preferences-parts "$u2_generation/apt/preferences.d")" = "$u2_preferences_digest" ] &&
+    [ "$(u2_path_set_digest "$u2_owner" methods "$u2_root/usr/lib/apt/methods")" = "$u2_methods_digest" ] &&
+    [ "$(u2_path_set_digest "$u2_owner" gzip "$u2_root/usr/bin/gzip" xz "$u2_root/usr/bin/xz" \
+      bzip2 "$u2_root/usr/bin/bzip2" lz4 "$u2_root/usr/bin/lz4" zstd "$u2_root/usr/bin/zstd")" = "$u2_compressors_digest" ] &&
+    [ "$(u2_path_set_digest "$u2_owner" apt-helper "$u2_root/usr/lib/apt/apt-helper" \
+      apt-solvers "$u2_root/usr/lib/apt/solvers" apt-planners "$u2_root/usr/lib/apt/planners" \
+      gpgv "$u2_root/usr/bin/gpgv")" = "$u2_helpers_digest" ] || return 1
+  u2_source_identities=$u2_generation/apt/source-identities
+  u2_file_ready "$u2_source_identities" "$u2_owner" 65536 &&
+    [ "$(sha256_file "$u2_source_identities")" = "$u2_source_identities_digest" ] || return 1
+  awk -F '|' 'NR==1{if($0!="source-identities|1")exit 1;next}
+    NF!=3||$1!="source"||$2!~/^[A-Za-z0-9][A-Za-z0-9._:+@,-]{0,255}$/||
+      length($3)!=64||$3!~/^[0-9a-f]+$/||seen[$2]++||(previous!=""&&previous>=$0){exit 1}{previous=$0}' \
+    "$u2_source_identities" || return 1
+  u2_effective_tmp=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-u2-apt.XXXXXX") || return 1
+  if ! env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      APT_CONFIG="$u2_apt_config" "$u2_root/usr/bin/apt-config" dump >"$u2_effective_tmp" 2>/dev/null ||
+    [ "$(sha256_file "$u2_effective_tmp")" != "$u2_effective_digest" ] ||
+    grep -Eiq '(Pre-Invoke|Post-Invoke|Pre-Install-Pkgs|Proxy::Login|DPkg::Tools::Options|::Command|::Proxy)' \
+      "$u2_effective_tmp"; then
+    rm -f "$u2_effective_tmp"
+    return 1
+  fi
+  rm -f "$u2_effective_tmp"
+  u2_validate_apt_source_authority "$u2_generation" "$u2_root" "$u2_owner" || return 1
+  u2_observed_architecture=$(env -i HOME=/root LC_ALL=C LANG=C TZ=UTC \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin APT_CONFIG="$u2_apt_config" \
+    "$u2_root/usr/bin/dpkg" --print-architecture 2>/dev/null) || return 1
+  [ "$u2_observed_architecture" = "$u2_architecture" ] || return 1
+
+  u2_observed_preconditions='[]'
+  if awk -F '|' '$1=="action"&&$2=="apt.update-metadata.v1"&&$3=="posix-root-v1"&&$4=="enabled"{found=1}END{exit !found}' \
+      "$u2_generation/policy.actions"; then
+    u2_metadata_tmp=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-u2-metadata.XXXXXX") || return 1
+    if env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        APT_CONFIG="$u2_apt_config" "$u2_root/usr/bin/apt-cache" policy >"$u2_metadata_tmp" 2>/dev/null &&
+      [ "$(file_size "$u2_metadata_tmp")" -le 1048576 ]; then
+      u2_metadata_digest=$(sha256_file "$u2_metadata_tmp")
+      u2_precondition_digest=$(printf 'metadata|%s\n' "$u2_metadata_digest" | sha256_stream)
+      u2_observed_preconditions=$(jq -cn --arg digest "$u2_precondition_digest" --arg metadata "$u2_metadata_digest" \
+        '[{action_id:"apt.update-metadata.v1",policy_token:"-",digest:{algorithm:"sha256",value:$digest},
+           evidence:{kind:"apt-cache-policy",digest:{algorithm:"sha256",value:$metadata}}}]')
+    fi
+    rm -f "$u2_metadata_tmp"
+  fi
+  return 0
+}
+
+u2_validate_macos_context() {
+  u2_generation=$1
+  u2_root=$2
+  u2_owner=$3
+  u2_macos_context=$u2_generation/macos.context
+  awk -F '|' '
+    BEGIN { binary[2]="chown"; binary[3]="installer"; binary[4]="pkgutil"; binary[5]="pmset"; binary[6]="systemsetup" }
+    $0!~/^[ -~]+$/ { exit 1 }
+    NR==1 { if(NF!=2||$1!="macos-context"||$2!="2")exit 1; next }
+    NR>=2&&NR<=6 { if(NF!=3||$1!="binary"||$2!=binary[NR]||length($3)!=64||$3!~/^[0-9a-f]+$/)exit 1; next }
+    { exit 1 } END { if(NR!=6)exit 1 }
+  ' "$u2_macos_context" || return 1
+  for u2_binary in chown installer pkgutil pmset systemsetup; do
+    case $u2_binary in pmset) u2_binary_path=$u2_root/usr/bin/pmset ;; *) u2_binary_path=$u2_root/usr/sbin/$u2_binary ;; esac
+    u2_expected_digest=$(awk -F '|' -v name="$u2_binary" '$1=="binary"&&$2==name{print $3;exit}' "$u2_macos_context")
+    u2_file_ready "$u2_binary_path" "$u2_owner" 33554432 && [ -x "$u2_binary_path" ] &&
+      [ "$(sha256_file "$u2_binary_path")" = "$u2_expected_digest" ] || return 1
+  done
+  u2_package_root=$u2_generation/macos/packages
+  u2_directory_ready "$u2_generation/macos" "$u2_owner" 755 &&
+    u2_directory_ready "$u2_package_root" "$u2_owner" 755 || return 1
+  u2_package_count=0
+  while IFS='|' read -r u2_kind _ u2_token u2_payload_mode u2_size u2_digest _; do
+    [ "$u2_kind" = macos-pkg ] || continue
+    case $u2_payload_mode in script-free|sealed-cask-payload-v1) ;; *) return 1 ;; esac
+    u2_package=$u2_package_root/$u2_token.pkg
+    u2_file_ready "$u2_package" "$u2_owner" 2147483647 644 &&
+      [ "$(file_size "$u2_package")" = "$u2_size" ] &&
+      [ "$(sha256_file "$u2_package")" = "$u2_digest" ] || return 1
+    u2_package_count=$((u2_package_count + 1))
+  done <"$u2_generation/policy.constraints"
+  u2_file_count=$(find "$u2_package_root" -mindepth 1 -maxdepth 1 -type f -print | wc -l | tr -d ' ')
+  [ "$u2_package_count" -eq "$u2_file_count" ] &&
+    [ "$(find "$u2_package_root" -mindepth 1 -maxdepth 1 ! -type f -print | wc -l | tr -d ' ')" -eq 0 ]
+}
+
+u2_macos_setting_value_valid() {
+  u2_setting_id=$1
+  u2_setting_value=$2
+  case $u2_setting_id in
+    timezone)
+      [ "${#u2_setting_value}" -le 255 ] &&
+        [[ $u2_setting_value =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+){0,2}$ ]]
+      ;;
+    wake-on-network-access|restart-after-power-failure)
+      [[ $u2_setting_value =~ ^(on|off)$ ]]
+      ;;
+    network-time-server)
+      [[ $u2_setting_value =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] &&
+        [ "${#u2_setting_value}" -le 253 ] && [[ $u2_setting_value != *..* ]]
+      ;;
+    computer-sleep|display-sleep)
+      [ "$u2_setting_value" = Never ] ||
+        { [[ $u2_setting_value =~ ^[1-9][0-9]{0,2}$ ]] && [ "$u2_setting_value" -le 180 ]; }
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+u2_macos_app_basename_valid() {
+  u2_app_name=$1
+  u2_app_pattern='^[A-Za-z0-9][A-Za-z0-9._+() -]{0,123}[.]app$'
+  [ "${#u2_app_name}" -le 128 ] && [[ $u2_app_name =~ $u2_app_pattern ]] && [[ $u2_app_name != *..* ]]
+}
+
+u2_macos_receipt_version() {
+  u2_pkgutil=$1
+  u2_receipt=$2
+  [[ $u2_receipt =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$ ]] || return 1
+  u2_output=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-pkg.XXXXXX") || return 1
+  u2_error=$u2_output.error
+  if ! env -i HOME=/var/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      "$u2_pkgutil" --pkg-info-plist "$u2_receipt" >"$u2_output" 2>"$u2_error"; then
+    [ "$(<"$u2_error")" = "No receipt for '$u2_receipt' found at '/'." ] || {
+      rm -f "$u2_output" "$u2_error"
+      return 1
+    }
+    rm -f "$u2_output" "$u2_error"
+    printf '%s\n' -
+    return 0
+  fi
+  [ ! -s "$u2_error" ] && [ "$(file_size "$u2_output")" -le 65536 ] || {
+    rm -f "$u2_output" "$u2_error"
+    return 1
+  }
+  u2_observed_id=$(awk '
+    /<key>pkgid<\/key>/{if(found++)exit 1;getline;if($0!~/<string>[^<]+<\/string>/)exit 1;
+      sub(/^.*<string>/,"");sub(/<\/string>.*$/,"");value=$0}
+    END{if(found!=1)exit 1;print value}' "$u2_output") || {
+    rm -f "$u2_output" "$u2_error"
+    return 1
+  }
+  u2_observed_version=$(awk '
+    /<key>pkg-version<\/key>/{if(found++)exit 1;getline;if($0!~/<string>[^<]+<\/string>/)exit 1;
+      sub(/^.*<string>/,"");sub(/<\/string>.*$/,"");value=$0}
+    END{if(found!=1)exit 1;print value}' "$u2_output") || {
+    rm -f "$u2_output" "$u2_error"
+    return 1
+  }
+  rm -f "$u2_output" "$u2_error"
+  [ "$u2_observed_id" = "$u2_receipt" ] &&
+    [[ $u2_observed_version =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$ ]] || return 1
+  printf '%s\n' "$u2_observed_version"
+}
+
+u2_macos_pmset_snapshot() {
+  u2_root=$1
+  u2_owner=$2
+  u2_output=$3
+  u2_pmset=$u2_root/usr/bin/pmset
+  u2_raw=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-pmset.XXXXXX") || return 1
+  if ! u2_validate_protected_ancestors "$u2_pmset" "$u2_owner" ||
+    ! u2_file_ready "$u2_pmset" "$u2_owner" 33554432 || [ ! -x "$u2_pmset" ] ||
+    ! env -i HOME=/nonexistent LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      "$u2_pmset" -g custom >"$u2_raw" 2>/dev/null ||
+    [ "$(file_size "$u2_raw")" -gt 65536 ]; then
+    rm -f "$u2_raw"
+    return 1
+  fi
+  if ! awk '
+    /^[A-Za-z][A-Za-z ]*:$/ {
+      profile=$0; sub(/:$/, "", profile)
+      if(seen_profile[profile]++)exit 1
+      profiles++; profile_name[profiles]=profile
+      next
+    }
+    /^[[:space:]]+[A-Za-z0-9][A-Za-z0-9 ]*[[:space:]]+-?[0-9]+[[:space:]]*$/ {
+      if(profile=="")exit 1
+      if(NF!=2)next
+      key=$1; value=$2
+      if(key!="womp"&&key!="autorestart"&&key!="sleep"&&key!="displaysleep")next
+      if(seen[key,profile]++)exit 1
+      if((key=="womp"||key=="autorestart")&&(value!="0"&&value!="1"))exit 1
+      if((key=="sleep"||key=="displaysleep")&&(value!~/^(0|[1-9][0-9]{0,2})$/||(value+0)>180))exit 1
+      if((key in selected)&&selected[key]!=value)exit 1
+      selected[key]=value
+      next
+    }
+    {exit 1}
+    END {
+      if(profiles<1||!("womp" in selected)||!("autorestart" in selected)||
+        !("sleep" in selected)||!("displaysleep" in selected))exit 1
+      for(i=1;i<=profiles;i++)
+        if(!seen["womp",profile_name[i]]||!seen["autorestart",profile_name[i]]||
+          !seen["sleep",profile_name[i]]||!seen["displaysleep",profile_name[i]])exit 1
+      print "wake-on-network-access|" (selected["womp"]=="1"?"on":"off")
+      print "restart-after-power-failure|" (selected["autorestart"]=="1"?"on":"off")
+      print "computer-sleep|" (selected["sleep"]=="0"?"Never":selected["sleep"])
+      print "display-sleep|" (selected["displaysleep"]=="0"?"Never":selected["displaysleep"])
+    }
+  ' "$u2_raw" >"$u2_output"; then
+    rm -f "$u2_raw" "$u2_output"
+    return 1
+  fi
+  rm -f "$u2_raw"
+}
+
+u2_macos_setting_snapshot() {
+  u2_root=$1
+  u2_owner=$2
+  u2_setting_id=$3
+  u2_pmset_values=$4
+  case $u2_setting_id in
+    timezone)
+      u2_localtime=$u2_root/etc/localtime
+      u2_validate_protected_ancestors "$u2_localtime" "$u2_owner" && [ -L "$u2_localtime" ] || return 1
+      u2_zone_link=$(readlink "$u2_localtime") || return 1
+      case $u2_zone_link in /var/db/timezone/zoneinfo/*) ;; *) return 1 ;; esac
+      u2_current=${u2_zone_link#/var/db/timezone/zoneinfo/}
+      case /$u2_current/ in */../*|*/./*|*//*) return 1 ;; esac
+      u2_zone_file=$u2_root$u2_zone_link
+      u2_validate_protected_ancestors "$u2_zone_file" "$u2_owner" &&
+        u2_file_ready "$u2_zone_file" "$u2_owner" 8388608 || return 1
+      ;;
+    network-time-server)
+      u2_ntp=$u2_root/etc/ntp.conf
+      u2_validate_protected_ancestors "$u2_ntp" "$u2_owner" &&
+        u2_file_ready "$u2_ntp" "$u2_owner" 4096 644 || return 1
+      u2_current=$(awk 'NR==1&&NF==2&&$1=="server"&&$0=="server " $2{value=$2;next}
+        {exit 1}END{if(NR!=1)exit 1;print value}' "$u2_ntp") || return 1
+      ;;
+    wake-on-network-access|restart-after-power-failure|computer-sleep|display-sleep)
+      u2_current=$(awk -F '|' -v id="$u2_setting_id" '$1==id{if(found++)exit 1;value=$2}
+        END{if(found!=1)exit 1;print value}' "$u2_pmset_values") || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  u2_macos_setting_value_valid "$u2_setting_id" "$u2_current" || return 1
+  printf '%s\n' "$u2_current"
+}
+
+u2_macos_preconditions() {
+  u2_generation=$1
+  u2_root=$2
+  u2_values=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-preconditions.XXXXXX") || return 1
+  u2_pmset_values=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-pmset-values.XXXXXX") || {
+    rm -f "$u2_values"
+    return 1
+  }
+  : >"$u2_values"
+  : >"$u2_pmset_values"
+  if awk -F '|' '$1=="macos-setting"&&$4~/^(wake-on-network-access|restart-after-power-failure|computer-sleep|display-sleep)$/{found=1}END{exit !found}' \
+      "$u2_generation/policy.constraints" &&
+    ! u2_macos_pmset_snapshot "$u2_root" "$u2_protected_owner" "$u2_pmset_values"; then
+    rm -f "$u2_values" "$u2_pmset_values"
+    return 1
+  fi
+  u2_count=0
+  u2_failed=false
+  while IFS='|' read -r u2_kind u2_action u2_token u2_field4 u2_field5 u2_field6 u2_field7 \
+      u2_field8 u2_field9 u2_field10 u2_field11 u2_field12 u2_extra; do
+    case $u2_kind in
+      macos-pkg)
+        [ "$u2_action" = macos.install-signed-pkg.v1 ] && [ -z "$u2_extra" ] || { u2_failed=true; break; }
+        case $u2_field4 in script-free|sealed-cask-payload-v1) ;; *) u2_failed=true; break ;; esac
+        u2_current=$(u2_macos_receipt_version "$u2_root/usr/sbin/pkgutil" "$u2_field11") || {
+          u2_failed=true; break;
+        }
+        u2_digest=$(printf 'macos-pkg|2|%s|%s|%s|%s|%s|%s|%s|%s\n' "$u2_token" "$u2_field11" \
+          "$u2_current" "$u2_field12" "$u2_field6" "$u2_field10" "$u2_field9" "$u2_field4" | sha256_stream) || {
+          u2_failed=true; break;
+        }
+        ;;
+      macos-cask-app)
+        [ "$u2_action" = macos.install-signed-pkg.v1 ] &&
+          u2_macos_app_basename_valid "$u2_field4" &&
+          [ -z "$u2_field5$u2_field6$u2_field7$u2_field8$u2_field9$u2_field10$u2_field11$u2_field12$u2_extra" ] ||
+          { u2_failed=true; break; }
+        u2_target=$u2_root/Applications/$u2_field4
+        case /$u2_target/ in */../*|*/./*) u2_failed=true; break ;; esac
+        if [ ! -e "$u2_target" ] && [ ! -L "$u2_target" ]; then
+          u2_current=absent
+        elif [ -d "$u2_target" ] && [ ! -L "$u2_target" ]; then
+          u2_current="owner=$(file_owner "$u2_target"),mode=$(file_mode "$u2_target")"
+        else
+          u2_failed=true; break
+        fi
+        u2_digest=$(printf 'macos-cask-app|1|%s|%s|%s\n' "$u2_token" "$u2_field4" "$u2_current" |
+          sha256_stream) || { u2_failed=true; break; }
+        ;;
+      macos-setting)
+        [ "$u2_action" = macos.apply-system-setting.v1 ] &&
+          [ -z "$u2_field6$u2_field7$u2_field8$u2_field9$u2_field10$u2_field11$u2_field12$u2_extra" ] &&
+          u2_macos_setting_value_valid "$u2_field4" "$u2_field5" || { u2_failed=true; break; }
+        u2_current=$(u2_macos_setting_snapshot "$u2_root" "$u2_protected_owner" "$u2_field4" \
+          "$u2_pmset_values") || { u2_failed=true; break; }
+        u2_digest=$(printf 'macos-setting|1|%s|%s|%s\n' "$u2_field4" "$u2_current" "$u2_field5" |
+          sha256_stream) || { u2_failed=true; break; }
+        ;;
+      *) continue ;;
+    esac
+    u2_count=$((u2_count + 1))
+    [ "$u2_count" -le 128 ] || { u2_failed=true; break; }
+    printf '%s\t%s\t%s\n' "$u2_action" "$u2_token" "$u2_digest" >>"$u2_values" || {
+      u2_failed=true; break;
+    }
+  done <"$u2_generation/policy.constraints"
+  if [ "$u2_failed" = true ]; then
+    rm -f "$u2_values" "$u2_pmset_values"
+    return 1
+  fi
+  u2_observed_preconditions=$(jq -Rsc 'split("\n") | map(select(length>0) | split("\t") |
+    {action_id:.[0],policy_token:.[1],digest:{algorithm:"sha256",value:.[2]}})' "$u2_values") || {
+    rm -f "$u2_values" "$u2_pmset_values"
+    return 1
+  }
+  rm -f "$u2_values" "$u2_pmset_values"
+}
+
+u2_public_record_json() {
+  u2_public_file=$1
+  awk -F '|' '
+    $0!~/^[ -~]+$/{exit 1}
+    NR==1{if($0!="broker-public|1")exit 1;next}
+    NR==2{if($1!="state"||NF!=2)exit 1;next} NR==3{if($1!="reason"||NF!=2)exit 1;next}
+    NR==4{if($1!="request-id"||NF!=2)exit 1;next} NR==5{if($1!="plan-id"||NF!=2)exit 1;next}
+    NR==6{if($1!="action-id"||NF!=2)exit 1;next} NR==7{if($1!="enrollment-epoch"||NF!=2)exit 1;next}
+    {exit 1} END{if(NR!=7)exit 1}
+  ' "$u2_public_file" || return 1
+  u2_public_state=$(u2_record_value "$u2_public_file" state)
+  u2_public_reason=$(u2_record_value "$u2_public_file" reason)
+  u2_public_request=$(u2_record_value "$u2_public_file" request-id)
+  u2_public_plan=$(u2_record_value "$u2_public_file" plan-id)
+  u2_public_action=$(u2_record_value "$u2_public_file" action-id)
+  u2_public_epoch=$(u2_record_value "$u2_public_file" enrollment-epoch)
+  printf '%s' "$u2_public_epoch" | grep -Eq '^[1-9][0-9]{0,9}$' || return 1
+  jq -cn --arg state "$u2_public_state" --arg reason "$u2_public_reason" \
+    --arg request_id "$u2_public_request" --arg plan_id "$u2_public_plan" \
+    --arg action_id "$u2_public_action" --argjson enrollment_epoch "$u2_public_epoch" \
+    '{state:$state,reason:$reason,request_id:$request_id,plan_id:$plan_id,
+      action_id:$action_id,enrollment_epoch:$enrollment_epoch}'
+}
+
+emit_privilege_readiness() {
+  platform=$(jq -r --arg host "$host_id" '.machines[$host].platform' "$config")
+  machine_transport=$(jq -r --arg host "$host_id" '.machines[$host].transport' "$config")
+  route=$(jq -c --arg host "$host_id" '.machines[$host].privilege_broker.automation_transport // null' "$config")
+  transport=$(printf '%s' "$route" | jq -r '.mode // empty')
+  request_principal=$(printf '%s' "$route" | jq -r '.request_user // empty')
+  pinned_host_key=$(printf '%s' "$route" | jq -r '.pinned_host_key_fingerprint // empty')
+  if jq -e '.worker.policy_proposal_digest != null' "$config" >/dev/null 2>&1; then
+    proposal_digest=$(jq -r '.worker.policy_proposal_digest' "$config")
+  elif jq -e --arg host "$host_id" '.machines[$host].privilege_broker.policy_proposal != null' "$config" >/dev/null; then
+    proposal_digest=$(jq -r --arg host "$host_id" \
+      '.machines[$host].privilege_broker.policy_proposal[]' "$config" | sha256_stream)
+  else
+    proposal_digest=$(sha256_file "$script_dir/../references/privilege-policy.default")
+  fi
+
+  identity=${ROUNDHOUSE_IDENTITY:-${XDG_CONFIG_HOME:-"$HOME/.config"}/roundhouse/identity.json}
+  node_identity_ready=false
+  controller_receipt_ready=false
+  node_id=
+  fleet_domain=
+  node_key_fingerprint=
+  fleet_ca_fingerprint=
+  ca_generation=null
+  certificate_serial=
+  certificate_valid_after=
+  certificate_valid_before=
+  certificate_principals='[]'
+  certificate_source_addresses='[]'
+  originating_node_identity=null
+  expected_enrollment_epoch=
+  expected_broker_digest=
+  expected_policy_digest=
+  expected_context_digest=
+  if [ -f "$identity" ] && [ ! -L "$identity" ] &&
+    ROUNDHOUSE_CONFIG="$config" ROUNDHOUSE_IDENTITY="$identity" \
+      "$script_dir/machine-utilities" validate-config >/dev/null 2>&1; then
+    node_identity_ready=true
+    node_id=$(jq -r '.node_id' "$identity")
+    fleet_domain=$(jq -r '.fleet_domain' "$identity")
+    node_key_fingerprint=$(jq -r '.node_key_fingerprint' "$identity")
+    fleet_ca_fingerprint=$(jq -r '.fleet_ca_fingerprint' "$identity")
+    ca_generation=$(jq -r '.ca_generation' "$identity")
+    certificate_serial=$(jq -r '.certificate_serial' "$identity")
+    certificate_valid_after=$(jq -r '.certificate_valid_after' "$identity")
+    certificate_valid_before=$(jq -r '.certificate_valid_before' "$identity")
+    certificate_principals=$(jq -c '.certificate_principals' "$identity")
+    certificate_source_addresses=$(jq -c '.certificate_source_addresses' "$identity")
+    if jq -e --arg host "$host_id" '.enrollment_receipts[$host] != null' "$identity" >/dev/null; then
+      controller_receipt_ready=true
+      expected_enrollment_epoch=$(jq -r --arg host "$host_id" '.enrollment_receipts[$host].enrollment_epoch' "$identity")
+      expected_broker_digest=$(jq -r --arg host "$host_id" '.enrollment_receipts[$host].broker_digest' "$identity")
+      expected_policy_digest=$(jq -r --arg host "$host_id" '.enrollment_receipts[$host].policy_digest' "$identity")
+      expected_context_digest=$(jq -r --arg host "$host_id" '.enrollment_receipts[$host].context_canary_digest' "$identity")
+    fi
+  fi
+  if jq -e '.worker.originating_node_identity != null' "$config" >/dev/null 2>&1; then
+    originating_node_identity=$(jq -c '.worker.originating_node_identity' "$config")
+  elif [ "$node_identity_ready" = true ]; then
+    originating_node_identity=$(jq -c '{
+      schema:"roundhouse.originating-node-identity",schema_version:1,
+      fleet_domain,node_id,node_key_fingerprint,fleet_ca_fingerprint,ca_generation,
+      certificate_serial,certificate_valid_after,certificate_valid_before,
+      certificate_principals,certificate_source_addresses
+    }' "$identity")
+  fi
+
+  transport_ready=false
+  transport_receipt_status=missing
+  adapter=none
+  execution_principals='[]'
+  session_requirement=unsupported
+  if [ "$platform" = linux ] || [ "$platform" = macos ]; then
+    adapter=posix-sudo-v1
+    execution_principals='["root"]'
+    session_requirement=no-console-session
+    if [ "$machine_transport:$transport" = local:posix-ssh ] && [ -x /usr/bin/sudo ]; then
+      transport_ready=true
+      transport_receipt_status=local-sudo-readiness
+    fi
+  fi
+
+  u2_root=${ROUNDHOUSE_U2_FIXTURE_ROOT:-}
+  u2_fixture=false
+  u2_protected_owner=root
+  u2_fixture_valid=true
+  if [ -n "$u2_root" ]; then
+    case $u2_root in /*) ;; *) u2_fixture_valid=false ;; esac
+    case /$u2_root/ in */../*|*/./*) u2_fixture_valid=false ;; esac
+    u2_root=${u2_root%/}
+    [ -n "$u2_root" ] || u2_fixture_valid=false
+    u2_fixture=true
+    u2_protected_owner=$(id -un)
+  fi
+  if [ "$platform" = macos ]; then
+    broker_system_path=/usr/local/libexec/machine-utilities/posix-broker
+  else
+    broker_system_path=/usr/libexec/machine-utilities/posix-broker
+  fi
+  broker_path=$u2_root$broker_system_path
+  config_root=$u2_root/etc/machine-utilities
+  sudoers_path=$u2_root/etc/sudoers.d/machine-utilities-posix-broker
+  public_root=$u2_root/var/lib/machine-utilities-public
+  active_link=$config_root/active
+  observed_broker_digest=
+  observed_policy_digest=
+  observed_context_digest=
+  observed_constraints_digest=
+  observed_apt_context_digest=
+  observed_platform_context_digest=
+  observed_platform_artifacts_digest=
+  constraint_generation=null
+  enrollment_epoch=null
+  broker_version=
+  observed_contexts='[]'
+  observed_preconditions='[]'
+  observed_protocol=null
+  protected_artifacts_ready=false
+  adapter_mechanism_ready=false
+  adapter_verifier_status=not-installed
+  broker_ready=false
+  action_context_ready=false
+  protected_uid=null
+  protected_principal=
+  protected_host_id=
+  protected_fleet_domain=
+  protected_ca_fingerprint=
+  protected_ca_generation=null
+  protected_host_fingerprint=
+  protected_endpoint_principals=
+  enrollment_receipt_ready=false
+  enrollment_receipt_scope=
+  enrollment_manifest_digest=
+  enrollment_confirmation_digest=
+  receipt_sudoers_digest=
+  active_request=null
+  last_terminal_result=null
+  public_records_ready=true
+  route_binding_ready=true
+  revoked_receipt=false
+  artifact_any=false
+  lifecycle_lock=$u2_root/var/lib/machine-utilities-lifecycle.lock
+  lifecycle_recovery=$u2_root/var/lib/machine-utilities-lifecycle.recovery
+  lifecycle_drain=$u2_root/var/lib/machine-utilities/draining
+  lifecycle_activity=false
+  lifecycle_activity_valid=true
+  lifecycle_lock_present=false
+  lifecycle_recovery_present=false
+  lifecycle_drain_present=false
+  lifecycle_operation=
+  lifecycle_phase=
+  u2_transaction_operation=
+  u2_transaction_id=
+  u2_transaction_from=
+  u2_transaction_to=
+  u2_transaction_manifest=
+  u2_transaction_confirmation=
+  u2_transaction_phase=
+
+  for u2_candidate in "$active_link" "$broker_path" "$sudoers_path" "$config_root/trust/fleet-ca.pub" \
+    "$config_root/trust/allowed_signers" "$config_root/trust/revoked.krl" "$public_root/canary"; do
+    if [ -e "$u2_candidate" ] || [ -L "$u2_candidate" ]; then artifact_any=true; fi
+  done
+  if { [ "$platform" = linux ] || [ "$platform" = macos ]; } && [ "$u2_fixture_valid" = true ]; then
+    ancestors_ready=true
+    if [ -n "$u2_root" ]; then u2_directory_ready "$u2_root" "$u2_protected_owner" || ancestors_ready=false; fi
+    for u2_ancestor in "$u2_root/etc" "$u2_root/etc/sudoers.d" "$u2_root/usr" \
+      "$u2_root/var" "$u2_root/var/lib"; do
+      u2_directory_ready "$u2_ancestor" "$u2_protected_owner" || ancestors_ready=false
+    done
+    if [ "$platform" = macos ]; then
+      for u2_ancestor in "$u2_root/usr/local" "$u2_root/usr/local/libexec"; do
+        u2_directory_ready "$u2_ancestor" "$u2_protected_owner" || ancestors_ready=false
+      done
+    else
+      u2_directory_ready "$u2_root/usr/libexec" "$u2_protected_owner" || ancestors_ready=false
+    fi
+    lifecycle_transaction_count=0
+    for lifecycle_kind in lock recovery; do
+      case $lifecycle_kind in
+        lock) lifecycle_directory=$lifecycle_lock ;;
+        recovery) lifecycle_directory=$lifecycle_recovery ;;
+      esac
+      if [ -e "$lifecycle_directory" ] || [ -L "$lifecycle_directory" ]; then
+        lifecycle_activity=true
+        case $lifecycle_kind in lock) lifecycle_lock_present=true ;; recovery) lifecycle_recovery_present=true ;; esac
+        if ! u2_directory_ready "$lifecycle_directory" "$u2_protected_owner" 700 ||
+          ! u2_validate_lifecycle_owner "$lifecycle_directory" "$u2_protected_owner"; then
+          lifecycle_activity_valid=false
+        else
+          while IFS= read -r lifecycle_member; do
+            case ${lifecycle_member##*/} in owner|transaction) ;; *) lifecycle_activity_valid=false ;; esac
+          done < <(find "$lifecycle_directory" -mindepth 1 -maxdepth 1 -print | LC_ALL=C sort)
+          if [ -e "$lifecycle_directory/transaction" ] || [ -L "$lifecycle_directory/transaction" ]; then
+            lifecycle_transaction_count=$((lifecycle_transaction_count + 1))
+            if u2_validate_lifecycle_transaction "$lifecycle_directory" "$u2_protected_owner"; then
+              lifecycle_operation=$u2_transaction_operation
+              lifecycle_phase=$u2_transaction_phase
+            else
+              lifecycle_activity_valid=false
+            fi
+          fi
+        fi
+      fi
+    done
+    if [ "$lifecycle_lock_present" = true ] && [ "$lifecycle_recovery_present" = true ]; then
+      lifecycle_activity_valid=false
+    fi
+    [ "$lifecycle_transaction_count" -le 1 ] || lifecycle_activity_valid=false
+    if [ -e "$lifecycle_drain" ] || [ -L "$lifecycle_drain" ]; then
+      lifecycle_activity=true
+      lifecycle_drain_present=true
+      u2_validate_drain "$lifecycle_drain" "$u2_protected_owner" || lifecycle_activity_valid=false
+    fi
+    if [ "$lifecycle_transaction_count" -eq 1 ]; then
+      if [ "$u2_transaction_operation" = install ]; then
+        lifecycle_expected_drain="draining|2|operation=install|from=$u2_transaction_from|to=$u2_transaction_to|manifest-sha256=$u2_transaction_manifest|confirmation-sha256=$u2_transaction_confirmation"
+      else
+        lifecycle_expected_drain="draining|2|operation=revoke|from=$u2_transaction_from|to=0|manifest-sha256=$u2_transaction_manifest"
+      fi
+      if [ "$lifecycle_drain_present" = true ]; then
+        [ "$(cat "$lifecycle_drain" 2>/dev/null || true)" = "$lifecycle_expected_drain" ] || lifecycle_activity_valid=false
+      else
+        case $u2_transaction_phase in intent|rollback-finalizing|commit-finalizing) ;; *) lifecycle_activity_valid=false ;; esac
+      fi
+    elif [ "$lifecycle_drain_present" = true ]; then
+      lifecycle_activity_valid=false
+    fi
+    if [ -e "$public_root/transport" ]; then
+      if u2_file_ready "$public_root/transport" "$u2_protected_owner" 16384 644; then
+        transport_receipt_status=unrecognized
+      else
+        transport_receipt_status=invalid
+      fi
+    fi
+    if [ -e "$public_root/enrollment" ]; then
+      if u2_file_ready "$public_root/enrollment" "$u2_protected_owner" 16384 644 &&
+        awk -F '|' '
+          $0!~/^[ -~]+$/{exit 1}
+          NR==1{if($0!="enrollment-receipt|2")exit 1;next}
+          NR==2{if($0!="state|revoked")exit 1;next}
+          NR==3{if($2!~/^(fixture|native)$/||$1!="scope"||NF!=2)exit 1;next}
+          NR==4{if($1!="epoch"||$2!~/^[1-9][0-9]{0,9}$/||NF!=2)exit 1;next}
+          NR==5{if($1!="manifest-sha256"||length($2)!=64||$2!~/^[0-9a-f]+$/||NF!=2)exit 1;next}
+          NR==6{if($0!="reason|grant_broker_generation_and_trust_quarantined")exit 1;next}
+          {exit 1}END{if(NR!=6)exit 1}
+        ' "$public_root/enrollment"; then
+        revoked_receipt=true
+      elif [ ! -L "$active_link" ]; then
+        artifact_any=true
+      fi
+    fi
+    if [ -L "$active_link" ]; then
+      active_target=$(readlink "$active_link") || active_target=
+      if [ "$(file_owner "$active_link")" = "$u2_protected_owner" ] &&
+        printf '%s' "$active_target" | grep -Eq '^generations/[1-9][0-9]{0,9}$'; then
+        active_epoch=${active_target#generations/}
+        generation=$config_root/$active_target
+        policy_path=$generation/policy.actions
+        constraints_path=$generation/policy.constraints
+        context_path=$generation/context.canary
+        identity_path=$generation/host.identity
+        apt_context_path=$generation/apt.context
+        macos_context_path=$generation/macos.context
+        broker_digest_path=$generation/broker.sha256
+        broker_version_path=$generation/broker.version
+        trust_root=$config_root/trust
+        constraints_inventory=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-constraints.XXXXXX")
+        platform_files_ready=false
+        if [ "$platform" = linux ]; then
+          if u2_file_ready "$apt_context_path" "$u2_protected_owner" 65536 644 &&
+            u2_file_ready "$generation/apt.conf" "$u2_protected_owner" 65536 644; then
+            platform_files_ready=true
+          fi
+        elif u2_file_ready "$macos_context_path" "$u2_protected_owner" 65536 644 &&
+          u2_validate_macos_context "$generation" "$u2_root" "$u2_protected_owner"; then
+          platform_files_ready=true
+        fi
+        if [ "$ancestors_ready" = true ] &&
+          u2_directory_ready "$config_root" "$u2_protected_owner" 755 &&
+          u2_directory_ready "$config_root/generations" "$u2_protected_owner" 755 &&
+          u2_directory_ready "$generation" "$u2_protected_owner" 755 &&
+          u2_directory_ready "$trust_root" "$u2_protected_owner" 755 &&
+          u2_directory_ready "${broker_path%/*}" "$u2_protected_owner" 755 &&
+          u2_directory_ready "$public_root" "$u2_protected_owner" 755 &&
+          u2_file_ready "$broker_path" "$u2_protected_owner" 1048576 755 &&
+          u2_file_ready "$broker_digest_path" "$u2_protected_owner" 128 644 &&
+          u2_file_ready "$broker_version_path" "$u2_protected_owner" 128 644 &&
+          u2_file_ready "$policy_path" "$u2_protected_owner" 1048576 644 &&
+          u2_file_ready "$constraints_path" "$u2_protected_owner" 1048576 644 &&
+          u2_file_ready "$context_path" "$u2_protected_owner" 65536 644 &&
+          u2_file_ready "$identity_path" "$u2_protected_owner" 65536 644 &&
+          [ "$platform_files_ready" = true ] &&
+          u2_file_ready "$trust_root/fleet-ca.pub" "$u2_protected_owner" 8192 644 &&
+          u2_file_ready "$trust_root/allowed_signers" "$u2_protected_owner" 16384 644 &&
+          u2_file_ready "$trust_root/revoked.krl" "$u2_protected_owner" 1048576 644 &&
+          u2_file_ready "$sudoers_path" "$u2_protected_owner" 4096 440 &&
+          u2_file_ready "$public_root/enrollment" "$u2_protected_owner" 16384 644 &&
+          u2_file_ready "$public_root/canary" "$u2_protected_owner" 16384 644 &&
+          "$script_dir/machine-utilities" inspect-privilege-constraints \
+            "$policy_path" "$constraints_path" >"$constraints_inventory" 2>/dev/null; then
+          observed_broker_digest=$(sha256_file "$broker_path")
+          observed_policy_digest=$(sha256_file "$policy_path")
+          observed_constraints_digest=$(jq -r '.digest.value' "$constraints_inventory")
+          observed_context_digest=$(sha256_file "$context_path")
+          if [ "$platform" = linux ]; then
+            observed_apt_context_digest=$(sha256_file "$apt_context_path")
+            observed_platform_context_digest=$observed_apt_context_digest
+            observed_platform_artifacts_digest=$(sha256_file "$generation/apt/source-authority")
+          else
+            observed_platform_context_digest=$(sha256_file "$macos_context_path")
+            observed_platform_artifacts_digest=$(u2_path_set_digest "$u2_protected_owner" packages "$generation/macos/packages")
+          fi
+          constraint_generation=$(jq -r '.generation' "$constraints_inventory")
+          broker_version=$(head -1 "$broker_version_path" | clip)
+          declared_broker_digest=$(head -1 "$broker_digest_path" | clip)
+          observed_protocol=$(awk -F= '$1=="readonly broker_protocol"{print $2;exit}' "$broker_path")
+          if [ "$declared_broker_digest" = "$observed_broker_digest" ] &&
+            printf '%s' "$broker_version" | grep -Eq '^[0-9]+[.][0-9]+[.][0-9]+$' &&
+            [ "$observed_protocol" = 1 ] && [ "$constraint_generation" = "$active_epoch" ] &&
+            /bin/bash -n "$broker_path" &&
+            awk -F '|' '
+              function digest(v){return length(v)==64&&v~/^[0-9a-f]+$/}
+              $0!~/^[ -~]+$/{exit 1} NR==1{if($0!="enrollment-receipt|2")exit 1;next}
+              NR==2{if($0!="state|enrolled")exit 1;next}
+              NR==3{if(NF!=2||$1!="scope"||($2!="fixture"&&$2!="native"))exit 1;next}
+              NR==4{if(NF!=2||$1!="epoch"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+              NR>=5&&NR<=17{if(NF!=2||!digest($2))exit 1;next}
+              NR==18{if(NF!=2||$1!="fleet-ca-fingerprint"||$2!~/^SHA256:[A-Za-z0-9+\/=]+$/)exit 1;next}
+              NR==19{if(NF!=2||$1!="protected-uid"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+              NR==20{if(NF!=2||$1!="request-principal")exit 1;next}
+              NR==21{if(NF!=2||$1!="endpoint-principals")exit 1;next}
+              {exit 1}END{if(NR!=21)exit 1}
+            ' "$public_root/enrollment" &&
+            awk -F '|' '
+              BEGIN{key[2]="scope";key[3]="complete-sudoers";key[4]="positive-no-argument"
+                key[5]="negative-with-argument";key[6]="negative-direct-unprivileged"}
+              $0!~/^[ -~]+$/{exit 1} NR==1{if($0!="enrollment-canary|1")exit 1;next}
+              NR>=2&&NR<=6{if(NF!=2||$1!=key[NR])exit 1;next}
+              NR==7{if(NF!=2)exit 1;if($1=="epoch")mode="linux";else if($1=="negative-direct-installer")mode="macos";else exit 1;next}
+              mode=="macos"&&NR==8{if(NF!=2||$1!="negative-root-homebrew")exit 1;next}
+              mode=="macos"&&NR==9{if(NF!=2||$1!="negative-root-shell")exit 1;next}
+              mode=="linux"&&NR==8{if(NF!=2||$1!="broker-sha256")exit 1;next}
+              mode=="linux"&&NR==9{if(NF!=2||$1!="sudoers-sha256")exit 1;next}
+              mode=="macos"&&NR==10{if(NF!=2||$1!="epoch")exit 1;next}
+              mode=="macos"&&NR==11{if(NF!=2||$1!="broker-sha256")exit 1;next}
+              mode=="macos"&&NR==12{if(NF!=2||$1!="sudoers-sha256")exit 1;next}
+              {exit 1}END{if((mode=="linux"&&NR!=9)||(mode=="macos"&&NR!=12))exit 1}
+            ' "$public_root/canary"; then
+            receipt_state=$(u2_record_value "$public_root/enrollment" state)
+            enrollment_receipt_scope=$(u2_record_value "$public_root/enrollment" scope)
+            enrollment_epoch=$(u2_record_value "$public_root/enrollment" epoch)
+            enrollment_manifest_digest=$(u2_record_value "$public_root/enrollment" manifest-sha256)
+            enrollment_confirmation_digest=$(u2_record_value "$public_root/enrollment" confirmation-sha256)
+            receipt_broker_digest=$(u2_record_value "$public_root/enrollment" broker-sha256)
+            receipt_policy_digest=$(u2_record_value "$public_root/enrollment" policy-sha256)
+            receipt_constraints_digest=$(u2_record_value "$public_root/enrollment" constraints-sha256)
+            receipt_identity_digest=$(u2_record_value "$public_root/enrollment" host-identity-sha256)
+            receipt_context_digest=$(u2_record_value "$public_root/enrollment" context-canary-sha256)
+            if [ "$platform" = linux ]; then
+              receipt_platform_context_digest=$(u2_record_value "$public_root/enrollment" apt-context-sha256)
+              receipt_platform_artifacts_digest=$(u2_record_value "$public_root/enrollment" source-authority-sha256)
+              expected_receipt_labels='manifest-sha256,confirmation-sha256,broker-sha256,policy-sha256,constraints-sha256,host-identity-sha256,context-canary-sha256,apt-context-sha256,source-authority-sha256,fleet-ca-sha256,allowed-signers-sha256,revoked-krl-sha256,sudoers-sha256'
+              action_context_id=posix-root-v1
+            else
+              receipt_platform_context_digest=$(u2_record_value "$public_root/enrollment" platform-context-sha256)
+              receipt_platform_artifacts_digest=$(u2_record_value "$public_root/enrollment" platform-artifacts-sha256)
+              expected_receipt_labels='manifest-sha256,confirmation-sha256,broker-sha256,policy-sha256,constraints-sha256,host-identity-sha256,context-canary-sha256,platform-context-sha256,platform-artifacts-sha256,fleet-ca-sha256,allowed-signers-sha256,revoked-krl-sha256,sudoers-sha256'
+              action_context_id=macos-root-v1
+            fi
+            receipt_labels=$(awk -F '|' 'NR>=5&&NR<=17{printf "%s%s",sep,$1;sep=","}' "$public_root/enrollment")
+            receipt_ca_digest=$(u2_record_value "$public_root/enrollment" fleet-ca-sha256)
+            receipt_signers_digest=$(u2_record_value "$public_root/enrollment" allowed-signers-sha256)
+            receipt_krl_digest=$(u2_record_value "$public_root/enrollment" revoked-krl-sha256)
+            receipt_sudoers_digest=$(u2_record_value "$public_root/enrollment" sudoers-sha256)
+            receipt_ca_fingerprint=$(u2_record_value "$public_root/enrollment" fleet-ca-fingerprint)
+            protected_uid=$(u2_record_value "$public_root/enrollment" protected-uid)
+            protected_principal=$(u2_record_value "$public_root/enrollment" request-principal)
+            protected_endpoint_principals=$(u2_record_value "$public_root/enrollment" endpoint-principals)
+            canary_scope=$(u2_record_value "$public_root/canary" scope)
+            canary_sudoers=$(u2_record_value "$public_root/canary" complete-sudoers)
+            canary_positive=$(u2_record_value "$public_root/canary" positive-no-argument)
+            canary_negative_argument=$(u2_record_value "$public_root/canary" negative-with-argument)
+            canary_negative_direct=$(u2_record_value "$public_root/canary" negative-direct-unprivileged)
+            canary_negative_installer=$(u2_record_value "$public_root/canary" negative-direct-installer)
+            canary_negative_homebrew=$(u2_record_value "$public_root/canary" negative-root-homebrew)
+            canary_negative_shell=$(u2_record_value "$public_root/canary" negative-root-shell)
+            canary_epoch=$(u2_record_value "$public_root/canary" epoch)
+            canary_broker_digest=$(u2_record_value "$public_root/canary" broker-sha256)
+            canary_sudoers_digest=$(u2_record_value "$public_root/canary" sudoers-sha256)
+            IFS='|' read -r protected_identity_type protected_identity_version protected_host_id identity_uid \
+              identity_principal protected_fleet_domain protected_ca_fingerprint protected_ca_generation \
+              protected_host_fingerprint identity_endpoint_principals identity_extra <"$identity_path" || true
+            observed_ca_fingerprint=$(/usr/bin/ssh-keygen -lf "$trust_root/fleet-ca.pub" -E sha256 2>/dev/null | awk 'NR==1{print $2}')
+            receipt_digests_valid=true
+            for receipt_digest in "$enrollment_manifest_digest" "$enrollment_confirmation_digest" \
+              "$receipt_broker_digest" "$receipt_policy_digest" "$receipt_constraints_digest" \
+              "$receipt_identity_digest" "$receipt_context_digest" "$receipt_platform_context_digest" \
+              "$receipt_platform_artifacts_digest" \
+              "$receipt_ca_digest" "$receipt_signers_digest" "$receipt_krl_digest" "$receipt_sudoers_digest"; do
+              printf '%s' "$receipt_digest" | grep -Eq '^[0-9a-f]{64}$' || receipt_digests_valid=false
+            done
+            canary_labels_valid=false
+            if [ "$canary_scope" = native ] && [ "$canary_sudoers" = passed ] &&
+              [ "$canary_positive" = passed ] && [ "$canary_negative_argument" = passed ] &&
+              [ "$canary_negative_direct" = passed ]; then
+              if [ "$platform" = linux ] || {
+                [ "$canary_negative_installer" = passed ] && [ "$canary_negative_homebrew" = passed ] &&
+                [ "$canary_negative_shell" = passed ];
+              }; then
+                canary_labels_valid=true
+                adapter_verifier_status=passed-complete-policy
+              fi
+            elif [ "$u2_fixture" = true ] && [ "$canary_scope" = fixture ] &&
+              [ "$canary_sudoers" = fixture-not-run ] &&
+              [ "$canary_positive" = fixture-simulated-broker-reached ] &&
+              [ "$canary_negative_argument" = fixture-passed ] &&
+              [ "$canary_negative_direct" = fixture-not-run ]; then
+              if [ "$platform" = linux ] || {
+                [ "$canary_negative_installer" = fixture-not-run ] &&
+                [ "$canary_negative_homebrew" = fixture-not-run ] &&
+                [ "$canary_negative_shell" = fixture-not-run ];
+              }; then
+                canary_labels_valid=true
+                adapter_verifier_status=fixture-labeled
+              fi
+            fi
+            sudoers_content_valid=true
+            if [ -r "$sudoers_path" ]; then
+              expected_sudoers="$protected_principal ALL=(root) NOPASSWD:NOSETENV: $broker_system_path \"\""
+              if [ "$platform" = macos ]; then
+                expected_sudoers="$expected_sudoers
+$protected_principal ALL=(root) NOPASSWD:NOSETENV: $broker_system_path --homebrew-bridge-v1 *"
+              fi
+              [ "$(cat "$sudoers_path")" = "$expected_sudoers" ] &&
+                [ "$(sha256_file "$sudoers_path")" = "$receipt_sudoers_digest" ] || sudoers_content_valid=false
+            elif [ "$u2_fixture" = true ]; then
+              sudoers_content_valid=false
+            fi
+            if [ "$receipt_state" = enrolled ] && [ "$enrollment_receipt_scope" = "$canary_scope" ] &&
+              [ "$enrollment_epoch" = "$active_epoch" ] && [ "$canary_epoch" = "$active_epoch" ] &&
+              [ "$receipt_broker_digest" = "$observed_broker_digest" ] &&
+              [ "$receipt_policy_digest" = "$observed_policy_digest" ] &&
+              [ "$receipt_constraints_digest" = "$observed_constraints_digest" ] &&
+              [ "$receipt_identity_digest" = "$(sha256_file "$identity_path")" ] &&
+              [ "$receipt_context_digest" = "$observed_context_digest" ] &&
+              [ "$receipt_labels" = "$expected_receipt_labels" ] &&
+              [ "$receipt_platform_context_digest" = "$observed_platform_context_digest" ] &&
+              [ "$receipt_platform_artifacts_digest" = "$observed_platform_artifacts_digest" ] &&
+              [ "$receipt_ca_digest" = "$(sha256_file "$trust_root/fleet-ca.pub")" ] &&
+              [ "$receipt_signers_digest" = "$(sha256_file "$trust_root/allowed_signers")" ] &&
+              [ "$receipt_krl_digest" = "$(sha256_file "$trust_root/revoked.krl")" ] &&
+              [ "$receipt_ca_fingerprint" = "$observed_ca_fingerprint" ] &&
+              [ "$protected_identity_type" = identity ] && [ "$protected_identity_version" = 1 ] &&
+              [ -z "$identity_extra" ] && [ "$protected_host_id" = "$host_id" ] &&
+              [ "$protected_uid" = "$identity_uid" ] && [ "$protected_principal" = "$identity_principal" ] &&
+              [ "$protected_endpoint_principals" = "$identity_endpoint_principals" ] &&
+              [ "$protected_ca_fingerprint" = "$observed_ca_fingerprint" ] &&
+              [ "$protected_endpoint_principals" = machine-utilities-posix,machine-utilities-windows ] &&
+              printf '%s' "$protected_uid" | grep -Eq '^[1-9][0-9]{0,9}$' &&
+              [ "$canary_broker_digest" = "$observed_broker_digest" ] &&
+              [ "$canary_sudoers_digest" = "$receipt_sudoers_digest" ] &&
+              [ "$receipt_digests_valid" = true ] && [ "$canary_labels_valid" = true ] &&
+              [ "$sudoers_content_valid" = true ] &&
+              { { [ "$platform" = linux ] && u2_validate_apt_context "$generation" "$u2_root" "$u2_protected_owner"; } ||
+                { [ "$platform" = macos ] && [ "$platform_files_ready" = true ] &&
+                  u2_macos_preconditions "$generation" "$u2_root"; }; }; then
+              enrollment_receipt_ready=true
+              adapter_mechanism_ready=true
+              observed_preconditions=$u2_observed_preconditions
+              observed_contexts=$(awk -F '|' -v context="$action_context_id" 'NR>1&&$3==context&&$4=="enabled"{
+                print $2"\t"$3"\t"$5"\t"$6}' "$policy_path" |
+                jq -Rsc --slurpfile constraints "$constraints_inventory" '
+                  split("\n")|map(select(length>0)|split("\t")|
+                    {action_id:.[0],context_id:.[1],constraint_kind:.[2],constraint_digest:.[3],
+                     manager_source_identity:(if .[2]=="none" then "not-applicable" else .[3] end)} as $context |
+                    ($constraints[0].actions[]|select(.action_id==$context.action_id)) as $membership |
+                    $context+{constraint_generation:$constraints[0].generation,policy_tokens:$membership.policy_tokens})')
+              if [ "$(printf '%s' "$observed_contexts" | jq 'length')" -gt 0 ]; then action_context_ready=true; fi
+            fi
+          fi
+        fi
+        rm -f "$constraints_inventory"
+      fi
+    elif [ -e "$active_link" ]; then
+      public_records_ready=false
+    fi
+    if [ -e "$public_root/active" ]; then
+      if u2_file_ready "$public_root/active" "$u2_protected_owner" 4096 644 &&
+        active_request=$(u2_public_record_json "$public_root/active") &&
+        [ "$(printf '%s' "$active_request" | jq -r '.enrollment_epoch')" = "${active_epoch:-0}" ]; then :
+      else public_records_ready=false; active_request=null
+      fi
+    fi
+    if [ -e "$public_root/last" ]; then
+      if u2_file_ready "$public_root/last" "$u2_protected_owner" 4096 644 &&
+        last_terminal_result=$(u2_public_record_json "$public_root/last"); then :
+      else public_records_ready=false; last_terminal_result=null
+      fi
+    fi
+  fi
+
+  if [ "$enrollment_receipt_ready" = true ]; then
+    if [ -n "$request_principal" ] && [ "$request_principal" != "$protected_principal" ]; then route_binding_ready=false; fi
+    if [ -n "$pinned_host_key" ] && [ "$pinned_host_key" != "$protected_host_fingerprint" ]; then route_binding_ready=false; fi
+    if [ "$controller_receipt_ready" = true ] && {
+      [ "$expected_enrollment_epoch" != "$enrollment_epoch" ] ||
+      [ "$expected_broker_digest" != "$observed_broker_digest" ] ||
+      [ "$expected_policy_digest" != "$observed_policy_digest" ] ||
+      [ "$expected_context_digest" != "$observed_context_digest" ];
+    }; then route_binding_ready=false; fi
+    if [ "$node_identity_ready" = true ] && [ "$fleet_ca_fingerprint" != "$protected_ca_fingerprint" ]; then
+      route_binding_ready=false
+    fi
+  fi
+  if [ "$enrollment_receipt_ready" = true ] && [ "$action_context_ready" = true ] &&
+    [ "$adapter_mechanism_ready" = true ] && [ "$public_records_ready" = true ] &&
+    [ "$route_binding_ready" = true ] && [ "$lifecycle_activity" = false ]; then
+    protected_artifacts_ready=true
+    broker_ready=true
+  fi
+
+  lifecycle_status=needs_enrollment
+  if [ "$platform" = wsl ]; then
+    lifecycle_status=unsupported_security_boundary
+  elif [ "$platform" != linux ] && [ "$platform" != macos ]; then
+    lifecycle_status=unsupported_context
+  elif [ "$lifecycle_activity" = true ] && [ "$lifecycle_activity_valid" = true ]; then
+    lifecycle_status=draining
+  elif [ "$lifecycle_activity" = true ]; then
+    lifecycle_status=drifted
+  elif [ "$protected_artifacts_ready" = true ]; then
+    lifecycle_status=ready
+  elif [ "$revoked_receipt" = true ] && [ "$artifact_any" = true ]; then
+    lifecycle_status=drifted
+  elif [ "$revoked_receipt" = true ]; then
+    lifecycle_status=needs_enrollment
+  elif [ "$artifact_any" = true ]; then
+    lifecycle_status=drifted
+  fi
+
+  proposal_status=unobserved
+  if [ -n "$observed_policy_digest" ]; then
+    if [ "$proposal_digest" = "$observed_policy_digest" ]; then proposal_status='matches-observed'
+    else proposal_status='pending-human-enrollment'
+    fi
+  fi
+  case $observed_protocol in 0|1) ;; *) observed_protocol=null ;; esac
+  case $constraint_generation in ''|*[!0-9]*) constraint_generation=null ;; esac
+  case $enrollment_epoch in ''|*[!0-9]*) enrollment_epoch=null ;; esac
+  case $protected_uid in ''|*[!0-9]*) protected_uid=null ;; esac
+  case $protected_ca_generation in ''|*[!0-9]*) protected_ca_generation=null ;; esac
+  case $lifecycle_status in ready) record_status=present ;; drifted) record_status=partial ;; *) record_status=unavailable ;; esac
+  data=$(jq -cn \
+    --arg adapter "$adapter" --arg boundary "$platform" --arg lifecycle "$lifecycle_status" \
+    --arg transport "$transport" --arg transport_receipt_status "$transport_receipt_status" \
+    --arg request_principal "$request_principal" --arg pinned_host_key "$pinned_host_key" \
+    --arg session_requirement "$session_requirement" --arg broker_version "$broker_version" \
+    --arg broker_digest "$observed_broker_digest" --arg proposal_digest "$proposal_digest" \
+    --arg proposal_status "$proposal_status" --arg policy_digest "$observed_policy_digest" \
+    --arg context_digest "$observed_context_digest" --arg apt_context_digest "$observed_apt_context_digest" \
+    --arg platform_context_digest "$observed_platform_context_digest" \
+    --arg constraints_digest "$observed_constraints_digest" --arg adapter_verifier_status "$adapter_verifier_status" \
+    --arg node_id "$node_id" --arg fleet_domain "$fleet_domain" --arg node_key_fingerprint "$node_key_fingerprint" \
+    --arg fleet_ca_fingerprint "$fleet_ca_fingerprint" --arg certificate_serial "$certificate_serial" \
+    --arg certificate_valid_after "$certificate_valid_after" --arg certificate_valid_before "$certificate_valid_before" \
+    --arg protected_host_id "$protected_host_id" --arg protected_principal "$protected_principal" \
+    --arg protected_fleet_domain "$protected_fleet_domain" --arg protected_ca_fingerprint "$protected_ca_fingerprint" \
+    --arg protected_host_fingerprint "$protected_host_fingerprint" \
+    --arg protected_endpoint_principals "$protected_endpoint_principals" \
+    --arg enrollment_scope "$enrollment_receipt_scope" --arg enrollment_manifest "$enrollment_manifest_digest" \
+    --arg enrollment_confirmation "$enrollment_confirmation_digest" --arg sudoers_digest "$receipt_sudoers_digest" \
+    --arg lifecycle_operation "$lifecycle_operation" --arg lifecycle_phase "$lifecycle_phase" \
+    --argjson protected_uid "$protected_uid" --argjson protected_ca_generation "$protected_ca_generation" \
+    --argjson certificate_principals "$certificate_principals" \
+    --argjson certificate_source_addresses "$certificate_source_addresses" \
+    --argjson originating_node_identity "$originating_node_identity" --argjson ca_generation "$ca_generation" \
+    --argjson enrollment_epoch "$enrollment_epoch" --argjson transport_ready "$transport_ready" \
+    --argjson node_identity_ready "$node_identity_ready" --argjson broker_ready "$broker_ready" \
+    --argjson action_context_ready "$action_context_ready" --argjson execution_principals "$execution_principals" \
+    --argjson observed_contexts "$observed_contexts" --argjson observed_preconditions "$observed_preconditions" \
+    --argjson observed_protocol "$observed_protocol" --argjson constraint_generation "$constraint_generation" \
+    --argjson protected_artifacts_ready "$protected_artifacts_ready" \
+    --argjson adapter_mechanism_ready "$adapter_mechanism_ready" \
+    --argjson lifecycle_activity "$lifecycle_activity" --argjson lifecycle_activity_valid "$lifecycle_activity_valid" \
+    --argjson lifecycle_lock_present "$lifecycle_lock_present" \
+    --argjson lifecycle_recovery_present "$lifecycle_recovery_present" \
+    --argjson lifecycle_drain_present "$lifecycle_drain_present" \
+    --argjson active_request "$active_request" --argjson last_terminal_result "$last_terminal_result" '
+    {
+      contract_version:1,platform_adapter:$adapter,platform_boundary:$boundary,lifecycle_status:$lifecycle,
+      transport:(if $transport=="" then null else $transport end),transport_ready:$transport_ready,
+      transport_receipt_status:$transport_receipt_status,node_identity_ready:$node_identity_ready,
+      broker_ready:$broker_ready,action_context_ready:$action_context_ready,
+      protected_artifacts_ready:$protected_artifacts_ready,adapter_mechanism_ready:$adapter_mechanism_ready,
+      adapter_verifier_status:$adapter_verifier_status,
+      lifecycle_activity:{active:$lifecycle_activity,valid:$lifecycle_activity_valid,
+        lock_present:$lifecycle_lock_present,recovery_present:$lifecycle_recovery_present,
+        drain_present:$lifecycle_drain_present,
+        operation:(if $lifecycle_operation=="" then null else $lifecycle_operation end),
+        phase:(if $lifecycle_phase=="" then null else $lifecycle_phase end)},
+      request_principal:(if $request_principal=="" then null else $request_principal end),
+      execution_principals:$execution_principals,session_requirement:$session_requirement,
+      broker_protocol:{supported:[1,0],observed:$observed_protocol},
+      broker_version:(if $broker_version=="" then null else $broker_version end),
+      broker_digest:(if $broker_digest=="" then null else {algorithm:"sha256",value:$broker_digest} end),
+      policy:{catalog_version:1,version:1,action_manifest_version:1},
+      policy_proposal_digest:{algorithm:"sha256",value:$proposal_digest},policy_proposal_status:$proposal_status,
+      observed_policy_digest:(if $policy_digest=="" then null else {algorithm:"sha256",value:$policy_digest} end),
+      observed_constraints_digest:(if $constraints_digest=="" then null else {algorithm:"sha256",value:$constraints_digest} end),
+      constraint_generation:$constraint_generation,observed_action_contexts:$observed_contexts,
+      observed_preconditions:$observed_preconditions,
+      context_canary_digest:(if $context_digest=="" then null else {algorithm:"sha256",value:$context_digest} end),
+      observed_platform_context_digest:(if $platform_context_digest=="" then null else
+        {algorithm:"sha256",value:$platform_context_digest} end),
+      apt_context:{version:(if $apt_context_digest=="" then null else 2 end),
+        digest:(if $apt_context_digest=="" then null else {algorithm:"sha256",value:$apt_context_digest} end)},
+      protected_identity:{host_id:(if $protected_host_id=="" then null else $protected_host_id end),
+        uid:$protected_uid,request_principal:(if $protected_principal=="" then null else $protected_principal end),
+        fleet_domain:(if $protected_fleet_domain=="" then null else $protected_fleet_domain end),
+        fleet_ca_fingerprint:(if $protected_ca_fingerprint=="" then null else $protected_ca_fingerprint end),
+        ca_generation:$protected_ca_generation,
+        pinned_host_key_fingerprint:(if $protected_host_fingerprint=="" then null else $protected_host_fingerprint end),
+        endpoint_principals:(if $protected_endpoint_principals=="" then [] else ($protected_endpoint_principals|split(",")) end)},
+      enrollment_receipt:{scope:(if $enrollment_scope=="" then null else $enrollment_scope end),
+        manifest_digest:(if $enrollment_manifest=="" then null else {algorithm:"sha256",value:$enrollment_manifest} end),
+        confirmation_digest:(if $enrollment_confirmation=="" then null else {algorithm:"sha256",value:$enrollment_confirmation} end),
+        sudoers_digest:(if $sudoers_digest=="" then null else {algorithm:"sha256",value:$sudoers_digest} end)},
+      node_identity:{node_id:(if $node_id=="" then null else $node_id end),
+        fleet_domain:(if $fleet_domain=="" then null else $fleet_domain end),
+        node_key_fingerprint:(if $node_key_fingerprint=="" then null else $node_key_fingerprint end),
+        fleet_ca_fingerprint:(if $fleet_ca_fingerprint=="" then null else $fleet_ca_fingerprint end),
+        ca_generation:$ca_generation,certificate_serial:(if $certificate_serial=="" then null else $certificate_serial end),
+        certificate_valid_after:(if $certificate_valid_after=="" then null else $certificate_valid_after end),
+        certificate_valid_before:(if $certificate_valid_before=="" then null else $certificate_valid_before end),
+        certificate_principals:$certificate_principals,certificate_source_addresses:$certificate_source_addresses},
+      originating_node_identity:$originating_node_identity,
+      pinned_host_key_fingerprint:(if $pinned_host_key=="" then null else $pinned_host_key end),
+      enrollment_epoch:$enrollment_epoch,active_request:$active_request,last_terminal_result:$last_terminal_result,
+      request_ttl:{minimum_seconds:0,maximum_seconds:3600}
+    }')
+  emit privilege_broker readiness "$record_status" high "$data" \
+    '[{"source":"protected-state","method":"read-only-contract-inventory"}]'
+}
+
+run_auth_health() {
+  entry=$1
+  auth_health_status=not-run
+  auth_health_exit=null
+  verify_count=$(printf '%s' "$entry" | jq '.value.verify // [] | length')
+  [ "$verify_count" -gt 0 ] || {
+    auth_health_status=not-configured
+    return
+  }
+  if [ "${auth_verify_allowed:-false}" != true ]; then
+    auth_health_status=not-authorized
+    return
+  fi
+  verify_command=$(printf '%s' "$entry" | jq -r '.value.verify[0]')
+  if ! command -v "$verify_command" >/dev/null 2>&1; then
+    auth_health_status=unavailable
+    return
+  fi
+  args_file=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-auth-args.XXXXXX")
+  chmod 600 "$args_file"
+  printf '%s' "$entry" | jq -j '.value.verify[1:][]? | . + "\u0000"' >"$args_file"
+  xargs -0 "$verify_command" <"$args_file" >/dev/null 2>&1 &
+  verify_pid=$!
+  ticks=0
+  while kill -0 "$verify_pid" >/dev/null 2>&1; do
+    if [ "$ticks" -ge 50 ]; then
+      kill "$verify_pid" >/dev/null 2>&1 || true
+      if wait "$verify_pid" >/dev/null 2>&1; then :; fi
+      auth_health_status=timeout
+      auth_health_exit=124
+      rm -f "$args_file"
+      return
+    fi
+    sleep 0.2
+    ticks=$((ticks + 1))
+  done
+  if wait "$verify_pid" >/dev/null 2>&1; then
+    auth_health_status=healthy
+    auth_health_exit=0
+  else
+    auth_health_exit=$?
+    auth_health_status=unhealthy
+  fi
+  rm -f "$args_file"
+}
+
+emit_agent_settings() {
+  artifact=$1
+  artifact_id=$2
+  artifact_path=$3
+  artifact_format=$4
+  artifact_agents=$5
+  artifact_path_state=${6:-resolved}
+  parsed_json=
+  parsed_json_valid=true
+  if [ "$artifact_path_state" = resolved ] && [ "$artifact_format" = json ] &&
+    [ -e "$artifact_path" ]; then
+    if [ -L "$artifact_path" ] || [ ! -f "$artifact_path" ] ||
+      ! parsed_json=$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0] else error("expected one object") end' \
+        "$artifact_path" 2>/dev/null); then
+      parsed_json_valid=false
+    fi
+  fi
+  printf '%s' "$artifact" | jq -c '.settings // {} | to_entries[]' | while IFS= read -r setting; do
+    key=$(printf '%s' "$setting" | jq -r '.key' | clip)
+    desired=$(printf '%s' "$setting" | jq -c '.value')
+    present=false
+    observed=null
+    if [ "$artifact_path_state" = resolved ]; then parsed=true; else parsed=false; fi
+    case $artifact_format in
+      json)
+        if [ "$artifact_path_state" != resolved ]; then
+          :
+        elif [ ! -e "$artifact_path" ]; then
+          :
+        elif [ "$parsed_json_valid" != true ]; then
+          parsed=false
+        elif printf '%s' "$parsed_json" | jq -e --arg key "$key" 'has($key)' >/dev/null; then
+          present=true
+          observed=$(printf '%s' "$parsed_json" | jq -c --arg key "$key" '.[$key]')
+        fi
+        ;;
+      toml)
+        raw=
+        if [ "$artifact_path_state" != resolved ]; then
+          :
+        elif [ -L "$artifact_path" ] || { [ -e "$artifact_path" ] && [ ! -f "$artifact_path" ]; }; then
+          parsed=false
+        elif [ -f "$artifact_path" ]; then
+          raw=$(awk -v key="$key" '
+          BEGIN { key_pattern = "(\"" key "\"|\047" key "\047|" key ")" }
+          /^[[:space:]]*\[/ { exit }
+          $0 ~ "^[[:space:]]*" key_pattern "[[:space:]]*=" {
+            sub("^[[:space:]]*" key_pattern "[[:space:]]*=[[:space:]]*", "")
+            triple = substr($0, 1, 3)
+            if (triple == "\"\"\"" || triple == "\047\047\047") {
+              value = substr($0, 4)
+              if (value == "") {
+                if (getline <= 0) exit
+                value = $0
+              }
+              close_at = index(value, triple)
+              if (close_at == 0) exit
+              trailer = substr(value, close_at + 3)
+              if (trailer !~ /^[[:space:]]*(#.*)?$/) exit
+              print (triple == "\"\"\"" ? "__MU_TOML_TRIPLE_BASIC__" : "__MU_TOML_TRIPLE_LITERAL__")
+              print substr(value, 1, close_at - 1)
+              exit
+            }
+            quote = ""
+            escaped = 0
+            for (i = 1; i <= length($0); i++) {
+              c = substr($0, i, 1)
+              if (quote == "") {
+                if (c == "#") { $0 = substr($0, 1, i - 1); break }
+                if (c == "\"" || c == "\047") quote = c
+              } else if (quote == "\"" && escaped) {
+                escaped = 0
+              } else if (quote == "\"" && c == "\\") {
+                escaped = 1
+              } else if (c == quote) {
+                quote = ""
+              }
+            }
+            print
+            exit
+          }' "$artifact_path")
+        fi
+        if [ -n "$raw" ]; then
+          case $raw in
+            __MU_TOML_TRIPLE_BASIC__*)
+              triple_value=${raw#__MU_TOML_TRIPLE_BASIC__}
+              triple_value=${triple_value#$'\n'}
+              if observed=$(printf '%s' "$triple_value" | jq -Rce '
+                ("\"" + . + "\"") | fromjson
+              ' 2>/dev/null); then
+                present=true
+              else
+                parsed=false
+                observed=null
+              fi
+              ;;
+            __MU_TOML_TRIPLE_LITERAL__*)
+              triple_value=${raw#__MU_TOML_TRIPLE_LITERAL__}
+              triple_value=${triple_value#$'\n'}
+              observed=$(printf '%s' "$triple_value" | jq -Rsc '.')
+              present=true
+              ;;
+            *)
+              if observed=$(printf '%s' "$raw" | jq -Rce 'fromjson' 2>/dev/null); then
+                present=true
+              elif literal=$(printf '%s' "$raw" | sed -n "s/^[[:space:]]*'\([^']*\)'[[:space:]]*$/\1/p") &&
+                [ -n "$literal" ]; then
+                observed=$(printf '%s' "$literal" | jq -Rsc '.')
+                present=true
+              else
+                parsed=false
+                observed=null
+              fi
+              ;;
+          esac
+        fi
+        ;;
+    esac
+    if [ "$parsed" = true ] && [ "$present" = true ] &&
+      ! printf '%s' "$observed" | jq -e --arg key "$key" --argjson desired "$desired" '
+        ([.. | strings |
+          length <= 8192 and (test("[[:cntrl:]]") | not)
+        ] | all) and (tojson | utf8bytelength <= 8192) and
+        (if . == null then $desired == null
+        elif $key | IN("remoteControlAtStartup","switchModelsOnFlag","agentPushNotifEnabled",
+            "check_for_update_on_startup") then type == "boolean"
+        elif $key == "availableModels" then
+          type == "array" and ([.[] | type == "string" and length > 0] | all)
+        elif $key == "autoUpdatesChannel" then IN("latest","stable")
+        elif $key == "cli_auth_credentials_store" then IN("file","keyring","auto")
+        else type == "string" and length > 0 end)
+      ' >/dev/null; then
+      parsed=false
+      observed=null
+    fi
+    if [ "$parsed" != true ]; then
+      case $artifact_path_state in
+        unknown)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:null,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"artifact_path_missing","severity":"warning","retryable":false,"message":"agent setting artifact has no path for this host"}]'
+          ;;
+        symlink)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"symlink_not_followed","severity":"warning","retryable":false,"message":"agent setting artifact path is a symlink"}]'
+          ;;
+        non-regular)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"non_regular_file","severity":"warning","retryable":false,"message":"agent setting artifact path is not a regular file"}]'
+          ;;
+        *)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"setting_parse_failed","severity":"warning","retryable":false,"message":"allowlisted agent setting could not be parsed"}]'
+          ;;
+      esac
+      emit agent_setting "$artifact_id:$key" unavailable medium \
+        "$setting_data" '[]' "$setting_errors"
+      continue
+    fi
+    in_sync=$(jq -cn --argjson present "$present" --argjson observed "$observed" --argjson desired "$desired" \
+      'if $desired == null then ($present | not) else ($present and $observed == $desired) end')
+    data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+      --arg key "$key" --argjson present "$present" --argjson observed "$observed" \
+      --argjson desired "$desired" --argjson in_sync "$in_sync" --argjson agents "$artifact_agents" \
+      '{artifact:$artifact,path:$path,format:$format,key:$key,observed_present:$present,
+        observed:$observed,desired:$desired,in_sync:$in_sync,agent_exposure:$agents}')
+    emit agent_setting "$artifact_id:$key" present high "$data" \
+      '[{"source":"filesystem","method":"allowlisted-semantic-setting"}]'
+  done
+}
+
+capability_matches() {
+  match_agent=$1
+  match_provider=$2
+  match_source=$3
+  match_name=$4
+  case $match_provider in
+    plugin)
+      case $match_agent in
+        codex) match_plugins=$codex_plugins ;;
+        claude) match_plugins=$claude_plugins ;;
+        *) return ;;
+      esac
+      match_plugin=$(basename "$match_source")
+      printf '%s\n' "$match_plugins" | jq -r \
+        --arg source "$match_source" --arg name "$match_plugin" '
+          .[] |
+          select(.enabled == true) |
+          select(.name == $name or .manager_id == $source) |
+          "plugin:"+.agent+":"+.marketplace+":"+.name+":"+.installed_version'
+      ;;
+    skills-cli)
+      match_lock="$HOME/.agents/.skill-lock.json"
+      [ -f "$match_lock" ] && jq -e '(.skills // .) | type == "object"' "$match_lock" >/dev/null 2>&1 || return
+      jq -r --arg name "$match_name" --arg source "$match_source" '
+        (.skills // .) | to_entries[] |
+        select(.key == $name or .value.source == $source or .value.sourceUrl == $source) |
+        "skills-cli:"+.key' "$match_lock"
+      ;;
+    jsm)
+      [ -n "${jsm_inventory:-}" ] || return
+      printf '%s\n' "$jsm_inventory" | jq -r --arg name "$match_name" --arg source "$match_source" '
+        .skills[]? | select(.name == $name or .name == $source) | "jsm:"+.name'
+      ;;
+    manual|plugin-source)
+      jq -c --arg agent "$match_agent" --argjson host_groups "$capability_host_groups" '
+        (.skill_roots // [])[] |
+        select((.agents // []) | index($agent) != null) |
+        select(
+          (.groups // []) as $groups |
+          ($groups | length) == 0 or
+          any($groups[]; . as $group | $host_groups | index($group) != null)
+        )' "$config" | while IFS= read -r match_root; do
+          match_root_id=$(printf '%s' "$match_root" | jq -r '.id')
+          match_root_path=$(expand_home "$(printf '%s' "$match_root" | jq -r '.path')")
+          [ -f "$match_root_path/$match_name/SKILL.md" ] &&
+            printf 'standalone:%s:%s\n' "$match_root_id" "$match_name"
+        done
+      ;;
+  esac
+}
+
+auth_verify_allowed=false
+has_section auth && auth_verify_allowed=true
+
+emit_privilege_readiness
+
+if has_section host; then
+  hostname_value=$(hostname 2>/dev/null | clip || printf unknown)
+  user_value=$(id -un 2>/dev/null | clip || printf unknown)
+  os_value=$(uname -s 2>/dev/null | clip || printf unknown)
+  kernel_value=$(uname -r 2>/dev/null | clip || printf unknown)
+  arch_value=$(uname -m 2>/dev/null | clip || printf unknown)
+  data=$(jq -cn \
+    --arg configured_name "$host_id" \
+    --arg hostname "$hostname_value" \
+    --arg user "$user_value" \
+    --arg home "$HOME" \
+    --arg os "$os_value" \
+    --arg kernel "$kernel_value" \
+    --arg architecture "$arch_value" \
+    '{configured_name:$configured_name,hostname:$hostname,user:$user,home:$home,os:$os,kernel:$kernel,architecture:$architecture}')
+  emit host "$host_id" present high "$data" '[{"source":"system","method":"uname+hostname"}]'
+fi
+
+if has_section packages; then
+  managers=$(jq -r --arg host "$host_id" '.machines[$host].package_managers[]? // empty' "$config")
+  for manager in $managers; do
+    case $manager in
+      homebrew|linuxbrew)
+        if command -v brew >/dev/null 2>&1; then
+          package_tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-packages.XXXXXX")
+          installed_formulae="$package_tmp/formulae.tsv"
+          installed_casks="$package_tmp/casks.tsv"
+          candidate_formulae="$package_tmp/formulae-candidates.tsv"
+          candidate_casks="$package_tmp/cask-candidates.tsv"
+          : >"$candidate_formulae"
+          : >"$candidate_casks"
+          if outdated_json=$(brew outdated --json=v2 2>/dev/null); then
+            printf '%s\n' "$outdated_json" |
+              jq -r '.formulae[]? | [.name, .current_version] | @tsv' >"$candidate_formulae"
+            printf '%s\n' "$outdated_json" |
+              jq -r '.casks[]? | [.name, .current_version] | @tsv' >"$candidate_casks"
+          else
+            emit error "packages:$manager-updates" unavailable high '{}' '[]' \
+              '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"brew outdated inventory failed"}]'
+          fi
+          if brew_packages=$(brew list --versions 2>/dev/null); then
+            printf '%s\n' "$brew_packages" |
+              awk 'NF >= 2 { print $1 "\t" $2 }' >"$installed_formulae"
+            join_package_candidates "$installed_formulae" "$candidate_formulae" |
+              emit_package_lines "$manager" list-installed
+          else
+            emit error "packages:$manager" unavailable high '{}' '[]' \
+              '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"brew package inventory failed"}]'
+          fi
+          if casks=$(brew list --cask --versions 2>/dev/null); then
+            printf '%s\n' "$casks" |
+              awk 'NF >= 2 { print $1 "\t" $2 }' >"$installed_casks"
+            join_package_candidates "$installed_casks" "$candidate_casks" |
+              emit_package_lines "$manager-cask" list-installed-casks
+          else
+            emit error "packages:$manager-cask" unavailable high '{}' '[]' \
+              '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"brew cask inventory failed"}]'
+          fi
+          rm -rf "$package_tmp"
+        else
+          emit error "packages:$manager" unavailable high '{}' '[]' \
+            "$(jq -cn --arg manager "$manager" '[{code:"manager_missing",severity:"warning",retryable:false,message:($manager+" is not installed")} ]')"
+        fi
+        ;;
+      apt)
+        if command -v dpkg-query >/dev/null 2>&1; then
+          package_tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-packages.XXXXXX")
+          installed_apt="$package_tmp/installed.tsv"
+          candidate_apt="$package_tmp/candidates.tsv"
+          : >"$candidate_apt"
+          if command -v apt >/dev/null 2>&1 &&
+            apt_candidates=$(apt list --upgradable 2>/dev/null); then
+            printf '%s\n' "$apt_candidates" |
+              awk -F '[/ ]' 'NR > 1 && NF >= 3 { print $1 "\t" $3 }' >"$candidate_apt"
+          else
+            emit error packages:apt-updates unavailable high '{}' '[]' \
+              '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"APT candidate inventory failed"}]'
+          fi
+          if apt_packages=$(dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null); then
+            printf '%s\n' "$apt_packages" >"$installed_apt"
+            native_apt_arch=
+            if command -v dpkg >/dev/null 2>&1; then
+              native_apt_arch=$(dpkg --print-architecture 2>/dev/null) || native_apt_arch=
+            fi
+            join_package_candidates "$installed_apt" "$candidate_apt" "$native_apt_arch" |
+              emit_package_lines apt dpkg-query+apt-upgradable
+          else
+            emit error packages:apt unavailable high '{}' '[]' \
+              '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"dpkg-query package inventory failed"}]'
+          fi
+          rm -rf "$package_tmp"
+        else
+          emit error packages:apt unavailable high '{}' '[]' \
+            '[{"code":"manager_missing","severity":"warning","retryable":false,"message":"dpkg-query is not installed"}]'
+        fi
+        ;;
+    esac
+  done
+fi
+
+if has_section agents; then
+  for runtime in codex claude; do
+    if command -v "$runtime" >/dev/null 2>&1; then
+      executable=$(command -v "$runtime")
+      version=$("$runtime" --version 2>/dev/null | head -1 | clip || printf unknown)
+      data=$(jq -cn --arg runtime "$runtime" --arg executable "$executable" --arg version "$version" \
+        '{runtime:$runtime,executable:$executable,version:$version}')
+      emit agent_runtime "$runtime" present high "$data" '[{"source":"runtime","method":"--version"}]'
+    else
+      emit agent_runtime "$runtime" absent high "$(jq -cn --arg runtime "$runtime" '{runtime:$runtime}')"
+    fi
+  done
+
+  codex_plugins='[]'
+  claude_plugins='[]'
+  codex_plugin_manager_state=absent
+  claude_plugin_manager_state=absent
+  for plugin_agent in codex claude; do
+    if ! command -v "$plugin_agent" >/dev/null 2>&1; then
+      emit plugin_manager "$plugin_agent" absent high \
+        "$(jq -cn --arg agent "$plugin_agent" '{agent:$agent,authoritative:false}')"
+      continue
+    fi
+    plugin_output=
+    normalized_plugins=
+    if plugin_output=$("$plugin_agent" plugin list --json 2>/dev/null); then
+      case $plugin_agent in
+        codex)
+          normalized_plugins=$(printf '%s\n' "$plugin_output" | jq -ce '
+            if type != "object" or
+              (.installed | type) != "array" or
+              (all(.installed[];
+                type == "object" and
+                (.pluginId | type == "string" and length > 0) and
+                (.name | type == "string" and length > 0) and
+                (.marketplaceName | type == "string" and length > 0) and
+                (.version | type == "string" and length > 0) and
+                (.installed | type == "boolean") and
+                (.enabled | type == "boolean") and
+                (
+                  (.source == null) or
+                  (
+                    (.source | type) == "object" and
+                    ((.source.path == null) or (.source.path | type) == "string")
+                  )
+                )
+              ) | not)
+            then error("invalid codex plugin list") else
+              [.installed[] |
+                select(.installed == true) |
+                {
+                  agent:"codex",
+                  manager_id:(.pluginId[0:8192]),
+                  marketplace:(.marketplaceName[0:8192]),
+                  name:(.name[0:8192]),
+                  installed_version:(.version[0:8192]),
+                  enabled:.enabled,
+                  path:((.source.path // null) | if type == "string" then .[0:8192] else null end),
+                  installed_at:null,
+                  last_updated:null
+                }]
+            end' 2>/dev/null) || normalized_plugins=
+          ;;
+        claude)
+          normalized_plugins=$(printf '%s\n' "$plugin_output" | jq -ce '
+            if type != "array" or
+              (all(.[];
+                type == "object" and
+                (.id | type == "string" and length > 0) and
+                ((.id | split("@")) as $parts |
+                  ($parts | length) == 2 and
+                  ($parts[0] | length) > 0 and
+                  ($parts[1] | length) > 0) and
+                (.version | type == "string" and length > 0) and
+                (.enabled | type == "boolean") and
+                ((.installPath == null) or (.installPath | type) == "string") and
+                ((.installedAt == null) or (.installedAt | type) == "string") and
+                ((.lastUpdated == null) or (.lastUpdated | type) == "string")
+              ) | not)
+            then error("invalid claude plugin list") else
+              [.[] |
+                .id as $manager_id |
+                {
+                  agent:"claude",
+                  manager_id:($manager_id[0:8192]),
+                  marketplace:(($manager_id | split("@")[1])[0:8192]),
+                  name:(($manager_id | split("@")[0])[0:8192]),
+                  installed_version:(.version[0:8192]),
+                  enabled:.enabled,
+                  path:((.installPath // null) | if type == "string" then .[0:8192] else null end),
+                  installed_at:((.installedAt // null) | if type == "string" then .[0:8192] else null end),
+                  last_updated:((.lastUpdated // null) | if type == "string" then .[0:8192] else null end)
+                }]
+            end' 2>/dev/null) || normalized_plugins=
+          ;;
+      esac
+    fi
+    if [ -n "$normalized_plugins" ]; then
+      case $plugin_agent in
+        codex)
+          codex_plugins=$normalized_plugins
+          codex_plugin_manager_state=present
+          ;;
+        claude)
+          claude_plugins=$normalized_plugins
+          claude_plugin_manager_state=present
+          ;;
+      esac
+      emit plugin_manager "$plugin_agent" present high \
+        "$(jq -cn --arg agent "$plugin_agent" --argjson count "$(printf '%s' "$normalized_plugins" | jq 'length')" \
+          '{agent:$agent,authoritative:true,installed_count:$count}')" \
+        '[{"source":"manager-cli","method":"plugin-list-json"}]'
+    else
+      case $plugin_agent in
+        codex) codex_plugin_manager_state=unavailable ;;
+        claude) claude_plugin_manager_state=unavailable ;;
+      esac
+      emit plugin_manager "$plugin_agent" unavailable high \
+        "$(jq -cn --arg agent "$plugin_agent" '{agent:$agent,authoritative:false}')" '[]' \
+        '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"plugin manager inventory failed"}]'
+    fi
+  done
+
+  lock="$HOME/.agents/.skill-lock.json"
+  if [ -f "$lock" ]; then
+    if jq -e '(.skills // .) | type == "object"' "$lock" >/dev/null 2>&1; then
+      jq -c \
+      --arg schema roundhouse.inventory \
+      --argjson schema_version 1 \
+      --arg snapshot_id "$snapshot_id" \
+      --arg host_id "$host_id" \
+      --arg observed_at "$observed_at" '
+        (.skills // .) | to_entries[]? |
+        (.key[0:8192]) as $name |
+        {
+          schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
+          host_id:$host_id,kind:"skill",id:(("skills-cli:"+$name)[0:8192]),
+          observed_at:$observed_at,status:"present",confidence:"high",
+          data:{
+            manager:"skills-cli",name:$name,
+            source:((.value.source // null) |
+              if type == "string" then
+                (split("?")[0] | if contains("@") then split("@")[-1] else . end)[0:8192]
+              else null end),
+            source_type:((.value.sourceType // null) | if type == "string" then .[0:8192] else null end),
+            source_url:((.value.sourceUrl // null) |
+              if type == "string" then
+                (split("?")[0] | if contains("@") then split("@")[-1] else . end)[0:8192]
+              else null end),
+            skill_path:((.value.skillPath // null) | if type == "string" then .[0:8192] else null end),
+            folder_hash:((.value.skillFolderHash // null) | if type == "string" then .[0:8192] else null end),
+            installed_at:((.value.installedAt // null) | if type == "string" then .[0:8192] else null end),
+            updated_at:((.value.updatedAt // null) | if type == "string" then .[0:8192] else null end)
+          },
+          evidence:[{source:"manager-lock",method:"skills-v3-lock"}],errors:[]
+          }' "$lock" 2>/dev/null
+    else
+      emit error agents:skills-cli-lock unavailable high '{}' '[]' \
+        '[{"code":"manager_lock_invalid","severity":"warning","retryable":false,"message":"skills-cli lock file is invalid"}]'
+    fi
+  fi
+
+  jsm_inventory=
+  if command -v jsm >/dev/null 2>&1; then
+    if jsm_inventory=$(jsm --json --offline list 2>/dev/null) &&
+      printf '%s\n' "$jsm_inventory" | jq -e '
+        (.skills | type == "array") and
+        ([.skills[] |
+          type == "object" and
+          (.name | type == "string" and length > 0) and
+          ((.version // null) | type | IN("null","string","number")) and
+          ((.installed_at // null) | type | IN("null","string")) and
+          ((.pinned // false) | type == "boolean") and
+          ((.update_available // null) | type | IN("null","boolean")) and
+          ((.latest_version // null) | type | IN("null","string","number")) and
+          ((.is_saved // null) | type | IN("null","boolean")) and
+          ((.is_jeffreys // null) | type | IN("null","boolean")) and
+          ((.tags // []) | type == "array" and length <= 128) and
+          ([.tags[]? | type | IN("string","number","boolean")] | all)
+        ] | all)
+      ' >/dev/null 2>&1; then
+      printf '%s\n' "$jsm_inventory" | jq -c \
+        --arg schema roundhouse.inventory \
+        --argjson schema_version 1 \
+        --arg snapshot_id "$snapshot_id" \
+        --arg host_id "$host_id" \
+        --arg observed_at "$observed_at" '
+          .skills[]? |
+          (.name[0:8192]) as $name |
+          {
+            schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
+            host_id:$host_id,kind:"skill",id:(("jsm:"+$name)[0:8192]),
+            observed_at:$observed_at,status:"present",confidence:"high",
+            data:{
+              manager:"jsm",name:$name,
+              version:((.version // null) | if . == null then null else tostring[0:8192] end),
+              installed_at:((.installed_at // null) | if type == "string" then .[0:8192] else null end),
+              pinned:(if (.pinned | type) == "boolean" then .pinned else false end),
+              update_available:(if (.update_available | type) == "boolean" then .update_available else null end),
+              latest_version:((.latest_version // null) | if . == null then null else tostring[0:8192] end),
+              is_saved:(if (.is_saved | type) == "boolean" then .is_saved else null end),
+              is_jeffreys:(if (.is_jeffreys | type) == "boolean" then .is_jeffreys else null end),
+              tags:((.tags // [])[0:128] | map(tostring[0:256]))
+            },
+            evidence:[{source:"manager-cli",method:"jsm-offline-list"}],errors:[]
+          }'
+    else
+      emit error agents:jsm unavailable medium '{}' '[]' \
+        '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"jsm offline inventory failed"}]'
+    fi
+  fi
+
+  capability_host_groups=$(jq -c --arg host "$host_id" '.machines[$host].groups // []' "$config")
+  jq -c --argjson host_groups "$capability_host_groups" '
+    (.capabilities // {}) | to_entries[]? |
+    select(
+      (.value.groups // []) as $groups |
+      ($groups | length) == 0 or
+      any($groups[]; . as $group | $host_groups | index($group) != null)
+    )' "$config" | while IFS= read -r capability; do
+    capability_name=$(printf '%s' "$capability" | jq -r '.key' | clip)
+    providers='[]'
+    desired_count=0
+    observed_count=0
+    duplicate_count=0
+    for capability_agent in codex claude; do
+      definition=$(printf '%s' "$capability" | jq -c --arg agent "$capability_agent" '
+        if ((.value.agents // []) | index($agent)) != null then .value
+        else .value[$agent] // empty end')
+      provider=$(printf '%s' "$definition" | jq -r '.provider // empty')
+      [ -n "$provider" ] || continue
+      source=$(printf '%s' "$definition" | jq -r '.source')
+      safe_source=$(printf '%s\n' "$source" | sanitize_remote | clip)
+      expected_name=$(printf '%s' "$definition" | jq -r --arg name "$capability_name" \
+        '.skill // .name // $name' | clip)
+      matches=$(capability_matches "$capability_agent" "$provider" "$source" "$expected_name" || true)
+      matches_json=$(printf '%s\n' "$matches" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
+      match_count=$(printf '%s' "$matches_json" | jq 'length')
+      desired_count=$((desired_count + 1))
+      [ "$match_count" -eq 0 ] || observed_count=$((observed_count + 1))
+      [ "$match_count" -le 1 ] || duplicate_count=$((duplicate_count + 1))
+      providers=$(printf '%s' "$providers" | jq -c \
+        --arg agent "$capability_agent" --arg provider "$provider" --arg source "$safe_source" \
+        --arg expected_name "$expected_name" --argjson matches "$matches_json" \
+        '. + [{agent:$agent,provider:$provider,source:$source,expected_name:$expected_name,
+          observed:(($matches|length)>0),matches:$matches,duplicate:(($matches|length)>1)}]')
+    done
+    auth_dependencies='[]'
+    artifact_dependencies='[]'
+    dependencies_ready=true
+    while IFS= read -r required_auth; do
+      [ -n "$required_auth" ] || continue
+      dependency_status=unconfigured
+      dependency_ready=false
+      auth_definition=$(jq -c --arg id "$required_auth" '.auth_artifacts[$id] // empty' "$config")
+      if [ -n "$auth_definition" ]; then
+        configured_path=$(printf '%s' "$auth_definition" | jq -r --arg host "$host_id" '.paths[$host] // .path // empty')
+        auth_portability=$(printf '%s' "$auth_definition" | jq -r '.portability // "per-machine"')
+        dependency_path=$(expand_home "$configured_path")
+        if [ -z "$dependency_path" ] && { [ "$auth_portability" = native-store ] || [ "$auth_portability" = per-machine ]; }; then
+          auth_entry=$(jq -cn --arg key "$required_auth" --argjson value "$auth_definition" '{key:$key,value:$value}')
+          run_auth_health "$auth_entry"
+          dependency_status=$auth_health_status
+          [ "$auth_health_status" = healthy ] && dependency_ready=true
+        elif [ -L "$dependency_path" ]; then
+          dependency_status=partial
+        elif [ -f "$dependency_path" ]; then
+          auth_entry=$(jq -cn --arg key "$required_auth" --argjson value "$auth_definition" '{key:$key,value:$value}')
+          run_auth_health "$auth_entry"
+          dependency_status=$auth_health_status
+          case $auth_health_status in
+            healthy|not-configured) dependency_ready=true ;;
+          esac
+        else
+          dependency_status=absent
+        fi
+      fi
+      [ "$dependency_ready" = true ] || dependencies_ready=false
+      auth_dependencies=$(printf '%s' "$auth_dependencies" | jq -c \
+        --arg id "$required_auth" --arg status "$dependency_status" --argjson ready "$dependency_ready" \
+        '. + [{id:$id,status:$status,ready:$ready}]')
+    done <<EOF
+$(printf '%s' "$capability" | jq -r '.value.requires_auth[]?')
+EOF
+    while IFS= read -r required_artifact; do
+      [ -n "$required_artifact" ] || continue
+      dependency_status=unconfigured
+      dependency_ready=false
+      artifact_definition=$(jq -c --arg id "$required_artifact" --argjson host_groups "$capability_host_groups" '
+        first((.agent_artifacts // [])[] |
+          select(.id == $id) |
+          select(
+            (.groups // []) as $groups |
+            ($groups | length) == 0 or
+            any($groups[]; . as $group | $host_groups | index($group) != null)
+          )
+        ) // empty' "$config")
+      if [ -n "$artifact_definition" ]; then
+        artifact_path=$(expand_home "$(printf '%s' "$artifact_definition" | jq -r --arg host "$host_id" '.paths[$host] // .path // empty')")
+        if [ -z "$artifact_path" ]; then
+          dependency_status=unavailable
+        elif [ -L "$artifact_path" ]; then
+          dependency_status=partial
+        elif [ -f "$artifact_path" ] || [ -d "$artifact_path" ]; then
+          dependency_status=present
+          dependency_ready=true
+        else
+          dependency_status=absent
+        fi
+      fi
+      [ "$dependency_ready" = true ] || dependencies_ready=false
+      artifact_dependencies=$(printf '%s' "$artifact_dependencies" | jq -c \
+        --arg id "$required_artifact" --arg status "$dependency_status" --argjson ready "$dependency_ready" \
+        '. + [{id:$id,status:$status,ready:$ready}]')
+    done <<EOF
+$(printf '%s' "$capability" | jq -r '.value.requires_artifacts[]?')
+EOF
+    provider_available=false
+    provider_consistent=false
+    if [ "$desired_count" -gt 0 ] && [ "$observed_count" -eq "$desired_count" ]; then
+      provider_available=true
+      [ "$duplicate_count" -ne 0 ] || provider_consistent=true
+    fi
+    capability_status=absent
+    capability_ready=false
+    if [ "$provider_consistent" = true ] && [ "$dependencies_ready" = true ]; then
+      capability_status=present
+      capability_ready=true
+    elif [ "$observed_count" -gt 0 ] ||
+      [ "$(printf '%s' "$auth_dependencies" | jq 'length')" -gt 0 ] ||
+      [ "$(printf '%s' "$artifact_dependencies" | jq 'length')" -gt 0 ]; then
+      capability_status=partial
+    fi
+    data=$(jq -cn --arg name "$capability_name" --argjson providers "$providers" \
+      --argjson provider_available "$provider_available" --argjson consistent "$provider_consistent" \
+      --argjson ready "$capability_ready" --argjson dependencies_ready "$dependencies_ready" \
+      --argjson auth "$auth_dependencies" --argjson artifacts "$artifact_dependencies" \
+      '{name:$name,available:($provider_available and $dependencies_ready),ready:$ready,
+        consistent:$consistent,providers:$providers,
+        dependencies:{ready:$dependencies_ready,auth:$auth,artifacts:$artifacts}}')
+    emit capability "$capability_name" "$capability_status" high "$data" \
+      '[{"source":"configuration+manager-state+dependency-state","method":"logical-provider-reconciliation"}]'
+  done
+
+  jq -c --argjson host_groups "$capability_host_groups" '
+    (.skill_roots // [])[] |
+    select(
+      (.groups // []) as $groups |
+      ($groups | length) == 0 or
+      any($groups[]; . as $group | $host_groups | index($group) != null)
+    )' "$config" | while IFS= read -r root_entry; do
+    root_id=$(printf '%s' "$root_entry" | jq -r '.id' | clip)
+    root_path=$(expand_home "$(printf '%s' "$root_entry" | jq -r '.path')")
+    root_manager=$(printf '%s' "$root_entry" | jq -r '.manager // "manual"' | clip)
+    root_agents=$(printf '%s' "$root_entry" | jq -c '.agents // []')
+    if [ ! -d "$root_path" ]; then
+      emit skill_root "$root_id" absent high \
+        "$(jq -cn --arg id "$root_id" --arg path "$root_path" '{id:$id,path:$path}')"
+      continue
+    fi
+    [ ! -f "$root_path/.SKILLS_MANAGED_BY_JSM" ] || root_manager=jsm
+    find "$root_path" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort |
+      while IFS= read -r skill_path; do
+        [ -f "$skill_path/SKILL.md" ] || continue
+        name=$(basename "$skill_path" | clip)
+        digest=$(directory_digest "$skill_path")
+        origin=$(git -C "$skill_path" remote get-url origin 2>/dev/null | sanitize_remote | clip || true)
+        data=$(jq -cn \
+          --arg name "$name" --arg root "$root_id" --arg path "$skill_path" \
+          --arg manager "$root_manager" --arg origin "$origin" \
+          --arg mtime "$(file_mtime "$skill_path/SKILL.md")" --arg digest "$digest" \
+          --argjson agents "$root_agents" \
+          '{name:$name,root:$root,path:$path,manager:$manager,agent_exposure:$agents,
+            origin:(if $origin=="" then null else $origin end),updated_at:$mtime,
+            digest:{algorithm:"sha256",value:$digest,scope:"directory-files"}}')
+        emit skill "standalone:$root_id:$name" present medium "$data" \
+          '[{"source":"filesystem","method":"configured-skill-root+directory-sha256"}]'
+      done
+  done
+
+  jq -c --argjson host_groups "$capability_host_groups" '
+    (.agent_artifacts // [])[] |
+    select(
+      (.groups // []) as $groups |
+      ($groups | length) == 0 or
+      any($groups[]; . as $group | $host_groups | index($group) != null)
+    )' "$config" | while IFS= read -r artifact; do
+    artifact_id=$(printf '%s' "$artifact" | jq -r '.id' | clip)
+    configured_artifact_path=$(printf '%s' "$artifact" | jq -r --arg host "$host_id" '.paths[$host] // .path // empty')
+    artifact_path=$(expand_home "$configured_artifact_path")
+    artifact_kind=$(printf '%s' "$artifact" | jq -r '.kind' | clip)
+    artifact_agents=$(printf '%s' "$artifact" | jq -c '.agents // []')
+    if [ -z "$artifact_path" ]; then
+      emit agent_artifact "$artifact_id" unavailable high \
+        "$(jq -cn --arg id "$artifact_id" --arg kind "$artifact_kind" --argjson agents "$artifact_agents" \
+          '{id:$id,path:null,artifact_kind:$kind,agent_exposure:$agents}')" \
+        '[]' '[{"code":"artifact_path_missing","severity":"warning","retryable":false,"message":"agent artifact has no path for this host"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents" unknown
+      fi
+    elif [ -L "$artifact_path" ]; then
+      emit agent_artifact "$artifact_id" partial medium \
+        "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
+          --argjson agents "$artifact_agents" '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents}')" \
+        '[]' '[{"code":"symlink_not_followed","severity":"warning","retryable":false,"message":"agent artifact path is a symlink"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents" symlink
+      fi
+    elif [ -f "$artifact_path" ]; then
+      data=$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
+        --arg digest "$(sha256_file "$artifact_path")" --arg mtime "$(file_mtime "$artifact_path")" \
+        --argjson agents "$artifact_agents" \
+        '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents,updated_at:$mtime,
+          digest:{algorithm:"sha256",value:$digest,scope:"raw-bytes"}}')
+      emit agent_artifact "$artifact_id" present high "$data" '[{"source":"filesystem","method":"configured-file+sha256"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents"
+      fi
+    elif [ -d "$artifact_path" ]; then
+      data=$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
+        --arg digest "$(directory_digest "$artifact_path")" --argjson agents "$artifact_agents" \
+        '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents,
+          digest:{algorithm:"sha256",value:$digest,scope:"directory-files"}}')
+      emit agent_artifact "$artifact_id" present medium "$data" '[{"source":"filesystem","method":"configured-directory+sha256"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents"
+      fi
+    elif [ -e "$artifact_path" ]; then
+      emit agent_artifact "$artifact_id" partial medium \
+        "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
+          --argjson agents "$artifact_agents" '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents}')" \
+        '[]' '[{"code":"non_regular_file","severity":"warning","retryable":false,"message":"agent artifact path is not a regular file or directory"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents" non-regular
+      fi
+    else
+      emit agent_artifact "$artifact_id" absent high \
+        "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
+          --argjson agents "$artifact_agents" '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents}')"
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents"
+      fi
+    fi
+  done
+
+  for agent in codex claude; do
+    case $agent in
+      codex)
+        cache="$HOME/.codex/plugins/cache"
+        active_plugins=$codex_plugins
+        plugin_manager_state=$codex_plugin_manager_state
+        ;;
+      claude)
+        cache="$HOME/.claude/plugins/cache"
+        active_plugins=$claude_plugins
+        plugin_manager_state=$claude_plugin_manager_state
+        ;;
+    esac
+    printf '%s\n' "$active_plugins" | jq -c '.[]' | while IFS= read -r active_plugin; do
+      marketplace=$(printf '%s' "$active_plugin" | jq -r '.marketplace' | clip)
+      plugin=$(printf '%s' "$active_plugin" | jq -r '.name' | clip)
+      version=$(printf '%s' "$active_plugin" | jq -r '.installed_version' | clip)
+      cache_path="$cache/$marketplace/$plugin/$version"
+      inferred=
+      cache_exists=false
+      if [ -d "$cache_path" ]; then
+        cache_exists=true
+        inferred=$(directory_birth_time "$cache_path")
+      fi
+      data=$(printf '%s' "$active_plugin" | jq -c \
+        --arg inferred "$inferred" --arg cache_path "$cache_path" --argjson cache_exists "$cache_exists" '
+          . + {
+            active:true,
+            install_state:"installed",
+            inventory_source:"manager",
+            cache_path:(if $cache_exists then $cache_path else null end),
+            inferred_installed_at:(if .installed_at != null or $inferred == "" then null else $inferred end),
+            inferred_installed_at_evidence:(if .installed_at != null or $inferred == "" then null else "filesystem_birthtime" end),
+            inferred_installed_at_confidence:(if .installed_at != null or $inferred == "" then "unknown" else "low" end)
+          }')
+      emit plugin "$agent:$marketplace:$plugin:$version" present high "$data" \
+        '[{"source":"manager-cli","method":"plugin-list-json"}]'
+    done
+
+    [ -d "$cache" ] || continue
+    find "$cache" -mindepth 3 -maxdepth 5 -type f \
+      \( -path '*/.codex-plugin/plugin.json' -o -path '*/.claude-plugin/plugin.json' \) \
+      ! -path "$cache/plugin-eval/*" \
+      2>/dev/null | while IFS= read -r manifest; do
+        dirname "$(dirname "$manifest")"
+      done | sort -u | while IFS= read -r path; do
+      version=$(basename "$path" | clip)
+      plugin=$(basename "$(dirname "$path")" | clip)
+      marketplace=$(basename "$(dirname "$(dirname "$path")")" | clip)
+      if printf '%s\n' "$active_plugins" | jq -e \
+        --arg marketplace "$marketplace" --arg plugin "$plugin" --arg version "$version" \
+        'any(.[]; .marketplace == $marketplace and .name == $plugin and .installed_version == $version)' \
+        >/dev/null; then
+        continue
+      fi
+      inferred=$(directory_birth_time "$path")
+      cache_install_state='cache-only'
+      cache_active=false
+      if [ "$plugin_manager_state" = unavailable ]; then
+        cache_install_state='manager-unverified'
+        cache_active=null
+      fi
+      data=$(jq -cn --arg agent "$agent" --arg marketplace "$marketplace" --arg plugin "$plugin" --arg version "$version" --arg path "$path" \
+        --arg inferred "$inferred" --arg install_state "$cache_install_state" --argjson active "$cache_active" \
+        '{agent:$agent,marketplace:$marketplace,name:$plugin,cached_version:$version,path:$path,active:$active,install_state:$install_state,inventory_source:"cache",inferred_cached_at:(if $inferred=="" then null else $inferred end),inferred_cached_at_evidence:(if $inferred=="" then null else "filesystem_birthtime" end),inferred_cached_at_confidence:(if $inferred=="" then "unknown" else "low" end)}')
+      emit plugin_cache "$agent:$marketplace:$plugin:$version" present low "$data" \
+        '[{"source":"filesystem","method":"cache-directory-observation+birthtime-inference"}]'
+    done
+  done
+fi
+
+if has_section auth; then
+  jq -c '.auth_artifacts // {} | to_entries[]' "$config" | while IFS= read -r entry; do
+    name=$(printf '%s' "$entry" | jq -r '.key' | clip)
+    configured_path=$(printf '%s' "$entry" | jq -r --arg host "$host_id" '.value.paths[$host] // .value.path // empty')
+    strategy=$(printf '%s' "$entry" | jq -r '.value.strategy // "ignore"' | clip)
+    portability=$(printf '%s' "$entry" | jq -r '.value.portability // "per-machine"' | clip)
+    path=$(expand_home "$configured_path")
+    auth_health_status=not-run
+    auth_health_exit=null
+    if [ -z "$path" ] && { [ "$portability" = native-store ] || [ "$portability" = per-machine ]; }; then
+      run_auth_health "$entry"
+      case $auth_health_status in
+        healthy) auth_status=present; reauth_required=false ;;
+        unhealthy)
+          if [ "$strategy" = reauth ]; then
+            auth_status=absent
+            reauth_required=true
+          else
+            auth_status=partial
+            reauth_required=false
+          fi
+          ;;
+        *) auth_status=partial; reauth_required=false ;;
+      esac
+      data=$(jq -cn --arg tool "$name" --arg strategy "$strategy" --arg portability "$portability" \
+        --arg health "$auth_health_status" --argjson verify_exit_code "$auth_health_exit" \
+        --argjson reauth_required "$reauth_required" \
+        '{tool:$tool,path:null,strategy:$strategy,portability:$portability,type:"native-status",health:$health,
+          verify_exit_code:$verify_exit_code,reauth_required:$reauth_required,
+          manual_action:(if $reauth_required then "run the configured native login on this host" else null end)}')
+      emit auth_artifact "$name" "$auth_status" high "$data" \
+        '[{"source":"native-cli","method":"configured-auth-status"}]'
+    elif [ -L "$path" ]; then
+      data=$(jq -cn --arg tool "$name" --arg path "$path" --arg strategy "$strategy" --arg portability "$portability" \
+        --arg health "$auth_health_status" \
+        '{tool:$tool,path:$path,strategy:$strategy,portability:$portability,type:"symlink",health:$health,verify_exit_code:null}')
+      emit auth_artifact "$name" partial medium "$data" '[{"source":"filesystem","method":"lstat"}]' \
+        '[{"code":"symlink_not_followed","severity":"warning","retryable":false,"message":"credential path is a symlink"}]'
+    elif [ -f "$path" ]; then
+      run_auth_health "$entry"
+      digest=$(sha256_file "$path")
+      data=$(jq -cn --arg tool "$name" --arg path "$path" --arg strategy "$strategy" --arg portability "$portability" \
+        --arg mode "$(file_mode "$path")" --arg owner "$(file_owner "$path")" \
+        --argjson size "$(file_size "$path")" --arg mtime "$(file_mtime "$path")" --arg digest "$digest" \
+        --arg health "$auth_health_status" --argjson verify_exit_code "$auth_health_exit" \
+        '{tool:$tool,path:$path,strategy:$strategy,portability:$portability,type:"file",mode:$mode,owner:$owner,size:$size,mtime:$mtime,
+          digest:{algorithm:"sha256",value:$digest,scope:"raw-bytes"},health:$health,verify_exit_code:$verify_exit_code}')
+      emit auth_artifact "$name" present medium "$data" '[{"source":"filesystem","method":"metadata+sha256"}]'
+    else
+      data=$(jq -cn --arg tool "$name" --arg path "$path" --arg strategy "$strategy" --arg portability "$portability" \
+        '{tool:$tool,path:$path,strategy:$strategy,portability:$portability,health:"not-run",verify_exit_code:null}')
+      emit auth_artifact "$name" absent medium "$data"
+    fi
+  done
+fi
+
+if has_section projects; then
+  dev_root=$(jq -r --arg host "$host_id" '.machines[$host].dev_root // empty' "$config")
+  if [ -z "$dev_root" ]; then
+    emit error projects:dev-root unavailable high '{}' '[]' \
+      '[{"code":"dev_root_missing","severity":"error","retryable":false,"message":"project inventory requires a configured dev_root"}]'
+  else
+    dev_root=$(expand_home "$dev_root")
+    host_groups=$(jq -c --arg host "$host_id" '.machines[$host].groups // []' "$config")
+    jq -c --argjson host_groups "$host_groups" '
+    .projects // {} | to_entries[] |
+    select(
+      (.value.groups // []) as $groups |
+      ($groups | length) == 0 or
+      any($groups[]; . as $group | $host_groups | index($group) != null)
+    )
+    ' "$config" | while IFS= read -r entry; do
+    name=$(printf '%s' "$entry" | jq -r '.key' | clip)
+    relative=$(printf '%s' "$entry" | jq -r '.value.path' | clip)
+    expected=$(printf '%s' "$entry" | jq -r '.value.source' | sanitize_remote | clip)
+    codex_required=$(printf '%s' "$entry" | jq '.value.codex // false')
+    path="$dev_root/$relative"
+    if [ -d "$path/.git" ] || git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      head=$(git -C "$path" rev-parse HEAD 2>/dev/null | clip || printf unknown)
+      tree=$(git -C "$path" rev-parse 'HEAD^{tree}' 2>/dev/null | clip || printf unknown)
+      branch=$(git -C "$path" symbolic-ref --short -q HEAD 2>/dev/null | clip || printf detached)
+      origin=$(git -C "$path" remote get-url origin 2>/dev/null | sanitize_remote | clip || printf unknown)
+      dirty=$(GIT_OPTIONAL_LOCKS=0 git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      expected_identity=$(printf '%s\n' "$expected" | canonical_git_source | clip)
+      origin_identity=$(printf '%s\n' "$origin" | canonical_git_source | clip)
+      origin_matches=false
+      [ -n "$expected_identity" ] && [ "$expected_identity" = "$origin_identity" ] && origin_matches=true
+      upstream=$(git -C "$path" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null | clip || true)
+      ahead=0
+      behind=0
+      sync_state=local-no-upstream
+      if [ -n "$upstream" ]; then
+        counts=$(git -C "$path" rev-list --left-right --count "HEAD...$upstream" 2>/dev/null || printf '0 0')
+        ahead=$(printf '%s\n' "$counts" | awk '{print $1+0}')
+        behind=$(printf '%s\n' "$counts" | awk '{print $2+0}')
+        if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
+          sync_state=local-tracking-diverged
+        elif [ "$ahead" -gt 0 ]; then
+          sync_state=local-tracking-ahead
+        elif [ "$behind" -gt 0 ]; then
+          sync_state=local-tracking-behind
+        else
+          sync_state=local-tracking-up-to-date
+        fi
+      fi
+      repository_readiness=ready
+      [ "$dirty" -eq 0 ] || repository_readiness=dirty
+      [ "$origin_matches" = true ] || repository_readiness=wrong-origin
+      [ "$branch" != detached ] || repository_readiness=detached
+      [ "$sync_state" != local-tracking-diverged ] || repository_readiness=diverged
+      status=present
+      [ "$repository_readiness" = ready ] || status=partial
+      data=$(jq -cn --arg name "$name" --arg path "$path" --arg expected_source "$expected" \
+        --arg origin "$origin" --arg head "$head" --arg tree "$tree" --arg branch "$branch" \
+        --arg upstream "$upstream" --arg sync_state "$sync_state" --arg readiness "$repository_readiness" \
+        --argjson dirty_count "$dirty" --argjson ahead "$ahead" --argjson behind "$behind" \
+        --argjson origin_matches "$origin_matches" --argjson codex_required "$codex_required" \
+        '{name:$name,path:$path,expected_source:$expected_source,origin:$origin,
+          origin_matches:$origin_matches,head:$head,tree:$tree,branch:$branch,
+          upstream:(if $upstream=="" then null else $upstream end),ahead:$ahead,behind:$behind,
+          sync_state:$sync_state,tracking_freshness:"unknown",dirty_count:$dirty_count,repository_readiness:$readiness,
+          codex_required:$codex_required,
+          codex_saved_project_status:(if $codex_required then "requires-controller-check" else "not-required" end)}')
+      emit project "$name" "$status" high "$data" '[{"source":"git","method":"rev-parse+status"}]'
+    elif [ -e "$path" ]; then
+      emit project "$name" partial high "$(jq -cn --arg name "$name" --arg path "$path" --arg expected "$expected" '{name:$name,path:$path,expected_source:$expected}')" \
+        '[]' '[{"code":"not_git_repository","severity":"error","retryable":false,"message":"configured project path exists but is not a Git checkout"}]'
+    else
+      emit project "$name" absent high "$(jq -cn --arg name "$name" --arg path "$path" --arg expected "$expected" '{name:$name,path:$path,expected_source:$expected}')"
+    fi
+    done
+  fi
+fi
+
+if has_section startup; then
+  case $(uname -s 2>/dev/null || printf unknown) in
+    Darwin)
+      for startup_spec in \
+        "launchd-user|user|$HOME/Library/LaunchAgents" \
+        "launchd-system-agent|system|/Library/LaunchAgents" \
+        "launchd-system-daemon|system|/Library/LaunchDaemons"; do
+        scheduler=${startup_spec%%|*}
+        startup_remainder=${startup_spec#*|}
+        scope=${startup_remainder%%|*}
+        directory=${startup_remainder#*|}
+        [ -d "$directory" ] || continue
+        find "$directory" -maxdepth 1 -type f -name '*.plist' 2>/dev/null | LC_ALL=C sort |
+          while IFS= read -r path; do
+            mtime=$(file_mtime "$path")
+            definition='{}'
+            definition_parse_failed=true
+            digest=
+            if command -v plutil >/dev/null 2>&1 &&
+              definition=$(
+                set -o pipefail
+                plutil -convert json -o - "$path" 2>/dev/null | jq -e -c 'select(type == "object") | {
+                label:(.Label // null),
+                program:(.Program // .ProgramArguments[0] // null),
+                run_at_load:(.RunAtLoad // false),
+                keep_alive:(.KeepAlive // false),
+                start_interval:(.StartInterval // null),
+                start_calendar_interval:(.StartCalendarInterval // null),
+                working_directory:(.WorkingDirectory // null)
+              }' 2>/dev/null
+              ); then
+              if digest=$(
+                set -o pipefail
+                sha256_file "$path"
+              ); then
+                definition_parse_failed=false
+              else
+                definition='{}'
+              fi
+            else
+              definition='{}'
+            fi
+            label=$(printf '%s' "$definition" | jq -r '.label // empty' | clip)
+            [ -n "$label" ] || label=$(basename "$path" .plist | clip)
+            loaded=false
+            launch_domain=system
+            [ "$scope" = user ] && launch_domain="gui/$(id -u)"
+            launch_state=$(launchctl print "$launch_domain/$label" 2>/dev/null || true)
+            [ -z "$launch_state" ] || loaded=true
+            last_exit=$(printf '%s\n' "$launch_state" | awk -F'= ' '/last exit code =/ {gsub(/[^0-9-]/,"",$2); print $2; exit}')
+            case $last_exit in ''|*[!0-9-]*) last_exit=null ;; esac
+            if [ "$definition_parse_failed" = true ]; then
+              status=partial
+              errors='[{"code":"launchd_definition_parse_failed","severity":"warning","retryable":false,"message":"property list could not be read or parsed"}]'
+            else
+              status=present
+              errors='[]'
+            fi
+            data=$(jq -cn --arg scheduler "$scheduler" --arg scope "$scope" \
+              --arg path "$path" --arg label "$label" --arg digest "$digest" --arg mtime "$mtime" \
+              --argjson loaded "$loaded" --argjson last_exit "$last_exit" \
+              --argjson definition_parse_failed "$definition_parse_failed" --argjson definition "$definition" \
+              '{scheduler:$scheduler,scope:$scope,label:$label,enabled:null,active:$loaded,
+                last_result:$last_exit,source_definition_path:$path,definition_mtime:$mtime,
+                definition_digest:(if $definition_parse_failed then null else
+                  {algorithm:"sha256",value:$digest,scope:"raw-bytes"} end)} + $definition')
+            emit startup_task "$scheduler:$label" "$status" high "$data" \
+              '[{"source":"launchd+filesystem","method":"launchctl-print+plist"}]' "$errors"
+          done
+      done
+      ;;
+    Linux)
+      for scope in user system; do
+        scheduler="systemd-$scope"
+        systemd_ok=true
+        if ! command -v systemctl >/dev/null 2>&1; then
+          systemd_ok=false
+          units=
+        elif [ "$scope" = user ]; then
+          units=$(systemctl --user list-unit-files --type=service,timer --state=enabled --no-legend --no-pager 2>/dev/null) || systemd_ok=false
+        else
+          units=$(systemctl list-unit-files --type=service,timer --state=enabled --no-legend --no-pager 2>/dev/null) || systemd_ok=false
+        fi
+        if [ "$systemd_ok" = false ]; then
+          emit error "startup:$scheduler" unavailable high '{}' '[]' \
+            "$(jq -cn --arg scheduler "$scheduler" \
+              '[{code:"scheduler_query_failed",severity:"warning",retryable:true,message:($scheduler+" inventory failed")} ]')"
+          continue
+        fi
+        [ -n "$units" ] || continue
+        printf '%s\n' "$units" | awk 'NF {print $1}' | LC_ALL=C sort -u |
+          while IFS= read -r unit; do
+            if [ "$scope" = user ]; then
+              active=$(systemctl --user is-active "$unit" 2>/dev/null) || active=inactive
+              path=$(systemctl --user show "$unit" -p FragmentPath --value 2>/dev/null | head -1)
+              action_line=$(systemctl --user show "$unit" -p ExecStart --value 2>/dev/null | head -1)
+              working_directory=$(systemctl --user show "$unit" -p WorkingDirectory --value 2>/dev/null | head -1)
+              restart_policy=$(systemctl --user show "$unit" -p Restart --value 2>/dev/null | head -1)
+              next_run=$(systemctl --user show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null | head -1)
+              last_run=$(systemctl --user show "$unit" -p LastTriggerUSec --value 2>/dev/null | head -1)
+            else
+              active=$(systemctl is-active "$unit" 2>/dev/null) || active=inactive
+              path=$(systemctl show "$unit" -p FragmentPath --value 2>/dev/null | head -1)
+              action_line=$(systemctl show "$unit" -p ExecStart --value 2>/dev/null | head -1)
+              working_directory=$(systemctl show "$unit" -p WorkingDirectory --value 2>/dev/null | head -1)
+              restart_policy=$(systemctl show "$unit" -p Restart --value 2>/dev/null | head -1)
+              next_run=$(systemctl show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null | head -1)
+              last_run=$(systemctl show "$unit" -p LastTriggerUSec --value 2>/dev/null | head -1)
+            fi
+            action=$(printf '%s\n' "$action_line" | sed -nE 's#.*path=([^ ;}]+).*#\1#p' | head -1 | clip)
+            action_digest=
+            [ -z "$action_line" ] || action_digest=$(printf '%s' "$action_line" | sha256_stream)
+            digest=
+            mtime=
+            if [ -n "$path" ] && [ -f "$path" ]; then
+              digest=$(sha256_file "$path")
+              mtime=$(file_mtime "$path")
+            fi
+            data=$(jq -cn --arg scheduler "$scheduler" --arg scope "$scope" --arg unit "$unit" \
+              --arg path "$path" --arg digest "$digest" --arg mtime "$mtime" \
+              --arg active "$active" --arg action "$action" --arg action_digest "$action_digest" \
+              --arg working_directory "$working_directory" --arg restart_policy "$restart_policy" \
+              --arg next_run "$next_run" --arg last_run "$last_run" \
+              '{scheduler:$scheduler,scope:$scope,label:$unit,enabled:"enabled",active:$active,
+                action:(if $action=="" then null else $action end),
+                action_arguments_digest:(if $action_digest=="" then null else {algorithm:"sha256",value:$action_digest} end),
+                working_directory:(if $working_directory=="" then null else $working_directory end),
+                restart_policy:(if $restart_policy=="" then null else $restart_policy end),
+                next_run:(if $next_run=="" then null else $next_run end),
+                last_run:(if $last_run=="" then null else $last_run end),
+                source_definition_path:(if $path=="" then null else $path end),
+                definition_mtime:(if $mtime=="" then null else $mtime end),
+                definition_digest:(if $digest=="" then null else {algorithm:"sha256",value:$digest,scope:"raw-bytes"} end)}')
+            emit startup_task "$scheduler:$unit" present high "$data" \
+              '[{"source":"systemd","method":"list-unit-files+show"}]'
+          done
+      done
+      ;;
+  esac
+  if command -v crontab >/dev/null 2>&1; then
+    cron_file=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-cron.XXXXXX")
+    chmod 600 "$cron_file"
+    if crontab -l >"$cron_file" 2>/dev/null; then
+      cron_entries=$(awk 'NF && $1 !~ /^#/ {count++} END {print count+0}' "$cron_file")
+      data=$(jq -cn --argjson entry_count "$cron_entries" --arg digest "$(sha256_file "$cron_file")" \
+        '{scheduler:"cron",scope:"user",label:"user-crontab",entry_count:$entry_count,
+          definition_digest:{algorithm:"sha256",value:$digest,scope:"crontab-bytes"}}')
+      emit startup_task cron:user present high "$data" '[{"source":"cron","method":"crontab-list-hash"}]'
+    else
+      emit startup_task cron:user absent high '{"scheduler":"cron","scope":"user","label":"user-crontab"}'
+    fi
+    rm -f "$cron_file"
+  fi
+fi
+
+if has_section chezmoi; then
+  source_path=${CHEZMOI_SOURCE_DIR:-}
+  if [ -z "$source_path" ] && command -v chezmoi >/dev/null 2>&1; then
+    source_path=$(chezmoi source-path 2>/dev/null | head -1 | clip || true)
+  fi
+  source_path=${source_path:-"$HOME/.local/share/chezmoi"}
+  source_path=$(expand_home "$source_path")
+  if [ -d "$source_path" ]; then
+    if head=$(git -C "$source_path" rev-parse HEAD 2>/dev/null | clip) && [ -n "$head" ]; then
+      dirty=$(GIT_OPTIONAL_LOCKS=0 git -C "$source_path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      status=present
+      [ "$dirty" -eq 0 ] || status=partial
+      data=$(jq -cn --arg path "$source_path" --arg head "$head" --argjson dirty_count "$dirty" \
+        '{role:"chezmoi-source",path:$path,head:$head,dirty_count:$dirty_count}')
+      emit file chezmoi:source "$status" medium "$data" '[{"source":"git","method":"rev-parse+status"}]'
+    else
+      emit file chezmoi:source partial medium \
+        "$(jq -cn --arg path "$source_path" '{role:"chezmoi-source",path:$path}')" '[]' \
+        '[{"code":"not_git_repository","severity":"warning","retryable":false,"message":"chezmoi source is not a readable Git checkout"}]'
+    fi
+  else
+    emit file chezmoi:source absent medium "$(jq -cn --arg path "$source_path" '{role:"chezmoi-source",path:$path}')"
+  fi
+  if command -v chezmoi >/dev/null 2>&1; then
+    chezmoi_status=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-chezmoi.XXXXXX")
+    chmod 600 "$chezmoi_status"
+    if chezmoi status >"$chezmoi_status" 2>/dev/null; then
+      drift_count=$(awk 'NF {count++} END {print count+0}' "$chezmoi_status")
+      status_digest=$(sha256_file "$chezmoi_status")
+      status_codes=$(awk 'NF {code=substr($0,1,2); counts[code]++} END {
+        for (code in counts) print code "\t" counts[code]
+      }' "$chezmoi_status" | LC_ALL=C sort | jq -Rsc '
+        split("\n") | map(select(length > 0) | split("\t") | {code:.[0],count:(.[1]|tonumber)})')
+      data=$(jq -cn --arg source_path "$source_path" --arg digest "$status_digest" \
+        --argjson drift_count "$drift_count" --argjson codes "$status_codes" \
+        '{source_path:$source_path,drift_count:$drift_count,status_codes:$codes,
+          status_digest:{algorithm:"sha256",value:$digest,scope:"chezmoi-status-output"}}')
+      emit chezmoi_state live present high "$data" '[{"source":"chezmoi","method":"source-path+status"}]'
+    else
+      emit chezmoi_state live unavailable high "$(jq -cn --arg source_path "$source_path" '{source_path:$source_path}')" \
+        '[]' '[{"code":"chezmoi_status_failed","severity":"warning","retryable":true,"message":"chezmoi status failed"}]'
+    fi
+    rm -f "$chezmoi_status"
+  else
+    emit chezmoi_state live absent high '{"tool_available":false}'
+  fi
+fi

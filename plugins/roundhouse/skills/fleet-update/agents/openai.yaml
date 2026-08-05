@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fleet Update"
+  short_description: "Plan and apply guarded fleet updates"
+  default_prompt: "Use $fleet-update to plan package updates for my fleet."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fleet Authentication"
+  short_description: "Audit and safely reconcile fleet authentication"
+  default_prompt: "Use $fleet-auth to audit configured authentication artifacts."

@@ -1,0 +1,142 @@
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  posix:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install OpenSSH server for scope validation
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+      - name: Validate Bash and integrity
+        shell: bash
+        run: |
+          set -eu
+          bash -n plugins/roundhouse/scripts/machine-utilities
+          bash -n plugins/roundhouse/scripts/certify-ssh-node
+          bash -n plugins/roundhouse/scripts/collect-posix
+          bash -n plugins/roundhouse/scripts/enroll-privilege-posix
+          bash -n plugins/roundhouse/scripts/enroll-ssh-posix
+          bash -n plugins/roundhouse/scripts/prepare-ssh-identity
+          bash -n plugins/roundhouse/scripts/privilege-broker-posix
+          bash -n plugins/roundhouse/scripts/test-roundhouse
+          bash -n plugins/roundhouse/scripts/update-integrity
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            shellcheck --severity=warning plugins/roundhouse/scripts/machine-utilities \
+              plugins/roundhouse/scripts/collect-posix \
+              plugins/roundhouse/scripts/test-roundhouse \
+              plugins/roundhouse/scripts/update-integrity
+          fi
+          plugins/roundhouse/scripts/update-integrity
+          git diff --exit-code -- plugins/roundhouse/integrity.json
+      - name: Validate public identity and transport helpers
+        shell: bash
+        run: |
+          set -eu
+          plugins/roundhouse/scripts/enroll-ssh-posix self-test
+          plugins/roundhouse/scripts/prepare-ssh-identity self-test
+          plugins/roundhouse/scripts/certify-ssh-node self-test
+      - name: Validate fleet skill frontmatter
+        shell: bash
+        run: |
+          set -eu
+          python3 - plugins/roundhouse/skills/*/SKILL.md <<'PY'
+          import pathlib
+          import sys
+
+          for argument in sys.argv[1:]:
+              path = pathlib.Path(argument)
+              lines = path.read_text(encoding="utf-8").splitlines()
+              if not lines or lines[0] != "---" or "---" not in lines[1:]:
+                  raise SystemExit(f"invalid frontmatter boundary: {path}")
+              end = lines.index("---", 1)
+              fields = {}
+              for line in lines[1:end]:
+                  if ": " not in line:
+                      raise SystemExit(f"invalid frontmatter field: {path}: {line}")
+                  key, value = line.split(": ", 1)
+                  if key in fields or not value:
+                      raise SystemExit(f"invalid frontmatter value: {path}: {key}")
+                  fields[key] = value
+              if set(fields) != {"name", "description"} or fields["name"] != path.parent.name:
+                  raise SystemExit(f"invalid skill identity: {path}")
+          PY
+      - name: Run fixture suite
+        shell: bash
+        run: |
+          chmod -R go-w plugins/roundhouse
+          plugins/roundhouse/scripts/test-roundhouse
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Validate PowerShell native boundaries and release hashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $scripts = @(
+            "plugins/roundhouse/scripts/collect-windows.ps1",
+            "plugins/roundhouse/scripts/apply-windows.ps1",
+            "plugins/roundhouse/scripts/enroll-privilege-windows.ps1",
+            "plugins/roundhouse/scripts/enroll-windows-sftp.ps1",
+            "plugins/roundhouse/scripts/privilege-broker-windows.ps1",
+            "plugins/roundhouse/scripts/profile-worker-windows.ps1",
+            "plugins/roundhouse/scripts/register-profile-task-windows.ps1",
+            "plugins/roundhouse/scripts/windows-native-canary-runner.ps1"
+          )
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script), [ref]$tokens, [ref]$errors
+            )
+            if ($errors.Count -gt 0) { throw ($errors -join "`n") }
+          }
+          & pwsh -NoLogo -NoProfile -NonInteractive -File `
+            "plugins/roundhouse/scripts/apply-windows.ps1" -SelfTest
+          if ($LASTEXITCODE -ne 0) { throw "Windows native boundary self-test failed" }
+          foreach ($script in @($scripts | Where-Object { $_ -notlike "*apply-windows.ps1" })) {
+            & pwsh -NoLogo -NoProfile -NonInteractive -File $script -SelfTest
+            if ($LASTEXITCODE -ne 0) { throw "Windows self-test failed: $script" }
+          }
+          $root = Resolve-Path "plugins/roundhouse"
+          $integrity = Get-Content "$root/integrity.json" -Raw | ConvertFrom-Json
+          foreach ($file in @($integrity.files)) {
+            $actual = (Get-FileHash (Join-Path $root $file.path) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $file.sha256) { throw "Integrity mismatch: $($file.path)" }
+          }
+          $requirementPath = Join-Path $env:RUNNER_TEMP "machine-utilities-executor.json"
+          try {
+            [ordered]@{
+              schema = "machine-utilities.executor"
+              schema_version = 1
+              plugin = $integrity.plugin
+              marketplace = $integrity.marketplace
+              version = $integrity.version
+              integrity_manifest_sha256 = (
+                Get-FileHash (Join-Path $root "integrity.json") -Algorithm SHA256
+              ).Hash.ToLowerInvariant()
+              files = @($integrity.files)
+            } | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $requirementPath -Encoding utf8NoBOM
+            $verified = & pwsh -NoLogo -NoProfile -NonInteractive -File `
+              "plugins/roundhouse/scripts/apply-windows.ps1" `
+              -VerifyExecutor -ExecutorRequirementPath $requirementPath |
+              ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $verified.verified -ne $true) {
+              throw "Native executor verification failed"
+            }
+          } finally {
+            Remove-Item -LiteralPath $requirementPath -Force -ErrorAction SilentlyContinue
+          }

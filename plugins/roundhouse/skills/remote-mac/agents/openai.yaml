@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote Mac"
+  short_description: "Operate configured Macs safely over SSH"
+  default_prompt: "Use $remote-mac to inspect or operate the selected fleet Mac."

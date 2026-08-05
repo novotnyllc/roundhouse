@@ -1,0 +1,2634 @@
+#!/bin/bash -p
+# Isolated owner ceremony for public SSH certificate requests.
+#
+# The sign path accepts a bounded public-only CSR on stdin.  It never accepts
+# a CA path, signing command, dependency, principal policy, or SSH option from
+# the request.  Those values live in the protected signer-account profile.
+set -euo pipefail
+
+umask 077
+export LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin
+IFS=$' \t\n'
+inherited_ssh_auth_sock=${SSH_AUTH_SOCK-}
+unset BASH_ENV CDPATH ENV GLOBIGNORE SSH_AUTH_SOCK SSH_AGENT_PID SSH_ASKPASS \
+  SSH_CLIENT SSH_CONNECTION SSH_ORIGINAL_COMMAND SSH_TTY SSH_CONFIG \
+  GIT_SSH GIT_SSH_COMMAND \
+  LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH \
+  DYLD_FALLBACK_LIBRARY_PATH DYLD_FRAMEWORK_PATH DYLD_FALLBACK_FRAMEWORK_PATH \
+  http_proxy https_proxy ftp_proxy all_proxy no_proxy \
+  HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
+
+readonly ssh_keygen=/usr/bin/ssh-keygen
+readonly helper_name=certify-ssh-node
+readonly policy_name=signer.policy
+readonly release_digest_name=helper.sha256
+readonly ca_public_name=fleet-ca.pub
+readonly serial_name=serial.next
+readonly manifest_name=manifest
+readonly sign_claim_name=.sign-claim
+readonly sign_candidate_prefix=.sign-candidate.
+readonly sign_stage_prefix=.sign-stage.
+readonly native_receipt_max_age=900
+
+# Fixture state is deliberately initialized here rather than read from the
+# environment.  A normal candidate can consume only the root-owned receipt;
+# the self-test's synthetic receipt is reachable only inside this process.
+fixture_mode=false
+fixture_ancestor_boundary=
+fixture_receipt_path=
+fixture_helper_path=
+fixture_crash_phase=
+fixture_stop_phase=
+fixture_control_dir=
+fixture_command_temp_parent=
+fixture_exact_link_outcome=
+exact_link_binary=
+owned_sign_candidate=
+owned_sign_candidate_id=
+owned_sign_claim=
+owned_sign_stage=
+owned_sign_stage_id=
+owned_sign_transaction_id=
+owned_sign_serial=
+owned_sign_next_serial=
+owned_sign_manifest_digest=
+owned_sign_pid=
+owned_sign_process_start=
+owned_sign_boot_identity=
+owned_csr_dir=
+owned_csr_dir_id=
+owned_csr=
+owned_csr_id=
+bootstrap_csr_parent=
+bootstrap_csr_dir=
+bootstrap_csr_dir_id=
+bootstrap_csr=
+bootstrap_csr_id=
+owned_input_child_pid=
+owned_input_fd_open=false
+deferred_input_signal=0
+deferred_bootstrap_signal=0
+approved_agent_socket_id=
+approved_agent_socket_mode=
+approved_agent_socket_owner=
+approved_agent_peer_pid=
+approved_agent_peer_start=
+approved_agent_peer_executable=
+approved_agent_peer_digest=
+approved_native_receipt_id=
+approved_native_receipt_digest=
+serial_file_id=
+owned_serial_temp=
+owned_serial_temp_id=
+
+usage() {
+  printf '%s\n' \
+    'usage: certify-ssh-node status|self-test' \
+    '       certify-ssh-node preview < public-certificate-request' \
+    '       certify-ssh-node sign MANIFEST_SHA256 < public-certificate-request' >&2
+  exit 64
+}
+record() { printf '%s\n' "$@"; }
+
+portable_stat() {
+  case $(/usr/bin/uname -s) in
+    Darwin) /usr/bin/stat -f "$1" "$3" 2>/dev/null ;;
+    Linux) /usr/bin/stat -c "$2" "$3" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+file_owner() { portable_stat %Su %U "$1"; }
+file_group() { portable_stat %Sg %G "$1"; }
+file_mode() { portable_stat %Lp %a "$1"; }
+file_size() { portable_stat %z %s "$1"; }
+file_links() { portable_stat %l %h "$1"; }
+file_device_inode() { portable_stat '%d:%i' '%d:%i' "$1"; }
+public_sticky_directory_mode() {
+  local observed
+  case $(platform_boundary) in
+    macos) observed=$(/usr/bin/stat -f %Sp "$1" 2>/dev/null) || return 1 ;;
+    linux) observed=$(/usr/bin/stat -c %A "$1" 2>/dev/null) || return 1 ;;
+    *) return 1 ;;
+  esac
+  [ "$observed" = drwxrwxrwt ]
+}
+safe_permissions() {
+  local mode permissions
+  mode=$(file_mode "$1") || return 1
+  permissions=$(printf '%s' "$mode" | /usr/bin/sed 's/.*\(...\)$/\1/')
+  [ "${#permissions}" -eq 3 ] || return 1
+  case $(printf '%s' "$permissions" | /usr/bin/cut -c 2-3) in *2*|*3*|*6*|*7*) return 1 ;; esac
+}
+safe_extended_acl() {
+  # A mode suffix of `+` only says that an access ACL exists.  A deny-only
+  # macOS ACL is protective and remains acceptable; every effective grant is
+  # rejected.  Linux rejects default ACLs and named grants with permissions.
+  local mode acl_tool acl
+  mode=$(/bin/ls -ld "$1" 2>/dev/null | /usr/bin/awk 'NR == 1 { print $1; exit }') || return 1
+  [ -n "$mode" ] || return 1
+  case $mode in
+    *+*) ;;
+    *) return 0 ;;
+  esac
+  case $(/usr/bin/uname -s) in
+    Darwin)
+      acl=$(/bin/ls -led "$1" 2>/dev/null | /usr/bin/awk '
+        NR == 1 { next }
+        /^[[:space:]]*[0-9]+:/ {
+          if (NF < 4) exit 1
+          if ($3 == "deny") next
+          exit 1
+        }
+        { exit 1 }
+        END { if (NR == 1) exit 1 }
+      ') || return 1
+      : "$acl"
+      ;;
+    Linux)
+      for acl_tool in /usr/bin/getfacl /bin/getfacl; do
+        [ -x "$acl_tool" ] && break
+        acl_tool=
+      done
+      [ -n "$acl_tool" ] || return 1
+      "$acl_tool" -cp -- "$1" 2>/dev/null | /usr/bin/awk '
+        /^#/ { next }
+        /^default:/ { exit 1 }
+        /^user::/ || /^group::/ || /^other::/ || /^mask::/ { next }
+        /^user:/ || /^group:/ {
+          split($0, fields, ":")
+          if (fields[2] != "" && fields[3] != "---") exit 1
+          next
+        }
+        { exit 1 }
+      ' || return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+clear_inherited_acl() {
+  case $(/usr/bin/uname -s) in
+    Darwin) /bin/chmod -N "$1" >/dev/null 2>&1 || return 1 ;;
+    Linux)
+      if [ -x /usr/bin/setfacl ]; then
+        /usr/bin/setfacl -b "$1" >/dev/null 2>&1 || return 1
+      elif [ -x /bin/setfacl ]; then
+        /bin/setfacl -b "$1" >/dev/null 2>&1 || return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  safe_extended_acl "$1"
+}
+owner_directory() {
+  [ -d "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$(/usr/bin/id -un)" ] &&
+    [ "$(file_mode "$1")" = 700 ] && safe_extended_acl "$1"
+}
+owner_file() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$(/usr/bin/id -un)" ] &&
+    [ "$(file_mode "$1")" = 600 ] && [ "$(file_links "$1")" = 1 ] &&
+    [ "$(file_size "$1")" -le "$2" ] && safe_extended_acl "$1"
+}
+owner_file_with_links() {
+  local path=$1 maximum=$2 links=$3
+  [ -f "$path" ] && [ ! -L "$path" ] && [ "$(file_owner "$path")" = "$(/usr/bin/id -un)" ] &&
+    [ "$(file_mode "$path")" = 600 ] && [ "$(file_links "$path")" = "$links" ] &&
+    [ "$(file_size "$path")" -le "$maximum" ] && safe_extended_acl "$path"
+}
+owner_executable() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$(/usr/bin/id -un)" ] &&
+    [ "$(file_mode "$1")" = 700 ] && [ "$(file_links "$1")" = 1 ] &&
+    [ "$(file_size "$1")" -le "$2" ] && safe_extended_acl "$1"
+}
+root_directory() {
+  [ -d "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = root ] &&
+    [ "$(file_mode "$1")" = 700 ] && safe_extended_acl "$1"
+}
+root_file() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = root ] &&
+    [ "$(file_mode "$1")" = 600 ] && [ "$(file_links "$1")" = 1 ] &&
+    [ "$(file_size "$1")" -le "$2" ] && safe_extended_acl "$1"
+}
+root_receipt_group() {
+  case $(platform_boundary) in
+    macos) printf '%s' wheel ;;
+    linux) printf '%s' root ;;
+    *) return 1 ;;
+  esac
+}
+public_integrity_directory() {
+  local path=$1 expected_owner=$2 expected_group=$3 links
+  links=$(file_links "$path") || return 1
+  [ -d "$path" ] && [ ! -L "$path" ] &&
+    [ "$(file_owner "$path")" = "$expected_owner" ] &&
+    [ "$(file_group "$path")" = "$expected_group" ] &&
+    [ "$(file_mode "$path")" = 755 ] && [[ $links =~ ^[1-9][0-9]*$ ]] &&
+    safe_extended_acl "$path"
+}
+public_integrity_file() {
+  local path=$1 expected_owner=$2 expected_group=$3 maximum=$4
+  [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] &&
+    [ "$(file_owner "$path")" = "$expected_owner" ] &&
+    [ "$(file_group "$path")" = "$expected_group" ] &&
+    [ "$(file_mode "$path")" = 644 ] && [ "$(file_links "$path")" = 1 ] &&
+    [ "$(file_size "$path")" -le "$maximum" ] && safe_extended_acl "$path"
+}
+normalise_created_directory() {
+  /bin/chmod 700 "$1" >/dev/null 2>&1 || return 1
+  clear_inherited_acl "$1" || return 1
+  owner_directory "$1"
+}
+normalise_created_file() {
+  /bin/chmod 600 "$1" >/dev/null 2>&1 || return 1
+  clear_inherited_acl "$1" || return 1
+  owner_file "$1" "$2"
+}
+normalise_fixture_public_directory() {
+  [ "$fixture_mode" = true ] || return 1
+  /usr/bin/chgrp "$(/usr/bin/id -gn)" "$1" >/dev/null 2>&1 &&
+    /bin/chmod 755 "$1" >/dev/null 2>&1 && clear_inherited_acl "$1" &&
+    public_integrity_directory "$1" "$(/usr/bin/id -un)" "$(/usr/bin/id -gn)"
+}
+normalise_fixture_public_file() {
+  [ "$fixture_mode" = true ] || return 1
+  /usr/bin/chgrp "$(/usr/bin/id -gn)" "$1" >/dev/null 2>&1 &&
+    /bin/chmod 644 "$1" >/dev/null 2>&1 && clear_inherited_acl "$1" &&
+    public_integrity_file "$1" "$(/usr/bin/id -un)" "$(/usr/bin/id -gn)" "$2"
+}
+canonical_directory() {
+  (CDPATH=''; builtin cd -P "$1" 2>/dev/null || exit 1; builtin pwd -P)
+}
+canonical_absolute_path_syntax() {
+  local candidate=$1
+  case $candidate in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case $candidate in
+    *'//'*|*'/./'*|*/.|*'/../'*|*/..) return 1 ;;
+  esac
+}
+canonical_existing_path() {
+  local candidate=$1 parent base canonical_parent
+  canonical_absolute_path_syntax "$candidate" || return 1
+  parent=${candidate%/*}
+  base=${candidate##*/}
+  [ -n "$parent" ] || parent=/
+  [ -n "$base" ] || return 1
+  canonical_parent=$(canonical_directory "$parent") || return 1
+  printf '%s/%s' "${canonical_parent%/}" "$base"
+}
+canonical_script() {
+  local canonical
+  case $0 in /*) ;; *) return 1 ;; esac
+  canonical=$(canonical_existing_path "$0") || return 1
+  [ -f "$canonical" ] && [ ! -L "$canonical" ] || return 1
+  printf '%s' "$canonical"
+}
+forbidden_location() {
+  local candidate=$1 cursor
+  case /$candidate/ in
+    */.codex/plugins/cache/*|*/.claude/plugins/cache/*|*/CloudStorage/*|*/Dropbox/*|*/OneDrive*/*) return 0 ;;
+  esac
+  cursor=$candidate
+  while :; do
+    case /$cursor/ in
+      */.codex/plugins/cache/*|*/.claude/plugins/cache/*|*/CloudStorage/*|*/Dropbox/*|*/OneDrive*/*) return 0 ;;
+    esac
+    [ ! -e "$cursor/.git" ] && [ ! -L "$cursor/.git" ] || return 0
+    [ "$cursor" = / ] && break
+    cursor=${cursor%/*}
+    [ -n "$cursor" ] || cursor=/
+  done
+  return 1
+}
+validate_protected_ancestor_chain() {
+  local cursor=$1 required_owner=$2 owner
+  while :; do
+    [ -d "$cursor" ] && [ ! -L "$cursor" ] || return 1
+    safe_permissions "$cursor" && safe_extended_acl "$cursor" || return 1
+    owner=$(file_owner "$cursor") || return 1
+    [ "$owner" = "$required_owner" ] || [ "$owner" = root ] || return 1
+    if [ -n "$fixture_ancestor_boundary" ] && [ "$cursor" = "$fixture_ancestor_boundary" ]; then
+      return 0
+    fi
+    [ "$cursor" = / ] && return 0
+    cursor=${cursor%/*}
+    [ -n "$cursor" ] || cursor=/
+  done
+}
+validate_receipt_ancestor_chain() {
+  local cursor=$1 required_owner=$2 required_group=$3 canonical owner group links
+  while :; do
+    canonical=$(canonical_directory "$cursor") || return 1
+    [ "$canonical" = "$cursor" ] && [ -d "$cursor" ] && [ ! -L "$cursor" ] || return 1
+    safe_permissions "$cursor" && safe_extended_acl "$cursor" || return 1
+    owner=$(file_owner "$cursor") && group=$(file_group "$cursor") && links=$(file_links "$cursor") || return 1
+    [[ $group =~ ^[A-Za-z0-9._-]+$ ]] && [[ $links =~ ^[1-9][0-9]*$ ]] || return 1
+    [ "$owner" = "$required_owner" ] || [ "$owner" = root ] || return 1
+    if [ "$owner" = root ]; then [ "$group" = "$required_group" ] || return 1; fi
+    if [ -n "$fixture_ancestor_boundary" ] && [ "$cursor" = "$fixture_ancestor_boundary" ]; then
+      return 0
+    fi
+    if [ "$owner" = "$required_owner" ]; then [ "$group" = "$required_group" ] || return 1; fi
+    [ "$cursor" = / ] && return 0
+    cursor=${cursor%/*}
+    [ -n "$cursor" ] || cursor=/
+  done
+}
+verify_signer_root() {
+  local canonical
+  canonical_absolute_path_syntax "$signer_root" || return 1
+  canonical=$(canonical_directory "$signer_root") || return 1
+  [ "$canonical" = "$signer_root" ] || return 1
+  forbidden_location "$signer_root" && return 1
+  owner_directory "$signer_root" && owner_directory "$signer_root/.work" || return 1
+  validate_protected_ancestor_chain "$signer_root" "$(/usr/bin/id -un)"
+}
+verify_root_receipt_path() {
+  local receipt=$1 directory canonical expected_owner expected_group
+  canonical=$(canonical_existing_path "$receipt") || return 1
+  [ -f "$canonical" ] && [ ! -L "$canonical" ] || return 1
+  directory=${canonical%/*}
+  if [ "$fixture_mode" = true ]; then
+    # Fixture mode uses the current account as its stand-in enrollment
+    # authority, but retains the production 0755/0644 public-integrity
+    # contract.  This receipt contains identifiers and public digests only.
+    expected_owner=$(/usr/bin/id -un) || return 1
+    expected_group=$(/usr/bin/id -gn) || return 1
+    public_integrity_directory "$directory" "$expected_owner" "$expected_group" &&
+      public_integrity_file "$canonical" "$expected_owner" "$expected_group" 8192 &&
+      validate_receipt_ancestor_chain "$directory" "$expected_owner" "$expected_group" || return 1
+  else
+    expected_owner=root
+    expected_group=$(root_receipt_group) || return 1
+    public_integrity_directory "$directory" "$expected_owner" "$expected_group" &&
+      public_integrity_file "$canonical" "$expected_owner" "$expected_group" 8192 &&
+      validate_receipt_ancestor_chain "$directory" root "$expected_group" || return 1
+  fi
+  native_receipt_canonical=$canonical
+  native_receipt_id=$(file_device_inode "$canonical") || return 1
+  native_receipt_digest=$(sha256_file "$canonical") || return 1
+}
+platform_boundary() {
+  case $(/usr/bin/uname -s) in
+    Darwin) printf '%s' macos ;;
+    Linux)
+      if [ -r /proc/sys/kernel/osrelease ] && /usr/bin/grep -Eiq '(microsoft|wsl)' /proc/sys/kernel/osrelease; then
+        printf '%s' wsl
+      else
+        printf '%s' linux
+      fi
+      ;;
+    *) printf '%s' unsupported ;;
+  esac
+}
+signer_root_for_current_user() {
+  local base
+  case $(platform_boundary) in
+    macos) base=${HOME-}/Library/'Application Support' ;;
+    linux)
+      if [ -n "${XDG_STATE_HOME-}" ]; then base=$XDG_STATE_HOME
+      else base=${HOME-}/.local/state
+      fi
+      ;;
+    *) return 69 ;;
+  esac
+  [ -n "$base" ] || return 1
+  case $base in /*) ;; *) return 1 ;; esac
+  base=${base%/}
+  printf '%s/machine-utilities-signer' "$base"
+}
+sha256_file() {
+  if [ -x /usr/bin/sha256sum ]; then
+    /usr/bin/sha256sum "$1" | /usr/bin/awk '{print tolower($1)}'
+  else
+    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print tolower($1)}'
+  fi
+}
+sha256_stream() {
+  if [ -x /usr/bin/sha256sum ]; then
+    /usr/bin/sha256sum | /usr/bin/awk '{print tolower($1)}'
+  else
+    /usr/bin/shasum -a 256 | /usr/bin/awk '{print tolower($1)}'
+  fi
+}
+system_ssh_keygen_ready() {
+  [ -f "$ssh_keygen" ] && [ ! -L "$ssh_keygen" ] && [ -x "$ssh_keygen" ] &&
+    [ "$(file_owner "$ssh_keygen")" = root ] && safe_permissions "$ssh_keygen" && safe_extended_acl "$ssh_keygen" &&
+    [ "$(file_size "$ssh_keygen")" -le 33554432 ] &&
+    validate_protected_ancestor_chain "${ssh_keygen%/*}" root
+}
+system_exact_link_ready() {
+  local candidate links
+  for candidate in /usr/bin/link /bin/link; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] && [ -x "$candidate" ] || continue
+    links=$(file_links "$candidate") || continue
+    [ "$(file_owner "$candidate")" = root ] && [[ $links =~ ^[1-9][0-9]*$ ]] || continue
+    safe_permissions "$candidate" && safe_extended_acl "$candidate" || continue
+    [ "$(file_size "$candidate")" -le 1048576 ] || continue
+    validate_protected_ancestor_chain "${candidate%/*}" root || continue
+    exact_link_binary=$candidate
+    return 0
+  done
+  exact_link_binary=
+  return 1
+}
+create_exact_link() {
+  local source=$1 destination=$2
+  system_exact_link_ready || return 1
+  "$exact_link_binary" "$source" "$destination" 2>/dev/null || return 1
+  if [ "$fixture_mode" = true ]; then
+    case $fixture_exact_link_outcome in
+      '') ;;
+      report-failure-after-success) return 1 ;;
+      *) return 1 ;;
+    esac
+  fi
+}
+private_temp_directory() {
+  local directory
+  directory=$(/usr/bin/mktemp -d /tmp/machine-utilities-certify.XXXXXX 2>/dev/null) || return 1
+  directory=$(canonical_directory "$directory") || { /bin/rm -rf "$directory" >/dev/null 2>&1; return 1; }
+  normalise_created_directory "$directory" || { /bin/rm -rf "$directory" >/dev/null 2>&1; return 1; }
+  printf '%s' "$directory"
+}
+key_fingerprint() {
+  "$ssh_keygen" -lf "$1" -E sha256 2>/dev/null | /usr/bin/awk 'NR==1 {print $2; exit}'
+}
+
+valid_domain() {
+  [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] && [[ $1 == *.* ]]
+}
+valid_node_id() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; }
+valid_principal() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._@:-]{0,127}$ ]]; }
+valid_source() {
+  local value=$1 address prefix a b c d extra component one two three four numeric mask
+  case $value in */*) ;; *) return 1 ;; esac
+  address=${value%/*}
+  prefix=${value##*/}
+  [[ $prefix =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+  if [[ $address == *:* ]]; then
+    [ "$prefix" -le 128 ] && [[ $address =~ ^[0-9A-Fa-f:]+$ ]]
+    return
+  fi
+  [ "$prefix" -le 32 ] || return 1
+  IFS=. read -r a b c d extra <<EOF
+$address
+EOF
+  [ -z "${extra:-}" ] && [ -n "${d:-}" ] || return 1
+  for component in "$a" "$b" "$c" "$d"; do
+    [[ $component =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    [ "$component" -le 255 ] 2>/dev/null || return 1
+  done
+  one=$((10#$a)); two=$((10#$b)); three=$((10#$c)); four=$((10#$d))
+  numeric=$(( (one << 24) | (two << 16) | (three << 8) | four ))
+  if [ "$prefix" -eq 0 ]; then mask=0
+  else mask=$(( (4294967295 << (32 - prefix)) & 4294967295 ))
+  fi
+  [ $((numeric & mask)) -eq "$numeric" ]
+}
+canonical_csv() {
+  local input=$1 kind=$2 value count canonical
+  [ -n "$input" ] || return 1
+  [ "$input" != '-' ] || { [ "$kind" = source ] || return 1; return 0; }
+  count=0
+  while IFS= read -r value; do
+    [ -n "$value" ] || return 1
+    case $kind in principal) valid_principal "$value" ;; source) valid_source "$value" ;; *) return 1 ;; esac || return 1
+    count=$((count + 1))
+  done <<EOF
+$(printf '%s' "$input" | /usr/bin/tr ',' '\n')
+EOF
+  [ "$count" -ge 1 ] && [ "$count" -le 16 ] || return 1
+  canonical=$(printf '%s' "$input" | /usr/bin/tr ',' '\n' | /usr/bin/sort -u | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
+  [ "$canonical" = "$input" ] || return 1
+}
+validate_endpoint_principals() {
+  local value=$1 count
+  canonical_csv "$value" principal || return 1
+  count=$(printf '%s\n' "$value" | /usr/bin/tr ',' '\n' | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+  [ "$count" -le 15 ]
+}
+field() {
+  /usr/bin/awk -F '|' -v number="$2" -v name="$3" '
+    NR==number && NF==2 && $1==name && $2 !~ /\|/ {print $2; found=1}
+    END {exit found ? 0 : 1}
+  ' "$1"
+}
+ascii_record() {
+  [ "$(file_size "$1")" -le "$2" ] && ! LC_ALL=C /usr/bin/grep -q '[^ -~]' "$1"
+}
+normalise_public_key() {
+  /usr/bin/awk '
+    NF >= 2 && NF <= 3 && $1=="ssh-ed25519" && $2 ~ /^[A-Za-z0-9+\057]+={0,2}$/ {
+      if (NF==3 && $3 !~ /^[ -~]+$/) exit 1
+      print $1 " " $2; good=1; next
+    }
+    {exit 1}
+    END {exit good ? 0 : 1}
+  ' "$1" >"$2"
+}
+normalise_certificate_record() {
+  /usr/bin/awk '
+    NF >= 2 && $1=="ssh-ed25519-cert-v01@openssh.com" && $2 ~ /^[A-Za-z0-9+\057]+={0,2}$/ {
+      print $1 " " $2; good=1; next
+    }
+    {exit 1}
+    END {exit good ? 0 : 1}
+  ' "$1"
+}
+read_csr() {
+  # Read one byte beyond the public-record limit so an unbounded stdin cannot
+  # fill a signer disk before the record parser rejects it.
+  local result=0 transition_result=0 managed_signals=${2-}
+  if [ "$managed_signals" = managed ]; then
+    deferred_input_signal=0
+    trap 'deferred_input_signal=129' HUP
+    trap 'deferred_input_signal=130' INT
+    trap 'deferred_input_signal=143' TERM
+  fi
+  if ! exec 9<&0; then
+    if [ "$managed_signals" = managed ]; then
+      result=$deferred_input_signal
+      deferred_input_signal=0
+      install_command_traps
+      case $result in
+        129) handle_hup ;;
+        130) handle_int ;;
+        143) handle_term ;;
+      esac
+    fi
+    return 1
+  fi
+  owned_input_fd_open=true
+  /usr/bin/head -c 16385 <&9 >"$1" 2>/dev/null &
+  # In fixture mode this transition can stop inside the otherwise tiny shell
+  # interval between async launch and `$!` registration.  Signals are deferred
+  # until the child is tracked, so no reader can escape with the FIFO open.
+  fixture_transition input-child-before-registration || transition_result=1
+  owned_input_child_pid=$!
+  exec 9<&-
+  owned_input_fd_open=false
+  if [ "$managed_signals" = managed ]; then install_command_traps; fi
+  if [ "$deferred_input_signal" -ne 0 ]; then
+    result=$deferred_input_signal
+    deferred_input_signal=0
+    case $result in
+      129) handle_hup ;;
+      130) handle_int ;;
+      143) handle_term ;;
+      *) terminate_owned_input_child >/dev/null 2>&1 || :; return 1 ;;
+    esac
+  fi
+  if [ "$transition_result" -ne 0 ]; then
+    terminate_owned_input_child >/dev/null 2>&1 || :
+    return 1
+  fi
+  if wait "$owned_input_child_pid"; then :; else result=$?; fi
+  owned_input_child_pid=
+  [ "$result" = 0 ] || return 1
+  [ "$(file_size "$1")" -ge 64 ] && [ "$(file_size "$1")" -le 16384 ]
+}
+parse_csr() {
+  local file=$1 lines temp_dir scratch normalised
+  [ -f "$file" ] && [ ! -L "$file" ] && ascii_record "$file" 16384 || return 1
+  lines=$(/usr/bin/wc -l <"$file" | /usr/bin/tr -d ' ')
+  [ "$lines" = 9 ] && [ "$(/usr/bin/sed -n '1p' "$file")" = 'machine-utilities-ssh-csr|1' ] &&
+    [ "$(/usr/bin/sed -n '9p' "$file")" = 'end-csr|' ] || return 1
+  csr_domain=$(field "$file" 2 fleet-domain) || return 1
+  csr_node_id=$(field "$file" 3 node-id) || return 1
+  csr_public_key=$(field "$file" 4 public-key) || return 1
+  csr_fingerprint=$(field "$file" 5 node-key-fingerprint) || return 1
+  csr_signing_principal=$(field "$file" 6 signing-principal) || return 1
+  csr_endpoints=$(field "$file" 7 endpoint-principals) || return 1
+  csr_sources=$(field "$file" 8 source-addresses) || return 1
+  valid_domain "$csr_domain" && valid_node_id "$csr_node_id" && valid_principal "$csr_signing_principal" &&
+    [ "$csr_signing_principal" = "$csr_node_id@$csr_domain" ] &&
+    [[ $csr_fingerprint =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] || return 1
+  validate_endpoint_principals "$csr_endpoints" || return 1
+  canonical_csv "$csr_sources" source || return 1
+  temp_dir=$(private_temp_directory) || return 1
+  scratch=$(/usr/bin/mktemp "$temp_dir/public.XXXXXX") || { /bin/rm -rf "$temp_dir"; return 1; }
+  normalised=$(/usr/bin/mktemp "$temp_dir/normalised.XXXXXX") || { /bin/rm -rf "$temp_dir"; return 1; }
+  if ! { owner_file "$scratch" 16384 && owner_file "$normalised" 16384; }; then
+    /bin/rm -rf "$temp_dir"
+    return 1
+  fi
+  printf '%s\n' "$csr_public_key" >"$scratch"
+  if ! normalise_public_key "$scratch" "$normalised" 2>/dev/null ||
+    [ "$(/bin/cat "$normalised")" != "$csr_public_key" ] ||
+    [ "$(key_fingerprint "$normalised")" != "$csr_fingerprint" ]; then
+    /bin/rm -rf "$temp_dir"; return 1
+  fi
+  /bin/rm -rf "$temp_dir"
+}
+
+native_canary_receipt_path() {
+  if [ "$fixture_mode" = true ]; then
+    [ -n "$fixture_receipt_path" ] || return 1
+    printf '%s' "$fixture_receipt_path"
+    return
+  fi
+  case $(platform_boundary) in
+    macos) printf '%s' /var/db/machine-utilities-bootstrap/ca-isolation.receipt ;;
+    linux) printf '%s' /var/lib/machine-utilities-bootstrap/ca-isolation.receipt ;;
+    *) return 1 ;;
+  esac
+}
+parse_policy() {
+  local file=$1 lines
+  owner_file "$file" 8192 && ascii_record "$file" 8192 || return 1
+  lines=$(/usr/bin/wc -l <"$file" | /usr/bin/tr -d ' ')
+  [ "$lines" = 13 ] && [ "$(/usr/bin/sed -n '1p' "$file")" = 'machine-utilities-ssh-signer-policy|2' ] &&
+    [ "$(/usr/bin/sed -n '13p' "$file")" = 'end-policy|' ] || return 1
+  policy_domain=$(field "$file" 2 fleet-domain) || return 1
+  policy_ca_fingerprint=$(field "$file" 3 fleet-ca-fingerprint) || return 1
+  policy_generation=$(field "$file" 4 ca-generation) || return 1
+  policy_validity=$(field "$file" 5 validity-seconds) || return 1
+  policy_endpoints=$(field "$file" 6 endpoint-principals) || return 1
+  policy_sources=$(field "$file" 7 source-addresses) || return 1
+  policy_socket=$(field "$file" 8 agent-socket) || return 1
+  policy_ordinary_account=$(field "$file" 9 ordinary-account) || return 1
+  policy_signer_account=$(field "$file" 10 signer-account) || return 1
+  policy_agent_peer_executable=$(field "$file" 11 agent-peer-executable) || return 1
+  policy_agent_peer_digest=$(field "$file" 12 agent-peer-sha256) || return 1
+  valid_domain "$policy_domain" && [[ $policy_ca_fingerprint =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] &&
+    [[ $policy_generation =~ ^[1-9][0-9]{0,9}$ ]] && [[ $policy_validity =~ ^[1-9][0-9]{0,7}$ ]] &&
+    [ "$policy_validity" -ge 3600 ] && [ "$policy_validity" -le 7776000 ] &&
+    [[ $policy_ordinary_account =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] &&
+    [[ $policy_signer_account =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] &&
+    [[ $policy_agent_peer_digest =~ ^[0-9a-f]{64}$ ]] || return 1
+  [ "$policy_ordinary_account" != "$policy_signer_account" ] || return 1
+  validate_endpoint_principals "$policy_endpoints" && canonical_csv "$policy_sources" source || return 1
+  canonical_absolute_path_syntax "$policy_socket" && canonical_absolute_path_syntax "$policy_agent_peer_executable" || return 1
+  [[ $policy_socket =~ ^/[A-Za-z0-9._/-]+$ ]] && [[ $policy_agent_peer_executable =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+  forbidden_location "$policy_socket" && return 1
+  policy_digest=$(sha256_file "$file") || return 1
+}
+verify_pinned_helper() {
+  local helper expected
+  verify_signer_root || return 1
+  if [ "$fixture_mode" = true ]; then
+    helper=$(canonical_existing_path "$fixture_helper_path") || return 1
+  else
+    helper=$(canonical_script) || return 1
+  fi
+  [ "$helper" = "$signer_root/$helper_name" ] && owner_executable "$helper" 1048576 &&
+    owner_file "$signer_root/$release_digest_name" 128 || return 1
+  expected=$(/bin/cat "$signer_root/$release_digest_name")
+  [[ $expected =~ ^[0-9a-f]{64}$ ]] || return 1
+  helper_digest=$(sha256_file "$helper") || return 1
+  [ "$helper_digest" = "$expected" ]
+}
+verify_agent_peer_executable() {
+  local canonical
+  canonical=$(canonical_existing_path "$policy_agent_peer_executable") || return 1
+  [ "$canonical" = "$policy_agent_peer_executable" ] || return 1
+  [ -f "$canonical" ] && [ ! -L "$canonical" ] && [ -x "$canonical" ] &&
+    [ "$(file_owner "$canonical")" = root ] && [ "$(file_links "$canonical")" = 1 ] &&
+    safe_permissions "$canonical" && safe_extended_acl "$canonical" &&
+    validate_protected_ancestor_chain "${canonical%/*}" root || return 1
+  agent_peer_executable=$canonical
+  agent_peer_digest=$(sha256_file "$canonical") || return 1
+  [ "$agent_peer_digest" = "$policy_agent_peer_digest" ]
+}
+lsof_binary() {
+  local candidate
+  for candidate in /usr/sbin/lsof /usr/bin/lsof /bin/lsof; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] && [ -x "$candidate" ] &&
+      [ "$(file_owner "$candidate")" = root ] && safe_permissions "$candidate" && safe_extended_acl "$candidate" &&
+      validate_protected_ancestor_chain "${candidate%/*}" root || continue
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+process_uid() {
+  local pid=$1 value
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  value=$(/bin/ps -o uid= -p "$pid" 2>/dev/null | /usr/bin/tr -d '[:space:]') || return 1
+  [[ $value =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$value"
+}
+process_executable() {
+  local pid=$1 candidate canonical mode process_name readlink_binary
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  case $(platform_boundary) in
+    macos) candidate=$(/bin/ps -o comm= -p "$pid" 2>/dev/null | /usr/bin/awk 'NR == 1 {$1=$1; print; exit}') ;;
+    linux)
+      if [ -x /usr/bin/readlink ]; then
+        readlink_binary=/usr/bin/readlink
+      elif [ -x /bin/readlink ]; then
+        readlink_binary=/bin/readlink
+      else
+        return 1
+      fi
+      if ! candidate=$($readlink_binary --verbose "/proc/$pid/exe" 2>&1); then
+        case $candidate in *': Permission denied'|*': Operation not permitted') ;; *) return 1 ;; esac
+        [ -n "${agent_peer_executable-}" ] || return 1
+        mode=$(file_mode "$agent_peer_executable") || return 1
+        case $mode in [2367][0-7][0-7][0-7]) ;; *) return 1 ;; esac
+        [ -d "/proc/$pid" ] && [ ! -L "/proc/$pid" ] || return 1
+        IFS= read -r process_name <"/proc/$pid/comm" || return 1
+        [ "$process_name" = "${agent_peer_executable##*/}" ] || return 1
+        candidate=$agent_peer_executable
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  canonical=$(canonical_existing_path "$candidate") || return 1
+  [ "$canonical" = "$candidate" ] || return 1
+  printf '%s' "$canonical"
+}
+process_start_identity() {
+  local pid=$1 value
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  case $(platform_boundary) in
+    macos) value=$(/bin/ps -o lstart= -p "$pid" 2>/dev/null | /usr/bin/awk '{$1=$1; print; exit}') ;;
+    linux) value=$(/usr/bin/awk '{sub(/^.*\) /, ""); print $20; exit}' "/proc/$pid/stat" 2>/dev/null) ;;
+    *) return 1 ;;
+  esac
+  [ -n "$value" ] || return 1
+  printf '%s' "$value" | sha256_stream
+}
+current_boot_identity() {
+  local value
+  case $(platform_boundary) in
+    macos) value=$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null | /usr/bin/sed -n 's/.*sec = \([0-9][0-9]*\).*/\1/p') ;;
+    linux) value=$(/bin/cat /proc/sys/kernel/random/boot_id 2>/dev/null) ;;
+    *) return 1 ;;
+  esac
+  [ -n "$value" ] || return 1
+  printf '%s' "$value" | sha256_stream
+}
+current_host_identity() {
+  local value
+  case $(platform_boundary) in
+    macos) value=$(/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | /usr/bin/awk -F '"' '/IOPlatformUUID/ { print $4; exit }') ;;
+    linux) value=$(/bin/cat /etc/machine-id 2>/dev/null) ;;
+    *) return 1 ;;
+  esac
+  [ -n "$value" ] || return 1
+  printf '%s' "$value" | sha256_stream
+}
+current_session_identity() {
+  local sid uid
+  case $(platform_boundary) in
+    macos) sid=$(/bin/ps -o sess= -p "$$" 2>/dev/null | /usr/bin/tr -d '[:space:]') ;;
+    linux) sid=$(/bin/ps -o sid= -p "$$" 2>/dev/null | /usr/bin/tr -d '[:space:]') ;;
+    *) return 1 ;;
+  esac
+  uid=$(/usr/bin/id -u) || return 1
+  [[ $sid =~ ^[0-9]+$ ]] && [[ $uid =~ ^[0-9]+$ ]] || return 1
+  printf '%s:%s' "$uid" "$sid" | sha256_stream
+}
+find_agent_peer() {
+  local lsof pid candidate_uid candidate_executable candidate_start matches= candidates receipt lines
+  lsof=$(lsof_binary) || return 1
+  candidates=$($lsof -n -w -Fp -a -U "$agent_socket_canonical" 2>/dev/null |
+    /usr/bin/awk '/^p[0-9]+$/ {sub(/^p/, ""); print}' | /usr/bin/sort -u)
+  if [ -z "$candidates" ] && [ "$(platform_boundary)" = linux ]; then
+    if [ "$fixture_mode" = true ] && [ -n "${agent_pid-}" ]; then
+      candidates=${agent_pid-}
+    else
+      receipt=$(native_canary_receipt_path) && verify_root_receipt_path "$receipt" &&
+        ascii_record "$native_receipt_canonical" 8192 || return 1
+      lines=$(/usr/bin/wc -l <"$native_receipt_canonical" | /usr/bin/tr -d ' ')
+      [ "$lines" = 26 ] &&
+        [ "$(/usr/bin/sed -n '1p' "$native_receipt_canonical")" = 'machine-utilities-ca-isolation|2' ] &&
+        [ "$(/usr/bin/sed -n '26p' "$native_receipt_canonical")" = 'end-ca-isolation|' ] || return 1
+      candidates=$(field "$native_receipt_canonical" 15 agent-peer-pid) || return 1
+    fi
+  fi
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    candidate_uid=$(process_uid "$pid") || continue
+    [ "$candidate_uid" = "$(/usr/bin/id -u)" ] || continue
+    candidate_executable=$(process_executable "$pid") || continue
+    [ "$candidate_executable" = "$agent_peer_executable" ] || continue
+    candidate_start=$(process_start_identity "$pid") || continue
+    [ -z "$matches" ] || return 1
+    matches=$pid
+    agent_peer_pid=$pid
+    agent_peer_start=$candidate_start
+  done <<EOF
+$candidates
+EOF
+  [ -n "$matches" ]
+}
+verify_agent_socket() {
+  local canonical parent mode
+  canonical=$(canonical_existing_path "$policy_socket") || return 1
+  [ "$canonical" = "$policy_socket" ] || return 1
+  [ -S "$canonical" ] && [ ! -L "$canonical" ] || return 1
+  [ "$(file_owner "$canonical")" = "$(/usr/bin/id -un)" ] || return 1
+  mode=$(file_mode "$canonical") || return 1
+  case $mode in 600|700) ;; *) return 1 ;; esac
+  [ "$(file_links "$canonical")" = 1 ] && safe_extended_acl "$canonical" || return 1
+  parent=${canonical%/*}
+  validate_protected_ancestor_chain "$parent" "$(/usr/bin/id -un)" || return 1
+  agent_socket_canonical=$canonical
+  agent_socket_id=$(file_device_inode "$canonical") || return 1
+  agent_socket_mode=$mode
+  agent_socket_owner=$(/usr/bin/id -un)
+  verify_agent_peer_executable && find_agent_peer
+}
+verify_native_ca_isolation() {
+  local receipt lines issued_epoch expires_epoch now
+  receipt=$(native_canary_receipt_path) || return 1
+  verify_root_receipt_path "$receipt" || return 1
+  receipt=$native_receipt_canonical
+  ascii_record "$receipt" 8192 || return 1
+  lines=$(/usr/bin/wc -l <"$receipt" | /usr/bin/tr -d ' ')
+  [ "$lines" = 26 ] && [ "$(/usr/bin/sed -n '1p' "$receipt")" = 'machine-utilities-ca-isolation|2' ] &&
+    [ "$(/usr/bin/sed -n '26p' "$receipt")" = 'end-ca-isolation|' ] || return 1
+  [ "$(field "$receipt" 2 signer-account)" = "$policy_signer_account" ] &&
+    [ "$(field "$receipt" 2 signer-account)" = "$(/usr/bin/id -un)" ] &&
+    [ "$(field "$receipt" 3 ordinary-account)" = "$policy_ordinary_account" ] &&
+    [ "$(field "$receipt" 4 signer-helper-path)" = "$signer_root/$helper_name" ] &&
+    [ "$(field "$receipt" 5 signer-helper-sha256)" = "$helper_digest" ] &&
+    [ "$(field "$receipt" 6 signer-policy-sha256)" = "$policy_digest" ] &&
+    [ "$(field "$receipt" 7 fleet-ca-fingerprint)" = "$policy_ca_fingerprint" ] &&
+    [ "$(field "$receipt" 8 ca-generation)" = "$policy_generation" ] &&
+    [ "$(field "$receipt" 9 agent-socket)" = "$agent_socket_canonical" ] &&
+    [ "$(field "$receipt" 10 agent-socket-device-inode)" = "$agent_socket_id" ] &&
+    [ "$(field "$receipt" 11 agent-socket-mode)" = "$agent_socket_mode" ] &&
+    [ "$(field "$receipt" 12 agent-socket-owner)" = "$agent_socket_owner" ] &&
+    [ "$(field "$receipt" 13 agent-peer-executable)" = "$agent_peer_executable" ] &&
+    [ "$(field "$receipt" 14 agent-peer-sha256)" = "$agent_peer_digest" ] &&
+    [ "$(field "$receipt" 15 agent-peer-pid)" = "$agent_peer_pid" ] &&
+    [ "$(field "$receipt" 16 agent-peer-start)" = "$agent_peer_start" ] &&
+    [ "$(field "$receipt" 17 host-identity)" = "$(current_host_identity)" ] &&
+    [ "$(field "$receipt" 18 boot-identity)" = "$(current_boot_identity)" ] &&
+    [ "$(field "$receipt" 19 session-identity)" = "$(current_session_identity)" ] &&
+    [ "$(field "$receipt" 22 ordinary-account-agent-tamper)" = denied ] &&
+    [ "$(field "$receipt" 23 ordinary-account-ca-enumeration)" = denied ] &&
+    [ "$(field "$receipt" 24 ordinary-account-ca-export)" = denied ] &&
+    [ "$(field "$receipt" 25 ordinary-account-ca-offer)" = denied ] || return 1
+  issued=$(field "$receipt" 20 issued-at) || return 1
+  expires=$(field "$receipt" 21 expires-at) || return 1
+  [[ $issued =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] &&
+    [[ $expires =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+  issued_epoch=$(iso_epoch "${issued%Z}") && expires_epoch=$(iso_epoch "${expires%Z}") || return 1
+  now=$(/bin/date -u +%s) || return 1
+  [ "$issued_epoch" -le "$now" ] && [ "$expires_epoch" -gt "$now" ] &&
+    [ "$expires_epoch" -gt "$issued_epoch" ] &&
+    [ $((expires_epoch - issued_epoch)) -le "$native_receipt_max_age" ] || return 1
+  [ "$(file_device_inode "$receipt")" = "$native_receipt_id" ] &&
+    [ "$(sha256_file "$receipt")" = "$native_receipt_digest" ]
+}
+capture_approved_endpoint() {
+  approved_agent_socket_id=$agent_socket_id
+  approved_agent_socket_mode=$agent_socket_mode
+  approved_agent_socket_owner=$agent_socket_owner
+  approved_agent_peer_pid=$agent_peer_pid
+  approved_agent_peer_start=$agent_peer_start
+  approved_agent_peer_executable=$agent_peer_executable
+  approved_agent_peer_digest=$agent_peer_digest
+  approved_native_receipt_id=$native_receipt_id
+  approved_native_receipt_digest=$native_receipt_digest
+}
+revalidate_approved_endpoint() {
+  verify_agent_socket && verify_native_ca_isolation || return 1
+  [ "$agent_socket_id" = "$approved_agent_socket_id" ] &&
+    [ "$agent_socket_mode" = "$approved_agent_socket_mode" ] &&
+    [ "$agent_socket_owner" = "$approved_agent_socket_owner" ] &&
+    [ "$agent_peer_pid" = "$approved_agent_peer_pid" ] &&
+    [ "$agent_peer_start" = "$approved_agent_peer_start" ] &&
+    [ "$agent_peer_executable" = "$approved_agent_peer_executable" ] &&
+    [ "$agent_peer_digest" = "$approved_agent_peer_digest" ] &&
+    [ "$native_receipt_id" = "$approved_native_receipt_id" ] &&
+    [ "$native_receipt_digest" = "$approved_native_receipt_digest" ]
+}
+read_serial() {
+  local value
+  owner_file "$signer_root/$serial_name" 64 || return 1
+  serial_file_id=$(file_device_inode "$signer_root/$serial_name") || return 1
+  value=$(/bin/cat "$signer_root/$serial_name")
+  [[ $value =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  [ "$(file_device_inode "$signer_root/$serial_name")" = "$serial_file_id" ] || return 1
+  printf '%s' "$value"
+}
+write_serial() {
+  local value=$1 temporary temporary_id
+  [[ $value =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  [ -n "$serial_file_id" ] && owner_file "$signer_root/$serial_name" 64 &&
+    [ "$(file_device_inode "$signer_root/$serial_name")" = "$serial_file_id" ] || return 1
+  temporary=$(/usr/bin/mktemp "$signer_root/.serial.XXXXXX" 2>/dev/null) || return 1
+  temporary_id=$(file_device_inode "$temporary") || return 1
+  owned_serial_temp=$temporary
+  owned_serial_temp_id=$temporary_id
+  if ! printf '%s\n' "$value" >"$temporary" || ! normalise_created_file "$temporary" 64 ||
+    [ "$(file_device_inode "$temporary")" != "$temporary_id" ]; then
+    return 1
+  fi
+  if ! owner_file "$signer_root/$serial_name" 64 ||
+    [ "$(file_device_inode "$signer_root/$serial_name")" != "$serial_file_id" ] ||
+    ! /bin/mv -f "$temporary" "$signer_root/$serial_name" ||
+    ! owner_file "$signer_root/$serial_name" 64 ||
+    [ "$(file_device_inode "$signer_root/$serial_name")" != "$temporary_id" ]; then
+    return 1
+  fi
+  serial_file_id=$temporary_id
+  owned_serial_temp=
+  owned_serial_temp_id=
+}
+prepare_context() {
+  local csr=$1 ca observed
+  system_ssh_keygen_ready && parse_csr "$csr" && verify_pinned_helper &&
+    parse_policy "$signer_root/$policy_name" || return 1
+  [ "$policy_signer_account" = "$(/usr/bin/id -un)" ] && [ "$(/usr/bin/id -u)" -ne 0 ] || return 1
+  [ "$csr_domain" = "$policy_domain" ] && [ "$csr_endpoints" = "$policy_endpoints" ] &&
+    [ "$csr_sources" = "$policy_sources" ] || return 1
+  ca=$signer_root/$ca_public_name
+  owner_file "$ca" 16384 || return 1
+  observed=$(key_fingerprint "$ca") || return 1
+  [ "$observed" = "$policy_ca_fingerprint" ] || return 1
+  verify_agent_socket || return 1
+  [ "$inherited_ssh_auth_sock" = "$agent_socket_canonical" ] || return 1
+  approved_ssh_auth_sock=$agent_socket_canonical
+  signing_principals=$(printf '%s\n%s\n' "$csr_signing_principal" "$csr_endpoints" |
+    /usr/bin/tr ',' '\n' | /usr/bin/sort -u | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
+  canonical_csv "$signing_principals" principal || return 1
+  verify_native_ca_isolation
+}
+manifest() {
+  record 'machine-utilities-ssh-certificate-manifest|1' \
+    "fleet-domain|$csr_domain" "node-id|$csr_node_id" "node-key-fingerprint|$csr_fingerprint" \
+    "signing-principal|$csr_signing_principal" "certificate-principals|$signing_principals" \
+    "source-addresses|$csr_sources" "fleet-ca-fingerprint|$policy_ca_fingerprint" \
+    "ca-generation|$policy_generation" "serial|$1" "validity-seconds|$policy_validity" \
+    'extensions|cleared' 'end-manifest|'
+}
+manifest_digest() { manifest "$1" | sha256_stream; }
+iso_epoch() {
+  case $(/usr/bin/uname -s) in
+    Darwin) /bin/date -j -u -f '%Y-%m-%dT%H:%M:%S' "$1" +%s ;;
+    Linux) /bin/date -u -d "$1" +%s ;;
+    *) return 1 ;;
+  esac
+}
+verify_certificate() {
+  local cert=$1 serial=$2 details key_id seen_serial seen_ca after before after_epoch before_epoch
+  local expected_principals seen_principals expected_sources seen_sources
+  details=$($ssh_keygen -Lf "$cert" 2>/dev/null) || return 1
+  key_id=$(printf '%s\n' "$details" | /usr/bin/awk -F '"' '/^[[:space:]]*Key ID:/ {print $2; exit}')
+  seen_serial=$(printf '%s\n' "$details" | /usr/bin/awk '/^[[:space:]]*Serial:/ {print $2; exit}')
+  seen_ca=$(printf '%s\n' "$details" | /usr/bin/awk '/^[[:space:]]*Signing CA:/ {for (i=1;i<=NF;i++) if ($i ~ /^SHA256:/) {print $i; exit}}')
+  after=$(printf '%s\n' "$details" | /usr/bin/awk '/^[[:space:]]*Valid: from / {print $3; exit}')
+  before=$(printf '%s\n' "$details" | /usr/bin/awk '/^[[:space:]]*Valid: from / {print $5; exit}')
+  printf '%s\n' "$details" | /usr/bin/grep -Eq '^[[:space:]]*Type:[[:space:]]+ssh-ed25519-cert-v01@openssh.com user certificate$' &&
+    [ "$(key_fingerprint "$cert")" = "$csr_fingerprint" ] && [ "$key_id" = "$csr_signing_principal" ] &&
+    [ "$seen_serial" = "$serial" ] && [ "$seen_ca" = "$policy_ca_fingerprint" ] &&
+    printf '%s\n' "$details" | /usr/bin/grep -Eq '^[[:space:]]*Extensions:[[:space:]]+\(none\)[[:space:]]*$' || return 1
+  after_epoch=$(iso_epoch "$after") && before_epoch=$(iso_epoch "$before") || return 1
+  [ "$before_epoch" -gt "$after_epoch" ] &&
+    [ $((before_epoch - after_epoch)) -ge "$policy_validity" ] &&
+    [ $((before_epoch - after_epoch)) -le $((policy_validity + 120)) ] || return 1
+  expected_principals=$(printf '%s' "$signing_principals" | /usr/bin/tr ',' '\n' | /usr/bin/sort)
+  seen_principals=$(printf '%s\n' "$details" | /usr/bin/awk '
+    /^[[:space:]]*Principals:/ {on=1; next}
+    /^[[:space:]]*Critical Options:/ {on=0}
+    on {sub(/^[[:space:]]+/, ""); if ($0 != "(none)") print}
+  ' | /usr/bin/sort)
+  [ "$seen_principals" = "$expected_principals" ] || return 1
+  expected_sources=
+  [ "$csr_sources" = - ] || expected_sources=$(printf '%s' "$csr_sources" | /usr/bin/tr ',' '\n' | /usr/bin/sort)
+  seen_sources=$(printf '%s\n' "$details" | /usr/bin/awk '
+    /^[[:space:]]*Critical Options:/ {on=1; next}
+    /^[[:space:]]*Extensions:/ {on=0}
+    on {sub(/^[[:space:]]+/, ""); if ($0=="(none)") next; if ($1!="source-address" || NF!=2) exit 1; n=split($2,a,","); for(i=1;i<=n;i++) print a[i]}
+  ' | /usr/bin/sort) || return 1
+  [ "$seen_sources" = "$expected_sources" ]
+}
+emit_preview() {
+  local serial digest
+  prepare_context "$1" || return 1
+  serial=$(read_serial) || return 1
+  digest=$(manifest_digest "$serial") || return 1
+  manifest "$serial"
+  record "manifest-sha256|$digest" 'signing|owner-confirmation-required' \
+    'post-signing|terminate-helper-and-lock-ca-agent' 'end-preview|'
+}
+fixture_transition() {
+  local phase=$1 marker
+  [ "$fixture_mode" = true ] || return 0
+  if [ -n "$fixture_control_dir" ]; then
+    owner_directory "$fixture_control_dir" || return 1
+    marker=$fixture_control_dir/$phase
+    (set -C; printf '%s\n' "$$" >"$marker") 2>/dev/null || return 1
+    normalise_created_file "$marker" 64 || return 1
+  fi
+  if [ "$fixture_crash_phase" = "$phase" ]; then
+    /bin/kill -KILL "$$"
+    return 137
+  fi
+  if [ "$fixture_stop_phase" = "$phase" ]; then
+    /bin/kill -STOP "$$"
+  fi
+}
+exclusive_empty_file() { (set -C; : >"$1") 2>/dev/null; }
+validated_unlink_owner_file() {
+  local path=$1 maximum=$2 expected_id=$3 expected_links=$4
+  owner_file_with_links "$path" "$maximum" "$expected_links" &&
+    [ "$(file_device_inode "$path")" = "$expected_id" ] || return 1
+  /bin/rm -f "$path" >/dev/null 2>&1 || return 1
+  [ ! -e "$path" ] && [ ! -L "$path" ]
+}
+validate_sign_stage() {
+  local stage=$1 expected_id=${2-} child base maximum
+  owner_directory "$stage" || return 1
+  [ -z "$expected_id" ] || [ "$(file_device_inode "$stage")" = "$expected_id" ] || return 1
+  while IFS= read -r -d '' child; do
+    base=${child##*/}
+    case $base in
+      "$manifest_name") maximum=8192 ;;
+      request) maximum=16384 ;;
+      request-cert.pub) maximum=32768 ;;
+      *) return 1 ;;
+    esac
+    owner_file "$child" "$maximum" || return 1
+  done < <(/usr/bin/find "$stage" -mindepth 1 -maxdepth 1 -print0)
+}
+remove_validated_sign_stage() {
+  local stage=$1 expected_id=$2 child base maximum child_id
+  validate_sign_stage "$stage" "$expected_id" || return 1
+  while IFS= read -r -d '' child; do
+    base=${child##*/}
+    case $base in
+      "$manifest_name") maximum=8192 ;;
+      request) maximum=16384 ;;
+      request-cert.pub) maximum=32768 ;;
+      *) return 1 ;;
+    esac
+    child_id=$(file_device_inode "$child") || return 1
+    validated_unlink_owner_file "$child" "$maximum" "$child_id" 1 || return 1
+  done < <(/usr/bin/find "$stage" -mindepth 1 -maxdepth 1 -print0)
+  owner_directory "$stage" && [ "$(file_device_inode "$stage")" = "$expected_id" ] || return 1
+  /bin/rmdir "$stage" >/dev/null 2>&1 || return 1
+}
+parse_sign_candidate() {
+  local file=$1 expected_links=$2 lines expected_next
+  owner_file_with_links "$file" 4096 "$expected_links" && ascii_record "$file" 4096 || return 1
+  lines=$(/usr/bin/wc -l <"$file" | /usr/bin/tr -d ' ')
+  [ "$lines" = 13 ] && [ "$(/usr/bin/sed -n '1p' "$file")" = 'machine-utilities-sign-transaction|2' ] &&
+    [ "$(/usr/bin/sed -n '13p' "$file")" = 'end-sign-transaction|' ] || return 1
+  transaction_id=$(field "$file" 2 transaction-id) || return 1
+  transaction_owner=$(field "$file" 3 owner) || return 1
+  transaction_pid=$(field "$file" 4 pid) || return 1
+  transaction_process_start=$(field "$file" 5 process-start) || return 1
+  transaction_boot_identity=$(field "$file" 6 boot-identity) || return 1
+  transaction_candidate_id=$(field "$file" 7 candidate-device-inode) || return 1
+  transaction_stage=$(field "$file" 8 stage) || return 1
+  transaction_stage_id=$(field "$file" 9 stage-device-inode) || return 1
+  transaction_serial=$(field "$file" 10 serial) || return 1
+  transaction_next_serial=$(field "$file" 11 next-serial) || return 1
+  transaction_manifest_digest=$(field "$file" 12 manifest-sha256) || return 1
+  [[ $transaction_id =~ ^[A-Za-z0-9]{8}$ ]] &&
+    [[ $transaction_owner =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] &&
+    [[ $transaction_pid =~ ^[1-9][0-9]*$ ]] && [[ $transaction_process_start =~ ^[0-9a-f]{64}$ ]] &&
+    [[ $transaction_boot_identity =~ ^[0-9a-f]{64}$ ]] &&
+    [[ $transaction_candidate_id =~ ^[0-9]+:[0-9]+$ ]] &&
+    [ "$transaction_stage" = "$sign_stage_prefix$transaction_id" ] &&
+    [[ $transaction_stage_id =~ ^[0-9]+:[0-9]+$ ]] &&
+    [[ $transaction_serial =~ ^[1-9][0-9]{0,9}$ ]] &&
+    [[ $transaction_next_serial =~ ^[1-9][0-9]{0,9}$ ]] &&
+    [[ $transaction_manifest_digest =~ ^[0-9a-f]{64}$ ]] || return 1
+  expected_next=$((transaction_serial + 1))
+  [ "$expected_next" -le 2147483647 ] && [ "$transaction_next_serial" = "$expected_next" ] || return 1
+  case ${file##*/} in
+    "$sign_candidate_prefix$transaction_id") ;;
+    "$sign_claim_name") [ "$expected_links" = 2 ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  [ "$(file_device_inode "$file")" = "$transaction_candidate_id" ]
+}
+inspect_signer_inventory() {
+  local child base links
+  verify_signer_root || return 1
+  while IFS= read -r -d '' child; do
+    base=${child##*/}
+    case $base in
+      .work) owner_directory "$child" || return 1 ;;
+      "$helper_name") owner_executable "$child" 1048576 || return 1 ;;
+      "$policy_name"|"$ca_public_name") owner_file "$child" 16384 || return 1 ;;
+      "$release_digest_name") owner_file "$child" 128 || return 1 ;;
+      "$serial_name") owner_file "$child" 64 || return 1 ;;
+      "$sign_claim_name") owner_file_with_links "$child" 4096 2 || return 1 ;;
+      "$sign_candidate_prefix"*)
+        [[ $base =~ ^\.sign-candidate\.[A-Za-z0-9]{8}$ ]] || return 1
+        links=$(file_links "$child") || return 1
+        case $links in 1|2) ;; *) return 1 ;; esac
+        owner_file_with_links "$child" 4096 "$links" || return 1
+        ;;
+      .serial.*)
+        [[ $base =~ ^\.serial\.[A-Za-z0-9]{6,}$ ]] && owner_file "$child" 64 || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done < <(/usr/bin/find "$signer_root" -mindepth 1 -maxdepth 1 -print0)
+  while IFS= read -r -d '' child; do
+    base=${child##*/}
+    [[ $base =~ ^\.sign-stage\.[A-Za-z0-9]{8}$ ]] || return 1
+    validate_sign_stage "$child" || return 1
+  done < <(/usr/bin/find "$signer_root/.work" -mindepth 1 -maxdepth 1 -print0)
+}
+claimed_transaction_state() {
+  local claim=$signer_root/$sign_claim_name candidate stage current_boot current_start
+  parse_sign_candidate "$claim" 2 || return 2
+  candidate=$signer_root/$sign_candidate_prefix$transaction_id
+  parse_sign_candidate "$candidate" 2 || return 2
+  [ "$(file_device_inode "$claim")" = "$transaction_candidate_id" ] || return 2
+  stage=$signer_root/.work/$transaction_stage
+  if [ -e "$stage" ] || [ -L "$stage" ]; then
+    validate_sign_stage "$stage" "$transaction_stage_id" || return 2
+  fi
+  [ "$transaction_owner" = "$(/usr/bin/id -un)" ] || return 2
+  current_boot=$(current_boot_identity) || return 2
+  [ "$transaction_boot_identity" = "$current_boot" ] || return 0
+  if ! /bin/kill -0 "$transaction_pid" 2>/dev/null; then return 0; fi
+  current_start=$(process_start_identity "$transaction_pid") || return 2
+  [ "$current_start" = "$transaction_process_start" ] || return 0
+  return 1
+}
+remove_serial_transients() {
+  local child child_id
+  while IFS= read -r -d '' child; do
+    [[ ${child##*/} =~ ^\.serial\.[A-Za-z0-9]{6,}$ ]] || return 1
+    child_id=$(file_device_inode "$child") || return 1
+    validated_unlink_owner_file "$child" 64 "$child_id" 1 || return 1
+  done < <(/usr/bin/find "$signer_root" -mindepth 1 -maxdepth 1 -name '.serial.*' -print0)
+}
+recover_claimed_transaction() {
+  local state claim candidate stage current_serial claim_id
+  claim=$signer_root/$sign_claim_name
+  if claimed_transaction_state; then state=0; else state=$?; fi
+  case $state in 0) ;; 1) return 75 ;; *) return 75 ;; esac
+  candidate=$signer_root/$sign_candidate_prefix$transaction_id
+  stage=$signer_root/.work/$transaction_stage
+  current_serial=$(read_serial) || return 75
+  [ "$current_serial" = "$transaction_serial" ] ||
+    [ "$current_serial" = "$transaction_next_serial" ] || return 75
+  if [ -e "$stage" ] || [ -L "$stage" ]; then
+    remove_validated_sign_stage "$stage" "$transaction_stage_id" || return 75
+  fi
+  claim_id=$transaction_candidate_id
+  validated_unlink_owner_file "$claim" 4096 "$claim_id" 2 || return 75
+  validated_unlink_owner_file "$candidate" 4096 "$claim_id" 1 || return 75
+  remove_serial_transients || return 75
+}
+recover_orphan_transactions() {
+  local child base suffix stage child_id stage_id links
+  while IFS= read -r -d '' child; do
+    base=${child##*/}
+    [[ $base =~ ^\.sign-candidate\.[A-Za-z0-9]{8}$ ]] || return 75
+    links=$(file_links "$child") || return 75
+    [ "$links" = 1 ] && owner_file_with_links "$child" 4096 1 || return 75
+    suffix=${base#"$sign_candidate_prefix"}
+    stage=$signer_root/.work/$sign_stage_prefix$suffix
+    if parse_sign_candidate "$child" 1; then
+      stage_id=$transaction_stage_id
+    elif [ -e "$stage" ] && [ ! -L "$stage" ] && owner_directory "$stage"; then
+      stage_id=$(file_device_inode "$stage") || return 75
+    else
+      stage_id=
+    fi
+    if [ -e "$stage" ] || [ -L "$stage" ]; then
+      [ -n "$stage_id" ] && remove_validated_sign_stage "$stage" "$stage_id" || return 75
+    fi
+    child_id=$(file_device_inode "$child") || return 75
+    validated_unlink_owner_file "$child" 4096 "$child_id" 1 || return 75
+  done < <(/usr/bin/find "$signer_root" -mindepth 1 -maxdepth 1 -name '.sign-candidate.*' -print0)
+  while IFS= read -r -d '' stage; do
+    [[ ${stage##*/} =~ ^\.sign-stage\.[A-Za-z0-9]{8}$ ]] || return 75
+    stage_id=$(file_device_inode "$stage") || return 75
+    remove_validated_sign_stage "$stage" "$stage_id" || return 75
+  done < <(/usr/bin/find "$signer_root/.work" -mindepth 1 -maxdepth 1 -print0)
+  remove_serial_transients || return 75
+}
+recover_signer_state() {
+  inspect_signer_inventory || return 75
+  if [ -e "$signer_root/$sign_claim_name" ] || [ -L "$signer_root/$sign_claim_name" ]; then
+    recover_claimed_transaction || return $?
+  fi
+  recover_orphan_transactions || return $?
+  inspect_signer_inventory || return 75
+}
+create_sign_transaction() {
+  local serial=$1 next=$2 confirmed=$3 stage suffix candidate candidate_id stage_id claim claim_state
+  stage=$(/usr/bin/mktemp -d "$signer_root/.work/${sign_stage_prefix}XXXXXXXX" 2>/dev/null) || return 65
+  normalise_created_directory "$stage" || return 65
+  stage_id=$(file_device_inode "$stage") || return 65
+  suffix=${stage##*.}
+  [[ $suffix =~ ^[A-Za-z0-9]{8}$ ]] || return 65
+  candidate=$signer_root/$sign_candidate_prefix$suffix
+  exclusive_empty_file "$candidate" || return 65
+  normalise_created_file "$candidate" 4096 || return 65
+  candidate_id=$(file_device_inode "$candidate") || return 65
+  owned_sign_stage=$stage
+  owned_sign_stage_id=$stage_id
+  owned_sign_candidate=$candidate
+  owned_sign_candidate_id=$candidate_id
+  owned_sign_claim=$signer_root/$sign_claim_name
+  owned_sign_transaction_id=$suffix
+  owned_sign_serial=$serial
+  owned_sign_next_serial=$next
+  owned_sign_manifest_digest=$confirmed
+  owned_sign_pid=$$
+  owned_sign_process_start=$(process_start_identity "$$") || return 65
+  owned_sign_boot_identity=$(current_boot_identity) || return 65
+  record 'machine-utilities-sign-transaction|2' "transaction-id|$suffix" \
+    "owner|$(/usr/bin/id -un)" "pid|$$" "process-start|$owned_sign_process_start" \
+    "boot-identity|$owned_sign_boot_identity" "candidate-device-inode|$candidate_id" \
+    "stage|${stage##*/}" "stage-device-inode|$stage_id" "serial|$serial" \
+    "next-serial|$next" "manifest-sha256|$confirmed" 'end-sign-transaction|' >"$candidate" || return 65
+  normalise_created_file "$candidate" 4096 && parse_sign_candidate "$candidate" 1 || return 65
+  fixture_transition before-claim || return 65
+  claim=$signer_root/$sign_claim_name
+  create_exact_link "$candidate" "$claim" || return 75
+  if claimed_transaction_state; then claim_state=0; else claim_state=$?; fi
+  [ "$claim_state" = 1 ] || return 65
+  fixture_transition claim-with-candidate || return 65
+}
+owned_sign_record_matches() {
+  local record=$1 expected_links=$2 candidate
+  [ -n "$owned_sign_candidate$owned_sign_candidate_id$owned_sign_stage_id" ] &&
+    [ -n "$owned_sign_transaction_id$owned_sign_serial$owned_sign_next_serial" ] &&
+    [ -n "$owned_sign_manifest_digest$owned_sign_pid$owned_sign_process_start$owned_sign_boot_identity" ] || return 1
+  [ "$owned_sign_claim" = "$signer_root/$sign_claim_name" ] || return 1
+  candidate=$signer_root/$sign_candidate_prefix$owned_sign_transaction_id
+  [ "$candidate" = "$owned_sign_candidate" ] && [ "$owned_sign_pid" = "$$" ] || return 1
+  parse_sign_candidate "$record" "$expected_links" || return 1
+  [ "$transaction_id" = "$owned_sign_transaction_id" ] &&
+    [ "$transaction_owner" = "$(/usr/bin/id -un)" ] &&
+    [ "$transaction_candidate_id" = "$owned_sign_candidate_id" ] &&
+    [ "$transaction_stage_id" = "$owned_sign_stage_id" ] &&
+    [ "$transaction_serial" = "$owned_sign_serial" ] &&
+    [ "$transaction_next_serial" = "$owned_sign_next_serial" ] &&
+    [ "$transaction_manifest_digest" = "$owned_sign_manifest_digest" ] &&
+    [ "$transaction_pid" = "$owned_sign_pid" ] &&
+    [ "$transaction_process_start" = "$owned_sign_process_start" ] &&
+    [ "$transaction_boot_identity" = "$owned_sign_boot_identity" ]
+}
+owned_sign_transaction_matches() {
+  local claim=$owned_sign_claim candidate=$owned_sign_candidate
+  owned_sign_record_matches "$claim" 2 && owned_sign_record_matches "$candidate" 2 &&
+    [ "$(file_device_inode "$claim")" = "$owned_sign_candidate_id" ]
+}
+owned_unclaimed_transaction_matches() {
+  local claim=$owned_sign_claim stage claim_id
+  owned_sign_record_matches "$owned_sign_candidate" 1 || return 1
+  stage=$signer_root/.work/$sign_stage_prefix$owned_sign_transaction_id
+  if [ -n "$owned_sign_stage" ]; then
+    [ "$owned_sign_stage" = "$stage" ] &&
+      validate_sign_stage "$owned_sign_stage" "$owned_sign_stage_id" || return 1
+  else
+    [ ! -e "$stage" ] && [ ! -L "$stage" ] || return 1
+  fi
+  if [ -e "$claim" ] || [ -L "$claim" ]; then
+    claim_id=$(file_device_inode "$claim") || return 1
+    # A same-inode claim might mean link(2) succeeded before its utility was
+    # interrupted.  Only owned_sign_transaction_matches may authorize it.
+    [ "$claim_id" != "$owned_sign_candidate_id" ] || return 1
+  fi
+}
+clear_owned_sign_stage() {
+  [ -n "$owned_sign_stage$owned_sign_stage_id" ] || return 0
+  owned_sign_transaction_matches || owned_unclaimed_transaction_matches || return 1
+  [ "$owned_sign_stage" = "$signer_root/.work/$sign_stage_prefix$owned_sign_transaction_id" ] || return 1
+  remove_validated_sign_stage "$owned_sign_stage" "$owned_sign_stage_id" || return 1
+  owned_sign_stage=
+}
+clear_owned_transaction_globals() {
+  owned_sign_candidate=
+  owned_sign_candidate_id=
+  owned_sign_claim=
+  owned_sign_stage=
+  owned_sign_stage_id=
+  owned_sign_transaction_id=
+  owned_sign_serial=
+  owned_sign_next_serial=
+  owned_sign_manifest_digest=
+  owned_sign_pid=
+  owned_sign_process_start=
+  owned_sign_boot_identity=
+}
+release_owned_sign_claim() {
+  local claim=$owned_sign_claim candidate=$owned_sign_candidate claim_state
+  [ -n "$candidate$owned_sign_candidate_id" ] || return 0
+  [ -z "$owned_sign_stage" ] || return 1
+  if owned_sign_transaction_matches; then
+    claim_state=claimed
+  elif owned_unclaimed_transaction_matches; then
+    claim_state=unclaimed
+  else
+    return 1
+  fi
+  if [ "$claim_state" = claimed ]; then
+    validated_unlink_owner_file "$claim" 4096 "$owned_sign_candidate_id" 2 || return 1
+    fixture_transition release || return 1
+  fi
+  if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+    validated_unlink_owner_file "$candidate" 4096 "$owned_sign_candidate_id" 1 || return 1
+  fi
+  clear_owned_transaction_globals
+}
+cleanup_owned_serial_temp() {
+  [ -n "$owned_serial_temp$owned_serial_temp_id" ] || return 0
+  if [ ! -e "$owned_serial_temp" ] && [ ! -L "$owned_serial_temp" ]; then
+    owned_serial_temp=
+    owned_serial_temp_id=
+    return 0
+  fi
+  validated_unlink_owner_file "$owned_serial_temp" 64 "$owned_serial_temp_id" 1 || return 1
+  owned_serial_temp=
+  owned_serial_temp_id=
+}
+command_temp_parent() {
+  local parent links
+  if [ "$fixture_mode" = true ] && [ -n "$fixture_command_temp_parent" ]; then
+    owner_directory "$fixture_command_temp_parent" || return 1
+    printf '%s' "$fixture_command_temp_parent"
+    return
+  fi
+  parent=$(canonical_directory /tmp) || return 1
+  case $(platform_boundary):$parent in
+    macos:/private/tmp|linux:/tmp) ;;
+    *) return 1 ;;
+  esac
+  links=$(file_links "$parent") || return 1
+  [ -d "$parent" ] && [ ! -L "$parent" ] && [ "$(file_owner "$parent")" = root ] &&
+    public_sticky_directory_mode "$parent" && [[ $links =~ ^[1-9][0-9]*$ ]] &&
+    safe_extended_acl "$parent" || return 1
+  printf '%s' "$parent"
+}
+clear_bootstrap_csr_globals() {
+  bootstrap_csr_parent=
+  bootstrap_csr_dir=
+  bootstrap_csr_dir_id=
+  bootstrap_csr=
+  bootstrap_csr_id=
+}
+cleanup_bootstrap_csr() {
+  local child base
+  [ -n "$bootstrap_csr_dir$bootstrap_csr_dir_id$bootstrap_csr$bootstrap_csr_id" ] || {
+    clear_bootstrap_csr_globals
+    return 0
+  }
+  [ -n "$bootstrap_csr_parent" ] && [ -n "$bootstrap_csr_dir" ] &&
+    [ -n "$bootstrap_csr_dir_id" ] || return 1
+  [ "${bootstrap_csr_dir%/*}" = "$bootstrap_csr_parent" ] || return 1
+  base=${bootstrap_csr_dir##*/}
+  [[ $base =~ ^machine-utilities-certify\.[0-9a-f]{12}$ ]] || return 1
+  [ -d "$bootstrap_csr_dir" ] && [ ! -L "$bootstrap_csr_dir" ] &&
+    [ "$(file_owner "$bootstrap_csr_dir")" = "$(/usr/bin/id -un)" ] &&
+    [ "$(file_device_inode "$bootstrap_csr_dir")" = "$bootstrap_csr_dir_id" ] || return 1
+  if [ -n "$bootstrap_csr" ]; then
+    [ "$bootstrap_csr" = "$bootstrap_csr_dir/request" ] || return 1
+    if [ -e "$bootstrap_csr" ] || [ -L "$bootstrap_csr" ]; then
+      [ -n "$bootstrap_csr_id" ] || return 1
+      validated_unlink_owner_file "$bootstrap_csr" 16384 "$bootstrap_csr_id" 1 || return 1
+    fi
+  fi
+  while IFS= read -r -d '' child; do return 1; done < <(/usr/bin/find "$bootstrap_csr_dir" -mindepth 1 -maxdepth 1 -print0)
+  [ "$(file_device_inode "$bootstrap_csr_dir")" = "$bootstrap_csr_dir_id" ] || return 1
+  /bin/rmdir "$bootstrap_csr_dir" >/dev/null 2>&1 || return 1
+  clear_bootstrap_csr_globals
+}
+create_command_csr() {
+  local attempts=0 suffix creation_result=0
+  bootstrap_csr_parent=$(command_temp_parent) || return 1
+  fixture_transition bootstrap-before-directory || return 1
+  defer_bootstrap_signals
+  while [ "$attempts" -lt 32 ]; do
+    printf -v suffix '%04x%04x%04x' "$RANDOM" "$RANDOM" "$RANDOM"
+    bootstrap_csr_dir=$bootstrap_csr_parent/machine-utilities-certify.$suffix
+    bootstrap_csr_dir_id=
+    if /bin/mkdir "$bootstrap_csr_dir" 2>/dev/null; then break; fi
+    bootstrap_csr_dir=
+    attempts=$((attempts + 1))
+  done
+  if [ -n "$bootstrap_csr_dir" ] && [ -d "$bootstrap_csr_dir" ] && [ ! -L "$bootstrap_csr_dir" ]; then
+    fixture_transition bootstrap-directory-before-registration || creation_result=1
+    bootstrap_csr_dir_id=$(file_device_inode "$bootstrap_csr_dir") || creation_result=1
+  else
+    creation_result=1
+  fi
+  restore_and_replay_bootstrap_signals
+  [ "$creation_result" = 0 ] || return 1
+  normalise_created_directory "$bootstrap_csr_dir" || return 1
+  fixture_transition bootstrap-directory-created || return 1
+  bootstrap_csr=$bootstrap_csr_dir/request
+  bootstrap_csr_id=
+  creation_result=0
+  defer_bootstrap_signals
+  exclusive_empty_file "$bootstrap_csr" || creation_result=1
+  if [ "$creation_result" = 0 ]; then
+    fixture_transition bootstrap-csr-before-registration || creation_result=1
+    bootstrap_csr_id=$(file_device_inode "$bootstrap_csr") || creation_result=1
+  fi
+  restore_and_replay_bootstrap_signals
+  [ "$creation_result" = 0 ] || return 1
+  normalise_created_file "$bootstrap_csr" 16384 || return 1
+  fixture_transition bootstrap-csr-created || return 1
+  register_owned_csr "$bootstrap_csr_dir" "$bootstrap_csr" || return 1
+  csr=$bootstrap_csr
+  clear_bootstrap_csr_globals
+}
+register_owned_csr() {
+  local directory=$1 request=$2 directory_id request_id
+  owner_directory "$directory" && owner_file "$request" 16384 &&
+    [ "${request%/*}" = "$directory" ] || return 1
+  directory_id=$(file_device_inode "$directory") && request_id=$(file_device_inode "$request") || return 1
+  owned_csr_dir=$directory
+  owned_csr_dir_id=$directory_id
+  owned_csr=$request
+  owned_csr_id=$request_id
+}
+clear_owned_csr_globals() {
+  owned_csr_dir=
+  owned_csr_dir_id=
+  owned_csr=
+  owned_csr_id=
+}
+cleanup_owned_csr() {
+  local child
+  [ -n "$owned_csr_dir$owned_csr_dir_id$owned_csr$owned_csr_id" ] || return 0
+  owner_directory "$owned_csr_dir" && [ "$(file_device_inode "$owned_csr_dir")" = "$owned_csr_dir_id" ] || return 1
+  [ "${owned_csr%/*}" = "$owned_csr_dir" ] || return 1
+  if [ -e "$owned_csr" ] || [ -L "$owned_csr" ]; then
+    validated_unlink_owner_file "$owned_csr" 16384 "$owned_csr_id" 1 || return 1
+  fi
+  while IFS= read -r -d '' child; do return 1; done < <(/usr/bin/find "$owned_csr_dir" -mindepth 1 -maxdepth 1 -print0)
+  owner_directory "$owned_csr_dir" && [ "$(file_device_inode "$owned_csr_dir")" = "$owned_csr_dir_id" ] || return 1
+  /bin/rmdir "$owned_csr_dir" >/dev/null 2>&1 || return 1
+  clear_owned_csr_globals
+}
+terminate_owned_input_child() {
+  local child=$owned_input_child_pid
+  [ -n "$child" ] || return 0
+  [[ $child =~ ^[1-9][0-9]*$ ]] || return 1
+  if /bin/kill -0 "$child" 2>/dev/null; then
+    /bin/kill -TERM "$child" >/dev/null 2>&1 || return 1
+  fi
+  wait "$child" 2>/dev/null || :
+  owned_input_child_pid=
+}
+close_owned_input_fd() {
+  [ "$owned_input_fd_open" = true ] || return 0
+  exec 9<&-
+  owned_input_fd_open=false
+}
+cleanup_owned_signer_artifacts() {
+  local result=0
+  cleanup_owned_serial_temp || result=1
+  clear_owned_sign_stage || result=1
+  release_owned_sign_claim || result=1
+  return "$result"
+}
+cleanup_sign_command() {
+  local result=0
+  cleanup_owned_signer_artifacts || result=1
+  cleanup_owned_csr || result=1
+  return "$result"
+}
+cleanup_bootstrap_command() {
+  local result=0 bootstrap_present=false
+  [ -n "$bootstrap_csr_dir$bootstrap_csr_dir_id$bootstrap_csr$bootstrap_csr_id" ] && bootstrap_present=true
+  if [ "$bootstrap_present" = true ]; then
+    if cleanup_bootstrap_csr; then
+      # During register_owned_csr both records can briefly name the same
+      # objects.  Successful bootstrap cleanup retires that partial alias too.
+      clear_owned_csr_globals
+    else
+      result=1
+      cleanup_owned_csr || result=1
+    fi
+    cleanup_owned_signer_artifacts || result=1
+  else
+    cleanup_sign_command || result=1
+  fi
+  return "$result"
+}
+bootstrap_handle_exit() {
+  local result=$?
+  trap - EXIT HUP INT TERM
+  terminate_owned_input_child >/dev/null 2>&1 || :
+  close_owned_input_fd >/dev/null 2>&1 || :
+  cleanup_bootstrap_command >/dev/null 2>&1 || :
+  exit "$result"
+}
+bootstrap_handle_hup() { trap - EXIT HUP INT TERM; terminate_owned_input_child >/dev/null 2>&1 || :; close_owned_input_fd >/dev/null 2>&1 || :; cleanup_bootstrap_command >/dev/null 2>&1 || :; exit 129; }
+bootstrap_handle_int() { trap - EXIT HUP INT TERM; terminate_owned_input_child >/dev/null 2>&1 || :; close_owned_input_fd >/dev/null 2>&1 || :; cleanup_bootstrap_command >/dev/null 2>&1 || :; exit 130; }
+bootstrap_handle_term() { trap - EXIT HUP INT TERM; terminate_owned_input_child >/dev/null 2>&1 || :; close_owned_input_fd >/dev/null 2>&1 || :; cleanup_bootstrap_command >/dev/null 2>&1 || :; exit 143; }
+defer_bootstrap_signals() {
+  deferred_bootstrap_signal=0
+  trap 'deferred_bootstrap_signal=129' HUP
+  trap 'deferred_bootstrap_signal=130' INT
+  trap 'deferred_bootstrap_signal=143' TERM
+}
+restore_and_replay_bootstrap_signals() {
+  local result=$deferred_bootstrap_signal
+  deferred_bootstrap_signal=0
+  install_bootstrap_traps
+  case $result in
+    0) ;;
+    129) bootstrap_handle_hup ;;
+    130) bootstrap_handle_int ;;
+    143) bootstrap_handle_term ;;
+    *) return 1 ;;
+  esac
+}
+install_bootstrap_traps() {
+  trap 'bootstrap_handle_exit' EXIT
+  trap 'bootstrap_handle_hup' HUP
+  trap 'bootstrap_handle_int' INT
+  trap 'bootstrap_handle_term' TERM
+}
+install_command_traps() {
+  trap 'handle_exit' EXIT
+  trap 'handle_hup' HUP
+  trap 'handle_int' INT
+  trap 'handle_term' TERM
+}
+handle_exit() {
+  local result=$?
+  trap - EXIT HUP INT TERM
+  terminate_owned_input_child >/dev/null 2>&1 || :
+  close_owned_input_fd >/dev/null 2>&1 || :
+  cleanup_sign_command >/dev/null 2>&1 || :
+  exit "$result"
+}
+handle_hup() { trap - EXIT HUP INT TERM; terminate_owned_input_child >/dev/null 2>&1 || :; close_owned_input_fd >/dev/null 2>&1 || :; cleanup_sign_command >/dev/null 2>&1 || :; exit 129; }
+handle_int() { trap - EXIT HUP INT TERM; terminate_owned_input_child >/dev/null 2>&1 || :; close_owned_input_fd >/dev/null 2>&1 || :; cleanup_sign_command >/dev/null 2>&1 || :; exit 130; }
+handle_term() { trap - EXIT HUP INT TERM; terminate_owned_input_child >/dev/null 2>&1 || :; close_owned_input_fd >/dev/null 2>&1 || :; cleanup_sign_command >/dev/null 2>&1 || :; exit 143; }
+write_owned_sign_inputs() {
+  local serial=$1 expected=$2 manifest_path public actual
+  [ -n "$owned_sign_stage$owned_sign_stage_id" ] && owned_sign_transaction_matches || return 1
+  manifest_path=$owned_sign_stage/$manifest_name
+  public=$owned_sign_stage/request
+  [ ! -e "$manifest_path" ] && [ ! -L "$manifest_path" ] &&
+    [ ! -e "$public" ] && [ ! -L "$public" ] || return 1
+  manifest "$serial" >"$manifest_path" && normalise_created_file "$manifest_path" 8192 || return 1
+  actual=$(sha256_file "$manifest_path") || return 1
+  [ "$actual" = "$(manifest_digest "$serial")" ] && [ "$actual" = "$expected" ] || return 1
+  printf '%s\n' "$csr_public_key" >"$public" && normalise_created_file "$public" 16384 || return 1
+  validate_sign_stage "$owned_sign_stage" "$owned_sign_stage_id"
+}
+emit_native_recovery_required() {
+  record 'ssh-signer-recovery|1' 'state|native_canary_required' \
+    "serial|$owned_sign_serial" 'serial-disposition|retired' 'publication|withheld' \
+    'agent-channel-binding|pre-and-post-endpoint-pinning' \
+    'native-residual|connection-race-requires-host-canary' 'end-recovery|' >&2
+}
+sign_certificate() {
+  local csr=$1 confirmed=$2 serial digest next public cert recovery_result sign_result=0
+  local certificate_details certificate_after certificate_before certificate_public
+  [[ $confirmed =~ ^[0-9a-f]{64}$ ]] || return 64
+  prepare_context "$csr" || {
+    printf '%s\n' 'certify-ssh-node: protected signer policy, pinned helper, or native CA isolation proof is not ready' >&2
+    return 65
+  }
+  recover_signer_state || return $?
+  prepare_context "$csr" || return 65
+  capture_approved_endpoint
+  serial=$(read_serial) || return 65
+  serial_file_id=$(file_device_inode "$signer_root/$serial_name") || return 65
+  digest=$(manifest_digest "$serial") || return 65
+  [ "$digest" = "$confirmed" ] || return 65
+  next=$((serial + 1)); [ "$next" -le 2147483647 ] || return 65
+  if create_sign_transaction "$serial" "$next" "$confirmed"; then :; else
+    recovery_result=$?
+    cleanup_owned_signer_artifacts || :
+    return "$recovery_result"
+  fi
+  # The immutable candidate and its fixed hard-link claim bind this exact
+  # stage, serial, manifest, process, and boot.  No fixed empty-lock state is
+  # ever observable.
+  if ! prepare_context "$csr" || ! revalidate_approved_endpoint || ! owned_sign_transaction_matches; then
+    cleanup_owned_signer_artifacts || :
+    return 65
+  fi
+  [ "$(read_serial)" = "$serial" ] && [ "$(manifest_digest "$serial")" = "$confirmed" ] || {
+    cleanup_owned_signer_artifacts || :; return 65;
+  }
+  serial_file_id=$(file_device_inode "$signer_root/$serial_name") || {
+    cleanup_owned_signer_artifacts || :; return 65;
+  }
+  write_owned_sign_inputs "$serial" "$confirmed" || { cleanup_owned_signer_artifacts || :; return 65; }
+  fixture_transition bound-stage-before-serial || { cleanup_owned_signer_artifacts || :; return 65; }
+  # Reserve before signing.  Every ambiguous or failed ceremony retires this
+  # serial, so crash recovery can never replay or double-sign it.
+  write_serial "$next" || { cleanup_owned_signer_artifacts || :; return 65; }
+  fixture_transition after-serial-reservation || { cleanup_owned_signer_artifacts || :; return 65; }
+  if ! revalidate_approved_endpoint; then
+    emit_native_recovery_required
+    cleanup_owned_signer_artifacts || :
+    return 77
+  fi
+  # OpenSSH has no supported way to pass an already-authenticated agent fd to
+  # ssh-keygen.  The endpoint is therefore pinned immediately before and after
+  # the connection; the remaining connect-time race is a required native-host
+  # canary, never a claim of cryptographic channel binding.
+  fixture_transition before-ssh-keygen || { cleanup_owned_signer_artifacts || :; return 65; }
+  public=$owned_sign_stage/request
+  cert=$public-cert.pub
+  if [ "$csr_sources" = - ]; then
+    /usr/bin/env -i LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin SSH_AUTH_SOCK="$approved_ssh_auth_sock" \
+      "$ssh_keygen" -q -U -s "$signer_root/$ca_public_name" -I "$csr_signing_principal" \
+      -n "$signing_principals" -V "+$policy_validity"s -z "$serial" -O clear "$public" >/dev/null 2>&1 || sign_result=$?
+  else
+    /usr/bin/env -i LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin SSH_AUTH_SOCK="$approved_ssh_auth_sock" \
+      "$ssh_keygen" -q -U -s "$signer_root/$ca_public_name" -I "$csr_signing_principal" \
+      -n "$signing_principals" -V "+$policy_validity"s -z "$serial" -O clear \
+      -O "source-address=$csr_sources" "$public" >/dev/null 2>&1 || sign_result=$?
+  fi
+  fixture_transition after-sign || { cleanup_owned_signer_artifacts || :; return 65; }
+  if ! revalidate_approved_endpoint; then
+    emit_native_recovery_required
+    cleanup_owned_signer_artifacts || :
+    return 77
+  fi
+  [ "$sign_result" = 0 ] || { cleanup_owned_signer_artifacts || :; return 65; }
+  if ! owner_file "$cert" 32768 || ! verify_certificate "$cert" "$serial"; then
+    cleanup_owned_signer_artifacts || :
+    return 65
+  fi
+  certificate_details=$("$ssh_keygen" -Lf "$cert" 2>/dev/null) || {
+    cleanup_owned_signer_artifacts || :; return 65
+  }
+  certificate_after=$(printf '%s\n' "$certificate_details" | /usr/bin/awk '/^[[:space:]]*Valid: from / {print $3 "Z"; exit}')
+  certificate_before=$(printf '%s\n' "$certificate_details" | /usr/bin/awk '/^[[:space:]]*Valid: from / {print $5 "Z"; exit}')
+  [[ $certificate_after =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] &&
+    [[ $certificate_before =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || {
+    cleanup_owned_signer_artifacts || :; return 65
+  }
+  certificate_public=$(normalise_certificate_record "$cert") || {
+    cleanup_owned_signer_artifacts || :; return 65;
+  }
+  clear_owned_sign_stage || { cleanup_owned_signer_artifacts || :; return 65; }
+  fixture_transition stage-removed || { cleanup_owned_signer_artifacts || :; return 65; }
+  release_owned_sign_claim || { cleanup_owned_signer_artifacts || :; return 65; }
+  record 'machine-utilities-ssh-certificate|1' \
+    "fleet-domain|$csr_domain" "node-id|$csr_node_id" "node-key-fingerprint|$csr_fingerprint" \
+    "fleet-ca-fingerprint|$policy_ca_fingerprint" "ca-generation|$policy_generation" "serial|$serial" \
+    "certificate-principals|$signing_principals" "source-addresses|$csr_sources" \
+    "certificate|$certificate_public" 'extensions|cleared' 'end-certificate|'
+  record 'machine-utilities-ssh-certificate-contract|1' \
+    "fleet-ca-fingerprint|$policy_ca_fingerprint" "ca-generation|$policy_generation" \
+    "certificate-serial|$serial" "certificate-valid-after|$certificate_after" \
+    "certificate-valid-before|$certificate_before" "certificate-principals|$signing_principals" \
+    "source-addresses|$csr_sources" "certifier-helper-sha256|$helper_digest" \
+    'end-certificate-contract|'
+}
+emit_status() {
+  local root
+  root=$(signer_root_for_current_user) || {
+    record 'ssh-signer-status|1' 'state|unsupported' "platform-boundary|$(platform_boundary)" 'end-status|'
+    return 69
+  }
+  if [ ! -d "$root" ]; then
+    record 'ssh-signer-status|1' 'state|needs_owner_signer_setup' 'ca-private-key|not-inspected' \
+      'native-ca-isolation-canary|required' 'end-status|'
+    return 0
+  fi
+  signer_root=$root
+  if ! verify_pinned_helper || ! parse_policy "$signer_root/$policy_name" ||
+    ! owner_file "$signer_root/$ca_public_name" 16384 || ! read_serial >/dev/null || ! verify_agent_socket; then
+    record 'ssh-signer-status|1' 'state|drifted' 'ca-private-key|not-inspected' \
+      'native-ca-isolation-canary|required' 'end-status|'
+    return 74
+  fi
+  if ! verify_native_ca_isolation; then
+    record 'ssh-signer-status|1' 'state|native_canary_required' "fleet-domain|$policy_domain" \
+      "ca-generation|$policy_generation" 'ca-private-key|not-inspected' \
+      'native-ca-isolation-canary|required-on-isolated-signer-host' 'end-status|'
+    return 77
+  fi
+  record 'ssh-signer-status|1' 'state|ready_for_owner_ceremony' "fleet-domain|$policy_domain" \
+    "ca-generation|$policy_generation" 'ca-private-key|not-inspected' \
+    'native-ca-isolation-canary|passed' 'end-status|'
+}
+fixture_expiry_utc() {
+  case $(platform_boundary) in
+    macos) /bin/date -u -v+10M '+%Y-%m-%dT%H:%M:%SZ' ;;
+    linux) /bin/date -u -d '+10 minutes' '+%Y-%m-%dT%H:%M:%SZ' ;;
+    *) return 1 ;;
+  esac
+}
+write_fixture_native_receipt() {
+  local receipt=$1 temporary issued expires
+  [ "$fixture_mode" = true ] || return 1
+  issued=$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+  expires=$(fixture_expiry_utc) || return 1
+  temporary=$(/usr/bin/mktemp "${receipt%/*}/.receipt.XXXXXXXX" 2>/dev/null) || return 1
+  if ! record 'machine-utilities-ca-isolation|2' \
+      "signer-account|$policy_signer_account" "ordinary-account|$policy_ordinary_account" \
+      "signer-helper-path|$signer_root/$helper_name" "signer-helper-sha256|$helper_digest" \
+      "signer-policy-sha256|$policy_digest" \
+      "fleet-ca-fingerprint|$policy_ca_fingerprint" "ca-generation|$policy_generation" \
+      "agent-socket|$agent_socket_canonical" "agent-socket-device-inode|$agent_socket_id" \
+      "agent-socket-mode|$agent_socket_mode" "agent-socket-owner|$agent_socket_owner" \
+      "agent-peer-executable|$agent_peer_executable" "agent-peer-sha256|$agent_peer_digest" \
+      "agent-peer-pid|$agent_peer_pid" "agent-peer-start|$agent_peer_start" \
+      "host-identity|$(current_host_identity)" "boot-identity|$(current_boot_identity)" \
+      "session-identity|$(current_session_identity)" "issued-at|$issued" "expires-at|$expires" \
+      'ordinary-account-agent-tamper|denied' 'ordinary-account-ca-enumeration|denied' \
+      'ordinary-account-ca-export|denied' 'ordinary-account-ca-offer|denied' \
+      'end-ca-isolation|' >"$temporary" || ! normalise_fixture_public_file "$temporary" 8192 ||
+    ! /bin/mv -f "$temporary" "$receipt" ||
+    ! public_integrity_file "$receipt" "$(/usr/bin/id -un)" "$(/usr/bin/id -gn)" 8192; then
+    /bin/rm -f "$temporary" >/dev/null 2>&1 || :
+    return 1
+  fi
+}
+fixture_sign_worker() {
+  local source_path=$1 root=$2 receipt=$3 helper=$4 socket=$5 csr=$6 confirmed=$7
+  local crash_phase=${8-} stop_phase=${9-} control=${10-}
+  /bin/bash -p -c '
+    # Self-test only: SOURCE_PATH is the helper canonical source selected
+    # by self_test, and extraction stops before its public command dispatcher.
+    eval "$(/usr/bin/awk '\''/^command=/{exit} {print}'\'' "$1")"
+    fixture_mode=true
+    fixture_ancestor_boundary=$2
+    fixture_receipt_path=$3
+    fixture_helper_path=$4
+    fixture_crash_phase=$8
+    fixture_stop_phase=$9
+    fixture_control_dir=${10}
+    signer_root=$2/signer
+    inherited_ssh_auth_sock=$5
+    trap '\''handle_exit'\'' EXIT
+    trap '\''handle_hup'\'' HUP
+    trap '\''handle_int'\'' INT
+    trap '\''handle_term'\'' TERM
+    sign_certificate "$6" "$7"
+  ' _ "$source_path" "$root" "$receipt" "$helper" "$socket" "$csr" "$confirmed" \
+    "$crash_phase" "$stop_phase" "$control"
+}
+fixture_recover_worker() {
+  local source_path=$1 root=$2 receipt=$3 helper=$4 socket=$5 csr=$6
+  /bin/bash -p -c '
+    eval "$(/usr/bin/awk '\''/^command=/{exit} {print}'\'' "$1")"
+    fixture_mode=true
+    fixture_ancestor_boundary=$2
+    fixture_receipt_path=$3
+    fixture_helper_path=$4
+    signer_root=$2/signer
+    inherited_ssh_auth_sock=$5
+    prepare_context "$6" && recover_signer_state
+  ' _ "$source_path" "$root" "$receipt" "$helper" "$socket" "$csr"
+}
+fixture_contender_worker() {
+  local source_path=$1 root=$2 receipt=$3 helper=$4 socket=$5 csr=$6 control=$7
+  /bin/bash -p -c '
+    eval "$(/usr/bin/awk '\''/^command=/{exit} {print}'\'' "$1")"
+    fixture_mode=true
+    fixture_ancestor_boundary=$2
+    fixture_receipt_path=$3
+    fixture_helper_path=$4
+    fixture_control_dir=$7
+    signer_root=$2/signer
+    inherited_ssh_auth_sock=$5
+    trap '\''handle_exit'\'' EXIT
+    trap '\''handle_hup'\'' HUP
+    trap '\''handle_int'\'' INT
+    trap '\''handle_term'\'' TERM
+    prepare_context "$6"
+    contender_serial=$(read_serial)
+    contender_next=$((contender_serial + 1))
+    contender_manifest=$(manifest_digest "$contender_serial")
+    fixture_stop_phase=contender-ready
+    fixture_transition contender-ready
+    fixture_stop_phase=before-claim
+    if create_sign_transaction "$contender_serial" "$contender_next" "$contender_manifest"; then
+      contender_create=0
+    else
+      contender_create=$?
+    fi
+    if [ "$contender_create" = 0 ]; then
+      fixture_stop_phase=contender-winner-held
+      fixture_transition contender-winner-held
+      contender_role=winner
+    else
+      contender_role=loser
+    fi
+    if cleanup_owned_signer_artifacts; then contender_cleanup=0; else contender_cleanup=$?; fi
+    record "role|$contender_role" "create-rc|$contender_create" \
+      "cleanup-rc|$contender_cleanup" "end-contender|"
+    trap - EXIT HUP INT TERM
+  ' _ "$source_path" "$root" "$receipt" "$helper" "$socket" "$csr" "$control"
+}
+fixture_signal_worker() {
+  local source_path=$1 root=$2 signal_name=$3 control=$4 fifo=$5 stop_phase=${6-}
+  /bin/bash -p -c '
+    eval "$(/usr/bin/awk '\''/^command=/{exit} {print}'\'' "$1")"
+    fixture_mode=true
+    fixture_ancestor_boundary=$2
+    fixture_control_dir=$4
+    fixture_stop_phase=$6
+    csr_dir=$2/signal-$3-csr
+    /bin/mkdir "$csr_dir" && normalise_created_directory "$csr_dir"
+    csr_file=$(/usr/bin/mktemp "$csr_dir/request.XXXXXXXX")
+    register_owned_csr "$csr_dir" "$csr_file"
+    trap '\''handle_exit'\'' EXIT
+    trap '\''handle_hup'\'' HUP
+    trap '\''handle_int'\'' INT
+    trap '\''handle_term'\'' TERM
+    printf "%s\n" "$$" >"$4/ready"
+    normalise_created_file "$4/ready" 64
+    exec 3<>"$5"
+    read_csr "$csr_file" managed <&3
+  ' _ "$source_path" "$root" "$signal_name" "$control" "$fifo" "$stop_phase"
+}
+fixture_bootstrap_signal_worker() {
+  local source_path=$1 root=$2 phase=$3 control=$4
+  /bin/bash -p -c '
+    eval "$(/usr/bin/awk '\''/^command=/{exit} {print}'\'' "$1")"
+    fixture_mode=true
+    fixture_ancestor_boundary=$2
+    fixture_command_temp_parent=$2/bootstrap-temp
+    fixture_stop_phase=$3
+    fixture_control_dir=$4
+    install_bootstrap_traps
+    create_command_csr
+  ' _ "$source_path" "$root" "$phase" "$control"
+}
+fixture_public_ingress() {
+  local source_path=$1 root=$2 request=$3 ingress_command=$4 input_kind=$5 expected=$6
+  local output=$root/ingress-$ingress_command-$input_kind.out
+  local error=$root/ingress-$ingress_command-$input_kind.err
+  local fifo=$root/ingress-$ingress_command-$input_kind.fifo result writer=
+  set -- "$source_path" "$ingress_command"
+  if [ "$ingress_command" = sign ]; then
+    set -- "$@" 0000000000000000000000000000000000000000000000000000000000000000
+  fi
+  case $input_kind in
+    pipe)
+      if /bin/cat "$request" | /usr/bin/env -i HOME="$root/public-home" XDG_STATE_HOME="$root/public-state" \
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin "$@" >"$output" 2>"$error"; then result=0; else result=$?; fi
+      ;;
+    file)
+      if /usr/bin/env -i HOME="$root/public-home" XDG_STATE_HOME="$root/public-state" \
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin "$@" <"$request" >"$output" 2>"$error"; then result=0; else result=$?; fi
+      ;;
+    fifo)
+      /usr/bin/mkfifo "$fifo" || return 1
+      /bin/cat "$request" >"$fifo" &
+      writer=$!
+      if /usr/bin/env -i HOME="$root/public-home" XDG_STATE_HOME="$root/public-state" \
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin "$@" <"$fifo" >"$output" 2>"$error"; then result=0; else result=$?; fi
+      wait "$writer" || return 1
+      /bin/rm -f "$fifo" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  [ ! -s "$output" ] || return 1
+  case $expected in
+    parsed)
+      [ "$result" = 65 ] &&
+        [ "$(/bin/cat "$error")" = 'certify-ssh-node: protected signer policy, pinned helper, or native CA isolation proof is not ready' ]
+      ;;
+    invalid)
+      [ "$result" = 64 ] &&
+        [ "$(/bin/cat "$error")" = 'certify-ssh-node: invalid public certificate request' ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+fixture_transaction_tree_clean() {
+  [ "$fixture_mode" = true ] || return 1
+  [ ! -e "$signer_root/$sign_claim_name" ] && [ ! -L "$signer_root/$sign_claim_name" ] || return 1
+  ! /usr/bin/find "$signer_root" -mindepth 1 -maxdepth 1 \
+    \( -name '.sign-candidate.*' -o -name '.serial.*' \) -print | /usr/bin/grep -q . || return 1
+  ! /usr/bin/find "$signer_root/.work" -mindepth 1 -maxdepth 1 -print | /usr/bin/grep -q .
+}
+wait_for_fixture_marker() {
+  local marker=$1 count=0
+  while [ "$count" -lt 400 ]; do
+    [ -s "$marker" ] && return 0
+    /bin/sleep 0.05
+    count=$((count + 1))
+  done
+  return 1
+}
+wait_for_either_fixture_marker() {
+  local first=$1 second=$2 count=0
+  while [ "$count" -lt 400 ]; do
+    if [ -s "$first" ] || [ -s "$second" ]; then return 0; fi
+    /bin/sleep 0.01
+    count=$((count + 1))
+  done
+  return 1
+}
+wait_for_fixture_stop() {
+  local pid=$1 count=0 state
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  while [ "$count" -lt 400 ]; do
+    state=$(/bin/ps -o state= -p "$pid" 2>/dev/null | /usr/bin/tr -d ' ') || return 1
+    case $state in T*) return 0 ;; esac
+    /bin/sleep 0.01
+    count=$((count + 1))
+  done
+  return 1
+}
+self_test() {
+  local root key request invalid_ingress public output private_material startup_env startup_marker startup_output
+  local self_dir self_base self_path hostile_tmp hostile_target repo_root signer_fixture helper_copy
+  local release_digest ca_key ca_fingerprint agent_socket agent_pid='' peer_digest fixture_receipt
+  local manifest_confirmation fixture_output fixture_retry fixture_retry_error fixture_result serial_value next_value
+  local crash_phase control crash_output crash_error before_serial expected_serial modified_record
+  local unknown original_stage replacement_stage serial_transient serial_link csr_swap_dir csr_swap original_csr
+  local signal_name signal_number signal_expected signal_control signal_fifo signal_worker signal_pid signal_output signal_error
+  local bootstrap_phase bootstrap_control bootstrap_worker exact_source_a exact_source_b exact_claim exact_target
+  local racer_a racer_b racer_a_result racer_b_result ingress_command input_kind
+  local race_control race_output race_error race_worker race_pid replacement_agent_output replacement_agent_error
+  local contender_round contender_a contender_b contender_a_worker contender_b_worker contender_a_pid contender_b_pid
+  local contender_winner contender_loser contender_winner_worker contender_loser_worker contender_winner_pid
+  local contender_winner_output contender_loser_output contender_winner_error contender_loser_error
+  local candidate_count stage_count interruption_backup foreign_claim foreign_claim_id external_candidate original_candidate
+  local replacement_candidate_id
+  local background_pids='' fixture_pid
+  root=$(private_temp_directory) || return 1
+  trap 'for fixture_pid in ${background_pids:-}; do /bin/kill -KILL "$fixture_pid" >/dev/null 2>&1 || :; wait "$fixture_pid" 2>/dev/null || :; done; if [ -n "${agent_pid:-}" ]; then /bin/kill "$agent_pid" >/dev/null 2>&1 || :; wait "$agent_pid" 2>/dev/null || :; fi; /usr/bin/find "$root" -depth -delete >/dev/null 2>&1 || :' RETURN
+  trap 'self_test_rc=$?; printf "FAIL: certify-ssh-node self-test line %s rc %s\n" "$LINENO" "$self_test_rc" >&2' ERR
+
+  # The claim primitive must never reinterpret an existing destination as a
+  # container.  Exercise real and symlinked directories, then race two exact
+  # candidates for one absent pathname: exactly one link(2) may win.
+  exact_source_a=$root/exact-source-a
+  exact_source_b=$root/exact-source-b
+  printf '%s\n' a >"$exact_source_a" && printf '%s\n' b >"$exact_source_b" || return 1
+  normalise_created_file "$exact_source_a" 64 && normalise_created_file "$exact_source_b" 64 || return 1
+  exact_target=$root/exact-target
+  /bin/mkdir "$exact_target" && normalise_created_directory "$exact_target" || return 1
+  ! create_exact_link "$exact_source_a" "$exact_target" || return 1
+  [ ! -e "$exact_target/${exact_source_a##*/}" ] && [ ! -L "$exact_target/${exact_source_a##*/}" ] || return 1
+  exact_claim=$root/exact-symlink
+  /bin/ln -s "$exact_target" "$exact_claim" || return 1
+  ! create_exact_link "$exact_source_a" "$exact_claim" || return 1
+  [ ! -e "$exact_target/${exact_source_a##*/}" ] && [ ! -L "$exact_target/${exact_source_a##*/}" ] || return 1
+  /bin/rm -f "$exact_claim" || return 1
+  exact_claim=$root/exact-race-claim
+  create_exact_link "$exact_source_a" "$exact_claim" & racer_a=$!
+  create_exact_link "$exact_source_b" "$exact_claim" & racer_b=$!
+  background_pids="$racer_a $racer_b"
+  if wait "$racer_a"; then racer_a_result=0; else racer_a_result=$?; fi
+  if wait "$racer_b"; then racer_b_result=0; else racer_b_result=$?; fi
+  background_pids=
+  [ $((racer_a_result + racer_b_result)) -ne 0 ] &&
+    { [ "$racer_a_result" = 0 ] || [ "$racer_b_result" = 0 ]; } || return 1
+  [ -f "$exact_claim" ] && [ ! -L "$exact_claim" ] && [ "$(file_links "$exact_claim")" = 2 ] || return 1
+  if [ "$(file_device_inode "$exact_claim")" = "$(file_device_inode "$exact_source_a")" ]; then
+    validated_unlink_owner_file "$exact_claim" 64 "$(file_device_inode "$exact_source_a")" 2 || return 1
+  elif [ "$(file_device_inode "$exact_claim")" = "$(file_device_inode "$exact_source_b")" ]; then
+    validated_unlink_owner_file "$exact_claim" 64 "$(file_device_inode "$exact_source_b")" 2 || return 1
+  else
+    return 1
+  fi
+  owner_file "$exact_source_a" 64 && owner_file "$exact_source_b" 64 || return 1
+
+  self_dir=$(printf '%s' "$0" | /usr/bin/sed 's,/[^/]*$,,' )
+  self_base=$(printf '%s' "$0" | /usr/bin/sed 's,.*/,,' )
+  self_path=$(canonical_directory "$self_dir")/$self_base || return 1
+  startup_env=$root/startup-env
+  startup_marker=$root/BASH_ENV_EXECUTED
+  startup_output=$root/startup-output
+  printf '%s\n' "/bin/touch '$startup_marker'" >"$startup_env"
+  /usr/bin/env -i HOME="$root/home" XDG_STATE_HOME="$root/state" PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    BASH_ENV="$startup_env" SHELLOPTS=errexit SSH_AUTH_SOCK="$root/hostile-agent" \
+    "$self_path" status >"$startup_output" || return 1
+  [ ! -e "$startup_marker" ] && [ ! -L "$startup_marker" ] || return 1
+  [ ! -e "$root/state" ] && [ ! -L "$root/state" ] || return 1
+  key=$root/node
+  "$ssh_keygen" -q -t ed25519 -N '' -f "$key" || return 1
+  public=$(/usr/bin/awk 'NF>=2 {print $1 " " $2; exit}' "$key.pub")
+  request=$root/request
+  record 'machine-utilities-ssh-csr|1' 'fleet-domain|fleet.example' 'node-id|node-a' \
+    "public-key|$public" "node-key-fingerprint|$(key_fingerprint "$key.pub")" \
+    'signing-principal|node-a@fleet.example' 'endpoint-principals|mu-posix,mu-request' \
+    'source-addresses|10.0.0.0/8,192.0.2.0/24' 'end-csr|' >"$request"
+  [ "$(file_size "$request")" = 363 ] && parse_csr "$request" || return 1
+  invalid_ingress=$root/invalid-ingress
+  /usr/bin/sed '1s/machine-utilities-ssh-csr|1/machine-utilities-ssh-csr|0/' \
+    "$request" >"$invalid_ingress" || return 1
+  for ingress_command in preview sign; do
+    for input_kind in pipe file fifo; do
+      fixture_public_ingress "$self_path" "$root" "$request" "$ingress_command" "$input_kind" parsed || return 1
+      fixture_public_ingress "$self_path" "$root" "$invalid_ingress" "$ingress_command" "$input_kind" invalid || return 1
+    done
+  done
+  private_material=$(/bin/cat "$key")
+  policy_ca_fingerprint=SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  policy_generation=1
+  policy_validity=604800
+  signing_principals='mu-posix,mu-request,node-a@fleet.example'
+  output=$(manifest 17)
+  printf '%s\n' "$output" | /usr/bin/grep -Fx 'extensions|cleared' >/dev/null || return 1
+  [[ $output != *"$private_material"* ]] || return 1
+  /usr/bin/sed 's/endpoint-principals|mu-posix,mu-request/endpoint-principals|mu-request,mu-posix/' \
+    "$request" >"$root/bad"
+  ! parse_csr "$root/bad" || return 1
+  /usr/bin/sed 's/source-addresses|10.0.0.0\/8,192.0.2.0\/24/source-addresses|010.0.0.0\/8/' \
+    "$request" >"$root/bad-source"
+  ! parse_csr "$root/bad-source" || return 1
+  /usr/bin/sed 's/source-addresses|10.0.0.0\/8,192.0.2.0\/24/source-addresses|2001:db8::\/32/' \
+    "$request" >"$root/ipv6"
+  parse_csr "$root/ipv6" || return 1
+  /usr/bin/sed -e 's/fleet-domain|fleet.example/fleet-domain|fleet/' \
+    -e 's/signing-principal|node-a@fleet.example/signing-principal|node-a@fleet/' \
+    "$request" >"$root/bad-domain"
+  ! parse_csr "$root/bad-domain" || return 1
+  hostile_target=$root/hostile-tmp-target
+  hostile_tmp=$root/hostile-tmp
+  /bin/mkdir "$hostile_target"
+  /bin/ln -s "$hostile_target" "$hostile_tmp"
+  TMPDIR=$hostile_tmp
+  parse_csr "$request" || return 1
+  unset TMPDIR
+  ! /usr/bin/find "$hostile_target" -mindepth 1 -maxdepth 1 -print | /usr/bin/grep -q . || return 1
+  ! /bin/dd if=/dev/zero bs=16385 count=1 2>/dev/null | read_csr "$root/oversized-csr" || return 1
+  repo_root=$root/repository
+  /bin/mkdir "$repo_root"
+  : >"$repo_root/.git"
+  forbidden_location "$repo_root/signer-root" || return 1
+  ! write_fixture_native_receipt "$root/candidate-receipt" || return 1
+  [ ! -e "$root/candidate-receipt" ] && [ ! -L "$root/candidate-receipt" ] || return 1
+
+  # This is a real, but wholly ephemeral, agent-backed certificate ceremony.
+  # It never touches a 1Password account or a native receipt path: fixture
+  # mode exists only inside self-test and uses a private temporary root.
+  [ -x /usr/bin/ssh-agent ] && [ -x /usr/bin/ssh-add ] || return 1
+  signer_fixture=$root/signer
+  fixture_receipt=$root/native-canary/ca-isolation.receipt
+  /bin/mkdir "$signer_fixture" "$signer_fixture/.work" "$root/native-canary" || return 1
+  for output in "$signer_fixture" "$signer_fixture/.work"; do
+    normalise_created_directory "$output" || return 1
+  done
+  helper_copy=$signer_fixture/$helper_name
+  /bin/cp "$self_path" "$helper_copy" || return 1
+  /bin/chmod 700 "$helper_copy" >/dev/null 2>&1 || return 1
+  clear_inherited_acl "$helper_copy" && owner_executable "$helper_copy" 1048576 || return 1
+  release_digest=$(sha256_file "$helper_copy") || return 1
+  printf '%s\n' "$release_digest" >"$signer_fixture/$release_digest_name" || return 1
+  normalise_created_file "$signer_fixture/$release_digest_name" 128 || return 1
+  ca_key=$root/fixture-ca
+  "$ssh_keygen" -q -t ed25519 -N '' -C fixture-fleet-ca -f "$ca_key" || return 1
+  /bin/cp "$ca_key.pub" "$signer_fixture/$ca_public_name" || return 1
+  normalise_created_file "$signer_fixture/$ca_public_name" 16384 || return 1
+  ca_fingerprint=$(key_fingerprint "$signer_fixture/$ca_public_name") || return 1
+  agent_socket=$root/fixture-agent.sock
+  /usr/bin/ssh-agent -D -a "$agent_socket" >"$root/fixture-agent.out" 2>"$root/fixture-agent.err" &
+  agent_pid=$!
+  for serial_value in 1 2 3 4 5 6 7 8 9 10; do
+    [ -S "$agent_socket" ] && break
+    /bin/sleep 0.1
+  done
+  [ -S "$agent_socket" ] || return 1
+  SSH_AUTH_SOCK="$agent_socket" /usr/bin/ssh-add "$ca_key" >/dev/null 2>&1 || return 1
+  peer_digest=$(sha256_file /usr/bin/ssh-agent) || return 1
+  record 'machine-utilities-ssh-signer-policy|2' \
+    'fleet-domain|fleet.example' "fleet-ca-fingerprint|$ca_fingerprint" 'ca-generation|1' \
+    'validity-seconds|3600' 'endpoint-principals|mu-posix,mu-request' \
+    'source-addresses|10.0.0.0/8,192.0.2.0/24' "agent-socket|$agent_socket" \
+    'ordinary-account|ordinary-fixture' "signer-account|$(/usr/bin/id -un)" \
+    'agent-peer-executable|/usr/bin/ssh-agent' "agent-peer-sha256|$peer_digest" \
+    'end-policy|' >"$signer_fixture/$policy_name" || return 1
+  normalise_created_file "$signer_fixture/$policy_name" 8192 || return 1
+  printf '%s\n' 1 >"$signer_fixture/$serial_name" || return 1
+  normalise_created_file "$signer_fixture/$serial_name" 64 || return 1
+  fixture_mode=true
+  fixture_ancestor_boundary=$root
+  fixture_receipt_path=$fixture_receipt
+  fixture_helper_path=$helper_copy
+  normalise_fixture_public_directory "$root/native-canary" || return 1
+  signer_root=$signer_fixture
+  inherited_ssh_auth_sock=$agent_socket
+  verify_pinned_helper && parse_policy "$signer_fixture/$policy_name" && verify_agent_socket || return 1
+  write_fixture_native_receipt "$fixture_receipt" || return 1
+  verify_native_ca_isolation || return 1
+  [ "$(file_mode "$root/native-canary")" = 755 ] && [ "$(file_mode "$fixture_receipt")" = 644 ] &&
+    [ "$(file_owner "$fixture_receipt")" = "$(/usr/bin/id -un)" ] &&
+    [ "$(file_group "$fixture_receipt")" = "$(/usr/bin/id -gn)" ] && [ -r "$fixture_receipt" ] || return 1
+  /bin/chmod 600 "$fixture_receipt" || return 1
+  ! verify_root_receipt_path "$fixture_receipt" || return 1
+  /bin/chmod 644 "$fixture_receipt" || return 1
+  verify_root_receipt_path "$fixture_receipt" || return 1
+  /bin/ln "$fixture_receipt" "$root/receipt-hardlink" || return 1
+  ! verify_root_receipt_path "$fixture_receipt" || return 1
+  /bin/rm -f "$root/receipt-hardlink" || return 1
+  verify_root_receipt_path "$fixture_receipt" || return 1
+  parse_csr "$request" || return 1
+  signing_principals=$(printf '%s\n%s\n' "$csr_signing_principal" "$csr_endpoints" |
+    /usr/bin/tr ',' '\n' | /usr/bin/sort -u | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
+  canonical_csv "$signing_principals" principal || return 1
+  serial_value=$(read_serial) || return 1
+  manifest_confirmation=$(manifest_digest "$serial_value") || return 1
+  fixture_output=$root/fixture-sign.out
+  fixture_sign_worker "$self_path" "$root" "$fixture_receipt" "$helper_copy" "$agent_socket" \
+    "$request" "$manifest_confirmation" >"$fixture_output" || return 1
+  [ "$(/usr/bin/grep -Fxc 'machine-utilities-ssh-certificate|1' "$fixture_output")" = 1 ] || return 1
+  [ "$(/usr/bin/grep -Fxc 'machine-utilities-ssh-certificate-contract|1' "$fixture_output")" = 1 ] || return 1
+  [[ $(/bin/cat "$fixture_output") != *"$private_material"* ]] || return 1
+  ! /usr/bin/grep -F "$root" "$fixture_output" >/dev/null || return 1
+  [ "$(read_serial)" = 2 ] || return 1
+  fixture_transaction_tree_clean || return 1
+  fixture_retry=$root/fixture-retry.out
+  fixture_retry_error=$root/fixture-retry.err
+  if fixture_sign_worker "$self_path" "$root" "$fixture_receipt" "$helper_copy" "$agent_socket" \
+      "$request" "$manifest_confirmation" >"$fixture_retry" 2>"$fixture_retry_error"; then
+    return 1
+  else
+    fixture_result=$?
+  fi
+  [ "$fixture_result" = 65 ] && [ ! -s "$fixture_retry" ] && [ ! -s "$fixture_retry_error" ] || return 1
+  [ "$(read_serial)" = 2 ] || return 1
+  fixture_transaction_tree_clean || return 1
+
+  # A successful link(2) whose utility reports failure is claimed, not
+  # unclaimed.  Complete transaction proof permits cleanup; corrupting that
+  # same-inode record makes the state ambiguous and must preserve everything.
+  serial_value=$(read_serial) || return 1
+  next_value=$((serial_value + 1))
+  manifest_confirmation=$(manifest_digest "$serial_value") || return 1
+  fixture_exact_link_outcome=report-failure-after-success
+  if create_sign_transaction "$serial_value" "$next_value" "$manifest_confirmation"; then
+    return 1
+  else
+    fixture_result=$?
+  fi
+  fixture_exact_link_outcome=
+  [ "$fixture_result" = 75 ] && owned_sign_transaction_matches || return 1
+  cleanup_owned_signer_artifacts && fixture_transaction_tree_clean || return 1
+  [ "$(read_serial)" = "$serial_value" ] || return 1
+
+  fixture_exact_link_outcome=report-failure-after-success
+  if create_sign_transaction "$serial_value" "$next_value" "$manifest_confirmation"; then
+    return 1
+  else
+    fixture_result=$?
+  fi
+  fixture_exact_link_outcome=
+  [ "$fixture_result" = 75 ] && owned_sign_transaction_matches || return 1
+  interruption_backup=$root/interrupted-link-record
+  /bin/cp "$owned_sign_candidate" "$interruption_backup" &&
+    normalise_created_file "$interruption_backup" 4096 || return 1
+  printf '%s\n' ambiguous-link-result >"$owned_sign_candidate" || return 1
+  ! cleanup_owned_signer_artifacts || return 1
+  [ "$(file_device_inode "$owned_sign_claim")" = "$owned_sign_candidate_id" ] &&
+    [ "$(file_device_inode "$owned_sign_candidate")" = "$owned_sign_candidate_id" ] &&
+    validate_sign_stage "$owned_sign_stage" "$owned_sign_stage_id" || return 1
+  /bin/cat "$interruption_backup" >"$owned_sign_candidate" || return 1
+  owned_sign_transaction_matches && cleanup_owned_signer_artifacts && fixture_transaction_tree_clean || return 1
+
+  # A different claim never authorizes touching that claim.  Extra candidate
+  # links and path replacement both withhold cleanup until exact provenance is
+  # restored; the valid unclaimed branch then removes only its own artifacts.
+  foreign_claim=$root/foreign-claim
+  printf '%s\n' foreign-claim >"$foreign_claim" && normalise_created_file "$foreign_claim" 64 || return 1
+  foreign_claim_id=$(file_device_inode "$foreign_claim") || return 1
+  create_exact_link "$foreign_claim" "$signer_root/$sign_claim_name" || return 1
+  if create_sign_transaction "$serial_value" "$next_value" "$manifest_confirmation"; then return 1; else fixture_result=$?; fi
+  [ "$fixture_result" = 75 ] && owned_unclaimed_transaction_matches || return 1
+  external_candidate=$root/external-candidate-link
+  create_exact_link "$owned_sign_candidate" "$external_candidate" || return 1
+  ! cleanup_owned_signer_artifacts || return 1
+  [ -e "$owned_sign_candidate" ] && [ -e "$owned_sign_stage" ] && [ -e "$external_candidate" ] &&
+    [ "$(file_device_inode "$signer_root/$sign_claim_name")" = "$foreign_claim_id" ] || return 1
+  validated_unlink_owner_file "$external_candidate" 4096 "$owned_sign_candidate_id" 2 || return 1
+  cleanup_owned_signer_artifacts || return 1
+  [ "$(file_device_inode "$signer_root/$sign_claim_name")" = "$foreign_claim_id" ] || return 1
+
+  if create_sign_transaction "$serial_value" "$next_value" "$manifest_confirmation"; then return 1; else fixture_result=$?; fi
+  [ "$fixture_result" = 75 ] && owned_unclaimed_transaction_matches || return 1
+  original_candidate=$root/original-unclaimed-candidate
+  /bin/mv "$owned_sign_candidate" "$original_candidate" || return 1
+  exclusive_empty_file "$owned_sign_candidate" && normalise_created_file "$owned_sign_candidate" 4096 || return 1
+  replacement_candidate_id=$(file_device_inode "$owned_sign_candidate") || return 1
+  ! cleanup_owned_signer_artifacts || return 1
+  [ -e "$owned_sign_candidate" ] && [ -e "$original_candidate" ] && [ -e "$owned_sign_stage" ] || return 1
+  validated_unlink_owner_file "$owned_sign_candidate" 4096 "$replacement_candidate_id" 1 || return 1
+  /bin/mv "$original_candidate" "$owned_sign_candidate" || return 1
+  cleanup_owned_signer_artifacts || return 1
+  [ "$(file_device_inode "$signer_root/$sign_claim_name")" = "$foreign_claim_id" ] || return 1
+  validated_unlink_owner_file "$signer_root/$sign_claim_name" 64 "$foreign_claim_id" 2 || return 1
+  owner_file "$foreign_claim" 64 && fixture_transaction_tree_clean || return 1
+
+  # Sixteen synchronized transaction races hold the winner's claim while the
+  # loser performs immediate cleanup.  Recovery is deliberately absent here:
+  # only the winner candidate/stage may remain, then its cleanup reaches zero.
+  contender_round=1
+  while [ "$contender_round" -le 16 ]; do
+    contender_a=$root/contender-$contender_round-a
+    contender_b=$root/contender-$contender_round-b
+    /bin/mkdir "$contender_a" "$contender_b" || return 1
+    normalise_created_directory "$contender_a" && normalise_created_directory "$contender_b" || return 1
+    fixture_contender_worker "$self_path" "$root" "$fixture_receipt" "$helper_copy" "$agent_socket" \
+      "$request" "$contender_a" >"$contender_a/output" 2>"$contender_a/error" &
+    contender_a_worker=$!
+    background_pids=$contender_a_worker
+    wait_for_fixture_marker "$contender_a/contender-ready" || return 1
+    contender_a_pid=$(/bin/cat "$contender_a/contender-ready") || return 1
+    wait_for_fixture_stop "$contender_a_pid" || return 1
+    fixture_contender_worker "$self_path" "$root" "$fixture_receipt" "$helper_copy" "$agent_socket" \
+      "$request" "$contender_b" >"$contender_b/output" 2>"$contender_b/error" &
+    contender_b_worker=$!
+    background_pids="$contender_a_worker $contender_a_pid $contender_b_worker"
+    wait_for_fixture_marker "$contender_b/contender-ready" || return 1
+    contender_b_pid=$(/bin/cat "$contender_b/contender-ready") || return 1
+    wait_for_fixture_stop "$contender_b_pid" || return 1
+    background_pids="$contender_a_worker $contender_a_pid $contender_b_worker $contender_b_pid"
+    /bin/kill -CONT "$contender_a_pid" "$contender_b_pid" || return 1
+    wait_for_fixture_marker "$contender_a/before-claim" && wait_for_fixture_marker "$contender_b/before-claim" || return 1
+    wait_for_fixture_stop "$contender_a_pid" && wait_for_fixture_stop "$contender_b_pid" || return 1
+    /bin/kill -CONT "$contender_a_pid" "$contender_b_pid" || return 1
+    wait_for_either_fixture_marker "$contender_a/contender-winner-held" "$contender_b/contender-winner-held" || return 1
+    if [ -s "$contender_a/contender-winner-held" ]; then
+      contender_winner=$contender_a; contender_winner_worker=$contender_a_worker; contender_winner_pid=$contender_a_pid
+      contender_loser=$contender_b; contender_loser_worker=$contender_b_worker
+    else
+      contender_winner=$contender_b; contender_winner_worker=$contender_b_worker; contender_winner_pid=$contender_b_pid
+      contender_loser=$contender_a; contender_loser_worker=$contender_a_worker
+    fi
+    wait_for_fixture_stop "$contender_winner_pid" || return 1
+    wait "$contender_loser_worker" || return 1
+    background_pids="$contender_winner_worker $contender_winner_pid"
+    contender_loser_output=$contender_loser/output
+    contender_loser_error=$contender_loser/error
+    /usr/bin/grep -Fx 'role|loser' "$contender_loser_output" >/dev/null &&
+      /usr/bin/grep -Fx 'create-rc|75' "$contender_loser_output" >/dev/null &&
+      /usr/bin/grep -Fx 'cleanup-rc|0' "$contender_loser_output" >/dev/null &&
+      [ ! -s "$contender_loser_error" ] || return 1
+    candidate_count=$(/usr/bin/find "$signer_root" -mindepth 1 -maxdepth 1 -name '.sign-candidate.*' -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+    stage_count=$(/usr/bin/find "$signer_root/.work" -mindepth 1 -maxdepth 1 -name '.sign-stage.*' -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+    [ "$candidate_count" = 1 ] && [ "$stage_count" = 1 ] &&
+      parse_sign_candidate "$signer_root/$sign_claim_name" 2 || return 1
+    /bin/kill -CONT "$contender_winner_pid" || return 1
+    wait "$contender_winner_worker" || return 1
+    background_pids=
+    contender_winner_output=$contender_winner/output
+    contender_winner_error=$contender_winner/error
+    /usr/bin/grep -Fx 'role|winner' "$contender_winner_output" >/dev/null &&
+      /usr/bin/grep -Fx 'create-rc|0' "$contender_winner_output" >/dev/null &&
+      /usr/bin/grep -Fx 'cleanup-rc|0' "$contender_winner_output" >/dev/null &&
+      [ ! -s "$contender_winner_error" ] && fixture_transaction_tree_clean || return 1
+    [ "$(read_serial)" = "$serial_value" ] || return 1
+    contender_round=$((contender_round + 1))
+  done
+
+  # SIGKILL every transaction transition.  Recovery must understand the
+  # unclaimed candidate, atomic claim, bound stage, serial reservation,
+  # ambiguous post-sign state, removed stage, and half-released claim.
+  for crash_phase in before-claim claim-with-candidate bound-stage-before-serial \
+      after-serial-reservation after-sign stage-removed release; do
+    before_serial=$(read_serial) || return 1
+    manifest_confirmation=$(manifest_digest "$before_serial") || return 1
+    control=$root/crash-$crash_phase
+    /bin/mkdir "$control" && normalise_created_directory "$control" || return 1
+    crash_output=$root/crash-$crash_phase.out
+    crash_error=$root/crash-$crash_phase.err
+    if fixture_sign_worker "$self_path" "$root" "$fixture_receipt" "$helper_copy" "$agent_socket" \
+        "$request" "$manifest_confirmation" "$crash_phase" '' "$control" >"$crash_output" 2>"$crash_error"; then
+      return 1
+    else
+      fixture_result=$?
+    fi
+    [ "$fixture_result" = 137 ] && [ -s "$control/$crash_phase" ] || return 1
+    ! /usr/bin/grep -Eq 'machine-utilities-ssh-certificate(\||-contract)' "$crash_output" || return 1
+    ! /usr/bin/grep -F "$root" "$crash_output" "$crash_error" >/dev/null || return 1
+    fixture_recover_worker "$self_path" "$root" "$fixture_receipt" "$helper_copy" "$agent_socket" "$request" || return 1
+    case $crash_phase in
+      after-serial-reservation|after-sign|stage-removed|release) expected_serial=$((before_serial + 1)) ;;
+      *) expected_serial=$before_serial ;;
+    esac
+    [ "$(read_serial)" = "$expected_serial" ] && fixture_transaction_tree_clean || return 1
+  done
+
+  # A boot change makes a claimed transaction stale even if its PID happens
+  # to be live again.  The synthetic rewrite is fixture-authority-only.
+  serial_value=$(read_serial) || return 1
+  next_value=$((serial_value + 1))
+  manifest_confirmation=$(manifest_digest "$serial_value") || return 1
+  create_sign_transaction "$serial_value" "$next_value" "$manifest_confirmation" || return 1
+  modified_record=$root/reboot-transaction
+  /usr/bin/sed 's/^boot-identity|.*/boot-identity|0000000000000000000000000000000000000000000000000000000000000000/' \
+    "$owned_sign_candidate" >"$modified_record" || return 1
+  /bin/cat "$modified_record" >"$owned_sign_candidate" || return 1
+  parse_sign_candidate "$owned_sign_candidate" 2 || return 1
+  recover_signer_state || return 1
+  clear_owned_transaction_globals
+  [ "$(read_serial)" = "$serial_value" ] && fixture_transaction_tree_clean || return 1
+
+  # Unknown children are rejected and preserved at every mutable boundary.
+  unknown=$signer_fixture/unknown-root
+  /bin/ln -s "$root" "$unknown" || return 1
+  ! recover_signer_state && [ -L "$unknown" ] || return 1
+  /bin/rm -f "$unknown" || return 1
+  unknown=$signer_fixture/.work/unknown-work
+  printf '%s\n' unknown >"$unknown" && normalise_created_file "$unknown" 64 || return 1
+  ! recover_signer_state && [ -f "$unknown" ] || return 1
+  /bin/rm -f "$unknown" || return 1
+  serial_value=$(read_serial) || return 1
+  next_value=$((serial_value + 1))
+  manifest_confirmation=$(manifest_digest "$serial_value") || return 1
+  create_sign_transaction "$serial_value" "$next_value" "$manifest_confirmation" || return 1
+  unknown=$owned_sign_stage/unknown-stage
+  /bin/mkdir "$unknown" && normalise_created_directory "$unknown" || return 1
+  ! cleanup_owned_signer_artifacts && [ -d "$unknown" ] || return 1
+  /bin/rmdir "$unknown" || return 1
+  cleanup_owned_signer_artifacts && fixture_transaction_tree_clean || return 1
+
+  # Serial transients are allowlisted only with exact single-link provenance.
+  serial_transient=$(/usr/bin/mktemp "$signer_fixture/.serial.XXXXXXXX") || return 1
+  printf '%s\n' 999 >"$serial_transient" && normalise_created_file "$serial_transient" 64 || return 1
+  serial_link=$root/serial-hardlink
+  /bin/ln "$serial_transient" "$serial_link" || return 1
+  ! recover_signer_state && [ -f "$serial_transient" ] || return 1
+  /bin/rm -f "$serial_link" || return 1
+  recover_signer_state || return 1
+  [ ! -e "$serial_transient" ] && [ ! -L "$serial_transient" ] || return 1
+
+  # Stage path replacement must survive failed cleanup; restoring the owned
+  # inode lets the same preserved provenance converge on a repeated cleanup.
+  serial_value=$(read_serial) || return 1
+  next_value=$((serial_value + 1))
+  manifest_confirmation=$(manifest_digest "$serial_value") || return 1
+  create_sign_transaction "$serial_value" "$next_value" "$manifest_confirmation" || return 1
+  original_stage=$root/original-stage
+  replacement_stage=$owned_sign_stage
+  /bin/mv "$owned_sign_stage" "$original_stage" || return 1
+  /bin/mkdir "$replacement_stage" && normalise_created_directory "$replacement_stage" || return 1
+  ! cleanup_owned_signer_artifacts && [ -d "$replacement_stage" ] || return 1
+  /bin/rmdir "$replacement_stage" && /bin/mv "$original_stage" "$replacement_stage" || return 1
+  cleanup_owned_signer_artifacts && fixture_transaction_tree_clean || return 1
+
+  # CSR replacement follows the same exact-inode cleanup contract.
+  csr_swap_dir=$root/csr-swap
+  /bin/mkdir "$csr_swap_dir" && normalise_created_directory "$csr_swap_dir" || return 1
+  csr_swap=$(/usr/bin/mktemp "$csr_swap_dir/request.XXXXXXXX") || return 1
+  normalise_created_file "$csr_swap" 16384 && register_owned_csr "$csr_swap_dir" "$csr_swap" || return 1
+  original_csr=$root/original-csr
+  /bin/mv "$csr_swap" "$original_csr" || return 1
+  printf '%s\n' replacement >"$csr_swap" && normalise_created_file "$csr_swap" 16384 || return 1
+  ! cleanup_owned_csr && [ -f "$csr_swap" ] || return 1
+  /bin/rm -f "$csr_swap" && /bin/mv "$original_csr" "$csr_swap" || return 1
+  cleanup_owned_csr || return 1
+  [ ! -e "$csr_swap_dir" ] && [ ! -L "$csr_swap_dir" ] || return 1
+  /bin/ln "$signer_fixture/$policy_name" "$root/policy-hardlink" || return 1
+  ! parse_policy "$signer_fixture/$policy_name" || return 1
+  /bin/rm -f "$root/policy-hardlink" || return 1
+  parse_policy "$signer_fixture/$policy_name" || return 1
+  if [ "$(/usr/bin/uname -s)" = Darwin ]; then
+    /bin/chmod +a 'group:everyone deny delete' "$signer_fixture/$policy_name" || return 1
+    parse_policy "$signer_fixture/$policy_name" || return 1
+    /bin/chmod -N "$signer_fixture/$policy_name" || return 1
+    /bin/chmod +a 'group:everyone allow read' "$signer_fixture/$policy_name" || return 1
+    ! parse_policy "$signer_fixture/$policy_name" || return 1
+    /bin/chmod -N "$signer_fixture/$policy_name" || return 1
+  fi
+  /usr/bin/sed 's/^signer-policy-sha256|.*/signer-policy-sha256|0000000000000000000000000000000000000000000000000000000000000000/' \
+    "$fixture_receipt" >"$root/receipt-policy-drift" || return 1
+  normalise_fixture_public_file "$root/receipt-policy-drift" 8192 || return 1
+  /bin/mv -f "$root/receipt-policy-drift" "$fixture_receipt" || return 1
+  ! verify_native_ca_isolation || return 1
+  write_fixture_native_receipt "$fixture_receipt" && verify_native_ca_isolation || return 1
+  /bin/chmod 700 "$agent_socket" || return 1
+  verify_agent_socket || return 1
+  ! verify_native_ca_isolation || return 1
+  /bin/chmod 600 "$agent_socket" || return 1
+  verify_agent_socket || return 1
+  write_fixture_native_receipt "$fixture_receipt" && verify_native_ca_isolation || return 1
+  /bin/chmod 777 "$agent_socket" || return 1
+  ! verify_agent_socket || return 1
+  /bin/chmod 600 "$agent_socket" || return 1
+  verify_agent_socket && write_fixture_native_receipt "$fixture_receipt" || return 1
+
+  # Stop after the last pre-connect pin, kill the agent, and rebind the exact
+  # pathname to a new agent holding the same CA.  Post-connect pinning must
+  # retire the serial and withhold all publication.
+  serial_value=$(read_serial) || return 1
+  manifest_confirmation=$(manifest_digest "$serial_value") || return 1
+  race_control=$root/race-control
+  /bin/mkdir "$race_control" && normalise_created_directory "$race_control" || return 1
+  race_output=$root/race.out
+  race_error=$root/race.err
+  fixture_sign_worker "$self_path" "$root" "$fixture_receipt" "$helper_copy" "$agent_socket" \
+    "$request" "$manifest_confirmation" '' before-ssh-keygen "$race_control" >"$race_output" 2>"$race_error" &
+  race_worker=$!
+  background_pids=$race_worker
+  if ! wait_for_fixture_marker "$race_control/before-ssh-keygen"; then
+    race_pid=$(/bin/cat "$race_control/before-claim" 2>/dev/null || :)
+    [[ $race_pid =~ ^[1-9][0-9]*$ ]] && /bin/kill -KILL "$race_pid" >/dev/null 2>&1 || :
+    /bin/kill -KILL "$race_worker" >/dev/null 2>&1 || :
+    wait "$race_worker" 2>/dev/null || :
+    background_pids=
+    return 1
+  fi
+  race_pid=$(/bin/cat "$race_control/before-ssh-keygen") || return 1
+  [[ $race_pid =~ ^[1-9][0-9]*$ ]] || return 1
+  /bin/kill "$agent_pid" >/dev/null 2>&1 || return 1
+  wait "$agent_pid" 2>/dev/null || :
+  agent_pid=
+  [ ! -e "$agent_socket" ] && [ ! -L "$agent_socket" ] || return 1
+  replacement_agent_output=$root/replacement-agent.out
+  replacement_agent_error=$root/replacement-agent.err
+  /usr/bin/ssh-agent -D -a "$agent_socket" >"$replacement_agent_output" 2>"$replacement_agent_error" &
+  agent_pid=$!
+  for next_value in 1 2 3 4 5 6 7 8 9 10; do [ -S "$agent_socket" ] && break; /bin/sleep 0.1; done
+  [ -S "$agent_socket" ] || return 1
+  SSH_AUTH_SOCK="$agent_socket" /usr/bin/ssh-add "$ca_key" >/dev/null 2>&1 || return 1
+  /bin/kill -CONT "$race_pid" || return 1
+  if wait "$race_worker"; then return 1; else fixture_result=$?; fi
+  background_pids=
+  [ "$fixture_result" = 77 ] && [ ! -s "$race_output" ] || return 1
+  /usr/bin/grep -Fx 'state|native_canary_required' "$race_error" >/dev/null || return 1
+  /usr/bin/grep -Fx 'publication|withheld' "$race_error" >/dev/null || return 1
+  ! /usr/bin/grep -F "$root" "$race_output" "$race_error" >/dev/null || return 1
+  [ "$(read_serial)" = $((serial_value + 1)) ] && fixture_transaction_tree_clean || return 1
+  verify_agent_socket && write_fixture_native_receipt "$fixture_receipt" && verify_native_ca_isolation || return 1
+
+  # Bootstrap traps exist before the first command-owned temporary object.
+  # Signal the pre-create boundary and both pre-registration ownership states;
+  # each handler must leave the dedicated fixture parent empty.
+  /bin/mkdir "$root/bootstrap-temp" && normalise_created_directory "$root/bootstrap-temp" || return 1
+  for bootstrap_phase in bootstrap-before-directory bootstrap-directory-before-registration \
+      bootstrap-directory-created bootstrap-csr-before-registration bootstrap-csr-created; do
+    for signal_name in HUP INT TERM; do
+      case $signal_name in HUP) signal_number=HUP; signal_expected=129 ;; INT) signal_number=INT; signal_expected=130 ;; TERM) signal_number=TERM; signal_expected=143 ;; esac
+      bootstrap_control=$root/bootstrap-$bootstrap_phase-$signal_name
+      /bin/mkdir "$bootstrap_control" && normalise_created_directory "$bootstrap_control" || return 1
+      (
+        wait_for_fixture_marker "$bootstrap_control/$bootstrap_phase" || exit 1
+        signal_pid=$(/bin/cat "$bootstrap_control/$bootstrap_phase") || exit 1
+        wait_for_fixture_stop "$signal_pid" || exit 1
+        /bin/kill -"$signal_number" "$signal_pid" || exit 1
+        /bin/kill -CONT "$signal_pid" >/dev/null 2>&1 || :
+        next_value=0
+        while [ "$next_value" -lt 400 ]; do
+          ! /bin/kill -0 "$signal_pid" 2>/dev/null && exit 0
+          /bin/sleep 0.05
+          next_value=$((next_value + 1))
+        done
+        /bin/kill -KILL "$signal_pid" >/dev/null 2>&1 || :
+        exit 1
+      ) &
+      bootstrap_worker=$!
+      background_pids=$bootstrap_worker
+      if fixture_bootstrap_signal_worker "$self_path" "$root" "$bootstrap_phase" "$bootstrap_control" \
+          >"$bootstrap_control/output" 2>"$bootstrap_control/error"; then
+        fixture_result=0
+      else
+        fixture_result=$?
+      fi
+      wait "$bootstrap_worker" || return 1
+      background_pids=
+      [ "$fixture_result" = "$signal_expected" ] &&
+        [ ! -s "$bootstrap_control/output" ] && [ ! -s "$bootstrap_control/error" ] || return 1
+      ! /usr/bin/find "$root/bootstrap-temp" -mindepth 1 -maxdepth 1 -print | /usr/bin/grep -q . || return 1
+    done
+  done
+
+  # Blocking FIFO reads exercise each signal independently.  Handlers must
+  # remove only the owned CSR, close its explicit stdin descriptor, and
+  # terminate with the conventional status.
+  for signal_name in HUP INT TERM; do
+    case $signal_name in HUP) signal_number=HUP; signal_expected=129 ;; INT) signal_number=INT; signal_expected=130 ;; TERM) signal_number=TERM; signal_expected=143 ;; esac
+    signal_control=$root/signal-$signal_name-control
+    signal_fifo=$root/signal-$signal_name.fifo
+    signal_output=$root/signal-$signal_name.out
+    signal_error=$root/signal-$signal_name.err
+    /bin/mkdir "$signal_control" && normalise_created_directory "$signal_control" || return 1
+    /usr/bin/mkfifo "$signal_fifo" || return 1
+    (
+      wait_for_fixture_marker "$signal_control/ready" || exit 1
+      signal_pid=$(/bin/cat "$signal_control/ready") || exit 1
+      /bin/kill -"$signal_number" "$signal_pid" || exit 1
+      next_value=0
+      while [ "$next_value" -lt 400 ]; do
+        ! /bin/kill -0 "$signal_pid" 2>/dev/null && exit 0
+        /bin/sleep 0.05
+        next_value=$((next_value + 1))
+      done
+      /bin/kill -KILL "$signal_pid" >/dev/null 2>&1 || :
+      exit 1
+    ) &
+    signal_worker=$!
+    background_pids=$signal_worker
+    if fixture_signal_worker "$self_path" "$root" "$signal_name" "$signal_control" "$signal_fifo" \
+        >"$signal_output" 2>"$signal_error"; then
+      fixture_result=0
+    else
+      fixture_result=$?
+    fi
+    wait "$signal_worker" || return 1
+    background_pids=
+    [ "$fixture_result" = "$signal_expected" ] || return 1
+    [ ! -e "$root/signal-$signal_name-csr" ] && [ ! -L "$root/signal-$signal_name-csr" ] || return 1
+    [ ! -s "$signal_output" ] && [ ! -s "$signal_error" ] || return 1
+    /bin/rm -f "$signal_fifo" || return 1
+  done
+
+  # Repeat each signal while the child exists but before `$!` is copied into
+  # owned_input_child_pid.  The temporary deferral traps must register and
+  # retire that child before replaying the conventional command handler.
+  for signal_name in HUP INT TERM; do
+    case $signal_name in HUP) signal_number=HUP; signal_expected=129 ;; INT) signal_number=INT; signal_expected=130 ;; TERM) signal_number=TERM; signal_expected=143 ;; esac
+    signal_control=$root/input-critical-$signal_name-control
+    signal_fifo=$root/input-critical-$signal_name.fifo
+    signal_output=$root/input-critical-$signal_name.out
+    signal_error=$root/input-critical-$signal_name.err
+    /bin/mkdir "$signal_control" && normalise_created_directory "$signal_control" || return 1
+    /usr/bin/mkfifo "$signal_fifo" || return 1
+    (
+      wait_for_fixture_marker "$signal_control/input-child-before-registration" || exit 1
+      signal_pid=$(/bin/cat "$signal_control/input-child-before-registration") || exit 1
+      wait_for_fixture_stop "$signal_pid" || exit 1
+      /bin/kill -"$signal_number" "$signal_pid" || exit 1
+      /bin/kill -CONT "$signal_pid" >/dev/null 2>&1 || :
+      next_value=0
+      while [ "$next_value" -lt 400 ]; do
+        ! /bin/kill -0 "$signal_pid" 2>/dev/null && exit 0
+        /bin/sleep 0.05
+        next_value=$((next_value + 1))
+      done
+      /bin/kill -KILL "$signal_pid" >/dev/null 2>&1 || :
+      exit 1
+    ) &
+    signal_worker=$!
+    background_pids=$signal_worker
+    if fixture_signal_worker "$self_path" "$root" "$signal_name" "$signal_control" "$signal_fifo" \
+        input-child-before-registration >"$signal_output" 2>"$signal_error"; then
+      fixture_result=0
+    else
+      fixture_result=$?
+    fi
+    wait "$signal_worker" || return 1
+    background_pids=
+    [ "$fixture_result" = "$signal_expected" ] || return 1
+    [ ! -e "$root/signal-$signal_name-csr" ] && [ ! -L "$root/signal-$signal_name-csr" ] || return 1
+    [ ! -s "$signal_output" ] && [ ! -s "$signal_error" ] || return 1
+    /bin/rm -f "$signal_fifo" || return 1
+  done
+
+  /bin/kill "$agent_pid" >/dev/null 2>&1 || return 1
+  wait "$agent_pid" 2>/dev/null || :
+  agent_pid=
+  fixture_mode=false
+  fixture_ancestor_boundary=
+  fixture_receipt_path=
+  fixture_helper_path=
+  /usr/bin/find "$root" -depth -delete || return 1
+  trap - ERR
+  trap - RETURN
+  printf '%s\n' 'PASS: certify-ssh-node fixture-safe self-check'
+}
+
+command=
+if [ "$#" -gt 0 ]; then command=$1; shift; fi
+case $(platform_boundary) in
+  macos|linux) ;;
+  wsl)
+    record 'ssh-signer-status|1' 'state|unsupported' 'reason|unsupported_security_boundary' \
+      'platform-boundary|wsl' 'end-status|'
+    exit 69
+    ;;
+  *)
+    record 'ssh-signer-status|1' 'state|unsupported' 'reason|unsupported_platform' 'end-status|'
+    exit 69
+    ;;
+esac
+case $command in
+  status)
+    [ "$#" -eq 0 ] || usage
+    emit_status
+    ;;
+  preview)
+    [ "$#" -eq 0 ] || usage
+    install_bootstrap_traps
+    create_command_csr || exit 65
+    install_command_traps
+    read_csr "$csr" managed || { printf '%s\n' 'certify-ssh-node: invalid public certificate request' >&2; exit 64; }
+    parse_csr "$csr" || { printf '%s\n' 'certify-ssh-node: invalid public certificate request' >&2; exit 64; }
+    signer_root=$(signer_root_for_current_user) || exit 69
+    emit_preview "$csr" || {
+      printf '%s\n' 'certify-ssh-node: protected signer policy, pinned helper, or native CA isolation proof is not ready' >&2
+      exit 65
+    }
+    ;;
+  sign)
+    [ "$#" -eq 1 ] || usage
+    install_bootstrap_traps
+    create_command_csr || exit 65
+    install_command_traps
+    read_csr "$csr" managed || { printf '%s\n' 'certify-ssh-node: invalid public certificate request' >&2; exit 64; }
+    parse_csr "$csr" || { printf '%s\n' 'certify-ssh-node: invalid public certificate request' >&2; exit 64; }
+    signer_root=$(signer_root_for_current_user) || exit 69
+    sign_certificate "$csr" "$1"
+    ;;
+  self-test)
+    [ "$#" -eq 0 ] || usage
+    system_ssh_keygen_ready && system_exact_link_ready || exit 69
+    self_test
+    ;;
+  *) usage ;;
+esac

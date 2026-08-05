@@ -1,0 +1,4 @@
+interface:
+  display_name: "SSH Doctor"
+  short_description: "Diagnose macOS SSH and Remote Login"
+  default_prompt: "Use $ssh-doctor to diagnose this fleet Mac SSH failure."

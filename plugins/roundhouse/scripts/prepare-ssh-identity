@@ -1,0 +1,2102 @@
+#!/bin/bash -p
+# Node-local, public-request-only SSH identity preparation.
+#
+# This command deliberately has no remote, elevated, CA, or SSH-client mode.
+# A private node key is created only below the caller's local state directory;
+# certification and target enrollment are separate owner ceremonies.
+set -euo pipefail
+
+umask 077
+export LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin
+IFS=$' \t\n'
+unset BASH_ENV CDPATH ENV GLOBIGNORE SSH_AUTH_SOCK SSH_AGENT_PID SSH_ASKPASS \
+  SSH_CLIENT SSH_CONNECTION SSH_ORIGINAL_COMMAND SSH_TTY SSH_CONFIG \
+  GIT_SSH GIT_SSH_COMMAND \
+  LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH \
+  DYLD_FALLBACK_LIBRARY_PATH DYLD_FRAMEWORK_PATH DYLD_FALLBACK_FRAMEWORK_PATH \
+  http_proxy https_proxy ftp_proxy all_proxy no_proxy \
+  HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
+
+readonly ssh_keygen=/usr/bin/ssh-keygen
+readonly key_name=node-key
+readonly request_name=certificate-request
+readonly certificate_name=node-key-cert.pub
+readonly certificate_contract_name=certificate-contract
+readonly generation_intent_name=generation-intent
+readonly prepare_lock_lease_name=lease
+fixture_mode=false
+fixture_ancestor_boundary=
+held_request_snapshot_directory=
+held_request_snapshot=
+owned_prepare_lock=
+owned_prepare_lock_id=
+owned_prepare_stage=
+owned_prepare_stage_id=
+owned_prepare_pid=
+owned_prepare_process_start=
+owned_prepare_boot_identity=
+self_test_worker_pids=
+self_test_worker_root=
+
+usage() {
+  printf '%s\n' \
+    'usage: prepare-ssh-identity status [EXPECTED_CA_FINGERPRINT CA_GENERATION CERTIFIER_HELPER_SHA256]|self-test' \
+    '       prepare-ssh-identity preview FLEET_DOMAIN NODE_ID ENDPOINT_PRINCIPALS SOURCE_CIDRS' \
+    '       prepare-ssh-identity prepare FLEET_DOMAIN NODE_ID ENDPOINT_PRINCIPALS SOURCE_CIDRS' \
+    '       prepare-ssh-identity request'
+  exit 64
+}
+
+record() {
+  # All records are deliberately public-only.  In particular, do not add an
+  # identity directory or private-key field here: these records may be copied
+  # into an owner signing ceremony or a ticket.
+  printf '%s\n' "$@"
+}
+
+portable_stat() {
+  case $(/usr/bin/uname -s) in
+    Darwin) /usr/bin/stat -f "$1" "$3" 2>/dev/null ;;
+    Linux) /usr/bin/stat -c "$2" "$3" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+file_owner() { portable_stat %Su %U "$1"; }
+file_mode() { portable_stat %Lp %a "$1"; }
+file_size() { portable_stat %z %s "$1"; }
+file_links() { portable_stat %l %h "$1"; }
+file_device_inode() { portable_stat '%d:%i' '%d:%i' "$1"; }
+
+is_wsl() {
+  [ "$(/usr/bin/uname -s)" = Linux ] && [ -r /proc/sys/kernel/osrelease ] &&
+    /usr/bin/grep -Eiq '(microsoft|wsl)' /proc/sys/kernel/osrelease
+}
+
+platform_boundary() {
+  case $(/usr/bin/uname -s) in
+    Darwin) printf '%s' macos ;;
+    Linux)
+      if is_wsl; then printf '%s' wsl; else printf '%s' linux; fi
+      ;;
+    *) printf '%s' unsupported ;;
+  esac
+}
+
+safe_permissions() {
+  local mode permissions
+  mode=$(file_mode "$1") || return 1
+  permissions=$(printf '%s' "$mode" | /usr/bin/sed 's/.*\(...\)$/\1/')
+  [ "${#permissions}" -eq 3 ] || return 1
+  case $(printf '%s' "$permissions" | /usr/bin/cut -c 2-3) in *2*|*3*|*6*|*7*) return 1 ;; esac
+}
+
+safe_extended_acl() {
+  # A `+` means an access ACL exists, but it does not say whether that ACL
+  # grants access.  macOS deny-only entries (for example, a protective
+  # `group:everyone deny delete`) do not weaken the owner boundary and are
+  # therefore permitted.  Any macOS allow entry, every default POSIX ACL, and
+  # every named POSIX grant are rejected.
+  local mode acl_tool acl
+  mode=$(/bin/ls -ld "$1" 2>/dev/null | /usr/bin/awk 'NR == 1 { print $1; exit }') || return 1
+  [ -n "$mode" ] || return 1
+  case $mode in
+    *+*) ;;
+    *) return 0 ;;
+  esac
+  case $(/usr/bin/uname -s) in
+    Darwin)
+      # The first line is the normal ls record.  A non-empty ACL record has
+      # the stable numeric-index/principal/allow-or-deny shape below.  Treat a
+      # parser mismatch as unsafe instead of silently accepting a new format.
+      acl=$(/bin/ls -led "$1" 2>/dev/null | /usr/bin/awk '
+        NR == 1 { next }
+        /^[[:space:]]*[0-9]+:/ {
+          if (NF < 4) exit 1
+          if ($3 == "deny") next
+          exit 1
+        }
+        { exit 1 }
+        END { if (NR == 1) exit 1 }
+      ') || return 1
+      # The value is deliberately unused: successful parsing proves every
+      # effective entry was a deny entry.
+      : "$acl"
+      return 0
+      ;;
+    Linux)
+      for acl_tool in /usr/bin/getfacl /bin/getfacl; do
+        [ -x "$acl_tool" ] && break
+        acl_tool=
+      done
+      [ -n "$acl_tool" ] || return 1
+      "$acl_tool" -cp -- "$1" 2>/dev/null | /usr/bin/awk '
+        /^#/ { next }
+        /^default:/ { exit 1 }
+        /^user::/ || /^group::/ || /^other::/ || /^mask::/ { next }
+        /^user:/ || /^group:/ {
+          split($0, fields, ":")
+          if (fields[2] != "" && fields[3] != "---") exit 1
+          next
+        }
+        { exit 1 }
+      ' || return 1
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+clear_inherited_acl() {
+  case $(/usr/bin/uname -s) in
+    Darwin) /bin/chmod -N "$1" >/dev/null 2>&1 || return 1 ;;
+    Linux)
+      if [ -x /usr/bin/setfacl ]; then
+        /usr/bin/setfacl -b "$1" >/dev/null 2>&1 || return 1
+      elif [ -x /bin/setfacl ]; then
+        /bin/setfacl -b "$1" >/dev/null 2>&1 || return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  safe_extended_acl "$1"
+}
+
+owner_only_directory() {
+  [ -d "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$(/usr/bin/id -un)" ] &&
+    [ "$(file_mode "$1")" = 700 ] && safe_extended_acl "$1"
+}
+
+owner_only_file() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$(/usr/bin/id -un)" ] &&
+    [ "$(file_mode "$1")" = 600 ] && [ "$(file_links "$1")" = 1 ] &&
+    [ "$(file_size "$1")" -le "$2" ] && safe_extended_acl "$1"
+}
+
+normalise_created_directory() {
+  /bin/chmod 700 "$1" >/dev/null 2>&1 || return 1
+  clear_inherited_acl "$1" || return 1
+  owner_only_directory "$1"
+}
+
+normalise_created_file() {
+  /bin/chmod 600 "$1" >/dev/null 2>&1 || return 1
+  clear_inherited_acl "$1" || return 1
+  owner_only_file "$1" "$2"
+}
+
+canonical_directory() {
+  # `pwd -P` is available in the system shell on both supported POSIX hosts
+  # and avoids accepting a symlinked state root as an identity location.
+  (
+    CDPATH=''
+    builtin cd -P "$1" 2>/dev/null || exit 1
+    builtin pwd -P
+  )
+}
+
+canonical_absolute_path_syntax() {
+  # Missing identity roots cannot be resolved with `pwd -P` before creation.
+  # Require their lexical form to already be canonical so status and prepare
+  # apply the same boundary and `mkdir -p` can never traverse a path that the
+  # post-create physical-path check will reject.
+  local candidate=$1
+  case $candidate in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case $candidate in
+    *'//'*|*'/./'*|*/.|*'/../'*|*/..) return 1 ;;
+  esac
+}
+
+validate_credential_ancestor_chain() {
+  # From the credential directory upward, only the current user or root may
+  # own a component. Root-owned system parents are acceptable only while
+  # they remain non-writable by group/other and ACL-free. Fixture tests stop
+  # at their private root so the host sticky temporary directory is never a
+  # trust anchor. A malicious process already running as this same owner is
+  # outside this V1 filesystem boundary; links, ACL grants, and writable
+  # ancestors are nevertheless treated as drift rather than prepared state.
+  local cursor=$1 owner current_user
+  current_user=$(/usr/bin/id -un)
+  while :; do
+    [ -d "$cursor" ] && [ ! -L "$cursor" ] || return 1
+    safe_permissions "$cursor" && safe_extended_acl "$cursor" || return 1
+    owner=$(file_owner "$cursor") || return 1
+    [ "$owner" = "$current_user" ] || [ "$owner" = root ] || return 1
+    if [ -n "$fixture_ancestor_boundary" ] && [ "$cursor" = "$fixture_ancestor_boundary" ]; then
+      return 0
+    fi
+    [ "$cursor" = / ] && return 0
+    cursor=${cursor%/*}
+    [ -n "$cursor" ] || cursor=/
+  done
+}
+
+normalise_created_directory_chain() {
+  local existing_ancestor=$1 requested=$2 cursor
+  cursor=$requested
+  while [ "$cursor" != "$existing_ancestor" ]; do
+    normalise_created_directory "$cursor" || return 1
+    cursor=${cursor%/*}
+    [ -n "$cursor" ] || return 1
+  done
+}
+
+forbidden_identity_location() {
+  local candidate=$1 cursor
+  case /$candidate/ in
+    */.codex/plugins/cache/*|*/.claude/plugins/cache/*|*/CloudStorage/*|*/Dropbox/*|*/OneDrive*/*)
+      return 0 ;;
+  esac
+  # HOME/XDG_STATE_HOME are not trust anchors.  Walk the physical ancestor
+  # chain and reject every checkout (including a linked worktree) and every
+  # known sync/cache component, regardless of the environment path source.
+  cursor=$candidate
+  while :; do
+    case /$cursor/ in
+      */.codex/plugins/cache/*|*/.claude/plugins/cache/*|*/CloudStorage/*|*/Dropbox/*|*/OneDrive*/*) return 0 ;;
+    esac
+    [ ! -e "$cursor/.git" ] && [ ! -L "$cursor/.git" ] || return 0
+    [ "$cursor" = / ] && break
+    cursor=${cursor%/*}
+    [ -n "$cursor" ] || cursor=/
+  done
+  return 1
+}
+
+identity_root_for_current_user() {
+  local base
+  case $(platform_boundary) in
+    macos) base=${HOME:-}/Library/'Application Support' ;;
+    linux) base=${XDG_STATE_HOME:-${HOME:-}/.local/state} ;;
+    wsl) return 69 ;;
+    *) return 69 ;;
+  esac
+  case $base in
+    /*) ;;
+    *) return 64 ;;
+  esac
+  printf '%s/roundhouse/ssh-identity' "${base%/}"
+}
+
+inspect_identity_root() {
+  local requested canonical
+  requested=$1
+  canonical_absolute_path_syntax "$requested" || return 1
+  forbidden_identity_location "$requested" && return 1
+  [ -d "$requested" ] && [ ! -L "$requested" ] || return 1
+  canonical=$(canonical_directory "$requested") || return 1
+  [ "$canonical" = "${requested%/}" ] || return 1
+  forbidden_identity_location "$canonical" && return 1
+  owner_only_directory "$canonical" || return 1
+  validate_credential_ancestor_chain "$canonical" || return 1
+  identity_root=$canonical
+}
+
+prepare_identity_root() {
+  local requested ancestor canonical_ancestor
+  requested=$1
+  canonical_absolute_path_syntax "$requested" || return 1
+  forbidden_identity_location "$requested" && return 1
+  if [ -e "$requested" ] || [ -L "$requested" ]; then
+    inspect_identity_root "$requested"
+    return
+  fi
+  # Refuse an existing symlinked ancestor before mkdir can follow it.  A new
+  # root is then chmodded only after it has been independently inspected.
+  ancestor=$requested
+  while [ ! -e "$ancestor" ] && [ ! -L "$ancestor" ]; do
+    ancestor=${ancestor%/*}
+    [ -n "$ancestor" ] && [ "$ancestor" != / ] || return 1
+  done
+  [ -d "$ancestor" ] && [ ! -L "$ancestor" ] || return 1
+  canonical_ancestor=$(canonical_directory "$ancestor") || return 1
+  forbidden_identity_location "$canonical_ancestor" && return 1
+  validate_credential_ancestor_chain "$canonical_ancestor" || return 1
+  /bin/mkdir -p "$requested" >/dev/null 2>&1 || return 1
+  normalise_created_directory_chain "$ancestor" "$requested" || return 1
+  inspect_identity_root "$requested" || return 1
+  validate_credential_ancestor_chain "$identity_root"
+}
+
+prospective_identity_root_safe() {
+  # Status must use the same storage boundary as prepare even when the leaf
+  # does not exist.  This is intentionally read-only: it does not create,
+  # chmod, or repair any ancestor.
+  local requested=$1 ancestor canonical_ancestor
+  canonical_absolute_path_syntax "$requested" || return 1
+  forbidden_identity_location "$requested" && return 1
+  if [ -e "$requested" ] || [ -L "$requested" ]; then
+    inspect_identity_root "$requested"
+    return
+  fi
+  ancestor=$requested
+  while [ ! -e "$ancestor" ] && [ ! -L "$ancestor" ]; do
+    ancestor=${ancestor%/*}
+    [ -n "$ancestor" ] && [ "$ancestor" != / ] || return 1
+  done
+  [ -d "$ancestor" ] && [ ! -L "$ancestor" ] || return 1
+  canonical_ancestor=$(canonical_directory "$ancestor") || return 1
+  forbidden_identity_location "$canonical_ancestor" && return 1
+  validate_credential_ancestor_chain "$canonical_ancestor"
+}
+
+identity_directory() {
+  printf '%s/current' "$identity_root"
+}
+
+valid_domain() {
+  [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] && [[ $1 == *.* ]]
+}
+
+valid_node_id() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+}
+
+valid_principal() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._@:-]{0,127}$ ]]
+}
+
+valid_ipv4() {
+  local address=$1 a b c d extra component one two three four numeric mask prefix
+  IFS=. read -r a b c d extra <<EOF
+$address
+EOF
+  [ -z "${extra:-}" ] && [ -n "${d:-}" ] || return 1
+  for component in "$a" "$b" "$c" "$d"; do
+    [[ $component =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    [ "$component" -le 255 ] 2>/dev/null || return 1
+  done
+  one=$((10#$a)); two=$((10#$b)); three=$((10#$c)); four=$((10#$d))
+  numeric=$(( (one << 24) | (two << 16) | (three << 8) | four ))
+  prefix=$valid_source_prefix
+  if [ "$prefix" -eq 0 ]; then mask=0
+  else mask=$(( (4294967295 << (32 - prefix)) & 4294967295 ))
+  fi
+  [ $((numeric & mask)) -eq "$numeric" ]
+}
+
+valid_source_address() {
+  local value=$1 address prefix
+  case $value in
+    */*) address=${value%/*}; prefix=${value##*/} ;;
+    *) return 1 ;;
+  esac
+  [[ $prefix =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+  if [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    [ "$prefix" -le 32 ] || return 1
+    valid_source_prefix=$prefix
+    valid_ipv4 "$address"
+  else
+    [ "$prefix" -le 128 ] && [[ $address =~ ^[0-9A-Fa-f:]+$ ]] && [[ $address == *:* ]]
+  fi
+}
+
+canonicalize_csv() {
+  local input=$1 kind=$2 entry count
+  local -a entries
+  [ -n "$input" ] || return 1
+  [ "$input" != '-' ] || {
+    [ "$kind" = source ] || return 1
+    canonical_csv=-
+    return 0
+  }
+  IFS=, read -r -a entries <<EOF
+$input
+EOF
+  [ "${#entries[@]}" -ge 1 ] && [ "${#entries[@]}" -le 16 ] || return 1
+  for entry in "${entries[@]}"; do
+    case $kind in
+      principal) valid_principal "$entry" ;;
+      source) valid_source_address "$entry" ;;
+      *) return 1 ;;
+    esac || return 1
+  done
+  canonical_csv=$(printf '%s\n' "${entries[@]}" | /usr/bin/sort -u | /usr/bin/tr '\n' ',' | /usr/bin/sed 's/,$//')
+  [ "$canonical_csv" = "$input" ] || return 1
+  count=$(printf '%s\n' "${entries[@]}" | /usr/bin/sort -u | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+  [ "$count" = "${#entries[@]}" ]
+}
+
+validate_endpoint_principals() {
+  local value=$1 count
+  canonicalize_csv "$value" principal || return 1
+  count=$(printf '%s\n' "$value" | /usr/bin/tr ',' '\n' | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+  # The certificate also carries the unique node@domain signing principal.
+  [ "$count" -le 15 ]
+}
+
+system_ssh_keygen_ready() {
+  [ -f "$ssh_keygen" ] && [ ! -L "$ssh_keygen" ] && [ -x "$ssh_keygen" ] &&
+    [ "$(file_owner "$ssh_keygen")" = root ] && safe_permissions "$ssh_keygen" &&
+    [ "$(file_size "$ssh_keygen")" -le 33554432 ]
+}
+
+private_temp_directory() {
+  local directory
+  directory=$(/usr/bin/mktemp -d /tmp/machine-utilities-ssh-identity.XXXXXX 2>/dev/null) || return 1
+  normalise_created_directory "$directory" || { /bin/rm -rf "$directory" >/dev/null 2>&1; return 1; }
+  printf '%s' "$directory"
+}
+
+key_fingerprint() {
+  "$ssh_keygen" -lf "$1" -E sha256 2>/dev/null | /usr/bin/awk 'NR == 1 { print $2; exit }'
+}
+
+public_key_from_private() {
+  "$ssh_keygen" -y -f "$1" 2>/dev/null | /usr/bin/awk 'NF >= 2 && $1 == "ssh-ed25519" { print $1 " " $2; exit }'
+}
+
+private_key_comment() {
+  "$ssh_keygen" -lf "$1" -E sha256 2>/dev/null | /usr/bin/awk '
+    NR == 1 && NF == 4 && $1 ~ /^[0-9]+$/ &&
+      $2 ~ /^SHA256:[A-Za-z0-9+\057]{43}=?$/ && $4 == "(ED25519)" {
+      print $3
+      exit
+    }
+  '
+}
+
+normalise_public_key_file() {
+  local source=$1 destination
+  destination=$2
+  /usr/bin/awk '
+    NF >= 2 && NF <= 3 && $1 == "ssh-ed25519" && $2 ~ /^[A-Za-z0-9+\057]+={0,2}$/ {
+      if (NF == 3 && $3 !~ /^[ -~]+$/) exit 1
+      print $1 " " $2; found=1; next
+    }
+    { exit 1 }
+    END { exit found ? 0 : 1 }
+  ' "$source" 2>/dev/null >"$destination"
+}
+
+identity_directory_contents_safe() {
+  local directory=$1 require_request=$2 entries entry base
+  local have_key=false have_pub=false have_intent=false have_request=false have_cert=false have_contract=false
+  owner_only_directory "$directory" && validate_credential_ancestor_chain "$directory" || return 1
+  entries=$(/usr/bin/find "$directory" -mindepth 1 -maxdepth 1 -print) || return 1
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    base=${entry##*/}
+    case $base in
+      "$key_name")
+        [ "$have_key" = false ] && owner_only_file "$entry" 16384 || return 1
+        have_key=true
+        ;;
+      "$key_name.pub")
+        [ "$have_pub" = false ] && owner_only_file "$entry" 16384 || return 1
+        have_pub=true
+        ;;
+      "$generation_intent_name")
+        [ "$have_intent" = false ] && owner_only_file "$entry" 8192 || return 1
+        have_intent=true
+        ;;
+      "$request_name")
+        [ "$have_request" = false ] && owner_only_file "$entry" 16384 || return 1
+        have_request=true
+        ;;
+      "$certificate_name")
+        [ "$have_cert" = false ] && owner_only_file "$entry" 32768 || return 1
+        have_cert=true
+        ;;
+      "$certificate_contract_name")
+        [ "$have_contract" = false ] && owner_only_file "$entry" 8192 || return 1
+        have_contract=true
+        ;;
+      *) return 1 ;;
+    esac
+  done <<EOF
+$entries
+EOF
+  [ "$have_key" = true ] && [ "$have_pub" = true ] && [ "$have_intent" = true ] || return 1
+  if [ "$require_request" = true ]; then
+    [ "$have_request" = true ] || return 1
+  else
+    [ "$have_request" = false ] && [ "$have_cert" = false ] && [ "$have_contract" = false ] || return 1
+  fi
+  [ "$have_cert" = "$have_contract" ]
+}
+
+read_record_value() {
+  local file=$1 number=$2 expected=$3 line value
+  line=$(/usr/bin/sed -n "${number}p" "$file")
+  case $line in
+    "$expected"'|'*) value=${line#"$expected"|} ;;
+    *) return 1 ;;
+  esac
+  case $value in *'|'*) return 1 ;; esac
+  printf '%s' "$value"
+}
+
+parse_request_file() {
+  local file=$1 line_count temp_dir temp normalised
+  [ -f "$file" ] && [ ! -L "$file" ] && [ "$(file_size "$file")" -le 16384 ] || return 1
+  line_count=$(/usr/bin/wc -l <"$file" | /usr/bin/tr -d ' ')
+  [ "$line_count" = 9 ] || return 1
+  LC_ALL=C /usr/bin/grep -q '[^ -~]' "$file" && return 1
+  [ "$(/usr/bin/sed -n '1p' "$file")" = 'machine-utilities-ssh-csr|1' ] || return 1
+  [ "$(/usr/bin/sed -n '9p' "$file")" = 'end-csr|' ] || return 1
+  csr_domain=$(read_record_value "$file" 2 fleet-domain) || return 1
+  csr_node_id=$(read_record_value "$file" 3 node-id) || return 1
+  csr_public_key=$(read_record_value "$file" 4 public-key) || return 1
+  csr_fingerprint=$(read_record_value "$file" 5 node-key-fingerprint) || return 1
+  csr_signing_principal=$(read_record_value "$file" 6 signing-principal) || return 1
+  csr_endpoint_principals=$(read_record_value "$file" 7 endpoint-principals) || return 1
+  csr_source_addresses=$(read_record_value "$file" 8 source-addresses) || return 1
+  valid_domain "$csr_domain" && valid_node_id "$csr_node_id" &&
+    valid_principal "$csr_signing_principal" &&
+    [ "$csr_signing_principal" = "$csr_node_id@$csr_domain" ] || return 1
+  validate_endpoint_principals "$csr_endpoint_principals" || return 1
+  canonicalize_csv "$csr_source_addresses" source || return 1
+  [[ $csr_fingerprint =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] || return 1
+  temp_dir=$(private_temp_directory) || return 1
+  temp=$(/usr/bin/mktemp "$temp_dir/public.XXXXXX" 2>/dev/null) || { /bin/rm -rf "$temp_dir" >/dev/null 2>&1; return 1; }
+  normalised=$(/usr/bin/mktemp "$temp_dir/normalised.XXXXXX" 2>/dev/null) || { /bin/rm -rf "$temp_dir" >/dev/null 2>&1; return 1; }
+  if ! { normalise_created_file "$temp" 16384 && normalise_created_file "$normalised" 16384; }; then
+    /bin/rm -rf "$temp_dir" >/dev/null 2>&1
+    return 1
+  fi
+  printf '%s\n' "$csr_public_key" 2>/dev/null >"$temp"
+  if ! normalise_public_key_file "$temp" "$normalised" 2>/dev/null ||
+    [ "$(/bin/cat "$normalised")" != "$csr_public_key" ] ||
+    [ "$(key_fingerprint "$normalised")" != "$csr_fingerprint" ]; then
+    /bin/rm -rf "$temp_dir" >/dev/null 2>&1
+    return 1
+  fi
+  /bin/rm -rf "$temp_dir" >/dev/null 2>&1
+}
+
+parse_generation_intent_file() {
+  local directory=$1 intent lines
+  intent=$directory/$generation_intent_name
+  owner_only_file "$intent" 8192 || return 1
+  lines=$(/usr/bin/wc -l <"$intent" | /usr/bin/tr -d ' ')
+  [ "$lines" = 10 ] || return 1
+  LC_ALL=C /usr/bin/grep -q '[^ -~]' "$intent" && return 1
+  [ "$(/usr/bin/sed -n '1p' "$intent")" = 'machine-utilities-ssh-generation-intent|1' ] &&
+    [ "$(/usr/bin/sed -n '10p' "$intent")" = 'end-generation-intent|' ] || return 1
+  intent_domain=$(read_record_value "$intent" 2 fleet-domain) || return 1
+  intent_node_id=$(read_record_value "$intent" 3 node-id) || return 1
+  intent_signing_principal=$(read_record_value "$intent" 4 signing-principal) || return 1
+  intent_endpoint_principals=$(read_record_value "$intent" 5 endpoint-principals) || return 1
+  intent_source_addresses=$(read_record_value "$intent" 6 source-addresses) || return 1
+  intent_fingerprint=$(read_record_value "$intent" 7 node-key-fingerprint) || return 1
+  intent_private_comment=$(read_record_value "$intent" 8 private-key-comment) || return 1
+  intent_public_comment=$(read_record_value "$intent" 9 public-key-comment) || return 1
+  valid_domain "$intent_domain" && valid_node_id "$intent_node_id" &&
+    valid_principal "$intent_signing_principal" &&
+    [ "$intent_signing_principal" = "$intent_node_id@$intent_domain" ] &&
+    validate_endpoint_principals "$intent_endpoint_principals" &&
+    canonicalize_csv "$intent_source_addresses" source &&
+    [[ $intent_fingerprint =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] &&
+    valid_principal "$intent_private_comment" &&
+    [ "$intent_private_comment" = "$intent_node_id@$intent_domain" ] &&
+    [ "$intent_public_comment" = - ]
+}
+
+intent_matches_identity_fields() {
+  local domain=$1 node_id=$2 endpoints=$3 sources=$4 fingerprint=$5 private_comment=$6
+  [ "$intent_domain" = "$domain" ] && [ "$intent_node_id" = "$node_id" ] &&
+    [ "$intent_signing_principal" = "$node_id@$domain" ] &&
+    [ "$intent_endpoint_principals" = "$endpoints" ] &&
+    [ "$intent_source_addresses" = "$sources" ] &&
+    [ "$intent_fingerprint" = "$fingerprint" ] &&
+    [ "$intent_private_comment" = "$private_comment" ] &&
+    [ "$intent_public_comment" = - ]
+}
+
+release_held_request_snapshot() {
+  local directory=$held_request_snapshot_directory
+  held_request_snapshot_directory=
+  held_request_snapshot=
+  [ -n "$directory" ] || return 0
+  [ -d "$directory" ] && [ ! -L "$directory" ] || return 0
+  /bin/rm -rf "$directory"
+}
+
+emit_held_request_snapshot() {
+  [ -n "$held_request_snapshot" ] && [ -f "$held_request_snapshot" ] &&
+    [ ! -L "$held_request_snapshot" ] || return 1
+  if ! /bin/cat "$held_request_snapshot"; then
+    release_held_request_snapshot
+    return 1
+  fi
+  release_held_request_snapshot
+}
+
+request_matches_identity_fields() {
+  local expected_domain=$1 expected_node_id=$2 expected_endpoints=$3 expected_sources=$4
+  [ "$csr_public_key" = "$identity_public_key" ] && [ "$csr_fingerprint" = "$identity_fingerprint" ] ||
+    return 1
+  # The immutable owner-created intent is the metadata binding.  A request
+  # using the resident key but a substituted domain/node/principal/scope is
+  # not an equivalent public request and must never be accepted by status,
+  # request, or a repeated prepare invocation.
+  [ "$csr_domain" = "$intent_domain" ] && [ "$csr_node_id" = "$intent_node_id" ] &&
+    [ "$csr_signing_principal" = "$intent_signing_principal" ] &&
+    [ "$csr_endpoint_principals" = "$intent_endpoint_principals" ] &&
+    [ "$csr_source_addresses" = "$intent_source_addresses" ] || return 1
+  if [ -z "$expected_domain$expected_node_id$expected_endpoints$expected_sources" ]; then
+    return 0
+  fi
+  [ -n "$expected_domain" ] && [ -n "$expected_node_id" ] &&
+    [ -n "$expected_endpoints" ] && [ -n "$expected_sources" ] || return 1
+  [ "$csr_domain" = "$expected_domain" ] && [ "$csr_node_id" = "$expected_node_id" ] &&
+    [ "$csr_signing_principal" = "$expected_node_id@$expected_domain" ] &&
+    [ "$csr_endpoint_principals" = "$expected_endpoints" ] &&
+    [ "$csr_source_addresses" = "$expected_sources" ]
+}
+
+snapshot_and_validate_request() {
+  # The request pathname is opened exactly once into an owner-only private
+  # snapshot. All parsing, identity binding, and any later emission use that
+  # held snapshot, never a second read of a mutable resident pathname.
+  local directory=$1 expected_domain=$2 expected_node_id=$3 expected_endpoints=$4 expected_sources=$5
+  local source temporary_directory snapshot
+  [ -z "$held_request_snapshot_directory" ] && [ -z "$held_request_snapshot" ] || return 1
+  identity_directory_contents_safe "$directory" true || return 1
+  source=$directory/$request_name
+  owner_only_file "$source" 16384 || return 1
+  temporary_directory=$(private_temp_directory) || return 1
+  snapshot=$(/usr/bin/mktemp "$temporary_directory/request.XXXXXX" 2>/dev/null) || {
+    /bin/rm -rf "$temporary_directory" >/dev/null 2>&1
+    return 1
+  }
+  if ! normalise_created_file "$snapshot" 16384 ||
+    ! /usr/bin/head -c 16385 "$source" 2>/dev/null >"$snapshot" ||
+    ! normalise_created_file "$snapshot" 16384 ||
+    ! parse_request_file "$snapshot" ||
+    ! validate_identity_directory "$directory" "$csr_domain" "$csr_node_id" "$csr_endpoint_principals" "$csr_source_addresses" true ||
+    ! request_matches_identity_fields "$expected_domain" "$expected_node_id" "$expected_endpoints" "$expected_sources"; then
+    /bin/rm -rf "$temporary_directory" >/dev/null 2>&1
+    return 1
+  fi
+  held_request_snapshot_directory=$temporary_directory
+  held_request_snapshot=$snapshot
+}
+
+iso_utc_epoch() {
+  case $(/usr/bin/uname -s) in
+    Darwin) /bin/date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s ;;
+    Linux) /bin/date -u -d "$1" +%s ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_certificate_contract() {
+  local directory=$1 contract lines now
+  contract=$directory/$certificate_contract_name
+  owner_only_file "$contract" 8192 || return 1
+  lines=$(/usr/bin/wc -l <"$contract" | /usr/bin/tr -d ' ')
+  [ "$lines" = 10 ] || return 1
+  LC_ALL=C /usr/bin/grep -q '[^ -~]' "$contract" && return 1
+  [ "$(/usr/bin/sed -n '1p' "$contract")" = 'machine-utilities-ssh-certificate-contract|1' ] &&
+    [ "$(/usr/bin/sed -n '10p' "$contract")" = 'end-certificate-contract|' ] || return 1
+  contract_ca_fingerprint=$(read_record_value "$contract" 2 fleet-ca-fingerprint) || return 1
+  contract_ca_generation=$(read_record_value "$contract" 3 ca-generation) || return 1
+  contract_serial=$(read_record_value "$contract" 4 certificate-serial) || return 1
+  contract_valid_after=$(read_record_value "$contract" 5 certificate-valid-after) || return 1
+  contract_valid_before=$(read_record_value "$contract" 6 certificate-valid-before) || return 1
+  contract_principals=$(read_record_value "$contract" 7 certificate-principals) || return 1
+  contract_sources=$(read_record_value "$contract" 8 source-addresses) || return 1
+  contract_certifier_digest=$(read_record_value "$contract" 9 certifier-helper-sha256) || return 1
+  [[ $contract_ca_fingerprint =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] &&
+    [[ $contract_ca_generation =~ ^[1-9][0-9]{0,9}$ ]] &&
+    [[ $contract_serial =~ ^(0|[1-9][0-9]{0,19})$ ]] &&
+    [[ $contract_valid_after =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] &&
+    [[ $contract_valid_before =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] &&
+    [[ $contract_certifier_digest =~ ^[0-9a-f]{64}$ ]] || return 1
+  canonicalize_csv "$contract_principals" principal || return 1
+  canonicalize_csv "$contract_sources" source || return 1
+  contract_after_epoch=$(iso_utc_epoch "$contract_valid_after") || return 1
+  contract_before_epoch=$(iso_utc_epoch "$contract_valid_before") || return 1
+  now=$(/bin/date -u +%s) || return 1
+  [ "$contract_after_epoch" -le "$now" ] && [ "$contract_before_epoch" -gt "$now" ] &&
+    [ "$contract_before_epoch" -gt "$contract_after_epoch" ] &&
+    [ $((contract_before_epoch - contract_after_epoch)) -le 7776000 ]
+}
+
+valid_external_certificate_pins() {
+  [[ $1 =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] &&
+    [[ $2 =~ ^[1-9][0-9]{0,9}$ ]] &&
+    [[ $3 =~ ^[0-9a-f]{64}$ ]]
+}
+
+certificate_trust_state() {
+  local expected_ca_fingerprint=$1 expected_ca_generation=$2 expected_certifier_digest=$3
+  if [ -z "$expected_ca_fingerprint$expected_ca_generation$expected_certifier_digest" ]; then
+    printf '%s' locally-consistent-untrusted
+    return 0
+  fi
+  valid_external_certificate_pins "$expected_ca_fingerprint" "$expected_ca_generation" "$expected_certifier_digest" ||
+    return 1
+  [ "$contract_ca_fingerprint" = "$expected_ca_fingerprint" ] &&
+    [ "$contract_ca_generation" = "$expected_ca_generation" ] &&
+    [ "$contract_certifier_digest" = "$expected_certifier_digest" ] || return 1
+  printf '%s' trusted-ready
+}
+
+certificate_principals_from_details() {
+  printf '%s\n' "$1" | /usr/bin/awk '
+    /^[[:space:]]*Principals:/ { section=1; next }
+    /^[[:space:]]*Critical Options:/ { section=0 }
+    section { sub(/^[[:space:]]+/, ""); if ($0 != "(none)") print }
+  ' | /usr/bin/sort
+}
+
+certificate_sources_from_details() {
+  printf '%s\n' "$1" | /usr/bin/awk '
+    /^[[:space:]]*Critical Options:/ { section=1; next }
+    /^[[:space:]]*Extensions:/ { section=0 }
+    section {
+      sub(/^[[:space:]]+/, "")
+      if ($0 == "(none)") next
+      if ($1 != "source-address" || NF != 2) exit 1
+      count=split($2, addresses, ",")
+      for (i=1; i<=count; i++) print addresses[i]
+    }
+  ' | /usr/bin/sort
+}
+
+validate_identity_directory() {
+  local directory=$1 domain=$2 node_id=$3 endpoints=$4 sources=$5 require_request=${6:-true}
+  local expected_public expected_fingerprint expected_private_comment details observed_key_id observed_ca observed_serial observed_after observed_before
+  local expected_principals observed_principals expected_sources observed_sources temp_dir
+  local key=$directory/$key_name pub=$directory/$key_name.pub cert=$directory/$certificate_name
+  identity_directory_contents_safe "$directory" "$require_request" || return 1
+  owner_only_file "$key" 16384 && owner_only_file "$pub" 16384 || return 1
+  expected_public=$(public_key_from_private "$key") || return 1
+  [ -n "$expected_public" ] || return 1
+  temp_dir=$(private_temp_directory) || return 1
+  local scratch
+  scratch=$(/usr/bin/mktemp "$temp_dir/public.XXXXXX" 2>/dev/null) || { /bin/rm -rf "$temp_dir" >/dev/null 2>&1; return 1; }
+  local normalised
+  normalised=$(/usr/bin/mktemp "$temp_dir/normalised.XXXXXX" 2>/dev/null) || { /bin/rm -rf "$temp_dir" >/dev/null 2>&1; return 1; }
+  if ! { normalise_created_file "$scratch" 16384 && normalise_created_file "$normalised" 16384; }; then
+    /bin/rm -rf "$temp_dir"
+    return 1
+  fi
+  printf '%s\n' "$expected_public" 2>/dev/null >"$scratch"
+  if ! normalise_public_key_file "$pub" "$normalised" ||
+    [ "$(/bin/cat "$normalised")" != "$expected_public" ]; then
+    /bin/rm -rf "$temp_dir"
+    return 1
+  fi
+  expected_fingerprint=$(key_fingerprint "$scratch") || { /bin/rm -rf "$temp_dir"; return 1; }
+  [ -n "$expected_fingerprint" ] || { /bin/rm -rf "$temp_dir"; return 1; }
+  expected_private_comment=$(private_key_comment "$key") || { /bin/rm -rf "$temp_dir"; return 1; }
+  if ! parse_generation_intent_file "$directory" ||
+    ! intent_matches_identity_fields "$domain" "$node_id" "$endpoints" "$sources" \
+      "$expected_fingerprint" "$expected_private_comment"; then
+    /bin/rm -rf "$temp_dir"
+    return 1
+  fi
+  if [ -e "$cert" ] || [ -L "$cert" ]; then
+    if ! { owner_only_file "$cert" 32768 && parse_certificate_contract "$directory"; }; then
+      /bin/rm -rf "$temp_dir"
+      return 1
+    fi
+    expected_principals=$(printf '%s\n%s\n' "$node_id@$domain" "$endpoints" |
+      /usr/bin/tr ',' '\n' | /usr/bin/sort -u)
+    observed_principals=$(printf '%s' "$contract_principals" | /usr/bin/tr ',' '\n' | /usr/bin/sort)
+    [ "$observed_principals" = "$expected_principals" ] && [ "$contract_sources" = "$sources" ] || {
+      /bin/rm -rf "$temp_dir"
+      return 1
+    }
+    details=$("$ssh_keygen" -Lf "$cert" 2>/dev/null) || { /bin/rm -rf "$temp_dir"; return 1; }
+    observed_key_id=$(printf '%s\n' "$details" | /usr/bin/awk -F '"' '/^[[:space:]]*Key ID:/ { print $2; exit }')
+    observed_ca=$(printf '%s\n' "$details" | /usr/bin/awk '/^[[:space:]]*Signing CA:/ { for (i=1; i<=NF; i++) if ($i ~ /^SHA256:/) { print $i; exit } }')
+    observed_serial=$(printf '%s\n' "$details" | /usr/bin/awk '/^[[:space:]]*Serial:/ { print $2; exit }')
+    observed_after=$(printf '%s\n' "$details" | /usr/bin/awk '/^[[:space:]]*Valid: from / { print $3 "Z"; exit }')
+    observed_before=$(printf '%s\n' "$details" | /usr/bin/awk '/^[[:space:]]*Valid: from / { print $5 "Z"; exit }')
+    observed_principals=$(certificate_principals_from_details "$details") || {
+      /bin/rm -rf "$temp_dir"
+      return 1
+    }
+    expected_sources=
+    [ "$sources" = - ] || expected_sources=$(printf '%s' "$sources" | /usr/bin/tr ',' '\n' | /usr/bin/sort)
+    observed_sources=$(certificate_sources_from_details "$details") || {
+      /bin/rm -rf "$temp_dir"
+      return 1
+    }
+    if ! printf '%s\n' "$details" | /usr/bin/grep -Eq '^[[:space:]]*Type:[[:space:]]+ssh-ed25519-cert-v01@openssh.com user certificate$' ||
+      [ "$observed_key_id" != "$node_id@$domain" ] ||
+      [ "$observed_ca" != "$contract_ca_fingerprint" ] ||
+      [ "$observed_serial" != "$contract_serial" ] ||
+      [ "$observed_after" != "$contract_valid_after" ] ||
+      [ "$observed_before" != "$contract_valid_before" ] ||
+      [ "$observed_principals" != "$expected_principals" ] ||
+      [ "$observed_sources" != "$expected_sources" ] ||
+      ! printf '%s\n' "$details" | /usr/bin/grep -Eq '^[[:space:]]*Extensions:[[:space:]]+\(none\)[[:space:]]*$' ||
+      [ "$(key_fingerprint "$cert")" != "$expected_fingerprint" ]; then
+      /bin/rm -rf "$temp_dir"
+      return 1
+    fi
+  fi
+  /bin/rm -rf "$temp_dir"
+  identity_public_key=$expected_public
+  identity_fingerprint=$expected_fingerprint
+}
+
+write_generation_intent_to_directory() {
+  local directory=$1 domain=$2 node_id=$3 endpoints=$4 sources=$5 target temporary
+  local expected_fingerprint expected_private_comment
+  local key=$directory/$key_name pub=$directory/$key_name.pub
+  owner_only_file "$key" 16384 && owner_only_file "$pub" 16384 || return 1
+  expected_fingerprint=$(key_fingerprint "$pub") || return 1
+  expected_private_comment=$(private_key_comment "$key") || return 1
+  [ "$expected_private_comment" = "$node_id@$domain" ] || return 1
+  target=$directory/$generation_intent_name
+  temporary=$(/usr/bin/mktemp "$directory/.generation-intent.XXXXXX" 2>/dev/null) || return 1
+  normalise_created_file "$temporary" 8192 || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
+  if ! record \
+    'machine-utilities-ssh-generation-intent|1' \
+    "fleet-domain|$domain" \
+    "node-id|$node_id" \
+    "signing-principal|$node_id@$domain" \
+    "endpoint-principals|$endpoints" \
+    "source-addresses|$sources" \
+    "node-key-fingerprint|$expected_fingerprint" \
+    "private-key-comment|$expected_private_comment" \
+    'public-key-comment|-' \
+    'end-generation-intent|' >"$temporary" 2>/dev/null; then
+    /bin/rm -f "$temporary" >/dev/null 2>&1
+    return 1
+  fi
+  if ! normalise_created_file "$temporary" 8192 || [ -e "$target" ] || [ -L "$target" ]; then
+    /bin/rm -f "$temporary" >/dev/null 2>&1
+    return 1
+  fi
+  /bin/mv "$temporary" "$target" >/dev/null 2>&1 || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
+  if ! parse_generation_intent_file "$directory" ||
+    ! intent_matches_identity_fields "$domain" "$node_id" "$endpoints" "$sources" \
+      "$expected_fingerprint" "$expected_private_comment"; then
+    /bin/rm -f "$target" >/dev/null 2>&1
+    return 1
+  fi
+  owner_only_file "$target" 8192
+}
+
+write_request_to_directory() {
+  local directory=$1 domain=$2 node_id=$3 endpoints=$4 sources=$5 target temporary
+  target=$directory/$request_name
+  temporary=$(/usr/bin/mktemp "$directory/.request.XXXXXX" 2>/dev/null) || return 1
+  normalise_created_file "$temporary" 16384 || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
+  if fixture_failpoint partial-request-record; then
+    record 'machine-utilities-ssh-csr|1' 2>/dev/null >"$temporary" || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
+    /bin/rm -f "$temporary" >/dev/null 2>&1
+    return 1
+  fi
+  if ! record \
+    'machine-utilities-ssh-csr|1' \
+    "fleet-domain|$domain" \
+    "node-id|$node_id" \
+    "public-key|$identity_public_key" \
+    "node-key-fingerprint|$identity_fingerprint" \
+    "signing-principal|$node_id@$domain" \
+    "endpoint-principals|$endpoints" \
+    "source-addresses|$sources" \
+    'end-csr|' 2>/dev/null >"$temporary"; then
+    /bin/rm -f "$temporary" >/dev/null 2>&1
+    return 1
+  fi
+  if ! normalise_created_file "$temporary" 16384 ||
+    ! parse_request_file "$temporary" ||
+    ! request_matches_identity_fields "$domain" "$node_id" "$endpoints" "$sources" ||
+    [ -e "$target" ] || [ -L "$target" ]; then
+    /bin/rm -f "$temporary" >/dev/null 2>&1
+    return 1
+  fi
+  /bin/mv "$temporary" "$target" >/dev/null 2>&1 || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
+  owner_only_file "$target" 16384
+}
+
+fixture_failpoint() {
+  [ "$fixture_mode" = true ] && [ "${ROUNDHOUSE_PREPARE_TEST_FAILPOINT:-}" = "$1" ]
+}
+
+fixture_pause() {
+  local label=$1 marker=${ROUNDHOUSE_PREPARE_TEST_PAUSE_MARKER:-}
+  [ "$fixture_mode" = true ] && [ "${ROUNDHOUSE_PREPARE_TEST_PAUSE_AT:-}" = "$label" ] &&
+    [ -n "$marker" ] || return 0
+  : >"$marker" 2>/dev/null || return 1
+  while :; do
+    /bin/sleep 1
+  done
+}
+
+fixture_worker_prepare() {
+  # self-test uses a fresh Bash process so its lease PID is the actual worker
+  # process, not the parent test shell's PID inherited by a subshell on the
+  # Bash 3.2 shipped with macOS.
+  local source_path=$1 root=$2 boundary=$3 domain=$4 node_id=$5 endpoints=$6 sources=$7 emit_snapshot=$8
+  exec /bin/bash -p -c '
+    eval "$(/usr/bin/awk '\''/^command=/{exit} {print}'\'' "$1")"
+    fixture_mode=true
+    fixture_ancestor_boundary=$3
+    identity_root=$2
+    prepare_identity "$4" "$5" "$6" "$7" "$8"
+  ' _ "$source_path" "$root" "$boundary" "$domain" "$node_id" "$endpoints" "$sources" "$emit_snapshot"
+}
+
+fixture_wait_for_marker() {
+  local marker=$1 attempts=0
+  while [ ! -f "$marker" ] || [ -L "$marker" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -le 200 ] || return 1
+    /bin/sleep 0.025
+  done
+}
+
+register_self_test_worker() {
+  [[ $1 =~ ^[1-9][0-9]*$ ]] || return 1
+  self_test_worker_pids="$self_test_worker_pids $1"
+}
+
+forget_self_test_worker() {
+  local target=$1 candidate remaining=
+  [[ $target =~ ^[1-9][0-9]*$ ]] || return 1
+  for candidate in $self_test_worker_pids; do
+    [ "$candidate" = "$target" ] || remaining="$remaining $candidate"
+  done
+  self_test_worker_pids=$remaining
+}
+
+cleanup_self_test_workers() {
+  local candidate command
+  for candidate in $self_test_worker_pids; do
+    [[ $candidate =~ ^[1-9][0-9]*$ ]] || continue
+    if /bin/kill -0 "$candidate" 2>/dev/null; then
+      command=$(/bin/ps -p "$candidate" -o command= 2>/dev/null || true)
+      case $command in
+        *"$self_test_worker_root"*prepare-ssh-identity*)
+          /bin/kill -TERM "$candidate" 2>/dev/null || true
+          wait "$candidate" 2>/dev/null || true
+          ;;
+      esac
+    fi
+  done
+  self_test_worker_pids=
+  self_test_worker_root=
+}
+
+identity_root_contents_safe() {
+  local directory=$1 permitted_lock=$2 permitted_stage=$3 entries entry base current_count=0 stage_count=0
+  owner_only_directory "$directory" && validate_credential_ancestor_chain "$directory" || return 1
+  entries=$(/usr/bin/find "$directory" -mindepth 1 -maxdepth 1 -print) || return 1
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    base=${entry##*/}
+    case $base in
+      current)
+        [ "$current_count" -eq 0 ] && owner_only_directory "$entry" || return 1
+        current_count=1
+        ;;
+      .prepare-lock)
+        [ -n "$permitted_lock" ] && [ "$entry" = "$permitted_lock" ] &&
+          owner_only_directory "$entry" || return 1
+        ;;
+      .identity.*)
+        if [ "$permitted_stage" = waiting-stage ]; then
+          [ "$stage_count" -eq 0 ] && owner_only_directory "$entry" || return 1
+          stage_count=1
+        else
+          [ -n "$permitted_stage" ] && [ "$entry" = "$permitted_stage" ] &&
+            owner_only_directory "$entry" || return 1
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+  done <<EOF
+$entries
+EOF
+  [ "$stage_count" -eq 0 ] ||
+    { [ -n "$permitted_lock" ] && [ -d "$permitted_lock" ] && [ ! -L "$permitted_lock" ]; }
+}
+
+clear_owned_prepare_stage() {
+  local nested current stage_name
+  [ -n "$owned_prepare_stage" ] && [ -n "$owned_prepare_stage_id" ] || return 0
+  prepare_lock_owned_by_current_process || return 1
+  stage_name=${owned_prepare_stage##*/}
+  [ "$lease_stage" = "$stage_name" ] && [ "$lease_stage_id" = "$owned_prepare_stage_id" ] || return 1
+  if [ -d "$owned_prepare_stage" ] && [ ! -L "$owned_prepare_stage" ] &&
+    [ "$(file_device_inode "$owned_prepare_stage")" = "$owned_prepare_stage_id" ]; then
+    /bin/rm -rf "$owned_prepare_stage" >/dev/null 2>&1 || return 1
+  else
+    current=$(identity_directory)
+    nested=$current/${owned_prepare_stage##*/}
+    if [ -d "$nested" ] && [ ! -L "$nested" ] &&
+      [ "$(file_device_inode "$nested")" = "$owned_prepare_stage_id" ]; then
+      /bin/rm -rf "$nested" >/dev/null 2>&1 || return 1
+    else
+      return 1
+    fi
+  fi
+  owned_prepare_stage=
+  owned_prepare_stage_id=
+  write_prepare_lock_lease "$owned_prepare_lock" "$owned_prepare_lock_id" - -
+}
+
+release_owned_prepare_lock() {
+  [ -n "$owned_prepare_lock" ] && [ -n "$owned_prepare_lock_id" ] || return 0
+  if [ -d "$owned_prepare_lock" ] && [ ! -L "$owned_prepare_lock" ] &&
+    [ "$(file_device_inode "$owned_prepare_lock")" = "$owned_prepare_lock_id" ]; then
+    prepare_lock_owned_by_current_process || return 1
+    # A stage that was already removed may still be recorded if the lease
+    # rewrite was interrupted.  It is safe for this same live owner to close
+    # only that exact, now-absent stage record; a present stage is never lost.
+    if [ "$lease_stage" != - ] || [ "$lease_stage_id" != - ]; then
+      [ ! -e "$identity_root/$lease_stage" ] && [ ! -L "$identity_root/$lease_stage" ] || return 1
+    fi
+    /bin/rm -f "$owned_prepare_lock/$prepare_lock_lease_name" >/dev/null 2>&1 || return 1
+    /bin/rmdir "$owned_prepare_lock" >/dev/null 2>&1 || return 1
+  fi
+  owned_prepare_lock=
+  owned_prepare_lock_id=
+  owned_prepare_pid=
+  owned_prepare_process_start=
+  owned_prepare_boot_identity=
+}
+
+cleanup_owned_prepare_artifacts() {
+  release_held_request_snapshot || true
+  clear_owned_prepare_stage || true
+  release_owned_prepare_lock || true
+}
+
+install_prepare_cleanup_traps() {
+  trap 'cleanup_owned_prepare_artifacts' EXIT
+  trap 'cleanup_owned_prepare_artifacts; exit 129' HUP
+  trap 'cleanup_owned_prepare_artifacts; exit 130' INT
+  trap 'cleanup_owned_prepare_artifacts; exit 143' TERM
+}
+
+clear_prepare_cleanup_traps() {
+  trap - EXIT HUP INT TERM
+}
+
+digest_text() {
+  if [ -x /usr/bin/shasum ]; then
+    /usr/bin/shasum -a 256 | /usr/bin/awk 'NF >= 1 && $1 ~ /^[0-9a-f]{64}$/ { print $1; exit }'
+  elif [ -x /bin/shasum ]; then
+    /bin/shasum -a 256 | /usr/bin/awk 'NF >= 1 && $1 ~ /^[0-9a-f]{64}$/ { print $1; exit }'
+  elif [ -x /usr/bin/sha256sum ]; then
+    /usr/bin/sha256sum | /usr/bin/awk 'NF >= 1 && $1 ~ /^[0-9a-f]{64}$/ { print $1; exit }'
+  elif [ -x /bin/sha256sum ]; then
+    /bin/sha256sum | /usr/bin/awk 'NF >= 1 && $1 ~ /^[0-9a-f]{64}$/ { print $1; exit }'
+  else
+    return 1
+  fi
+}
+
+current_boot_identity() {
+  local value
+  case $(/usr/bin/uname -s) in
+    Darwin)
+      value=$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null | /usr/bin/awk '
+        /\{ sec = [0-9]+/ { sub(/^.*\{ sec = /, ""); sub(/,.*/, ""); print; exit }
+      ') || return 1
+      [[ $value =~ ^[0-9]+$ ]] || return 1
+      printf 'macos:%s' "$value"
+      ;;
+    Linux)
+      [ -r /proc/sys/kernel/random/boot_id ] || return 1
+      value=$(/bin/cat /proc/sys/kernel/random/boot_id 2>/dev/null) || return 1
+      [[ $value =~ ^[0-9a-fA-F-]{36}$ ]] || return 1
+      printf 'linux:%s' "${value,,}"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+process_start_identity() {
+  local pid=$1 value
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  case $(/usr/bin/uname -s) in
+    Darwin)
+      value=$(/bin/ps -o lstart= -p "$pid" 2>/dev/null | /usr/bin/awk '
+        NF == 5 { print $0; exit }
+      ') || return 1
+      [ -n "$value" ] || return 1
+      printf '%s\n' "$value" | digest_text
+      ;;
+    Linux)
+      [ -r "/proc/$pid/stat" ] || return 1
+      value=$(/usr/bin/sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null |
+        /usr/bin/awk 'NF >= 20 && $20 ~ /^[0-9]+$/ { print $20; exit }') || return 1
+      [[ $value =~ ^[0-9]+$ ]] || return 1
+      printf 'linux:%s' "$value"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+process_presence() {
+  local pid=$1
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 2
+  if kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  if /bin/ps -p "$pid" -o pid= 2>/dev/null | /usr/bin/awk 'NF == 1 && $1 ~ /^[0-9]+$/ { found=1 } END { exit found ? 0 : 1 }'; then
+    # A visible process which we cannot signal is not proof of a stale owner.
+    return 2
+  fi
+  return 1
+}
+
+parse_prepare_lock_lease() {
+  local lock=$1 lease lines
+  lease=$lock/$prepare_lock_lease_name
+  owner_only_file "$lease" 2048 || return 1
+  lines=$(/usr/bin/wc -l <"$lease" | /usr/bin/tr -d ' ')
+  [ "$lines" = 9 ] || return 1
+  LC_ALL=C /usr/bin/grep -q '[^ -~]' "$lease" && return 1
+  [ "$(/usr/bin/sed -n '1p' "$lease")" = 'machine-utilities-prepare-lock|1' ] &&
+    [ "$(/usr/bin/sed -n '9p' "$lease")" = 'end-prepare-lock|' ] || return 1
+  lease_owner=$(read_record_value "$lease" 2 owner) || return 1
+  lease_pid=$(read_record_value "$lease" 3 pid) || return 1
+  lease_process_start=$(read_record_value "$lease" 4 process-start) || return 1
+  lease_boot_identity=$(read_record_value "$lease" 5 boot-identity) || return 1
+  lease_lock_id=$(read_record_value "$lease" 6 lock-device-inode) || return 1
+  lease_stage=$(read_record_value "$lease" 7 stage) || return 1
+  lease_stage_id=$(read_record_value "$lease" 8 stage-device-inode) || return 1
+  [[ $lease_owner =~ ^[A-Za-z0-9._-]{1,128}$ ]] &&
+    [[ $lease_pid =~ ^[1-9][0-9]*$ ]] &&
+    ([[ $lease_process_start =~ ^[0-9a-f]{64}$ ]] || [[ $lease_process_start =~ ^linux:[0-9]+$ ]]) &&
+    [[ $lease_boot_identity =~ ^(macos:[0-9]+|linux:[0-9a-f-]{36})$ ]] &&
+    [[ $lease_lock_id =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  if [ "$lease_stage" = - ]; then
+    [ "$lease_stage_id" = - ] || return 1
+  else
+    [[ $lease_stage =~ ^\.identity\.[A-Za-z0-9]+$ ]] &&
+      [[ $lease_stage_id =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  fi
+}
+
+prepare_lock_contents_safe() {
+  local lock=$1 entries entry base count=0 actual_id
+  owner_only_directory "$lock" && validate_credential_ancestor_chain "$lock" || return 1
+  entries=$(/usr/bin/find "$lock" -mindepth 1 -maxdepth 1 -print 2>/dev/null) || return 1
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    base=${entry##*/}
+    [ "$base" = "$prepare_lock_lease_name" ] && [ "$count" -eq 0 ] &&
+      owner_only_file "$entry" 2048 || return 1
+    count=1
+  done <<EOF
+$entries
+EOF
+  [ "$count" -eq 1 ] || return 1
+  parse_prepare_lock_lease "$lock" || return 1
+  actual_id=$(file_device_inode "$lock") || return 1
+  [ "$lease_lock_id" = "$actual_id" ]
+}
+
+prepare_lock_owned_by_current_process() {
+  local current_pid
+  [ -n "$owned_prepare_lock" ] && [ -n "$owned_prepare_lock_id" ] &&
+    [ -n "$owned_prepare_pid" ] && [ -n "$owned_prepare_process_start" ] &&
+    [ -n "$owned_prepare_boot_identity" ] || return 1
+  prepare_lock_contents_safe "$owned_prepare_lock" || return 1
+  # macOS ships Bash 3.2, which has no BASHPID.  In a normal command
+  # invocation `$$` identifies the script process and remains stable for the
+  # lifetime of its lease.
+  current_pid=$$
+  [ "$owned_prepare_pid" = "$current_pid" ] &&
+    [ "$lease_owner" = "$(/usr/bin/id -un)" ] &&
+    [ "$lease_pid" = "$owned_prepare_pid" ] &&
+    [ "$lease_process_start" = "$owned_prepare_process_start" ] &&
+    [ "$lease_boot_identity" = "$owned_prepare_boot_identity" ] &&
+    [ "$lease_lock_id" = "$owned_prepare_lock_id" ]
+}
+
+write_prepare_lock_lease() {
+  local lock=$1 lock_id=$2 stage=$3 stage_id=$4 temporary stage_name
+  [ -d "$lock" ] && [ ! -L "$lock" ] && [ "$(file_device_inode "$lock")" = "$lock_id" ] || return 1
+  owner_only_directory "$lock" || return 1
+  [ -n "$owned_prepare_pid$owned_prepare_process_start$owned_prepare_boot_identity" ] || return 1
+  if [ "$stage" = - ]; then
+    [ "$stage_id" = - ] || return 1
+  else
+    stage_name=${stage##*/}
+    [ "$stage_name" = "$stage" ] && [[ $stage_name =~ ^\.identity\.[A-Za-z0-9]+$ ]] &&
+      [[ $stage_id =~ ^[0-9]+:[0-9]+$ ]] || return 1
+    stage=$stage_name
+  fi
+  temporary=$(/usr/bin/mktemp "$lock/.lease.XXXXXX" 2>/dev/null) || return 1
+  normalise_created_file "$temporary" 2048 || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
+  if ! record \
+    'machine-utilities-prepare-lock|1' \
+    "owner|$(/usr/bin/id -un)" \
+    "pid|$owned_prepare_pid" \
+    "process-start|$owned_prepare_process_start" \
+    "boot-identity|$owned_prepare_boot_identity" \
+    "lock-device-inode|$lock_id" \
+    "stage|$stage" \
+    "stage-device-inode|$stage_id" \
+    'end-prepare-lock|' >"$temporary" 2>/dev/null; then
+    /bin/rm -f "$temporary" >/dev/null 2>&1
+    return 1
+  fi
+  normalise_created_file "$temporary" 2048 || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
+  /bin/mv -f "$temporary" "$lock/$prepare_lock_lease_name" >/dev/null 2>&1 || {
+    /bin/rm -f "$temporary" >/dev/null 2>&1
+    return 1
+  }
+  prepare_lock_owned_by_current_process
+}
+
+prepare_lock_staleness() {
+  # Return 0 only for a provably stale same-owner lease; 1 is live and 2 is
+  # ambiguous/corrupt.  Callers must preserve ambiguous and other-owner locks.
+  local lock=$1 actual_id current_boot observed_start presence
+  prepare_lock_contents_safe "$lock" || return 2
+  actual_id=$(file_device_inode "$lock") || return 2
+  [ "$lease_owner" = "$(/usr/bin/id -un)" ] && [ "$lease_lock_id" = "$actual_id" ] || return 2
+  current_boot=$(current_boot_identity) || return 2
+  [ "$lease_boot_identity" = "$current_boot" ] || return 0
+  if process_presence "$lease_pid"; then
+    presence=0
+  else
+    presence=$?
+  fi
+  case $presence in
+    0)
+      observed_start=$(process_start_identity "$lease_pid") || return 2
+      [ "$observed_start" = "$lease_process_start" ] && return 1
+      return 0
+      ;;
+    1) return 0 ;;
+    *) return 2 ;;
+  esac
+}
+
+recover_stale_prepare_lock() {
+  local lock=$1 actual_id stage_path
+  if ! prepare_lock_staleness "$lock"; then
+    return 2
+  fi
+  prepare_lock_contents_safe "$lock" || return 2
+  actual_id=$(file_device_inode "$lock") || return 2
+  [ "$lease_owner" = "$(/usr/bin/id -un)" ] && [ "$lease_lock_id" = "$actual_id" ] || return 2
+  if [ "$lease_stage" != - ]; then
+    stage_path=$identity_root/$lease_stage
+    if [ -e "$stage_path" ] || [ -L "$stage_path" ]; then
+      [ -d "$stage_path" ] && [ ! -L "$stage_path" ] && owner_only_directory "$stage_path" &&
+        [ "$(file_device_inode "$stage_path")" = "$lease_stage_id" ] || return 2
+      /bin/rm -rf "$stage_path" >/dev/null 2>&1 || return 2
+    fi
+  fi
+  if ! prepare_lock_staleness "$lock"; then
+    return 2
+  fi
+  [ "$(file_device_inode "$lock")" = "$actual_id" ] || return 2
+  /bin/rm -f "$lock/$prepare_lock_lease_name" >/dev/null 2>&1 || return 2
+  /bin/rmdir "$lock" >/dev/null 2>&1
+}
+
+prepare_lock_attempt_limit() {
+  local limit=${ROUNDHOUSE_PREPARE_TEST_LOCK_ATTEMPTS:-}
+  if [ "$fixture_mode" = true ] && [ -n "$limit" ]; then
+    [[ $limit =~ ^[1-9][0-9]?$ ]] && [ "$limit" -le 64 ] || return 1
+    printf '%s' "$limit"
+  else
+    printf '%s' 480
+  fi
+}
+
+prepare_lock_backoff() {
+  local attempts=$1 delay
+  delay=$((15 + (RANDOM % 26)))
+  [ "$attempts" -le 12 ] || delay=$((50 + (RANDOM % 76)))
+  /bin/sleep "0.$(printf '%03d' "$delay")"
+}
+
+acquire_prepare_lock() {
+  local candidate=$identity_root/.prepare-lock attempts=0 limit state
+  limit=$(prepare_lock_attempt_limit) || return 1
+  while :; do
+    if /bin/mkdir "$candidate" 2>/dev/null; then
+      if ! normalise_created_directory "$candidate"; then
+        /bin/rmdir "$candidate" >/dev/null 2>&1 || true
+        return 1
+      fi
+      owned_prepare_lock=$candidate
+      owned_prepare_lock_id=$(file_device_inode "$candidate") || {
+        /bin/rmdir "$candidate" >/dev/null 2>&1 || true
+        owned_prepare_lock=
+        return 1
+      }
+      owned_prepare_pid=$$
+      if ! owned_prepare_process_start=$(process_start_identity "$owned_prepare_pid") ||
+        ! owned_prepare_boot_identity=$(current_boot_identity); then
+        /bin/rmdir "$candidate" >/dev/null 2>&1 || true
+        owned_prepare_lock=
+        owned_prepare_lock_id=
+        owned_prepare_pid=
+        owned_prepare_process_start=
+        owned_prepare_boot_identity=
+        return 1
+      fi
+      if ! write_prepare_lock_lease "$owned_prepare_lock" "$owned_prepare_lock_id" - -; then
+        /bin/rm -f "$owned_prepare_lock/$prepare_lock_lease_name" >/dev/null 2>&1 || true
+        /bin/rmdir "$owned_prepare_lock" >/dev/null 2>&1 || true
+        owned_prepare_lock=
+        owned_prepare_lock_id=
+        owned_prepare_pid=
+        owned_prepare_process_start=
+        owned_prepare_boot_identity=
+        return 1
+      fi
+      return 0
+    fi
+    # mkdir can lose a release/reacquire race after returning EEXIST.  A
+    # vanished candidate is retried; an unsafe, live, or ambiguous candidate
+    # is never removed and eventually reports the public retryable code 75.
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+      if owner_only_directory "$candidate"; then
+        if prepare_lock_staleness "$candidate"; then
+          state=0
+        else
+          state=$?
+        fi
+        if [ "$state" -eq 0 ]; then
+          recover_stale_prepare_lock "$candidate" || state=2
+          [ "$state" -eq 0 ] && continue
+        fi
+      else
+        state=2
+      fi
+    fi
+    attempts=$((attempts + 1))
+    [ "$attempts" -le "$limit" ] || return 75
+    prepare_lock_backoff "$attempts" || return 75
+  done
+}
+
+record_fixture_generation() {
+  local log=${ROUNDHOUSE_PREPARE_TEST_GENERATION_LOG:-}
+  [ "$fixture_mode" = true ] && [ -n "$log" ] || return 0
+  printf '%s\n' "$$" >>"$log"
+}
+
+finish_prepared_request() {
+  local emit_snapshot=$1
+  if ! release_owned_prepare_lock; then
+    cleanup_owned_prepare_artifacts
+    clear_prepare_cleanup_traps
+    return 1
+  fi
+  clear_prepare_cleanup_traps
+  if [ "$emit_snapshot" = true ]; then
+    emit_held_request_snapshot
+  else
+    release_held_request_snapshot
+  fi
+}
+
+prepare_identity() {
+  local domain=$1 node_id=$2 endpoints=$3 sources=$4 emit_snapshot=${5:-false}
+  local current stage published_id
+  case $emit_snapshot in true|false) ;; *) return 1 ;; esac
+  valid_domain "$domain" && valid_node_id "$node_id" || return 1
+  validate_endpoint_principals "$endpoints" || return 1
+  endpoints=$canonical_csv
+  canonicalize_csv "$sources" source || return 1
+  sources=$canonical_csv
+  [ -z "$owned_prepare_lock$owned_prepare_lock_id$owned_prepare_stage$owned_prepare_stage_id" ] &&
+    [ -z "$owned_prepare_pid$owned_prepare_process_start$owned_prepare_boot_identity" ] &&
+    [ -z "$held_request_snapshot_directory$held_request_snapshot" ] || return 1
+  system_ssh_keygen_ready || return 1
+  inspect_identity_root "$identity_root" || return 1
+  identity_root_contents_safe "$identity_root" "$identity_root/.prepare-lock" waiting-stage || return 1
+  install_prepare_cleanup_traps
+  local lock_result
+  if acquire_prepare_lock; then
+    lock_result=0
+  else
+    lock_result=$?
+  fi
+  if [ "$lock_result" -ne 0 ]; then
+    cleanup_owned_prepare_artifacts
+    clear_prepare_cleanup_traps
+    return "$lock_result"
+  fi
+  if ! prepare_lock_owned_by_current_process ||
+    ! identity_root_contents_safe "$identity_root" "$owned_prepare_lock" ""; then
+    cleanup_owned_prepare_artifacts
+    clear_prepare_cleanup_traps
+    return 1
+  fi
+  current=$(identity_directory)
+  if [ -e "$current" ] || [ -L "$current" ]; then
+    if ! snapshot_and_validate_request "$current" "$domain" "$node_id" "$endpoints" "$sources"; then
+      cleanup_owned_prepare_artifacts
+      clear_prepare_cleanup_traps
+      return 1
+    fi
+    finish_prepared_request "$emit_snapshot" || return 1
+    return
+  fi
+  stage=$(/usr/bin/mktemp -d "$identity_root/.identity.XXXXXX" 2>/dev/null) || {
+    cleanup_owned_prepare_artifacts
+    clear_prepare_cleanup_traps
+    return 1
+  }
+  owned_prepare_stage=$stage
+  owned_prepare_stage_id=$(file_device_inode "$stage") || {
+    cleanup_owned_prepare_artifacts
+    clear_prepare_cleanup_traps
+    return 1
+  }
+  if ! write_prepare_lock_lease "$owned_prepare_lock" "$owned_prepare_lock_id" \
+      "${owned_prepare_stage##*/}" "$owned_prepare_stage_id" ||
+    ! fixture_pause after-stage-lease ||
+    ! normalise_created_directory "$stage" ||
+    ! identity_root_contents_safe "$identity_root" "$owned_prepare_lock" "$stage" ||
+    ! record_fixture_generation ||
+    ! "$ssh_keygen" -q -t ed25519 -a 64 -N '' -C "$node_id@$domain" -f "$stage/$key_name" >/dev/null 2>&1 ||
+    ! normalise_created_file "$stage/$key_name" 16384 ||
+    ! normalise_created_file "$stage/$key_name.pub" 16384 ||
+    ! write_generation_intent_to_directory "$stage" "$domain" "$node_id" "$endpoints" "$sources" ||
+    ! validate_identity_directory "$stage" "$domain" "$node_id" "$endpoints" "$sources" false ||
+    ! write_request_to_directory "$stage" "$domain" "$node_id" "$endpoints" "$sources" ||
+    ! identity_directory_contents_safe "$stage" true ||
+    fixture_failpoint after-staged-request; then
+    cleanup_owned_prepare_artifacts
+    clear_prepare_cleanup_traps
+    return 1
+  fi
+  # Recheck under the per-root lock. A concurrent caller can now use an
+  # existing matching identity, but its stage is never moved below current.
+  if [ -e "$current" ] || [ -L "$current" ]; then
+    clear_owned_prepare_stage || {
+      cleanup_owned_prepare_artifacts
+      clear_prepare_cleanup_traps
+      return 1
+    }
+    if ! snapshot_and_validate_request "$current" "$domain" "$node_id" "$endpoints" "$sources"; then
+      cleanup_owned_prepare_artifacts
+      clear_prepare_cleanup_traps
+      return 1
+    fi
+    finish_prepared_request "$emit_snapshot" || return 1
+    return
+  fi
+  published_id=$owned_prepare_stage_id
+  if ! /bin/mv "$stage" "$current" >/dev/null 2>&1; then
+    cleanup_owned_prepare_artifacts
+    clear_prepare_cleanup_traps
+    return 1
+  fi
+  if ! { [ -d "$current" ] && [ ! -L "$current" ] &&
+    [ "$(file_device_inode "$current")" = "$published_id" ]; }; then
+    cleanup_owned_prepare_artifacts
+    clear_prepare_cleanup_traps
+    return 1
+  fi
+  if ! write_prepare_lock_lease "$owned_prepare_lock" "$owned_prepare_lock_id" - -; then
+    cleanup_owned_prepare_artifacts
+    clear_prepare_cleanup_traps
+    return 1
+  fi
+  owned_prepare_stage=
+  owned_prepare_stage_id=
+  if ! identity_root_contents_safe "$identity_root" "$owned_prepare_lock" "" ||
+    ! snapshot_and_validate_request "$current" "$domain" "$node_id" "$endpoints" "$sources"; then
+    cleanup_owned_prepare_artifacts
+    clear_prepare_cleanup_traps
+    return 1
+  fi
+  finish_prepared_request "$emit_snapshot" || return 1
+}
+
+emit_identity_status() {
+  local root current certificate_state certificate_trust
+  if [ "$#" -eq 4 ]; then
+    # Internal fixture form: ROOT EXPECTED_CA EXPECTED_GENERATION EXPECTED_DIGEST.
+    root=$1
+    shift
+  elif ! root=$(identity_root_for_current_user); then
+    record 'ssh-identity-status|1' 'state|unsupported' "platform-boundary|$(platform_boundary)" 'end-status|'
+    return 69
+  fi
+  local expected_ca_fingerprint=${1:-} expected_ca_generation=${2:-} expected_certifier_digest=${3:-}
+  if [ -n "$expected_ca_fingerprint$expected_ca_generation$expected_certifier_digest" ] &&
+    ! valid_external_certificate_pins "$expected_ca_fingerprint" "$expected_ca_generation" "$expected_certifier_digest"; then
+    record 'ssh-identity-status|1' 'state|drifted' 'certificate-state|external-pins-invalid' 'end-status|'
+    return 74
+  fi
+  if [ ! -d "$root" ]; then
+    if ! prospective_identity_root_safe "$root"; then
+      record 'ssh-identity-status|1' 'state|drifted' 'reason|unsupported-storage' \
+        'storage|owner-only-nonsynced' 'end-status|'
+      return 74
+    fi
+    record 'ssh-identity-status|1' 'state|absent' 'storage|owner-only-nonsynced' 'end-status|'
+    return 0
+  fi
+  # Status is strictly read-only in the credential tree. It validates a
+  # held private CSR snapshot and never creates or chmods persistent state.
+  if ! inspect_identity_root "$root" || ! identity_root_contents_safe "$root" "" ""; then
+    record 'ssh-identity-status|1' 'state|drifted' 'storage|owner-only-nonsynced' 'end-status|'
+    return 74
+  fi
+  current=$(identity_directory)
+  if ! snapshot_and_validate_request "$current" "" "" "" ""; then
+    record 'ssh-identity-status|1' 'state|drifted' 'storage|owner-only-nonsynced' 'end-status|'
+    return 74
+  fi
+  certificate_state=absent
+  certificate_trust=not-applicable
+  if [ -f "$current/$certificate_name" ]; then
+    if ! certificate_state=$(certificate_trust_state "$expected_ca_fingerprint" "$expected_ca_generation" "$expected_certifier_digest"); then
+      release_held_request_snapshot
+      record 'ssh-identity-status|1' 'state|drifted' 'certificate-state|external-pin-mismatch' 'end-status|'
+      return 74
+    fi
+    if [ "$certificate_state" = trusted-ready ]; then
+      certificate_trust=external-pins-verified
+    else
+      certificate_trust=external-pins-required
+    fi
+  fi
+  release_held_request_snapshot || return 1
+  record \
+    'ssh-identity-status|1' 'state|prepared' \
+    "fleet-domain|$csr_domain" "node-id|$csr_node_id" \
+    "node-key-fingerprint|$identity_fingerprint" \
+    "certificate-state|$certificate_state" "certificate-trust|$certificate_trust" \
+    'storage|owner-only-nonsynced' 'end-status|'
+}
+
+emit_identity_request() {
+  local root=$1 current
+  inspect_identity_root "$root" || return 1
+  identity_root_contents_safe "$identity_root" "" "" || return 1
+  current=$(identity_directory)
+  snapshot_and_validate_request "$current" "" "" "" "" || return 1
+  emit_held_request_snapshot
+}
+
+emit_preview() {
+  local domain=$1 node_id=$2 endpoints=$3 sources=$4
+  valid_domain "$domain" && valid_node_id "$node_id" || return 1
+  validate_endpoint_principals "$endpoints" || return 1
+  endpoints=$canonical_csv
+  canonicalize_csv "$sources" source || return 1
+  sources=$canonical_csv
+  record \
+    'ssh-identity-preview|1' 'operation|prepare' \
+    "fleet-domain|$domain" "node-id|$node_id" \
+    "signing-principal|$node_id@$domain" \
+    "endpoint-principals|$endpoints" "source-addresses|$sources" \
+    'private-key-storage|owner-only-nonsynced-local-state' \
+    'certificate|owner-signature-required' 'end-preview|'
+}
+
+run_prepare_command() {
+  local root prepare_result
+  [ "$#" -eq 4 ] || return 64
+  root=$(identity_root_for_current_user) || {
+    printf '%s\n' 'prepare-ssh-identity: unsupported identity storage boundary' >&2
+    return 69
+  }
+  if ! prepare_identity_root "$root"; then
+    printf '%s\n' 'prepare-ssh-identity: unsupported-storage' >&2
+    return 65
+  fi
+  if prepare_identity "$1" "$2" "$3" "$4" true; then
+    return 0
+  else
+    prepare_result=$?
+  fi
+  if [ "$prepare_result" -eq 75 ]; then
+    printf '%s\n' 'prepare-ssh-identity: contention' >&2
+    return 75
+  fi
+  printf '%s\n' 'prepare-ssh-identity: identity-validation-failed' >&2
+  return 65
+}
+
+self_test() {
+  local original_root=${identity_root:-} original_fixture=$fixture_mode original_fixture_boundary=$fixture_ancestor_boundary test_root current
+  local output private_material saved_request saved_public rogue_public rogue_fingerprint ca_key symlink_target symlink_root unsafe_root unsafe_ancestor prospective_root prospective_unsafe owner_unwritable diagnostic_stdout diagnostic_stderr failure_root repo_root linked_repository hardlink_path before_count after_count acl_target
+  local concurrent_root concurrent_log concurrent_first pids pid index
+  local lock_root lock_marker lock_owner lock_waiter lock_id_before lock_id_after waiter_status
+  local unowned_root unowned_marker unowned_owner ambiguous_root ambiguous_marker ambiguous_owner
+  local cert_details cert_ca cert_serial cert_after cert_before contract
+  local startup_env startup_marker startup_output self_dir self_base self_path hostile_tmp hostile_target
+  local noncanonical_root noncanonical_home noncanonical_status noncanonical_error command_result
+  test_root=$(/usr/bin/mktemp -d /tmp/machine-utilities-prepare-identity.XXXXXX) || return 1
+  test_root=$(canonical_directory "$test_root") || return 1
+  self_test_worker_pids=
+  self_test_worker_root=$test_root
+  trap 'cleanup_self_test_workers; /bin/rm -rf "$test_root"' RETURN
+  fixture_mode=true
+  fixture_ancestor_boundary=$test_root
+  self_dir=$(printf '%s' "$0" | /usr/bin/sed 's,/[^/]*$,,' )
+  self_base=$(printf '%s' "$0" | /usr/bin/sed 's,.*/,,' )
+  self_path=$(canonical_directory "$self_dir")/$self_base || return 1
+  startup_env=$test_root/startup-env
+  startup_marker=$test_root/BASH_ENV_EXECUTED
+  startup_output=$test_root/startup-output
+  printf '%s\n' "/bin/touch '$startup_marker'" >"$startup_env"
+  /usr/bin/env -i HOME="$test_root/home" XDG_STATE_HOME="$test_root/state" \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin BASH_ENV="$startup_env" SHELLOPTS=errexit \
+    "$self_path" preview fleet.example node-startup mu-posix 10.0.0.0/8 >"$startup_output" ||
+    return 1
+  [ ! -e "$startup_marker" ] && [ ! -L "$startup_marker" ] || return 1
+
+  # An absolute but lexically noncanonical HOME/XDG root must fail closed in
+  # both public commands.  In particular, status must not advertise `absent`
+  # for a tree that prepare would later create through `..` and then reject.
+  noncanonical_root=$test_root/noncanonical-home
+  noncanonical_home=$noncanonical_root/alias/../safe
+  noncanonical_status=$test_root/noncanonical-status
+  noncanonical_error=$test_root/noncanonical-error
+  /bin/mkdir -p "$noncanonical_root/alias" || return 1
+  /bin/chmod 700 "$noncanonical_root" "$noncanonical_root/alias" || return 1
+  if /usr/bin/env -i HOME="$noncanonical_home" XDG_STATE_HOME="$noncanonical_home" \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin "$self_path" status >"$noncanonical_status" 2>"$noncanonical_error"; then
+    return 1
+  else
+    command_result=$?
+  fi
+  [ "$command_result" = 74 ] || return 1
+  /usr/bin/grep -Fx 'state|drifted' "$noncanonical_status" >/dev/null || return 1
+  /usr/bin/grep -Fx 'reason|unsupported-storage' "$noncanonical_status" >/dev/null || return 1
+  [ ! -e "$noncanonical_root/safe" ] && [ ! -L "$noncanonical_root/safe" ] || return 1
+  if /usr/bin/env -i HOME="$noncanonical_home" XDG_STATE_HOME="$noncanonical_home" \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin "$self_path" prepare fleet.example node-canonical mu-posix 10.0.0.0/8 \
+      >"$noncanonical_status" 2>"$noncanonical_error"; then
+    return 1
+  else
+    command_result=$?
+  fi
+  [ "$command_result" = 65 ] || return 1
+  [ "$(/bin/cat "$noncanonical_error")" = 'prepare-ssh-identity: unsupported-storage' ] || return 1
+  [ ! -e "$noncanonical_root/safe" ] && [ ! -L "$noncanonical_root/safe" ] || return 1
+
+  identity_root=$test_root/identity
+  /bin/mkdir -p "$identity_root"
+  /bin/chmod 700 "$identity_root"
+  prepare_identity fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  current=$(identity_directory)
+  owner_only_directory "$current" && parse_request_file "$current/$request_name" || return 1
+  [ "$csr_signing_principal" = node-a@fleet.example ] || return 1
+  private_material=$(/bin/cat "$current/$key_name")
+  output=$(emit_preview fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24') || return 1
+  [[ $output != *"$private_material"* ]] && [[ $output != *"$identity_root"* ]] || return 1
+  before_count=$(/usr/bin/find "$identity_root" -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+  output=$(emit_identity_status "$identity_root" "" "" "") || return 1
+  printf '%s\n' "$output" | /usr/bin/grep -Fx 'certificate-state|absent' >/dev/null || return 1
+  output=$(emit_identity_request "$identity_root") || return 1
+  [ "$output" = "$(/bin/cat "$current/$request_name")" ] || return 1
+  after_count=$(/usr/bin/find "$identity_root" -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+  [ "$before_count" = "$after_count" ] && [ ! -e "$identity_root/.prepare-lock" ] || return 1
+  SSH_AUTH_SOCK=$test_root/hostile-agent
+  output=$(emit_preview fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24') || return 1
+  [[ $output != *"$SSH_AUTH_SOCK"* ]] || return 1
+  unset SSH_AUTH_SOCK
+  hostile_target=$test_root/hostile-tmp-target
+  hostile_tmp=$test_root/hostile-tmp
+  /bin/mkdir "$hostile_target"
+  /bin/ln -s "$hostile_target" "$hostile_tmp"
+  TMPDIR=$hostile_tmp
+  parse_request_file "$current/$request_name" || return 1
+  unset TMPDIR
+  ! /usr/bin/find "$hostile_target" -mindepth 1 -maxdepth 1 -print | /usr/bin/grep -q . || return 1
+
+  ! emit_preview fleet.example node-a mu-posix 010.0.0.0/8 || return 1
+  ! emit_preview fleet.example node-a mu-posix 10.0.0.1/8 || return 1
+  emit_preview fleet.example node-a mu-posix 2001:db8::/32 >/dev/null || return 1
+  ! emit_preview fleet node-a mu-posix 10.0.0.0/8 || return 1
+  ! emit_preview fleet.example node-a mu-posix 10.0.0.0/033 || return 1
+  saved_request=$test_root/request.saved
+  /bin/cp "$current/$request_name" "$saved_request"
+  "$ssh_keygen" -q -t ed25519 -N '' -f "$test_root/rogue" || return 1
+  rogue_public=$(/usr/bin/awk 'NF >= 2 { print $1 " " $2; exit }' "$test_root/rogue.pub")
+  rogue_fingerprint=$(key_fingerprint "$test_root/rogue.pub") || return 1
+  /usr/bin/awk -v key="$rogue_public" -v fingerprint="$rogue_fingerprint" '
+    NR == 4 { $0 = "public-key|" key }
+    NR == 5 { $0 = "node-key-fingerprint|" fingerprint }
+    { print }
+  ' "$saved_request" >"$current/$request_name"
+  /bin/chmod 600 "$current/$request_name"
+  if output=$(emit_identity_status "$identity_root" "" "" ""); then return 1; fi
+  ! emit_identity_request "$identity_root" || return 1
+  ! prepare_identity fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  ! prepare_identity fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  /bin/mv -f "$saved_request" "$current/$request_name"
+  prepare_identity fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  /bin/cp "$current/$request_name" "$saved_request"
+  /usr/bin/sed 's/endpoint-principals|mu-posix,mu-request/endpoint-principals|mu-request,mu-posix/' \
+    "$saved_request" >"$current/$request_name"
+  ! prepare_identity fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  /bin/mv -f "$saved_request" "$current/$request_name"
+  # The resident key and fingerprint alone are not an identity binding.  A
+  # same-key public request with substituted metadata must fail every reader
+  # and both the original and substituted repeated prepares.
+  /bin/cp "$current/$request_name" "$saved_request"
+  /usr/bin/awk '
+    NR == 2 { $0 = "fleet-domain|evil.example" }
+    NR == 3 { $0 = "node-id|evil-node" }
+    NR == 6 { $0 = "signing-principal|evil-node@evil.example" }
+    NR == 7 { $0 = "endpoint-principals|evil-endpoint" }
+    NR == 8 { $0 = "source-addresses|203.0.113.0/24" }
+    { print }
+  ' "$saved_request" >"$current/$request_name"
+  /bin/chmod 600 "$current/$request_name"
+  if output=$(emit_identity_status "$identity_root" "" "" ""); then return 1; fi
+  ! emit_identity_request "$identity_root" || return 1
+  ! prepare_identity fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  ! prepare_identity evil.example evil-node evil-endpoint '203.0.113.0/24' || return 1
+  /bin/mv -f "$saved_request" "$current/$request_name"
+  output=$(emit_identity_status "$identity_root" "" "" "") || return 1
+  output=$(emit_identity_request "$identity_root") || return 1
+  prepare_identity fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  saved_public=$test_root/public.saved
+  /bin/cp "$current/$key_name.pub" "$saved_public"
+  /bin/cp "$test_root/rogue.pub" "$current/$key_name.pub"
+  /bin/chmod 600 "$current/$key_name.pub"
+  ! validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  /bin/mv -f "$saved_public" "$current/$key_name.pub"
+  linked_repository=$test_root/linked-repository
+  /bin/mkdir -p "$linked_repository/.git"
+  hardlink_path=$linked_repository/.git/node-key-copy
+  /bin/ln "$current/$key_name" "$hardlink_path" || return 1
+  ! validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  /bin/rm -f "$hardlink_path"
+  validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  if [ "$(/usr/bin/uname -s)" = Darwin ]; then
+    # Protective macOS denies do not grant a different principal access;
+    # effective allow entries still invalidate every protected object.
+    /bin/chmod +a 'group:everyone deny delete' "$current/$key_name" || return 1
+    validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+    /bin/chmod -N "$current/$key_name" || return 1
+    /bin/chmod +a 'group:everyone allow read' "$current/$key_name" || return 1
+    ! validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+    /bin/chmod -N "$current/$key_name" || return 1
+    validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+    for acl_target in "$current/$key_name.pub" "$current/$request_name" "$current" "$identity_root" "$test_root"; do
+      /bin/chmod +a 'group:everyone allow read' "$acl_target" || return 1
+      ! validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+      /bin/chmod -N "$acl_target" || return 1
+      validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+    done
+  fi
+  ca_key=$test_root/ca
+  "$ssh_keygen" -q -t ed25519 -N '' -f "$ca_key" || return 1
+  "$ssh_keygen" -q -s "$ca_key" -I wrong@fleet.example -n mu-posix -O clear "$current/$key_name.pub" || return 1
+  ! validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  /bin/rm -f "$current/$certificate_name"
+  "$ssh_keygen" -q -s "$ca_key" -I node-a@fleet.example \
+    -n node-a@fleet.example,mu-posix,mu-request -V +3600s -z 7 -O clear \
+    -O source-address=10.0.0.0/8,192.0.2.0/24 "$current/$key_name.pub" || return 1
+  /bin/chmod 600 "$current/$certificate_name"
+  cert_details=$($ssh_keygen -Lf "$current/$certificate_name") || return 1
+  cert_ca=$(printf '%s\n' "$cert_details" | /usr/bin/awk '/^[[:space:]]*Signing CA:/ {for (i=1;i<=NF;i++) if ($i ~ /^SHA256:/) {print $i; exit}}')
+  cert_serial=$(printf '%s\n' "$cert_details" | /usr/bin/awk '/^[[:space:]]*Serial:/ {print $2; exit}')
+  cert_after=$(printf '%s\n' "$cert_details" | /usr/bin/awk '/^[[:space:]]*Valid: from / {print $3 "Z"; exit}')
+  cert_before=$(printf '%s\n' "$cert_details" | /usr/bin/awk '/^[[:space:]]*Valid: from / {print $5 "Z"; exit}')
+  contract=$current/$certificate_contract_name
+  record 'machine-utilities-ssh-certificate-contract|1' \
+    "fleet-ca-fingerprint|$cert_ca" 'ca-generation|1' "certificate-serial|$cert_serial" \
+    "certificate-valid-after|$cert_after" "certificate-valid-before|$cert_before" \
+    'certificate-principals|mu-posix,mu-request,node-a@fleet.example' \
+    'source-addresses|10.0.0.0/8,192.0.2.0/24' \
+    "certifier-helper-sha256|$(printf '%064d' 0)" 'end-certificate-contract|' >"$contract"
+  /bin/chmod 600 "$contract"
+  validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  output=$(emit_identity_status "$identity_root" "" "" "") || return 1
+  printf '%s\n' "$output" | /usr/bin/grep -Fx 'certificate-state|locally-consistent-untrusted' >/dev/null || return 1
+  ! printf '%s\n' "$output" | /usr/bin/grep -Fq 'trusted-ready' || return 1
+  output=$(emit_identity_status "$identity_root" "$cert_ca" 1 "$(printf '%064d' 0)") || return 1
+  printf '%s\n' "$output" | /usr/bin/grep -Fx 'certificate-state|trusted-ready' >/dev/null || return 1
+  if output=$(emit_identity_status "$identity_root" 'SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' 1 "$(printf '%064d' 0)"); then return 1; fi
+  /usr/bin/sed 's/fleet-ca-fingerprint|SHA256:/fleet-ca-fingerprint|SHA256:X/' "$contract" >"$test_root/contract.bad"
+  /bin/mv -f "$test_root/contract.bad" "$contract"
+  ! validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  /bin/rm -f "$current/$certificate_name" "$contract"
+
+  symlink_target=$test_root/symlink-target
+  symlink_root=$test_root/symlink-root
+  /bin/mkdir "$symlink_target"
+  /bin/chmod 755 "$symlink_target"
+  /bin/ln -s "$symlink_target" "$symlink_root"
+  ! inspect_identity_root "$symlink_root" || return 1
+  [ "$(file_mode "$symlink_target")" = 755 ] || return 1
+  unsafe_root=$test_root/unsafe
+  /bin/mkdir "$unsafe_root"
+  /bin/chmod 755 "$unsafe_root"
+  ! inspect_identity_root "$unsafe_root" || return 1
+  [ "$(file_mode "$unsafe_root")" = 755 ] || return 1
+  unsafe_ancestor=$test_root/unsafe-ancestor
+  /bin/mkdir "$unsafe_ancestor"
+  /bin/chmod 777 "$unsafe_ancestor"
+  ! prepare_identity_root "$unsafe_ancestor/private-state" || return 1
+  [ ! -e "$unsafe_ancestor/private-state" ] && [ ! -L "$unsafe_ancestor/private-state" ] || return 1
+  prospective_root=$test_root/prospective-safe/identity
+  output=$(emit_identity_status "$prospective_root" "" "" "") || return 1
+  printf '%s\n' "$output" | /usr/bin/grep -Fx 'state|absent' >/dev/null || return 1
+  [ ! -e "$test_root/prospective-safe" ] && [ ! -L "$test_root/prospective-safe" ] || return 1
+  prospective_unsafe=$test_root/prospective-unsafe
+  /bin/mkdir "$prospective_unsafe"
+  /bin/chmod 777 "$prospective_unsafe"
+  if output=$(emit_identity_status "$prospective_unsafe/identity" "" "" ""); then return 1; fi
+  printf '%s\n' "$output" | /usr/bin/grep -Fx 'state|drifted' >/dev/null || return 1
+  printf '%s\n' "$output" | /usr/bin/grep -Fx 'reason|unsupported-storage' >/dev/null || return 1
+  [ ! -e "$prospective_unsafe/identity" ] && [ ! -L "$prospective_unsafe/identity" ] || return 1
+  owner_unwritable=$test_root/owner-unwritable
+  diagnostic_stdout=$test_root/owner-unwritable.stdout
+  diagnostic_stderr=$test_root/owner-unwritable.stderr
+  /bin/mkdir "$owner_unwritable"
+  /bin/chmod 500 "$owner_unwritable"
+  if (fixture_ancestor_boundary=$test_root; prepare_identity_root "$owner_unwritable/identity") >"$diagnostic_stdout" 2>"$diagnostic_stderr"; then
+    return 1
+  fi
+  case $- in
+    *x*) : ;; # xtrace itself names the fixture path; do not test trace noise.
+    *)
+      [ ! -s "$diagnostic_stdout" ] && [ ! -s "$diagnostic_stderr" ] || return 1
+      ! /usr/bin/grep -Eq '(\.identity|node-key|certificate-request)' "$diagnostic_stdout" "$diagnostic_stderr" || return 1
+      ;;
+  esac
+  /bin/chmod 700 "$owner_unwritable"
+  repo_root=$test_root/repository
+  /bin/mkdir "$repo_root"
+  : >"$repo_root/.git"
+  forbidden_identity_location "$repo_root/private-state" || return 1
+  ! prepare_identity_root "$repo_root/private-state" || return 1
+  [ ! -e "$repo_root/private-state" ] && [ ! -L "$repo_root/private-state" ] || return 1
+
+  failure_root=$test_root/failure
+  /bin/mkdir "$failure_root"
+  /bin/chmod 700 "$failure_root"
+  identity_root=$failure_root
+  ROUNDHOUSE_PREPARE_TEST_FAILPOINT=after-staged-request
+  ! prepare_identity fleet.example node-b 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  unset ROUNDHOUSE_PREPARE_TEST_FAILPOINT
+  [ ! -e "$(identity_directory)" ] && [ ! -L "$(identity_directory)" ] || return 1
+  ! /usr/bin/find "$failure_root" -mindepth 1 -maxdepth 1 -name '.identity.*' -print | /usr/bin/grep -q . || return 1
+  ROUNDHOUSE_PREPARE_TEST_FAILPOINT=partial-request-record
+  ! prepare_identity fleet.example node-b 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  unset ROUNDHOUSE_PREPARE_TEST_FAILPOINT
+  [ ! -e "$(identity_directory)" ] && [ ! -L "$(identity_directory)" ] || return 1
+  ! /usr/bin/find "$failure_root" -mindepth 1 -maxdepth 1 -name '.identity.*' -print | /usr/bin/grep -q . || return 1
+
+  concurrent_root=$test_root/concurrent-identity
+  prepare_identity_root "$concurrent_root" || return 1
+  concurrent_log=$test_root/concurrent-generations
+  ROUNDHOUSE_PREPARE_TEST_GENERATION_LOG=$concurrent_log
+  export ROUNDHOUSE_PREPARE_TEST_GENERATION_LOG
+  pids=
+  for index in {1..16}; do
+    (
+      fixture_worker_prepare "$self_path" "$concurrent_root" "$test_root" \
+        fleet.example node-concurrent 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' true
+    ) >"$test_root/concurrent-$index.out" 2>"$test_root/concurrent-$index.err" &
+    pids="$pids $!"
+    register_self_test_worker "$!" || return 1
+  done
+  for pid in $pids; do
+    wait "$pid" || return 1
+    forget_self_test_worker "$pid" || return 1
+  done
+  unset ROUNDHOUSE_PREPARE_TEST_GENERATION_LOG
+  [ "$(/usr/bin/wc -l <"$concurrent_log" | /usr/bin/tr -d ' ')" = 1 ] || return 1
+  concurrent_first=$(/bin/cat "$test_root/concurrent-1.out")
+  [ -n "$concurrent_first" ] || return 1
+  for index in {2..16}; do
+    [ "$(/bin/cat "$test_root/concurrent-$index.out")" = "$concurrent_first" ] || return 1
+  done
+  identity_root=$concurrent_root
+  validate_identity_directory "$(identity_directory)" fleet.example node-concurrent 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
+  identity_root_contents_safe "$identity_root" "" "" || return 1
+  ! /usr/bin/find "$identity_root" -mindepth 1 -maxdepth 1 -name '.identity.*' -print | /usr/bin/grep -q . || return 1
+
+  # A live owner serializes waiters with retryable code 75, TERM never lets a
+  # waiter remove the owner's lease, and a SIGKILLed owner is recoverable only
+  # after its PID/start/boot lease is proven stale.
+  lock_root=$test_root/lock-identity
+  prepare_identity_root "$lock_root" || return 1
+  lock_marker=$test_root/lock-owner-ready
+  ROUNDHOUSE_PREPARE_TEST_PAUSE_AT=after-stage-lease
+  ROUNDHOUSE_PREPARE_TEST_PAUSE_MARKER=$lock_marker
+  export ROUNDHOUSE_PREPARE_TEST_PAUSE_AT ROUNDHOUSE_PREPARE_TEST_PAUSE_MARKER
+  fixture_worker_prepare "$self_path" "$lock_root" "$test_root" \
+    fleet.example node-lock mu-posix '10.0.0.0/8' false >"$test_root/lock-owner.out" 2>"$test_root/lock-owner.err" &
+  lock_owner=$!
+  register_self_test_worker "$lock_owner" || return 1
+  fixture_wait_for_marker "$lock_marker" || return 1
+  [ -d "$lock_root/.prepare-lock" ] && [ ! -L "$lock_root/.prepare-lock" ] || return 1
+  lock_id_before=$(file_device_inode "$lock_root/.prepare-lock") || return 1
+  ROUNDHOUSE_PREPARE_TEST_LOCK_ATTEMPTS=2
+  export ROUNDHOUSE_PREPARE_TEST_LOCK_ATTEMPTS
+  if (fixture_worker_prepare "$self_path" "$lock_root" "$test_root" \
+    fleet.example node-lock mu-posix '10.0.0.0/8' false >"$test_root/lock-short-waiter.out" 2>"$test_root/lock-short-waiter.err"); then
+    return 1
+  else
+    waiter_status=$?
+  fi
+  [ "$waiter_status" = 75 ] || return 1
+  lock_id_after=$(file_device_inode "$lock_root/.prepare-lock") || return 1
+  [ "$lock_id_after" = "$lock_id_before" ] || return 1
+  if (
+    identity_root_for_current_user() { printf '%s' "$lock_root"; }
+    run_prepare_command fleet.example node-lock mu-posix '10.0.0.0/8'
+  ) >"$test_root/lock-public.out" 2>"$test_root/lock-public.err"; then
+    return 1
+  else
+    waiter_status=$?
+  fi
+  [ "$waiter_status" = 75 ] || return 1
+  [ ! -s "$test_root/lock-public.out" ] || return 1
+  [ "$(/bin/cat "$test_root/lock-public.err")" = 'prepare-ssh-identity: contention' ] || return 1
+  unset ROUNDHOUSE_PREPARE_TEST_LOCK_ATTEMPTS
+  fixture_worker_prepare "$self_path" "$lock_root" "$test_root" \
+    fleet.example node-lock mu-posix '10.0.0.0/8' false >"$test_root/lock-term-waiter.out" 2>"$test_root/lock-term-waiter.err" &
+  lock_waiter=$!
+  register_self_test_worker "$lock_waiter" || return 1
+  /bin/sleep 0.100
+  /bin/kill -0 "$lock_waiter" 2>/dev/null || return 1
+  /bin/kill -TERM "$lock_waiter" 2>/dev/null || return 1
+  wait "$lock_waiter" 2>/dev/null || :
+  forget_self_test_worker "$lock_waiter" || return 1
+  lock_id_after=$(file_device_inode "$lock_root/.prepare-lock") || return 1
+  [ "$lock_id_after" = "$lock_id_before" ] || return 1
+  /bin/kill -KILL "$lock_owner" 2>/dev/null || return 1
+  wait "$lock_owner" 2>/dev/null || :
+  forget_self_test_worker "$lock_owner" || return 1
+  unset ROUNDHOUSE_PREPARE_TEST_PAUSE_AT ROUNDHOUSE_PREPARE_TEST_PAUSE_MARKER
+  (fixture_worker_prepare "$self_path" "$lock_root" "$test_root" \
+    fleet.example node-lock mu-posix '10.0.0.0/8' false) || return 1
+  identity_root=$lock_root
+  validate_identity_directory "$(identity_directory)" fleet.example node-lock mu-posix '10.0.0.0/8' || return 1
+  identity_root_contents_safe "$identity_root" "" "" || return 1
+  ! /usr/bin/find "$identity_root" -mindepth 1 -maxdepth 1 -name '.identity.*' -print | /usr/bin/grep -q . || return 1
+
+  # Explicitly unowned and malformed leases remain intact and return the same
+  # retryable contention result; the recovery path never guesses ownership.
+  unowned_root=$test_root/unowned-lock-identity
+  prepare_identity_root "$unowned_root" || return 1
+  unowned_marker=$test_root/unowned-owner-ready
+  ROUNDHOUSE_PREPARE_TEST_PAUSE_AT=after-stage-lease
+  ROUNDHOUSE_PREPARE_TEST_PAUSE_MARKER=$unowned_marker
+  export ROUNDHOUSE_PREPARE_TEST_PAUSE_AT ROUNDHOUSE_PREPARE_TEST_PAUSE_MARKER
+  fixture_worker_prepare "$self_path" "$unowned_root" "$test_root" \
+    fleet.example node-unowned mu-posix '10.0.0.0/8' false >"$test_root/unowned-owner.out" 2>"$test_root/unowned-owner.err" &
+  unowned_owner=$!
+  register_self_test_worker "$unowned_owner" || return 1
+  fixture_wait_for_marker "$unowned_marker" || return 1
+  lock_id_before=$(file_device_inode "$unowned_root/.prepare-lock") || return 1
+  /usr/bin/sed 's/^owner|.*/owner|other-owner/' "$unowned_root/.prepare-lock/$prepare_lock_lease_name" >"$test_root/unowned-lease" || return 1
+  /bin/chmod 600 "$test_root/unowned-lease" || return 1
+  /bin/mv -f "$test_root/unowned-lease" "$unowned_root/.prepare-lock/$prepare_lock_lease_name" || return 1
+  ROUNDHOUSE_PREPARE_TEST_LOCK_ATTEMPTS=2
+  export ROUNDHOUSE_PREPARE_TEST_LOCK_ATTEMPTS
+  if (fixture_worker_prepare "$self_path" "$unowned_root" "$test_root" \
+    fleet.example node-unowned mu-posix '10.0.0.0/8' false >"$test_root/unowned-waiter.out" 2>"$test_root/unowned-waiter.err"); then
+    return 1
+  else
+    waiter_status=$?
+  fi
+  [ "$waiter_status" = 75 ] || return 1
+  [ "$(file_device_inode "$unowned_root/.prepare-lock")" = "$lock_id_before" ] || return 1
+  /bin/kill -KILL "$unowned_owner" 2>/dev/null || return 1
+  wait "$unowned_owner" 2>/dev/null || :
+  forget_self_test_worker "$unowned_owner" || return 1
+
+  ambiguous_root=$test_root/ambiguous-lock-identity
+  prepare_identity_root "$ambiguous_root" || return 1
+  ambiguous_marker=$test_root/ambiguous-owner-ready
+  ROUNDHOUSE_PREPARE_TEST_PAUSE_MARKER=$ambiguous_marker
+  fixture_worker_prepare "$self_path" "$ambiguous_root" "$test_root" \
+    fleet.example node-ambiguous mu-posix '10.0.0.0/8' false >"$test_root/ambiguous-owner.out" 2>"$test_root/ambiguous-owner.err" &
+  ambiguous_owner=$!
+  register_self_test_worker "$ambiguous_owner" || return 1
+  fixture_wait_for_marker "$ambiguous_marker" || return 1
+  lock_id_before=$(file_device_inode "$ambiguous_root/.prepare-lock") || return 1
+  /usr/bin/sed 's/^process-start|.*/process-start|invalid/' "$ambiguous_root/.prepare-lock/$prepare_lock_lease_name" >"$test_root/ambiguous-lease" || return 1
+  /bin/chmod 600 "$test_root/ambiguous-lease" || return 1
+  /bin/mv -f "$test_root/ambiguous-lease" "$ambiguous_root/.prepare-lock/$prepare_lock_lease_name" || return 1
+  if (fixture_worker_prepare "$self_path" "$ambiguous_root" "$test_root" \
+    fleet.example node-ambiguous mu-posix '10.0.0.0/8' false >"$test_root/ambiguous-waiter.out" 2>"$test_root/ambiguous-waiter.err"); then
+    return 1
+  else
+    waiter_status=$?
+  fi
+  [ "$waiter_status" = 75 ] || return 1
+  [ "$(file_device_inode "$ambiguous_root/.prepare-lock")" = "$lock_id_before" ] || return 1
+  /bin/kill -KILL "$ambiguous_owner" 2>/dev/null || return 1
+  wait "$ambiguous_owner" 2>/dev/null || :
+  forget_self_test_worker "$ambiguous_owner" || return 1
+  unset ROUNDHOUSE_PREPARE_TEST_LOCK_ATTEMPTS
+  unset ROUNDHOUSE_PREPARE_TEST_PAUSE_AT ROUNDHOUSE_PREPARE_TEST_PAUSE_MARKER
+
+  ! (
+    identity_root=$concurrent_root
+    fixture_ancestor_boundary=$test_root
+    fixture_mode=true
+    prepare_identity fleet.example mismatched-node 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24'
+  ) || return 1
+
+  identity_root=$original_root
+  fixture_mode=$original_fixture
+  fixture_ancestor_boundary=$original_fixture_boundary
+  self_test_worker_pids=
+  self_test_worker_root=
+  /bin/rm -rf "$test_root"
+  trap - RETURN
+  printf '%s\n' 'PASS: prepare-ssh-identity fixture-safe self-check'
+}
+
+command=${1:-}
+shift || true
+
+case $(platform_boundary) in
+  wsl)
+    record 'ssh-identity-status|1' 'state|unsupported' 'reason|unsupported_security_boundary' 'platform-boundary|wsl' 'end-status|'
+    exit 69
+    ;;
+  macos|linux) ;;
+  *)
+    record 'ssh-identity-status|1' 'state|unsupported' 'reason|unsupported_platform' 'platform-boundary|unknown' 'end-status|'
+    exit 69
+    ;;
+esac
+
+case $command in
+  status)
+    case $# in
+      0) emit_identity_status ;;
+      3) emit_identity_status "$1" "$2" "$3" ;;
+      *) usage ;;
+    esac
+    ;;
+  preview)
+    [ "$#" -eq 4 ] || usage
+    emit_preview "$1" "$2" "$3" "$4" || { printf '%s\n' 'prepare-ssh-identity: invalid bounded identity request' >&2; exit 64; }
+    ;;
+  prepare)
+    [ "$#" -eq 4 ] || usage
+    run_prepare_command "$@"
+    ;;
+  request)
+    [ "$#" -eq 0 ] || usage
+    root=$(identity_root_for_current_user) || { printf '%s\n' 'prepare-ssh-identity: unsupported identity storage boundary' >&2; exit 69; }
+    if ! emit_identity_request "$root"; then
+      printf '%s\n' 'prepare-ssh-identity: no valid prepared public request' >&2
+      exit 65
+    fi
+    ;;
+  self-test)
+    [ "$#" -eq 0 ] || usage
+    self_test
+    ;;
+  *) usage ;;
+esac

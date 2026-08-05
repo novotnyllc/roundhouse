@@ -1,0 +1,93 @@
+{
+  "files": [
+    {
+      "path": ".claude-plugin/plugin.json",
+      "sha256": "0bf5bc8a63b89d24bcc91f0b4d70354c1917239103ce635c9d92b249bccf5f7c"
+    },
+    {
+      "path": ".codex-plugin/plugin.json",
+      "sha256": "3592589e8b90986f8d6eaec392a82dc2329ef5571cd460069b1ed32535e495bf"
+    },
+    {
+      "path": "references/privilege-policy.default",
+      "sha256": "09456c0023c09a6cda403e0f635ef203e97b8fd4c9a94d51e646fd9ae74823b1"
+    },
+    {
+      "path": "references/windows-winget-provider.lock",
+      "sha256": "ffa1cb4186260368d057daacd312677e9663a80374226900e30293d668ee2a09"
+    },
+    {
+      "path": "scripts/apply-windows.ps1",
+      "sha256": "c5d7891f87e3e1fc1705e730e213d5c4d036e0c89b8b15f8c945a4e2e6865b07"
+    },
+    {
+      "path": "scripts/certify-ssh-node",
+      "sha256": "5633b509c4ca50ce9a1c220e3345cab7bc37d043cd461f2cff205c044768ebae"
+    },
+    {
+      "path": "scripts/codex-plugin-hooks.mjs",
+      "sha256": "66ee67e30a14f78833cd172bdd379951b64e3055a5e105f50ddb7d5d58ad79c6"
+    },
+    {
+      "path": "scripts/collect-posix",
+      "sha256": "de78600fa4e477a47fe58e137bc2bf0d6657c9a6b7469f79c7d7b44e3adb587f"
+    },
+    {
+      "path": "scripts/collect-windows.ps1",
+      "sha256": "10ce87bb2669b16f7daf7c8219ac18d73bb52d4a81b20d753a7e9eb92d33dee6"
+    },
+    {
+      "path": "scripts/enroll-privilege-posix",
+      "sha256": "8f9e1658e575bcc2ecfef1b84cc107e30f0c644afbcd80d1af809e61f919f7aa"
+    },
+    {
+      "path": "scripts/enroll-privilege-windows.ps1",
+      "sha256": "9e06a5565fac49b385618bb61992956c1dd3b94826d4d9ba84950879bf8ab2b8"
+    },
+    {
+      "path": "scripts/enroll-ssh-posix",
+      "sha256": "9e24a6ebba815cee32e21796fe55e3574d6e876a176a1af9242fa16436c8eb80"
+    },
+    {
+      "path": "scripts/enroll-windows-sftp.ps1",
+      "sha256": "ace4dce7cf1a523d2ba1085faa3a5f8b0b0696b72be8a6456dbae1b98937304f"
+    },
+    {
+      "path": "scripts/homebrew-bridge.rb",
+      "sha256": "5febc6c786acf5f70352288494e6678d2c56c092cdcd2bfe01f3b109bbf6a2ba"
+    },
+    {
+      "path": "scripts/machine-utilities",
+      "sha256": "e2071781cd10a01214e8e3d0d16ea81e6ab0f322a9a3b76437eb8987bfb275c2"
+    },
+    {
+      "path": "scripts/prepare-ssh-identity",
+      "sha256": "0d540c8476d63b96df7ddfc727d55fe0af1fc62adb1eac4792fdf9a0033abaeb"
+    },
+    {
+      "path": "scripts/privilege-broker-posix",
+      "sha256": "b908128d0209e088b1cd9e51333bd4729ec07ed2783dbfb9980f97a3ecfbc4e3"
+    },
+    {
+      "path": "scripts/privilege-broker-windows.ps1",
+      "sha256": "b315a84afcb7ddff4131c24d20cb453f25f2168bf369a513d2ff9ef228b2e9bf"
+    },
+    {
+      "path": "scripts/profile-worker-windows.ps1",
+      "sha256": "419c0439361245181d837018eca53e070a5a992012d225c4db19d9abe9879fc4"
+    },
+    {
+      "path": "scripts/register-profile-task-windows.ps1",
+      "sha256": "05edea9878c56122ec4e89810606dff0b9abac989433aba45d703cbaa1711a01"
+    },
+    {
+      "path": "scripts/windows-native-canary-runner.ps1",
+      "sha256": "e3aedf573a323a12fc83f4cbb09234b8499e801f0fedaa544bd3fc8d699f6692"
+    }
+  ],
+  "marketplace": "novotnyllc",
+  "plugin": "roundhouse",
+  "schema": "roundhouse.integrity",
+  "schema_version": 1,
+  "version": "0.1.0"
+}

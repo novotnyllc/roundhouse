@@ -1,0 +1,243 @@
+{
+  "version": 1,
+  "machines": {
+    "local": {
+      "platform": "macos",
+      "transport": "local",
+      "codex_host": "saved-local-host",
+      "groups": ["development"],
+      "package_managers": ["homebrew"],
+      "dev_root": "~/dev"
+    },
+    "remote-mac": {
+      "platform": "macos",
+      "transport": "ssh",
+      "ssh_alias": "configured-ssh-alias",
+      "expected_hostname": "configured-hostname",
+      "expected_user": "configured-user",
+      "groups": ["development"],
+      "package_managers": ["homebrew"],
+      "dev_root": "~/dev"
+    },
+    "linux": {
+      "platform": "linux",
+      "transport": "local",
+      "expected_hostname": "configured-linux-hostname",
+      "expected_user": "configured-linux-user",
+      "groups": ["development"],
+      "package_managers": ["apt"],
+      "dev_root": "~/dev",
+      "privilege_broker": {
+        "automation_transport": {
+          "mode": "posix-ssh",
+          "host": "linux.example.invalid",
+          "port": 22,
+          "request_user": "machine-utilities",
+          "pinned_host_key_fingerprint": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+          "management_networks": ["192.0.2.0/24"]
+        }
+      }
+    },
+    "windows": {
+      "platform": "windows",
+      "transport": "codex-remote-control",
+      "codex_host": "saved-windows-host",
+      "codex_control_project": "example",
+      "expected_hostname": "configured-windows-hostname",
+      "expected_user": "configured-windows-user",
+      "groups": ["development"],
+      "package_managers": ["winget"],
+      "dev_root": "~/dev",
+      "privilege_broker": {
+        "automation_transport": {
+          "mode": "windows-sftp",
+          "host": "windows.example.invalid",
+          "port": 22,
+          "request_user": "MachineUtilitiesRequest",
+          "request_sid": "S-1-5-21-1000-1001-1002-2001",
+          "pinned_host_key_fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "management_networks": ["192.0.2.0/24"]
+        }
+      }
+    }
+  },
+  "projects": {
+    "example": {
+      "source": "owner/example",
+      "path": "example",
+      "groups": ["development"],
+      "codex": true
+    },
+    "handoffs": {
+      "source": "owner/private-handoffs",
+      "path": "coordination/handoffs",
+      "groups": ["development"],
+      "codex": true
+    }
+  },
+  "handoff_project": "handoffs",
+  "capabilities": {
+    "last30days": {
+      "groups": ["development"],
+      "requires_auth": ["xurl"],
+      "agents": ["codex", "claude"],
+      "provider": "skills-cli",
+      "source": "mvanhorn/last30days-skill"
+    },
+    "compound-engineering": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "compound-engineering"
+    },
+    "ponytail": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "ponytail"
+    },
+    "impeccable": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "impeccable"
+    },
+    "roundhouse": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "roundhouse"
+    },
+    "oracle": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "roundhouse"
+    },
+    "roundhouse": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "roundhouse"
+    },
+    "tart-xcode-runner": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "tart-xcode-runner"
+    }
+  },
+  "skill_roots": [
+    {
+      "id": "shared-agents",
+      "path": "~/.agents/skills",
+      "manager": "mixed",
+      "agents": ["codex", "claude"],
+      "groups": ["development"]
+    },
+    {
+      "id": "codex",
+      "path": "~/.codex/skills",
+      "manager": "mixed",
+      "agents": ["codex"],
+      "groups": ["development"]
+    },
+    {
+      "id": "claude",
+      "path": "~/.claude/skills",
+      "manager": "mixed",
+      "agents": ["claude"],
+      "groups": ["development"]
+    }
+  ],
+  "agent_artifacts": [
+    {
+      "id": "codex-instructions",
+      "path": "~/.codex/AGENTS.md",
+      "kind": "instruction",
+      "agents": ["codex"],
+      "groups": ["development"]
+    },
+    {
+      "id": "claude-instructions",
+      "path": "~/.claude/CLAUDE.md",
+      "kind": "instruction",
+      "agents": ["claude"],
+      "groups": ["development"]
+    },
+    {
+      "id": "codex-settings",
+      "path": "~/.codex/config.toml",
+      "kind": "config",
+      "format": "toml",
+      "settings": {
+        "check_for_update_on_startup": true
+      },
+      "agents": ["codex"],
+      "groups": ["development"]
+    },
+    {
+      "id": "claude-code-settings",
+      "path": "~/.claude/settings.json",
+      "kind": "config",
+      "format": "json",
+      "settings": {
+        "remoteControlAtStartup": true,
+        "switchModelsOnFlag": false,
+        "fallbackModel": null,
+        "autoUpdatesChannel": "latest"
+      },
+      "agents": ["claude"],
+      "groups": ["development"]
+    },
+    {
+      "id": "shared-agents",
+      "path": "~/.agents/agents",
+      "kind": "agent-definition",
+      "agents": ["codex", "claude"],
+      "groups": ["development"]
+    }
+  ],
+  "auth_artifacts": {
+    "github-cli": {
+      "path": "~/.config/gh/hosts.yml",
+      "paths": {
+        "windows": "~/AppData/Roaming/GitHub CLI/hosts.yml"
+      },
+      "strategy": "reauth",
+      "portability": "per-machine",
+      "mode": "0600",
+      "verify": ["gh", "auth", "status"],
+      "reauth": ["gh", "auth", "login"]
+    },
+    "codex": {
+      "strategy": "reauth",
+      "portability": "per-machine",
+      "verify": ["codex", "login", "status"],
+      "reauth": ["codex", "login"]
+    },
+    "claude-code": {
+      "strategy": "reauth",
+      "portability": "per-machine",
+      "verify": ["claude", "auth", "status", "--json"],
+      "reauth": ["claude", "auth", "login"]
+    },
+    "xurl": {
+      "path": "~/.xurl/auth.yml",
+      "strategy": "encrypted-install",
+      "portability": "secret-reference",
+      "secret_ref": "op://your-vault/xurl-auth/credential-file",
+      "mode": "0600",
+      "verify": ["xurl", "auth", "status"]
+    }
+  },
+  "policy": {
+    "updates": {
+      "cleanup": false,
+      "autoremove": false
+    },
+    "projects": {
+      "update": "ff-only"
+    }
+  }
+}

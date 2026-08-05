@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fleet Agents"
+  short_description: "Reconcile agent tooling across machines"
+  default_prompt: "Use $fleet-agents to audit and reconcile agent capabilities."

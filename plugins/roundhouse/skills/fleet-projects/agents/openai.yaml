@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fleet Projects"
+  short_description: "Prepare repositories for distributed work"
+  default_prompt: "Use $fleet-projects to audit project and Codex readiness."
