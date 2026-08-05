@@ -26,12 +26,17 @@ post-verification contract. Do not duplicate its commands or treat raw SSH
 command execution as a remote agent. Launching a destination-native harness
 worker over the configured SSH transport — for example a Claude Code
 `claude -p` child with its own session identity in a fleet-verified checkout,
-under `yardmaster:task-orchestrator`'s placement contract — is agent
+under `yardmaster:orchestrate`'s placement contract — is agent
 dispatch, not raw command execution, and is the supported Claude Code
 placement lane. A visible Codex task covers only ordinary native
 Windows work. Protected or logged-off Windows work requires fresh
 `privilege_broker` readiness from the enrolled `windows-sftp` route; never
-substitute the visible task, WSL, or another transport.
+substitute the visible task, WSL, or another transport. That `windows-sftp`
+route is also the harness-neutral way to deliver dispatch prerequisites —
+marketplace desired-records and profile bundles — to a Windows target: any
+harness can stage them over SSH/SFTP (broker pickup within one minute), and
+only the in-session cache install and hook-trust convergence still needs the
+Codex task surface.
 
 For macOS, report a separate root-broker state only when readiness advertises
 the owner-enrolled, default-disabled `macos.install-signed-pkg.v1` or

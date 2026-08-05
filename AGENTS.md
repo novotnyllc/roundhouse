@@ -11,7 +11,10 @@ work arrives.
 infrastructure —
 
 - *Readiness* — `fleet-readiness` synthesizes go/no-go from the narrow skills
-  below; it is what `yardmaster:task-orchestrator` consults before dispatch.
+  below; it is what `yardmaster:orchestrate` consults before dispatch.
+- *Host lifecycle* — `fleet-hosts` adds or removes one machine end to end
+  (config, certificate enrollment/revocation, target prerequisites,
+  readiness); `yardmaster:setup` delegates here during onboarding.
 - *Inventory and parity* — `fleet-inventory` (read-only snapshots),
   `fleet-agents` (harness runtimes, plugins, skills, capabilities),
   `fleet-projects` (checkouts and saved projects), `fleet-auth` (credential

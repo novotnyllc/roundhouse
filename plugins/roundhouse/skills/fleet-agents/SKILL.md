@@ -85,7 +85,7 @@ The only pre-helper fallback is a separately approved self-update of
 `roundhouse@novotnyllc` from an integrity-verified release that lacks
 `update-codex-plugin`. After upgrading the `novotnyllc` marketplace, run exactly
 `codex plugin add roundhouse@novotnyllc --json`, recapture inventory,
-reload the new target-native plugin, and require its version `0.1.0` executor
+reload the new target-native plugin, and require its version `0.2.0` executor
 and integrity verification before any other mutation. Never use that raw-add
 fallback for another plugin or once the helper command is available.
 
@@ -96,6 +96,15 @@ other work-starting follow-up, invoke the reference's exact shared
 `yardmaster/model-routing/v1` runtime-skill contract; no local model
 policy is permitted. Lazy-discover the task-control app tools before declaring
 them unavailable.
+
+A harness that cannot drive the Codex task surface (Claude Code) is not
+blocked from the declarative half: stage the marketplace desired-record and
+profile bundles onto the Windows target through the enrolled `windows-sftp`
+lane (`"$SKILL_DIR/../../references/windows-sftp.md"`), which any harness can
+drive over SSH/SFTP. The broker's scheduled task picks up a committed slot
+within one minute. Only the in-session convergence — installing plugin caches
+and re-approving hook trust against the staged desired-record — still
+requires the visible Codex task or an operator at the machine.
 
 Use the sealed-plan reconciliation path below instead when the request includes
 broad drift, runtime or settings changes, provenance repair, provider
