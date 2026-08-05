@@ -48,9 +48,9 @@ de-duplicated set of every installed plugin owned by the marketplace. Treat the
 two harnesses independently and refresh each available, applicable runtime.
 For local execution set `TARGET_CLI="$CLI"` and verify the loaded executor. For
 SSH, use the configured alias and target login shell (`$SHELL -lc`), resolve the
-target's installed Machine Utilities version from its active Codex plugin
+target's installed Roundhouse version from its active Codex plugin
 record, and set `TARGET_CLI` to that target cache's
-`machine-utilities/VERSION/scripts/machine-utilities`; never send or interpolate
+`roundhouse/VERSION/scripts/machine-utilities`; never send or interpolate
 the controller's `SKILL_DIR` or `CLI`. Require `"$TARGET_CLI" verify-executor`
 to pass before using it. Run only these target-native command sequences, in
 order, substituting the authorized marketplace and each installed plugin ID:

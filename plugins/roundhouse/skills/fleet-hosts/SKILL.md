@@ -53,10 +53,11 @@ Order matters: clean up over SSH while access still works, revoke second.
    touching); optionally uninstall the fleet plugins on the target; remove
    enrolled artifacts via the enroll scripts' own uninstall/revoke paths
    (never raw deletion of the protected trees).
-2. **Revoke trust** — `certify-ssh-node`/`enroll-ssh-posix revoke` adds the
-   host's certificate to the KRL; distribute the updated KRL to every
-   remaining fleet host (`enroll-ssh-posix repair`), not just the departing
-   one. Revoke privilege enrollment the same way when present.
+2. **Revoke trust** — generate the updated owner KRL (an owner-side
+   ceremony), tear down the departing host's enrollment with
+   `enroll-ssh-posix preview-revoke` then `revoke`, and deliver the new KRL
+   to every remaining fleet host with `enroll-ssh-posix repair` — not just
+   the departing one. Revoke privilege enrollment the same way when present.
 3. **Config removal** — delete the machine entry, re-run
    `"$CLI" validate-config`, and drop the host from any groups.
 4. **Report** — state what was removed, what was revoked, and any residual

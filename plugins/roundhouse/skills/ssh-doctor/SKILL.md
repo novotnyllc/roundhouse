@@ -5,7 +5,7 @@ description: Diagnose macOS SSH and Remote Login failures, including pre-auth cl
 
 # SSH Doctor
 
-Resolve the target from the Machine Utilities config and verify its identity
+Resolve the target from the Roundhouse config and verify its identity
 before changing anything. Do not print secrets, tokens, broad environment
 output, or credential files. Run SSH commands through the target user's
 configured login shell (`$SHELL -lc`) so user-level paths are present; never

@@ -117,10 +117,10 @@ jobs:
             $actual = (Get-FileHash (Join-Path $root $file.path) -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($actual -ne $file.sha256) { throw "Integrity mismatch: $($file.path)" }
           }
-          $requirementPath = Join-Path $env:RUNNER_TEMP "machine-utilities-executor.json"
+          $requirementPath = Join-Path $env:RUNNER_TEMP "roundhouse-executor.json"
           try {
             [ordered]@{
-              schema = "machine-utilities.executor"
+              schema = "roundhouse.executor"
               schema_version = 1
               plugin = $integrity.plugin
               marketplace = $integrity.marketplace

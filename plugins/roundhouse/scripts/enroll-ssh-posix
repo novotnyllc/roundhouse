@@ -941,7 +941,7 @@ copy_release_generation() {
     directory=${target%/*}
     ensure_directory "$directory" 0755 || return 1
     case $relative in
-      scripts/machine-utilities|scripts/collect-posix|scripts/enroll-privilege-posix|scripts/privilege-broker-posix|scripts/test-machine-utilities|scripts/update-integrity|scripts/prepare-ssh-identity|scripts/certify-ssh-node|scripts/enroll-ssh-posix) mode=0755 ;;
+      scripts/machine-utilities|scripts/collect-posix|scripts/enroll-privilege-posix|scripts/privilege-broker-posix|scripts/test-roundhouse|scripts/update-integrity|scripts/prepare-ssh-identity|scripts/certify-ssh-node|scripts/enroll-ssh-posix) mode=0755 ;;
       *) mode=0644 ;;
     esac
     copy_held_file "$source" "$target" "$expected" "$mode" || return 1

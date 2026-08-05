@@ -26,7 +26,7 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
-      "sha256": "66ee67e30a14f78833cd172bdd379951b64e3055a5e105f50ddb7d5d58ad79c6"
+      "sha256": "fa48b3bbb8173cc0bc80cfee364a57325a22311f4f256a84567bde663d10386b"
     },
     {
       "path": "scripts/collect-posix",
@@ -46,7 +46,7 @@
     },
     {
       "path": "scripts/enroll-ssh-posix",
-      "sha256": "9e24a6ebba815cee32e21796fe55e3574d6e876a176a1af9242fa16436c8eb80"
+      "sha256": "b0200dbfb380081a284a26faf079f69b61dbb2eb0249263e1ccb5d2ce4a3360b"
     },
     {
       "path": "scripts/enroll-windows-sftp.ps1",

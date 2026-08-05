@@ -85,9 +85,9 @@ class AppServer {
   async initialize() {
     await this.request("initialize", {
       clientInfo: {
-        name: "machine_utilities",
-        title: "Machine Utilities",
-        version: "0.2.20",
+        name: "roundhouse",
+        title: "Roundhouse",
+        version: "0.2.0",
       },
       capabilities: {},
     });

@@ -159,7 +159,7 @@ commands in order for each applicable harness:
 # Codex
 codex plugin list --json
 codex plugin marketplace upgrade MARKETPLACE --json
-node "EXACT-MACHINE-UTILITIES-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" update EACH_INSTALLED_PLUGIN@MARKETPLACE
+node "EXACT-ROUNDHOUSE-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" update EACH_INSTALLED_PLUGIN@MARKETPLACE
 
 # Claude
 claude plugin list --json
@@ -215,7 +215,7 @@ provenance, conversions, ambiguous scope, and sealed-plan mutations.
 3. Updating the executor is a separately approved bootstrap action. Use
    `codex plugin marketplace upgrade novotnyllc --json` followed by the current
    integrity-verified helper:
-   `node "EXACT-MACHINE-UTILITIES-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" update roundhouse@novotnyllc`.
+   `node "EXACT-ROUNDHOUSE-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" update roundhouse@novotnyllc`.
    It snapshots hook trust before running the exact native plugin add. The only
    fallback is a separately approved Machine Utilities self-update from an
    integrity-verified release that predates this helper: after the marketplace
