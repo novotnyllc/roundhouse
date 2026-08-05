@@ -28,7 +28,7 @@ There is no stored administrator credential.
 Ordinary Windows inventory reports transport state as a
 `protected-local-observation`. The collector accepts only the exact
 ACL-protected local `candidate.receipt`, detached CMS, and `readiness` files
-under `MachineUtilities-Sftp-Public` and binds them to current local broker
+under `Roundhouse-Sftp-Public` and binds them to current local broker
 projections and the configured route. At promotion, the detached CMS signer
 certificate must cover the candidate's original `issued-at`/`expires-at`
 interval. After promotion, those exact signed bytes are historical
@@ -45,7 +45,7 @@ readiness.
 
 ## Prepare and certify each node
 
-Run `machine-utilities prepare-privilege-identity` on the originating node.
+Run `roundhouse prepare-privilege-identity` on the originating node.
 The fixed helper creates the private key only below its platform state root and
 emits a public-only certificate request. Repository, plugin-cache, cloud-sync,
 symlinked, wrong-owner, or group/world-readable locations fail closed. Do not
@@ -70,8 +70,8 @@ agent. Renewal is manual: keep the old identity until the replacement passes
 representative POSIX and Windows canaries.
 
 The protected Windows `AuthorizedPrincipalsFile` maps the fixed
-`machine-utilities-windows` certificate principal to the dedicated
-`MachineUtilitiesRequest` account. The signed request identity remains that
+`roundhouse-windows` certificate principal to the dedicated
+`RoundhouseRequest` account. The signed request identity remains that
 account and its pinned SID; the account name is not an additional certificate
 principal.
 
@@ -80,10 +80,10 @@ principal.
 Use these read-only surfaces from either Codex or Claude:
 
 ```text
-machine-utilities privilege-status HOST STATUS.jsonl
-machine-utilities prepare-privilege-enrollment HOST PREPARATION.json
-machine-utilities preview-privilege-upgrade HOST UPGRADE.json
-machine-utilities preview-privilege-revocation HOST REVOCATION.json
+roundhouse privilege-status HOST STATUS.jsonl
+roundhouse prepare-privilege-enrollment HOST PREPARATION.json
+roundhouse preview-privilege-upgrade HOST UPGRADE.json
+roundhouse preview-privilege-revocation HOST REVOCATION.json
 ```
 
 `prepare-privilege-enrollment` names only fixed repository entrypoints, modes,
@@ -114,7 +114,7 @@ candidate signature, and final verification all pass.
 
 Use the protected copy of `enroll-windows-sftp.ps1` fixed by
 `bootstrap.receipt`; do not run a repository or plugin-cache copy. The staging
-root is `C:\ProgramData\MachineUtilities-Sftp-Bootstrap`. Its controller inputs
+root is `C:\ProgramData\Roundhouse-Sftp-Bootstrap`. Its controller inputs
 have fixed names: `controller.intent`, `controller.intent.p7s`,
 `controller.receipt`, and `controller.receipt.p7s`.
 
@@ -133,7 +133,7 @@ have fixed names: `controller.intent`, `controller.intent.p7s`,
    transaction stages and canaries the generation and publishes the exact
    candidate in an awaiting-signature state; it cannot promote `ready`.
 4. Export the exact candidate bytes from
-   `C:\ProgramData\MachineUtilities-Sftp-Public\candidate.receipt`. Rehash them
+   `C:\ProgramData\Roundhouse-Sftp-Public\candidate.receipt`. Rehash them
    outside the target and require the hash to equal both the previewed hash and
    the active pending candidate hash. Do not normalize newlines, reserialize,
    copy from prose, or sign a reconstructed file.
@@ -197,7 +197,7 @@ agent forwarding, directory creation, and listing are outside the contract. An
 unrelated broad SSH firewall rule cannot widen the certificate's signed source
 restriction or the managed per-account restriction.
 
-`machine-utilities privilege-status HOST STATUS.jsonl` sends the normal signed
+`roundhouse privilege-status HOST STATUS.jsonl` sends the normal signed
 `request|1` envelope with action `broker.readiness.v1`, an empty payload, fixed
 `windows-system-v1`/`LocalSystem` context, and detached broker/policy/
 constraint/generation inputs. It uses the same four-file slot and commit-last

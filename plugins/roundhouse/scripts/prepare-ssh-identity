@@ -436,7 +436,7 @@ system_ssh_keygen_ready() {
 
 private_temp_directory() {
   local directory
-  directory=$(/usr/bin/mktemp -d /tmp/machine-utilities-ssh-identity.XXXXXX 2>/dev/null) || return 1
+  directory=$(/usr/bin/mktemp -d /tmp/roundhouse-ssh-identity.XXXXXX 2>/dev/null) || return 1
   normalise_created_directory "$directory" || { /bin/rm -rf "$directory" >/dev/null 2>&1; return 1; }
   printf '%s' "$directory"
 }
@@ -536,7 +536,7 @@ parse_request_file() {
   line_count=$(/usr/bin/wc -l <"$file" | /usr/bin/tr -d ' ')
   [ "$line_count" = 9 ] || return 1
   LC_ALL=C /usr/bin/grep -q '[^ -~]' "$file" && return 1
-  [ "$(/usr/bin/sed -n '1p' "$file")" = 'machine-utilities-ssh-csr|1' ] || return 1
+  [ "$(/usr/bin/sed -n '1p' "$file")" = 'roundhouse-ssh-csr|1' ] || return 1
   [ "$(/usr/bin/sed -n '9p' "$file")" = 'end-csr|' ] || return 1
   csr_domain=$(read_record_value "$file" 2 fleet-domain) || return 1
   csr_node_id=$(read_record_value "$file" 3 node-id) || return 1
@@ -575,7 +575,7 @@ parse_generation_intent_file() {
   lines=$(/usr/bin/wc -l <"$intent" | /usr/bin/tr -d ' ')
   [ "$lines" = 10 ] || return 1
   LC_ALL=C /usr/bin/grep -q '[^ -~]' "$intent" && return 1
-  [ "$(/usr/bin/sed -n '1p' "$intent")" = 'machine-utilities-ssh-generation-intent|1' ] &&
+  [ "$(/usr/bin/sed -n '1p' "$intent")" = 'roundhouse-ssh-generation-intent|1' ] &&
     [ "$(/usr/bin/sed -n '10p' "$intent")" = 'end-generation-intent|' ] || return 1
   intent_domain=$(read_record_value "$intent" 2 fleet-domain) || return 1
   intent_node_id=$(read_record_value "$intent" 3 node-id) || return 1
@@ -692,7 +692,7 @@ parse_certificate_contract() {
   lines=$(/usr/bin/wc -l <"$contract" | /usr/bin/tr -d ' ')
   [ "$lines" = 10 ] || return 1
   LC_ALL=C /usr/bin/grep -q '[^ -~]' "$contract" && return 1
-  [ "$(/usr/bin/sed -n '1p' "$contract")" = 'machine-utilities-ssh-certificate-contract|1' ] &&
+  [ "$(/usr/bin/sed -n '1p' "$contract")" = 'roundhouse-ssh-certificate-contract|1' ] &&
     [ "$(/usr/bin/sed -n '10p' "$contract")" = 'end-certificate-contract|' ] || return 1
   contract_ca_fingerprint=$(read_record_value "$contract" 2 fleet-ca-fingerprint) || return 1
   contract_ca_generation=$(read_record_value "$contract" 3 ca-generation) || return 1
@@ -852,7 +852,7 @@ write_generation_intent_to_directory() {
   temporary=$(/usr/bin/mktemp "$directory/.generation-intent.XXXXXX" 2>/dev/null) || return 1
   normalise_created_file "$temporary" 8192 || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
   if ! record \
-    'machine-utilities-ssh-generation-intent|1' \
+    'roundhouse-ssh-generation-intent|1' \
     "fleet-domain|$domain" \
     "node-id|$node_id" \
     "signing-principal|$node_id@$domain" \
@@ -885,12 +885,12 @@ write_request_to_directory() {
   temporary=$(/usr/bin/mktemp "$directory/.request.XXXXXX" 2>/dev/null) || return 1
   normalise_created_file "$temporary" 16384 || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
   if fixture_failpoint partial-request-record; then
-    record 'machine-utilities-ssh-csr|1' 2>/dev/null >"$temporary" || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
+    record 'roundhouse-ssh-csr|1' 2>/dev/null >"$temporary" || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
     /bin/rm -f "$temporary" >/dev/null 2>&1
     return 1
   fi
   if ! record \
-    'machine-utilities-ssh-csr|1' \
+    'roundhouse-ssh-csr|1' \
     "fleet-domain|$domain" \
     "node-id|$node_id" \
     "public-key|$identity_public_key" \
@@ -1154,7 +1154,7 @@ parse_prepare_lock_lease() {
   lines=$(/usr/bin/wc -l <"$lease" | /usr/bin/tr -d ' ')
   [ "$lines" = 9 ] || return 1
   LC_ALL=C /usr/bin/grep -q '[^ -~]' "$lease" && return 1
-  [ "$(/usr/bin/sed -n '1p' "$lease")" = 'machine-utilities-prepare-lock|1' ] &&
+  [ "$(/usr/bin/sed -n '1p' "$lease")" = 'roundhouse-prepare-lock|1' ] &&
     [ "$(/usr/bin/sed -n '9p' "$lease")" = 'end-prepare-lock|' ] || return 1
   lease_owner=$(read_record_value "$lease" 2 owner) || return 1
   lease_pid=$(read_record_value "$lease" 3 pid) || return 1
@@ -1229,7 +1229,7 @@ write_prepare_lock_lease() {
   temporary=$(/usr/bin/mktemp "$lock/.lease.XXXXXX" 2>/dev/null) || return 1
   normalise_created_file "$temporary" 2048 || { /bin/rm -f "$temporary" >/dev/null 2>&1; return 1; }
   if ! record \
-    'machine-utilities-prepare-lock|1' \
+    'roundhouse-prepare-lock|1' \
     "owner|$(/usr/bin/id -un)" \
     "pid|$owned_prepare_pid" \
     "process-start|$owned_prepare_process_start" \
@@ -1631,7 +1631,7 @@ self_test() {
   local cert_details cert_ca cert_serial cert_after cert_before contract
   local startup_env startup_marker startup_output self_dir self_base self_path hostile_tmp hostile_target
   local noncanonical_root noncanonical_home noncanonical_status noncanonical_error command_result
-  test_root=$(/usr/bin/mktemp -d /tmp/machine-utilities-prepare-identity.XXXXXX) || return 1
+  test_root=$(/usr/bin/mktemp -d /tmp/roundhouse-prepare-identity.XXXXXX) || return 1
   test_root=$(canonical_directory "$test_root") || return 1
   self_test_worker_pids=
   self_test_worker_root=$test_root
@@ -1804,7 +1804,7 @@ self_test() {
   cert_after=$(printf '%s\n' "$cert_details" | /usr/bin/awk '/^[[:space:]]*Valid: from / {print $3 "Z"; exit}')
   cert_before=$(printf '%s\n' "$cert_details" | /usr/bin/awk '/^[[:space:]]*Valid: from / {print $5 "Z"; exit}')
   contract=$current/$certificate_contract_name
-  record 'machine-utilities-ssh-certificate-contract|1' \
+  record 'roundhouse-ssh-certificate-contract|1' \
     "fleet-ca-fingerprint|$cert_ca" 'ca-generation|1' "certificate-serial|$cert_serial" \
     "certificate-valid-after|$cert_after" "certificate-valid-before|$cert_before" \
     'certificate-principals|mu-posix,mu-request,node-a@fleet.example' \

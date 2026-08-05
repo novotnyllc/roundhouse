@@ -50,8 +50,7 @@ Nothing "just runs a command" on a remote machine.
 
 One file describes the fleet:
 `${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/config.json` (override with
-`ROUNDHOUSE_CONFIG`; hosts migrating from machine-utilities fall back to the
-legacy path automatically). It names each machine — display name, SSH alias,
+`ROUNDHOUSE_CONFIG`). It names each machine — display name, SSH alias,
 platform, transport, groups — plus the development root and optional
 Codex remote-control and handoff-project settings. Scaffold it from the
 plugin's `config.example.json`, or let `yardmaster:setup` interview you.
@@ -112,9 +111,6 @@ Reads need reachability; mutations need a sealed plan and your approval;
 privileged actions additionally need prior enrollment (a one-time, consented
 ceremony per host) and ride signed requests validated against an enrolled
 certificate — there is no general "run this as root" anywhere in the system.
-Enrolled hosts keep the legacy `machine-utilities` system namespace on disk;
-[AGENTS.md](../AGENTS.md) explains why and what a future re-namespacing
-involves.
 
 ## With yardmaster
 

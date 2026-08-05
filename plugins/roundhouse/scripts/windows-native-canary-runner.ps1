@@ -39,7 +39,7 @@ function Get-ChrootAccessEvidenceContract([string]$RequestSid) {
     $DirectorySddl = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x001200a0;;;$RequestSid)"
     return [pscustomobject]@{
         RequestSid = $RequestSid
-        ChrootPathSha256 = Get-Sha256Utf8Text "C:\PROGRAMDATA\MACHINEUTILITIES\CHROOT"
+        ChrootPathSha256 = Get-Sha256Utf8Text "C:\PROGRAMDATA\ROUNDHOUSE\CHROOT"
         ChrootDirectorySddlSha256 = Get-Sha256Utf8Text $DirectorySddl
         SlotDirectorySddlSha256 = Get-Sha256Utf8Text $DirectorySddl
         SlotFileSddlSha256 = Get-Sha256Utf8Text `
@@ -547,7 +547,7 @@ function Invoke-SelfTest {
     $Rsa = [Security.Cryptography.RSA]::Create(2048)
     try {
         $Request = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
-            "CN=MachineUtilities Fixture", $Rsa, [Security.Cryptography.HashAlgorithmName]::SHA256,
+            "CN=Roundhouse Fixture", $Rsa, [Security.Cryptography.HashAlgorithmName]::SHA256,
             [Security.Cryptography.RSASignaturePadding]::Pkcs1)
         $Certificate = $Request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddMinutes(-1),
             [DateTimeOffset]::UtcNow.AddMinutes(10))

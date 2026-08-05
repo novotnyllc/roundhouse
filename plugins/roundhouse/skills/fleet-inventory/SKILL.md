@@ -6,7 +6,7 @@ description: Inventory and compare a configured fleet of macOS, Linux, WSL, and 
 # Fleet Inventory
 
 Set `SKILL_DIR` to the absolute directory containing this loaded `SKILL.md` and
-`CLI="$SKILL_DIR/../../scripts/machine-utilities"`; the shell working directory
+`CLI="$SKILL_DIR/../../scripts/roundhouse"`; the shell working directory
 is not the skill directory. Start with `"$CLI" validate-config`, resolve
 requested host names or groups from the config, then collect only the sections
 needed. Default to all configured hosts and a human report; preserve the JSONL

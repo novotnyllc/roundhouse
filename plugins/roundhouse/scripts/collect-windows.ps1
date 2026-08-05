@@ -420,8 +420,8 @@ function Read-WindowsSftpCandidateLines([string[]]$Lines) {
     if ($null -eq $Fields -or $Fields.operation -cnotin @("install", "repair") -or
         $Fields.authorization -cne "inert-unsigned-local-observation" -or
         -not (Test-WindowsSftpHost $Fields.host) -or
-        $Fields.'request-account' -cne "MachineUtilitiesRequest" -or
-        $Fields.'endpoint-principal' -cne "machine-utilities-windows" -or
+        $Fields.'request-account' -cne "RoundhouseRequest" -or
+        $Fields.'endpoint-principal' -cne "roundhouse-windows" -or
         -not (Test-WindowsSftpSid $Fields.'request-sid') -or
         -not (Test-WindowsSftpFingerprint $Fields.'primary-ca-fingerprint') -or
         -not (Test-WindowsSftpUInt $Fields.'primary-ca-generation' $true) -or
@@ -556,7 +556,7 @@ function Read-WindowsSftpProtectedReadiness([string]$ProgramDataRoot) {
         $CanonicalProgramData = [IO.Path]::GetFullPath([Environment]::GetFolderPath("CommonApplicationData"))
         if (-not [IO.Path]::GetFullPath($ProgramDataRoot).Equals(
                 $CanonicalProgramData, [StringComparison]::OrdinalIgnoreCase)) { return $null }
-        $PublicRoot = Join-Path $CanonicalProgramData "MachineUtilities-Sftp-Public"
+        $PublicRoot = Join-Path $CanonicalProgramData "Roundhouse-Sftp-Public"
         $ReadinessPath = Join-Path $PublicRoot "readiness"
         $DirectorySddl = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
         $FileSddl = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120089;;;BU)"
@@ -572,7 +572,7 @@ function Get-WindowsSftpContractDigests([string]$RequestSid) {
     $SlotFile = "O:${RequestSid}G:BAD:P(D;;0x000c0000;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x00100002;;;$RequestSid)"
     $ResultsDirectory = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1200a0;;;$RequestSid)"
     $ResultFile = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120089;;;$RequestSid)"
-    $Chroot = @("windows-sftp-chroot-contract|1", "chroot|C:\ProgramData\MachineUtilities\chroot",
+    $Chroot = @("windows-sftp-chroot-contract|1", "chroot|C:\ProgramData\Roundhouse\chroot",
         "request|/ingress/slot/request", "signature|/ingress/slot/request.sig", "payload|/ingress/slot/payload",
         "commit|/ingress/slot/commit", "results|/results/<request-id>.result", "projection|direct-non-reparse",
         "end-chroot|")
@@ -584,8 +584,8 @@ function Get-WindowsSftpContractDigests([string]$RequestSid) {
         "list|denied", "end-results-acl|")
     $Quota = @("windows-sftp-quota-contract|1", "request-sid|$RequestSid", "limit-bytes|68157440",
         "warning-bytes|67108864", "tracking|enabled", "enforcement|enabled", "volume|C:\ProgramData", "end-quota|")
-    $OpenSsh = @("windows-sftp-openssh-contract|1", "request-account|MachineUtilitiesRequest",
-        "endpoint-principal|machine-utilities-windows", "chroot|C:\ProgramData\MachineUtilities\chroot",
+    $OpenSsh = @("windows-sftp-openssh-contract|1", "request-account|RoundhouseRequest",
+        "endpoint-principal|roundhouse-windows", "chroot|C:\ProgramData\Roundhouse\chroot",
         "force-command|internal-sftp", "authentication|publickey-ca-certificate", "password|disabled",
         "keyboard-interactive|disabled", "pty|disabled", "x11|disabled", "tcp-forwarding|disabled",
         "stream-local-forwarding|disabled", "agent-forwarding|disabled", "tunnel|disabled", "user-rc|disabled",
@@ -601,8 +601,8 @@ function Get-WindowsSftpContractDigests([string]$RequestSid) {
 }
 
 function Get-WindowsSftpFirewallContractDigest([string]$ManagementCidrs) {
-    $Lines = @("windows-sftp-firewall-contract|1", "name|Machine Utilities Windows SFTP v1",
-        "group|Machine Utilities", "direction|inbound", "action|allow", "protocol|tcp", "local-port|22",
+    $Lines = @("windows-sftp-firewall-contract|1", "name|Roundhouse Windows SFTP v1",
+        "group|Roundhouse", "direction|inbound", "action|allow", "protocol|tcp", "local-port|22",
         "service|sshd", "remote-addresses|$ManagementCidrs", "profiles|any",
         "activation-order|account-then-firewall-last", "end-firewall|")
     return Get-TextSha256 (($Lines -join "`n") + "`n")
@@ -610,15 +610,15 @@ function Get-WindowsSftpFirewallContractDigest([string]$ManagementCidrs) {
 
 function Test-WindowsSftpManagedFirewall([string]$ExpectedCidrs) {
     try {
-        $Rules = @(NetSecurity\Get-NetFirewallRule -Name "MachineUtilities-Windows-Sftp-v1" -ErrorAction Stop)
+        $Rules = @(NetSecurity\Get-NetFirewallRule -Name "Roundhouse-Windows-Sftp-v1" -ErrorAction Stop)
         if ($Rules.Count -ne 1) { return $false }
         $Rule = $Rules[0]
         $Port = @(NetSecurity\Get-NetFirewallPortFilter -AssociatedNetFirewallRule $Rule -ErrorAction Stop)
         $Address = @(NetSecurity\Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $Rule -ErrorAction Stop)
         $Service = @(NetSecurity\Get-NetFirewallServiceFilter -AssociatedNetFirewallRule $Rule -ErrorAction Stop)
         if ($Port.Count -ne 1 -or $Address.Count -ne 1 -or $Service.Count -ne 1 -or
-            [string]$Rule.DisplayName -cne "Machine Utilities Windows SFTP v1" -or
-            [string]$Rule.Group -cne "Machine Utilities" -or [string]$Rule.Direction -cne "Inbound" -or
+            [string]$Rule.DisplayName -cne "Roundhouse Windows SFTP v1" -or
+            [string]$Rule.Group -cne "Roundhouse" -or [string]$Rule.Direction -cne "Inbound" -or
             [string]$Rule.Action -cne "Allow" -or [string]$Rule.Enabled -cne "True" -or
             [string]$Rule.Profile -cne "Any" -or [string]$Rule.EdgeTraversalPolicy -cne "Block" -or
             [string]$Port[0].Protocol -notin @("TCP", "6") -or [string]$Port[0].LocalPort -cne "22" -or
@@ -643,7 +643,7 @@ function Get-WindowsSftpProtectedObservation(
         $CanonicalProgramData = [IO.Path]::GetFullPath([Environment]::GetFolderPath("CommonApplicationData"))
         if (-not [IO.Path]::GetFullPath($ProgramDataRoot).Equals(
                 $CanonicalProgramData, [StringComparison]::OrdinalIgnoreCase)) { return $null }
-        $PublicRoot = Join-Path $CanonicalProgramData "MachineUtilities-Sftp-Public"
+        $PublicRoot = Join-Path $CanonicalProgramData "Roundhouse-Sftp-Public"
         $DirectorySddl = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
         $FileSddl = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120089;;;BU)"
         $CandidatePath = Join-Path $PublicRoot "candidate.receipt"
@@ -679,7 +679,7 @@ function Get-WindowsSftpProtectedObservation(
         if ($Candidate.host -cne $ExpectedHost -or $Candidate.host -cne $CurrentHost -or
             [string]$Route.mode -cne "windows-sftp" -or [int64]$Route.port -ne 22 -or
             [string]$Route.request_user -cne $Candidate.'request-account' -or
-            $Candidate.'endpoint-principal' -cne "machine-utilities-windows" -or
+            $Candidate.'endpoint-principal' -cne "roundhouse-windows" -or
             [string]$Route.pinned_host_key_fingerprint -cne $Candidate.'host-key-fingerprint' -or
             $Candidate.'management-cidrs' -cne $ExpectedCidrsText) { return $null }
 
@@ -712,7 +712,7 @@ function Get-WindowsSftpProtectedObservation(
             (Get-FileHash -LiteralPath $SshdConfig -Algorithm SHA256).Hash.ToLowerInvariant() -cne
                 $Candidate.'configuration-sha256' -or
             -not (Test-WindowsSftpManagedFirewall $Candidate.'management-cidrs')) { return $null }
-        $Account = Microsoft.PowerShell.LocalAccounts\Get-LocalUser -Name "MachineUtilitiesRequest" -ErrorAction Stop
+        $Account = Microsoft.PowerShell.LocalAccounts\Get-LocalUser -Name "RoundhouseRequest" -ErrorAction Stop
         if (-not [bool]$Account.Enabled -or [string]$Account.Sid.Value -cne $Candidate.'request-sid') { return $null }
         return [pscustomobject]@{
             Authority = "protected-local-observation"
@@ -756,7 +756,7 @@ function Read-WindowsBrokerReadiness([string]$Path) {
             ($Fields.'request-sid' -cne "-" -or $Fields.'request-principal' -cne "-")) -or
         ($Fields.'request-account-state' -cne "absent" -and
             ($Fields.'request-sid' -notmatch '^S-[0-9]+(?:-[0-9]+){1,14}$' -or
-             $Fields.'request-principal' -cne "MachineUtilitiesRequest")) -or
+             $Fields.'request-principal' -cne "RoundhouseRequest")) -or
         @($Fields.'system-task-ready', $Fields.'profile-task-ready', $Fields.'transport-ready',
             $Fields.'native-canary-ready' | Where-Object { $_ -cnotin @("true", "false") }).Count -ne 0) { return $null }
     if ($Fields.lifecycle -cin @("needs_native_canary", "needs_transport_enrollment", "ready") -and
@@ -997,7 +997,7 @@ function Add-PrivilegeReadiness([object]$Value, [object]$ConfiguredMachine) {
     $IdentityPath = if (-not [string]::IsNullOrWhiteSpace($env:ROUNDHOUSE_IDENTITY)) {
         $env:ROUNDHOUSE_IDENTITY
     } elseif (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-        Join-Path $env:LOCALAPPDATA "MachineUtilities/identity.json"
+        Join-Path $env:LOCALAPPDATA "Roundhouse/identity.json"
     } else {
         Join-Path $HOME ".config/roundhouse/identity.json"
     }
@@ -1039,13 +1039,13 @@ function Add-PrivilegeReadiness([object]$Value, [object]$ConfiguredMachine) {
         }
     }
     $ProgramDataRoot = if ([string]::IsNullOrWhiteSpace($env:ProgramData)) {
-        Join-Path $HOME ".machine-utilities-programdata"
+        Join-Path $HOME ".roundhouse-programdata"
     } else { $env:ProgramData }
-    $PublicRoot = Join-Path $ProgramDataRoot "MachineUtilities-Public"
+    $PublicRoot = Join-Path $ProgramDataRoot "Roundhouse-Public"
     $ReadinessPath = Join-Path $PublicRoot "readiness"
     $PolicyPath = Join-Path $PublicRoot "policy.actions"
     $ConstraintsPath = Join-Path $PublicRoot "policy.constraints"
-    $SftpPublicRoot = Join-Path $ProgramDataRoot "MachineUtilities-Sftp-Public"
+    $SftpPublicRoot = Join-Path $ProgramDataRoot "Roundhouse-Sftp-Public"
     $SftpReadinessPath = Join-Path $SftpPublicRoot "readiness"
     $Readiness = Read-WindowsBrokerReadiness $ReadinessPath
     $ReadinessPresent = Test-Path -LiteralPath $ReadinessPath -PathType Leaf
@@ -1648,7 +1648,7 @@ function Assert-WorkerConfig([object]$Value) {
             if (@($RouteFields | Where-Object { $_ -notin @("host", "management_networks", "mode", "pinned_host_key_fingerprint", "port", "request_user") }).Count -gt 0 -or
                 $RouteFields.Count -ne 6 -or [string]$Route.mode -ne "windows-sftp" -or
                 [string]$Route.host -notmatch '^[A-Za-z0-9][A-Za-z0-9.:-]{0,254}$' -or
-                [int64]$Route.port -ne 22 -or [string]$Route.request_user -cne "MachineUtilitiesRequest" -or
+                [int64]$Route.port -ne 22 -or [string]$Route.request_user -cne "RoundhouseRequest" -or
                 [string]$Route.pinned_host_key_fingerprint -notmatch '^SHA256:[A-Za-z0-9+/]{43}=?$' -or
                 @($Route.management_networks).Count -lt 1 -or @($Route.management_networks).Count -gt 32) {
                 throw "Invalid Windows automation transport"
@@ -1826,7 +1826,7 @@ function Invoke-WindowsSftpReceiptSelfTest {
     $SecondCertificate = $null
     try {
         $Request = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
-            "CN=machine-utilities-controller", $Key, [Security.Cryptography.HashAlgorithmName]::SHA256,
+            "CN=roundhouse-controller", $Key, [Security.Cryptography.HashAlgorithmName]::SHA256,
             [Security.Cryptography.RSASignaturePadding]::Pkcs1)
         $Certificate = $Request.CreateSelfSigned(
             [DateTimeOffset]::FromUnixTimeSeconds($IssuedAt - 60),
@@ -1836,8 +1836,8 @@ function Invoke-WindowsSftpReceiptSelfTest {
         [string[]]$CandidateLines = @(
             "windows-sftp-enrollment-candidate|1", "operation|install",
             "authorization|inert-unsigned-local-observation", "host|WINDOWS-FIXTURE",
-            "request-account|MachineUtilitiesRequest", "request-sid|S-1-5-21-1-2-3-2001",
-            "endpoint-principal|machine-utilities-windows", "primary-ca-fingerprint|$Fingerprint",
+            "request-account|RoundhouseRequest", "request-sid|S-1-5-21-1-2-3-2001",
+            "endpoint-principal|roundhouse-windows", "primary-ca-fingerprint|$Fingerprint",
             "primary-ca-generation|1", "previous-ca-fingerprint|-", "previous-ca-generation|0",
             "krl-generation|1", "management-cidrs|192.0.2.0/24", "host-key-fingerprint|$Fingerprint",
             "intent-sha256|$DigestA", "controller-signature-sha256|$DigestB",
@@ -1853,7 +1853,7 @@ function Invoke-WindowsSftpReceiptSelfTest {
         $Candidate = Read-WindowsSftpCandidateLines $CandidateLines
         if ($null -eq $Candidate) { throw "self_test_candidate_rejected" }
         [string[]]$AccountPrincipalLines = $CandidateLines.Clone()
-        $AccountPrincipalLines[6] = "endpoint-principal|MachineUtilitiesRequest"
+        $AccountPrincipalLines[6] = "endpoint-principal|RoundhouseRequest"
         if ($null -ne (Read-WindowsSftpCandidateLines $AccountPrincipalLines)) {
             throw "self_test_account_name_endpoint_accepted"
         }
@@ -1871,7 +1871,7 @@ function Invoke-WindowsSftpReceiptSelfTest {
         $HistoricalExpiresAt = $Now - 300
         $HistoricalKey = [Security.Cryptography.RSA]::Create(2048)
         $HistoricalRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
-            "CN=machine-utilities-historical-controller", $HistoricalKey,
+            "CN=roundhouse-historical-controller", $HistoricalKey,
             [Security.Cryptography.HashAlgorithmName]::SHA256,
             [Security.Cryptography.RSASignaturePadding]::Pkcs1)
         $HistoricalCertificate = $HistoricalRequest.CreateSelfSigned(
@@ -1951,7 +1951,7 @@ function Invoke-WindowsSftpReceiptSelfTest {
 
         $SecondKey = [Security.Cryptography.RSA]::Create(2048)
         $SecondRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
-            "CN=machine-utilities-second-controller", $SecondKey,
+            "CN=roundhouse-second-controller", $SecondKey,
             [Security.Cryptography.HashAlgorithmName]::SHA256,
             [Security.Cryptography.RSASignaturePadding]::Pkcs1)
         $SecondCertificate = $SecondRequest.CreateSelfSigned(
@@ -2027,7 +2027,7 @@ if (Test-Section "packages") {
                 @{ code = "manager_missing"; severity = "warning"; retryable = $false; message = "winget is not installed" }
             )
         } else {
-            $Temp = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-winget-" + [Guid]::NewGuid().ToString("N") + ".json")
+            $Temp = Join-Path ([IO.Path]::GetTempPath()) ("roundhouse-winget-" + [Guid]::NewGuid().ToString("N") + ".json")
             $Candidates = @{}
             $CandidateQueryAuthoritative = $false
             try {
@@ -3013,7 +3013,7 @@ if (Test-Section "chezmoi") {
     if ($null -eq $Chezmoi) {
         Add-Record -Kind "chezmoi_state" -Id "live" -Status "absent" -Confidence "high" -Data @{ tool_available = $false }
     } else {
-        $StatusFile = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-chezmoi-" + [Guid]::NewGuid().ToString("N"))
+        $StatusFile = Join-Path ([IO.Path]::GetTempPath()) ("roundhouse-chezmoi-" + [Guid]::NewGuid().ToString("N"))
         try {
             $StatusOutput = @(& chezmoi status 2>$null)
             $ChezmoiSucceeded = $?

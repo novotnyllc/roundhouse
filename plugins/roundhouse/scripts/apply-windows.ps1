@@ -833,7 +833,7 @@ function Assert-Postcondition([object]$Operation, [object[]]$Before, [object[]]$
 function Write-Result([object[]]$Records) {
     Assert-ResultPath
     $Directory = Split-Path -Parent ([IO.Path]::GetFullPath($ResultPath))
-    $Temporary = Join-Path $Directory (".machine-utilities-" + [Guid]::NewGuid().ToString("N"))
+    $Temporary = Join-Path $Directory (".roundhouse-" + [Guid]::NewGuid().ToString("N"))
     try {
         $Lines = @($Records | Sort-Object host_id, kind, id | ForEach-Object {
             if (-not (Test-BoundedStrings $_)) { throw "Result record contains an oversized or control string" }
@@ -962,7 +962,7 @@ function New-ApplySummaryRecord(
 }
 
 if ($SelfTest) {
-    $SelfTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-selftest-" + [Guid]::NewGuid().ToString("N"))
+    $SelfTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("roundhouse-selftest-" + [Guid]::NewGuid().ToString("N"))
     try {
         [void][IO.Directory]::CreateDirectory($SelfTestRoot)
         $Canonical = ConvertTo-CanonicalJson ([ordered]@{ b = 2; a = 1 })
@@ -1030,10 +1030,10 @@ if ($SelfTest) {
         }
         $TargetedChezmoiArgv = @(Get-ExactArgv ([pscustomobject]@{
             type = "chezmoi-apply"; kind = "chezmoi_state"; id = "live"
-            targets = @("C:\Users\Claire\.profile.d\10-env.sh", "C:\Users\Claire\.zprofile.d\10-env.zsh")
+            targets = @("C:\Users\Operator\.profile.d\10-env.sh", "C:\Users\Operator\.zprofile.d\10-env.zsh")
         }) $null $null)
         if ((ConvertTo-CanonicalJson $TargetedChezmoiArgv) -ne
-            '["chezmoi","--no-tty","apply","--","C:\\Users\\Claire\\.profile.d\\10-env.sh","C:\\Users\\Claire\\.zprofile.d\\10-env.zsh"]') {
+            '["chezmoi","--no-tty","apply","--","C:\\Users\\Operator\\.profile.d\\10-env.sh","C:\\Users\\Operator\\.zprofile.d\\10-env.zsh"]') {
             throw "Targeted chezmoi argv self-test failed"
         }
         $Rejected = $false
@@ -1176,8 +1176,8 @@ if ($SelfTest) {
             precondition_digest = [ordered]@{ algorithm = "sha256"; value = "c" * 64 }
             operations = @([pscustomobject][ordered]@{
                 type = "chezmoi-apply"; kind = "chezmoi_state"; id = "live"
-                argv = @("chezmoi", "--no-tty", "apply", "--", "C:\Users\Claire\.profile.d\10-env.sh")
-                targets = @("C:\Users\Claire\.profile.d\10-env.sh")
+                argv = @("chezmoi", "--no-tty", "apply", "--", "C:\Users\Operator\.profile.d\10-env.sh")
+                targets = @("C:\Users\Operator\.profile.d\10-env.sh")
             })
         }
         $TargetedChezmoiDigest = Get-TextSha256 ((ConvertTo-CanonicalJson $TargetedChezmoiPlan) + "`n")
@@ -1201,7 +1201,7 @@ if ($SelfTest) {
             precondition_digest = [ordered]@{ algorithm = "sha256"; value = "c" * 64 }
             operations = @([ordered]@{
                 type = "agent-update"; kind = "agent_runtime"; id = "codex"; argv = @("codex", "update")
-                targets = @("C:\Users\Claire\.profile.d\10-env.sh")
+                targets = @("C:\Users\Operator\.profile.d\10-env.sh")
             })
         }
         $Rejected = $false
@@ -1318,8 +1318,8 @@ if ($SelfTest) {
             if ($LASTEXITCODE -ne 0) { throw "Fixture Git init failed" }
             [IO.File]::WriteAllText((Join-Path $SeedPath "README.md"), "fixture`n", $OutputEncoding)
             & $Git.Source -C $SeedPath add README.md
-            & $Git.Source -C $SeedPath -c user.name=machine-utilities `
-                -c user.email=machine-utilities@example.invalid commit --quiet -m fixture
+            & $Git.Source -C $SeedPath -c user.name=roundhouse `
+                -c user.email=roundhouse@example.invalid commit --quiet -m fixture
             if ($LASTEXITCODE -ne 0) { throw "Fixture Git commit failed" }
             & $Git.Source clone --quiet --bare -- $SeedPath $OriginPath
             if ($LASTEXITCODE -ne 0) { throw "Fixture bare clone failed" }

@@ -94,8 +94,8 @@ function Test-ManagedRelativePath([string]$Path) {
         $Segments[0].ToLowerInvariant() -ceq ".codex" -and
         $Segments[1].ToLowerInvariant() -ceq "skills" -and
         $Segments[2] -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
-    return $Folded.StartsWith(".codex/machine-utilities/managed/") -or
-        $Folded.StartsWith(".codex/machine-utilities/marketplace-stage/") -or
+    return $Folded.StartsWith(".codex/roundhouse/managed/") -or
+        $Folded.StartsWith(".codex/roundhouse/marketplace-stage/") -or
         $StandaloneSkillFile -or
         $Folded -match '^\.codex/settings(?:\.[a-z0-9._-]+)?\.json$' -or
         $Folded -match '^\.codex/config(?:\.[a-z0-9._-]+)?\.toml$' -or
@@ -117,9 +117,9 @@ function Assert-HandlerDestination([string]$Path, [string]$Handler) {
                 $Parts[1].ToLowerInvariant() -ceq "skills" -and
                 $Parts[2] -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
         }
-        "marketplace-file" { $Folded.StartsWith(".codex/machine-utilities/marketplace-stage/") }
-        "marketplace-desired-record" { $Folded -eq ".codex/machine-utilities/managed/marketplace.desired" }
-        "managed-file" { $Folded.StartsWith(".codex/machine-utilities/managed/") }
+        "marketplace-file" { $Folded.StartsWith(".codex/roundhouse/marketplace-stage/") }
+        "marketplace-desired-record" { $Folded -eq ".codex/roundhouse/managed/marketplace.desired" }
+        "managed-file" { $Folded.StartsWith(".codex/roundhouse/managed/") }
     }
     if (-not $Expected) { throw "handler_destination_mismatch" }
 }
@@ -160,7 +160,7 @@ function Get-CompiledEntryContract([string]$Path, [string]$Handler) {
             $Parts = $Path.Split('/')
             if ($Parts.Count -lt 5 -or -not (Test-Token $Parts[3])) { throw "handler_identity_mismatch" }
             $Artifact = $Parts[3].ToLowerInvariant()
-            return [pscustomobject]@{ Artifact = $Artifact; Manager = "machine-utilities";
+            return [pscustomobject]@{ Artifact = $Artifact; Manager = "roundhouse";
                 LogicalIdentity = "managed-file:$(Get-Sha256Text $Folded)" }
         }
     }
@@ -491,7 +491,7 @@ function Assert-ContentForHandler([object]$Entry, [byte[]]$Bytes, [object]$Marke
 }
 
 function Initialize-ProfileNativeTypes {
-    if ("MachineUtilitiesProfileNative" -as [type]) { return }
+    if ("RoundhouseProfileNative" -as [type]) { return }
     Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -499,14 +499,14 @@ using System.IO;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-public sealed class MachineUtilitiesHeldDirectory : IDisposable
+public sealed class RoundhouseHeldDirectory : IDisposable
 {
     public SafeFileHandle Handle { get; private set; }
     public string FinalPath { get; private set; }
     public uint VolumeSerial { get; private set; }
     public ulong FileId { get; private set; }
 
-    internal MachineUtilitiesHeldDirectory(SafeFileHandle handle, string finalPath, uint volumeSerial, ulong fileId)
+    internal RoundhouseHeldDirectory(SafeFileHandle handle, string finalPath, uint volumeSerial, ulong fileId)
     {
         Handle = handle; FinalPath = finalPath; VolumeSerial = volumeSerial; FileId = fileId;
     }
@@ -514,13 +514,13 @@ public sealed class MachineUtilitiesHeldDirectory : IDisposable
     public void Dispose() { if (Handle != null) Handle.Dispose(); }
 }
 
-public sealed class MachineUtilitiesRegularFile
+public sealed class RoundhouseRegularFile
 {
     public bool Exists { get; internal set; }
     public byte[] Bytes { get; internal set; }
 }
 
-public sealed class MachineUtilitiesStagedFile
+public sealed class RoundhouseStagedFile
 {
     public SafeFileHandle Handle { get; internal set; }
     public string TemporaryPath { get; internal set; }
@@ -528,7 +528,7 @@ public sealed class MachineUtilitiesStagedFile
     public bool Closed { get; internal set; }
 }
 
-public static class MachineUtilitiesProfileNative
+public static class RoundhouseProfileNative
 {
     const uint FILE_READ_ATTRIBUTES = 0x80;
     const uint GENERIC_READ = 0x80000000;
@@ -606,7 +606,7 @@ public static class MachineUtilitiesProfileNative
             throw new InvalidOperationException("profile_path_escape");
     }
 
-    public static MachineUtilitiesHeldDirectory OpenDirectory(string path)
+    public static RoundhouseHeldDirectory OpenDirectory(string path)
     {
         SafeFileHandle handle = CreateFileW(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
             IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
@@ -618,12 +618,12 @@ public static class MachineUtilitiesProfileNative
                 (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
                 throw new InvalidOperationException("profile_reparse_or_collision");
             ulong fileId = ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow;
-            return new MachineUtilitiesHeldDirectory(handle, FinalPath(handle), info.VolumeSerialNumber, fileId);
+            return new RoundhouseHeldDirectory(handle, FinalPath(handle), info.VolumeSerialNumber, fileId);
         }
         catch { handle.Dispose(); throw; }
     }
 
-    public static MachineUtilitiesRegularFile ReadRegularFile(string path, string rootFinalPath)
+    public static RoundhouseRegularFile ReadRegularFile(string path, string rootFinalPath)
     {
         SafeFileHandle handle = CreateFileW(path, GENERIC_READ | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_DELETE, IntPtr.Zero, OPEN_EXISTING,
@@ -631,7 +631,7 @@ public static class MachineUtilitiesProfileNative
         if (handle.IsInvalid)
         {
             int error = Marshal.GetLastWin32Error(); handle.Dispose();
-            if (error == 2 || error == 3) return new MachineUtilitiesRegularFile { Exists = false, Bytes = new byte[0] };
+            if (error == 2 || error == 3) return new RoundhouseRegularFile { Exists = false, Bytes = new byte[0] };
             throw new Win32Exception(error, "profile_file_open_failed");
         }
         using (handle)
@@ -644,7 +644,7 @@ public static class MachineUtilitiesProfileNative
             using (MemoryStream output = new MemoryStream())
             {
                 stream.CopyTo(output);
-                return new MachineUtilitiesRegularFile { Exists = true, Bytes = output.ToArray() };
+                return new RoundhouseRegularFile { Exists = true, Bytes = output.ToArray() };
             }
         }
     }
@@ -683,10 +683,10 @@ public static class MachineUtilitiesProfileNative
         finally { Marshal.FreeHGlobal(buffer); }
     }
 
-    public static MachineUtilitiesStagedFile StageFile(MachineUtilitiesHeldDirectory parent,
+    public static RoundhouseStagedFile StageFile(RoundhouseHeldDirectory parent,
         string parentPath, byte[] bytes)
     {
-        string temporary = Path.Combine(parentPath, ".machine-utilities-" + Guid.NewGuid().ToString("N"));
+        string temporary = Path.Combine(parentPath, ".roundhouse-" + Guid.NewGuid().ToString("N"));
         SafeFileHandle handle = CreateFileW(temporary, GENERIC_READ | GENERIC_WRITE | DELETE,
             FILE_SHARE_READ | FILE_SHARE_DELETE, IntPtr.Zero, CREATE_NEW,
             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
@@ -713,7 +713,7 @@ public static class MachineUtilitiesProfileNative
             }
             finally { if (pin.IsAllocated) pin.Free(); }
             if (!FlushFileBuffers(handle)) throw Error("profile_flush_failed");
-            return new MachineUtilitiesStagedFile { Handle = handle, TemporaryPath = temporary };
+            return new RoundhouseStagedFile { Handle = handle, TemporaryPath = temporary };
         }
         catch
         {
@@ -723,8 +723,8 @@ public static class MachineUtilitiesProfileNative
         }
     }
 
-    public static void CommitStagedFile(MachineUtilitiesHeldDirectory parent, string leaf,
-        MachineUtilitiesStagedFile staged)
+    public static void CommitStagedFile(RoundhouseHeldDirectory parent, string leaf,
+        RoundhouseStagedFile staged)
     {
         if (String.IsNullOrEmpty(leaf) || leaf.IndexOfAny(new char[] { '\\', '/', ':' }) >= 0)
             throw new InvalidOperationException("invalid_profile_leaf");
@@ -734,7 +734,7 @@ public static class MachineUtilitiesProfileNative
         staged.Committed = true;
     }
 
-    public static void CloseStagedFile(MachineUtilitiesStagedFile staged)
+    public static void CloseStagedFile(RoundhouseStagedFile staged)
     {
         if (staged == null || staged.Closed) return;
         if (staged.Handle != null) staged.Handle.Dispose();
@@ -743,9 +743,9 @@ public static class MachineUtilitiesProfileNative
         staged.Closed = true;
     }
 
-    public static void AtomicReplace(MachineUtilitiesHeldDirectory parent, string parentPath, string leaf, byte[] bytes)
+    public static void AtomicReplace(RoundhouseHeldDirectory parent, string parentPath, string leaf, byte[] bytes)
     {
-        MachineUtilitiesStagedFile staged = StageFile(parent, parentPath, bytes);
+        RoundhouseStagedFile staged = StageFile(parent, parentPath, bytes);
         try { CommitStagedFile(parent, leaf, staged); }
         finally { CloseStagedFile(staged); }
     }
@@ -794,7 +794,7 @@ function New-ManagedPathSession([string]$ProfileRoot, [string]$TargetSid, [strin
     $ByPath = @{}
     if ($IsWindows -and -not $script:FixtureMode) {
         Initialize-ProfileNativeTypes
-        $RootHandle = [MachineUtilitiesProfileNative]::OpenDirectory($FullRoot)
+        $RootHandle = [RoundhouseProfileNative]::OpenDirectory($FullRoot)
         [void]$Handles.Add($RootHandle); $ByPath[$FullRoot.ToLowerInvariant()] = $RootHandle
     } else {
         $RootItem = Get-Item -LiteralPath $FullRoot -Force
@@ -831,7 +831,7 @@ function Resolve-ManagedDestination([object]$Session, [string]$RelativePath, [bo
             if (-not $CreateParents) { break }
             if ($null -eq $CreatedParents) { throw "profile_created_parent_untracked" }
             if ($IsWindows -and -not $script:FixtureMode) {
-                $Created = [MachineUtilitiesProfileNative]::CreateDirectoryExclusive($Current)
+                $Created = [RoundhouseProfileNative]::CreateDirectoryExclusive($Current)
             } else {
                 try {
                     [void][IO.Directory]::CreateDirectory($Current)
@@ -843,7 +843,7 @@ function Resolve-ManagedDestination([object]$Session, [string]$RelativePath, [bo
         }
         if ($Created) { [void]$CreatedParents.Add([IO.Path]::GetFullPath($Current)) }
         if ($IsWindows -and -not $script:FixtureMode) {
-            $Handle = [MachineUtilitiesProfileNative]::OpenDirectory($Current)
+            $Handle = [RoundhouseProfileNative]::OpenDirectory($Current)
             $Expected = [IO.Path]::GetFullPath($Current).TrimEnd([IO.Path]::DirectorySeparatorChar)
             if (-not $Handle.FinalPath.Equals($Expected, [StringComparison]::OrdinalIgnoreCase)) {
                 $Handle.Dispose(); throw "profile_ancestor_identity_drift"
@@ -864,7 +864,7 @@ function Resolve-ManagedDestination([object]$Session, [string]$RelativePath, [bo
 
 function Assert-ProfileRootStable([object]$Session, [string]$TargetSid) {
     if ($script:FixtureMode) { return }
-    $Observed = [MachineUtilitiesProfileNative]::OpenDirectory($Session.RootPath)
+    $Observed = [RoundhouseProfileNative]::OpenDirectory($Session.RootPath)
     try {
         if ((Get-RootIdentity $Observed $TargetSid) -cne $Session.RootId -or
             -not $Observed.FinalPath.Equals($Session.RootHandle.FinalPath, [StringComparison]::OrdinalIgnoreCase)) {
@@ -891,7 +891,7 @@ function Assert-EntryMapBinding([object]$Manifest, [object]$EntryMap) {
 function Get-LiveState([object]$Session, [object]$Entry) {
     $Path = Resolve-ManagedDestination $Session $Entry.Path $false
     if ($IsWindows -and -not $script:FixtureMode) {
-        $Observed = [MachineUtilitiesProfileNative]::ReadRegularFile($Path, $Session.RootHandle.FinalPath)
+        $Observed = [RoundhouseProfileNative]::ReadRegularFile($Path, $Session.RootHandle.FinalPath)
         if (-not $Observed.Exists) {
             return [pscustomobject]@{ Presence = "absent"; Digest = "-"; Manager = "-"; Bytes = [byte[]]@() }
         }
@@ -951,9 +951,9 @@ function New-StagedManagedFile([object]$Session, [object]$Entry, [byte[]]$Bytes,
     if ($IsWindows -and -not $script:FixtureMode) {
         $Parent = $Session.ByPath[[IO.Path]::GetFullPath($ParentPath).ToLowerInvariant()]
         if ($null -eq $Parent) { throw "profile_parent_not_held" }
-        return [MachineUtilitiesProfileNative]::StageFile($Parent, $ParentPath, $Bytes)
+        return [RoundhouseProfileNative]::StageFile($Parent, $ParentPath, $Bytes)
     }
-    $Temporary = Join-Path $ParentPath (".machine-utilities-" + [Guid]::NewGuid().ToString("N"))
+    $Temporary = Join-Path $ParentPath (".roundhouse-" + [Guid]::NewGuid().ToString("N"))
     try {
         $Stream = [IO.File]::Open($Temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try { $Stream.Write($Bytes, 0, $Bytes.Count); $Stream.Flush($true) } finally { $Stream.Dispose() }
@@ -970,7 +970,7 @@ function Commit-StagedManagedFile([object]$Session, [object]$Entry, [object]$Sta
     if ($IsWindows -and -not $script:FixtureMode) {
         $Parent = $Session.ByPath[[IO.Path]::GetFullPath($ParentPath).ToLowerInvariant()]
         if ($null -eq $Parent) { throw "profile_parent_not_held" }
-        [MachineUtilitiesProfileNative]::CommitStagedFile($Parent, [IO.Path]::GetFileName($Destination), $Staged)
+        [RoundhouseProfileNative]::CommitStagedFile($Parent, [IO.Path]::GetFileName($Destination), $Staged)
         return
     }
     if ($Staged.Closed -or $Staged.Committed -or -not [IO.File]::Exists($Staged.TemporaryPath)) {
@@ -983,7 +983,7 @@ function Commit-StagedManagedFile([object]$Session, [object]$Entry, [object]$Sta
 function Close-StagedManagedFile([object]$Staged) {
     if ($null -eq $Staged) { return }
     if ($IsWindows -and -not $script:FixtureMode) {
-        [MachineUtilitiesProfileNative]::CloseStagedFile($Staged)
+        [RoundhouseProfileNative]::CloseStagedFile($Staged)
         return
     }
     if ($Staged.Closed) { return }
@@ -995,7 +995,7 @@ function Close-StagedManagedFile([object]$Staged) {
 
 function Assert-StagedManagedFile([object]$Session, [object]$Staged, [byte[]]$ExpectedBytes) {
     if ($IsWindows -and -not $script:FixtureMode) {
-        $Observed = [MachineUtilitiesProfileNative]::ReadRegularFile(
+        $Observed = [RoundhouseProfileNative]::ReadRegularFile(
             $Staged.TemporaryPath, $Session.RootHandle.FinalPath)
         if (-not $Observed.Exists -or (Get-Sha256Bytes $Observed.Bytes) -cne (Get-Sha256Bytes $ExpectedBytes) -or
             $Observed.Bytes.Count -ne $ExpectedBytes.Count) { throw "profile_stage_verification_failed" }
@@ -1020,11 +1020,11 @@ function Write-ManagedFileAtomic([object]$Session, [object]$Entry, [byte[]]$Byte
     if ($IsWindows -and -not $script:FixtureMode) {
         $Parent = $Session.ByPath[[IO.Path]::GetFullPath($ParentPath).ToLowerInvariant()]
         if ($null -eq $Parent) { throw "profile_parent_not_held" }
-        [MachineUtilitiesProfileNative]::AtomicReplace($Parent, $ParentPath,
+        [RoundhouseProfileNative]::AtomicReplace($Parent, $ParentPath,
             [IO.Path]::GetFileName($Destination), $Bytes)
         return
     }
-    $Temporary = Join-Path $ParentPath (".machine-utilities-" + [Guid]::NewGuid().ToString("N"))
+    $Temporary = Join-Path $ParentPath (".roundhouse-" + [Guid]::NewGuid().ToString("N"))
     try {
         $Stream = [IO.File]::Open($Temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try { $Stream.Write($Bytes, 0, $Bytes.Count); $Stream.Flush($true) } finally { $Stream.Dispose() }
@@ -1035,7 +1035,7 @@ function Write-ManagedFileAtomic([object]$Session, [object]$Entry, [byte[]]$Byte
 function Remove-ManagedFile([object]$Session, [object]$Entry) {
     $Destination = Resolve-ManagedDestination $Session $Entry.Path $false
     if ($IsWindows -and -not $script:FixtureMode) {
-        [MachineUtilitiesProfileNative]::DeleteRegularFile($Destination, $Session.RootHandle.FinalPath)
+        [RoundhouseProfileNative]::DeleteRegularFile($Destination, $Session.RootHandle.FinalPath)
     } elseif ([IO.File]::Exists($Destination)) { [IO.File]::Delete($Destination) }
 }
 
@@ -1361,7 +1361,7 @@ function Invoke-ProfileReadinessProbe([string]$ProfileRoot, [object]$Handoff, [o
 }
 
 function Initialize-ProfileContextTypes {
-    if ("MachineUtilitiesProfileContextNative" -as [type]) { return }
+    if ("RoundhouseProfileContextNative" -as [type]) { return }
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -1371,7 +1371,7 @@ using System.Security.Principal;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
-public sealed class MachineUtilitiesTokenEvidence
+public sealed class RoundhouseTokenEvidence
 {
     public int IntegrityRid { get; internal set; }
     public bool Elevated { get; internal set; }
@@ -1380,13 +1380,13 @@ public sealed class MachineUtilitiesTokenEvidence
     public string[] EnabledPrivileges { get; internal set; }
 }
 
-public sealed class MachineUtilitiesMutationProbeResult
+public sealed class RoundhouseMutationProbeResult
 {
     public bool Opened { get; internal set; }
     public int ErrorCode { get; internal set; }
 }
 
-public static class MachineUtilitiesProfileContextNative
+public static class RoundhouseProfileContextNative
 {
     const uint TOKEN_QUERY = 0x0008;
     const uint SE_GROUP_ENABLED = 0x00000004;
@@ -1432,7 +1432,7 @@ public static class MachineUtilitiesProfileContextNative
         return buffer;
     }
 
-    public static MachineUtilitiesTokenEvidence InspectToken()
+    public static RoundhouseTokenEvidence InspectToken()
     {
         SafeAccessTokenHandle token;
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, out token))
@@ -1479,7 +1479,7 @@ public static class MachineUtilitiesProfileContextNative
                         throw new Win32Exception(Marshal.GetLastWin32Error(), "profile_privilege_name_failed");
                     enabled.Add(name.ToString());
                 }
-                return new MachineUtilitiesTokenEvidence {
+                return new RoundhouseTokenEvidence {
                     IntegrityRid = integrityRid, Elevated = Marshal.ReadInt32(elevation) != 0,
                     ElevationType = Marshal.ReadInt32(elevationType),
                     AdministratorsEnabled = administratorsEnabled, EnabledPrivileges = enabled.ToArray()
@@ -1494,7 +1494,7 @@ public static class MachineUtilitiesProfileContextNative
         }
     }
 
-    public static MachineUtilitiesMutationProbeResult ProbeMutationAccess(string path, bool directory)
+    public static RoundhouseMutationProbeResult ProbeMutationAccess(string path, bool directory)
     {
         uint access = directory ? FILE_ADD_FILE : GENERIC_WRITE;
         uint flags = FILE_FLAG_OPEN_REPARSE_POINT | (directory ? FILE_FLAG_BACKUP_SEMANTICS : 0);
@@ -1503,10 +1503,10 @@ public static class MachineUtilitiesProfileContextNative
         if (!handle.IsInvalid)
         {
             handle.Dispose();
-            return new MachineUtilitiesMutationProbeResult { Opened = true, ErrorCode = 0 };
+            return new RoundhouseMutationProbeResult { Opened = true, ErrorCode = 0 };
         }
         int error = Marshal.GetLastWin32Error(); handle.Dispose();
-        return new MachineUtilitiesMutationProbeResult { Opened = false, ErrorCode = error };
+        return new RoundhouseMutationProbeResult { Opened = false, ErrorCode = error };
     }
 
     public static bool CanCreateService()
@@ -1560,7 +1560,7 @@ function Assert-MutationAccessDenied([object]$Probe) {
 function Get-ProfileContextEvidence([string]$CurrentSid, [string]$ProgramData) {
     if (-not $IsWindows) { throw "unsupported_context" }
     Initialize-ProfileContextTypes
-    $Token = [MachineUtilitiesProfileContextNative]::InspectToken()
+    $Token = [RoundhouseProfileContextNative]::InspectToken()
     $Dangerous = @("SeAssignPrimaryTokenPrivilege", "SeBackupPrivilege", "SeCreatePermanentPrivilege",
         "SeCreateTokenPrivilege", "SeDebugPrivilege", "SeImpersonatePrivilege", "SeLoadDriverPrivilege",
         "SeManageVolumePrivilege", "SeRelabelPrivilege", "SeRestorePrivilege", "SeSecurityPrivilege",
@@ -1570,12 +1570,12 @@ function Get-ProfileContextEvidence([string]$CurrentSid, [string]$ProgramData) {
         @($Token.EnabledPrivileges | Where-Object { $_ -cin $Dangerous }).Count -ne 0) {
         throw "unsupported_context"
     }
-    $BrokerRoot = Join-Path $ProgramData "MachineUtilities"
+    $BrokerRoot = Join-Path $ProgramData "Roundhouse"
     $TaskPath = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)) `
-        "System32\Tasks\MachineUtilitiesProfileV1"
-    Assert-MutationAccessDenied ([MachineUtilitiesProfileContextNative]::ProbeMutationAccess($BrokerRoot, $true))
-    Assert-MutationAccessDenied ([MachineUtilitiesProfileContextNative]::ProbeMutationAccess($TaskPath, $false))
-    if ([MachineUtilitiesProfileContextNative]::CanCreateService()) { throw "unsupported_context" }
+        "System32\Tasks\RoundhouseProfileV1"
+    Assert-MutationAccessDenied ([RoundhouseProfileContextNative]::ProbeMutationAccess($BrokerRoot, $true))
+    Assert-MutationAccessDenied ([RoundhouseProfileContextNative]::ProbeMutationAccess($TaskPath, $false))
+    if ([RoundhouseProfileContextNative]::CanCreateService()) { throw "unsupported_context" }
     try {
         $WritableHklm = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE", $true)
         if ($null -ne $WritableHklm) { $WritableHklm.Dispose(); throw "unsupported_context" }
@@ -1592,7 +1592,7 @@ function Get-ProfileContextEvidence([string]$CurrentSid, [string]$ProgramData) {
     }
     if ($null -eq $OtherProfile) { throw "unsupported_context" }
     Assert-MutationAccessDenied `
-        ([MachineUtilitiesProfileContextNative]::ProbeMutationAccess($OtherProfile, $true))
+        ([RoundhouseProfileContextNative]::ProbeMutationAccess($OtherProfile, $true))
     return [ordered]@{
         Integrity = "medium_or_lower"; Elevated = "false"; Administrators = "disabled"
         DangerousPrivileges = "none"; AuthenticatedSmb = (Get-AuthenticatedSmbCanaryEvidence)
@@ -1602,7 +1602,7 @@ function Get-ProfileContextEvidence([string]$CurrentSid, [string]$ProgramData) {
 }
 
 function Invoke-SelfTest {
-    $Root = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-profile-worker-" + [Guid]::NewGuid().ToString("N"))
+    $Root = Join-Path ([IO.Path]::GetTempPath()) ("roundhouse-profile-worker-" + [Guid]::NewGuid().ToString("N"))
     $script:FixtureMode = $true
     try {
         Initialize-ProfileNativeTypes
@@ -1631,7 +1631,7 @@ function Invoke-SelfTest {
             $HeldHandle = [IO.File]::Open($HeldHandlePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite,
                 [IO.FileShare]::None)
             try {
-                $ObservedHeldHandleProbe = [MachineUtilitiesProfileContextNative]::ProbeMutationAccess(
+                $ObservedHeldHandleProbe = [RoundhouseProfileContextNative]::ProbeMutationAccess(
                     $HeldHandlePath, $false)
                 if ((Get-MutationProbeDisposition $ObservedHeldHandleProbe) -cne "unavailable" -or
                     [int]$ObservedHeldHandleProbe.ErrorCode -ne 32) {
@@ -1818,13 +1818,13 @@ function Invoke-SelfTest {
             }
         }
 
-        $MarketplacePath = ".codex/machine-utilities/marketplace-stage/acme/plugin/SKILL.md"
+        $MarketplacePath = ".codex/roundhouse/marketplace-stage/acme/plugin/SKILL.md"
         [byte[]]$MarketplaceContent = $script:Utf8.GetBytes("fixture marketplace snapshot")
         $MarketplaceDigest = Get-Sha256Bytes $MarketplaceContent
         $MarketplaceLogical = "marketplace-file:$(Get-Sha256Text $MarketplacePath.ToLowerInvariant())"
         $MarketplaceMap = Read-EntryMap (ConvertTo-CanonicalAsciiBytes @(
             "profile-entry-map|1",
-            "entry|.codex/machine-utilities/managed/marketplace.desired|marketplace-desired-record|marketplace-desired|fleet-agents|marketplace-desired",
+            "entry|.codex/roundhouse/managed/marketplace.desired|marketplace-desired-record|marketplace-desired|fleet-agents|marketplace-desired",
             "entry|$MarketplacePath|marketplace-file|acme|fleet-agents|$MarketplaceLogical",
             "end-entry-map|"))
         $MarketplaceSet = Read-MarketplaceSet (ConvertTo-CanonicalAsciiBytes @(
@@ -1879,7 +1879,7 @@ function Invoke-SelfTest {
             throw "all-entry preflight self-test failed"
         }
 
-        $TransactionalPath = ".codex/machine-utilities/managed/demo/file"
+        $TransactionalPath = ".codex/roundhouse/managed/demo/file"
         $TransactionalContract = Get-CompiledEntryContract $TransactionalPath "managed-file"
         $TransactionalMapBytes = ConvertTo-CanonicalAsciiBytes @(
             "profile-entry-map|1",
@@ -1913,7 +1913,7 @@ function Invoke-SelfTest {
             "entry-map-sha256|$(Get-Sha256Bytes $TransactionalMapBytes)",
             "marketplace-set-sha256|$($EmptyMarketplaceSet.Digest)", "max-entries|8", "max-bytes|65536",
             "delete-mode|managed-only", "request-precondition-sha256|$LateMismatchPrecondition", "end-handoff|"))
-        $TransactionalParent = Join-Path $ProfileRoot ".codex/machine-utilities"
+        $TransactionalParent = Join-Path $ProfileRoot ".codex/roundhouse"
         $LateMismatchRejected = $false
         try {
             Invoke-ProfileOperation $ProfileRoot $LateMismatchHandoff `
@@ -1958,7 +1958,7 @@ function Invoke-SelfTest {
         if (-not $InjectedFailureRestored -or [IO.File]::Exists($TransactionalDestination) -or
             [IO.Directory]::Exists($TransactionalParent) -or
             (Get-Sha256Bytes ([IO.File]::ReadAllBytes($Destination))) -cne (Get-Sha256Bytes $Before) -or
-            @(Get-ChildItem -LiteralPath $ProfileRoot -Filter ".machine-utilities-*" -Recurse -Force).Count -ne 0) {
+            @(Get-ChildItem -LiteralPath $ProfileRoot -Filter ".roundhouse-*" -Recurse -Force).Count -ne 0) {
             throw "mid-commit exact rollback self-test failed"
         }
         $HardLink = Join-Path $Root "settings-hardlink"
@@ -1987,13 +1987,13 @@ function Invoke-SelfTest {
             if (-not $Rejected) { throw "unsafe content self-test failed" }
         }
         $Outside = Join-Path $Root "outside"; [void][IO.Directory]::CreateDirectory($Outside)
-        $LinkParent = Join-Path $ProfileRoot ".codex/machine-utilities"
+        $LinkParent = Join-Path $ProfileRoot ".codex/roundhouse"
         if ([IO.Directory]::Exists((Split-Path -Parent $LinkParent))) {
             try {
                 [void](New-Item -ItemType SymbolicLink -Path $LinkParent -Target $Outside -ErrorAction Stop)
-                $LinkEntry = [pscustomobject]@{ Path = ".codex/machine-utilities/managed/demo/file";
-                    Handler = "managed-file"; Artifact = "demo"; Manager = "machine-utilities";
-                    LogicalIdentity = "managed-file:$(Get-Sha256Text '.codex/machine-utilities/managed/demo/file')" }
+                $LinkEntry = [pscustomobject]@{ Path = ".codex/roundhouse/managed/demo/file";
+                    Handler = "managed-file"; Artifact = "demo"; Manager = "roundhouse";
+                    LogicalIdentity = "managed-file:$(Get-Sha256Text '.codex/roundhouse/managed/demo/file')" }
                 $Session = $null; $Rejected = $false
                 try {
                     $Session = New-ManagedPathSession $ProfileRoot "S-1-5-21-1-2-3-1001" $FixtureRootId
@@ -2038,7 +2038,7 @@ $RegisteredProfileRoot = Get-ProfilePathForSid $CurrentSid
 if (-not $ProfileRoot.Equals($RegisteredProfileRoot, [StringComparison]::OrdinalIgnoreCase)) {
     throw "profile_root_identity_drift"
 }
-$HandoffRoot = Join-Path $ProgramData "MachineUtilities/profile/handoff"
+$HandoffRoot = Join-Path $ProgramData "Roundhouse/profile/handoff"
 $PointerBytes = [IO.File]::ReadAllBytes((Join-Path $HandoffRoot "active"))
 $PointerLines = ConvertFrom-CanonicalAsciiBytes $PointerBytes 512 "profile_pointer"
 $PointerFields = Read-FixedFields $PointerLines @("request-id", "handoff-sha256") `

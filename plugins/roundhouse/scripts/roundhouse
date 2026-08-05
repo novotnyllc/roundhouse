@@ -11,35 +11,35 @@ maximum_windows_broker_payload_bytes=67108864
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  machine-utilities validate-config
-  machine-utilities validate-privilege-policy POLICY
-  machine-utilities inspect-privilege-constraints POLICY CONSTRAINTS
-  machine-utilities check-mutation-config
-  machine-utilities worker-config HOST DOMAIN OUTPUT.json
-  machine-utilities collect [--target HOST] [--native-target] [--section SECTION]... [--output FILE|-]
-  machine-utilities validate SNAPSHOT.jsonl|-
-  machine-utilities render [--format human|json|jsonl] SNAPSHOT.jsonl|-
-  machine-utilities compare LEFT.jsonl RIGHT.jsonl
-  machine-utilities executor-status [OUTPUT.json|-]
-  machine-utilities verify-executor [REQUIREMENT.json]
-  machine-utilities approve-codex-plugin-hooks PLUGIN@MARKETPLACE
-  machine-utilities update-codex-plugin PLUGIN@MARKETPLACE
-  machine-utilities privilege-status TARGET OUTPUT.jsonl|-
-  machine-utilities prepare-privilege-identity FLEET-DOMAIN NODE-ID ENDPOINT-PRINCIPALS SOURCE-CIDRS OUTPUT|-
-  machine-utilities prepare-privilege-enrollment TARGET OUTPUT.json|-
-  machine-utilities record-codex-readiness SNAPSHOT.jsonl METADATA.json OUTPUT.jsonl
-  machine-utilities profile-bundle SPEC.json SOURCE-ROOT OUTPUT.bundle
-  machine-utilities seal-plan DRAFT.json SNAPSHOT.jsonl PLAN.json
-  machine-utilities verify-preconditions PLAN.json CURRENT-SNAPSHOT.jsonl
-  machine-utilities verify-privilege-plan PLAN.json CURRENT-SNAPSHOT.jsonl
-  machine-utilities apply-plan PLAN.json PLAN-ID OUTPUT.jsonl
-  machine-utilities submit-privilege-plan PLAN.json PLAN-ID OUTPUT.jsonl
-  machine-utilities lookup-privilege-result PLAN.json OPERATION-INDEX OUTPUT
-  machine-utilities preview-privilege-upgrade TARGET OUTPUT.json|-
-  machine-utilities preview-privilege-revocation TARGET OUTPUT.json|-
-  machine-utilities apply-native-plan PLAN.json PLAN-ID OUTPUT.jsonl
-  machine-utilities apply-ssh-plan PLAN.json PLAN-ID OUTPUT.jsonl
-  machine-utilities dispatch-posix-request
+  roundhouse validate-config
+  roundhouse validate-privilege-policy POLICY
+  roundhouse inspect-privilege-constraints POLICY CONSTRAINTS
+  roundhouse check-mutation-config
+  roundhouse worker-config HOST DOMAIN OUTPUT.json
+  roundhouse collect [--target HOST] [--native-target] [--section SECTION]... [--output FILE|-]
+  roundhouse validate SNAPSHOT.jsonl|-
+  roundhouse render [--format human|json|jsonl] SNAPSHOT.jsonl|-
+  roundhouse compare LEFT.jsonl RIGHT.jsonl
+  roundhouse executor-status [OUTPUT.json|-]
+  roundhouse verify-executor [REQUIREMENT.json]
+  roundhouse approve-codex-plugin-hooks PLUGIN@MARKETPLACE
+  roundhouse update-codex-plugin PLUGIN@MARKETPLACE
+  roundhouse privilege-status TARGET OUTPUT.jsonl|-
+  roundhouse prepare-privilege-identity FLEET-DOMAIN NODE-ID ENDPOINT-PRINCIPALS SOURCE-CIDRS OUTPUT|-
+  roundhouse prepare-privilege-enrollment TARGET OUTPUT.json|-
+  roundhouse record-codex-readiness SNAPSHOT.jsonl METADATA.json OUTPUT.jsonl
+  roundhouse profile-bundle SPEC.json SOURCE-ROOT OUTPUT.bundle
+  roundhouse seal-plan DRAFT.json SNAPSHOT.jsonl PLAN.json
+  roundhouse verify-preconditions PLAN.json CURRENT-SNAPSHOT.jsonl
+  roundhouse verify-privilege-plan PLAN.json CURRENT-SNAPSHOT.jsonl
+  roundhouse apply-plan PLAN.json PLAN-ID OUTPUT.jsonl
+  roundhouse submit-privilege-plan PLAN.json PLAN-ID OUTPUT.jsonl
+  roundhouse lookup-privilege-result PLAN.json OPERATION-INDEX OUTPUT
+  roundhouse preview-privilege-upgrade TARGET OUTPUT.json|-
+  roundhouse preview-privilege-revocation TARGET OUTPUT.json|-
+  roundhouse apply-native-plan PLAN.json PLAN-ID OUTPUT.jsonl
+  roundhouse apply-ssh-plan PLAN.json PLAN-ID OUTPUT.jsonl
+  roundhouse dispatch-posix-request
 EOF
   exit 64
 }
@@ -48,13 +48,7 @@ config_path() {
   if [ -n "${ROUNDHOUSE_CONFIG:-}" ]; then
     printf '%s\n' "$ROUNDHOUSE_CONFIG"
   else
-    base=${XDG_CONFIG_HOME:-"$HOME/.config"}
-    # legacy fallback: legacy hosts keep config under machine-utilities/
-    if [ ! -f "$base/roundhouse/config.json" ] && [ -f "$base/machine-utilities/config.json" ]; then
-      printf '%s/machine-utilities/config.json\n' "$base"
-    else
-      printf '%s/roundhouse/config.json\n' "$base"
-    fi
+    printf '%s/roundhouse/config.json\n' "${XDG_CONFIG_HOME:-"$HOME/.config"}"
   fi
 }
 
@@ -62,13 +56,7 @@ identity_path() {
   if [ -n "${ROUNDHOUSE_IDENTITY:-}" ]; then
     printf '%s\n' "$ROUNDHOUSE_IDENTITY"
   else
-    base=${XDG_CONFIG_HOME:-"$HOME/.config"}
-    # legacy fallback: legacy hosts keep identity under machine-utilities/
-    if [ ! -f "$base/roundhouse/identity.json" ] && [ -f "$base/machine-utilities/identity.json" ]; then
-      printf '%s/machine-utilities/identity.json\n' "$base"
-    else
-      printf '%s/roundhouse/identity.json\n' "$base"
-    fi
+    printf '%s/roundhouse/identity.json\n' "${XDG_CONFIG_HOME:-"$HOME/.config"}"
   fi
 }
 
@@ -228,7 +216,7 @@ validate_privilege_constraints_file() (
     printf 'roundhouse: %s does not bind the active policy digest\n' "$label" >&2
     exit 64
   }
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-constraints.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-constraints.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   for action in \
     apt.install-package-version.v1 apt.upgrade-package.v1 \
@@ -399,7 +387,7 @@ validate_node_identity_file() (
   check_private_owned_file "$certificate" "node certificate"
   check_private_owned_file "$known_hosts" "automation known-hosts file"
   ssh_keygen=$(system_ssh_keygen_path)
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-identity.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-identity.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   if ! {
     "$ssh_keygen" -y -f "$private_key" >"$tmp/private.pub" 2>/dev/null &&
@@ -562,7 +550,7 @@ prepare_privilege_identity_command() (
   endpoint_principals=$3
   source_cidrs=$4
   output=$5
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-identity-prepare.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-identity-prepare.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   "$script_dir/prepare-ssh-identity" prepare "$fleet_domain" "$node_id" \
     "$endpoint_principals" "$source_cidrs" >"$tmp/public-preparation"
@@ -584,7 +572,7 @@ prepare_privilege_enrollment_command() (
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")
   route=$(jq -r --arg target "$target" \
     '.machines[$target].privilege_broker.automation_transport.mode // "not-configured"' "$config")
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-enrollment-prepare.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-enrollment-prepare.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   case $platform:$route in
     wsl:*)
@@ -823,7 +811,7 @@ validate_config_file() {
                   else ["host","management_networks","mode","pinned_host_key_fingerprint","port","request_user"] end) | sort) and
               .privilege_broker.automation_transport.mode == "windows-sftp" and
               .privilege_broker.automation_transport.port == 22 and
-              .privilege_broker.automation_transport.request_user == "MachineUtilitiesRequest" and
+              .privilege_broker.automation_transport.request_user == "RoundhouseRequest" and
               (if ($config.worker // null) == null then
                  (.privilege_broker.automation_transport.request_sid | type == "string" and
                    test("^S-[0-9]+(?:-[0-9]+){1,14}$"))
@@ -989,7 +977,7 @@ validate_config_file() {
     exit 64
   }
   validate_privilege_policy_file "$plugin_root/references/privilege-policy.default" "packaged privilege policy"
-  proposal_tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-policy.XXXXXX")
+  proposal_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-policy.XXXXXX")
   trap 'rm -rf "$proposal_tmp"' EXIT HUP INT TERM
   while IFS= read -r proposal_host; do
     [ -n "$proposal_host" ] || continue
@@ -1131,7 +1119,7 @@ executor_status_command() (
     exit 65
   }
 
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-executor.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-executor.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   : >"$tmp/files.jsonl"
   while IFS="$(printf '\t')" read -r relative expected; do
@@ -1194,7 +1182,7 @@ verify_executor_requirement() (
     printf 'roundhouse: executor requirement must be a regular non-symlink file\n' >&2
     exit 64
   }
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-executor-verify.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-executor-verify.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   executor_status_command "$tmp/status.json"
   jq -e -n --slurpfile required "$requirement" --slurpfile actual "$tmp/status.json" '
@@ -1264,7 +1252,7 @@ worker_config_command() (
     exit 64
   }
   controller_digest=$(sha256_file "$config")
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-worker-config.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-worker-config.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   materialize_policy_proposal "$config" "$target" "$tmp/policy-proposal"
   policy_proposal_digest=$(sha256_file "$tmp/policy-proposal")
@@ -1470,8 +1458,8 @@ target=$4
 snapshot_id=$5
 sections=$6
 trap 'rm -rf "$remote_dir"' EXIT HUP INT TERM
-codex_cli=$HOME/.codex/plugins/cache/$marketplace/roundhouse/$version/scripts/machine-utilities
-claude_cli=$HOME/.claude/plugins/cache/$marketplace/roundhouse/$version/scripts/machine-utilities
+codex_cli=$HOME/.codex/plugins/cache/$marketplace/roundhouse/$version/scripts/roundhouse
+claude_cli=$HOME/.claude/plugins/cache/$marketplace/roundhouse/$version/scripts/roundhouse
 if [ -x "$codex_cli" ]; then cli=$codex_cli
 elif [ -x "$claude_cli" ]; then cli=$claude_cli
 else
@@ -1497,7 +1485,7 @@ REMOTE_COLLECTOR
               operation_envelope_status=partial
               jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" \
                 --arg snapshot_id "$snapshot_id" --arg host_id "$target" --arg observed_at "$observed" \
-                '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:"error",id:"executor:ssh",observed_at:$observed_at,status:"unavailable",confidence:"high",data:{transport:"ssh"},evidence:[],errors:[{code:"executor_update_required",severity:"error",retryable:true,message:"Exact Machine Utilities executor is missing, stale, or failed integrity verification"}]}' >>"$records"
+                '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:"error",id:"executor:ssh",observed_at:$observed_at,status:"unavailable",confidence:"high",data:{transport:"ssh"},evidence:[],errors:[{code:"executor_update_required",severity:"error",retryable:true,message:"Exact Roundhouse executor is missing, stale, or failed integrity verification"}]}' >>"$records"
             fi
           fi
           ssh_run "$alias" \
@@ -1614,7 +1602,7 @@ materialize_input() {
   requested_input=$1
   input_tmp=
   if [ "$requested_input" = - ]; then
-    input_tmp=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-input.XXXXXX")
+    input_tmp=$(mktemp "${TMPDIR:-/tmp}/roundhouse-input.XXXXXX")
     trap 'rm -f "$input_tmp"' EXIT HUP INT TERM
     cat >"$input_tmp"
     resolved_input=$input_tmp
@@ -1763,7 +1751,7 @@ record_codex_readiness_command() {
     exit 65
   }
   checked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-codex-readiness.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-codex-readiness.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   jq -cS --slurpfile metadata "$metadata" --arg checked_at "$checked_at" '
     $metadata[0] as $m |
@@ -2081,17 +2069,17 @@ profile_compiled_entry_contract() {
       printf '%s\t%s\tstandalone-skill-file:%s\n' "$skill" standalone \
         "$(printf '%s' "$folded" | sha256_stream)"
       ;;
-    marketplace-desired-record:.codex/machine-utilities/managed/marketplace.desired)
+    marketplace-desired-record:.codex/roundhouse/managed/marketplace.desired)
       printf '%s\t%s\t%s\n' marketplace-desired fleet-agents marketplace-desired
       ;;
-    marketplace-file:.codex/machine-utilities/marketplace-stage/*/*)
+    marketplace-file:.codex/roundhouse/marketplace-stage/*/*)
       artifact=$(printf '%s' "$folded" | cut -d/ -f4)
       printf '%s\t%s\tmarketplace-file:%s\n' "$artifact" fleet-agents \
         "$(printf '%s' "$folded" | sha256_stream)"
       ;;
-    managed-file:.codex/machine-utilities/managed/*/*)
+    managed-file:.codex/roundhouse/managed/*/*)
       artifact=$(printf '%s' "$folded" | cut -d/ -f4)
-      printf '%s\t%s\tmanaged-file:%s\n' "$artifact" machine-utilities \
+      printf '%s\t%s\tmanaged-file:%s\n' "$artifact" roundhouse \
         "$(printf '%s' "$folded" | sha256_stream)"
       ;;
     *) return 1 ;;
@@ -2115,7 +2103,7 @@ profile_destination_contract() {
   ' || return 1
   folded=$(printf '%s' "$path" | LC_ALL=C tr '[:upper:]' '[:lower:]')
   case /$folded/ in
-    */.ssh/*|*/authorized_keys/*|*/.codex/machine-utilities/node-overlay/*|*/.codex/auth.json/*|\
+    */.ssh/*|*/authorized_keys/*|*/.codex/roundhouse/node-overlay/*|*/.codex/auth.json/*|\
     */.codex/plugins/cache/*|*/auth/*|*/credential*/*|*/secret*/*|*/cache/*|*/sessions/*|\
     */browser/*|*/history/*|*/internal/*|*/startup/*|*/tasks/*|*/programdata/*|*.tmpl/*)
       return 1
@@ -2266,7 +2254,7 @@ profile_bundle_command() (
     printf 'roundhouse: invalid profile bundle spec\n' >&2
     exit 64
   }
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-profile-bundle.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-profile-bundle.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   : >"$tmp/payload"
   : >"$tmp/entries"
@@ -2671,7 +2659,7 @@ seal_plan_command() {
   planning_snapshot_id=$(jq -r 'select(.kind == "snapshot") | .snapshot_id' "$snapshot")
   planning_observed_at=$(jq -r 'select(.kind == "snapshot") | .observed_at' "$snapshot")
   created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-plan.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-plan.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   executor_status_command "$tmp/executor.json"
   worker_config_command "$target" "$domain" "$tmp/worker-config.json"
@@ -3023,7 +3011,7 @@ validate_mixed_privileged_plan_file() (
     printf 'roundhouse: invalid mixed privileged apply plan\n' >&2
     exit 64
   }
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-v4-plan.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-v4-plan.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   jq -c '
     . as $plan |
@@ -3658,7 +3646,7 @@ install_auth_artifact() (
     check_private_owned_file "$destination" "existing auth destination"
   fi
 
-  temporary=$(mktemp "$parent/.machine-utilities-auth.XXXXXX")
+  temporary=$(mktemp "$parent/.roundhouse-auth.XXXXXX")
   backup=
   installed=0
   # shellcheck disable=SC2329 # invoked by EXIT and signal traps
@@ -3696,7 +3684,7 @@ install_auth_artifact() (
   }
   chmod "$mode" "$temporary"
   if [ -f "$destination" ]; then
-    backup=$(mktemp "$parent/.machine-utilities-auth-backup.XXXXXX")
+    backup=$(mktemp "$parent/.roundhouse-auth-backup.XXXXXX")
     chmod 600 "$backup"
     cp -p "$destination" "$backup"
   fi
@@ -3770,7 +3758,7 @@ check_chezmoi_targets() {
   expected=$1
   shift
   validate_chezmoi_targets "$@" || return
-  status=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-chezmoi-status.XXXXXX")
+  status=$(mktemp "${TMPDIR:-/tmp}/roundhouse-chezmoi-status.XXXXXX")
   if ! chezmoi status -- "$@" >"$status"; then
     rm -f "$status"
     printf 'roundhouse: chezmoi target status failed\n' >&2
@@ -3863,7 +3851,7 @@ EOF
             return 64
           fi
           if [ "${id%%:*}" = homebrew-cask ]; then
-            homebrew_app_broker=/usr/local/libexec/machine-utilities/posix-broker
+            homebrew_app_broker=/usr/local/libexec/roundhouse/posix-broker
             if [ -x "$homebrew_app_broker" ]; then
               if homebrew_prepare_output=$(/usr/bin/sudo -n -- "$homebrew_app_broker" \
                   --homebrew-bridge-v1 prepare-app "$package_name" 2>&1); then
@@ -4188,7 +4176,7 @@ validate_profile_bundle_for_operation() (
     [ "$payload_length" -le 1073741824 ] &&
     [ $((16 + manifest_length + payload_length)) -eq "$total_length" ] || exit 64
   assert_windows_broker_payload_length "$total_length" || exit $?
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-profile-verify.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-profile-verify.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   dd if="$bundle" of="$tmp/manifest" bs=1 skip=16 count="$manifest_length" 2>/dev/null
   dd if="$bundle" of="$tmp/payload" bs=1 skip=$((16 + manifest_length)) \
@@ -4375,7 +4363,7 @@ make_windows_broker_slot() (
   } >"$slot_root/request"
   certificate_path=$(jq -r '.certificate_path' "$identity")
   ssh_keygen=$(system_ssh_keygen_path)
-  SSH_AUTH_SOCK='' "$ssh_keygen" -Y sign -f "$certificate_path" -n machine-utilities-request \
+  SSH_AUTH_SOCK='' "$ssh_keygen" -Y sign -f "$certificate_path" -n roundhouse-request \
     "$slot_root/request" >/dev/null 2>&1
   [ -s "$slot_root/request.sig" ] && [ ! -L "$slot_root/request.sig" ] || {
     printf 'roundhouse: failed to sign Windows broker request\n' >&2
@@ -4436,7 +4424,7 @@ validate_windows_broker_slot_files() (
     END { exit !(count_length == 1 && valid_length && count_digest == 1 && valid_digest) }
   ' "$slot_root/request" || exit 64
   ssh_keygen=$(system_ssh_keygen_path)
-  SSH_AUTH_SOCK='' "$ssh_keygen" -Y check-novalidate -n machine-utilities-request \
+  SSH_AUTH_SOCK='' "$ssh_keygen" -Y check-novalidate -n roundhouse-request \
     -s "$slot_root/request.sig" <"$slot_root/request" >/dev/null 2>&1 || exit 64
 )
 
@@ -4535,7 +4523,7 @@ make_windows_readiness_slot() (
   } >"$slot_root/request"
   certificate_path=$(jq -r '.certificate_path' "$identity")
   ssh_keygen=$(system_ssh_keygen_path)
-  SSH_AUTH_SOCK='' "$ssh_keygen" -Y sign -f "$certificate_path" -n machine-utilities-request \
+  SSH_AUTH_SOCK='' "$ssh_keygen" -Y sign -f "$certificate_path" -n roundhouse-request \
     "$slot_root/request" >/dev/null 2>&1
   [ -s "$slot_root/request.sig" ] && [ ! -L "$slot_root/request.sig" ] || {
     printf 'roundhouse: failed to sign Windows readiness request\n' >&2
@@ -4813,7 +4801,7 @@ windows_sftp_readiness_unavailable_snapshot() (
   route=$(jq -ce --arg target "$target" \
     '.machines[$target].privilege_broker.automation_transport | select(.mode == "windows-sftp")' \
     "$config") || exit 64
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-windows-readiness-unavailable.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-windows-readiness-unavailable.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   observed_at=$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)
   snapshot_id="windows-readiness-unavailable-$(printf '%s' "$observed_at" | tr -d ':-')-$$"
@@ -4865,7 +4853,7 @@ windows_sftp_readiness_snapshot_from_result() (
   output=$4
   config=$(config_path)
   identity=$(identity_path)
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-windows-readiness-snapshot.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-windows-readiness-snapshot.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   public_node_identity "$identity" "$config" >"$tmp/origin.json"
   observed_at=$(jq -r '.observed_at | todateiso8601' "$parsed")
@@ -4984,7 +4972,7 @@ windows_sftp_readiness_snapshot() (
     printf 'roundhouse: protected Windows readiness requires windows-sftp\n' >&2
     exit 64
   }
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-windows-readiness.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-windows-readiness.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   mkdir "$tmp/slot"
   if ! make_windows_readiness_slot "$target" "$tmp/slot"; then
@@ -5080,7 +5068,7 @@ windows_sftp_poll_result() (
     '.operations[$index].privilege.request.expires_at | fromdateiso8601' "$plan")
   route=$(jq -c --arg target "$target" '.machines[$target].privilege_broker.automation_transport |
     select(.mode == "windows-sftp")' "$config") || exit 64
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-windows-poll.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-windows-poll.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   printf 'get "/results/%s.result" "%s"\n' "$request_id" "$tmp/result" >"$tmp/poll.batch"
   misses=0
@@ -5135,7 +5123,7 @@ write_posix_dispatch_request() (
     *) return 64 ;;
   esac
   [ -f "$request" ] && [ ! -L "$request" ] || return 64
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-posix-dispatch-client.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-posix-dispatch-client.XXXXXX")
   if [ "$mode" = ordinary-plan ] || [ "$mode" = readiness ]; then
     cp "$worker" "$tmp/worker"
   else
@@ -5272,7 +5260,7 @@ prepare_posix_readiness_worker_config() (
   }' "$config" >"$output"
   chmod 600 "$output"
   ROUNDHOUSE_CONFIG="$output" ROUNDHOUSE_IDENTITY="${output}.no-node-identity" \
-    "$script_dir/machine-utilities" validate-config >/dev/null
+    "$script_dir/roundhouse" validate-config >/dev/null
 )
 
 posix_dispatch_readiness_records() (
@@ -5284,7 +5272,7 @@ posix_dispatch_readiness_records() (
   identity=$(identity_path)
   validate_config_file
   check_private_owned_file "$config" "collection configuration"
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-posix-readiness.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-posix-readiness.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   public_node_identity "$identity" "$config" >"$tmp/origin.json"
   route=$(jq -c --arg target "$target" '.machines[$target] | select((.platform | IN("linux","macos")) and .transport == "ssh") |
@@ -5366,7 +5354,7 @@ posix_dispatch_readiness_snapshot() (
   target=$1
   output=$2
   config=$(config_path)
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-posix-readiness-snapshot.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-posix-readiness-snapshot.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   posix_dispatch_readiness_records "$target" "$tmp/readiness.jsonl"
   snapshot_id=$(jq -r '.snapshot_id' "$tmp/readiness.jsonl")
@@ -5414,7 +5402,7 @@ dispatch_posix_request_command() (
     printf 'roundhouse: the fixed POSIX dispatcher rejects SSH_ORIGINAL_COMMAND\n' >&2
     exit 64
   }
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-posix-dispatch.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-posix-dispatch.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   IFS= read -r line_1 && IFS= read -r line_2 && IFS= read -r line_3 &&
     IFS= read -r line_4 && IFS= read -r line_5 && IFS= read -r line_6 && IFS= read -r line_7 || {
@@ -5500,7 +5488,7 @@ dispatch_posix_request_command() (
       [ "$worker_length" -gt 0 ] && [ "$worker_length" -le 262144 ] &&
         [ "$request_length" -le 4096 ] || exit 64
       ROUNDHOUSE_CONFIG="$tmp/worker" ROUNDHOUSE_IDENTITY="$tmp/no-node-identity" \
-        "$script_dir/machine-utilities" validate-config >/dev/null || exit 64
+        "$script_dir/roundhouse" validate-config >/dev/null || exit 64
       readiness_binding=$(jq -er '
         (.machines | keys) as $targets |
         if ((.worker // null) == null and
@@ -5565,7 +5553,7 @@ make_posix_broker_envelope() (
   config=$(config_path)
   identity=$(identity_path)
   validate_node_identity_file "$identity" "$config"
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-posix-envelope.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-posix-envelope.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   jq -e --argjson index "$index" '
     .operations[$index] | select(.type == "semantic-action" and
@@ -5690,7 +5678,7 @@ make_posix_broker_envelope() (
     printf 'manager-source-identity|%s\n' "$manager_source_identity"
     printf 'end-request|\n'
   } >"$tmp/request"
-  SSH_AUTH_SOCK='' "$ssh_keygen" -Y sign -f "$certificate_path" -n machine-utilities-request \
+  SSH_AUTH_SOCK='' "$ssh_keygen" -Y sign -f "$certificate_path" -n roundhouse-request \
     "$tmp/request" >/dev/null 2>&1
   [ -f "$tmp/request.sig" ] && [ ! -L "$tmp/request.sig" ] || {
     printf 'roundhouse: failed to create sealed POSIX request signature\n' >&2
@@ -5710,8 +5698,8 @@ invoke_fixed_posix_broker() {
   output=$2
   [ -x /usr/bin/sudo ] || return 69
   case $(uname -s) in
-    Darwin) fixed_broker=/usr/local/libexec/machine-utilities/posix-broker ;;
-    Linux) fixed_broker=/usr/libexec/machine-utilities/posix-broker ;;
+    Darwin) fixed_broker=/usr/local/libexec/roundhouse/posix-broker ;;
+    Linux) fixed_broker=/usr/libexec/roundhouse/posix-broker ;;
     *) return 69 ;;
   esac
   /usr/bin/env -i HOME="$HOME" LC_ALL=C LANG=C TZ=UTC \
@@ -5737,7 +5725,7 @@ invoke_posix_broker_for_target() (
       invoke_fixed_posix_broker "$envelope" "$output"
       ;;
     linux:ssh:posix-ssh|macos:ssh:posix-ssh)
-      tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-posix-broker-dispatch.XXXXXX")
+      tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-posix-broker-dispatch.XXXXXX")
       trap 'rm -rf "$tmp"' EXIT HUP INT TERM
       write_posix_dispatch_request broker-envelope - "$envelope" "$tmp/framed" || exit 64
       if invoke_fixed_posix_dispatch "$target" "$tmp/framed" "$tmp/response"; then
@@ -5777,7 +5765,7 @@ write_posix_journal_expectations() (
   index=$2
   envelope=$3
   destination=$4
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-journal-expect.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-journal-expect.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   awk '/^certificate\|/{exit} {print}' "$envelope" >"$tmp/request"
   awk -F '|' '$1 == "certificate" { sub(/^certificate\|/, ""); print; exit }' "$envelope" |
@@ -6123,7 +6111,7 @@ apply_mixed_privileged_plan_command() {
     printf 'roundhouse: mixed Windows plans require ordinary Codex inventory; protected SFTP readiness is execution-only\n' >&2
     return 69
   fi
-  work=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-v4-apply.XXXXXX")
+  work=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-v4-apply.XXXXXX")
   trap 'rm -rf "$work"' EXIT HUP INT TERM
   required_section=$(jq -r '.required_section' "$plan")
   preflight_ok=true
@@ -6133,7 +6121,7 @@ apply_mixed_privileged_plan_command() {
     elif ! windows_sftp_readiness_snapshot "$target" "$work/pre.jsonl"; then
       preflight_ok=false
     fi
-  elif ! "$script_dir/machine-utilities" collect --target "$target" --section host --section "$required_section" \
+  elif ! "$script_dir/roundhouse" collect --target "$target" --section host --section "$required_section" \
       --output "$work/pre.jsonl"; then
     preflight_ok=false
   fi
@@ -6173,7 +6161,7 @@ apply_mixed_privileged_plan_command() {
             windows-sftp-execution; then
           operation_ready=false
         fi
-      elif ! "$script_dir/machine-utilities" collect --target "$target" --section host --section "$required_section" \
+      elif ! "$script_dir/roundhouse" collect --target "$target" --section host --section "$required_section" \
           --output "$work/pre-operation-$index.jsonl" ||
         ! validate_file "$work/pre-operation-$index.jsonl" || ! check_mutation_config; then
         operation_ready=false
@@ -6235,7 +6223,7 @@ apply_mixed_privileged_plan_command() {
     else
       post_status=partial
     fi
-  elif ! "$script_dir/machine-utilities" collect --target "$target" --section host --section "$required_section" \
+  elif ! "$script_dir/roundhouse" collect --target "$target" --section host --section "$required_section" \
       --output "$work/post.jsonl"; then
     post_status=partial
   fi
@@ -6393,7 +6381,7 @@ apply_privileged_plan_command() (
   transport=$(jq -r --arg target "$target" '.machines[$target].transport // empty' "$config")
   route_mode=$(jq -r --arg target "$target" \
     '.machines[$target].privilege_broker.automation_transport.mode // empty' "$config")
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-v3-execution.XXXXXX") || exit $?
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-v3-execution.XXXXXX") || exit $?
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   if [ "$platform:$transport:$route_mode" = windows:codex-remote-control:windows-sftp ]; then
     verify_mixed_configuration_binding "$plan" || exit $?
@@ -6401,7 +6389,7 @@ apply_privileged_plan_command() (
     windows_sftp_readiness_snapshot "$target" "$tmp/current.jsonl" || exit $?
     validate_file "$tmp/current.jsonl" || exit $?
   else
-    "$script_dir/machine-utilities" collect --target "$target" --section host --section "$required_section" \
+    "$script_dir/roundhouse" collect --target "$target" --section host --section "$required_section" \
       --output "$tmp/current.jsonl" || exit $?
     validate_file "$tmp/current.jsonl" || exit $?
     verify_privileged_preconditions_command "$plan" "$tmp/current.jsonl" >/dev/null || exit $?
@@ -6453,13 +6441,13 @@ apply_plan_command() {
     }
   fi
 
-  work=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-apply.XXXXXX")
+  work=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-apply.XXXXXX")
   trap 'rm -rf "$work"' EXIT HUP INT TERM
   section=$(jq -r '.required_section' "$plan")
   set -- --target "$target" --section host --section "$section"
   [ "$section" != agents ] || set -- "$@" --section auth
   [ "$native_mode" != true ] || set -- "$@" --native-target
-  if ! "$script_dir/machine-utilities" collect "$@" --output "$work/pre.jsonl"; then
+  if ! "$script_dir/roundhouse" collect "$@" --output "$work/pre.jsonl"; then
     printf 'roundhouse: apply preflight inventory was partial\n' >&2
     exit 70
   fi
@@ -6480,7 +6468,7 @@ apply_plan_command() {
   done
 
   post_status=completed
-  if ! "$script_dir/machine-utilities" collect "$@" --output "$work/post.jsonl"; then
+  if ! "$script_dir/roundhouse" collect "$@" --output "$work/post.jsonl"; then
     printf 'roundhouse: apply completed but post-change inventory was partial\n' >&2
     post_status=partial
     apply_status=partial
@@ -6637,7 +6625,7 @@ apply_ssh_plan_command() (
     printf 'roundhouse: interactive reauthentication requires a visible target terminal\n' >&2
     exit 69
   fi
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-ssh-apply.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-ssh-apply.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   worker_config_command "$target" "$domain" "$tmp/config.json"
   [ "$(sha256_file "$tmp/config.json")" = "$(jq -r '.worker_configuration_digest.value' "$plan")" ] || {
@@ -6672,8 +6660,8 @@ marketplace=$2
 version=$3
 confirmation=$4
 trap 'rm -rf "$remote_dir"' EXIT HUP INT TERM
-codex_cli=$HOME/.codex/plugins/cache/$marketplace/roundhouse/$version/scripts/machine-utilities
-claude_cli=$HOME/.claude/plugins/cache/$marketplace/roundhouse/$version/scripts/machine-utilities
+codex_cli=$HOME/.codex/plugins/cache/$marketplace/roundhouse/$version/scripts/roundhouse
+claude_cli=$HOME/.claude/plugins/cache/$marketplace/roundhouse/$version/scripts/roundhouse
 if [ -x "$codex_cli" ]; then
   cli=$codex_cli
 elif [ -x "$claude_cli" ]; then
@@ -6774,7 +6762,7 @@ lookup_privilege_result_command() (
   check_mutation_config
   check_private_owned_file "$plan" "privilege result plan"
   case $index in ''|*[!0-9]*) usage ;; esac
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-result-lookup.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-result-lookup.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   if jq -e '.schema_version == 4' "$plan" >/dev/null 2>&1; then
     validate_mixed_privileged_plan_file "$plan"
@@ -6874,7 +6862,7 @@ preview_privilege_upgrade_command() (
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")
   route=$(jq -r --arg target "$target" \
     '.machines[$target].privilege_broker.automation_transport.mode // "not-configured"' "$config")
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-upgrade-preview.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-upgrade-preview.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   case $platform:$route in
     wsl:*) state=unsupported; reason=unsupported_security_boundary; entrypoints='[]' ;;
@@ -6916,7 +6904,7 @@ preview_privilege_revocation_command() (
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")
   route=$(jq -r --arg target "$target" \
     '.machines[$target].privilege_broker.automation_transport.mode // "not-configured"' "$config")
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-revocation-preview.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-revocation-preview.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   case $platform:$route in
     wsl:*) state=unsupported; reason=unsupported_security_boundary; entrypoints='[]' ;;

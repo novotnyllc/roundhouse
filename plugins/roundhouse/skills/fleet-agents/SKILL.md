@@ -6,7 +6,7 @@ description: Inventory and reconcile Codex and Claude runtimes, safe settings, p
 # Fleet Agents
 
 Set `SKILL_DIR` to the absolute directory containing this loaded `SKILL.md` and
-`CLI="$SKILL_DIR/../../scripts/machine-utilities"`; the shell working directory
+`CLI="$SKILL_DIR/../../scripts/roundhouse"`; the shell working directory
 is not the skill directory. Collect `--section agents --section auth` when
 evaluating capability readiness; provider-only inventory may collect just
 `agents`. Windows tasks must pass `-AllowAuthVerify` for the combined readiness
@@ -27,6 +27,61 @@ Use manager-native ownership:
 - JSM installs: use JSM for inventory/update when its metadata proves ownership.
 - local source skills: update their owning repository; do not overwrite them
   with a package manager.
+
+## Desired-state sync
+
+One store, two actuators. **chezmoi is the single desired-state store,
+distributor, and variation engine** for the whole synced surface: config
+files (`~/.claude/settings.json`, `~/.codex/config.toml`, the roundhouse
+fleet config, any yardmaster model-routing catalog) are managed directly,
+and the non-file surface — plugins with enabled/disabled state, Claude
+user-scope MCP servers, standalone skills — is declared in a
+`desired.json.tmpl` template in the chezmoi source. **Sync groups** are
+chezmoi data: each machine declares its groups in its chezmoi config, and
+the template filters entries by group (e.g. only `xcode`-group machines get
+`tart-xcode-runner`), so the rendered
+`${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/desired.json` (shape:
+`"$SKILL_DIR/../../desired.example.json"`) is already machine-specific — no
+runtime override layer, nothing chezmoi already does is repeated here.
+
+This skill is the **actuator** for the non-file surface. A sync request
+("sync my plugins", "converge the fleet", the scheduled unattended run)
+first runs `chezmoi update` (pull + apply, so the rendered desired.json is
+current), then reconciles the host's managers to it — bidirectionally, with
+change time deciding direction so deliberate local changes propagate
+outward instead of being steamrolled as drift:
+
+- Three inputs: the rendered desired.json (per-entry last-change time from
+  `git log` in the chezmoi source; file mtime as fallback), local manager
+  state (`installed_plugins.json` `installedAt`/`lastUpdated`,
+  `claude mcp list`, skill lockfiles), and the host's last-sync snapshot
+  (`~/.local/state/roundhouse/sync-state.json`).
+- **Newest event wins.** Desired-but-missing locally: synced before and
+  desired unchanged since → the local removal is newer → delete the entry
+  in the chezmoi source template; desired's entry newer → reinstall.
+  Locally-present-but-undeclared: never synced → local install → add it to
+  the template (into the right group guard, defaulting to all machines);
+  removed from desired more recently → remove locally. Enabled/disabled
+  merges the same way via `lastUpdated`.
+- **Outward changes are chezmoi-source commits** — `git pull --rebase`,
+  edit `desired.json.tmpl`, commit with a message naming the host and
+  event, push. Concurrent edits from different hosts therefore meet in git,
+  the one reconciliation point for the whole pool; a rebase conflict is
+  resolved by the same newest-event rule, and ambiguity (clock skew,
+  missing snapshot) falls back to desired-wins and says so — never a silent
+  delete.
+- Claude user-scope MCP servers reconcile via `claude mcp add`/`remove`
+  (Codex MCP is `config.toml`, chezmoi's job directly); desired entries
+  carry no secrets — required env vars are checked for presence only.
+  Standalone skills reconcile by their declared manager (skills-cli, JSM,
+  local-source), preserving provenance rules below.
+
+Project-scope plugins/servers and anything undeclared *and never synced*
+are out of scope. With no desired.json, fall back to the routine
+marketplace refresh below (update-only, no removals). `yardmaster:setup`
+bootstraps the template from the current host's installed set and, opt-in,
+schedules this sync with the unattended maintenance run
+(`roundhouse:fleet-update`'s "Unattended schedule").
 
 ## Routine marketplace refresh
 
@@ -50,7 +105,7 @@ For local execution set `TARGET_CLI="$CLI"` and verify the loaded executor. For
 SSH, use the configured alias and target login shell (`$SHELL -lc`), resolve the
 target's installed Roundhouse version from its active Codex plugin
 record, and set `TARGET_CLI` to that target cache's
-`roundhouse/VERSION/scripts/machine-utilities`; never send or interpolate
+`roundhouse/VERSION/scripts/roundhouse`; never send or interpolate
 the controller's `SKILL_DIR` or `CLI`. Require `"$TARGET_CLI" verify-executor`
 to pass before using it. Run only these target-native command sequences, in
 order, substituting the authorized marketplace and each installed plugin ID:
@@ -85,7 +140,7 @@ The only pre-helper fallback is a separately approved self-update of
 `roundhouse@novotnyllc` from an integrity-verified release that lacks
 `update-codex-plugin`. After upgrading the `novotnyllc` marketplace, run exactly
 `codex plugin add roundhouse@novotnyllc --json`, recapture inventory,
-reload the new target-native plugin, and require its version `0.2.0` executor
+reload the new target-native plugin, and require its version `0.3.0` executor
 and integrity verification before any other mutation. Never use that raw-add
 fallback for another plugin or once the helper command is available.
 

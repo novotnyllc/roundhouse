@@ -2,7 +2,7 @@
 set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-cli="$script_dir/machine-utilities"
+cli="$script_dir/roundhouse"
 plugin_version=$(jq -r '.version' "$script_dir/../.codex-plugin/plugin.json")
 pwsh_command=$(command -v pwsh 2>/dev/null || true)
 real_git=$(command -v git)
@@ -131,7 +131,7 @@ assert_contains "$remote_control_text" 'matching both the configured'
 for native_status in tool_surface_missing host_offline saved_project_missing native_evidence_unavailable task_creation_failed task_cleanup_failed executor_mismatch executor_or_plugin_failure; do
   assert_contains "$remote_control_text" "$native_status"
 done
-assert_contains "$remote_control_text" 'does not require or preflight the Machine Utilities executor'
+assert_contains "$remote_control_text" 'does not require or preflight the Roundhouse executor'
 assert_ordered "$remote_control_reference" \
   'codex plugin marketplace upgrade MARKETPLACE --json' \
   'codex-plugin-hooks.mjs" update EACH_INSTALLED_PLUGIN@MARKETPLACE'
@@ -1019,7 +1019,7 @@ chmod -R go-w "$plugin_cache"
 case ${ROUNDHOUSE_TEST_SCOPE:-} in
   u1-characterization|u1-contracts|u4-contracts|u5-contracts|macos-privilege-contracts)
     "$plugin_cache/scripts/update-integrity"
-    cli="$plugin_cache/scripts/machine-utilities"
+    cli="$plugin_cache/scripts/roundhouse"
     ;;
 esac
 printf '%s\n' 2.50.0 >"$BREW_STATE_FILE"
@@ -1057,24 +1057,24 @@ test_u2_contracts() {
   [ ! -e "$apt_marker" ] || fail "U2 malformed request reached APT"
 
   u2_root="$tmp/u2-root"
-  u2_bootstrap="$u2_root/var/lib/machine-utilities-bootstrap"
+  u2_bootstrap="$u2_root/var/lib/roundhouse-bootstrap"
   u2_build="$tmp/u2-bundle"
-  u2_generation="$u2_root/etc/machine-utilities/generations/1"
+  u2_generation="$u2_root/etc/roundhouse/generations/1"
   mkdir -p "$u2_bootstrap/staged" "$u2_bootstrap/receipts" "$u2_build/apt/sources.list.d" \
     "$u2_build/apt/trusted.gpg.d" "$u2_build/apt/preferences.d" "$u2_build/apt/metadata" \
     "$u2_root/usr/bin" \
     "$u2_root/usr/lib/apt/methods" "$u2_root/usr/lib/apt/solvers" \
     "$u2_root/usr/lib/apt/planners" "$u2_root/etc/sudoers.d" "$u2_root/usr/libexec" \
-    "$u2_root/etc/machine-utilities/generations" "$u2_root/etc/machine-utilities/trust" \
-    "$u2_root/var/lib/machine-utilities"
+    "$u2_root/etc/roundhouse/generations" "$u2_root/etc/roundhouse/trust" \
+    "$u2_root/var/lib/roundhouse"
   chmod 755 "$u2_root" "$u2_root/etc" "$u2_root/etc/sudoers.d" \
-    "$u2_root/etc/machine-utilities" "$u2_root/etc/machine-utilities/generations" \
-    "$u2_root/etc/machine-utilities/trust" "$u2_root/usr" "$u2_root/usr/bin" \
+    "$u2_root/etc/roundhouse" "$u2_root/etc/roundhouse/generations" \
+    "$u2_root/etc/roundhouse/trust" "$u2_root/usr" "$u2_root/usr/bin" \
     "$u2_root/usr/lib" "$u2_root/usr/lib/apt" "$u2_root/usr/lib/apt/methods" \
     "$u2_root/usr/lib/apt/solvers" "$u2_root/usr/lib/apt/planners" "$u2_root/usr/libexec" \
     "$u2_root/var" "$u2_root/var/lib"
   chmod 700 "$u2_bootstrap" "$u2_bootstrap/staged" "$u2_bootstrap/receipts" \
-    "$u2_root/var/lib/machine-utilities"
+    "$u2_root/var/lib/roundhouse"
   chmod -R go-w "$u2_root" "$u2_build"
 
   u2_sha256() {
@@ -1146,22 +1146,22 @@ test_u2_contracts() {
     u2_state_listing="$tmp/u2-enrollment-state"
     : >"$u2_state_listing"
     for u2_state_path in \
-      "$u2_root/usr/libexec/machine-utilities/posix-broker" \
-      "$u2_root/etc/sudoers.d/machine-utilities-posix-broker" \
-      "$u2_root/etc/machine-utilities/trust/fleet-ca.pub" \
-      "$u2_root/etc/machine-utilities/trust/allowed_signers" \
-      "$u2_root/etc/machine-utilities/trust/revoked.krl" \
-      "$u2_root/var/lib/machine-utilities-public/enrollment" \
-      "$u2_root/var/lib/machine-utilities-public/canary" \
-      "$u2_root/var/lib/machine-utilities-public/active" \
-      "$u2_root/var/lib/machine-utilities-public/last" \
-      "$u2_root/etc/machine-utilities/generations" \
-      "$u2_root/var/lib/machine-utilities/revocation.reserve" \
-      "$u2_root/var/lib/machine-utilities/draining" \
-      "$u2_root/var/lib/machine-utilities/rollback" \
-      "$u2_root/var/lib/machine-utilities/quarantine" \
-      "$u2_root/var/lib/machine-utilities-lifecycle.lock" \
-      "$u2_root/var/lib/machine-utilities-lifecycle.recovery"; do
+      "$u2_root/usr/libexec/roundhouse/posix-broker" \
+      "$u2_root/etc/sudoers.d/roundhouse-posix-broker" \
+      "$u2_root/etc/roundhouse/trust/fleet-ca.pub" \
+      "$u2_root/etc/roundhouse/trust/allowed_signers" \
+      "$u2_root/etc/roundhouse/trust/revoked.krl" \
+      "$u2_root/var/lib/roundhouse-public/enrollment" \
+      "$u2_root/var/lib/roundhouse-public/canary" \
+      "$u2_root/var/lib/roundhouse-public/active" \
+      "$u2_root/var/lib/roundhouse-public/last" \
+      "$u2_root/etc/roundhouse/generations" \
+      "$u2_root/var/lib/roundhouse/revocation.reserve" \
+      "$u2_root/var/lib/roundhouse/draining" \
+      "$u2_root/var/lib/roundhouse/rollback" \
+      "$u2_root/var/lib/roundhouse/quarantine" \
+      "$u2_root/var/lib/roundhouse-lifecycle.lock" \
+      "$u2_root/var/lib/roundhouse-lifecycle.recovery"; do
       if [ -L "$u2_state_path" ]; then
         printf '%s|symlink|%s\n' "$u2_state_path" "$(readlink "$u2_state_path")" >>"$u2_state_listing"
       elif [ -f "$u2_state_path" ]; then
@@ -1174,8 +1174,8 @@ test_u2_contracts() {
         printf '%s|absent\n' "$u2_state_path" >>"$u2_state_listing"
       fi
     done
-    if [ -L "$u2_root/etc/machine-utilities/active" ]; then
-      printf 'active|%s\n' "$(readlink "$u2_root/etc/machine-utilities/active")" >>"$u2_state_listing"
+    if [ -L "$u2_root/etc/roundhouse/active" ]; then
+      printf 'active|%s\n' "$(readlink "$u2_root/etc/roundhouse/active")" >>"$u2_state_listing"
     else
       printf '%s\n' 'active|absent' >>"$u2_state_listing"
     fi
@@ -1263,25 +1263,25 @@ test_u2_contracts() {
   "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-rotated-node-key"
   "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-host-node-key"
   "$ssh_keygen" -q -s "$tmp/u2-fleet-ca" -I 'node-a@fleet.example' -z 41 \
-    -n 'node-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -n 'node-a@fleet.example,roundhouse-posix,roundhouse-windows' -V '-5m:+2h' \
     -O no-agent-forwarding -O no-port-forwarding -O no-pty -O no-user-rc -O no-X11-forwarding \
     "$tmp/u2-node-key.pub"
   "$ssh_keygen" -q -s "$tmp/u2-fleet-ca" -I 'node-b@fleet.example' -z 43 \
-    -n 'node-b@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -n 'node-b@fleet.example,roundhouse-posix,roundhouse-windows' -V '-5m:+2h' \
     -O no-agent-forwarding -O no-port-forwarding -O no-pty -O no-user-rc -O no-X11-forwarding \
     "$tmp/u2-node-b-key.pub"
   "$ssh_keygen" -q -s "$tmp/u2-fleet-ca" -I 'node-a@fleet.example' -z 44 \
-    -n 'node-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -n 'node-a@fleet.example,roundhouse-posix,roundhouse-windows' -V '-5m:+2h' \
     -O no-agent-forwarding -O no-port-forwarding -O no-pty -O no-user-rc -O no-X11-forwarding \
     "$tmp/u2-node-renewed-key.pub"
   "$ssh_keygen" -q -s "$tmp/u2-rotated-fleet-ca" -I 'node-a@fleet.example' -z 45 \
-    -n 'node-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -n 'node-a@fleet.example,roundhouse-posix,roundhouse-windows' -V '-5m:+2h' \
     -O no-agent-forwarding -O no-port-forwarding -O no-pty -O no-user-rc -O no-X11-forwarding \
     "$tmp/u2-rotated-node-key.pub"
   "$ssh_keygen" -q -s "$tmp/u2-fleet-ca" -h -I 'node-a@fleet.example' -z 42 \
-    -n 'node-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -n 'node-a@fleet.example,roundhouse-posix,roundhouse-windows' -V '-5m:+2h' \
     "$tmp/u2-host-node-key.pub"
-  awk 'NR==1{print "machine-utilities-release "$0}' "$tmp/u2-release-key.pub" \
+  awk 'NR==1{print "roundhouse-release "$0}' "$tmp/u2-release-key.pub" \
     >"$u2_bootstrap/release-allowed-signers"
   {
     awk 'NR==1{print "node-a@fleet.example cert-authority "$0}' "$tmp/u2-fleet-ca.pub"
@@ -1358,8 +1358,8 @@ set -eu
 keyring=$4
 signature=$5
 release=$6
-[ "$(sed -n '1p' "$keyring")" = 'machine-utilities-test-keyring|1' ] || exit 65
-[ "$(sed -n '1p' "$signature")" = 'machine-utilities-test-signature|1' ] || exit 65
+[ "$(sed -n '1p' "$keyring")" = 'roundhouse-test-keyring|1' ] || exit 65
+[ "$(sed -n '1p' "$signature")" = 'roundhouse-test-signature|1' ] || exit 65
 sha256_file() {
   if [ -x /usr/bin/sha256sum ]; then /usr/bin/sha256sum "$1" | /usr/bin/awk '{print $1}'
   else /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
@@ -1402,11 +1402,11 @@ Signed-By: $u2_generation/apt/trusted.gpg.d/fleet.gpg $u2_publisher_fingerprint
 Trusted: no
 EOF
   cat >"$u2_build/apt/trusted.gpg.d/fleet.gpg" <<'EOF'
-machine-utilities-test-keyring|1
+roundhouse-test-keyring|1
 fingerprint|0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 EOF
   cat >"$u2_build/apt/metadata/Release" <<'EOF'
-Origin: machine-utilities-fixture
+Origin: roundhouse-fixture
 Suite: stable
 Codename: bookworm
 Components: main contrib
@@ -1416,7 +1416,7 @@ EOF
   u2_release_digest=$(u2_sha256 "$u2_build/apt/metadata/Release")
   u2_test_keyring_digest=$(u2_sha256 "$u2_build/apt/trusted.gpg.d/fleet.gpg")
   cat >"$u2_build/apt/metadata/Release.gpg" <<EOF
-machine-utilities-test-signature|1
+roundhouse-test-signature|1
 release-sha256|$u2_release_digest
 keyring-sha256|$u2_test_keyring_digest
 status-mode|valid
@@ -1434,7 +1434,7 @@ release-sha256|$u2_release_digest
 signature-sha256|$(u2_sha256 "$u2_build/apt/metadata/Release.gpg")
 EOF
   : >"$u2_build/apt/preferences"
-  : >"$u2_build/apt/preferences.d/00-machine-utilities"
+  : >"$u2_build/apt/preferences.d/00-roundhouse"
   printf '%s\n' 'source-identities|1' >"$u2_build/apt/source-identities"
   find "$u2_build/apt" -type d -exec chmod 755 {} +
   find "$u2_build/apt" -type f -exec chmod 644 {} +
@@ -1447,7 +1447,7 @@ EOF
   u2_uid=$(id -u)
   u2_ca_fingerprint=$("$ssh_keygen" -lf "$tmp/u2-fleet-ca.pub" -E sha256 | awk 'NR==1{print $2}')
   u2_host_fingerprint=$("$ssh_keygen" -lf "$tmp/u2-node-key.pub" -E sha256 | awk 'NR==1{print $2}')
-  printf 'identity|1|test-apt|%s|machine-utilities|fleet.example|%s|1|%s|machine-utilities-posix,machine-utilities-windows\n' \
+  printf 'identity|1|test-apt|%s|roundhouse|fleet.example|%s|1|%s|roundhouse-posix,roundhouse-windows\n' \
     "$u2_uid" "$u2_ca_fingerprint" "$u2_host_fingerprint" >"$u2_build/host.identity"
   printf '%s\n' 'context|1|platform=linux|required=posix-root-v1|principal=root|console-session=none' \
     >"$u2_build/context.canary"
@@ -1507,7 +1507,7 @@ EOF
 
   : >"$u2_build/bootstrap.manifest"
   for u2_relative in allowed_signers apt.conf apt.context apt/effective.dump apt/preferences \
-    apt/metadata/Release apt/metadata/Release.gpg apt/preferences.d/00-machine-utilities \
+    apt/metadata/Release apt/metadata/Release.gpg apt/preferences.d/00-roundhouse \
     apt/source-authority apt/source-identities apt/sources.list \
     apt/sources.list.d/roundhouse.sources apt/trusted.gpg.d/fleet.gpg \
     context.canary enroll-privilege-posix fleet-ca.pub \
@@ -1515,15 +1515,15 @@ EOF
     printf 'file|%s|%s\n' "$u2_relative" "$(u2_sha256 "$u2_build/$u2_relative")"
   done | LC_ALL=C sort -t '|' -k2,2 >"$u2_build/bootstrap.manifest"
   u2_manifest_digest=$(u2_sha256 "$u2_build/bootstrap.manifest")
-  "$ssh_keygen" -Y sign -f "$tmp/u2-release-key" -n machine-utilities-release \
+  "$ssh_keygen" -Y sign -f "$tmp/u2-release-key" -n roundhouse-release \
     "$u2_build/bootstrap.manifest" >/dev/null
   u2_bundle="$u2_bootstrap/staged/$u2_manifest_digest"
   mv "$u2_build" "$u2_bundle"
-  printf 'bootstrap|1|manifest-sha256=%s|release-principal=machine-utilities-release\n' \
+  printf 'bootstrap|1|manifest-sha256=%s|release-principal=roundhouse-release\n' \
     "$u2_manifest_digest" >"$u2_bootstrap/receipts/$u2_manifest_digest"
   chmod -R go-w "$u2_root"
   "$ssh_keygen" -Y verify -f "$u2_bootstrap/release-allowed-signers" \
-    -I machine-utilities-release -n machine-utilities-release \
+    -I roundhouse-release -n roundhouse-release \
     -s "$u2_bundle/bootstrap.manifest.sig" <"$u2_bundle/bootstrap.manifest" >/dev/null 2>&1 ||
     fail "U2 release signature fixture was invalid"
 
@@ -1539,7 +1539,7 @@ EOF
     rebind_signer=$(awk -F '|' '$1=="signer-fingerprint"{print $2;exit}' "$rebind_signature")
     rebind_primary=$(awk -F '|' '$1=="primary-fingerprint"{print $2;exit}' "$rebind_signature")
     {
-      printf '%s\n' 'machine-utilities-test-signature|1'
+      printf '%s\n' 'roundhouse-test-signature|1'
       printf 'release-sha256|%s\nkeyring-sha256|%s\n' "$rebind_release_digest" "$rebind_keyring_digest"
       printf 'status-mode|%s\nsigner-fingerprint|%s\nprimary-fingerprint|%s\n' \
         "$rebind_status_mode" "$rebind_signer" "$rebind_primary"
@@ -1572,12 +1572,12 @@ EOF
       stage_relative=${stage_file#"$stage_build"/}
       printf 'file|%s|%s\n' "$stage_relative" "$(u2_sha256 "$stage_file")"
     done | LC_ALL=C sort -t '|' -k2,2 >"$stage_build/bootstrap.manifest"
-    "$ssh_keygen" -Y sign -f "$tmp/u2-release-key" -n machine-utilities-release \
+    "$ssh_keygen" -Y sign -f "$tmp/u2-release-key" -n roundhouse-release \
       "$stage_build/bootstrap.manifest" >/dev/null
     stage_digest=$(u2_sha256 "$stage_build/bootstrap.manifest")
     u2_staged_candidate=$u2_bootstrap/staged/$stage_digest
     mv "$stage_build" "$u2_staged_candidate"
-    printf 'bootstrap|1|manifest-sha256=%s|release-principal=machine-utilities-release\n' \
+    printf 'bootstrap|1|manifest-sha256=%s|release-principal=roundhouse-release\n' \
       "$stage_digest" >"$u2_bootstrap/receipts/$stage_digest"
     chmod -R go-w "$u2_staged_candidate" "$u2_bootstrap/receipts/$stage_digest"
   }
@@ -1812,32 +1812,32 @@ EOF
       "$u2_manifest_digest" "$(printf '0%.0s' {1..64})" >"$tmp/u2-wrong-confirmation" 2>/dev/null; then
     fail "U2 enrollment accepted an unconfirmed policy digest"
   fi
-  [ ! -e "$u2_root/etc/machine-utilities/active" ] ||
+  [ ! -e "$u2_root/etc/roundhouse/active" ] ||
     fail "U2 failed confirmation changed active state"
 
-  mkdir -p "$u2_root/var/lib/machine-utilities"
-  printf '%s\n' unrelated-survives >"$u2_root/var/lib/machine-utilities/unrelated-lifecycle-sentinel"
-  chmod 600 "$u2_root/var/lib/machine-utilities/unrelated-lifecycle-sentinel"
+  mkdir -p "$u2_root/var/lib/roundhouse"
+  printf '%s\n' unrelated-survives >"$u2_root/var/lib/roundhouse/unrelated-lifecycle-sentinel"
+  chmod 600 "$u2_root/var/lib/roundhouse/unrelated-lifecycle-sentinel"
   for u2_collision_kind in final staging staging-prepare backup backup-prepare; do
     case $u2_collision_kind in
       final)
-        u2_collision_path="$u2_root/etc/machine-utilities/generations/1"
+        u2_collision_path="$u2_root/etc/roundhouse/generations/1"
         u2_collision_mode=755
         ;;
       staging)
-        u2_collision_path="$u2_root/etc/machine-utilities/generations/.staging-1-$u2_manifest_digest"
+        u2_collision_path="$u2_root/etc/roundhouse/generations/.staging-1-$u2_manifest_digest"
         u2_collision_mode=755
         ;;
       staging-prepare)
-        u2_collision_path="$u2_root/etc/machine-utilities/generations/.staging-1-$u2_manifest_digest.prepare"
+        u2_collision_path="$u2_root/etc/roundhouse/generations/.staging-1-$u2_manifest_digest.prepare"
         u2_collision_mode=755
         ;;
       backup)
-        u2_collision_path="$u2_root/var/lib/machine-utilities/rollback/install-0-1-$u2_manifest_digest"
+        u2_collision_path="$u2_root/var/lib/roundhouse/rollback/install-0-1-$u2_manifest_digest"
         u2_collision_mode=700
         ;;
       backup-prepare)
-        u2_collision_path="$u2_root/var/lib/machine-utilities/rollback/install-0-1-$u2_manifest_digest.prepare"
+        u2_collision_path="$u2_root/var/lib/roundhouse/rollback/install-0-1-$u2_manifest_digest.prepare"
         u2_collision_mode=700
         ;;
     esac
@@ -1855,12 +1855,12 @@ EOF
     [ "$u2_collision_rc" -eq 74 ] &&
       grep -Fqx 'reason|transaction_artifact_collision' "$tmp/u2-collision-$u2_collision_kind" &&
       grep -Fqx "collision|$u2_collision_kind" "$u2_collision_path/unrelated" &&
-      grep -Fqx unrelated-survives "$u2_root/var/lib/machine-utilities/unrelated-lifecycle-sentinel" ||
+      grep -Fqx unrelated-survives "$u2_root/var/lib/roundhouse/unrelated-lifecycle-sentinel" ||
       fail "U2 collision handling was not deterministic and non-destructive: $u2_collision_kind"
     rm -rf "$u2_collision_path"
   done
 
-  u2_restore_collision="$u2_root/usr/libexec/machine-utilities/posix-broker.rollback.install-0-1-$u2_manifest_digest"
+  u2_restore_collision="$u2_root/usr/libexec/roundhouse/posix-broker.rollback.install-0-1-$u2_manifest_digest"
   printf '%s\n' rollback-temp-collision-survives >"$u2_restore_collision"
   chmod 600 "$u2_restore_collision"
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle" \
@@ -1883,20 +1883,20 @@ EOF
     >"$tmp/u2-prepare-before-owner" 2>&1 &
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job"
-  [ -d "$u2_root/var/lib/.machine-utilities-lifecycle.lock.prepare" ] &&
-    [ ! -e "$u2_root/var/lib/.machine-utilities-lifecycle.lock.prepare/owner" ] ||
+  [ -d "$u2_root/var/lib/.roundhouse-lifecycle.lock.prepare" ] &&
+    [ ! -e "$u2_root/var/lib/.roundhouse-lifecycle.lock.prepare/owner" ] ||
     fail "U2 prepare crash seam was not ownerless and bounded"
   u2_kill_paused "$u2_pause_marker" "$u2_pause_job"
   printf '%s\n' partial-owner-record > \
-    "$u2_root/var/lib/.machine-utilities-lifecycle.lock.prepare/.owner.424242"
-  chmod 600 "$u2_root/var/lib/.machine-utilities-lifecycle.lock.prepare/.owner.424242"
+    "$u2_root/var/lib/.roundhouse-lifecycle.lock.prepare/.owner.424242"
+  chmod 600 "$u2_root/var/lib/.roundhouse-lifecycle.lock.prepare/.owner.424242"
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_U2_FAILPOINT=after-drain \
       "$enrollment" install "$u2_bundle" "$u2_manifest_digest" "$u2_confirmation_digest" \
       >"$tmp/u2-prepare-recovered" 2>/dev/null; then
     fail "U2 prepare recovery unexpectedly passed its failpoint"
   fi
-  if [ -e "$u2_root/var/lib/.machine-utilities-lifecycle.lock.prepare" ] ||
-    [ -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ]; then
+  if [ -e "$u2_root/var/lib/.roundhouse-lifecycle.lock.prepare" ] ||
+    [ -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ]; then
     cat "$tmp/u2-prepare-recovered" >&2
     find "$u2_root/var/lib" -maxdepth 3 -name '*lifecycle*' -print >&2
     fail "U2 prepare-before-owner SIGKILL did not recover narrowly"
@@ -1910,7 +1910,7 @@ EOF
     >"$tmp/u2-backup-prepare" 2>&1 &
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job"
-  u2_backup_prepare="$u2_root/var/lib/machine-utilities/rollback/install-0-1-$u2_manifest_digest.prepare"
+  u2_backup_prepare="$u2_root/var/lib/roundhouse/rollback/install-0-1-$u2_manifest_digest.prepare"
   [ -d "$u2_backup_prepare" ] &&
     [ -z "$(find "$u2_backup_prepare" -mindepth 1 -maxdepth 1 -print)" ] ||
     fail "U2 backup prepare seam was not empty before marker publication"
@@ -1921,9 +1921,9 @@ EOF
     fail "U2 backup prepare recovery unexpectedly passed its failpoint"
   fi
   [ ! -e "$u2_backup_prepare" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities/rollback/install-0-1-$u2_manifest_digest" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] ||
+    [ ! -e "$u2_root/var/lib/roundhouse/rollback/install-0-1-$u2_manifest_digest" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] ||
     fail "U2 backup prepare SIGKILL did not recover narrowly"
 
   u2_pause_marker="$tmp/u2-lock-retirement-pause"
@@ -1934,8 +1934,8 @@ EOF
     >"$tmp/u2-lock-retirement" 2>&1 &
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job"
-  [ -d "$u2_root/var/lib/.machine-utilities-lifecycle.lock.retired" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] ||
+  [ -d "$u2_root/var/lib/.roundhouse-lifecycle.lock.retired" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] ||
     fail "U2 lock retirement was not atomic before deletion"
   u2_kill_paused "$u2_pause_marker" "$u2_pause_job"
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_U2_FAILPOINT=after-drain \
@@ -1943,7 +1943,7 @@ EOF
       >"$tmp/u2-lock-retirement-recovered" 2>/dev/null; then
     fail "U2 lock retirement retry unexpectedly passed its failpoint"
   fi
-  [ ! -e "$u2_root/var/lib/.machine-utilities-lifecycle.lock.retired" ] ||
+  [ ! -e "$u2_root/var/lib/.roundhouse-lifecycle.lock.retired" ] ||
     fail "U2 orphan lock retirement was not finished idempotently"
 
   u2_pause_marker="$tmp/u2-retirement-failure-pause"
@@ -1953,11 +1953,11 @@ EOF
     >"$tmp/u2-retirement-failure" 2>&1 &
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job"
-  mkdir "$u2_root/var/lib/.machine-utilities-lifecycle.lock.retired"
-  chmod 700 "$u2_root/var/lib/.machine-utilities-lifecycle.lock.retired"
+  mkdir "$u2_root/var/lib/.roundhouse-lifecycle.lock.retired"
+  chmod 700 "$u2_root/var/lib/.roundhouse-lifecycle.lock.retired"
   printf '%s\n' retirement-collision-survives \
-    >"$u2_root/var/lib/.machine-utilities-lifecycle.lock.retired/unexpected"
-  chmod 600 "$u2_root/var/lib/.machine-utilities-lifecycle.lock.retired/unexpected"
+    >"$u2_root/var/lib/.roundhouse-lifecycle.lock.retired/unexpected"
+  chmod 600 "$u2_root/var/lib/.roundhouse-lifecycle.lock.retired/unexpected"
   touch "$u2_pause_marker.continue"
   if wait "$u2_pause_job"; then
     fail "U2 successful unenrolled revoke ignored lifecycle retirement failure"
@@ -1968,10 +1968,10 @@ EOF
     grep -Fqx 'reason|lifecycle_lock_retirement_failed' "$tmp/u2-retirement-failure" &&
     ! grep -Fqx 'state|revoked' "$tmp/u2-retirement-failure" &&
     grep -Fqx retirement-collision-survives \
-      "$u2_root/var/lib/.machine-utilities-lifecycle.lock.retired/unexpected" &&
-    [ -d "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] ||
+      "$u2_root/var/lib/.roundhouse-lifecycle.lock.retired/unexpected" &&
+    [ -d "$u2_root/var/lib/roundhouse-lifecycle.lock" ] ||
     fail "U2 retirement failure emitted success or destroyed unrelated state"
-  rm "$u2_root/var/lib/.machine-utilities-lifecycle.lock.retired/unexpected"
+  rm "$u2_root/var/lib/.roundhouse-lifecycle.lock.retired/unexpected"
   if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" \
       "$enrollment" revoke "$u2_bundle" "$u2_manifest_digest" 1 \
       >"$tmp/u2-retirement-failure-retry" 2>/dev/null; then
@@ -1979,9 +1979,9 @@ EOF
   fi
   grep -Fqx 'state|revoked' "$tmp/u2-retirement-failure-retry" &&
     grep -Fqx 'reason|already_not_enrolled' "$tmp/u2-retirement-failure-retry" &&
-    [ ! -e "$u2_root/var/lib/.machine-utilities-lifecycle.lock.retired" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] ||
+    [ ! -e "$u2_root/var/lib/.roundhouse-lifecycle.lock.retired" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] ||
     fail "U2 retirement failure retry did not clean exact bounded artifacts"
 
   u2_pause_marker="$tmp/u2-retirement-member-pause"
@@ -1992,8 +1992,8 @@ EOF
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job"
   printf '%s\n' canonical-retirement-member-survives \
-    >"$u2_root/var/lib/machine-utilities-lifecycle.lock/unexpected"
-  chmod 600 "$u2_root/var/lib/machine-utilities-lifecycle.lock/unexpected"
+    >"$u2_root/var/lib/roundhouse-lifecycle.lock/unexpected"
+  chmod 600 "$u2_root/var/lib/roundhouse-lifecycle.lock/unexpected"
   touch "$u2_pause_marker.continue"
   if wait "$u2_pause_job"; then
     fail "U2 retirement accepted a canonical lifecycle sibling"
@@ -2004,10 +2004,10 @@ EOF
     grep -Fqx 'reason|lifecycle_lock_retirement_failed' "$tmp/u2-retirement-member" &&
     ! grep -Fqx 'state|revoked' "$tmp/u2-retirement-member" &&
     grep -Fqx canonical-retirement-member-survives \
-      "$u2_root/var/lib/machine-utilities-lifecycle.lock/unexpected" &&
-    [ ! -e "$u2_root/var/lib/.machine-utilities-lifecycle.lock.retired" ] ||
+      "$u2_root/var/lib/roundhouse-lifecycle.lock/unexpected" &&
+    [ ! -e "$u2_root/var/lib/.roundhouse-lifecycle.lock.retired" ] ||
     fail "U2 retirement moved or destroyed an invalid canonical lifecycle directory"
-  rm "$u2_root/var/lib/machine-utilities-lifecycle.lock/unexpected"
+  rm "$u2_root/var/lib/roundhouse-lifecycle.lock/unexpected"
   if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" \
       "$enrollment" revoke "$u2_bundle" "$u2_manifest_digest" 1 \
       >"$tmp/u2-retirement-member-retry" 2>/dev/null; then
@@ -2015,12 +2015,12 @@ EOF
   fi
   grep -Fqx 'state|revoked' "$tmp/u2-retirement-member-retry" &&
     grep -Fqx 'reason|already_not_enrolled' "$tmp/u2-retirement-member-retry" &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] ||
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] ||
     fail "U2 canonical retirement-member retry left lifecycle artifacts"
 
-  mkdir -p "$u2_root/var/lib/machine-utilities/lock/active"
-  chmod 700 "$u2_root/var/lib/machine-utilities/lock/active"
+  mkdir -p "$u2_root/var/lib/roundhouse/lock/active"
+  chmod 700 "$u2_root/var/lib/roundhouse/lock/active"
   u2_pause_marker="$tmp/u2-parked-drain-pause"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_U2_PAUSE_AT=lifecycle-parked \
     ROUNDHOUSE_U2_PAUSE_MARKER="$u2_pause_marker" \
@@ -2028,9 +2028,9 @@ EOF
     >"$tmp/u2-parked-drain-owner" 2>&1 &
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job"
-  [ -f "$u2_root/var/lib/machine-utilities-lifecycle.recovery/transaction" ] &&
-    [ "$(awk -F '|' '$1=="phase"{print $2}' "$u2_root/var/lib/machine-utilities-lifecycle.recovery/transaction")" = waiting ] &&
-    [ -f "$u2_root/var/lib/machine-utilities/draining" ] ||
+  [ -f "$u2_root/var/lib/roundhouse-lifecycle.recovery/transaction" ] &&
+    [ "$(awk -F '|' '$1=="phase"{print $2}' "$u2_root/var/lib/roundhouse-lifecycle.recovery/transaction")" = waiting ] &&
+    [ -f "$u2_root/var/lib/roundhouse/draining" ] ||
     fail "U2 parked drain lost durable transaction authority"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_IDENTITY="$tmp/u2-no-identity" \
     "$collector" "$tmp/config.json" test-apt u2-parked-readiness none >"$tmp/u2-parked-readiness.jsonl"
@@ -2046,16 +2046,16 @@ EOF
   fi
   [ "$u2_parked_rc" -eq 75 ] &&
     grep -Fqx 'reason|active_request_must_settle' "$tmp/u2-parked-still-active" &&
-    [ -f "$u2_root/var/lib/machine-utilities-lifecycle.recovery/transaction" ] ||
+    [ -f "$u2_root/var/lib/roundhouse-lifecycle.recovery/transaction" ] ||
     fail "U2 parked drain retry did not preserve authority"
-  rmdir "$u2_root/var/lib/machine-utilities/lock/active"
+  rmdir "$u2_root/var/lib/roundhouse/lock/active"
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_U2_FAILPOINT=after-drain \
       "$enrollment" install "$u2_bundle" "$u2_manifest_digest" "$u2_confirmation_digest" \
       >"$tmp/u2-parked-settled" 2>/dev/null; then
     fail "U2 settled parked drain unexpectedly passed its failpoint"
   fi
-  [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] ||
+  [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse/draining" ] ||
     fail "U2 settled parked drain did not finalize idempotently"
 
   for u2_failpoint in after-drain after-generation after-broker after-trust after-sudoers \
@@ -2065,12 +2065,12 @@ EOF
         >"$tmp/u2-first-install-$u2_failpoint" 2>/dev/null; then
       fail "U2 first-install failpoint completed: $u2_failpoint"
     fi
-    [ ! -e "$u2_root/etc/machine-utilities/active" ] &&
-      [ ! -e "$u2_root/etc/machine-utilities/generations/1" ] &&
-      [ ! -e "$u2_root/usr/libexec/machine-utilities/posix-broker" ] &&
-      [ ! -e "$u2_root/etc/sudoers.d/machine-utilities-posix-broker" ] &&
-      [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] &&
-      [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] ||
+    [ ! -e "$u2_root/etc/roundhouse/active" ] &&
+      [ ! -e "$u2_root/etc/roundhouse/generations/1" ] &&
+      [ ! -e "$u2_root/usr/libexec/roundhouse/posix-broker" ] &&
+      [ ! -e "$u2_root/etc/sudoers.d/roundhouse-posix-broker" ] &&
+      [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&
+      [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] ||
       fail "U2 first-install rollback was incomplete at $u2_failpoint"
   done
 
@@ -2099,7 +2099,7 @@ EOF
     fail "U2 live install contention did not return 75 with exact unchanged state"
   fi
   u2_kill_paused "$u2_pause_marker" "$u2_pause_job"
-  [ -f "$u2_root/var/lib/machine-utilities-lifecycle.lock/owner" ] ||
+  [ -f "$u2_root/var/lib/roundhouse-lifecycle.lock/owner" ] ||
     fail "U2 SIGKILL did not leave recoverable lifecycle ownership evidence"
 
   u2_pause_marker="$tmp/u2-install-mutation-pause"
@@ -2110,33 +2110,33 @@ EOF
     >"$tmp/u2-install-killed" 2>&1 &
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job"
-  [ -f "$u2_root/var/lib/machine-utilities-lifecycle.lock/transaction" ] &&
-    [ -f "$u2_root/var/lib/machine-utilities/draining" ] &&
-    [ -d "$u2_root/var/lib/machine-utilities/rollback/install-0-1-$u2_manifest_digest" ] ||
+  [ -f "$u2_root/var/lib/roundhouse-lifecycle.lock/transaction" ] &&
+    [ -f "$u2_root/var/lib/roundhouse/draining" ] &&
+    [ -d "$u2_root/var/lib/roundhouse/rollback/install-0-1-$u2_manifest_digest" ] ||
     fail "U2 install mutation pause lacked durable transaction evidence"
   u2_kill_paused "$u2_pause_marker" "$u2_pause_job"
 
   printf '%s\n' unexpected-member-survives \
-    >"$u2_root/var/lib/machine-utilities-lifecycle.lock/unexpected-member"
-  chmod 600 "$u2_root/var/lib/machine-utilities-lifecycle.lock/unexpected-member"
+    >"$u2_root/var/lib/roundhouse-lifecycle.lock/unexpected-member"
+  chmod 600 "$u2_root/var/lib/roundhouse-lifecycle.lock/unexpected-member"
   printf '%s\n' partial-transaction-record \
-    >"$u2_root/var/lib/machine-utilities-lifecycle.lock/.transaction.424242"
-  chmod 600 "$u2_root/var/lib/machine-utilities-lifecycle.lock/.transaction.424242"
+    >"$u2_root/var/lib/roundhouse-lifecycle.lock/.transaction.424242"
+  chmod 600 "$u2_root/var/lib/roundhouse-lifecycle.lock/.transaction.424242"
   u2_invalid_lifecycle_before=$(u2_tree_digest \
-    "$u2_root/var/lib/machine-utilities-lifecycle.lock")
+    "$u2_root/var/lib/roundhouse-lifecycle.lock")
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle" \
       "$u2_manifest_digest" "$u2_confirmation_digest" >"$tmp/u2-unexpected-lifecycle-member" 2>/dev/null; then
     fail "U2 recovery accepted an unexpected lifecycle member"
   fi
   grep -Fqx 'reason|lifecycle_recovery_failed' "$tmp/u2-unexpected-lifecycle-member" &&
     grep -Fqx unexpected-member-survives \
-      "$u2_root/var/lib/machine-utilities-lifecycle.recovery/unexpected-member" &&
-    [ -f "$u2_root/var/lib/machine-utilities-lifecycle.recovery/.transaction.424242" ] &&
-    [ "$(u2_tree_digest "$u2_root/var/lib/machine-utilities-lifecycle.recovery")" = \
+      "$u2_root/var/lib/roundhouse-lifecycle.recovery/unexpected-member" &&
+    [ -f "$u2_root/var/lib/roundhouse-lifecycle.recovery/.transaction.424242" ] &&
+    [ "$(u2_tree_digest "$u2_root/var/lib/roundhouse-lifecycle.recovery")" = \
       "$u2_invalid_lifecycle_before" ] ||
     fail "U2 unexpected lifecycle member mutated recovery state before rejection"
-  rm "$u2_root/var/lib/machine-utilities-lifecycle.recovery/unexpected-member"
-  rm "$u2_root/var/lib/machine-utilities-lifecycle.recovery/.transaction.424242"
+  rm "$u2_root/var/lib/roundhouse-lifecycle.recovery/unexpected-member"
+  rm "$u2_root/var/lib/roundhouse-lifecycle.recovery/.transaction.424242"
 
   u2_pause_marker="$tmp/u2-install-recovery-pause"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" \
@@ -2146,8 +2146,8 @@ EOF
     >"$tmp/u2-install-recovery-killed" 2>&1 &
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job"
-  [ -f "$u2_root/var/lib/machine-utilities-lifecycle.recovery/transaction" ] &&
-    [ -f "$u2_root/var/lib/machine-utilities-lifecycle.recovery/owner" ] ||
+  [ -f "$u2_root/var/lib/roundhouse-lifecycle.recovery/transaction" ] &&
+    [ -f "$u2_root/var/lib/roundhouse-lifecycle.recovery/owner" ] ||
     fail "U2 recovery pause lacked guarded durable recovery authority"
   u2_recovery_contender_before=$(u2_enrollment_state_digest)
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle" \
@@ -2170,7 +2170,7 @@ EOF
     >"$tmp/u2-install-rolled-back-killed" 2>&1 &
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job"
-  [ "$(awk -F '|' '$1=="phase"{print $2}' "$u2_root/var/lib/machine-utilities-lifecycle.recovery/transaction")" = rolled-back ] ||
+  [ "$(awk -F '|' '$1=="phase"{print $2}' "$u2_root/var/lib/roundhouse-lifecycle.recovery/transaction")" = rolled-back ] ||
     fail "U2 rollback state was not durable before finalization cleanup"
   u2_kill_paused "$u2_pause_marker" "$u2_pause_job"
 
@@ -2181,8 +2181,8 @@ EOF
     >"$tmp/u2-recovery-retirement-killed" 2>&1 &
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job" "$tmp/u2-recovery-retirement-killed"
-  [ -d "$u2_root/var/lib/.machine-utilities-lifecycle.recovery.retired" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] ||
+  [ -d "$u2_root/var/lib/.roundhouse-lifecycle.recovery.retired" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] ||
     fail "U2 recovery retirement was not atomic before deletion"
   u2_kill_paused "$u2_pause_marker" "$u2_pause_job"
 
@@ -2193,8 +2193,8 @@ EOF
     >"$tmp/u2-install-committed-killed" 2>&1 &
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job" "$tmp/u2-install-committed-killed"
-  [ "$(awk -F '|' '$1=="phase"{print $2}' "$u2_root/var/lib/machine-utilities-lifecycle.lock/transaction")" = committed ] &&
-    [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/1 ] ||
+  [ "$(awk -F '|' '$1=="phase"{print $2}' "$u2_root/var/lib/roundhouse-lifecycle.lock/transaction")" = committed ] &&
+    [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/1 ] ||
     fail "U2 committed phase was not durable before finalization"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_IDENTITY="$tmp/u2-no-identity" \
     "$collector" "$tmp/config.json" test-apt u2-committed-readiness none >"$tmp/u2-committed-readiness.jsonl"
@@ -2202,7 +2202,7 @@ EOF
     "$tmp/u2-committed-readiness.jsonl")" = "$(printf 'draining\tcommitted\tfalse')" ] ||
     fail "U2 collector overclaimed readiness during commit finalization"
   u2_kill_paused "$u2_pause_marker" "$u2_pause_job"
-  u2_quarantine_collision="$u2_root/var/lib/machine-utilities/quarantine/revoked-1-$u2_manifest_digest"
+  u2_quarantine_collision="$u2_root/var/lib/roundhouse/quarantine/revoked-1-$u2_manifest_digest"
   mkdir "$u2_quarantine_collision"
   chmod 700 "$u2_quarantine_collision"
   printf '%s\n' quarantine-collision-survives >"$u2_quarantine_collision/unrelated"
@@ -2217,7 +2217,7 @@ EOF
   [ "$u2_quarantine_collision_rc" -eq 74 ] &&
     grep -Fqx 'reason|transaction_artifact_collision' "$tmp/u2-quarantine-collision" &&
     grep -Fqx quarantine-collision-survives "$u2_quarantine_collision/unrelated" &&
-    [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/1 ] ||
+    [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/1 ] ||
     fail "U2 quarantine collision was not deterministic and non-destructive"
   rm -rf "$u2_quarantine_collision"
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_U2_FAILPOINT=after-drain \
@@ -2225,49 +2225,49 @@ EOF
       >"$tmp/u2-commit-finalization-retry" 2>/dev/null; then
     fail "U2 commit-finalization recovery unexpectedly passed the revoke failpoint"
   fi
-  [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/1 ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] &&
-    grep -Fqx unrelated-survives "$u2_root/var/lib/machine-utilities/unrelated-lifecycle-sentinel" ||
+  [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/1 ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&
+    grep -Fqx unrelated-survives "$u2_root/var/lib/roundhouse/unrelated-lifecycle-sentinel" ||
     fail "U2 committed retry rolled back new state or left lifecycle debris"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" status >"$tmp/u2-enrolled"
   grep -Fqx 'state|enrolled' "$tmp/u2-enrolled" || fail "U2 fixture enrollment did not activate"
-  grep -Fqx 'scope|fixture' "$u2_root/var/lib/machine-utilities-public/canary" ||
+  grep -Fqx 'scope|fixture' "$u2_root/var/lib/roundhouse-public/canary" ||
     fail "U2 fixture canary was not labeled"
   grep -Fqx 'positive-no-argument|fixture-simulated-broker-reached' \
-    "$u2_root/var/lib/machine-utilities-public/canary" ||
+    "$u2_root/var/lib/roundhouse-public/canary" ||
     fail "U2 fixture positive canary was not explicit"
-  grep -Fqx 'negative-with-argument|fixture-passed' "$u2_root/var/lib/machine-utilities-public/canary" ||
+  grep -Fqx 'negative-with-argument|fixture-passed' "$u2_root/var/lib/roundhouse-public/canary" ||
     fail "U2 fixture negative argument canary did not pass"
-  grep -Fqx 'complete-sudoers|fixture-not-run' "$u2_root/var/lib/machine-utilities-public/canary" ||
+  grep -Fqx 'complete-sudoers|fixture-not-run' "$u2_root/var/lib/roundhouse-public/canary" ||
     fail "U2 fixture claimed complete native sudoers validation"
-  [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/1 ] ||
+  [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/1 ] ||
     fail "U2 enrollment did not atomically select generation 1"
-  [ -x "$u2_root/usr/libexec/machine-utilities/posix-broker" ] ||
+  [ -x "$u2_root/usr/libexec/roundhouse/posix-broker" ] ||
     fail "U2 enrollment did not install the protected broker"
-  grep -Fqx 'machine-utilities ALL=(root) NOPASSWD:NOSETENV: /usr/libexec/machine-utilities/posix-broker ""' \
-    "$u2_root/etc/sudoers.d/machine-utilities-posix-broker" ||
+  grep -Fqx 'roundhouse ALL=(root) NOPASSWD:NOSETENV: /usr/libexec/roundhouse/posix-broker ""' \
+    "$u2_root/etc/sudoers.d/roundhouse-posix-broker" ||
     fail "U2 sudoers fixture was not the fixed no-argument broker grant"
-  [ -f "$u2_root/var/lib/machine-utilities-public/enrollment" ] &&
-    [ -f "$u2_root/var/lib/machine-utilities-public/canary" ] ||
+  [ -f "$u2_root/var/lib/roundhouse-public/enrollment" ] &&
+    [ -f "$u2_root/var/lib/roundhouse-public/canary" ] ||
     fail "U2 enrollment did not create public status before the first request"
-  u2_revocation_reserve="$u2_root/var/lib/machine-utilities/revocation.reserve"
+  u2_revocation_reserve="$u2_root/var/lib/roundhouse/revocation.reserve"
   u2_reserve_size=$(stat -f %z "$u2_revocation_reserve" 2>/dev/null || stat -c %s "$u2_revocation_reserve")
   u2_reserve_blocks=$(stat -f %b "$u2_revocation_reserve" 2>/dev/null || stat -c %b "$u2_revocation_reserve")
   u2_reserve_device=$(stat -f %d "$u2_revocation_reserve" 2>/dev/null || stat -c %d "$u2_revocation_reserve")
-  u2_state_device=$(stat -f %d "$u2_root/var/lib/machine-utilities" 2>/dev/null || \
-    stat -c %d "$u2_root/var/lib/machine-utilities")
+  u2_state_device=$(stat -f %d "$u2_root/var/lib/roundhouse" 2>/dev/null || \
+    stat -c %d "$u2_root/var/lib/roundhouse")
   [ "$u2_reserve_size" -eq 4194304 ] && [ $((u2_reserve_blocks * 512)) -ge 1048576 ] &&
     [ "$u2_reserve_device" = "$u2_state_device" ] ||
     fail "U2 enrollment did not allocate a real same-filesystem revocation reserve"
   [ "$(sed -n '1p' "$u2_generation/ssh-keygen.sha256")" = "$(u2_sha256 /usr/bin/ssh-keygen)" ] &&
     [ "$(wc -l <"$u2_generation/ssh-keygen.sha256" | tr -d ' ')" = 1 ] ||
     fail "U2 enrollment did not bind the absolute system ssh-keygen into the generation"
-  [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] &&
-  [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities/rollback/install-0-1-$u2_manifest_digest" ] ||
+  [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] &&
+  [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse/rollback/install-0-1-$u2_manifest_digest" ] ||
     fail "U2 repeated SIGKILL recovery left lifecycle transaction artifacts"
 
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_IDENTITY="$tmp/u2-no-identity" \
@@ -2276,7 +2276,7 @@ EOF
   [ "$(jq -r 'select(.kind=="privilege_broker") | [.data.lifecycle_status,.data.broker_ready,.data.protected_artifacts_ready] | @tsv' \
     "$tmp/u2-pre-broker-ready.jsonl")" = "$(printf 'ready\ttrue\ttrue')" ] ||
     fail "U2 collector did not validate the clean pre-broker enrollment"
-  u2_live_release="$u2_root/etc/machine-utilities/generations/1/apt/metadata/Release"
+  u2_live_release="$u2_root/etc/roundhouse/generations/1/apt/metadata/Release"
   cp -p "$u2_live_release" "$tmp/u2-live-release"
   printf '%s\n' 'Unexpected: live-drift' >>"$u2_live_release"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_IDENTITY="$tmp/u2-no-identity" \
@@ -2294,8 +2294,8 @@ EOF
     fail "U2 collector did not recover after restoring live APT authority"
 
   u2_broker_digest=$(u2_sha256 "$broker")
-  u2_constraints_digest=$(u2_sha256 "$u2_root/etc/machine-utilities/generations/1/policy.constraints")
-  u2_context_digest=$(u2_sha256 "$u2_root/etc/machine-utilities/generations/1/context.canary")
+  u2_constraints_digest=$(u2_sha256 "$u2_root/etc/roundhouse/generations/1/policy.constraints")
+  u2_context_digest=$(u2_sha256 "$u2_root/etc/roundhouse/generations/1/context.canary")
   u2_metadata_digest=$(printf '%s\n' 'metadata|1' | u2_sha256_stream)
   u2_precondition_digest=$(printf 'metadata|%s\n' "$u2_metadata_digest" | u2_sha256_stream)
   u2_make_envelope() {
@@ -2345,7 +2345,7 @@ precondition-sha256|$envelope_precondition
 created-at|$envelope_created
 expires-at|$envelope_expiry
 transport|posix-ssh
-request-principal|machine-utilities
+request-principal|roundhouse
 required-context|posix-root-v1
 observed-execution-principal|root
 console-session-state|none
@@ -2365,7 +2365,7 @@ certificate-source-addresses|-
 manager-source-identity|$envelope_manager
 end-request|
 EOF
-    SSH_AUTH_SOCK='' "$ssh_keygen" -Y sign -f "$envelope_certificate" -n machine-utilities-request \
+    SSH_AUTH_SOCK='' "$ssh_keygen" -Y sign -f "$envelope_certificate" -n roundhouse-request \
       "$request_file" >/dev/null
     {
       cat "$request_file"
@@ -2425,7 +2425,7 @@ EOF
   [ "$(printf '%s' "$u2_readiness" | jq -r '.data.transport_ready')" = false ] ||
     fail "U2 collector promoted a configured route without a U6 transport receipt"
   [ "$(printf '%s' "$u2_readiness" | jq -r '.data.protected_identity.uid')" = "$u2_uid" ] &&
-    [ "$(printf '%s' "$u2_readiness" | jq -r '.data.protected_identity.request_principal')" = machine-utilities ] ||
+    [ "$(printf '%s' "$u2_readiness" | jq -r '.data.protected_identity.request_principal')" = roundhouse ] ||
     fail "U2 collector omitted the protected UID or request principal"
   [ "$(printf '%s' "$u2_readiness" | jq -r '.data.last_terminal_result.state')" = completed ] ||
     fail "U2 collector did not expose the sanitized last terminal result"
@@ -2434,8 +2434,8 @@ EOF
     "$u2_precondition_digest" ] || fail "U2 collector omitted fresh action precondition evidence"
   rm -f "$apt_marker"
 
-  u2_canonical="$u2_root/var/lib/machine-utilities/replay/request-00000000000000000000000000000001/journal"
-  u2_projection="$u2_root/var/lib/machine-utilities/journal/request-00000000000000000000000000000001.result"
+  u2_canonical="$u2_root/var/lib/roundhouse/replay/request-00000000000000000000000000000001/journal"
+  u2_projection="$u2_root/var/lib/roundhouse/journal/request-00000000000000000000000000000001.result"
   grep -Fqx 'journal|2' "$u2_canonical" &&
     grep -Fqx 'effect-phase|verified' "$u2_canonical" ||
     fail "U2 canonical journal did not retain the v2 verified terminal state"
@@ -2479,19 +2479,19 @@ EOF
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query_renewed" \
     >"$tmp/u2-query-renewed" || fail "U2 renewed node certificate could not recover an old result"
 
-  cp -p "$u2_root/etc/machine-utilities/trust/fleet-ca.pub" "$tmp/u2-query-old-ca"
-  cp -p "$u2_root/etc/machine-utilities/trust/allowed_signers" "$tmp/u2-query-old-signers"
+  cp -p "$u2_root/etc/roundhouse/trust/fleet-ca.pub" "$tmp/u2-query-old-ca"
+  cp -p "$u2_root/etc/roundhouse/trust/allowed_signers" "$tmp/u2-query-old-signers"
   cp -p "$u2_generation/host.identity" "$tmp/u2-query-old-host-identity"
   u2_rotated_ca_fingerprint=$("$ssh_keygen" -lf "$tmp/u2-rotated-fleet-ca.pub" -E sha256 |
     awk 'NR==1{print $2}')
-  cp "$tmp/u2-rotated-fleet-ca.pub" "$u2_root/etc/machine-utilities/trust/fleet-ca.pub"
+  cp "$tmp/u2-rotated-fleet-ca.pub" "$u2_root/etc/roundhouse/trust/fleet-ca.pub"
   awk 'NR==1{print "node-a@fleet.example cert-authority "$0}' "$tmp/u2-rotated-fleet-ca.pub" \
-    >"$u2_root/etc/machine-utilities/trust/allowed_signers"
+    >"$u2_root/etc/roundhouse/trust/allowed_signers"
   awk -F '|' -v OFS='|' -v ca="$u2_rotated_ca_fingerprint" '{$7=ca;$8=2;print}' \
     "$u2_generation/host.identity" >"$tmp/u2-query-rotated-host-identity"
   mv "$tmp/u2-query-rotated-host-identity" "$u2_generation/host.identity"
-  chmod 644 "$u2_generation/host.identity" "$u2_root/etc/machine-utilities/trust/fleet-ca.pub" \
-    "$u2_root/etc/machine-utilities/trust/allowed_signers"
+  chmod 644 "$u2_generation/host.identity" "$u2_root/etc/roundhouse/trust/fleet-ca.pub" \
+    "$u2_root/etc/roundhouse/trust/allowed_signers"
   u2_request_ca_fingerprint=$u2_rotated_ca_fingerprint
   u2_request_ca_generation=2
   u2_query_rotated=$(u2_make_envelope broker.query-result.v1 \
@@ -2500,24 +2500,24 @@ EOF
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query_rotated" \
     >"$tmp/u2-query-rotated" || fail "U2 rotated-CA certificate could not recover an old result"
   unset u2_request_ca_fingerprint u2_request_ca_generation
-  mv "$tmp/u2-query-old-ca" "$u2_root/etc/machine-utilities/trust/fleet-ca.pub"
-  mv "$tmp/u2-query-old-signers" "$u2_root/etc/machine-utilities/trust/allowed_signers"
+  mv "$tmp/u2-query-old-ca" "$u2_root/etc/roundhouse/trust/fleet-ca.pub"
+  mv "$tmp/u2-query-old-signers" "$u2_root/etc/roundhouse/trust/allowed_signers"
   mv "$tmp/u2-query-old-host-identity" "$u2_generation/host.identity"
 
   printf '%s\n' 'forged-result-projection' >"$u2_projection"
   chmod 600 "$u2_projection"
-  printf '%s\n' 'forged-public-projection' >"$u2_root/var/lib/machine-utilities-public/last"
-  chmod 644 "$u2_root/var/lib/machine-utilities-public/last"
+  printf '%s\n' 'forged-public-projection' >"$u2_root/var/lib/roundhouse-public/last"
+  chmod 644 "$u2_root/var/lib/roundhouse-public/last"
   u2_terminal_digest=$(u2_sha256 "$u2_canonical")
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query" >"$tmp/u2-query-repair" ||
     fail "U2 query did not repair forged projections"
   [ "$(u2_sha256 "$u2_canonical")" = "$u2_terminal_digest" ] &&
     cmp -s "$u2_canonical" "$u2_projection" &&
-    grep -Fqx 'broker-public|1' "$u2_root/var/lib/machine-utilities-public/last" &&
-    grep -Fqx 'state|completed' "$u2_root/var/lib/machine-utilities-public/last" ||
+    grep -Fqx 'broker-public|1' "$u2_root/var/lib/roundhouse-public/last" &&
+    grep -Fqx 'state|completed' "$u2_root/var/lib/roundhouse-public/last" ||
     fail "U2 projection repair changed or failed to reproduce terminal authority"
   if grep -Eq '/usr/|https://|BEGIN (SSH|PGP)|\[GNUPG:\]|VALIDSIG' \
-      "$u2_root/var/lib/machine-utilities-public/last"; then
+      "$u2_root/var/lib/roundhouse-public/last"; then
     fail "U2 public projection leaked protected execution or authentication material"
   fi
 
@@ -2553,8 +2553,8 @@ EOF
     [ "$(TZ=UTC u2_boot_identity)" = "$(TZ=America/New_York u2_boot_identity)" ] ||
       fail "U2 canonical boot identity depended on the sysctl timezone suffix"
   fi
-  mkdir "$u2_root/var/lib/machine-utilities/lock/active"
-  chmod 700 "$u2_root/var/lib/machine-utilities/lock/active"
+  mkdir "$u2_root/var/lib/roundhouse/lock/active"
+  chmod 700 "$u2_root/var/lib/roundhouse/lock/active"
   /bin/sleep 300 &
   u2_live_admission_pid=$!
   u2_terminal_launch=$(awk -F '|' '$1=="launch-record-sha256"{print $2}' "$u2_canonical")
@@ -2567,13 +2567,13 @@ EOF
     "$u2_live_admission_start" "$u2_live_admission_pid" "$u2_live_admission_pid" \
     "$u2_live_admission_start" \
     "$(u2_boot_identity)" "$u2_terminal_launch" \
-    >"$u2_root/var/lib/machine-utilities/lock/active/admission"
-  chmod 600 "$u2_root/var/lib/machine-utilities/lock/active/admission"
+    >"$u2_root/var/lib/roundhouse/lock/active/admission"
+  chmod 600 "$u2_root/var/lib/roundhouse/lock/active/admission"
   kill -0 "$u2_live_admission_pid" 2>/dev/null ||
     fail "U2 live-admission fixture child was not live immediately before query"
   [ "$(u2_process_start_identity "$u2_live_admission_pid")" = "$u2_live_admission_start" ] ||
     fail "U2 live-admission fixture process-start identity changed before query"
-  cp "$u2_root/var/lib/machine-utilities/lock/active/admission" "$tmp/u2-live-admission.before"
+  cp "$u2_root/var/lib/roundhouse/lock/active/admission" "$tmp/u2-live-admission.before"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" \
     "$broker" <"$u2_query" >"$tmp/u2-query-live-terminal" ||
     fail "U2 query rejected completed authority during the release window"
@@ -2581,18 +2581,18 @@ EOF
     fail "U2 live-admission reconciliation rewrote terminal authority"
   grep -Fqx 'state|completed' "$tmp/u2-query-live-terminal" ||
     fail "U2 live-admission query did not return completed authority"
-  if [ ! -f "$u2_root/var/lib/machine-utilities/lock/active/admission" ]; then
+  if [ ! -f "$u2_root/var/lib/roundhouse/lock/active/admission" ]; then
     cat "$tmp/u2-live-admission.before" >&2
     fail "U2 live-admission query removed a proven-live admission"
   fi
   kill "$u2_live_admission_pid" 2>/dev/null || true
   wait "$u2_live_admission_pid" 2>/dev/null || true
-  rm -f "$u2_root/var/lib/machine-utilities/lock/active/admission"
-  [ ! -d "$u2_root/var/lib/machine-utilities/lock/active" ] ||
-    rmdir "$u2_root/var/lib/machine-utilities/lock/active"
+  rm -f "$u2_root/var/lib/roundhouse/lock/active/admission"
+  [ ! -d "$u2_root/var/lib/roundhouse/lock/active" ] ||
+    rmdir "$u2_root/var/lib/roundhouse/lock/active"
 
-  mkdir "$u2_root/var/lib/machine-utilities/lock/active"
-  chmod 700 "$u2_root/var/lib/machine-utilities/lock/active"
+  mkdir "$u2_root/var/lib/roundhouse/lock/active"
+  chmod 700 "$u2_root/var/lib/roundhouse/lock/active"
   /bin/sleep 300 &
   u2_reused_group_pid=$!
   u2_wrong_start=$(printf '%064d' 0)
@@ -2600,18 +2600,18 @@ EOF
     request-00000000000000000000000000000001 "$u2_reused_group_pid" "$u2_wrong_start" \
     "$u2_reused_group_pid" "$u2_reused_group_pid" "$u2_wrong_start" \
     "$(u2_boot_identity)" "$u2_terminal_launch" \
-    >"$u2_root/var/lib/machine-utilities/lock/active/admission"
-  chmod 600 "$u2_root/var/lib/machine-utilities/lock/active/admission"
+    >"$u2_root/var/lib/roundhouse/lock/active/admission"
+  chmod 600 "$u2_root/var/lib/roundhouse/lock/active/admission"
   printf 'emergency|1|%s|%s|%s\n' request-00000000000000000000000000000001 \
     "$u2_reused_group_pid" "$(u2_boot_identity)" \
-    >"$u2_root/var/lib/machine-utilities/emergency-terminate"
-  chmod 600 "$u2_root/var/lib/machine-utilities/emergency-terminate"
+    >"$u2_root/var/lib/roundhouse/emergency-terminate"
+  chmod 600 "$u2_root/var/lib/roundhouse/emergency-terminate"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query" \
     >"$tmp/u2-query-reused-group" || fail "U2 reused-group reconciliation rejected the canonical result"
   kill -0 "$u2_reused_group_pid" 2>/dev/null ||
     fail "U2 emergency reconciliation signaled a process with mismatched leader start identity"
-  [ ! -e "$u2_root/var/lib/machine-utilities/emergency-terminate" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities/lock/active" ] ||
+  [ ! -e "$u2_root/var/lib/roundhouse/emergency-terminate" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse/lock/active" ] ||
     fail "U2 mismatched leader identity remained live in admission state"
   kill "$u2_reused_group_pid" 2>/dev/null || true
   wait "$u2_reused_group_pid" 2>/dev/null || true
@@ -2644,13 +2644,13 @@ EOF
   u2_expect_rejected signature_verification_failed "$u2_host_certificate" "$tmp/u2-host-certificate"
   [ ! -e "$apt_marker" ] || fail "U2 host certificate reached native APT"
 
-  printf '%s\n' 'torn-audit-fragment' >>"$u2_root/var/lib/machine-utilities/audit/events.log"
+  printf '%s\n' 'torn-audit-fragment' >>"$u2_root/var/lib/roundhouse/audit/events.log"
   u2_audit_repair=$(u2_make_envelope apt.update-metadata.v1 \
     request-0000000000000000000000000000000b "$u2_now" $((u2_now + 300)))
   APT_EXEC_MARKER="$apt_marker" ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" \
     "$broker" <"$u2_audit_repair" >"$tmp/u2-audit-repair" ||
     fail "U2 immutable audit projection repair rejected valid work"
-  ! grep -Fq 'torn-audit-fragment' "$u2_root/var/lib/machine-utilities/audit/events.log" &&
+  ! grep -Fq 'torn-audit-fragment' "$u2_root/var/lib/roundhouse/audit/events.log" &&
     grep -Fqx 'state|completed' "$tmp/u2-audit-repair" ||
     fail "U2 audit projection retained a torn append or lost terminal state"
   rm -f "$apt_marker"
@@ -2675,7 +2675,7 @@ EOF
     fail "U2 audit-capacity exhaustion was not explicit"
   grep -Fqx 'state|rejected' "$tmp/u2-audit-capacity" && [ ! -e "$apt_marker" ] ||
     fail "U2 audit-capacity exhaustion lacked a pre-effect terminal record"
-  if find "$u2_root/var/lib/machine-utilities/audit" -mindepth 1 -maxdepth 1 \
+  if find "$u2_root/var/lib/roundhouse/audit" -mindepth 1 -maxdepth 1 \
       -name '.events.*' -print | grep -q .; then
     fail "U2 audit-capacity exhaustion left a projection temporary"
   fi
@@ -2692,10 +2692,10 @@ EOF
       fail "U2 injected claim failure completed: $u2_claim_failpoint"
     fi
     grep -Fqx 'reason|claim_reservation_failed' "$tmp/u2-claim-$u2_claim_failpoint" &&
-      [ ! -e "$u2_root/var/lib/machine-utilities/replay/$u2_claim_request" ] &&
-      [ ! -e "$u2_root/var/lib/machine-utilities/lock/active" ] ||
+      [ ! -e "$u2_root/var/lib/roundhouse/replay/$u2_claim_request" ] &&
+      [ ! -e "$u2_root/var/lib/roundhouse/lock/active" ] ||
       fail "U2 claim failure did not release its admission: $u2_claim_failpoint"
-    if find "$u2_root/var/lib/machine-utilities/replay" -mindepth 1 -maxdepth 1 \
+    if find "$u2_root/var/lib/roundhouse/replay" -mindepth 1 -maxdepth 1 \
         -name '.claim-*' -print | grep -q .; then
       fail "U2 claim failure left pre-rename staging: $u2_claim_failpoint"
     fi
@@ -2712,14 +2712,14 @@ EOF
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job" "$tmp/u2-broker-parent-term-result"
   u2_gate_child=$(awk -F '|' 'NR==1&&$1=="admission"&&$2=="2"{print $6}' \
-    "$u2_root/var/lib/machine-utilities/lock/active/admission")
+    "$u2_root/var/lib/roundhouse/lock/active/admission")
   kill -TERM "$u2_pause_job"
   if wait "$u2_pause_job"; then fail "U2 TERM-interrupted broker reported success"; fi
   kill -0 "$u2_gate_child" 2>/dev/null && fail "U2 TERM-interrupted broker stranded its gate child"
-  u2_term_claim="$u2_root/var/lib/machine-utilities/replay/$u2_term_request"
+  u2_term_claim="$u2_root/var/lib/roundhouse/replay/$u2_term_request"
   grep -Fqx 'reason|parent_interrupted_before_native_effect' "$tmp/u2-broker-parent-term-result" &&
     [ ! -e "$u2_term_claim/launch.gate" ] && [ ! -e "$u2_term_claim/terminal.reserve" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities/lock/active" ] ||
+    [ ! -e "$u2_root/var/lib/roundhouse/lock/active" ] ||
     fail "U2 TERM interruption left a gate, reserve, or admission"
   rm -f "$u2_pause_marker" "$u2_pause_marker.continue" "$u2_pause_marker.kill"
 
@@ -2733,7 +2733,7 @@ EOF
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job" "$tmp/u2-broker-parent-kill-result"
   u2_gate_child=$(awk -F '|' 'NR==1&&$1=="admission"&&$2=="2"{print $6}' \
-    "$u2_root/var/lib/machine-utilities/lock/active/admission")
+    "$u2_root/var/lib/roundhouse/lock/active/admission")
   kill -KILL "$u2_pause_job"
   wait "$u2_pause_job" 2>/dev/null || true
   u2_gate_wait=0
@@ -2747,10 +2747,10 @@ EOF
     "$u2_now" $((u2_now + 300)))
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_kill_query" \
     >"$tmp/u2-broker-parent-kill-query" || fail "U2 query could not recover a killed pre-effect parent"
-  u2_kill_claim="$u2_root/var/lib/machine-utilities/replay/$u2_kill_request"
+  u2_kill_claim="$u2_root/var/lib/roundhouse/replay/$u2_kill_request"
   grep -Fqx 'state|stale' "$tmp/u2-broker-parent-kill-query" &&
     [ ! -e "$u2_kill_claim/launch.gate" ] && [ ! -e "$u2_kill_claim/terminal.reserve" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities/lock/active" ] ||
+    [ ! -e "$u2_root/var/lib/roundhouse/lock/active" ] ||
     fail "U2 killed-parent recovery left a gate, reserve, or admission"
 
   u2_policy_active="$u2_generation/policy.actions"
@@ -2811,7 +2811,7 @@ EOF
   sed 's/target-host-id|test-apt/target-host-id|other-host/' "$u2_changed" >"$tmp/u2-changed-bytes"
   u2_expect_rejected host_identity_mismatch "$tmp/u2-changed-bytes" "$tmp/u2-changed-result"
 
-  u2_policy_active="$u2_root/etc/machine-utilities/generations/1/policy.actions"
+  u2_policy_active="$u2_root/etc/roundhouse/generations/1/policy.actions"
   u2_policy_active_mode=$(test_file_mode "$u2_policy_active")
   cp -p "$u2_policy_active" "$tmp/u2-policy-backup"
   printf '%s\n' '# drift' >>"$u2_policy_active"
@@ -2822,7 +2822,7 @@ EOF
   [ "$(test_file_mode "$u2_policy_active")" = "$u2_policy_active_mode" ] ||
     fail "U2 policy-drift fixture did not restore exact metadata"
 
-  u2_apt_active="$u2_root/etc/machine-utilities/generations/1/apt.conf"
+  u2_apt_active="$u2_root/etc/roundhouse/generations/1/apt.conf"
   u2_apt_active_mode=$(test_file_mode "$u2_apt_active")
   cp -p "$u2_apt_active" "$tmp/u2-apt-backup"
   printf '%s\n' 'APT::Update::Pre-Invoke { "touch /tmp/forbidden"; };' >>"$u2_apt_active"
@@ -2833,20 +2833,20 @@ EOF
   [ "$(test_file_mode "$u2_apt_active")" = "$u2_apt_active_mode" ] ||
     fail "U2 APT-hook fixture did not restore exact metadata"
 
-  mv "$u2_root/var/lib/machine-utilities/audit/events.log" "$tmp/u2-audit-log"
-  mkdir "$u2_root/var/lib/machine-utilities/audit/events.log"
+  mv "$u2_root/var/lib/roundhouse/audit/events.log" "$tmp/u2-audit-log"
+  mkdir "$u2_root/var/lib/roundhouse/audit/events.log"
   u2_audit=$(u2_make_envelope apt.update-metadata.v1 \
     request-00000000000000000000000000000008 "$u2_now" $((u2_now + 300)))
   u2_expect_rejected audit_write_failed "$u2_audit" "$tmp/u2-audit-failure"
-  mv "$u2_root/var/lib/machine-utilities/audit/events.log" "$tmp/u2-blocked-audit"
-  mv "$tmp/u2-audit-log" "$u2_root/var/lib/machine-utilities/audit/events.log"
-  if find "$u2_root/var/lib/machine-utilities/audit" -mindepth 1 -maxdepth 1 \
+  mv "$u2_root/var/lib/roundhouse/audit/events.log" "$tmp/u2-blocked-audit"
+  mv "$tmp/u2-audit-log" "$u2_root/var/lib/roundhouse/audit/events.log"
+  if find "$u2_root/var/lib/roundhouse/audit" -mindepth 1 -maxdepth 1 \
       -name '.events.*' -print | grep -q .; then
     fail "U2 failed audit projection left a temporary"
   fi
 
   u2_build2="$tmp/u2-bundle-2"
-  u2_generation2="$u2_root/etc/machine-utilities/generations/2"
+  u2_generation2="$u2_root/etc/roundhouse/generations/2"
   cp -Rp "$u2_bundle" "$u2_build2"
   rm -f "$u2_build2/bootstrap.manifest" "$u2_build2/bootstrap.manifest.sig"
   printf 'constraints|1|generation=2|policy-sha256=%s\n' "$u2_policy_digest" \
@@ -2872,7 +2872,7 @@ EOF
   mv "$tmp/u2-apt2.context" "$u2_build2/apt.context"
   : >"$u2_build2/bootstrap.manifest"
   for u2_relative in allowed_signers apt.conf apt.context apt/effective.dump apt/preferences \
-    apt/metadata/Release apt/metadata/Release.gpg apt/preferences.d/00-machine-utilities \
+    apt/metadata/Release apt/metadata/Release.gpg apt/preferences.d/00-roundhouse \
     apt/source-authority apt/source-identities apt/sources.list \
     apt/sources.list.d/roundhouse.sources apt/trusted.gpg.d/fleet.gpg \
     context.canary enroll-privilege-posix fleet-ca.pub \
@@ -2880,11 +2880,11 @@ EOF
     printf 'file|%s|%s\n' "$u2_relative" "$(u2_sha256 "$u2_build2/$u2_relative")"
   done | LC_ALL=C sort -t '|' -k2,2 >"$u2_build2/bootstrap.manifest"
   u2_manifest2_digest=$(u2_sha256 "$u2_build2/bootstrap.manifest")
-  "$ssh_keygen" -Y sign -f "$tmp/u2-release-key" -n machine-utilities-release \
+  "$ssh_keygen" -Y sign -f "$tmp/u2-release-key" -n roundhouse-release \
     "$u2_build2/bootstrap.manifest" >/dev/null
   u2_bundle2="$u2_bootstrap/staged/$u2_manifest2_digest"
   mv "$u2_build2" "$u2_bundle2"
-  printf 'bootstrap|1|manifest-sha256=%s|release-principal=machine-utilities-release\n' \
+  printf 'bootstrap|1|manifest-sha256=%s|release-principal=roundhouse-release\n' \
     "$u2_manifest2_digest" >"$u2_bootstrap/receipts/$u2_manifest2_digest"
   chmod -R go-w "$u2_root"
   printf '%064d\n' 0 >"$u2_generation/ssh-keygen.sha256"
@@ -2936,7 +2936,7 @@ EOF
     fail "U2 install accepted live state changed after confirmation"
   fi
   grep -Fqx 'reason|under_lock_confirmation_digest_mismatch' "$tmp/u2-live-lock-race-result" &&
-    [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] ||
+    [ ! -e "$u2_root/var/lib/roundhouse/draining" ] ||
     fail "U2 under-lock confirmation recompute did not fail before mutation"
   mv "$tmp/u2-live-policy-before-lock-race" "$u2_generation/policy.actions"
   [ "$(test_file_mode "$u2_generation/policy.actions")" = "$u2_live_policy_mode" ] ||
@@ -2945,24 +2945,24 @@ EOF
     fail "U2 under-lock current-state race was not exactly recoverable"
 
   u2_reboot_before=$(u2_enrollment_state_digest)
-  mkdir "$u2_root/var/lib/machine-utilities-lifecycle.lock"
-  chmod 700 "$u2_root/var/lib/machine-utilities-lifecycle.lock"
-  cat >"$u2_root/var/lib/machine-utilities-lifecycle.lock/owner" <<'EOF'
+  mkdir "$u2_root/var/lib/roundhouse-lifecycle.lock"
+  chmod 700 "$u2_root/var/lib/roundhouse-lifecycle.lock"
+  cat >"$u2_root/var/lib/roundhouse-lifecycle.lock/owner" <<'EOF'
 lifecycle-owner|2
 boot-id|0000000000000000000000000000000000000000000000000000000000000000
 pid|1
 process-start|0000000000000000000000000000000000000000000000000000000000000000
 operation|install
 EOF
-  chmod 600 "$u2_root/var/lib/machine-utilities-lifecycle.lock/owner"
+  chmod 600 "$u2_root/var/lib/roundhouse-lifecycle.lock/owner"
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_U2_FAILPOINT=after-drain \
       "$enrollment" install "$u2_bundle2" "$u2_manifest2_digest" "$u2_confirmation2_digest" \
       >"$tmp/u2-reboot-recovery" 2>/dev/null; then
     fail "U2 simulated reboot recovery passed its forced failpoint"
   fi
   [ "$(u2_enrollment_state_digest)" = "$u2_reboot_before" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] ||
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] ||
     fail "U2 boot-bound stale owner recovery did not restore exact state"
   u2_upgrade_before=$(u2_enrollment_state_digest)
   for u2_failpoint in after-drain after-generation after-broker after-trust after-sudoers \
@@ -2973,30 +2973,30 @@ EOF
       fail "U2 upgrade failpoint completed: $u2_failpoint"
     fi
     [ "$(u2_enrollment_state_digest)" = "$u2_upgrade_before" ] &&
-      [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] &&
-      [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] ||
+      [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&
+      [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] ||
       fail "U2 upgrade rollback changed the previous generation at $u2_failpoint"
   done
 
-  mkdir "$u2_root/var/lib/machine-utilities/lock/active"
-  chmod 700 "$u2_root/var/lib/machine-utilities/lock/active"
+  mkdir "$u2_root/var/lib/roundhouse/lock/active"
+  chmod 700 "$u2_root/var/lib/roundhouse/lock/active"
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle2" \
       "$u2_manifest2_digest" "$u2_confirmation2_digest" >"$tmp/u2-upgrade-draining" 2>/dev/null; then
     fail "U2 upgrade ignored an active admission"
   fi
   grep -Fqx 'state|draining' "$tmp/u2-upgrade-draining" &&
-    [ -f "$u2_root/var/lib/machine-utilities/draining" ] ||
+    [ -f "$u2_root/var/lib/roundhouse/draining" ] ||
     fail "U2 upgrade did not preserve its exact resumable drain"
-  [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/1 ] ||
+  [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/1 ] ||
     fail "U2 draining upgrade changed the active generation"
-  rmdir "$u2_root/var/lib/machine-utilities/lock/active"
+  rmdir "$u2_root/var/lib/roundhouse/lock/active"
   if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle2" \
       "$u2_manifest2_digest" "$u2_confirmation2_digest" >"$tmp/u2-upgraded"; then
     cat "$tmp/u2-upgraded" >&2
     fail "U2 resumable upgrade was rejected"
   fi
-  [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/2 ] &&
-    [ -d "$u2_generation2" ] && [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] ||
+  [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/2 ] &&
+    [ -d "$u2_generation2" ] && [ ! -e "$u2_root/var/lib/roundhouse/draining" ] ||
     fail "U2 resumable upgrade did not activate generation 2"
   [ "$(sed -n '1p' "$u2_generation2/ssh-keygen.sha256")" = "$(u2_sha256 /usr/bin/ssh-keygen)" ] ||
     fail "U2 authenticated upgrade did not repair the OpenSSH attestation"
@@ -3017,7 +3017,7 @@ EOF
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job" "$tmp/u2-revocation-reserve-result"
   [ ! -e "$u2_revocation_reserve" ] &&
     [ "$(awk -F '|' '$1=="operation"{print $2}' \
-      "$u2_root/var/lib/machine-utilities-lifecycle.lock/owner")" = revoke ] ||
+      "$u2_root/var/lib/roundhouse-lifecycle.lock/owner")" = revoke ] ||
     fail "U2 revocation did not release its same-filesystem reserve under the lifecycle lock"
   u2_pause_owner=$(awk -F '[|=]' 'NR==1&&$1=="pause"&&$2=="1"&&$3=="point"&&$5=="pid"{print $6}' \
     "$u2_pause_marker")
@@ -3026,8 +3026,8 @@ EOF
   rm -f "$u2_pause_marker" "$u2_pause_marker.continue" "$u2_pause_marker.kill"
   [ "$(stat -f %z "$u2_revocation_reserve" 2>/dev/null || stat -c %s "$u2_revocation_reserve")" -eq 4194304 ] &&
     [ $((($(stat -f %b "$u2_revocation_reserve" 2>/dev/null || stat -c %b "$u2_revocation_reserve")) * 512)) -ge 1048576 ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
-    [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/2 ] ||
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
+    [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/2 ] ||
     fail "U2 interrupted pre-intent revocation did not restore its emergency reserve and enrollment"
 
   u2_pause_marker="$tmp/u2-revocation-reserve-prepared-pause"
@@ -3040,7 +3040,7 @@ EOF
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job" \
     "$tmp/u2-revocation-reserve-prepared-result"
-  [ -f "$u2_root/var/lib/machine-utilities/.revocation.reserve.pending" ] &&
+  [ -f "$u2_root/var/lib/roundhouse/.revocation.reserve.pending" ] &&
     [ ! -e "$u2_revocation_reserve" ] ||
     fail "U2 reserve restoration did not stage before its atomic rename"
   u2_kill_paused "$u2_pause_marker" "$u2_pause_job"
@@ -3049,12 +3049,12 @@ EOF
       >"$tmp/u2-revocation-reserve-prepared-recovery" 2>/dev/null; then
     fail "U2 reserve-temp recovery unexpectedly passed its forced failpoint"
   fi
-  [ ! -e "$u2_root/var/lib/machine-utilities/.revocation.reserve.pending" ] &&
+  [ ! -e "$u2_root/var/lib/roundhouse/.revocation.reserve.pending" ] &&
     [ "$(stat -f %z "$u2_revocation_reserve" 2>/dev/null || stat -c %s "$u2_revocation_reserve")" -eq 4194304 ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] &&
-    [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/2 ] ||
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&
+    [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/2 ] ||
     fail "U2 killed reserve-temp restoration did not recover atomically"
 
   u2_revoke_crash_before=$(u2_enrollment_state_digest)
@@ -3092,9 +3092,9 @@ EOF
     >"$tmp/u2-revoke-killed" 2>&1 &
   u2_pause_job=$!
   u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job"
-  [ -f "$u2_root/var/lib/machine-utilities-lifecycle.lock/transaction" ] &&
-    [ -d "$u2_root/var/lib/machine-utilities/quarantine/revoked-2-$u2_manifest2_digest" ] &&
-    [ ! -e "$u2_root/etc/machine-utilities/active" ] ||
+  [ -f "$u2_root/var/lib/roundhouse-lifecycle.lock/transaction" ] &&
+    [ -d "$u2_root/var/lib/roundhouse/quarantine/revoked-2-$u2_manifest2_digest" ] &&
+    [ ! -e "$u2_root/etc/roundhouse/active" ] ||
     fail "U2 revoke mutation pause lacked durable quarantined transaction evidence"
   u2_kill_paused "$u2_pause_marker" "$u2_pause_job"
 
@@ -3114,10 +3114,10 @@ EOF
     fail "U2 recovered revoke unexpectedly passed its after-drain failpoint"
   fi
   [ "$(u2_enrollment_state_digest)" = "$u2_revoke_crash_before" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] &&
-    [ ! -e "$u2_root/var/lib/machine-utilities/quarantine/revoked-2-$u2_manifest2_digest" ] ||
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse/quarantine/revoked-2-$u2_manifest2_digest" ] ||
     fail "U2 repeated revoke SIGKILL recovery did not restore exact enrolled state"
 
   u2_revoke_before=$(u2_enrollment_state_digest)
@@ -3130,39 +3130,39 @@ EOF
     fi
     u2_revoke_after=$(u2_enrollment_state_digest)
     if [ "$u2_revoke_after" != "$u2_revoke_before" ] ||
-      [ -e "$u2_root/var/lib/machine-utilities/draining" ] ||
-      [ -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ]; then
+      [ -e "$u2_root/var/lib/roundhouse/draining" ] ||
+      [ -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ]; then
       diff -u "$tmp/u2-revoke-before-state" "$tmp/u2-enrollment-state" >&2 || true
       fail "U2 revoke rollback did not restore the enrollment at $u2_failpoint"
     fi
   done
 
-  mkdir "$u2_root/var/lib/machine-utilities/lock/active"
-  chmod 700 "$u2_root/var/lib/machine-utilities/lock/active"
+  mkdir "$u2_root/var/lib/roundhouse/lock/active"
+  chmod 700 "$u2_root/var/lib/roundhouse/lock/active"
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" revoke "$u2_bundle2" \
       "$u2_manifest2_digest" 2 >"$tmp/u2-revoke-draining" 2>/dev/null; then
     fail "U2 revocation ignored active work"
   fi
   grep -Fqx 'state|draining' "$tmp/u2-revoke-draining" ||
     fail "U2 revocation did not report draining"
-  [ -x "$u2_root/usr/libexec/machine-utilities/posix-broker" ] ||
+  [ -x "$u2_root/usr/libexec/roundhouse/posix-broker" ] ||
     fail "U2 draining revocation removed the active broker"
-  rmdir "$u2_root/var/lib/machine-utilities/lock/active"
+  rmdir "$u2_root/var/lib/roundhouse/lock/active"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" revoke "$u2_bundle2" \
     "$u2_manifest2_digest" 2 >"$tmp/u2-revoked"
   grep -Fqx 'state|revoked' "$tmp/u2-revoked" || fail "U2 revocation did not complete"
-  [ ! -e "$u2_root/usr/libexec/machine-utilities/posix-broker" ] &&
-    [ ! -e "$u2_root/etc/sudoers.d/machine-utilities-posix-broker" ] &&
-    [ ! -e "$u2_root/etc/machine-utilities/active" ] &&
-    [ ! -e "$u2_root/etc/machine-utilities/generations/2" ] &&
-    [ ! -e "$u2_root/etc/machine-utilities/trust/fleet-ca.pub" ] ||
+  [ ! -e "$u2_root/usr/libexec/roundhouse/posix-broker" ] &&
+    [ ! -e "$u2_root/etc/sudoers.d/roundhouse-posix-broker" ] &&
+    [ ! -e "$u2_root/etc/roundhouse/active" ] &&
+    [ ! -e "$u2_root/etc/roundhouse/generations/2" ] &&
+    [ ! -e "$u2_root/etc/roundhouse/trust/fleet-ca.pub" ] ||
     fail "U2 revocation left a privileged grant, generation, or trust root"
-  [ -d "$u2_root/var/lib/machine-utilities/quarantine/revoked-2-$u2_manifest2_digest" ] ||
+  [ -d "$u2_root/var/lib/roundhouse/quarantine/revoked-2-$u2_manifest2_digest" ] ||
     fail "U2 revocation did not retain its protected quarantine"
   [ ! -e "$u2_revocation_reserve" ] || fail "U2 completed revocation retained its emergency reserve"
-  [ -f "$u2_root/var/lib/machine-utilities/journal/request-00000000000000000000000000000001.result" ] ||
+  [ -f "$u2_root/var/lib/roundhouse/journal/request-00000000000000000000000000000001.result" ] ||
     fail "U2 revocation discarded protected result evidence"
-  if find "$u2_root/var/lib/machine-utilities" \
+  if find "$u2_root/var/lib/roundhouse" \
       \( -name '.claim-*' -o -name '.revocation.reserve.*' -o -name 'launch.gate' -o -name 'terminal.reserve' \) \
       -print | grep -q .; then
     fail "U2 final residue scan found claim staging, reserve staging, launch gates, or terminal reserves"
@@ -3217,7 +3217,7 @@ JSON
   "$cli" worker-config test-ssh agents "$tmp/u1-ssh-worker-config.json"
   u1_worker_digest=$(shasum -a 256 "$tmp/u1-ssh-worker-config.json" | awk '{print $1}')
   mkdir -p "$tmp/home/.codex/plugins/cache/characterization/roundhouse/1.0.0/scripts"
-  cat >"$tmp/home/.codex/plugins/cache/characterization/roundhouse/1.0.0/scripts/machine-utilities" <<'SH'
+  cat >"$tmp/home/.codex/plugins/cache/characterization/roundhouse/1.0.0/scripts/roundhouse" <<'SH'
 #!/usr/bin/env sh
 case ${1:-} in
   verify-executor) exit 0 ;;
@@ -3229,7 +3229,7 @@ case ${1:-} in
   *) exit 64 ;;
 esac
 SH
-  chmod +x "$tmp/home/.codex/plugins/cache/characterization/roundhouse/1.0.0/scripts/machine-utilities"
+  chmod +x "$tmp/home/.codex/plugins/cache/characterization/roundhouse/1.0.0/scripts/roundhouse"
   jq -n --arg digest "$u1_worker_digest" '{
     schema:"roundhouse.plan",schema_version:2,
     created_at:"2026-01-01T00:00:00Z",plan_id:"plan-0000000000000000",
@@ -3274,15 +3274,15 @@ test_u1_contracts() {
   "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/identity-b/node-key"
   "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/identity-future/node-key"
   "$ssh_keygen" -q -s "$tmp/fleet-ca" -I 'origin-a@fleet.example' -z 1 \
-    -n 'origin-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -n 'origin-a@fleet.example,roundhouse-posix,roundhouse-windows' -V '-5m:+2h' \
     -O source-address=192.0.2.0/24 -O no-agent-forwarding -O no-port-forwarding -O no-pty \
     -O no-user-rc -O no-X11-forwarding "$tmp/identity-a/node-key.pub"
   "$ssh_keygen" -q -s "$tmp/fleet-ca" -I 'target-b@fleet.example' -z 2 \
-    -n 'target-b@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -n 'target-b@fleet.example,roundhouse-posix,roundhouse-windows' -V '-5m:+2h' \
     -O source-address=192.0.2.0/24 -O no-agent-forwarding -O no-port-forwarding -O no-pty \
     -O no-user-rc -O no-X11-forwarding "$tmp/identity-b/node-key.pub"
   "$ssh_keygen" -q -s "$tmp/fleet-ca" -I 'future-c@fleet.example' -z 3 \
-    -n 'future-c@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '+1h:+2h' \
+    -n 'future-c@fleet.example,roundhouse-posix,roundhouse-windows' -V '+1h:+2h' \
     -O source-address=192.0.2.0/24 -O no-agent-forwarding -O no-port-forwarding -O no-pty \
     -O no-user-rc -O no-X11-forwarding "$tmp/identity-future/node-key.pub"
   awk 'NR == FNR { key=$0; next } END {
@@ -3314,7 +3314,7 @@ test_u1_contracts() {
         private_key_path:$key,certificate_path:$cert,known_hosts_path:$hosts,
         node_key_fingerprint:$node_fp,fleet_ca_fingerprint:$ca_fp,ca_generation:1,
         certificate_serial:$serial,certificate_valid_after:$after,certificate_valid_before:$before,
-        certificate_principals:["machine-utilities-posix","machine-utilities-windows",($node+"@fleet.example")],
+        certificate_principals:["roundhouse-posix","roundhouse-windows",($node+"@fleet.example")],
         certificate_source_addresses:["192.0.2.0/24"],enrollment_receipts:{}
       }' >"$fixture_output"
     chmod 600 "$fixture_output"
@@ -3333,12 +3333,12 @@ test_u1_contracts() {
     .machines["test-apt"].privilege_broker = {
       policy_proposal:$records,
       automation_transport:{mode:"posix-ssh",host:"linux.example.invalid",port:22,
-        request_user:"machine-utilities",pinned_host_key_fingerprint:$fingerprint,
+        request_user:"roundhouse",pinned_host_key_fingerprint:$fingerprint,
         management_networks:["192.0.2.0/24"]}
     } |
     .machines["test-windows"].privilege_broker = {
       automation_transport:{mode:"windows-sftp",host:"windows.example.invalid",port:22,
-        request_user:"MachineUtilitiesRequest",pinned_host_key_fingerprint:$fingerprint,
+        request_user:"RoundhouseRequest",pinned_host_key_fingerprint:$fingerprint,
         request_sid:"S-1-5-21-1-2-3-2001",
         management_networks:["192.0.2.0/24"]}
     } |
@@ -3501,7 +3501,7 @@ test_u1_contracts() {
         'clock-skew-bound-seconds|300' \
         'request-account-state|disabled' \
         'request-sid|S-1-5-21-1-2-3-2001' \
-        'request-principal|MachineUtilitiesRequest' \
+        'request-principal|RoundhouseRequest' \
         'system-task-ready|true' \
         'profile-task-ready|true' \
         'transport-ready|false' \
@@ -3538,7 +3538,7 @@ test_u1_contracts() {
       .data.action_context_ready=true | .data.adapter_mechanism_ready=true |
       .data.protected_artifacts_ready=true | .data.adapter_verifier_status="verified-fixture" |
       .data.platform_adapter="posix-sudo-v1" |
-      .data.platform_boundary="linux" | .data.request_principal="machine-utilities" |
+      .data.platform_boundary="linux" | .data.request_principal="roundhouse" |
       .data.execution_principals=["root"] | .data.session_requirement="no-console-session" |
       .data.broker_protocol.observed=1 | .data.broker_version="1.0.0" |
       .data.broker_digest={algorithm:"sha256",value:$broker} |
@@ -3555,7 +3555,7 @@ test_u1_contracts() {
       .data.node_identity={node_id:"target-b",fleet_domain:"fleet.example",node_key_fingerprint:$target_fp,
         fleet_ca_fingerprint:$ca_fp,ca_generation:1,certificate_serial:"2",
         certificate_valid_after:$after,certificate_valid_before:$before,
-        certificate_principals:["machine-utilities-posix","machine-utilities-windows","target-b@fleet.example"],
+        certificate_principals:["roundhouse-posix","roundhouse-windows","target-b@fleet.example"],
         certificate_source_addresses:["192.0.2.0/24"]} |
       .data.originating_node_identity=$worker[0].worker.originating_node_identity |
       .data.pinned_host_key_fingerprint=$host_fp | .data.enrollment_epoch=1 |
@@ -3659,18 +3659,18 @@ test_u1_contracts() {
 
   if [ -n "$pwsh_command" ]; then
     "$cli" worker-config test-windows inventory "$tmp/u1-windows-worker.json"
-    mkdir -p "$tmp/programdata/MachineUtilities/active"
-    printf '%s\n' '# user-writable broker fixture; never executable' >"$tmp/programdata/MachineUtilities/active/broker.ps1"
-    printf '%s\n' '1.0.0' >"$tmp/programdata/MachineUtilities/active/broker.version"
-    cp "$policy_file" "$tmp/programdata/MachineUtilities/active/policy.actions"
-    windows_policy_digest=$(shasum -a 256 "$tmp/programdata/MachineUtilities/active/policy.actions" | awk '{print $1}')
+    mkdir -p "$tmp/programdata/Roundhouse/active"
+    printf '%s\n' '# user-writable broker fixture; never executable' >"$tmp/programdata/Roundhouse/active/broker.ps1"
+    printf '%s\n' '1.0.0' >"$tmp/programdata/Roundhouse/active/broker.version"
+    cp "$policy_file" "$tmp/programdata/Roundhouse/active/policy.actions"
+    windows_policy_digest=$(shasum -a 256 "$tmp/programdata/Roundhouse/active/policy.actions" | awk '{print $1}')
     printf 'constraints|1|generation=1|policy-sha256=%s\n' "$windows_policy_digest" \
-      >"$tmp/programdata/MachineUtilities/active/policy.constraints"
-    printf '%s\n' 'protected-winget-context' >"$tmp/programdata/MachineUtilities/active/winget.context"
-    printf '%s\n' 'unattested-context' >"$tmp/programdata/MachineUtilities/active/context.canary"
-    windows_broker_digest=$(shasum -a 256 "$tmp/programdata/MachineUtilities/active/broker.ps1" | awk '{print $1}')
-    windows_winget_context_digest=$(shasum -a 256 "$tmp/programdata/MachineUtilities/active/winget.context" | awk '{print $1}')
-    windows_context_digest=$(shasum -a 256 "$tmp/programdata/MachineUtilities/active/context.canary" | awk '{print $1}')
+      >"$tmp/programdata/Roundhouse/active/policy.constraints"
+    printf '%s\n' 'protected-winget-context' >"$tmp/programdata/Roundhouse/active/winget.context"
+    printf '%s\n' 'unattested-context' >"$tmp/programdata/Roundhouse/active/context.canary"
+    windows_broker_digest=$(shasum -a 256 "$tmp/programdata/Roundhouse/active/broker.ps1" | awk '{print $1}')
+    windows_winget_context_digest=$(shasum -a 256 "$tmp/programdata/Roundhouse/active/winget.context" | awk '{print $1}')
+    windows_context_digest=$(shasum -a 256 "$tmp/programdata/Roundhouse/active/context.canary" | awk '{print $1}')
     jq --arg broker "$windows_broker_digest" --arg policy "$windows_policy_digest" \
       --arg winget_context "$windows_winget_context_digest" --arg context "$windows_context_digest" \
       '.enrollment_receipts["test-windows"]={
@@ -3732,10 +3732,10 @@ test_u4_contracts() {
   u4_observed_at=$(jq -r 'select(.kind == "snapshot") | .observed_at' "$tmp/u1-ready.jsonl")
   jq --argjson uid "$u4_uid" '
     if .kind == "privilege_broker" then
-      .data.protected_identity={host_id:"test-apt",uid:$uid,request_principal:"machine-utilities",
+      .data.protected_identity={host_id:"test-apt",uid:$uid,request_principal:"roundhouse",
         fleet_domain:"fleet.example",fleet_ca_fingerprint:.data.originating_node_identity.fleet_ca_fingerprint,
         ca_generation:1,pinned_host_key_fingerprint:.data.pinned_host_key_fingerprint,
-        endpoint_principals:["machine-utilities-posix","machine-utilities-windows"]} |
+        endpoint_principals:["roundhouse-posix","roundhouse-windows"]} |
       .data.observed_preconditions=[{action_id:"apt.update-metadata.v1",policy_token:"-",
         digest:{algorithm:"sha256",value:("f" * 64)},
         evidence:{kind:"fixture",digest:{algorithm:"sha256",value:("e" * 64)}}}]
@@ -3974,7 +3974,7 @@ test_u4_contracts() {
             'NR == 1 { print identity " cert-authority " $1 " " $2 }' "$tmp/fleet-ca.pub" \
             >"$tmp/u4-recovery-allowed-signers"
           /usr/bin/ssh-keygen -Y verify -f "$tmp/u4-recovery-allowed-signers" \
-            -I "$u4_recovery_node_id@$u4_recovery_domain" -n machine-utilities-request \
+            -I "$u4_recovery_node_id@$u4_recovery_domain" -n roundhouse-request \
             -s "$tmp/u4-recovery-query-signature" <"$tmp/u4-recovery-query-request" >/dev/null || return 70
           printf '%s\n' query >>"$u4_query_calls"
           u4_write_terminal_journal "$u4_broker_output"
@@ -4017,7 +4017,7 @@ test_u4_contracts() {
   cp "$tmp/identity-a/node-key" "$tmp/identity-a/node-key.pub" \
     "$tmp/identity-a/known-hosts" "$tmp/identity-a-renewed/"
   "$ssh_keygen" -q -s "$tmp/fleet-ca" -I 'origin-a@fleet.example' -z 101 \
-    -n 'origin-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -n 'origin-a@fleet.example,roundhouse-posix,roundhouse-windows' -V '-5m:+2h' \
     -O source-address=192.0.2.0/24 -O no-agent-forwarding -O no-port-forwarding -O no-pty \
     -O no-user-rc -O no-X11-forwarding "$tmp/identity-a-renewed/node-key.pub"
   chmod 600 "$tmp/identity-a-renewed/node-key" "$tmp/identity-a-renewed/node-key-cert.pub" \
@@ -4052,7 +4052,7 @@ test_u4_contracts() {
         'NR == 1 { print identity " cert-authority " $1 " " $2 }' "$tmp/fleet-ca.pub" \
         >"$tmp/u4-current-query-allowed-signers"
       /usr/bin/ssh-keygen -Y verify -f "$tmp/u4-current-query-allowed-signers" \
-        -I "$u4_query_expected_node@$u4_query_expected_domain" -n machine-utilities-request \
+        -I "$u4_query_expected_node@$u4_query_expected_domain" -n roundhouse-request \
         -s "$tmp/u4-current-query-signature" <"$tmp/u4-current-query-request" >/dev/null ||
         fail "U4 result query signature did not verify as the current overlay identity"
     }
@@ -4138,7 +4138,7 @@ EOF
   jq '
     if .kind == "privilege_broker" then
       .data.protected_identity={host_id:.host_id,sid:"S-1-5-21-1-2-3-1001",
-        request_principal:"MachineUtilitiesRequest"} |
+        request_principal:"RoundhouseRequest"} |
       .data.observed_winget_context_digest={algorithm:"sha256",value:("9" * 64)}
     else . end
   ' "$tmp/u4-ready.jsonl" >"$tmp/u4-schema3-windows-ready.jsonl"
@@ -4172,7 +4172,7 @@ EOF
           u4_schema3_principal=root
           u4_schema3_boundary=linux
           u4_schema3_transport=posix-ssh
-          u4_schema3_request_principal=machine-utilities
+          u4_schema3_request_principal=roundhouse
           u4_schema3_target=test-apt
           u4_schema3_snapshot=$tmp/u4-ready.jsonl
           ;;
@@ -4181,7 +4181,7 @@ EOF
           u4_schema3_principal=LocalSystem
           u4_schema3_boundary=windows
           u4_schema3_transport=windows-sftp
-          u4_schema3_request_principal=MachineUtilitiesRequest
+          u4_schema3_request_principal=RoundhouseRequest
           u4_schema3_target=test-windows
           u4_schema3_snapshot=$tmp/u4-schema3-windows-ready.jsonl
           ;;
@@ -4190,7 +4190,7 @@ EOF
           u4_schema3_principal=enrolled-s4u-user
           u4_schema3_boundary=windows
           u4_schema3_transport=windows-sftp
-          u4_schema3_request_principal=MachineUtilitiesRequest
+          u4_schema3_request_principal=RoundhouseRequest
           u4_schema3_target=test-windows
           u4_schema3_snapshot=$tmp/u4-schema3-windows-ready.jsonl
           ;;
@@ -4405,7 +4405,7 @@ EOF
     if .kind == "privilege_broker" then
       .status="present" | .data.lifecycle_status="ready" |
       .data.protected_identity={host_id:.host_id,sid:"S-1-5-21-1-2-3-1001",
-        request_principal:"MachineUtilitiesRequest"} |
+        request_principal:"RoundhouseRequest"} |
       .data.observed_action_contexts=[{
         action_id:"profile.apply-managed-bundle.v1",context_id:"windows-user-s4u-v1",
         constraint_kind:"profile-bundle-set-sha256",constraint_digest:$entry_map,
@@ -4531,7 +4531,7 @@ EOF
     .operations[1].privilege.context.manager_source_identity="not-applicable" |
     .operations[1].privilege.context.platform_context_digest={algorithm:"sha256",value:("9" * 64)} |
     .operations[1].privilege.request.transport="windows-sftp" |
-    .operations[1].privilege.request.principal="MachineUtilitiesRequest" |
+    .operations[1].privilege.request.principal="RoundhouseRequest" |
     .operations[1].privilege.request.target_uid="-" |
     .operations[1].privilege.request.request_sid="S-1-5-21-1-2-3-2001" |
     del(.plan_id,.plan_digest)
@@ -4701,9 +4701,9 @@ EOF
   u4_operation_statuses=$(jq -c -s '[.[] | select(.kind == "operation" and (.id | startswith("apply:"))) | .data.operation_status] | sort' "$tmp/u4-no-canary-result.jsonl")
   [ "$u4_operation_statuses" = '["failed","partial","skipped"]' ] ||
     fail "U4 did not emit indexed failed/skipped operation records"
-  grep -Fq 'Linux) fixed_broker=/usr/libexec/machine-utilities/posix-broker' "$plugin_cache/scripts/machine-utilities" &&
-    grep -Fq 'Darwin) fixed_broker=/usr/local/libexec/machine-utilities/posix-broker' "$plugin_cache/scripts/machine-utilities" &&
-    grep -Fq 'broker.query-result.v1' "$plugin_cache/scripts/machine-utilities" ||
+  grep -Fq 'Linux) fixed_broker=/usr/libexec/roundhouse/posix-broker' "$plugin_cache/scripts/roundhouse" &&
+    grep -Fq 'Darwin) fixed_broker=/usr/local/libexec/roundhouse/posix-broker' "$plugin_cache/scripts/roundhouse" &&
+    grep -Fq 'broker.query-result.v1' "$plugin_cache/scripts/roundhouse" ||
     fail "U4 did not retain a fixed broker-only submit/query path"
 }
 
@@ -4719,13 +4719,13 @@ test_u5_contracts() {
     .machines["test-apt"].ssh_alias="hostile-ordinary-ssh-alias" |
     .machines["test-apt"].privilege_broker.automation_transport={
       mode:"posix-ssh",host:"linux.example.invalid",port:22,
-      request_user:"machine-utilities",
+      request_user:"roundhouse",
       pinned_host_key_fingerprint:"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       management_networks:["192.0.2.0/24"]
     } |
     .machines["test-windows"].privilege_broker.automation_transport={
       mode:"windows-sftp",host:"windows.example.invalid",port:22,
-      request_user:"MachineUtilitiesRequest",
+      request_user:"RoundhouseRequest",
       request_sid:"S-1-5-21-1-2-3-2001",
       pinned_host_key_fingerprint:"SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
       management_networks:["192.0.2.0/24"]
@@ -4791,7 +4791,7 @@ test_u5_contracts() {
     fail "U5 revocation preview omitted drain and result recovery"
 
   "$plugin_cache/scripts/prepare-ssh-identity" preview fleet.example u5-node \
-    machine-utilities-posix,machine-utilities-windows 192.0.2.0/24 \
+    roundhouse-posix,roundhouse-windows 192.0.2.0/24 \
     >"$tmp/u5-identity-preview"
   grep -Fq 'operation|prepare' "$tmp/u5-identity-preview" &&
     grep -Fq 'private-key-storage|owner-only-nonsynced-local-state' "$tmp/u5-identity-preview" &&
@@ -4807,7 +4807,7 @@ test_u5_contracts() {
   for u5_command in privilege-status prepare-privilege-identity prepare-privilege-enrollment \
       verify-privilege-plan submit-privilege-plan lookup-privilege-result \
       preview-privilege-upgrade preview-privilege-revocation; do
-    grep -Fq "machine-utilities $u5_command" "$tmp/u5-usage.stderr" ||
+    grep -Fq "roundhouse $u5_command" "$tmp/u5-usage.stderr" ||
       fail "U5 CLI usage omitted $u5_command"
   done
   jq -n '{schema_version:2}' >"$tmp/u5-ordinary-plan.json"
@@ -4853,7 +4853,7 @@ if grep -Fqx 'mode|readiness' "$root/stdin"; then
   snapshot=$(awk -F '|' '$1 == "snapshot-id" { print $2; exit }' "$root/stdin")
   [ -n "$snapshot" ]
   printf '%s\n' \
-    "{\"schema\":\"roundhouse.inventory\",\"schema_version\":1,\"snapshot_id\":\"$snapshot\",\"host_id\":\"test-apt\",\"kind\":\"privilege_broker\",\"id\":\"readiness\",\"observed_at\":\"2026-08-03T00:00:00Z\",\"status\":\"present\",\"confidence\":\"high\",\"data\":{\"lifecycle_status\":\"ready\",\"transport\":\"posix-ssh\",\"transport_ready\":false,\"node_identity_ready\":false,\"originating_node_identity\":null,\"broker_ready\":true,\"action_context_ready\":true,\"adapter_mechanism_ready\":true,\"protected_identity\":{\"host_id\":\"test-apt\",\"uid\":4242,\"request_principal\":\"machine-utilities\",\"pinned_host_key_fingerprint\":\"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"fleet_ca_fingerprint\":\"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"ca_generation\":1},\"pinned_host_key_fingerprint\":\"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"request_principal\":\"machine-utilities\"},\"evidence\":[],\"errors\":[]}" >"$payload"
+    "{\"schema\":\"roundhouse.inventory\",\"schema_version\":1,\"snapshot_id\":\"$snapshot\",\"host_id\":\"test-apt\",\"kind\":\"privilege_broker\",\"id\":\"readiness\",\"observed_at\":\"2026-08-03T00:00:00Z\",\"status\":\"present\",\"confidence\":\"high\",\"data\":{\"lifecycle_status\":\"ready\",\"transport\":\"posix-ssh\",\"transport_ready\":false,\"node_identity_ready\":false,\"originating_node_identity\":null,\"broker_ready\":true,\"action_context_ready\":true,\"adapter_mechanism_ready\":true,\"protected_identity\":{\"host_id\":\"test-apt\",\"uid\":4242,\"request_principal\":\"roundhouse\",\"pinned_host_key_fingerprint\":\"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"fleet_ca_fingerprint\":\"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"ca_generation\":1},\"pinned_host_key_fingerprint\":\"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"request_principal\":\"roundhouse\"},\"evidence\":[],\"errors\":[]}" >"$payload"
 else
   printf '%s\n' 'remote-broker-result' >"$payload"
 fi
@@ -4866,7 +4866,7 @@ cat "$payload"
 SH
     chmod +x "$u5_ssh_root/bin/ssh"
     cat >"$tmp/u5-origin.json" <<'JSON'
-{"schema":"roundhouse.originating-node-identity","schema_version":1,"fleet_domain":"fleet.example","node_id":"origin-a","node_key_fingerprint":"SHA256:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","fleet_ca_fingerprint":"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","ca_generation":1,"certificate_serial":"1","certificate_valid_after":"2025-01-01T00:00:00Z","certificate_valid_before":"2099-01-01T00:00:00Z","certificate_principals":["machine-utilities-posix"],"certificate_source_addresses":["192.0.2.0/24"]}
+{"schema":"roundhouse.originating-node-identity","schema_version":1,"fleet_domain":"fleet.example","node_id":"origin-a","node_key_fingerprint":"SHA256:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","fleet_ca_fingerprint":"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","ca_generation":1,"certificate_serial":"1","certificate_valid_after":"2025-01-01T00:00:00Z","certificate_valid_before":"2099-01-01T00:00:00Z","certificate_principals":["roundhouse-posix"],"certificate_source_addresses":["192.0.2.0/24"]}
 JSON
     printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureCertificate fixture' >"$tmp/u5-cert.pub"
     jq -n --arg certificate "$tmp/u5-cert.pub" '{
@@ -4939,7 +4939,7 @@ SH
       plan_id:"plan-u5-remote",target:"test-apt",operations:[{
         type:"semantic-action",id:"apt.update-metadata.v1",privilege:{
           context:{required:"posix-root-v1",manager_source_identity:"not-applicable",canary_digest:{value:$digest}},
-          request:{id:"request-u5-remote",target_uid:"4242",created_at:"2026-08-03T00:00:00Z",expires_at:"2099-01-01T00:00:00Z",originating_node_id:"origin-a",principal:"machine-utilities",certificate_source_addresses:["192.0.2.0/24"]},
+          request:{id:"request-u5-remote",target_uid:"4242",created_at:"2026-08-03T00:00:00Z",expires_at:"2099-01-01T00:00:00Z",originating_node_id:"origin-a",principal:"roundhouse",certificate_source_addresses:["192.0.2.0/24"]},
           action:{policy_token:null},broker:{protocol_version:1,version:"1",digest:{value:$digest}},
           policy:{digest:{value:$digest},constraints_digest:{value:$digest}},
           enrollment:{fleet_domain:"fleet.example",fleet_ca_fingerprint:"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",ca_generation:1,certificate_valid_after:"2025-01-01T00:00:00Z",certificate_valid_before:"2099-01-01T00:00:00Z",epoch:1,pinned_host_key_fingerprint:"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
@@ -5032,7 +5032,7 @@ winget-context-version|1
 winget-context-sha256|$u5_readiness_e
 provider-lock-sha256|$u5_readiness_f
 request-sid|S-1-5-21-1-2-3-2001
-request-principal|MachineUtilitiesRequest
+request-principal|RoundhouseRequest
 system-task-ready|true
 profile-task-ready|true
 transport-ready|true
@@ -5058,7 +5058,7 @@ EOF
         $r.status == "present" and $r.data.lifecycle_status == "ready" and
         $r.data.transport == "windows-sftp" and $r.data.transport_ready == true and
         $r.data.protected_identity.sid == "S-1-5-21-1-2-3-2001" and
-        $r.data.request_principal == "MachineUtilitiesRequest" and
+        $r.data.request_principal == "RoundhouseRequest" and
         $r.data.broker_digest.value == ("a" * 64) and
         $r.data.observed_policy_digest.value == ("b" * 64) and
         $r.data.observed_constraints_digest.value == ("c" * 64) and
@@ -5097,7 +5097,7 @@ EOF
     set +e
     parse_windows_broker_readiness_result "$tmp/u5-windows-readiness-result" \
       "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
-      S-1-5-21-1-2-3-9999 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-wrong-sid.json"
+      S-1-5-21-1-2-3-9999 RoundhouseRequest 2000000000 "$tmp/u5-windows-wrong-sid.json"
     u5_wrong_sid_rc=$?
     set -e
     [ "$u5_wrong_sid_rc" -eq 70 ] || fail "U5 Windows readiness accepted a SID other than the configured pin"
@@ -5107,7 +5107,7 @@ EOF
       "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-stale-readiness"
     if parse_windows_broker_readiness_result "$tmp/u5-windows-stale-readiness" \
         "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
-        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-stale.json"; then
+        S-1-5-21-1-2-3-2001 RoundhouseRequest 2000000000 "$tmp/u5-windows-stale.json"; then
       fail "U5 Windows readiness accepted a locally expired result"
     fi
     awk '
@@ -5117,14 +5117,14 @@ EOF
     ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-unsorted-readiness"
     if parse_windows_broker_readiness_result "$tmp/u5-windows-unsorted-readiness" \
         "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
-        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-unsorted.json"; then
+        S-1-5-21-1-2-3-2001 RoundhouseRequest 2000000000 "$tmp/u5-windows-unsorted.json"; then
       fail "U5 Windows readiness accepted unsorted action rows"
     fi
     sed 's/^action|profile.inventory-managed-state.v1|/action|profile.apply-managed-bundle.v1|/' \
       "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-duplicate-readiness"
     if parse_windows_broker_readiness_result "$tmp/u5-windows-duplicate-readiness" \
         "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
-        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-duplicate.json"; then
+        S-1-5-21-1-2-3-2001 RoundhouseRequest 2000000000 "$tmp/u5-windows-duplicate.json"; then
       fail "U5 Windows readiness accepted duplicate action/token rows"
     fi
     awk -F '|' -v digest="$u5_readiness_b" 'BEGIN { OFS="|" }
@@ -5133,7 +5133,7 @@ EOF
     ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-profile-precondition-conflict"
     if parse_windows_broker_readiness_result "$tmp/u5-windows-profile-precondition-conflict" \
         "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
-        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 \
+        S-1-5-21-1-2-3-2001 RoundhouseRequest 2000000000 \
         "$tmp/u5-windows-profile-precondition-conflict.json"; then
       fail "U5 Windows readiness accepted conflicting profile action preconditions"
     fi
@@ -5143,7 +5143,7 @@ EOF
     ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-profile-precondition-mismatch"
     if parse_windows_broker_readiness_result "$tmp/u5-windows-profile-precondition-mismatch" \
         "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
-        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 \
+        S-1-5-21-1-2-3-2001 RoundhouseRequest 2000000000 \
         "$tmp/u5-windows-profile-precondition-mismatch.json"; then
       fail "U5 Windows readiness accepted inconsistent profile precondition evidence"
     fi
@@ -5154,7 +5154,7 @@ EOF
     ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-profile-apply-only-readiness"
     parse_windows_broker_readiness_result "$tmp/u5-windows-profile-apply-only-readiness" \
       "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-profile-apply-only-readiness")" \
-      S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 \
+      S-1-5-21-1-2-3-2001 RoundhouseRequest 2000000000 \
       "$tmp/u5-windows-profile-apply-only.json"
     jq -e '
       (.actions | map(.action_id)) == ["profile.apply-managed-bundle.v1", "winget.inventory-machine.v1"] and
@@ -5168,7 +5168,7 @@ EOF
     ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-profile-inventory-only-readiness"
     parse_windows_broker_readiness_result "$tmp/u5-windows-profile-inventory-only-readiness" \
       "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-profile-inventory-only-readiness")" \
-      S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 \
+      S-1-5-21-1-2-3-2001 RoundhouseRequest 2000000000 \
       "$tmp/u5-windows-profile-inventory-only.json"
     jq -e '
       (.actions | map(.action_id)) == ["profile.inventory-managed-state.v1", "winget.inventory-machine.v1"] and
@@ -5185,7 +5185,7 @@ EOF
     ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-machine-only-readiness"
     parse_windows_broker_readiness_result "$tmp/u5-windows-machine-only-readiness" \
       "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-machine-only-readiness")" \
-      S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-machine-only.json"
+      S-1-5-21-1-2-3-2001 RoundhouseRequest 2000000000 "$tmp/u5-windows-machine-only.json"
     windows_sftp_readiness_snapshot_from_result test-windows \
       "$tmp/u5-windows-readiness-request" "$tmp/u5-windows-machine-only.json" \
       "$tmp/u5-windows-machine-only.jsonl"
@@ -5226,7 +5226,7 @@ EOF
       "$tmp/u5-windows-machine-only-readiness" >"$tmp/u5-windows-machine-only-overclaim"
     if parse_windows_broker_readiness_result "$tmp/u5-windows-machine-only-overclaim" \
         "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-machine-only-overclaim")" \
-        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 \
+        S-1-5-21-1-2-3-2001 RoundhouseRequest 2000000000 \
         "$tmp/u5-windows-machine-only-overclaim.json"; then
       fail "U5 machine-only Windows readiness accepted a profile-task overclaim"
     fi
@@ -5237,7 +5237,7 @@ EOF
     set +e
     parse_windows_broker_readiness_result "$tmp/u5-windows-unavailable-readiness" \
       "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
-      S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-unavailable.json"
+      S-1-5-21-1-2-3-2001 RoundhouseRequest 2000000000 "$tmp/u5-windows-unavailable.json"
     u5_unavailable_rc=$?
     set -e
     [ "$u5_unavailable_rc" -eq 75 ] &&
@@ -5282,7 +5282,7 @@ EOF
           session_requirement:"no-console-session",platform_boundary:"windows",
           manager_source_identity:"not-applicable",canary_digest:{algorithm:"sha256",value:$canary}},
         request:{id:"request-7123456789abcdef0123456789abcdef",created_at:$created,expires_at:$expires,
-          transport:"windows-sftp",principal:"MachineUtilitiesRequest",
+          transport:"windows-sftp",principal:"RoundhouseRequest",
           originating_node_id:$origin[0].node_id,node_key_fingerprint:$origin[0].node_key_fingerprint,
           certificate_serial:$origin[0].certificate_serial},
         enrollment:{epoch:7,fleet_domain:$origin[0].fleet_domain,
@@ -5301,8 +5301,8 @@ EOF
     validate_privileged_plan_file "$tmp/u5-loggedoff-plan.json"
     mkdir "$tmp/u5-no-codex"
     printf '%s\n' '#!/bin/sh' ': >"${U5_CODEX_COLLECT_MARKER:?}"' 'exit 70' \
-      >"$tmp/u5-no-codex/machine-utilities"
-    chmod +x "$tmp/u5-no-codex/machine-utilities"
+      >"$tmp/u5-no-codex/roundhouse"
+    chmod +x "$tmp/u5-no-codex/roundhouse"
     export U5_CODEX_COLLECT_MARKER=$tmp/u5-codex-collect-invoked
     rm -f "$U5_CODEX_COLLECT_MARKER" "$tmp/u5-windows-operation-request" \
       "$tmp/u5-windows-operation-submit.batch"
@@ -5513,7 +5513,7 @@ EOF
 
   jq '.machines["test-host"].privilege_broker.automation_transport={
       mode:"posix-ssh",host:"mac.example.invalid",port:22,
-      request_user:"machine-utilities",
+      request_user:"roundhouse",
       pinned_host_key_fingerprint:"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       management_networks:["192.0.2.0/24"]}' "$tmp/config.json" >"$tmp/macos-config.json"
   (
@@ -5579,7 +5579,7 @@ EOF
           platform_boundary:"macos",session_requirement:"no-console-session",
           manager_source_identity:("5"*64),canary_digest:{algorithm:"sha256",value:("6"*64)}},
         request:{id:"request-0123456789abcdef0123456789abcdef",created_at:"2026-08-03T00:00:00Z",
-          expires_at:"2099-01-01T00:05:00Z",transport:"posix-ssh",principal:"machine-utilities",
+          expires_at:"2099-01-01T00:05:00Z",transport:"posix-ssh",principal:"roundhouse",
           originating_node_id:"origin-a",node_key_fingerprint:("SHA256:"+("A"*43)),certificate_serial:"1"},
         enrollment:{epoch:1,fleet_domain:"fleet.example",fleet_ca_fingerprint:("SHA256:"+("B"*43)),
           ca_generation:1,certificate_valid_after:"2026-01-01T00:00:00Z",
@@ -5664,19 +5664,19 @@ SH
   fi
 
   macos_bridge_root=$tmp/macos-app-bridge
-  macos_bridge_generation=$macos_bridge_root/etc/machine-utilities/generations/1
-  macos_bridge_broker=$macos_bridge_root/usr/local/libexec/machine-utilities/posix-broker
-  mkdir -p "$macos_bridge_generation" "$macos_bridge_root/etc/machine-utilities/generations" \
-    "$macos_bridge_root/var/lib/machine-utilities" "$macos_bridge_root/usr/local/libexec/machine-utilities" \
+  macos_bridge_generation=$macos_bridge_root/etc/roundhouse/generations/1
+  macos_bridge_broker=$macos_bridge_root/usr/local/libexec/roundhouse/posix-broker
+  mkdir -p "$macos_bridge_generation" "$macos_bridge_root/etc/roundhouse/generations" \
+    "$macos_bridge_root/var/lib/roundhouse" "$macos_bridge_root/usr/local/libexec/roundhouse" \
     "$macos_bridge_root/usr/sbin" "$macos_bridge_root/Applications/Visual Studio Code.app/Contents"
-  chmod 755 "$macos_bridge_root" "$macos_bridge_root/etc" "$macos_bridge_root/etc/machine-utilities" \
-    "$macos_bridge_root/etc/machine-utilities/generations" "$macos_bridge_generation" \
+  chmod 755 "$macos_bridge_root" "$macos_bridge_root/etc" "$macos_bridge_root/etc/roundhouse" \
+    "$macos_bridge_root/etc/roundhouse/generations" "$macos_bridge_generation" \
     "$macos_bridge_root/usr" "$macos_bridge_root/usr/local" "$macos_bridge_root/usr/local/libexec" \
-    "$macos_bridge_root/usr/local/libexec/machine-utilities" "$macos_bridge_root/usr/sbin" \
+    "$macos_bridge_root/usr/local/libexec/roundhouse" "$macos_bridge_root/usr/sbin" \
     "$macos_bridge_root/Applications" "$macos_bridge_root/Applications/Visual Studio Code.app" \
     "$macos_bridge_root/Applications/Visual Studio Code.app/Contents"
   chmod 700 "$macos_bridge_root/var" "$macos_bridge_root/var/lib" \
-    "$macos_bridge_root/var/lib/machine-utilities"
+    "$macos_bridge_root/var/lib/roundhouse"
   cat >"$macos_bridge_root/usr/sbin/chown" <<SH
 #!/bin/sh
 printf '%s\n' "\$@" >'$tmp/macos-app-chown.log'
@@ -5694,7 +5694,7 @@ SH
   printf 'constraints|1|generation=1|policy-sha256=%s\n%s\n' \
     "$macos_bridge_policy_digest" "$macos_bridge_app_record" \
     >"$macos_bridge_generation/policy.constraints"
-  printf 'identity|1|test-mac|%s|machine-utilities|fleet.example|SHA256:%s|1|SHA256:%s|machine-utilities-posix,machine-utilities-windows\n' \
+  printf 'identity|1|test-mac|%s|roundhouse|fleet.example|SHA256:%s|1|SHA256:%s|roundhouse-posix,roundhouse-windows\n' \
     "$(id -u)" "$(printf 'A%.0s' {1..43})" "$(printf 'B%.0s' {1..43})" \
     >"$macos_bridge_generation/host.identity"
   cat >"$macos_bridge_generation/macos.context" <<EOF
@@ -5708,9 +5708,9 @@ EOF
   printf '%s\n' "$(shasum -a 256 "$macos_bridge_broker" | awk '{print $1}')" \
     >"$macos_bridge_generation/broker.sha256"
   chmod 644 "$macos_bridge_generation"/*
-  ln -s generations/1 "$macos_bridge_root/etc/machine-utilities/active"
+  ln -s generations/1 "$macos_bridge_root/etc/roundhouse/active"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$macos_bridge_root" ROUNDHOUSE_U2_FIXTURE_PLATFORM=macos \
-    SUDO_UID="$(id -u)" SUDO_USER=machine-utilities \
+    SUDO_UID="$(id -u)" SUDO_USER=roundhouse \
     "$macos_bridge_broker" --homebrew-bridge-v1 prepare-app visual-studio-code ||
     fail "typed app-target bridge rejected the exact protected cask target"
   printf '%s\n' -R -P -h -- "$(id -u)" \
@@ -5723,7 +5723,7 @@ EOF
       'prepare-app visual-studio-code /Applications/Other.app'; do
     # shellcheck disable=SC2086
     if ROUNDHOUSE_U2_FIXTURE_ROOT="$macos_bridge_root" ROUNDHOUSE_U2_FIXTURE_PLATFORM=macos \
-        SUDO_UID="$(id -u)" SUDO_USER=machine-utilities \
+        SUDO_UID="$(id -u)" SUDO_USER=roundhouse \
         "$macos_bridge_broker" --homebrew-bridge-v1 $macos_bad_bridge_args >/dev/null 2>&1; then
       fail "typed app-target bridge accepted traversal, another token, or a caller path"
     fi
@@ -5732,7 +5732,7 @@ EOF
     "$macos_bridge_root/Applications/Visual Studio Code.real.app"
   ln -s 'Visual Studio Code.real.app' "$macos_bridge_root/Applications/Visual Studio Code.app"
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$macos_bridge_root" ROUNDHOUSE_U2_FIXTURE_PLATFORM=macos \
-      SUDO_UID="$(id -u)" SUDO_USER=machine-utilities \
+      SUDO_UID="$(id -u)" SUDO_USER=roundhouse \
       "$macos_bridge_broker" --homebrew-bridge-v1 prepare-app visual-studio-code >/dev/null 2>&1; then
     fail "typed app-target bridge accepted a symlink target"
   fi
@@ -5741,7 +5741,7 @@ EOF
     grep -Fq 'macos.apply-system-setting.v1)' "$macos_broker" ||
     fail "macOS actions do not derive their finite operation from protected token constraints"
 
-  grep -Fq '/usr/local/libexec/machine-utilities/posix-broker' "$macos_broker" ||
+  grep -Fq '/usr/local/libexec/roundhouse/posix-broker' "$macos_broker" ||
     fail "macOS broker is not fixed to the SIP-safe Darwin launcher path"
   macos_collector="$plugin_cache/scripts/collect-posix"
   sed -n '/^u2_macos_preconditions()/,/^}/p' "$macos_collector" >"$tmp/macos-collector-contract"
@@ -7926,7 +7926,7 @@ auth_plan_id=$(jq -r '.plan_id' "$tmp/auth-plan.json")
 "$cli" validate "$tmp/auth-applied.jsonl"
 cmp -s "$OP_SECRET_FILE" "$tmp/home/.test-auth" ||
   fail "encrypted auth install did not atomically install the retrieved bytes"
-if find "$tmp/home" -name '.machine-utilities-auth*' -print -quit | grep -q .; then
+if find "$tmp/home" -name '.roundhouse-auth*' -print -quit | grep -q .; then
   fail "encrypted auth install left a temporary or backup file"
 fi
 
@@ -7943,7 +7943,7 @@ if AUTH_CHECK_FAIL=1 "$cli" apply-plan "$tmp/auth-rollback-plan.json" \
 fi
 cmp -s "$tmp/auth-before-failed-verify" "$tmp/home/.test-auth" ||
   fail "failed auth verification did not restore the prior credential file"
-if find "$tmp/home" -name '.machine-utilities-auth*' -print -quit | grep -q .; then
+if find "$tmp/home" -name '.roundhouse-auth*' -print -quit | grep -q .; then
   fail "failed auth verification left a temporary or backup file"
 fi
 
@@ -7962,7 +7962,7 @@ cmp -s "$tmp/auth-before-signal" "$tmp/home/.test-auth" ||
   fail "signal interruption did not restore original credential bytes"
 [ "$(test_file_mode "$tmp/home/.test-auth")" = "$auth_mode_before_signal" ] ||
   fail "signal interruption did not restore original credential mode"
-if find "$tmp/home" -name '.machine-utilities-auth*' -print -quit | grep -q .; then
+if find "$tmp/home" -name '.roundhouse-auth*' -print -quit | grep -q .; then
   fail "signal-interrupted auth install left a temporary or backup file"
 fi
 

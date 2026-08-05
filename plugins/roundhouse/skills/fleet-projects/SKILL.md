@@ -6,7 +6,7 @@ description: Inventory and prepare configured Git repositories and Codex saved-p
 # Fleet Projects
 
 Set `SKILL_DIR` to the absolute directory containing this loaded `SKILL.md` and
-`CLI="$SKILL_DIR/../../scripts/machine-utilities"`; the shell working directory
+`CLI="$SKILL_DIR/../../scripts/roundhouse"`; the shell working directory
 is not the skill directory. Collect the `projects` section with `"$CLI"`.
 Evaluate configured path, expected source, sanitized origin, HEAD/tree IDs,
 branch, dirty count, host groups, and whether Codex exposes the

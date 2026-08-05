@@ -8,7 +8,7 @@ description: "Add a host to the fleet or remove one, end to end: config entry, S
 Own the lifecycle of one fleet member at a time. Every mutating step names
 its target and gets explicit consent; signing and privileged steps are
 individually consented ceremonies, never batched into silence. Resolve
-`SKILL_DIR` and `CLI="$SKILL_DIR/../../scripts/machine-utilities"` as usual.
+`SKILL_DIR` and `CLI="$SKILL_DIR/../../scripts/roundhouse"` as usual.
 
 ## Add a host
 

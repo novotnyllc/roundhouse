@@ -19,7 +19,7 @@ Enrollment and protected policy activation remain human operations. Editing a
 portable `policy_proposal` only prepares a candidate; it never changes the
 root- or Administrator-owned active generation.
 
-Use `machine-utilities prepare-privilege-identity` to wrap the fixed
+Use `roundhouse prepare-privilege-identity` to wrap the fixed
 `prepare-ssh-identity prepare` helper. It emits only the public certificate
 request and preparation record; it never performs remote access, elevation, or
 CA use. Both Codex and Claude must ignore `SSH_AUTH_SOCK` for unattended work

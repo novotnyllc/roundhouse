@@ -6,7 +6,7 @@ description: Audit and deliberately reconcile configured authentication artifact
 # Fleet Authentication
 
 Set `SKILL_DIR` to the absolute directory containing this loaded `SKILL.md` and
-`CLI="$SKILL_DIR/../../scripts/machine-utilities"`; the shell working directory
+`CLI="$SKILL_DIR/../../scripts/roundhouse"`; the shell working directory
 is not the skill directory. Run the `auth` inventory section first. Show
 configured artifact name, path, strategy, owner, mode, size, mtime, SHA-256,
 link status, and native verification result. Do not read credential contents

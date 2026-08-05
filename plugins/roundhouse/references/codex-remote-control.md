@@ -39,12 +39,12 @@ invoke the installed runtime skill `yardmaster:model-routing`; it is the
 only routing authority used here. Send exact
 `contractVersion: "yardmaster/model-routing/v1"`. Do not call a provider
 router, copy model constants, effort defaults, a transport matrix, scoring,
-state, or cache lookup into Machine Utilities. If the skill or that exact
+state, or cache lookup into Roundhouse. If the skill or that exact
 compatible contract is absent, stop the affected Codex dispatch with
 `model_routing_capability_unavailable`; retain local/SSH evidence but never
 create an unbound task or omit model/effort controls.
 
-Machine Utilities remains the sole sender for its native remote actions and
+Roundhouse remains the sole sender for its native remote actions and
 retains host/project matching, Windows-native execution, executor readiness,
 payload/chunk validation, and cleanup. The routing request is bounded,
 content-free policy metadata and includes:
@@ -182,18 +182,18 @@ manager output alone. Record a failed postcondition as
 `executor_or_plugin_failure` while preserving before-state and command output;
 keep executor version/hash mismatch separate as `executor_mismatch` only when
 an executor load or verification was attempted. This manager-native refresh
-does not require or preflight the Machine Utilities executor, because that
-would prevent it from repairing a stale Machine Utilities installation.
+does not require or preflight the Roundhouse executor, because that
+would prevent it from repairing a stale Roundhouse installation.
 
 For an explicit Codex hook approval, first verify the exact native Machine
 Utilities root against `executor.json`, then invoke only its helper:
 
 ```powershell
-pwsh -NoProfile -File "VERIFIED-MACHINE-UTILITIES-ROOT\scripts\apply-windows.ps1" `
+pwsh -NoProfile -File "VERIFIED-ROUNDHOUSE-ROOT\scripts\apply-windows.ps1" `
   -ApproveCodexPluginHooks PLUGIN@MARKETPLACE `
   -ExecutorRequirementPath executor.json
 # The verified PowerShell boundary runs exactly:
-node "VERIFIED-MACHINE-UTILITIES-ROOT\scripts\codex-plugin-hooks.mjs" approve PLUGIN@MARKETPLACE
+node "VERIFIED-ROUNDHOUSE-ROOT\scripts\codex-plugin-hooks.mjs" approve PLUGIN@MARKETPLACE
 ```
 
 The helper writes only current matching trust hashes and verifies them. Do not
@@ -217,27 +217,27 @@ provenance, conversions, ambiguous scope, and sealed-plan mutations.
    integrity-verified helper:
    `node "EXACT-ROUNDHOUSE-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" update roundhouse@novotnyllc`.
    It snapshots hook trust before running the exact native plugin add. The only
-   fallback is a separately approved Machine Utilities self-update from an
+   fallback is a separately approved Roundhouse self-update from an
    integrity-verified release that predates this helper: after the marketplace
    upgrade, run exactly
    `codex plugin add roundhouse@novotnyllc --json`, end that task, start a
-   fresh task, and verify the `0.2.0` executor and integrity manifest before any
+   fresh task, and verify the `0.3.0` executor and integrity manifest before any
    other mutation. Never use raw add as a fallback for another plugin or once
    the helper is available. For Claude local or
    SSH use `claude plugin marketplace update novotnyllc` followed by
    `claude plugin update roundhouse@novotnyllc --scope user`. End the
-   bootstrap task and start a fresh task before loading any Machine Utilities
+   bootstrap task and start a fresh task before loading any Roundhouse
    skill or script.
 4. Use Codex Desktop project discovery. Match the configured host and the
    environment-native project path. If no saved project matches, stop and tell
    the user to add that checkout as a project in Codex Desktop on the target.
    Record `available`, `missing`, or `unreachable` with the opaque host/project
    IDs, configured host ID, exact native path, and expected source in a
-   mode-0600 metadata file, then use `machine-utilities
+   mode-0600 metadata file, then use `roundhouse
    record-codex-readiness`; never inspect or edit Codex's internal databases.
 5. Create a visible task against that saved project using its local checkout,
    not a new worktree: inventory must observe the real host.
-6. Tell the task to use the verified installed Machine Utilities collector, native
+6. Tell the task to use the verified installed Roundhouse collector, native
    PowerShell on Windows, and no WSL. Request one inventory section per task.
    Pass the initiating config's raw SHA-256 as `-ControllerConfigDigest`; the
    worker records both that digest and its bounded worker-config digest. Pass
@@ -261,7 +261,7 @@ provenance, conversions, ambiguous scope, and sealed-plan mutations.
    task, and correlation IDs using `record-codex-readiness`.
 
 For an approved mutation, generate the bounded target config with
-`machine-utilities worker-config HOST DOMAIN OUTPUT`, seal the plan, and send
+`roundhouse worker-config HOST DOMAIN OUTPUT`, seal the plan, and send
 only that config, the plan, the controller-derived executor status, and their
 byte counts/SHA-256 values. The native task must verify its configured
 `expected_hostname` and `expected_user`, then run `apply-windows.ps1` with the
@@ -343,7 +343,7 @@ cannot replace the ordinary inventory and precondition evidence needed to seal
 or verify a mixed schema-4 plan. The ordinary `collect` path remains Codex
 Desktop and is never silently routed through SFTP.
 
-Build logged-off profile payloads with `machine-utilities profile-bundle`.
+Build logged-off profile payloads with `roundhouse profile-bundle`.
 The builder compiles each destination's handler, artifact, manager, and logical
 identity; sorts destinations ordinally; binds the expected live presence,
 digest, and manager; and emits an uncompressed length-prefixed manifest and
@@ -371,13 +371,13 @@ readiness. See `windows-sftp.md` for the fixed filenames and ceremony order;
 neither the fleet CA nor controller-signing private key enters automation.
 
 Protected POSIX automation uses the root-owned forced command
-`/usr/local/libexec/machine-utilities/posix-dispatcher`, which executes only
-`/usr/local/libexec/machine-utilities/current/scripts/machine-utilities
+`/usr/local/libexec/roundhouse/posix-dispatcher`, which executes only
+`/usr/local/libexec/roundhouse/current/scripts/roundhouse
 dispatch-posix-request`. The bounded stdin protocol contains either one sealed
 ordinary schema-2 plan plus worker configuration or one signed broker envelope;
 it has no caller-selected command, executable, shell option, or workspace path.
 Linux broker envelopes reach only
-`sudo -n /usr/libexec/machine-utilities/posix-broker`. macOS supports the
+`sudo -n /usr/libexec/roundhouse/posix-broker`. macOS supports the
 ordinary bounded lane and rejects protected root actions.
 
 Standalone schema-3 plans for each closed APT, WinGet, and profile action are

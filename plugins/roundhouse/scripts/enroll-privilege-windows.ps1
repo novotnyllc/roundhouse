@@ -16,9 +16,9 @@ $ErrorActionPreference = "Stop"
 $script:Ascii = [Text.Encoding]::ASCII
 $script:Utf8 = [Text.UTF8Encoding]::new($false, $true)
 $script:BrokerVersion = "1.0.0"
-$script:RequestAccountName = "MachineUtilitiesRequest"
-$script:SystemTaskName = "MachineUtilitiesBrokerV1"
-$script:ProfileTaskName = "MachineUtilitiesProfileV1"
+$script:RequestAccountName = "RoundhouseRequest"
+$script:SystemTaskName = "RoundhouseBrokerV1"
+$script:ProfileTaskName = "RoundhouseProfileV1"
 $script:TaskSddl = "O:SYG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
 $script:TaskCreateOrUpdate = 0x6
 $script:TaskDontAddPrincipalAce = 0x10
@@ -292,7 +292,7 @@ function Get-ProfileRootIdentityRecord([string]$Sid, [string]$FinalPath, [uint32
 }
 
 function Initialize-EnrollmentProfileRootType {
-    if ("MachineUtilitiesEnrollmentProfileRoot" -as [type]) { return }
+    if ("RoundhouseEnrollmentProfileRoot" -as [type]) { return }
     Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -300,7 +300,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-public sealed class MachineUtilitiesEnrollmentProfileRoot
+public sealed class RoundhouseEnrollmentProfileRoot
 {
     public string FinalPath { get; private set; }
     public uint VolumeSerial { get; private set; }
@@ -323,7 +323,7 @@ public sealed class MachineUtilitiesEnrollmentProfileRoot
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, char[] path, uint length, uint flags);
 
-    public static MachineUtilitiesEnrollmentProfileRoot Observe(string path)
+    public static RoundhouseEnrollmentProfileRoot Observe(string path)
     {
         SafeFileHandle handle = CreateFileW(path, 0x80, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
         if (handle.IsInvalid) { int error = Marshal.GetLastWin32Error(); handle.Dispose();
@@ -342,7 +342,7 @@ public sealed class MachineUtilitiesEnrollmentProfileRoot
             string finalPath = new string(buffer, 0, (int)length);
             if (finalPath.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) finalPath = @"\\" + finalPath.Substring(8);
             else if (finalPath.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) finalPath = finalPath.Substring(4);
-            return new MachineUtilitiesEnrollmentProfileRoot { FinalPath = finalPath,
+            return new RoundhouseEnrollmentProfileRoot { FinalPath = finalPath,
                 VolumeSerial = info.VolumeSerialNumber,
                 FileId = ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow };
         }
@@ -385,7 +385,7 @@ function Get-TargetProfileRootEvidence([string]$TargetSid) {
             throw "profile_root_unavailable"
         }
         Initialize-EnrollmentProfileRootType
-        $Observed = [MachineUtilitiesEnrollmentProfileRoot]::Observe($ProfilePath)
+        $Observed = [RoundhouseEnrollmentProfileRoot]::Observe($ProfilePath)
         if (-not (Test-WindowsAbsolutePath $Observed.FinalPath) -or
             -not $Observed.FinalPath.Equals($ProfilePath, [StringComparison]::OrdinalIgnoreCase)) {
             throw "profile_root_identity_drift"
@@ -469,7 +469,7 @@ function Read-ProfileTaskRegistrationReceipt([byte[]]$Bytes, [object]$Expected) 
 function Get-VerifiedProfileTaskRegistration([string]$TargetSid, [string]$ProgramData, [string]$PowerShellPath,
     [switch]$Disabled) {
     $RootEvidence = Get-TargetProfileRootEvidence $TargetSid
-    $ReceiptPath = Join-Path $RootEvidence.FinalPath "AppData\Local\MachineUtilities\profile-task-registration.json"
+    $ReceiptPath = Join-Path $RootEvidence.FinalPath "AppData\Local\Roundhouse\profile-task-registration.json"
     if (-not [IO.File]::Exists($ReceiptPath)) { throw "profile_task_registration_required" }
     try { Assert-ProfileReceiptPath $RootEvidence.FinalPath $ReceiptPath }
     catch [System.UnauthorizedAccessException] { throw "unsupported_context" }
@@ -561,7 +561,7 @@ function Assert-StagedProfileArtifacts([string]$GenerationRoot, [object[]]$Recor
 function Get-GenerationDigest([object]$Manifest, [string]$OpenSshIdentitySha256) {
     if (-not (Test-Digest $OpenSshIdentitySha256)) { throw "invalid_generation_digest_input" }
     return Get-Sha256Text ((@(
-        "machine-utilities-generation|1", "epoch|$($Manifest.Epoch)",
+        "roundhouse-generation|1", "epoch|$($Manifest.Epoch)",
         "policy-sha256|$($Manifest.Fields.'policy-sha256')",
         "constraints-sha256|$($Manifest.Fields.'constraints-sha256')",
         "winget-context-sha256|$($Manifest.Fields.'winget-context-sha256')",
@@ -898,7 +898,7 @@ function Assert-PhysicalProjectionFile([string]$Path, [string]$Boundary, [long]$
         $Item.Length -lt 0 -or $Item.Length -gt $MaximumBytes) { throw "projection_file_type_drift" }
     if ($IsWindows) {
         Initialize-EnrollmentProfileRootType
-        [MachineUtilitiesEnrollmentProfileRoot]::AssertSingleLinkRegularFile($Path, $Path)
+        [RoundhouseEnrollmentProfileRoot]::AssertSingleLinkRegularFile($Path, $Path)
         if (-not [string]::IsNullOrEmpty($ExpectedSddl)) { Assert-PathSddl $Path $ExpectedSddl }
     }
 }
@@ -1278,7 +1278,7 @@ function Get-NativeCanaryAccessContract([string]$RequestSid) {
     $Acl = Get-AclBlueprint $RequestSid
     return [pscustomobject]@{
         RequestSid = $RequestSid
-        ChrootPathSha256 = Get-Sha256Utf8Text "C:\PROGRAMDATA\MACHINEUTILITIES\CHROOT"
+        ChrootPathSha256 = Get-Sha256Utf8Text "C:\PROGRAMDATA\ROUNDHOUSE\CHROOT"
         ChrootDirectorySddlSha256 = Get-Sha256Utf8Text $Acl.ChrootDirectory
         SlotDirectorySddlSha256 = Get-Sha256Utf8Text $Acl.SlotDirectory
         SlotFileSddlSha256 = Get-Sha256Utf8Text $Acl.SlotFile
@@ -1432,7 +1432,7 @@ function Read-WinGetProvisionContext([byte[]]$Bytes) {
     $Uri = $null
     try { $Uri = [Uri]::new($SourceArgument, [UriKind]::Absolute) }
     catch { throw "invalid_winget_provider_context" }
-    if ($Fields.'state-identifier' -cnotmatch '^machine-utilities-e[1-9][0-9]{0,9}-[0-9a-f]{64}$' -or
+    if ($Fields.'state-identifier' -cnotmatch '^roundhouse-e[1-9][0-9]{0,9}-[0-9a-f]{64}$' -or
         -not (Test-Atom $Fields.'source-id') -or -not (Test-Atom $Fields.'source-name') -or
         $Fields.'source-type' -cnotin @("Microsoft.Rest", "Microsoft.PreIndexed.Package") -or
         $SourceArgument -notmatch '^[\x21-\x7e]{1,2048}$' -or
@@ -1614,7 +1614,7 @@ function Remove-UnclaimedWinGetProvisionMarker([string]$Root, [object]$Paths, [b
 
 function Read-ActivePointer([byte[]]$Bytes) {
     $Fields = Read-FixedFields (ConvertFrom-CanonicalAsciiBytes $Bytes 160 "active_generation") `
-        @("epoch", "generation-sha256") "machine-utilities-active-generation|1" "end-generation|" "active_generation"
+        @("epoch", "generation-sha256") "roundhouse-active-generation|1" "end-generation|" "active_generation"
     if ($Fields.epoch -notmatch '^[1-9][0-9]{0,9}$' -or -not (Test-Digest $Fields.'generation-sha256')) {
         throw "invalid_active_generation"
     }
@@ -1651,8 +1651,8 @@ function Set-PathSddl([string]$Path, [string]$Sddl) {
 }
 
 function Get-SystemTaskXml([string]$ProgramData, [string]$PowerShellPath) {
-    $BrokerPath = $ProgramData.TrimEnd('\') + "\MachineUtilities\entry\privilege-broker-windows.ps1"
-    $EntryRoot = $ProgramData.TrimEnd('\') + "\MachineUtilities\entry"
+    $BrokerPath = $ProgramData.TrimEnd('\') + "\Roundhouse\entry\privilege-broker-windows.ps1"
+    $EntryRoot = $ProgramData.TrimEnd('\') + "\Roundhouse\entry"
     $EscapedCommand = [Security.SecurityElement]::Escape($PowerShellPath)
     $EscapedBroker = [Security.SecurityElement]::Escape(
         ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy AllSigned -File "' + $BrokerPath +
@@ -1660,7 +1660,7 @@ function Get-SystemTaskXml([string]$ProgramData, [string]$PowerShellPath) {
     $EscapedWorking = [Security.SecurityElement]::Escape($EntryRoot)
     return '<?xml version="1.0" encoding="UTF-16"?>' +
         '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' +
-        '<RegistrationInfo><URI>\MachineUtilitiesBrokerV1</URI></RegistrationInfo>' +
+        '<RegistrationInfo><URI>\RoundhouseBrokerV1</URI></RegistrationInfo>' +
         '<Triggers><TimeTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary>' +
         '<Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>' +
         '<Enabled>true</Enabled></TimeTrigger></Triggers>' +
@@ -1677,8 +1677,8 @@ function Get-SystemTaskXml([string]$ProgramData, [string]$PowerShellPath) {
 }
 
 function Get-ProfileTaskXml([string]$TargetSid, [string]$ProgramData, [string]$PowerShellPath) {
-    $WorkerPath = $ProgramData.TrimEnd('\') + "\MachineUtilities\entry\profile-worker-windows.ps1"
-    $EntryRoot = $ProgramData.TrimEnd('\') + "\MachineUtilities\entry"
+    $WorkerPath = $ProgramData.TrimEnd('\') + "\Roundhouse\entry\profile-worker-windows.ps1"
+    $EntryRoot = $ProgramData.TrimEnd('\') + "\Roundhouse\entry"
     $EscapedCommand = [Security.SecurityElement]::Escape($PowerShellPath)
     $EscapedWorker = [Security.SecurityElement]::Escape(
         ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy AllSigned -File "' + $WorkerPath +
@@ -1686,7 +1686,7 @@ function Get-ProfileTaskXml([string]$TargetSid, [string]$ProgramData, [string]$P
     $EscapedWorking = [Security.SecurityElement]::Escape($EntryRoot)
     return '<?xml version="1.0" encoding="UTF-16"?>' +
         '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' +
-        '<RegistrationInfo><URI>\MachineUtilitiesProfileV1</URI></RegistrationInfo>' +
+        '<RegistrationInfo><URI>\RoundhouseProfileV1</URI></RegistrationInfo>' +
         '<Triggers />' +
         '<Principals><Principal id="Author"><UserId>' + [Security.SecurityElement]::Escape($TargetSid) +
         '</UserId><LogonType>S4U</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>' +
@@ -1710,7 +1710,7 @@ function Assert-TaskContract([string]$XmlText, [string]$Kind, [string]$ExpectedS
     $ExpectedLogon = if ($Kind -ceq "system") { "ServiceAccount" } else { "S4U" }
     $ExpectedRunLevel = if ($Kind -ceq "system") { "HighestAvailable" } else { "LeastPrivilege" }
     $ExpectedArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy AllSigned -File "' +
-        ($ProgramData.TrimEnd('\') + "\MachineUtilities\entry\$ScriptName") + '" -Context ' + $Context
+        ($ProgramData.TrimEnd('\') + "\Roundhouse\entry\$ScriptName") + '" -Context ' + $Context
     $Checks = [ordered]@{
         "/t:Task/t:Principals/t:Principal/t:UserId" = $ExpectedSid
         "/t:Task/t:Principals/t:Principal/t:LogonType" = $ExpectedLogon
@@ -1721,7 +1721,7 @@ function Assert-TaskContract([string]$XmlText, [string]$Kind, [string]$ExpectedS
         "/t:Task/t:Settings/t:ExecutionTimeLimit" = "PT0S"
         "/t:Task/t:Actions/t:Exec/t:Command" = $PowerShellPath
         "/t:Task/t:Actions/t:Exec/t:Arguments" = $ExpectedArguments
-        "/t:Task/t:Actions/t:Exec/t:WorkingDirectory" = ($ProgramData.TrimEnd('\') + "\MachineUtilities\entry")
+        "/t:Task/t:Actions/t:Exec/t:WorkingDirectory" = ($ProgramData.TrimEnd('\') + "\Roundhouse\entry")
     }
     foreach ($Path in $Checks.Keys) {
         $Nodes = @($Document.SelectNodes($Path, $Namespace))
@@ -3024,13 +3024,13 @@ function Initialize-ProtectedLifecycleFile([string]$Path, [string]$Sddl) {
 }
 
 function Initialize-LsaType {
-    if (-not ("MachineUtilitiesLsa" -as [type])) {
+    if (-not ("RoundhouseLsa" -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
-public static class MachineUtilitiesLsa {
+public static class RoundhouseLsa {
   [StructLayout(LayoutKind.Sequential)] struct LSA_OBJECT_ATTRIBUTES {
     public int Length; public IntPtr RootDirectory; public IntPtr ObjectName;
     public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService;
@@ -3124,19 +3124,19 @@ function Get-SidBytes([string]$Sid) {
 function Add-LsaAccountRights([string]$Sid, [string[]]$Rights) {
     Initialize-LsaType
     $SidBytes = Get-SidBytes $Sid
-    [MachineUtilitiesLsa]::AddAccountRights($SidBytes, $Rights)
+    [RoundhouseLsa]::AddAccountRights($SidBytes, $Rights)
 }
 
 function Get-LsaAccountRights([string]$Sid) {
     Initialize-LsaType
-    return [string[]]@([MachineUtilitiesLsa]::GetAccountRights((Get-SidBytes $Sid)) | Sort-Object)
+    return [string[]]@([RoundhouseLsa]::GetAccountRights((Get-SidBytes $Sid)) | Sort-Object)
 }
 
 function Set-LsaAccountRightsExact([string]$Sid, [string[]]$Rights) {
     Initialize-LsaType
     $SidBytes = Get-SidBytes $Sid
-    [MachineUtilitiesLsa]::RemoveAccountRights($SidBytes, [string[]]@(), $true)
-    if ($Rights.Count -gt 0) { [MachineUtilitiesLsa]::AddAccountRights($SidBytes, [string[]]@($Rights)) }
+    [RoundhouseLsa]::RemoveAccountRights($SidBytes, [string[]]@(), $true)
+    if ($Rights.Count -gt 0) { [RoundhouseLsa]::AddAccountRights($SidBytes, [string[]]@($Rights)) }
     if ((@(Get-LsaAccountRights $Sid) -join "`n") -cne (@($Rights | Sort-Object) -join "`n")) {
         throw "account_rights_restore_failed"
     }
@@ -3144,7 +3144,7 @@ function Set-LsaAccountRightsExact([string]$Sid, [string[]]$Rights) {
 
 function Remove-LsaAccountRights([string]$Sid, [string[]]$Rights) {
     Initialize-LsaType
-    [MachineUtilitiesLsa]::RemoveAccountRights((Get-SidBytes $Sid), [string[]]@($Rights), $false)
+    [RoundhouseLsa]::RemoveAccountRights((Get-SidBytes $Sid), [string[]]@($Rights), $false)
 }
 
 function Add-BatchLogonRight([string]$Sid) {
@@ -3354,11 +3354,11 @@ function Read-EnrollmentMutations([byte[]]$Bytes) {
 }
 
 function Invoke-SelfTest {
-    $Root = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-windows-enroll-" + [Guid]::NewGuid().ToString("N"))
+    $Root = Join-Path ([IO.Path]::GetTempPath()) ("roundhouse-windows-enroll-" + [Guid]::NewGuid().ToString("N"))
     $script:SelfTestFixture = $true
     try {
         Initialize-EnrollmentProfileRootType
-        $StageRoot = "C:\ProgramData\MachineUtilities-Bootstrap\staged"
+        $StageRoot = "C:\ProgramData\Roundhouse-Bootstrap\staged"
         $Digest = "a" * 64
         $ManifestBytes = ConvertTo-CanonicalAsciiBytes @(
             "windows-enrollment-manifest|1", "epoch|7", "broker-version|1.0.0", "catalog-version|1",
@@ -3371,9 +3371,9 @@ function Invoke-SelfTest {
             "candidate-sha256|$Digest", "protected-copy-sha256|$Digest",
             "protected-copy-path|$StageRoot\scripts\enroll-privilege-windows.ps1",
             "manifest-sha256|$(Get-Sha256Bytes $ManifestBytes)", "protected-root|$StageRoot",
-            "native-canary-runner-path|C:\Windows\System32\MachineUtilitiesCanary\native-canary-runner-windows.ps1",
+            "native-canary-runner-path|C:\Windows\System32\RoundhouseCanary\native-canary-runner-windows.ps1",
             "native-canary-runner-sha256|$('d' * 64)", "native-canary-publisher-thumbprint|$('D' * 40)",
-            "native-canary-receipt-root|C:\ProgramData\MachineUtilitiesCanary\receipts", "end-bootstrap|")
+            "native-canary-receipt-root|C:\ProgramData\RoundhouseCanary\receipts", "end-bootstrap|")
         $Receipt = Read-BootstrapReceipt $ReceiptBytes $StageRoot
         $Manifest = Read-EnrollmentManifest $ManifestBytes
         if ($Receipt.'manifest-sha256' -cne (Get-Sha256Bytes $ManifestBytes)) { throw "bootstrap binding self-test failed" }
@@ -3513,23 +3513,23 @@ function Invoke-SelfTest {
         Assert-QuotaQueryText @'
 File system quotas are tracked and enforced on this volume.
 
-User Name: .\MachineUtilitiesRequest
+User Name: .\RoundhouseRequest
 User SID: S-1-5-21-1-2-3-1200
 Quota Threshold: 67,108,864 bytes
 Quota Limit: 68,157,440 bytes
-'@ "MachineUtilitiesRequest" "S-1-5-21-1-2-3-1200"
+'@ "RoundhouseRequest" "S-1-5-21-1-2-3-1200"
         $LooseQuotaRejected = $false
-        try { Assert-QuotaQueryText "Quota configured" "MachineUtilitiesRequest" "S-1-5-21-1-2-3-1200" }
+        try { Assert-QuotaQueryText "Quota configured" "RoundhouseRequest" "S-1-5-21-1-2-3-1200" }
         catch { $LooseQuotaRejected = $true }
         if (-not $LooseQuotaRejected) { throw "quota fail-closed self-test failed" }
         $QuotaSnapshot = Read-QuotaSnapshotText @'
 File system quotas are tracked but not enforced on this volume.
 
-User Name: .\MachineUtilitiesRequest
+User Name: .\RoundhouseRequest
 User SID: S-1-5-21-1-2-3-1200
 Quota Threshold: 12,345 bytes
 Quota Limit: 67,890 bytes
-'@ "C:\" "MachineUtilitiesRequest" "S-1-5-21-1-2-3-1200"
+'@ "C:\" "RoundhouseRequest" "S-1-5-21-1-2-3-1200"
         if ($QuotaSnapshot.State -cne "tracking" -or $QuotaSnapshot.Threshold -cne "12345" -or
             $QuotaSnapshot.Limit -cne "67890") { throw "quota snapshot self-test failed" }
         $MutationPath = Join-Path $Root "enrollment.mutations"
@@ -3542,7 +3542,7 @@ Quota Limit: 67,890 bytes
         }
         $TaskXml = Get-SystemTaskXml "C:\ProgramData" "C:\Program Files\PowerShell\7\pwsh.exe"
         Assert-TaskContract $TaskXml "system" "S-1-5-18" "C:\ProgramData" "C:\Program Files\PowerShell\7\pwsh.exe"
-        if ($TaskXml -notmatch '<URI>\\MachineUtilitiesBrokerV1</URI>' -or
+        if ($TaskXml -notmatch '<URI>\\RoundhouseBrokerV1</URI>' -or
             $TaskXml -match 'generations\\|active\.generation' -or
             ($script:TaskCreateOrUpdate -bor $script:TaskDontAddPrincipalAce) -ne 0x16 -or
             $script:TaskLogonServiceAccount -ne 0x5) { throw "fixed system task self-test failed" }
@@ -3840,7 +3840,7 @@ Quota Limit: 67,890 bytes
 
         $FixtureSourceArgument = "https://example.invalid/catalog"
         $FixtureSourceArgumentDigest = Get-Sha256Utf8Text $FixtureSourceArgument
-        $FixtureStateIdentifier = "machine-utilities-e7-" + ("d" * 64)
+        $FixtureStateIdentifier = "roundhouse-e7-" + ("d" * 64)
         $FixtureProvisionContext = Read-WinGetProvisionContext (ConvertTo-CanonicalAsciiBytes @(
             "winget-provider-context|1", "state-identifier|$FixtureStateIdentifier",
             "source-id|catalog-id", "source-name|catalog-name", "source-type|Microsoft.PreIndexed.Package",
@@ -3924,11 +3924,11 @@ Quota Limit: 67,890 bytes
         catch { $CompletedReplayRejected = $_.Exception.Message -eq "winget_provider_provision_recovery_required" }
         if (-not $CompletedReplayRejected) { throw "WinGet completed provision replay self-test failed" }
         # Fixture fault recovery restores the byte-for-byte prior pointer.
-        $Pointer = ConvertTo-CanonicalAsciiBytes @("machine-utilities-active-generation|1", "epoch|6",
+        $Pointer = ConvertTo-CanonicalAsciiBytes @("roundhouse-active-generation|1", "epoch|6",
             "generation-sha256|$('d' * 64)", "end-generation|")
         $PointerPath = Join-Path $Root "active.generation"; [IO.File]::WriteAllBytes($PointerPath, $Pointer)
         $Backup = [IO.File]::ReadAllBytes($PointerPath)
-        Write-AtomicAscii $PointerPath @("machine-utilities-active-generation|1", "epoch|7",
+        Write-AtomicAscii $PointerPath @("roundhouse-active-generation|1", "epoch|7",
             "generation-sha256|$GenerationDigest", "end-generation|")
         Write-AtomicBytes $PointerPath $Backup
         if ((Get-Sha256Bytes ([IO.File]::ReadAllBytes($PointerPath))) -cne (Get-Sha256Bytes $Pointer)) {
@@ -4039,9 +4039,9 @@ if ($SelfTest) { Invoke-SelfTest; return }
 
 $ProgramData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
 if ([string]::IsNullOrWhiteSpace($ProgramData)) { throw "unsupported_context" }
-$Root = Join-Path $ProgramData "MachineUtilities"
-$PublicRoot = Join-Path $ProgramData "MachineUtilities-Public"
-$BootstrapRoot = Join-Path $ProgramData "MachineUtilities-Bootstrap"
+$Root = Join-Path $ProgramData "Roundhouse"
+$PublicRoot = Join-Path $ProgramData "Roundhouse-Public"
+$BootstrapRoot = Join-Path $ProgramData "Roundhouse-Bootstrap"
 $StageRoot = Join-Path $BootstrapRoot "staged"
 $ManifestPath = Join-Path $StageRoot "enrollment.manifest"
 $ReleaseFilesPath = Join-Path $StageRoot "release.files"
@@ -4054,7 +4054,7 @@ if ($Status) {
 
 $PhysicalProjectionPaths = Get-ChrootProjectionPaths $Root $PublicRoot
 if (-not [IO.Path]::GetFullPath($PhysicalProjectionPaths.Chroot).Equals(
-        "C:\ProgramData\MachineUtilities\chroot", [StringComparison]::OrdinalIgnoreCase)) {
+        "C:\ProgramData\Roundhouse\chroot", [StringComparison]::OrdinalIgnoreCase)) {
     throw "unsupported_chroot_path"
 }
 
@@ -4527,7 +4527,7 @@ try {
     if ($null -eq $Account -and [IO.File]::Exists($MutationPath)) { throw "request_account_missing" }
     if ($null -eq $Account) {
         $Account = New-LocalUser -Name $script:RequestAccountName -NoPassword -AccountNeverExpires -Disabled `
-            -UserMayNotChangePassword -Description "Disabled MachineUtilities SFTP request principal"
+            -UserMayNotChangePassword -Description "Disabled Roundhouse SFTP request principal"
         $AccountCreated = $true
     }
     Disable-LocalUser -Name $script:RequestAccountName
@@ -4692,7 +4692,7 @@ try {
     }
 
     $PointerDigest = Get-GenerationDigest $Manifest $OpenSshIdentityDigest
-    Write-AtomicAscii $PointerPath @("machine-utilities-active-generation|1", "epoch|$($Manifest.Epoch)",
+    Write-AtomicAscii $PointerPath @("roundhouse-active-generation|1", "epoch|$($Manifest.Epoch)",
         "generation-sha256|$PointerDigest", "end-generation|")
     foreach ($ProtectedFile in @($PointerPath, $TransactionPath, (Join-Path $StateRoot "broker.lock"),
         (Join-Path $StateRoot "enrollment.mutations"))) {

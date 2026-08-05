@@ -21,18 +21,18 @@ $ErrorActionPreference = "Stop"
 
 $script:Ascii = [Text.Encoding]::ASCII
 $script:Utf8 = [Text.UTF8Encoding]::new($false, $true)
-$script:RequestAccountName = "MachineUtilitiesRequest"
-$script:EndpointPrincipal = "machine-utilities-windows"
-$script:SystemTaskName = "MachineUtilitiesBrokerV1"
-$script:ProfileTaskName = "MachineUtilitiesProfileV1"
+$script:RequestAccountName = "RoundhouseRequest"
+$script:EndpointPrincipal = "roundhouse-windows"
+$script:SystemTaskName = "RoundhouseBrokerV1"
+$script:ProfileTaskName = "RoundhouseProfileV1"
 $script:TaskSddl = "O:SYG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
 $script:SlotQuotaBytes = [int64]68157440
 $script:SlotWarningBytes = [int64]67108864
-$script:FirewallRuleName = "Machine Utilities Windows SFTP v1"
-$script:FirewallRuleId = "MachineUtilities-Windows-Sftp-v1"
-$script:FirewallRuleGroup = "Machine Utilities"
-$script:ManagedBlockBegin = "# BEGIN MACHINE-UTILITIES WINDOWS-SFTP v1"
-$script:ManagedBlockEnd = "# END MACHINE-UTILITIES WINDOWS-SFTP v1"
+$script:FirewallRuleName = "Roundhouse Windows SFTP v1"
+$script:FirewallRuleId = "Roundhouse-Windows-Sftp-v1"
+$script:FirewallRuleGroup = "Roundhouse"
+$script:ManagedBlockBegin = "# BEGIN ROUNDHOUSE WINDOWS-SFTP v1"
+$script:ManagedBlockEnd = "# END ROUNDHOUSE WINDOWS-SFTP v1"
 $script:MaximumIntentBytes = 32768
 $script:MaximumReceiptBytes = 65536
 $script:MaximumCaBytes = 16384
@@ -254,7 +254,7 @@ function Read-BootstrapReceipt([byte[]]$Bytes, [string]$ExpectedStageRoot, [stri
 function Read-ActivePointer([byte[]]$Bytes) {
     $Lines = ConvertFrom-CanonicalAsciiBytes $Bytes 1024 "active_pointer"
     $Fields = Read-FixedFields $Lines @("epoch", "generation-sha256") `
-        "machine-utilities-active-generation|1" "end-generation|" "active_pointer"
+        "roundhouse-active-generation|1" "end-generation|" "active_pointer"
     if (-not (Test-PositiveUInt $Fields.epoch) -or -not (Test-Digest $Fields.'generation-sha256')) {
         throw "invalid_active_pointer"
     }
@@ -268,7 +268,7 @@ function Get-U3ContractDigests([string]$RequestSid) {
     $ResultsDirectory = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1200a0;;;$RequestSid)"
     $ResultFile = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120089;;;$RequestSid)"
     $ChrootLines = @(
-        "windows-sftp-chroot-contract|1", "chroot|C:\ProgramData\MachineUtilities\chroot",
+        "windows-sftp-chroot-contract|1", "chroot|C:\ProgramData\Roundhouse\chroot",
         "request|/ingress/slot/request", "signature|/ingress/slot/request.sig",
         "payload|/ingress/slot/payload", "commit|/ingress/slot/commit",
         "results|/results/<request-id>.result", "projection|direct-non-reparse",
@@ -291,7 +291,7 @@ function Get-U3ContractDigests([string]$RequestSid) {
     )
     $OpenSshLines = @(
         "windows-sftp-openssh-contract|1", "request-account|$($script:RequestAccountName)",
-        "endpoint-principal|$($script:EndpointPrincipal)", "chroot|C:\ProgramData\MachineUtilities\chroot",
+        "endpoint-principal|$($script:EndpointPrincipal)", "chroot|C:\ProgramData\Roundhouse\chroot",
         "force-command|internal-sftp", "authentication|publickey-ca-certificate",
         "password|disabled", "keyboard-interactive|disabled", "pty|disabled", "x11|disabled",
         "tcp-forwarding|disabled", "stream-local-forwarding|disabled", "agent-forwarding|disabled",
@@ -340,9 +340,9 @@ function Get-NativeLayout {
         $SystemDrive + $ProgramDataRaw.Substring(13)
     } else { $ProgramDataRaw }
     if ($ProgramData -cne ($SystemDrive + "\ProgramData")) { throw "unsupported_protected_layout" }
-    $U3Root = $ProgramData + "\MachineUtilities"
-    $U6Root = $ProgramData + "\MachineUtilities-Sftp"
-    $StageRoot = $ProgramData + "\MachineUtilities-Sftp-Bootstrap"
+    $U3Root = $ProgramData + "\Roundhouse"
+    $U6Root = $ProgramData + "\Roundhouse-Sftp"
+    $StageRoot = $ProgramData + "\Roundhouse-Sftp-Bootstrap"
     return [pscustomobject]@{
         ProgramData = $ProgramData
         SystemRoot = $SystemRoot
@@ -360,7 +360,7 @@ function Get-NativeLayout {
         U6State = $U6Root + "\state"
         Generations = $U6Root + "\generations"
         ActivePointer = $U6Root + "\state\active"
-        PublicRoot = $ProgramData + "\MachineUtilities-Sftp-Public"
+        PublicRoot = $ProgramData + "\Roundhouse-Sftp-Public"
         StageRoot = $StageRoot
         BootstrapReceipt = $StageRoot + "\bootstrap.receipt"
         BootstrapVerifier = $StageRoot + "\bootstrap-verifier.ps1"
@@ -606,7 +606,7 @@ function Get-ManagedSshdBlock([string]$GenerationRoot) {
         "TrustedUserCAKeys $CaPath",
         "RevokedKeys $KrlPath",
         "Match User $($script:RequestAccountName)",
-        "    ChrootDirectory C:\ProgramData\MachineUtilities\chroot",
+        "    ChrootDirectory C:\ProgramData\Roundhouse\chroot",
         "    ForceCommand internal-sftp",
         "    PubkeyAuthentication yes",
         "    AuthenticationMethods publickey",
@@ -641,9 +641,9 @@ function Set-ManagedSshdBlock([byte[]]$ExistingBytes, [string[]]$ManagedLines) {
     for ($Index = 0; $Index -lt $ExistingLines.Count; $Index++) {
         if ($ExistingLines[$Index] -ceq $script:ManagedBlockBegin) { [void]$BeginIndexes.Add($Index) }
         if ($ExistingLines[$Index] -ceq $script:ManagedBlockEnd) { [void]$EndIndexes.Add($Index) }
-        if ($ExistingLines[$Index].StartsWith("# BEGIN MACHINE-UTILITIES WINDOWS-SFTP", [StringComparison]::Ordinal) -and
+        if ($ExistingLines[$Index].StartsWith("# BEGIN ROUNDHOUSE WINDOWS-SFTP", [StringComparison]::Ordinal) -and
             $ExistingLines[$Index] -cne $script:ManagedBlockBegin) { throw "unknown_managed_sshd_artifact" }
-        if ($ExistingLines[$Index].StartsWith("# END MACHINE-UTILITIES WINDOWS-SFTP", [StringComparison]::Ordinal) -and
+        if ($ExistingLines[$Index].StartsWith("# END ROUNDHOUSE WINDOWS-SFTP", [StringComparison]::Ordinal) -and
             $ExistingLines[$Index] -cne $script:ManagedBlockEnd) { throw "unknown_managed_sshd_artifact" }
     }
     if ($BeginIndexes.Count -ne $EndIndexes.Count -or $BeginIndexes.Count -gt 1 -or
@@ -763,7 +763,7 @@ function Get-U3NativeAccessContract([string]$RequestSid) {
     $Contracts = Get-U3ContractDigests $RequestSid
     return [pscustomobject]@{
         RequestSid = $RequestSid
-        ChrootPathSha256 = Get-Sha256Bytes ($script:Utf8.GetBytes("C:\PROGRAMDATA\MACHINEUTILITIES\CHROOT"))
+        ChrootPathSha256 = Get-Sha256Bytes ($script:Utf8.GetBytes("C:\PROGRAMDATA\ROUNDHOUSE\CHROOT"))
         ChrootDirectorySddlSha256 = Get-Sha256Bytes ($script:Utf8.GetBytes($Contracts.SlotDirectory))
         SlotDirectorySddlSha256 = Get-Sha256Bytes ($script:Utf8.GetBytes($Contracts.SlotDirectory))
         SlotFileSddlSha256 = Get-Sha256Bytes ($script:Utf8.GetBytes($Contracts.SlotFile))
@@ -966,13 +966,13 @@ function Get-U3TaskSnapshot([string]$TaskName) {
 }
 
 function Initialize-LsaReadType {
-    if ("MachineUtilitiesSftpLsa" -as [type]) { return }
+    if ("RoundhouseSftpLsa" -as [type]) { return }
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
-public static class MachineUtilitiesSftpLsa {
+public static class RoundhouseSftpLsa {
   [StructLayout(LayoutKind.Sequential)] struct LSA_OBJECT_ATTRIBUTES {
     public int Length; public IntPtr RootDirectory; public IntPtr ObjectName;
     public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService;
@@ -1019,7 +1019,7 @@ function Get-LsaAccountRights([string]$Sid) {
     $Identifier = [Security.Principal.SecurityIdentifier]::new($Sid)
     [byte[]]$Bytes = [byte[]]::new($Identifier.BinaryLength)
     $Identifier.GetBinaryForm($Bytes, 0)
-    return [string[]]@([MachineUtilitiesSftpLsa]::GetAccountRights($Bytes) | Sort-Object)
+    return [string[]]@([RoundhouseSftpLsa]::GetAccountRights($Bytes) | Sort-Object)
 }
 
 function Assert-AuthenticodePublisher([string]$Path, [string]$ExpectedThumbprint) {
@@ -1716,7 +1716,7 @@ function Assert-SshdConfiguration([object]$Layout, [object]$Context, [string]$Co
     }
     $Expected = [ordered]@{
         "forcecommand" = "internal-sftp"
-        "chrootdirectory" = "C:\ProgramData\MachineUtilities\chroot"
+        "chrootdirectory" = "C:\ProgramData\Roundhouse\chroot"
         "pubkeyauthentication" = "yes"
         "passwordauthentication" = "no"
         "kbdinteractiveauthentication" = "no"
@@ -3670,7 +3670,7 @@ function New-FixtureIntent([int64]$IssuedAt) {
 function New-FixtureCertificate {
     $Rsa = [Security.Cryptography.RSA]::Create(2048)
     $Request = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
-        "CN=MachineUtilities Fixture", $Rsa, [Security.Cryptography.HashAlgorithmName]::SHA256,
+        "CN=Roundhouse Fixture", $Rsa, [Security.Cryptography.HashAlgorithmName]::SHA256,
         [Security.Cryptography.RSASignaturePadding]::Pkcs1)
     $Request.CertificateExtensions.Add(
         [Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new(
@@ -3816,7 +3816,7 @@ function Invoke-SelfTest {
         "slot_write_data_only"
     $Access = Get-U3NativeAccessContract $Intent.Fields.'request-sid'
     Assert-Fixture ($Access.ChrootPathSha256 -ceq
-        (Get-Sha256Bytes ($script:Utf8.GetBytes("C:\PROGRAMDATA\MACHINEUTILITIES\CHROOT")))) "chroot_hash"
+        (Get-Sha256Bytes ($script:Utf8.GetBytes("C:\PROGRAMDATA\ROUNDHOUSE\CHROOT")))) "chroot_hash"
 
     $ContainmentFixture = [pscustomobject]@{
         DrainOperation = "install"; DrainTransactionId = "transaction-" + ("a" * 32); U3Epoch = 11
@@ -3846,7 +3846,7 @@ function Invoke-SelfTest {
     $IdentityText = $script:Ascii.GetString((Get-U3HostIdentityBytes $IdentityContext))
     Assert-Fixture ($IdentityText.Contains(
             "request-sid|$($Intent.Fields.'request-sid')`n", [StringComparison]::Ordinal) -and
-        $IdentityText.Contains("request-principal|MachineUtilitiesRequest`n", [StringComparison]::Ordinal) -and
+        $IdentityText.Contains("request-principal|RoundhouseRequest`n", [StringComparison]::Ordinal) -and
         $IdentityText.Contains("previous-ca-fingerprint|-`nprevious-ca-generation|0`n",
             [StringComparison]::Ordinal)) `
         "u3_identity_signed_sid_binding"
@@ -3913,13 +3913,13 @@ function Invoke-SelfTest {
         "constraint-version|1", "constraints-sha256|$('c' * 64)", "generation|11",
         "generation-sha256|$('d' * 64)", "winget-context-version|1",
         "winget-context-sha256|$('e' * 64)", "provider-lock-sha256|$('f' * 64)",
-        "request-sid|$($Intent.Fields.'request-sid')", "request-principal|MachineUtilitiesRequest",
+        "request-sid|$($Intent.Fields.'request-sid')", "request-principal|RoundhouseRequest",
         "system-task-ready|true", "profile-task-ready|false", "transport-ready|true",
         "native-canary-ready|true", "observed-at|$Now", "expires-at|$($Now + $script:ClockSkewSeconds)",
         "action-count|1", "action|winget.inventory-machine.v1|windows-system-v1|-|$('1' * 64)",
         "profile-constraint-count|0", "end-readiness|")
     $ReadinessPath = [IO.Path]::Combine([IO.Path]::GetTempPath(),
-        "machine-utilities-readiness-" + [Guid]::NewGuid().ToString("N"))
+        "roundhouse-readiness-" + [Guid]::NewGuid().ToString("N"))
     try {
         [IO.File]::WriteAllBytes($ReadinessPath, (ConvertTo-CanonicalAsciiBytes $ReadinessLines))
         Assert-U3ReadinessResult $ReadinessPath $ReadinessRequestId
@@ -3933,13 +3933,13 @@ function Invoke-SelfTest {
     }
 
     $ExistingConfig = ConvertTo-CanonicalAsciiBytes @("Port 22", "Subsystem sftp sftp-server.exe")
-    $Block = Get-ManagedSshdBlock "C:\ProgramData\MachineUtilities-Sftp\generations\$('a' * 64)"
+    $Block = Get-ManagedSshdBlock "C:\ProgramData\Roundhouse-Sftp\generations\$('a' * 64)"
     $ManagedConfig = Set-ManagedSshdBlock $ExistingConfig $Block
     Assert-Fixture (($script:Ascii.GetString($ManagedConfig).Split($script:ManagedBlockBegin).Count - 1) -eq 1) `
         "managed_block_single"
     $RemovedConfig = Remove-ManagedSshdBlock $ManagedConfig $Block
     Assert-Fixture ((Get-Sha256Bytes $RemovedConfig) -ceq (Get-Sha256Bytes $ExistingConfig)) "managed_block_roundtrip"
-    $UnknownMarker = ConvertTo-CanonicalAsciiBytes @("# BEGIN MACHINE-UTILITIES WINDOWS-SFTP v2", "Port 22")
+    $UnknownMarker = ConvertTo-CanonicalAsciiBytes @("# BEGIN ROUNDHOUSE WINDOWS-SFTP v2", "Port 22")
     Assert-FixtureThrows { [void](Set-ManagedSshdBlock $UnknownMarker $Block) } "unknown_marker"
 
     $Certificate = New-FixtureCertificate

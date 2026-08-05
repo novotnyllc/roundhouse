@@ -10,7 +10,7 @@ Use UniFi Network's managed Integration API before browser UI automation for rep
 ## Source Of Truth
 
 - Live console OpenAPI spec: `/usr/lib/unifi/webapps/ROOT/api-docs/integration.json` on `root@unifi`.
-- Saved snapshot: `references/current-openapi.json` from Claire's UDM Pro, currently Network `10.3.58`.
+- Saved snapshot: `references/current-openapi.json` from the operator's UDM Pro, currently Network `10.3.58`.
 - Notes and examples: `references/api-usage.md`.
 
 Before relying on a schema, prefer refreshing or checking the live console spec:

@@ -75,26 +75,26 @@ case $command in
     ;;
 esac
 
-readonly config_root=$root_prefix/etc/machine-utilities/ssh
+readonly config_root=$root_prefix/etc/roundhouse/ssh
 readonly generations_root=$config_root/generations
 readonly active_link=$config_root/active
-readonly state_root=$root_prefix/var/lib/machine-utilities-ssh
+readonly state_root=$root_prefix/var/lib/roundhouse-ssh
 readonly lifecycle_lock=$state_root/.lifecycle-lock
 readonly transaction_root=$state_root/transaction
 readonly drain_path=$state_root/drain
 readonly state_record=$state_root/enrollment
 readonly sshd_main=$root_prefix/etc/ssh/sshd_config
 readonly dropin_directory=$root_prefix/etc/ssh/sshd_config.d
-readonly dropin_path=$dropin_directory/10-machine-utilities-transport.conf
-readonly native_ca_path=/etc/machine-utilities/ssh/active/fleet-ca.pub
-readonly native_krl_path=/etc/machine-utilities/ssh/active/revoked.krl
-readonly native_principals_path=/etc/machine-utilities/ssh/active/principals/%u
-readonly dispatcher_native_path=/usr/local/libexec/machine-utilities/posix-dispatcher
+readonly dropin_path=$dropin_directory/10-roundhouse-transport.conf
+readonly native_ca_path=/etc/roundhouse/ssh/active/fleet-ca.pub
+readonly native_krl_path=/etc/roundhouse/ssh/active/revoked.krl
+readonly native_principals_path=/etc/roundhouse/ssh/active/principals/%u
+readonly dispatcher_native_path=/usr/local/libexec/roundhouse/posix-dispatcher
 readonly dispatcher_path=$root_prefix$dispatcher_native_path
-readonly release_root=$root_prefix/usr/local/libexec/machine-utilities
+readonly release_root=$root_prefix/usr/local/libexec/roundhouse
 readonly release_generations=$release_root/releases
 readonly current_release=$release_root/current
-readonly bootstrap_root=$root_prefix/var/lib/machine-utilities-bootstrap
+readonly bootstrap_root=$root_prefix/var/lib/roundhouse-bootstrap
 readonly ssh_keygen=/usr/bin/ssh-keygen
 readonly sshd_binary=/usr/sbin/sshd
 
@@ -296,7 +296,7 @@ render_principals() { printf '%s\n' "$endpoint_principal"; }
 
 render_dropin() {
   cat <<EOF
-# machine-utilities-owned transport v1
+# roundhouse-owned transport v1
 PermitUserEnvironment no
 
 Match User $target_account
@@ -360,7 +360,7 @@ parse_request_snapshot() {
   domain_name "$fleet_domain" && token "$host_id" && token "$target_account" &&
     [[ $target_uid =~ ^[1-9][0-9]{0,9}$ ]] && [ "$target_uid" -le 2147483647 ] &&
     fingerprint "$primary_ca_fingerprint" && positive_integer "$primary_ca_generation" &&
-    [ "$endpoint_principal" = machine-utilities-posix ] &&
+    [ "$endpoint_principal" = roundhouse-posix ] &&
     [ "$signing_principal" = "$host_id@$fleet_domain" ] && valid_sources "$management_sources" &&
     digest "$ca_public_key_sha256" && positive_integer "$krl_generation" && digest "$krl_sha256" &&
     digest "$principals_sha256" && digest "$dispatcher_sha256" && digest "$dropin_sha256" &&
@@ -386,7 +386,7 @@ parse_request_snapshot() {
 load_request() {
   local original=$1 snapshot rc=0
   candidate_file "$original" 16384 && exact_mode "$original" 600 || return 1
-  snapshot=$(/usr/bin/mktemp /tmp/machine-utilities-u6-request.XXXXXX) || return 1
+  snapshot=$(/usr/bin/mktemp /tmp/roundhouse-u6-request.XXXXXX) || return 1
   /bin/chmod 0600 "$snapshot" || { /bin/rm -f "$snapshot"; return 1; }
   exec 7<"$original" || { /bin/rm -f "$snapshot"; return 1; }
   /bin/cat <&7 >"$snapshot" || rc=1
@@ -414,7 +414,7 @@ unset SSH_ORIGINAL_COMMAND
 EOF
   printf 'exec /usr/bin/env -i HOME=%s USER=%s LOGNAME=%s PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C LANG=C TZ=UTC \\\n' \
     "$target_home" "$target_account" "$target_account"
-  printf '%s\n' '  /usr/local/libexec/machine-utilities/current/scripts/machine-utilities dispatch-posix-request'
+  printf '%s\n' '  /usr/local/libexec/roundhouse/current/scripts/roundhouse dispatch-posix-request'
 }
 
 validate_planned_dispatcher() {
@@ -495,10 +495,10 @@ first_management_address() {
 }
 
 non_target_account() {
-  if [ "$target_account" = machineutilitiesnontarget ]; then
-    printf '%s\n' machineutilitiestestaccount
+  if [ "$target_account" = roundhousenontarget ]; then
+    printf '%s\n' roundhousetestaccount
   else
-    printf '%s\n' machineutilitiesnontarget
+    printf '%s\n' roundhousenontarget
   fi
 }
 
@@ -638,7 +638,7 @@ validate_integrity_manifest() {
   local integrity=$release_plugin_root/integrity.json relative expected observed records found_worker=false found_entrypoint=false
   protected_file "$integrity" 1048576 || return 1
   /usr/bin/grep -Fq '"schema": "roundhouse.integrity"' "$integrity" &&
-    /usr/bin/grep -Fq '"plugin": "machine-utilities"' "$integrity" || return 1
+    /usr/bin/grep -Fq '"plugin": "roundhouse"' "$integrity" || return 1
   records=$(/usr/bin/awk '
     /"path"[[:space:]]*:/ {
       if (path != "") exit 1
@@ -659,7 +659,7 @@ validate_integrity_manifest() {
     observed=$(release_manifest_file_digest "plugins/roundhouse/$relative") || return 1
     [ "$observed" = "$expected" ] &&
       [ "$(sha256_file "$release_plugin_root/$relative")" = "$expected" ] || return 1
-    [ "$relative" = scripts/machine-utilities ] && found_worker=true
+    [ "$relative" = scripts/roundhouse ] && found_worker=true
     [ "$relative" = scripts/enroll-ssh-posix ] && found_entrypoint=true
   done <<<"$records"
   [ "$found_worker" = true ] && [ "$found_entrypoint" = true ]
@@ -678,10 +678,10 @@ verify_release_bundle() {
   [ "$(sha256_file "$manifest")" = "$expected_manifest" ] || return 1
   protected_file "$bootstrap_root/receipts/$expected_manifest" 1024 &&
     [ "$(/usr/bin/sed -n '1p' "$bootstrap_root/receipts/$expected_manifest")" = \
-      "bootstrap|1|manifest-sha256=$expected_manifest|release-principal=machine-utilities-release" ] || return 1
+      "bootstrap|1|manifest-sha256=$expected_manifest|release-principal=roundhouse-release" ] || return 1
   [ -x "$ssh_keygen" ] && "$ssh_keygen" -Y verify \
-    -f "$bootstrap_root/release-allowed-signers" -I machine-utilities-release \
-    -n machine-utilities-release -s "$candidate/bootstrap.manifest.sig" \
+    -f "$bootstrap_root/release-allowed-signers" -I roundhouse-release \
+    -n roundhouse-release -s "$candidate/bootstrap.manifest.sig" \
     <"$manifest" >/dev/null 2>&1 || return 1
   release_file_count=0
   release_total_bytes=0
@@ -701,7 +701,7 @@ verify_release_bundle() {
     [ "$release_file_count" -le 512 ] && [ "$release_total_bytes" -le 134217728 ] || return 1
   done <"$manifest"
   [ "$release_file_count" -ge 5 ] || return 1
-  release_plugin_root=$candidate/plugins/machine-utilities
+  release_plugin_root=$candidate/plugins/roundhouse
   protected_directory "$candidate/plugins" && protected_directory "$release_plugin_root" || return 1
   while IFS= read -r -d '' actual; do
     relative=${actual#"$candidate/"}
@@ -715,17 +715,17 @@ verify_release_bundle() {
   ! /usr/bin/find "$release_plugin_root" \( -type l -o ! -type d ! -type f \) -print | /usr/bin/grep -q . || return 1
   release_bundle=$candidate
   release_entrypoint_digest=$(release_manifest_file_digest plugins/roundhouse/scripts/enroll-ssh-posix) || return 1
-  release_worker_digest=$(release_manifest_file_digest plugins/roundhouse/scripts/machine-utilities) || return 1
+  release_worker_digest=$(release_manifest_file_digest plugins/roundhouse/scripts/roundhouse) || return 1
   [ "$expected_manifest" = "$release_manifest_sha256" ] &&
     /bin/bash -n "$release_plugin_root/scripts/enroll-ssh-posix" &&
-    /bin/bash -n "$release_plugin_root/scripts/machine-utilities" &&
-    /usr/bin/grep -Fq 'dispatch-posix-request' "$release_plugin_root/scripts/machine-utilities" &&
-    /usr/bin/grep -Fq 'invoke_fixed_posix_broker()' "$release_plugin_root/scripts/machine-utilities" &&
-    /usr/bin/grep -Fq '/usr/libexec/machine-utilities/posix-broker' \
-      "$release_plugin_root/scripts/machine-utilities" &&
-    /usr/bin/grep -Fq '/usr/local/libexec/machine-utilities/posix-broker' \
-      "$release_plugin_root/scripts/machine-utilities" &&
-    /usr/bin/grep -Fq '/usr/bin/sudo -n "$fixed_broker"' "$release_plugin_root/scripts/machine-utilities" &&
+    /bin/bash -n "$release_plugin_root/scripts/roundhouse" &&
+    /usr/bin/grep -Fq 'dispatch-posix-request' "$release_plugin_root/scripts/roundhouse" &&
+    /usr/bin/grep -Fq 'invoke_fixed_posix_broker()' "$release_plugin_root/scripts/roundhouse" &&
+    /usr/bin/grep -Fq '/usr/libexec/roundhouse/posix-broker' \
+      "$release_plugin_root/scripts/roundhouse" &&
+    /usr/bin/grep -Fq '/usr/local/libexec/roundhouse/posix-broker' \
+      "$release_plugin_root/scripts/roundhouse" &&
+    /usr/bin/grep -Fq '/usr/bin/sudo -n "$fixed_broker"' "$release_plugin_root/scripts/roundhouse" &&
     validate_integrity_manifest
 }
 
@@ -749,7 +749,7 @@ require_authenticated_bootstrap_launch() {
     protected_file "$launch_path" 1024 && exact_mode "$launch_path" 600 || return 1
   [ "$(file_identity "/dev/fd/$launch_fd")" = "$(file_identity "$launch_path")" ] || return 1
   IFS= read -r record <&"$launch_fd" || return 1
-  expected_record="bootstrap-launch|1|scope=posix-ssh|operation=$operation|manifest-sha256=$expected_manifest|entrypoint-sha256=$expected_entrypoint|nonce=$nonce|release-principal=machine-utilities-release"
+  expected_record="bootstrap-launch|1|scope=posix-ssh|operation=$operation|manifest-sha256=$expected_manifest|entrypoint-sha256=$expected_entrypoint|nonce=$nonce|release-principal=roundhouse-release"
   [ "$record" = "$expected_record" ] || return 1
   if IFS= read -r record <&"$launch_fd"; then return 1; fi
   running=$(canonical_script_path "$0") || return 1
@@ -769,7 +769,7 @@ preview_inputs() {
     verify_release_bundle "$bundle" "$expected_manifest" &&
     validate_ca_file "$ca_file" && validate_krl_file "$krl_file" "$ca_file" &&
     validate_host_key && validate_service_posture || return 1
-  scratch=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/machine-utilities-u6-preview.XXXXXX") || return 1
+  scratch=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/roundhouse-u6-preview.XXXXXX") || return 1
   /bin/chmod 0700 "$scratch"
   if ! validate_prospective_sshd "$scratch"; then
     /bin/rm -f "$scratch/dropin" "$scratch/effective" "$scratch/non-target-effective" "$scratch/prospective_sshd_config" 2>/dev/null || :
@@ -941,7 +941,7 @@ copy_release_generation() {
     directory=${target%/*}
     ensure_directory "$directory" 0755 || return 1
     case $relative in
-      scripts/machine-utilities|scripts/collect-posix|scripts/enroll-privilege-posix|scripts/privilege-broker-posix|scripts/test-roundhouse|scripts/update-integrity|scripts/prepare-ssh-identity|scripts/certify-ssh-node|scripts/enroll-ssh-posix) mode=0755 ;;
+      scripts/roundhouse|scripts/collect-posix|scripts/enroll-privilege-posix|scripts/privilege-broker-posix|scripts/test-roundhouse|scripts/update-integrity|scripts/prepare-ssh-identity|scripts/certify-ssh-node|scripts/enroll-ssh-posix) mode=0755 ;;
       *) mode=0644 ;;
     esac
     copy_held_file "$source" "$target" "$expected" "$mode" || return 1
@@ -968,7 +968,7 @@ validate_release_generation_at() {
     actual_count=$((actual_count + 1))
   done <"$manifest"
   [ "$actual_count" -eq "$release_file_count" ] &&
-    [ "$(sha256_file "$candidate/scripts/machine-utilities")" = "$release_worker_digest" ] &&
+    [ "$(sha256_file "$candidate/scripts/roundhouse")" = "$release_worker_digest" ] &&
     [ "$(sha256_file "$candidate/scripts/enroll-ssh-posix")" = "$release_entrypoint_digest" ]
 }
 
@@ -1183,7 +1183,7 @@ cleanup_install_stages() {
   fi
   for candidate in \
     "$release_root/.posix-dispatcher.$transaction_request" \
-    "$dropin_directory/.machine-utilities-transport.$transaction_request" \
+    "$dropin_directory/.roundhouse-transport.$transaction_request" \
     "$state_root/.enrollment.$transaction_request"; do
     if [ -L "$candidate" ]; then return 1
     elif [ -e "$candidate" ]; then protected_file "$candidate" 33554432 || return 1; /bin/rm -f "$candidate" || return 1
@@ -1199,7 +1199,7 @@ finish_transaction_cleanup() {
 
 render_denial_dropin() {
   cat <<EOF
-# machine-utilities-owned transport denial v1
+# roundhouse-owned transport denial v1
 PermitUserEnvironment no
 
 Match User $target_account
@@ -1249,7 +1249,7 @@ load_installed_release_metadata() {
     [ "$kind" = file ] && digest "$expected" || return 1
     case $relative in
       plugins/roundhouse/scripts/enroll-ssh-posix) release_entrypoint_digest=$expected ;;
-      plugins/roundhouse/scripts/machine-utilities) release_worker_digest=$expected ;;
+      plugins/roundhouse/scripts/roundhouse) release_worker_digest=$expected ;;
     esac
     count=$((count + 1)); [ "$count" -le 512 ] || return 1
   done <"$manifest"
@@ -1407,7 +1407,7 @@ prepare_install_stages() {
   local config_stage=$generations_root/.staging-$request_sha256
   local release_stage=$release_generations/.staging-$release_manifest_sha256
   local wrapper_stage=$release_root/.posix-dispatcher.$request_sha256
-  local dropin_stage=$dropin_directory/.machine-utilities-transport.$request_sha256
+  local dropin_stage=$dropin_directory/.roundhouse-transport.$request_sha256
   local state_stage=$state_root/.enrollment.$request_sha256
   local scratch=$state_root/.prospective.$request_sha256
   for candidate in "$config_stage" "$release_stage" "$wrapper_stage" "$dropin_stage" "$state_stage" "$scratch"; do
@@ -1429,7 +1429,7 @@ prepare_install_stages() {
   /bin/rmdir "$scratch" || return 1
   if "$wrapper_stage" unexpected </dev/null >/dev/null 2>&1; then return 1; fi
   if SSH_ORIGINAL_COMMAND=anything "$wrapper_stage" </dev/null >/dev/null 2>&1; then return 1; fi
-  if "$release_stage/scripts/machine-utilities" dispatch-posix-request unexpected \
+  if "$release_stage/scripts/roundhouse" dispatch-posix-request unexpected \
     </dev/null >/dev/null 2>&1; then return 1; fi
   durable_sync "$config_stage" && durable_sync "$release_stage" && durable_sync "$release_root" &&
     durable_sync "$dropin_directory" && durable_sync "$state_root"
@@ -1441,7 +1441,7 @@ activate_install_stages() {
   local config_final=$generations_root/$request_sha256
   local release_final=$release_generations/$release_manifest_sha256
   local wrapper_stage=$release_root/.posix-dispatcher.$request_sha256
-  local dropin_stage=$dropin_directory/.machine-utilities-transport.$request_sha256
+  local dropin_stage=$dropin_directory/.roundhouse-transport.$request_sha256
   local state_stage=$state_root/.enrollment.$request_sha256
   if [ -e "$release_final" ] || [ -L "$release_final" ]; then
     [ -d "$release_final" ] && [ ! -L "$release_final" ] &&
@@ -1620,7 +1620,7 @@ complete_revoke_transaction() {
   fi
   u6_failpoint after-revoke-endpoint-removal || return $?
   protected_file "$dropin_path" 65536 && /usr/bin/grep -Fqx \
-    '# machine-utilities-owned transport denial v1' "$dropin_path" || return 1
+    '# roundhouse-owned transport denial v1' "$dropin_path" || return 1
   /bin/rm -f "$dropin_path" && durable_sync "$dropin_directory" && reload_sshd || return 1
   validate_revoked_effective || return 1
   printf 'revoked|1|request-sha256=%s|release-manifest-sha256=%s|platform=%s|controller-trust=not-activated\n' \
@@ -1743,27 +1743,27 @@ selftest_root=
 selftest_cleanup() {
   local marker
   [ -n "$selftest_root" ] || return 0
-  case $selftest_root in /private/tmp/machine-utilities-u6-selftest.*|/tmp/machine-utilities-u6-selftest.*) ;; *) return 1 ;; esac
+  case $selftest_root in /private/tmp/roundhouse-u6-selftest.*|/tmp/roundhouse-u6-selftest.*) ;; *) return 1 ;; esac
   marker=$selftest_root/.u6-selftest-root
   [ -f "$marker" ] && [ ! -L "$marker" ] &&
-    [ "$(/usr/bin/sed -n '1p' "$marker")" = machine-utilities-u6-selftest ] || return 1
+    [ "$(/usr/bin/sed -n '1p' "$marker")" = roundhouse-u6-selftest ] || return 1
   /usr/bin/find "$selftest_root" -depth -delete
 }
 
 selftest_make_bundle() {
   local root=$1 self=$2 build plugin manifest manifest_digest worker_digest entrypoint_digest pub worker_source
-  build=$root/var/lib/machine-utilities-bootstrap/staged/build
-  plugin=$build/plugins/machine-utilities
+  build=$root/var/lib/roundhouse-bootstrap/staged/build
+  plugin=$build/plugins/roundhouse
   /bin/mkdir -p "$plugin/.claude-plugin" "$plugin/.codex-plugin" "$plugin/scripts" \
-    "$root/var/lib/machine-utilities-bootstrap/receipts"
-  printf '{"name":"machine-utilities","version":"0.0.0-fixture"}\n' >"$plugin/.claude-plugin/plugin.json"
-  printf '{"name":"machine-utilities","version":"0.0.0-fixture"}\n' >"$plugin/.codex-plugin/plugin.json"
+    "$root/var/lib/roundhouse-bootstrap/receipts"
+  printf '{"name":"roundhouse","version":"0.0.0-fixture"}\n' >"$plugin/.claude-plugin/plugin.json"
+  printf '{"name":"roundhouse","version":"0.0.0-fixture"}\n' >"$plugin/.codex-plugin/plugin.json"
   /bin/cp "$self" "$plugin/scripts/enroll-ssh-posix"
-  worker_source=${self%/*}/machine-utilities
+  worker_source=${self%/*}/roundhouse
   [ -f "$worker_source" ] && [ ! -L "$worker_source" ] || return 1
-  /bin/cp "$worker_source" "$plugin/scripts/machine-utilities"
-  /bin/chmod 0600 "$plugin/scripts/enroll-ssh-posix" "$plugin/scripts/machine-utilities"
-  worker_digest=$(sha256_file "$plugin/scripts/machine-utilities")
+  /bin/cp "$worker_source" "$plugin/scripts/roundhouse"
+  /bin/chmod 0600 "$plugin/scripts/enroll-ssh-posix" "$plugin/scripts/roundhouse"
+  worker_digest=$(sha256_file "$plugin/scripts/roundhouse")
   entrypoint_digest=$(sha256_file "$plugin/scripts/enroll-ssh-posix")
   cat >"$plugin/integrity.json" <<EOF
 {
@@ -1781,37 +1781,37 @@ selftest_make_bundle() {
       "sha256": "$entrypoint_digest"
     },
     {
-      "path": "scripts/machine-utilities",
+      "path": "scripts/roundhouse",
       "sha256": "$worker_digest"
     }
   ],
-  "plugin": "machine-utilities",
+  "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
   "version": "0.0.0-fixture"
 }
 EOF
-  /usr/bin/find "$root/var/lib/machine-utilities-bootstrap" -type d -exec /bin/chmod 0700 {} +
+  /usr/bin/find "$root/var/lib/roundhouse-bootstrap" -type d -exec /bin/chmod 0700 {} +
   /usr/bin/find "$plugin" -type f -exec /bin/chmod 0600 {} +
   manifest=$build/bootstrap.manifest
   (
     CDPATH='' cd "$build"
-    /usr/bin/find plugins/machine-utilities -type f -print | LC_ALL=C /usr/bin/sort | while IFS= read -r relative; do
+    /usr/bin/find plugins/roundhouse -type f -print | LC_ALL=C /usr/bin/sort | while IFS= read -r relative; do
       printf 'file|%s|%s\n' "$relative" "$(sha256_file "$relative")"
     done
   ) >"$manifest"
   /bin/chmod 0600 "$manifest"
   /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$root/release-signing-key"
-  /usr/bin/ssh-keygen -Y sign -f "$root/release-signing-key" -n machine-utilities-release \
+  /usr/bin/ssh-keygen -Y sign -f "$root/release-signing-key" -n roundhouse-release \
     "$manifest" >/dev/null 2>&1
   pub=$(/bin/cat "$root/release-signing-key.pub")
-  printf 'machine-utilities-release %s\n' "$pub" >"$root/var/lib/machine-utilities-bootstrap/release-allowed-signers"
-  /bin/chmod 0600 "$root/var/lib/machine-utilities-bootstrap/release-allowed-signers" "$manifest.sig"
+  printf 'roundhouse-release %s\n' "$pub" >"$root/var/lib/roundhouse-bootstrap/release-allowed-signers"
+  /bin/chmod 0600 "$root/var/lib/roundhouse-bootstrap/release-allowed-signers" "$manifest.sig"
   manifest_digest=$(sha256_file "$manifest")
-  printf 'bootstrap|1|manifest-sha256=%s|release-principal=machine-utilities-release\n' "$manifest_digest" \
-    >"$root/var/lib/machine-utilities-bootstrap/receipts/$manifest_digest"
-  /bin/chmod 0600 "$root/var/lib/machine-utilities-bootstrap/receipts/$manifest_digest"
-  /bin/mv "$build" "$root/var/lib/machine-utilities-bootstrap/staged/$manifest_digest"
+  printf 'bootstrap|1|manifest-sha256=%s|release-principal=roundhouse-release\n' "$manifest_digest" \
+    >"$root/var/lib/roundhouse-bootstrap/receipts/$manifest_digest"
+  /bin/chmod 0600 "$root/var/lib/roundhouse-bootstrap/receipts/$manifest_digest"
+  /bin/mv "$build" "$root/var/lib/roundhouse-bootstrap/staged/$manifest_digest"
   printf '%s\n' "$manifest_digest"
 }
 
@@ -1970,7 +1970,7 @@ selftest_make_request() {
   esac
   target_account=$account
   target_home=$home
-  endpoint_principal=machine-utilities-posix
+  endpoint_principal=roundhouse-posix
   principal_digest=$(render_principals | sha256_stream)
   wrapper_digest=$(render_dispatcher | sha256_stream)
   rendered_dropin_digest=$(render_dropin | sha256_stream)
@@ -1988,7 +1988,7 @@ primary-ca-generation|$primary_generation
 previous-ca-fingerprint|$previous_fingerprint
 previous-ca-generation|$previous_generation
 trust-mode|$trust
-endpoint-principal|machine-utilities-posix
+endpoint-principal|roundhouse-posix
 signing-principal|fixture-$fixture_platform_name@fleet.example
 management-sources|192.0.2.0/24,2001:db8::/64
 ca-public-key-sha256|$ca_digest
@@ -2009,8 +2009,8 @@ EOF
 selftest_dispatcher_hostile_environment() {
   local root=$1 installed_wrapper installed_worker fixture probe probe_wrapper worker_wrapper
   local fake_bin fake_tmp fake_home fake_config fake_identity marker tool frame rc
-  installed_wrapper=$root/usr/local/libexec/machine-utilities/posix-dispatcher
-  installed_worker=$root/usr/local/libexec/machine-utilities/current/scripts/machine-utilities
+  installed_wrapper=$root/usr/local/libexec/roundhouse/posix-dispatcher
+  installed_worker=$root/usr/local/libexec/roundhouse/current/scripts/roundhouse
   fixture=$root/dispatcher-hostile
   fake_bin=$fixture/bin
   fake_tmp=$fixture/tmp
@@ -2035,7 +2035,7 @@ EOF
     [ "$(file_owner "$installed_wrapper")" = "$(/usr/bin/id -un)" ] &&
     exact_mode "$installed_wrapper" 755 && safe_permissions "$installed_wrapper" &&
     [ "$(/usr/bin/grep -Fxc \
-      '  /usr/local/libexec/machine-utilities/current/scripts/machine-utilities dispatch-posix-request' \
+      '  /usr/local/libexec/roundhouse/current/scripts/roundhouse dispatch-posix-request' \
       "$installed_wrapper")" -eq 1 ] || return 1
 
   probe=$fixture/environment-probe
@@ -2061,8 +2061,8 @@ for tool in mktemp jq sha256sum sudo; do
   esac
 done
 [ "$(command -v mktemp)" = /usr/bin/mktemp ] || exit 84
-private_tmp=$(/usr/bin/mktemp -d /tmp/machine-utilities-u6-dispatch-probe.XXXXXX) || exit 85
-case $private_tmp in /tmp/machine-utilities-u6-dispatch-probe.*) ;; *) exit 85 ;; esac
+private_tmp=$(/usr/bin/mktemp -d /tmp/roundhouse-u6-dispatch-probe.XXXXXX) || exit 85
+case $private_tmp in /tmp/roundhouse-u6-dispatch-probe.*) ;; *) exit 85 ;; esac
 case $(/usr/bin/uname -s) in
   Darwin) mode=$(/usr/bin/stat -f %Lp "$private_tmp" 2>/dev/null); owner=$(/usr/bin/stat -f %Su "$private_tmp" 2>/dev/null) ;;
   Linux) mode=$(/usr/bin/stat -c %a "$private_tmp" 2>/dev/null); owner=$(/usr/bin/stat -c %U "$private_tmp" 2>/dev/null) ;;
@@ -2077,7 +2077,7 @@ EOF
   /bin/chmod 0700 "$probe"
   probe_wrapper=$fixture/probe-dispatcher
   /usr/bin/sed \
-    "s#^  /usr/local/libexec/machine-utilities/current/scripts/machine-utilities dispatch-posix-request\$#  $probe dispatch-posix-request#" \
+    "s#^  /usr/local/libexec/roundhouse/current/scripts/roundhouse dispatch-posix-request\$#  $probe dispatch-posix-request#" \
     "$installed_wrapper" >"$probe_wrapper"
   /bin/chmod 0700 "$probe_wrapper"
   [ "$(/usr/bin/grep -Fxc "  $probe dispatch-posix-request" "$probe_wrapper")" -eq 1 ] || return 1
@@ -2092,7 +2092,7 @@ EOF
 
   worker_wrapper=$fixture/worker-dispatcher
   /usr/bin/sed \
-    "s#^  /usr/local/libexec/machine-utilities/current/scripts/machine-utilities dispatch-posix-request\$#  $installed_worker dispatch-posix-request#" \
+    "s#^  /usr/local/libexec/roundhouse/current/scripts/roundhouse dispatch-posix-request\$#  $installed_worker dispatch-posix-request#" \
     "$installed_wrapper" >"$worker_wrapper"
   /bin/chmod 0700 "$worker_wrapper"
   [ "$(/usr/bin/grep -Fxc "  $installed_worker dispatch-posix-request" "$worker_wrapper")" -eq 1 ] || return 1
@@ -2161,7 +2161,7 @@ selftest_run_fixture() {
   manifest=$(selftest_make_bundle "$root" "$self") || {
     printf 'enroll-ssh-posix self-test: %s bundle failed\n' "$fixture_platform_name" >&2; return 1;
   }
-  bundle=$root/var/lib/machine-utilities-bootstrap/staged/$manifest
+  bundle=$root/var/lib/roundhouse-bootstrap/staged/$manifest
   /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$root/input/fleet-ca"
   ca=$root/input/fleet-ca.pub
   krl=$root/input/revoked.krl
@@ -2298,9 +2298,9 @@ selftest_run_fixture() {
     return 1
   fi
   /usr/bin/grep -Fqx 'state|revoked' "$root/revoke.out" &&
-    [ ! -e "$root/usr/local/libexec/machine-utilities/posix-dispatcher" ] &&
-    [ ! -e "$root/etc/ssh/sshd_config.d/10-machine-utilities-transport.conf" ] &&
-    [ ! -L "$root/etc/machine-utilities/ssh/active" ] || return 1
+    [ ! -e "$root/usr/local/libexec/roundhouse/posix-dispatcher" ] &&
+    [ ! -e "$root/etc/ssh/sshd_config.d/10-roundhouse-transport.conf" ] &&
+    [ ! -L "$root/etc/roundhouse/ssh/active" ] || return 1
 }
 
 self_test() {
@@ -2312,9 +2312,9 @@ self_test() {
   SSH_TTY=''
   SSH_ORIGINAL_COMMAND=''
   export SSH_CONNECTION SSH_CLIENT SSH_TTY SSH_ORIGINAL_COMMAND
-  raw_root=$(/usr/bin/mktemp -d /tmp/machine-utilities-u6-selftest.XXXXXX) || return 1
+  raw_root=$(/usr/bin/mktemp -d /tmp/roundhouse-u6-selftest.XXXXXX) || return 1
   selftest_root=$(CDPATH='' cd "$raw_root" && /bin/pwd -P) || return 1
-  printf 'machine-utilities-u6-selftest\n' >"$selftest_root/.u6-selftest-root"
+  printf 'roundhouse-u6-selftest\n' >"$selftest_root/.u6-selftest-root"
   /bin/chmod 0700 "$selftest_root"; /bin/chmod 0600 "$selftest_root/.u6-selftest-root"
   trap 'selftest_cleanup' EXIT HUP INT TERM
   linux_root=$selftest_root/linux; macos_root=$selftest_root/macos; wsl_root=$selftest_root/wsl

@@ -261,7 +261,7 @@ u2_path_set_digest() {
   u2_owner=$1
   shift
   u2_maximum=33554432
-  u2_listing=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-u2-path-set.XXXXXX") || return 1
+  u2_listing=$(mktemp "${TMPDIR:-/tmp}/roundhouse-u2-path-set.XXXXXX") || return 1
   : >"$u2_listing"
   while [ "$#" -gt 0 ]; do
     u2_label=$1
@@ -494,7 +494,7 @@ EOF
     }
     END{if(suite_count+codename_count<1||matches_distribution!=1||components_count!=1||matches!=1)exit 1}
   ' "$u2_release" || return 1
-  u2_gpgv_status=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-u2-gpgv-status.XXXXXX") || return 1
+  u2_gpgv_status=$(mktemp "${TMPDIR:-/tmp}/roundhouse-u2-gpgv-status.XXXXXX") || return 1
   chmod 0600 "$u2_gpgv_status" || { rm -f "$u2_gpgv_status"; return 1; }
   if env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       "$u2_authority_root/usr/bin/gpgv" --status-fd 3 --keyring "$u2_keyring" \
@@ -608,7 +608,7 @@ u2_validate_apt_context() {
     NF!=3||$1!="source"||$2!~/^[A-Za-z0-9][A-Za-z0-9._:+@,-]{0,255}$/||
       length($3)!=64||$3!~/^[0-9a-f]+$/||seen[$2]++||(previous!=""&&previous>=$0){exit 1}{previous=$0}' \
     "$u2_source_identities" || return 1
-  u2_effective_tmp=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-u2-apt.XXXXXX") || return 1
+  u2_effective_tmp=$(mktemp "${TMPDIR:-/tmp}/roundhouse-u2-apt.XXXXXX") || return 1
   if ! env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       APT_CONFIG="$u2_apt_config" "$u2_root/usr/bin/apt-config" dump >"$u2_effective_tmp" 2>/dev/null ||
     [ "$(sha256_file "$u2_effective_tmp")" != "$u2_effective_digest" ] ||
@@ -627,7 +627,7 @@ u2_validate_apt_context() {
   u2_observed_preconditions='[]'
   if awk -F '|' '$1=="action"&&$2=="apt.update-metadata.v1"&&$3=="posix-root-v1"&&$4=="enabled"{found=1}END{exit !found}' \
       "$u2_generation/policy.actions"; then
-    u2_metadata_tmp=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-u2-metadata.XXXXXX") || return 1
+    u2_metadata_tmp=$(mktemp "${TMPDIR:-/tmp}/roundhouse-u2-metadata.XXXXXX") || return 1
     if env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
         APT_CONFIG="$u2_apt_config" "$u2_root/usr/bin/apt-cache" policy >"$u2_metadata_tmp" 2>/dev/null &&
       [ "$(file_size "$u2_metadata_tmp")" -le 1048576 ]; then
@@ -711,7 +711,7 @@ u2_macos_receipt_version() {
   u2_pkgutil=$1
   u2_receipt=$2
   [[ $u2_receipt =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$ ]] || return 1
-  u2_output=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-pkg.XXXXXX") || return 1
+  u2_output=$(mktemp "${TMPDIR:-/tmp}/roundhouse-macos-pkg.XXXXXX") || return 1
   u2_error=$u2_output.error
   if ! env -i HOME=/var/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       "$u2_pkgutil" --pkg-info-plist "$u2_receipt" >"$u2_output" 2>"$u2_error"; then
@@ -752,7 +752,7 @@ u2_macos_pmset_snapshot() {
   u2_owner=$2
   u2_output=$3
   u2_pmset=$u2_root/usr/bin/pmset
-  u2_raw=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-pmset.XXXXXX") || return 1
+  u2_raw=$(mktemp "${TMPDIR:-/tmp}/roundhouse-macos-pmset.XXXXXX") || return 1
   if ! u2_validate_protected_ancestors "$u2_pmset" "$u2_owner" ||
     ! u2_file_ready "$u2_pmset" "$u2_owner" 33554432 || [ ! -x "$u2_pmset" ] ||
     ! env -i HOME=/nonexistent LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
@@ -836,8 +836,8 @@ u2_macos_setting_snapshot() {
 u2_macos_preconditions() {
   u2_generation=$1
   u2_root=$2
-  u2_values=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-preconditions.XXXXXX") || return 1
-  u2_pmset_values=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-pmset-values.XXXXXX") || {
+  u2_values=$(mktemp "${TMPDIR:-/tmp}/roundhouse-macos-preconditions.XXXXXX") || return 1
+  u2_pmset_values=$(mktemp "${TMPDIR:-/tmp}/roundhouse-macos-pmset-values.XXXXXX") || {
     rm -f "$u2_values"
     return 1
   }
@@ -971,7 +971,7 @@ emit_privilege_readiness() {
   expected_context_digest=
   if [ -f "$identity" ] && [ ! -L "$identity" ] &&
     ROUNDHOUSE_CONFIG="$config" ROUNDHOUSE_IDENTITY="$identity" \
-      "$script_dir/machine-utilities" validate-config >/dev/null 2>&1; then
+      "$script_dir/roundhouse" validate-config >/dev/null 2>&1; then
     node_identity_ready=true
     node_id=$(jq -r '.node_id' "$identity")
     fleet_domain=$(jq -r '.fleet_domain' "$identity")
@@ -1030,14 +1030,14 @@ emit_privilege_readiness() {
     u2_protected_owner=$(id -un)
   fi
   if [ "$platform" = macos ]; then
-    broker_system_path=/usr/local/libexec/machine-utilities/posix-broker
+    broker_system_path=/usr/local/libexec/roundhouse/posix-broker
   else
-    broker_system_path=/usr/libexec/machine-utilities/posix-broker
+    broker_system_path=/usr/libexec/roundhouse/posix-broker
   fi
   broker_path=$u2_root$broker_system_path
-  config_root=$u2_root/etc/machine-utilities
-  sudoers_path=$u2_root/etc/sudoers.d/machine-utilities-posix-broker
-  public_root=$u2_root/var/lib/machine-utilities-public
+  config_root=$u2_root/etc/roundhouse
+  sudoers_path=$u2_root/etc/sudoers.d/roundhouse-posix-broker
+  public_root=$u2_root/var/lib/roundhouse-public
   active_link=$config_root/active
   observed_broker_digest=
   observed_policy_digest=
@@ -1076,9 +1076,9 @@ emit_privilege_readiness() {
   route_binding_ready=true
   revoked_receipt=false
   artifact_any=false
-  lifecycle_lock=$u2_root/var/lib/machine-utilities-lifecycle.lock
-  lifecycle_recovery=$u2_root/var/lib/machine-utilities-lifecycle.recovery
-  lifecycle_drain=$u2_root/var/lib/machine-utilities/draining
+  lifecycle_lock=$u2_root/var/lib/roundhouse-lifecycle.lock
+  lifecycle_recovery=$u2_root/var/lib/roundhouse-lifecycle.recovery
+  lifecycle_drain=$u2_root/var/lib/roundhouse/draining
   lifecycle_activity=false
   lifecycle_activity_valid=true
   lifecycle_lock_present=false
@@ -1202,7 +1202,7 @@ emit_privilege_readiness() {
         broker_digest_path=$generation/broker.sha256
         broker_version_path=$generation/broker.version
         trust_root=$config_root/trust
-        constraints_inventory=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-constraints.XXXXXX")
+        constraints_inventory=$(mktemp "${TMPDIR:-/tmp}/roundhouse-constraints.XXXXXX")
         platform_files_ready=false
         if [ "$platform" = linux ]; then
           if u2_file_ready "$apt_context_path" "$u2_protected_owner" 65536 644 &&
@@ -1234,7 +1234,7 @@ emit_privilege_readiness() {
           u2_file_ready "$sudoers_path" "$u2_protected_owner" 4096 440 &&
           u2_file_ready "$public_root/enrollment" "$u2_protected_owner" 16384 644 &&
           u2_file_ready "$public_root/canary" "$u2_protected_owner" 16384 644 &&
-          "$script_dir/machine-utilities" inspect-privilege-constraints \
+          "$script_dir/roundhouse" inspect-privilege-constraints \
             "$policy_path" "$constraints_path" >"$constraints_inventory" 2>/dev/null; then
           observed_broker_digest=$(sha256_file "$broker_path")
           observed_policy_digest=$(sha256_file "$policy_path")
@@ -1393,7 +1393,7 @@ $protected_principal ALL=(root) NOPASSWD:NOSETENV: $broker_system_path --homebre
               [ "$protected_uid" = "$identity_uid" ] && [ "$protected_principal" = "$identity_principal" ] &&
               [ "$protected_endpoint_principals" = "$identity_endpoint_principals" ] &&
               [ "$protected_ca_fingerprint" = "$observed_ca_fingerprint" ] &&
-              [ "$protected_endpoint_principals" = machine-utilities-posix,machine-utilities-windows ] &&
+              [ "$protected_endpoint_principals" = roundhouse-posix,roundhouse-windows ] &&
               printf '%s' "$protected_uid" | grep -Eq '^[1-9][0-9]{0,9}$' &&
               [ "$canary_broker_digest" = "$observed_broker_digest" ] &&
               [ "$canary_sudoers_digest" = "$receipt_sudoers_digest" ] &&
@@ -1598,7 +1598,7 @@ run_auth_health() {
     auth_health_status=unavailable
     return
   fi
-  args_file=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-auth-args.XXXXXX")
+  args_file=$(mktemp "${TMPDIR:-/tmp}/roundhouse-auth-args.XXXXXX")
   chmod 600 "$args_file"
   printf '%s' "$entry" | jq -j '.value.verify[1:][]? | . + "\u0000"' >"$args_file"
   xargs -0 "$verify_command" <"$args_file" >/dev/null 2>&1 &
@@ -1884,7 +1884,7 @@ if has_section packages; then
     case $manager in
       homebrew|linuxbrew)
         if command -v brew >/dev/null 2>&1; then
-          package_tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-packages.XXXXXX")
+          package_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-packages.XXXXXX")
           installed_formulae="$package_tmp/formulae.tsv"
           installed_casks="$package_tmp/casks.tsv"
           candidate_formulae="$package_tmp/formulae-candidates.tsv"
@@ -1926,7 +1926,7 @@ if has_section packages; then
         ;;
       apt)
         if command -v dpkg-query >/dev/null 2>&1; then
-          package_tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-packages.XXXXXX")
+          package_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-packages.XXXXXX")
           installed_apt="$package_tmp/installed.tsv"
           candidate_apt="$package_tmp/candidates.tsv"
           : >"$candidate_apt"
@@ -2756,7 +2756,7 @@ if has_section startup; then
       ;;
   esac
   if command -v crontab >/dev/null 2>&1; then
-    cron_file=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-cron.XXXXXX")
+    cron_file=$(mktemp "${TMPDIR:-/tmp}/roundhouse-cron.XXXXXX")
     chmod 600 "$cron_file"
     if crontab -l >"$cron_file" 2>/dev/null; then
       cron_entries=$(awk 'NF && $1 !~ /^#/ {count++} END {print count+0}' "$cron_file")
@@ -2795,7 +2795,7 @@ if has_section chezmoi; then
     emit file chezmoi:source absent medium "$(jq -cn --arg path "$source_path" '{role:"chezmoi-source",path:$path}')"
   fi
   if command -v chezmoi >/dev/null 2>&1; then
-    chezmoi_status=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-chezmoi.XXXXXX")
+    chezmoi_status=$(mktemp "${TMPDIR:-/tmp}/roundhouse-chezmoi.XXXXXX")
     chmod 600 "$chezmoi_status"
     if chezmoi status >"$chezmoi_status" 2>/dev/null; then
       drift_count=$(awk 'NF {count++} END {print count+0}' "$chezmoi_status")

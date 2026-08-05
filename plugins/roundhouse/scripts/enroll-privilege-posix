@@ -66,16 +66,16 @@ readonly protected_group
   exit 77
 }
 
-readonly config_root=$root_prefix/etc/machine-utilities
-readonly state_root=$root_prefix/var/lib/machine-utilities
+readonly config_root=$root_prefix/etc/roundhouse
+readonly state_root=$root_prefix/var/lib/roundhouse
 if [ "$platform_boundary" = macos ]; then
-  readonly broker_system_path=/usr/local/libexec/machine-utilities/posix-broker
+  readonly broker_system_path=/usr/local/libexec/roundhouse/posix-broker
 else
-  readonly broker_system_path=/usr/libexec/machine-utilities/posix-broker
+  readonly broker_system_path=/usr/libexec/roundhouse/posix-broker
 fi
 readonly broker_path=$root_prefix$broker_system_path
-readonly sudoers_path=$root_prefix/etc/sudoers.d/machine-utilities-posix-broker
-readonly bootstrap_root=$root_prefix/var/lib/machine-utilities-bootstrap
+readonly sudoers_path=$root_prefix/etc/sudoers.d/roundhouse-posix-broker
+readonly bootstrap_root=$root_prefix/var/lib/roundhouse-bootstrap
 readonly ssh_keygen=/usr/bin/ssh-keygen
 readonly revocation_reserve_bytes=1048576
 readonly revocation_reserve_provision_bytes=4194304
@@ -112,7 +112,7 @@ capture_current_process_id() {
     # function body. A directly spawned child observes the actual calling
     # shell as its PPID. The probe uses only the native system shell and a
     # protected, single-use file; this is the production path for macOS Bash 3.
-    pid_file=$(/usr/bin/mktemp "$root_prefix/var/lib/.machine-utilities-pid.XXXXXX") || return 1
+    pid_file=$(/usr/bin/mktemp "$root_prefix/var/lib/.roundhouse-pid.XXXXXX") || return 1
     /bin/chmod 0600 "$pid_file" || { /bin/rm -f "$pid_file"; return 1; }
     protected_file "$pid_file" 128 && exact_mode "$pid_file" 600 || {
       /bin/rm -f "$pid_file"
@@ -285,10 +285,10 @@ verify_bootstrap_bundle() {
   receipt=$bootstrap_root/receipts/$manifest_digest
   protected_file "$receipt" 1024 || return 1
   [ "$(/usr/bin/sed -n '1p' "$receipt")" = \
-    "bootstrap|1|manifest-sha256=$manifest_digest|release-principal=machine-utilities-release" ] || return 1
+    "bootstrap|1|manifest-sha256=$manifest_digest|release-principal=roundhouse-release" ] || return 1
   system_ssh_keygen_digest >/dev/null || return 1
   "$ssh_keygen" -Y verify -f "$bootstrap_root/release-allowed-signers" \
-    -I machine-utilities-release -n machine-utilities-release \
+    -I roundhouse-release -n roundhouse-release \
     -s "$bundle/bootstrap.manifest.sig" <"$bundle/bootstrap.manifest" >/dev/null 2>&1 || return 1
 
   previous=
@@ -555,7 +555,7 @@ validate_host_and_context() {
     [[ $ca_fingerprint =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] &&
     [[ $ca_generation =~ ^[1-9][0-9]{0,9}$ ]] &&
     [[ $host_fingerprint =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] &&
-    [ "$endpoint_principals" = machine-utilities-posix,machine-utilities-windows ] || return 1
+    [ "$endpoint_principals" = roundhouse-posix,roundhouse-windows ] || return 1
   [ "$(/usr/bin/wc -l <"$bundle/host.identity" | /usr/bin/tr -d ' ')" = 1 ] || return 1
   [ "$(/usr/bin/sed -n '1p' "$bundle/context.canary")" = \
     "context|1|platform=$platform_boundary|required=$required_context|principal=root|console-session=none" ] &&
@@ -592,7 +592,7 @@ path_identity_mode() {
 
 path_set_digest() {
   local listing label candidate member relative answer maximum
-  listing=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/machine-utilities-path-set.XXXXXX") || return 1
+  listing=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/roundhouse-path-set.XXXXXX") || return 1
   : >"$listing" || { /bin/rm -f "$listing"; return 1; }
   while [ "$#" -gt 0 ]; do
     label=$1
@@ -795,7 +795,7 @@ validate_apt_source_authority() {
     }
     END{if(suite_count+codename_count<1||matches_distribution!=1||components_count!=1||matches!=1)exit 1}
   ' "$release" || return 1
-  status_file=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/machine-utilities-gpgv-status.XXXXXX") || return 1
+  status_file=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/roundhouse-gpgv-status.XXXXXX") || return 1
   /bin/chmod 0600 "$status_file" || { /bin/rm -f "$status_file"; return 1; }
   if /usr/bin/env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       "$root_prefix/usr/bin/gpgv" --status-fd 3 --keyring "$keyring" "$signature" "$release" \
@@ -925,7 +925,7 @@ validate_apt_context() {
     {previous=$0}
   ' "$bundle/apt/source-identities" || return 1
 
-  effective_dump=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/machine-utilities-apt-dump.XXXXXX") || return 1
+  effective_dump=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/roundhouse-apt-dump.XXXXXX") || return 1
   if ! /usr/bin/env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       APT_CONFIG="$bundle/apt.conf" "$root_prefix/usr/bin/apt-config" dump >"$effective_dump" 2>/dev/null ||
     [ "$(sha256_file "$effective_dump")" != "$effective_config_digest" ]; then
@@ -1010,7 +1010,7 @@ validate_public_enrollment_receipt() {
   local receipt_constraints receipt_identity receipt_context receipt_platform receipt_artifacts receipt_sudoers
   local receipt_ca receipt_signers receipt_krl receipt_uid receipt_principal receipt_endpoints
   local expected_context_label expected_artifacts_label
-  receipt=$root_prefix/var/lib/machine-utilities-public/enrollment
+  receipt=$root_prefix/var/lib/roundhouse-public/enrollment
   protected_file "$receipt" 8192 && exact_mode "$receipt" 644 || return 1
   /usr/bin/awk -F '|' '
     function digest(v){return length(v)==64&&v~/^[0-9a-f]+$/}
@@ -1088,7 +1088,7 @@ validate_public_enrollment_receipt() {
 
 validate_public_canary_receipt() {
   local expected_epoch=$1 canary scope broker_digest sudoers_digest digest_line sudoers_line
-  canary=$root_prefix/var/lib/machine-utilities-public/canary
+  canary=$root_prefix/var/lib/roundhouse-public/canary
   protected_file "$canary" 4096 && exact_mode "$canary" 644 || return 1
   /usr/bin/awk -F '|' -v platform="$platform_boundary" '
     $0!~/^[ -~]+$/||length($0)>512{exit 1}
@@ -1152,8 +1152,8 @@ validate_coherent_enrollment() {
     protected_directory "$config_root/generations" && exact_mode "$config_root/generations" 755 &&
     protected_directory "$config_root/trust" && exact_mode "$config_root/trust" 755 &&
     protected_directory "$state_root" && exact_mode "$state_root" 700 &&
-    protected_directory "$root_prefix/var/lib/machine-utilities-public" &&
-    exact_mode "$root_prefix/var/lib/machine-utilities-public" 755 &&
+    protected_directory "$root_prefix/var/lib/roundhouse-public" &&
+    exact_mode "$root_prefix/var/lib/roundhouse-public" 755 &&
     protected_directory "$generation" && exact_mode "$generation" 755 || return 1
   [ -L "$config_root/active" ] && [ "$(symlink_owner "$config_root/active")" = "$protected_owner" ] &&
     [ "$(/usr/bin/readlink "$config_root/active")" = "generations/$expected_epoch" ] || return 1
@@ -1219,7 +1219,7 @@ validate_unenrolled_state() {
   local path enrollment
   for path in "$config_root/active" "$broker_path" "$sudoers_path" \
     "$config_root/trust/fleet-ca.pub" "$config_root/trust/allowed_signers" \
-    "$config_root/trust/revoked.krl" "$root_prefix/var/lib/machine-utilities-public/canary" \
+    "$config_root/trust/revoked.krl" "$root_prefix/var/lib/roundhouse-public/canary" \
     "$revocation_reserve"; do
     [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
   done
@@ -1228,7 +1228,7 @@ validate_unenrolled_state() {
   elif [ -e "$config_root/generations" ] || [ -L "$config_root/generations" ]; then
     return 1
   fi
-  enrollment=$root_prefix/var/lib/machine-utilities-public/enrollment
+  enrollment=$root_prefix/var/lib/roundhouse-public/enrollment
   if [ -e "$enrollment" ] || [ -L "$enrollment" ]; then
     protected_file "$enrollment" 4096 && exact_mode "$enrollment" 644 || return 1
     /usr/bin/awk -F '|' '
@@ -1309,7 +1309,7 @@ preview_bundle() {
 validate_os_ancestors() {
   local ancestor broker_parent
   if [ -n "$root_prefix" ]; then protected_directory "$root_prefix" || return 1; fi
-  broker_parent=${broker_path%/machine-utilities/posix-broker}
+  broker_parent=${broker_path%/roundhouse/posix-broker}
   for ancestor in "$root_prefix/etc" "$root_prefix/etc/sudoers.d" "$root_prefix/usr" \
     "$root_prefix/var" "$root_prefix/var/lib"; do
     protected_directory "$ancestor" || return 1
@@ -1353,7 +1353,7 @@ ensure_application_layout() {
   for state_directory in replay journal audit lock rollback quarantine; do
     ensure_application_directory "$state_root/$state_directory" 0700 || return 1
   done
-  ensure_application_directory "$root_prefix/var/lib/machine-utilities-public" 0755
+  ensure_application_directory "$root_prefix/var/lib/roundhouse-public" 0755
 }
 
 remove_created_directories() {
@@ -1409,7 +1409,7 @@ lifecycle_owner_state() {
 acquire_lifecycle_guard() {
   local owner_pid guard_pid guard_rc
   capture_current_process_id owner_pid || return 74
-  lifecycle_guard=$root_prefix/var/lib/machine-utilities-lifecycle.guard
+  lifecycle_guard=$root_prefix/var/lib/roundhouse-lifecycle.guard
   lifecycle_guard_owned=false
   lifecycle_guard_method=
   if [ "$fixture_mode" = true ]; then
@@ -1625,11 +1625,11 @@ acquire_lifecycle_lock() {
     lifecycle_lock_reason=lifecycle_owner_identity_failed
     return 74
   }
-  lifecycle_lock=$root_prefix/var/lib/machine-utilities-lifecycle.lock
-  lifecycle_recovery=$root_prefix/var/lib/machine-utilities-lifecycle.recovery
-  lifecycle_prepare=$root_prefix/var/lib/.machine-utilities-lifecycle.lock.prepare
-  lifecycle_lock_retired=$root_prefix/var/lib/.machine-utilities-lifecycle.lock.retired
-  lifecycle_recovery_retired=$root_prefix/var/lib/.machine-utilities-lifecycle.recovery.retired
+  lifecycle_lock=$root_prefix/var/lib/roundhouse-lifecycle.lock
+  lifecycle_recovery=$root_prefix/var/lib/roundhouse-lifecycle.recovery
+  lifecycle_prepare=$root_prefix/var/lib/.roundhouse-lifecycle.lock.prepare
+  lifecycle_lock_retired=$root_prefix/var/lib/.roundhouse-lifecycle.lock.retired
+  lifecycle_recovery_retired=$root_prefix/var/lib/.roundhouse-lifecycle.recovery.retired
   lifecycle_lock_reason=lifecycle_operation_in_progress
   if acquire_lifecycle_guard; then guard_rc=0
   else guard_rc=$?
@@ -2101,8 +2101,8 @@ cleanup_install_artifacts() {
     "$state_root/.sudoers.$prefix" "$state_root/.enrollment-receipt.$prefix" \
     "$state_root/.canary-receipt.$prefix" "$state_root/.canary-output.$prefix" \
     "$state_root/.direct-output.$prefix" "$config_root/.active.$prefix" \
-    "$root_prefix/var/lib/machine-utilities-public/.enrollment.$prefix" \
-    "$root_prefix/var/lib/machine-utilities-public/.canary.$prefix"; do
+    "$root_prefix/var/lib/roundhouse-public/.enrollment.$prefix" \
+    "$root_prefix/var/lib/roundhouse-public/.canary.$prefix"; do
     if [ -L "$temporary" ]; then
       [ "$temporary" = "$config_root/.active.$prefix" ] &&
         [ "$(symlink_owner "$temporary")" = "$protected_owner" ] &&
@@ -2129,8 +2129,8 @@ restore_install_snapshot() {
       fleet_ca) restore_path "$label" "$config_root/trust/fleet-ca.pub" ;;
       allowed_signers) restore_path "$label" "$config_root/trust/allowed_signers" ;;
       revoked_krl) restore_path "$label" "$config_root/trust/revoked.krl" ;;
-      public_enrollment) restore_path "$label" "$root_prefix/var/lib/machine-utilities-public/enrollment" ;;
-      public_canary) restore_path "$label" "$root_prefix/var/lib/machine-utilities-public/canary" ;;
+      public_enrollment) restore_path "$label" "$root_prefix/var/lib/roundhouse-public/enrollment" ;;
+      public_canary) restore_path "$label" "$root_prefix/var/lib/roundhouse-public/canary" ;;
     esac || return 1
   done
 }
@@ -2147,7 +2147,7 @@ quarantine_member_ready() {
 
 validate_revoked_receipt() {
   local expected_epoch=$1 expected_manifest=$2 receipt scope
-  receipt=$root_prefix/var/lib/machine-utilities-public/enrollment
+  receipt=$root_prefix/var/lib/roundhouse-public/enrollment
   protected_file "$receipt" 4096 && exact_mode "$receipt" 644 || return 1
   /usr/bin/awk -F '|' '
     NR==1{if($0!="enrollment-receipt|2")exit 1;next}
@@ -2172,7 +2172,7 @@ validate_completed_revocation() {
   for member in "$broker_path" "$sudoers_path" "$config_root/active" \
     "$config_root/generations/$expected_epoch" "$config_root/trust/fleet-ca.pub" \
     "$config_root/trust/allowed_signers" "$config_root/trust/revoked.krl" \
-    "$root_prefix/var/lib/machine-utilities-public/canary"; do
+    "$root_prefix/var/lib/roundhouse-public/canary"; do
     [ ! -e "$member" ] && [ ! -L "$member" ] || return 1
   done
   protected_directory "$quarantine" && exact_mode "$quarantine" 700 || return 1
@@ -2201,8 +2201,8 @@ validate_completed_revocation() {
 restore_revoke_quarantine() {
   local quarantine=$1 index live quarantined
   local -a live_paths=(
-    "$root_prefix/var/lib/machine-utilities-public/enrollment"
-    "$root_prefix/var/lib/machine-utilities-public/canary"
+    "$root_prefix/var/lib/roundhouse-public/enrollment"
+    "$root_prefix/var/lib/roundhouse-public/canary"
     "$sudoers_path" "$broker_path" "$config_root/active"
     "$config_root/generations/$recovery_from"
     "$config_root/trust/fleet-ca.pub" "$config_root/trust/allowed_signers" "$config_root/trust/revoked.krl"
@@ -2338,7 +2338,7 @@ recover_install_transaction() {
 cleanup_revoke_temporary() {
   local temporary
   for temporary in "$state_root/.revoked-status.$recovery_id" \
-    "$root_prefix/var/lib/machine-utilities-public/.enrollment.$recovery_id"; do
+    "$root_prefix/var/lib/roundhouse-public/.enrollment.$recovery_id"; do
     if [ -e "$temporary" ] || [ -L "$temporary" ]; then
       protected_file "$temporary" 33554432 || return 1
       /bin/rm -f "$temporary" || return 1
@@ -2439,7 +2439,7 @@ u2_pause() {
 
 publish_public_file() {
   local source=$1 destination=$2 public_root public_tmp suffix
-  public_root=$root_prefix/var/lib/machine-utilities-public
+  public_root=$root_prefix/var/lib/roundhouse-public
   suffix=${transaction_id:-$$}
   public_tmp=$public_root/.$destination.$suffix
   /bin/cp "$source" "$public_tmp" && /bin/chmod 0644 "$public_tmp" || return 1
@@ -2642,11 +2642,11 @@ install_bundle() (
     "$config_root/trust/fleet-ca.pub.rollback.$transaction_id" \
     "$config_root/trust/allowed_signers.rollback.$transaction_id" \
     "$config_root/trust/revoked.krl.rollback.$transaction_id" \
-    "$root_prefix/var/lib/machine-utilities-public/enrollment.rollback.$transaction_id" \
-    "$root_prefix/var/lib/machine-utilities-public/canary.rollback.$transaction_id" \
+    "$root_prefix/var/lib/roundhouse-public/enrollment.rollback.$transaction_id" \
+    "$root_prefix/var/lib/roundhouse-public/canary.rollback.$transaction_id" \
     "$state_root/.canary-output.$transaction_id" "$state_root/.direct-output.$transaction_id" \
-    "$root_prefix/var/lib/machine-utilities-public/.enrollment.$transaction_id" \
-    "$root_prefix/var/lib/machine-utilities-public/.canary.$transaction_id" "$draining" || {
+    "$root_prefix/var/lib/roundhouse-public/.enrollment.$transaction_id" \
+    "$root_prefix/var/lib/roundhouse-public/.canary.$transaction_id" "$draining" || {
     result drifted transaction_artifact_collision linux
     exit 74
   }
@@ -2696,8 +2696,8 @@ install_bundle() (
   snapshot_path fleet_ca "$config_root/trust/fleet-ca.pub"
   snapshot_path allowed_signers "$config_root/trust/allowed_signers"
   snapshot_path revoked_krl "$config_root/trust/revoked.krl"
-  snapshot_path public_enrollment "$root_prefix/var/lib/machine-utilities-public/enrollment"
-  snapshot_path public_canary "$root_prefix/var/lib/machine-utilities-public/canary"
+  snapshot_path public_enrollment "$root_prefix/var/lib/roundhouse-public/enrollment"
+  snapshot_path public_canary "$root_prefix/var/lib/roundhouse-public/canary"
   durable_sync
   validate_backup "$current_epoch" || { result drifted rollback_snapshot_invalid linux; exit 74; }
   write_transaction_phase snapshotted || { result drifted transaction_phase_write_failed linux; exit 74; }
@@ -2893,7 +2893,7 @@ revoke_bundle() (
   local lifecycle_owned=false lifecycle_operation=revoke preserve_drain=false durable_commit=false
   local lifecycle_lock_reason=''
   local transaction_started=false rollback_ok=true drain_owned=false draining='' drain_record='' quarantine=''
-  local public_root=$root_prefix/var/lib/machine-utilities-public status_temp='' rc
+  local public_root=$root_prefix/var/lib/roundhouse-public status_temp='' rc
   local transaction_operation='' transaction_id='' transaction_boot='' transaction_start='' transaction_from=''
   local transaction_to='' transaction_manifest='' transaction_confirmation='' transaction_phase=''
   created_directories=()
@@ -2996,7 +2996,7 @@ revoke_bundle() (
   draining=$state_root/draining
   preflight_transaction_artifacts "$quarantine" "$status_temp" \
     "$(artifact_prepare_path "$quarantine")" \
-    "$root_prefix/var/lib/machine-utilities-public/.enrollment.$transaction_id" "$draining" || {
+    "$root_prefix/var/lib/roundhouse-public/.enrollment.$transaction_id" "$draining" || {
     result drifted transaction_artifact_collision linux
     exit 74
   }

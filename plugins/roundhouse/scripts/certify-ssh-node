@@ -396,7 +396,7 @@ signer_root_for_current_user() {
   [ -n "$base" ] || return 1
   case $base in /*) ;; *) return 1 ;; esac
   base=${base%/}
-  printf '%s/machine-utilities-signer' "$base"
+  printf '%s/roundhouse-signer' "$base"
 }
 sha256_file() {
   if [ -x /usr/bin/sha256sum ]; then
@@ -447,7 +447,7 @@ create_exact_link() {
 }
 private_temp_directory() {
   local directory
-  directory=$(/usr/bin/mktemp -d /tmp/machine-utilities-certify.XXXXXX 2>/dev/null) || return 1
+  directory=$(/usr/bin/mktemp -d /tmp/roundhouse-certify.XXXXXX 2>/dev/null) || return 1
   directory=$(canonical_directory "$directory") || { /bin/rm -rf "$directory" >/dev/null 2>&1; return 1; }
   normalise_created_directory "$directory" || { /bin/rm -rf "$directory" >/dev/null 2>&1; return 1; }
   printf '%s' "$directory"
@@ -593,7 +593,7 @@ parse_csr() {
   local file=$1 lines temp_dir scratch normalised
   [ -f "$file" ] && [ ! -L "$file" ] && ascii_record "$file" 16384 || return 1
   lines=$(/usr/bin/wc -l <"$file" | /usr/bin/tr -d ' ')
-  [ "$lines" = 9 ] && [ "$(/usr/bin/sed -n '1p' "$file")" = 'machine-utilities-ssh-csr|1' ] &&
+  [ "$lines" = 9 ] && [ "$(/usr/bin/sed -n '1p' "$file")" = 'roundhouse-ssh-csr|1' ] &&
     [ "$(/usr/bin/sed -n '9p' "$file")" = 'end-csr|' ] || return 1
   csr_domain=$(field "$file" 2 fleet-domain) || return 1
   csr_node_id=$(field "$file" 3 node-id) || return 1
@@ -630,8 +630,8 @@ native_canary_receipt_path() {
     return
   fi
   case $(platform_boundary) in
-    macos) printf '%s' /var/db/machine-utilities-bootstrap/ca-isolation.receipt ;;
-    linux) printf '%s' /var/lib/machine-utilities-bootstrap/ca-isolation.receipt ;;
+    macos) printf '%s' /var/db/roundhouse-bootstrap/ca-isolation.receipt ;;
+    linux) printf '%s' /var/lib/roundhouse-bootstrap/ca-isolation.receipt ;;
     *) return 1 ;;
   esac
 }
@@ -639,7 +639,7 @@ parse_policy() {
   local file=$1 lines
   owner_file "$file" 8192 && ascii_record "$file" 8192 || return 1
   lines=$(/usr/bin/wc -l <"$file" | /usr/bin/tr -d ' ')
-  [ "$lines" = 13 ] && [ "$(/usr/bin/sed -n '1p' "$file")" = 'machine-utilities-ssh-signer-policy|2' ] &&
+  [ "$lines" = 13 ] && [ "$(/usr/bin/sed -n '1p' "$file")" = 'roundhouse-ssh-signer-policy|2' ] &&
     [ "$(/usr/bin/sed -n '13p' "$file")" = 'end-policy|' ] || return 1
   policy_domain=$(field "$file" 2 fleet-domain) || return 1
   policy_ca_fingerprint=$(field "$file" 3 fleet-ca-fingerprint) || return 1
@@ -795,7 +795,7 @@ find_agent_peer() {
         ascii_record "$native_receipt_canonical" 8192 || return 1
       lines=$(/usr/bin/wc -l <"$native_receipt_canonical" | /usr/bin/tr -d ' ')
       [ "$lines" = 26 ] &&
-        [ "$(/usr/bin/sed -n '1p' "$native_receipt_canonical")" = 'machine-utilities-ca-isolation|2' ] &&
+        [ "$(/usr/bin/sed -n '1p' "$native_receipt_canonical")" = 'roundhouse-ca-isolation|2' ] &&
         [ "$(/usr/bin/sed -n '26p' "$native_receipt_canonical")" = 'end-ca-isolation|' ] || return 1
       candidates=$(field "$native_receipt_canonical" 15 agent-peer-pid) || return 1
     fi
@@ -840,7 +840,7 @@ verify_native_ca_isolation() {
   receipt=$native_receipt_canonical
   ascii_record "$receipt" 8192 || return 1
   lines=$(/usr/bin/wc -l <"$receipt" | /usr/bin/tr -d ' ')
-  [ "$lines" = 26 ] && [ "$(/usr/bin/sed -n '1p' "$receipt")" = 'machine-utilities-ca-isolation|2' ] &&
+  [ "$lines" = 26 ] && [ "$(/usr/bin/sed -n '1p' "$receipt")" = 'roundhouse-ca-isolation|2' ] &&
     [ "$(/usr/bin/sed -n '26p' "$receipt")" = 'end-ca-isolation|' ] || return 1
   [ "$(field "$receipt" 2 signer-account)" = "$policy_signer_account" ] &&
     [ "$(field "$receipt" 2 signer-account)" = "$(/usr/bin/id -un)" ] &&
@@ -953,7 +953,7 @@ prepare_context() {
   verify_native_ca_isolation
 }
 manifest() {
-  record 'machine-utilities-ssh-certificate-manifest|1' \
+  record 'roundhouse-ssh-certificate-manifest|1' \
     "fleet-domain|$csr_domain" "node-id|$csr_node_id" "node-key-fingerprint|$csr_fingerprint" \
     "signing-principal|$csr_signing_principal" "certificate-principals|$signing_principals" \
     "source-addresses|$csr_sources" "fleet-ca-fingerprint|$policy_ca_fingerprint" \
@@ -1071,7 +1071,7 @@ parse_sign_candidate() {
   local file=$1 expected_links=$2 lines expected_next
   owner_file_with_links "$file" 4096 "$expected_links" && ascii_record "$file" 4096 || return 1
   lines=$(/usr/bin/wc -l <"$file" | /usr/bin/tr -d ' ')
-  [ "$lines" = 13 ] && [ "$(/usr/bin/sed -n '1p' "$file")" = 'machine-utilities-sign-transaction|2' ] &&
+  [ "$lines" = 13 ] && [ "$(/usr/bin/sed -n '1p' "$file")" = 'roundhouse-sign-transaction|2' ] &&
     [ "$(/usr/bin/sed -n '13p' "$file")" = 'end-sign-transaction|' ] || return 1
   transaction_id=$(field "$file" 2 transaction-id) || return 1
   transaction_owner=$(field "$file" 3 owner) || return 1
@@ -1237,7 +1237,7 @@ create_sign_transaction() {
   owned_sign_pid=$$
   owned_sign_process_start=$(process_start_identity "$$") || return 65
   owned_sign_boot_identity=$(current_boot_identity) || return 65
-  record 'machine-utilities-sign-transaction|2' "transaction-id|$suffix" \
+  record 'roundhouse-sign-transaction|2' "transaction-id|$suffix" \
     "owner|$(/usr/bin/id -un)" "pid|$$" "process-start|$owned_sign_process_start" \
     "boot-identity|$owned_sign_boot_identity" "candidate-device-inode|$candidate_id" \
     "stage|${stage##*/}" "stage-device-inode|$stage_id" "serial|$serial" \
@@ -1379,7 +1379,7 @@ cleanup_bootstrap_csr() {
     [ -n "$bootstrap_csr_dir_id" ] || return 1
   [ "${bootstrap_csr_dir%/*}" = "$bootstrap_csr_parent" ] || return 1
   base=${bootstrap_csr_dir##*/}
-  [[ $base =~ ^machine-utilities-certify\.[0-9a-f]{12}$ ]] || return 1
+  [[ $base =~ ^roundhouse-certify\.[0-9a-f]{12}$ ]] || return 1
   [ -d "$bootstrap_csr_dir" ] && [ ! -L "$bootstrap_csr_dir" ] &&
     [ "$(file_owner "$bootstrap_csr_dir")" = "$(/usr/bin/id -un)" ] &&
     [ "$(file_device_inode "$bootstrap_csr_dir")" = "$bootstrap_csr_dir_id" ] || return 1
@@ -1402,7 +1402,7 @@ create_command_csr() {
   defer_bootstrap_signals
   while [ "$attempts" -lt 32 ]; do
     printf -v suffix '%04x%04x%04x' "$RANDOM" "$RANDOM" "$RANDOM"
-    bootstrap_csr_dir=$bootstrap_csr_parent/machine-utilities-certify.$suffix
+    bootstrap_csr_dir=$bootstrap_csr_parent/roundhouse-certify.$suffix
     bootstrap_csr_dir_id=
     if /bin/mkdir "$bootstrap_csr_dir" 2>/dev/null; then break; fi
     bootstrap_csr_dir=
@@ -1669,12 +1669,12 @@ sign_certificate() {
   clear_owned_sign_stage || { cleanup_owned_signer_artifacts || :; return 65; }
   fixture_transition stage-removed || { cleanup_owned_signer_artifacts || :; return 65; }
   release_owned_sign_claim || { cleanup_owned_signer_artifacts || :; return 65; }
-  record 'machine-utilities-ssh-certificate|1' \
+  record 'roundhouse-ssh-certificate|1' \
     "fleet-domain|$csr_domain" "node-id|$csr_node_id" "node-key-fingerprint|$csr_fingerprint" \
     "fleet-ca-fingerprint|$policy_ca_fingerprint" "ca-generation|$policy_generation" "serial|$serial" \
     "certificate-principals|$signing_principals" "source-addresses|$csr_sources" \
     "certificate|$certificate_public" 'extensions|cleared' 'end-certificate|'
-  record 'machine-utilities-ssh-certificate-contract|1' \
+  record 'roundhouse-ssh-certificate-contract|1' \
     "fleet-ca-fingerprint|$policy_ca_fingerprint" "ca-generation|$policy_generation" \
     "certificate-serial|$serial" "certificate-valid-after|$certificate_after" \
     "certificate-valid-before|$certificate_before" "certificate-principals|$signing_principals" \
@@ -1722,7 +1722,7 @@ write_fixture_native_receipt() {
   issued=$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
   expires=$(fixture_expiry_utc) || return 1
   temporary=$(/usr/bin/mktemp "${receipt%/*}/.receipt.XXXXXXXX" 2>/dev/null) || return 1
-  if ! record 'machine-utilities-ca-isolation|2' \
+  if ! record 'roundhouse-ca-isolation|2' \
       "signer-account|$policy_signer_account" "ordinary-account|$policy_ordinary_account" \
       "signer-helper-path|$signer_root/$helper_name" "signer-helper-sha256|$helper_digest" \
       "signer-policy-sha256|$policy_digest" \
@@ -2004,13 +2004,13 @@ self_test() {
   "$ssh_keygen" -q -t ed25519 -N '' -f "$key" || return 1
   public=$(/usr/bin/awk 'NF>=2 {print $1 " " $2; exit}' "$key.pub")
   request=$root/request
-  record 'machine-utilities-ssh-csr|1' 'fleet-domain|fleet.example' 'node-id|node-a' \
+  record 'roundhouse-ssh-csr|1' 'fleet-domain|fleet.example' 'node-id|node-a' \
     "public-key|$public" "node-key-fingerprint|$(key_fingerprint "$key.pub")" \
     'signing-principal|node-a@fleet.example' 'endpoint-principals|mu-posix,mu-request' \
     'source-addresses|10.0.0.0/8,192.0.2.0/24' 'end-csr|' >"$request"
   [ "$(file_size "$request")" = 363 ] && parse_csr "$request" || return 1
   invalid_ingress=$root/invalid-ingress
-  /usr/bin/sed '1s/machine-utilities-ssh-csr|1/machine-utilities-ssh-csr|0/' \
+  /usr/bin/sed '1s/roundhouse-ssh-csr|1/roundhouse-ssh-csr|0/' \
     "$request" >"$invalid_ingress" || return 1
   for ingress_command in preview sign; do
     for input_kind in pipe file fifo; do
@@ -2087,7 +2087,7 @@ self_test() {
   [ -S "$agent_socket" ] || return 1
   SSH_AUTH_SOCK="$agent_socket" /usr/bin/ssh-add "$ca_key" >/dev/null 2>&1 || return 1
   peer_digest=$(sha256_file /usr/bin/ssh-agent) || return 1
-  record 'machine-utilities-ssh-signer-policy|2' \
+  record 'roundhouse-ssh-signer-policy|2' \
     'fleet-domain|fleet.example' "fleet-ca-fingerprint|$ca_fingerprint" 'ca-generation|1' \
     'validity-seconds|3600' 'endpoint-principals|mu-posix,mu-request' \
     'source-addresses|10.0.0.0/8,192.0.2.0/24' "agent-socket|$agent_socket" \
@@ -2127,8 +2127,8 @@ self_test() {
   fixture_output=$root/fixture-sign.out
   fixture_sign_worker "$self_path" "$root" "$fixture_receipt" "$helper_copy" "$agent_socket" \
     "$request" "$manifest_confirmation" >"$fixture_output" || return 1
-  [ "$(/usr/bin/grep -Fxc 'machine-utilities-ssh-certificate|1' "$fixture_output")" = 1 ] || return 1
-  [ "$(/usr/bin/grep -Fxc 'machine-utilities-ssh-certificate-contract|1' "$fixture_output")" = 1 ] || return 1
+  [ "$(/usr/bin/grep -Fxc 'roundhouse-ssh-certificate|1' "$fixture_output")" = 1 ] || return 1
+  [ "$(/usr/bin/grep -Fxc 'roundhouse-ssh-certificate-contract|1' "$fixture_output")" = 1 ] || return 1
   [[ $(/bin/cat "$fixture_output") != *"$private_material"* ]] || return 1
   ! /usr/bin/grep -F "$root" "$fixture_output" >/dev/null || return 1
   [ "$(read_serial)" = 2 ] || return 1
@@ -2294,7 +2294,7 @@ self_test() {
       fixture_result=$?
     fi
     [ "$fixture_result" = 137 ] && [ -s "$control/$crash_phase" ] || return 1
-    ! /usr/bin/grep -Eq 'machine-utilities-ssh-certificate(\||-contract)' "$crash_output" || return 1
+    ! /usr/bin/grep -Eq 'roundhouse-ssh-certificate(\||-contract)' "$crash_output" || return 1
     ! /usr/bin/grep -F "$root" "$crash_output" "$crash_error" >/dev/null || return 1
     fixture_recover_worker "$self_path" "$root" "$fixture_receipt" "$helper_copy" "$agent_socket" "$request" || return 1
     case $crash_phase in

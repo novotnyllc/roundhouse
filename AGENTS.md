@@ -36,27 +36,10 @@ contracts require its `yardmaster/model-routing/v1` router and feed its
 placement decisions); craft skills
 ([`agent-utilities`](https://github.com/novotnyllc/agent-utilities)).
 
-## Legacy executor namespace
-
-The fleet CLI ships as `scripts/machine-utilities`, and enrolled hosts keep
-the `machine-utilities` system namespace
-(`/usr/local/libexec/machine-utilities`,
-`/etc/sudoers.d/machine-utilities-posix-broker`, `/etc/machine-utilities/ssh`,
-`/var/lib/machine-utilities*`, `%ProgramData%\MachineUtilities`, the
-`machine-utilities-windows` certificate principal, the
-`machine-utilities-release` signing namespace, and the SSH forced-command
-path). These are frozen at enrollment on every fleet host; renaming them is a
-separate privileged re-enrollment migration, deliberately not part of plugin
-renames. Everything plugin-side — skill names, `ROUNDHOUSE_*` environment
-variables, `~/.config/roundhouse/` — uses the roundhouse name, and the CLI
-falls back to a host's legacy `~/.config/machine-utilities/` files until that
-host's config migrates.
-
 ## Fleet Rules
 
 - Read inventory from `ROUNDHOUSE_CONFIG`, then
-  `${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/config.json` (legacy fallback:
-  `machine-utilities/config.json`).
+  `${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/config.json`.
 - Default to audit/report mode. Mutations require an explicit user request,
   target resolution, identity verification, preflight, and post-change checks.
 - Reuse existing chezmoi and package-manager commands instead of

@@ -26,7 +26,7 @@ version=$(jq -r '.version' "$plugin_root/.codex-plugin/plugin.json")
   exit 65
 }
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-integrity.XXXXXX")
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-integrity.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 : >"$tmp/files.jsonl"
 for relative in \
@@ -44,7 +44,7 @@ for relative in \
   scripts/enroll-ssh-posix \
   scripts/enroll-windows-sftp.ps1 \
   scripts/homebrew-bridge.rb \
-  scripts/machine-utilities \
+  scripts/roundhouse \
   scripts/prepare-ssh-identity \
   scripts/privilege-broker-posix \
   scripts/privilege-broker-windows.ps1 \

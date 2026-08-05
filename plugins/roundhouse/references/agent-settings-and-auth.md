@@ -40,7 +40,7 @@ Codex stores unmanaged hook decisions under `[hooks.state]`. Treat that table as
 machine-local trust state, not as an `agent_artifacts.settings` value and never
 copy the whole table between machines. An explicit approval for an exact
 `PLUGIN@MARKETPLACE` may be applied on each selected host with
-`machine-utilities approve-codex-plugin-hooks PLUGIN@MARKETPLACE`. It uses a
+`roundhouse approve-codex-plugin-hooks PLUGIN@MARKETPLACE`. It uses a
 fresh `codex app-server --stdio` session to discover the target's current hook
 hashes, updates only matching `trusted_hash` leaves through `config/batchWrite`,
 and verifies the result without changing `enabled` or unrelated entries.

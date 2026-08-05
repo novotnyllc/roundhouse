@@ -10,7 +10,7 @@ $ErrorActionPreference = "Stop"
 $script:Ascii = [Text.Encoding]::ASCII
 $script:BrokerProtocol = 1
 $script:BrokerVersion = "1.0.0"
-$script:RequestNamespace = "machine-utilities-request"
+$script:RequestNamespace = "roundhouse-request"
 $script:MaximumRequestBytes = 16384
 $script:MaximumSignatureBytes = 16384
 $script:MaximumPayloadBytes = 67108864
@@ -85,13 +85,13 @@ function Get-NormalizedTaskXml([string]$XmlText) {
 
 function Get-FixedTaskXml([string]$Kind, [string]$TargetSid, [string]$ProgramData) {
     if ($Kind -cnotin @("system", "profile")) { throw "invalid_task_kind" }
-    $TaskName = if ($Kind -ceq "system") { "MachineUtilitiesBrokerV1" } else { "MachineUtilitiesProfileV1" }
+    $TaskName = if ($Kind -ceq "system") { "RoundhouseBrokerV1" } else { "RoundhouseProfileV1" }
     $ScriptName = if ($Kind -ceq "system") { "privilege-broker-windows.ps1" } else { "profile-worker-windows.ps1" }
     $ContextName = if ($Kind -ceq "system") { "windows-system-v1" } else { "windows-user-s4u-v1" }
     $LogonType = if ($Kind -ceq "system") { "ServiceAccount" } else { "S4U" }
     $RunLevel = if ($Kind -ceq "system") { "HighestAvailable" } else { "LeastPrivilege" }
     $PowerShellPath = "C:\Program Files\PowerShell\7\pwsh.exe"
-    $EntryRoot = $ProgramData.TrimEnd('\') + "\MachineUtilities\entry"
+    $EntryRoot = $ProgramData.TrimEnd('\') + "\Roundhouse\entry"
     $ScriptPath = $EntryRoot + "\" + $ScriptName
     $Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy AllSigned -File "' +
         $ScriptPath + '" -Context ' + $ContextName
@@ -202,7 +202,7 @@ function ConvertTo-PositiveInt32([string]$Value, [string]$Reason) {
 function Read-ActiveGenerationPointer([byte[]]$Bytes) {
     $Lines = ConvertFrom-CanonicalAsciiBytes $Bytes 160 "active_generation"
     $Fields = Read-CanonicalFields $Lines @("epoch", "generation-sha256") `
-        "machine-utilities-active-generation|1" "end-generation|" "active_generation"
+        "roundhouse-active-generation|1" "end-generation|" "active_generation"
     $Epoch = ConvertTo-PositiveInt32 $Fields.epoch "invalid_active_generation"
     if (-not (Test-Digest $Fields.'generation-sha256')) { throw "invalid_active_generation" }
     return [pscustomobject]@{
@@ -226,7 +226,7 @@ function Get-GenerationDigest {
         if (-not (Test-Digest $Digest)) { throw "invalid_generation_digest_input" }
     }
     $Canonical = (@(
-        "machine-utilities-generation|1"
+        "roundhouse-generation|1"
         "epoch|$Epoch"
         "policy-sha256|$PolicySha256"
         "constraints-sha256|$ConstraintsSha256"
@@ -901,7 +901,7 @@ function Read-LiveProcessIdentity([string]$Path, [string]$ExpectedRequestId) {
     ) "windows-live-process|1" "end-live-process|" "live_process_identity"
     [uint32]$Pid = 0; [uint32]$ThreadId = 0; [uint64]$CreationFileTime = 0
     if ($Fields.'request-id' -cne $ExpectedRequestId -or
-        $Fields.'job-name' -cnotmatch '^Global\\MachineUtilitiesBroker-request-[0-9a-f]{32}$' -or
+        $Fields.'job-name' -cnotmatch '^Global\\RoundhouseBroker-request-[0-9a-f]{32}$' -or
         -not [uint32]::TryParse($Fields.pid, [Globalization.NumberStyles]::None,
             [Globalization.CultureInfo]::InvariantCulture, [ref]$Pid) -or $Pid -eq 0 -or
         -not [uint32]::TryParse($Fields.'thread-id', [Globalization.NumberStyles]::None,
@@ -1033,7 +1033,7 @@ function Repair-ConservativeClaims([string]$ReplayRoot, [string]$JournalRoot, [s
                     Write-Journal $ClaimRoot $JournalRoot $Request "partial" "orphaned_native_result" @{}
                 } else {
                     Initialize-ProcessContainmentTypes
-                    $Inspection = [MachineUtilitiesJob]::Inspect($Identity.Fields.'job-name', $Identity.Pid,
+                    $Inspection = [RoundhouseJob]::Inspect($Identity.Fields.'job-name', $Identity.Pid,
                         $Identity.CreationFileTime)
                     $RepairAction = Get-NativeRepairAction $Identity.Fields.state $Inspection
                     if ($RepairAction -ceq "drift") { throw "live_process_identity_drift" }
@@ -1041,7 +1041,7 @@ function Repair-ConservativeClaims([string]$ReplayRoot, [string]$JournalRoot, [s
                         Write-Journal $ClaimRoot $JournalRoot $Request "partial" "orphaned_native_result" @{}
                     } else {
                         if ($RepairAction -ceq "resume-and-recover") {
-                            [void][MachineUtilitiesSuspendedProcess]::ResumeIdentifiedThread(
+                            [void][RoundhouseSuspendedProcess]::ResumeIdentifiedThread(
                                 $Identity.Pid, $Identity.ThreadId)
                         }
                         # Inspection 2 means the identified leader already exited while a descendant
@@ -1125,7 +1125,7 @@ function Get-ReadinessProbeRequestId([object]$ControlRequest, [string]$ActionId,
         throw "invalid_readiness_probe_binding"
     }
     $Digest = Get-Sha256Bytes (ConvertTo-CanonicalAsciiBytes @(
-        "machine-utilities-readiness-probe-id|1", "control-request-id|$($ControlRequest.Fields.'request-id')",
+        "roundhouse-readiness-probe-id|1", "control-request-id|$($ControlRequest.Fields.'request-id')",
         "action-id|$ActionId", "policy-token|$PolicyToken", "end-probe-id|"))
     return "request-" + $Digest.Substring(0, 32)
 }
@@ -1261,7 +1261,7 @@ function Read-WinGetProviderContext([byte[]]$Bytes) {
     $SourceArgument = [string]$Fields.'source-argument'
     $Uri = $null
     try { $Uri = [Uri]::new($SourceArgument, [UriKind]::Absolute) } catch { throw "invalid_winget_provider_context" }
-    if ($Fields.'state-identifier' -cnotmatch '^machine-utilities-e[1-9][0-9]{0,9}-[0-9a-f]{64}$' -or
+    if ($Fields.'state-identifier' -cnotmatch '^roundhouse-e[1-9][0-9]{0,9}-[0-9a-f]{64}$' -or
         -not (Test-Atom $Fields.'source-id') -or -not (Test-Atom $Fields.'source-name') -or
         $Fields.'source-type' -cnotin @("Microsoft.Rest", "Microsoft.PreIndexed.Package") -or
         $SourceArgument -notmatch '^[\x21-\x7e]{1,2048}$' -or
@@ -1297,7 +1297,7 @@ function Read-WinGetProviderContext([byte[]]$Bytes) {
 
 function Get-WinGetStateAuthoritySha256([int]$Epoch, [object]$Generation, [object]$ProviderContext) {
     return Get-Sha256Bytes (ConvertTo-CanonicalAsciiBytes @(
-        "machine-utilities-winget-state-authority|1", "epoch|$Epoch",
+        "roundhouse-winget-state-authority|1", "epoch|$Epoch",
         "policy-sha256|$($Generation.Digests.Policy)",
         "constraints-sha256|$($Generation.Digests.Constraints)",
         "provider-lock-sha256|$($Generation.Digests.ProviderLock)",
@@ -2118,7 +2118,7 @@ function Get-FixedProcessEnvironment {
 }
 
 function Initialize-ProcessContainmentTypes {
-    if (-not $IsWindows -or ("MachineUtilitiesJob" -as [type])) { return }
+    if (-not $IsWindows -or ("RoundhouseJob" -as [type])) { return }
     Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -2129,7 +2129,7 @@ using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
-public static class MachineUtilitiesProcessSupport {
+public static class RoundhouseProcessSupport {
   public static async Task<byte[]> ReadBoundedAsync(Stream input, int maximum) {
     using (var output = new MemoryStream()) {
       var buffer = new byte[8192]; bool exceeded=false;
@@ -2145,7 +2145,7 @@ public static class MachineUtilitiesProcessSupport {
   }
 }
 
-public sealed class MachineUtilitiesSuspendedProcess : IDisposable {
+public sealed class RoundhouseSuspendedProcess : IDisposable {
   const uint CREATE_SUSPENDED = 0x00000004, CREATE_NO_WINDOW = 0x08000000,
     CREATE_UNICODE_ENVIRONMENT = 0x00000400, STARTF_USESTDHANDLES = 0x00000100,
     HANDLE_FLAG_INHERIT = 0x00000001, WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 258,
@@ -2203,7 +2203,7 @@ public sealed class MachineUtilitiesSuspendedProcess : IDisposable {
     b.Append('\\', slashes * 2); b.Append('"'); return b.ToString();
   }
   static void Close(ref IntPtr handle) { if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; } }
-  public static MachineUtilitiesSuspendedProcess Create(string file, string[] arguments,
+  public static RoundhouseSuspendedProcess Create(string file, string[] arguments,
       System.Collections.IDictionary environment, string currentDirectory) {
     IntPtr stdinRead=IntPtr.Zero, stdinWrite=IntPtr.Zero, stdoutRead=IntPtr.Zero,
       stdoutWrite=IntPtr.Zero, stderrRead=IntPtr.Zero, stderrWrite=IntPtr.Zero, environmentBlock=IntPtr.Zero;
@@ -2233,7 +2233,7 @@ public sealed class MachineUtilitiesSuspendedProcess : IDisposable {
           CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, environmentBlock,
           currentDirectory, ref startup, out info)) throw new Win32Exception(Marshal.GetLastWin32Error());
       Close(ref stdinRead); Close(ref stdoutWrite); Close(ref stderrWrite);
-      var result = new MachineUtilitiesSuspendedProcess { process=info.hProcess, thread=info.hThread,
+      var result = new RoundhouseSuspendedProcess { process=info.hProcess, thread=info.hThread,
         ProcessId=info.dwProcessId, ThreadId=info.dwThreadId };
       try {
         result.StandardInput = new FileStream(new SafeFileHandle(stdinWrite, true), FileAccess.Write, 4096, false);
@@ -2274,7 +2274,7 @@ public sealed class MachineUtilitiesSuspendedProcess : IDisposable {
     if (StandardError!=null) StandardError.Dispose(); Close(ref thread); Close(ref process); }
 }
 
-public sealed class MachineUtilitiesJob : IDisposable {
+public sealed class RoundhouseJob : IDisposable {
   const int JobObjectBasicAccountingInformation = 1;
   const int JobObjectExtendedLimitInformation = 9;
   const uint JOB_OBJECT_QUERY = 0x0004, SYNCHRONIZE = 0x00100000,
@@ -2322,7 +2322,7 @@ public sealed class MachineUtilitiesJob : IDisposable {
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
   [StructLayout(LayoutKind.Sequential)] struct FILETIME { public uint Low, High; }
 
-  public MachineUtilitiesJob(string name) {
+  public RoundhouseJob(string name) {
     handle = CreateJobObject(IntPtr.Zero, name);
     if (handle == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
     if (Marshal.GetLastWin32Error() == 183) { CloseHandle(handle); handle=IntPtr.Zero;
@@ -2430,10 +2430,10 @@ function Invoke-FixedProcess {
         $ExecutableSha256 = Get-HeldFileSha256 $FilePath 134217728
         try {
             $JobName = if ([string]::IsNullOrWhiteSpace($StableJobName)) {
-                "Local\MachineUtilitiesEphemeral-" + [Guid]::NewGuid().ToString("N")
+                "Local\RoundhouseEphemeral-" + [Guid]::NewGuid().ToString("N")
             } else { $StableJobName }
-            $Job = [MachineUtilitiesJob]::new($JobName)
-            $NativeProcess = [MachineUtilitiesSuspendedProcess]::Create(
+            $Job = [RoundhouseJob]::new($JobName)
+            $NativeProcess = [RoundhouseSuspendedProcess]::Create(
                 $FilePath, $Arguments, (Get-FixedProcessEnvironment), (Split-Path -Parent $FilePath))
             $Job.Assign($NativeProcess.ProcessHandle)
             $Job.InstallSurvivalHandle($NativeProcess.ProcessHandle)
@@ -2441,9 +2441,9 @@ function Invoke-FixedProcess {
                 Write-LiveProcessIdentity $LiveIdentityPath $LifecycleRequest.Fields.'request-id' $JobName `
                     $NativeProcess $FilePath $ExecutableSha256 "launch-pending"
             }
-            $OutputTask = [MachineUtilitiesProcessSupport]::ReadBoundedAsync(
+            $OutputTask = [RoundhouseProcessSupport]::ReadBoundedAsync(
                 $NativeProcess.StandardOutput, $MaximumOutputBytes)
-            $ErrorTask = [MachineUtilitiesProcessSupport]::ReadBoundedAsync(
+            $ErrorTask = [RoundhouseProcessSupport]::ReadBoundedAsync(
                 $NativeProcess.StandardError, 65536)
             $NativeProcess.StandardInput.Write($InputBytes, 0, $InputBytes.Count)
             $NativeProcess.StandardInput.Close()
@@ -2688,7 +2688,7 @@ function Get-TransportAclContract([string]$RequestSid) {
         SlotFile = $SlotFileSddl
         ResultsDirectory = $DirectorySddl
         ResultFile = $ResultFileSddl
-        ChrootPathSha256 = Get-Sha256Utf8Text "C:\PROGRAMDATA\MACHINEUTILITIES\CHROOT"
+        ChrootPathSha256 = Get-Sha256Utf8Text "C:\PROGRAMDATA\ROUNDHOUSE\CHROOT"
         ChrootDirectorySddlSha256 = Get-Sha256Utf8Text $DirectorySddl
         SlotDirectorySddlSha256 = Get-Sha256Utf8Text $DirectorySddl
         SlotFileSddlSha256 = Get-Sha256Utf8Text $SlotFileSddl
@@ -2728,10 +2728,10 @@ function Assert-PhysicalTransportFile([string]$Path, [long]$MaximumBytes, [strin
     if ($IsWindows) {
         Initialize-BrokerProfileNativeTypes
         if ($null -eq $HeldStream) {
-            [MachineUtilitiesBrokerProfileNative]::AssertSingleLinkRegularFile($Path, $Path)
+            [RoundhouseBrokerProfileNative]::AssertSingleLinkRegularFile($Path, $Path)
             if (-not $script:SelfTestFixture) { Assert-ExactSddl $Path $ExpectedSddl }
         } else {
-            [MachineUtilitiesBrokerProfileNative]::AssertHeldSingleLinkRegularFile(
+            [RoundhouseBrokerProfileNative]::AssertHeldSingleLinkRegularFile(
                 $HeldStream.SafeFileHandle, $Path)
         }
     }
@@ -2963,7 +2963,7 @@ function Assert-SignedRequest {
         if ($Details -match '(?m)^\s*Extensions:\s*$' -and $Details -match '(?m)^\s+\(none\)\s*$') {
             $ExtensionsCleared = $true
         }
-        $ExpectedPrincipals = @($SigningPrincipal, "machine-utilities-posix", "machine-utilities-windows" | Sort-Object)
+        $ExpectedPrincipals = @($SigningPrincipal, "roundhouse-posix", "roundhouse-windows" | Sort-Object)
         $ExpectedSources = if ($Fields.'certificate-source-addresses' -ceq "-") { @() }
             else { @($Fields.'certificate-source-addresses'.Split(',') | Sort-Object) }
         if ($NodeFingerprint -cne $Fields.'node-key-fingerprint' -or
@@ -3081,7 +3081,7 @@ function Get-ProtectedGeneration([string]$Root, [object]$Request) {
         OpenSshIdentity = $OpenSshIdentity
     }
     $StateAuthority = Get-WinGetStateAuthoritySha256 $Pointer.Epoch $Generation $ProviderContext
-    if ($ProviderContext.StateIdentifier -cne "machine-utilities-e$($Pointer.Epoch)-$StateAuthority") {
+    if ($ProviderContext.StateIdentifier -cne "roundhouse-e$($Pointer.Epoch)-$StateAuthority") {
         throw "active_state_drift"
     }
     return $Generation
@@ -3243,8 +3243,8 @@ function Test-BrokerManagedProfilePath([string]$Path) {
         $Segments[0].ToLowerInvariant() -ceq ".codex" -and
         $Segments[1].ToLowerInvariant() -ceq "skills" -and
         $Segments[2] -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
-    return $Folded.StartsWith(".codex/machine-utilities/managed/") -or
-        $Folded.StartsWith(".codex/machine-utilities/marketplace-stage/") -or
+    return $Folded.StartsWith(".codex/roundhouse/managed/") -or
+        $Folded.StartsWith(".codex/roundhouse/marketplace-stage/") -or
         $StandaloneSkillFile -or
         $Folded -match '^\.codex/settings(?:\.[a-z0-9._-]+)?\.json$' -or
         $Folded -match '^\.codex/config(?:\.[a-z0-9._-]+)?\.toml$' -or
@@ -3279,13 +3279,13 @@ function Get-BrokerCompiledProfileContract([string]$Path, [string]$Handler) {
                 LogicalIdentity = "standalone-skill-file:$(Get-Sha256Text $Folded)" }
         }
         "marketplace-desired-record" {
-            if ($Folded -cne ".codex/machine-utilities/managed/marketplace.desired") { throw "invalid_profile_entry_map" }
+            if ($Folded -cne ".codex/roundhouse/managed/marketplace.desired") { throw "invalid_profile_entry_map" }
             return [pscustomobject]@{ Artifact = "marketplace-desired"; Manager = "fleet-agents";
                 LogicalIdentity = "marketplace-desired" }
         }
         "marketplace-file" {
             $Parts = $Path.Split('/')
-            if (-not $Folded.StartsWith(".codex/machine-utilities/marketplace-stage/") -or
+            if (-not $Folded.StartsWith(".codex/roundhouse/marketplace-stage/") -or
                 $Parts.Count -lt 5 -or -not (Test-Token $Parts[3])) { throw "invalid_profile_entry_map" }
             $Marketplace = $Parts[3].ToLowerInvariant()
             return [pscustomobject]@{ Artifact = $Marketplace; Manager = "fleet-agents";
@@ -3293,10 +3293,10 @@ function Get-BrokerCompiledProfileContract([string]$Path, [string]$Handler) {
         }
         "managed-file" {
             $Parts = $Path.Split('/')
-            if (-not $Folded.StartsWith(".codex/machine-utilities/managed/") -or $Parts.Count -lt 5 -or
+            if (-not $Folded.StartsWith(".codex/roundhouse/managed/") -or $Parts.Count -lt 5 -or
                 -not (Test-Token $Parts[3])) { throw "invalid_profile_entry_map" }
             $Artifact = $Parts[3].ToLowerInvariant()
-            return [pscustomobject]@{ Artifact = $Artifact; Manager = "machine-utilities";
+            return [pscustomobject]@{ Artifact = $Artifact; Manager = "roundhouse";
                 LogicalIdentity = "managed-file:$(Get-Sha256Text $Folded)" }
         }
     }
@@ -3414,7 +3414,7 @@ function Get-BrokerProfileStateDigest([string]$ProfileRootId, [object[]]$States)
 }
 
 function Initialize-BrokerProfileNativeTypes {
-    if ("MachineUtilitiesBrokerProfileNative" -as [type]) { return }
+    if ("RoundhouseBrokerProfileNative" -as [type]) { return }
     Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
@@ -3422,24 +3422,24 @@ using System.IO;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-public sealed class MachineUtilitiesBrokerHeldDirectory : IDisposable
+public sealed class RoundhouseBrokerHeldDirectory : IDisposable
 {
     public SafeFileHandle Handle { get; private set; }
     public string FinalPath { get; private set; }
     public uint VolumeSerial { get; private set; }
     public ulong FileId { get; private set; }
-    internal MachineUtilitiesBrokerHeldDirectory(SafeFileHandle handle, string finalPath, uint volume, ulong fileId)
+    internal RoundhouseBrokerHeldDirectory(SafeFileHandle handle, string finalPath, uint volume, ulong fileId)
     { Handle = handle; FinalPath = finalPath; VolumeSerial = volume; FileId = fileId; }
     public void Dispose() { if (Handle != null) Handle.Dispose(); }
 }
 
-public sealed class MachineUtilitiesBrokerRegularFile
+public sealed class RoundhouseBrokerRegularFile
 {
     public bool Exists { get; internal set; }
     public byte[] Bytes { get; internal set; }
 }
 
-public static class MachineUtilitiesBrokerProfileNative
+public static class RoundhouseBrokerProfileNative
 {
     [StructLayout(LayoutKind.Sequential)]
     struct BY_HANDLE_FILE_INFORMATION
@@ -3475,7 +3475,7 @@ public static class MachineUtilitiesBrokerProfileNative
         return info;
     }
 
-    public static MachineUtilitiesBrokerHeldDirectory OpenDirectory(string path)
+    public static RoundhouseBrokerHeldDirectory OpenDirectory(string path)
     {
         SafeFileHandle handle = CreateFileW(path, 0x80, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
         if (handle.IsInvalid) { int error = Marshal.GetLastWin32Error(); handle.Dispose();
@@ -3485,20 +3485,20 @@ public static class MachineUtilitiesBrokerProfileNative
             BY_HANDLE_FILE_INFORMATION info = Information(handle);
             if ((info.FileAttributes & 0x10) == 0 || (info.FileAttributes & 0x400) != 0)
                 throw new InvalidOperationException("profile_reparse_or_collision");
-            return new MachineUtilitiesBrokerHeldDirectory(handle, FinalPath(handle), info.VolumeSerialNumber,
+            return new RoundhouseBrokerHeldDirectory(handle, FinalPath(handle), info.VolumeSerialNumber,
                 ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow);
         }
         catch { handle.Dispose(); throw; }
     }
 
-    public static MachineUtilitiesBrokerRegularFile ReadRegularFile(string path, string rootFinalPath)
+    public static RoundhouseBrokerRegularFile ReadRegularFile(string path, string rootFinalPath)
     {
         SafeFileHandle handle = CreateFileW(path, 0x80000080, 5, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
         if (handle.IsInvalid)
         {
             int error = Marshal.GetLastWin32Error(); handle.Dispose();
             if (error == 2 || error == 3)
-                return new MachineUtilitiesBrokerRegularFile { Exists = false, Bytes = new byte[0] };
+                return new RoundhouseBrokerRegularFile { Exists = false, Bytes = new byte[0] };
             throw new Win32Exception(error, "profile_file_open_failed");
         }
         using (handle)
@@ -3511,7 +3511,7 @@ public static class MachineUtilitiesBrokerProfileNative
                 throw new InvalidOperationException("profile_path_escape");
             using (FileStream stream = new FileStream(handle, FileAccess.Read))
             using (MemoryStream output = new MemoryStream())
-            { stream.CopyTo(output); return new MachineUtilitiesBrokerRegularFile { Exists = true, Bytes = output.ToArray() }; }
+            { stream.CopyTo(output); return new RoundhouseBrokerRegularFile { Exists = true, Bytes = output.ToArray() }; }
         }
     }
 
@@ -3550,7 +3550,7 @@ function Get-BrokerProfileRootId([object]$RootHandle, [string]$TargetSid) {
 function New-BrokerProfileSession([object]$Authorization) {
     Initialize-BrokerProfileNativeTypes
     $RootPath = Get-BrokerProfilePathForSid $Authorization.TargetSid
-    $RootHandle = [MachineUtilitiesBrokerProfileNative]::OpenDirectory($RootPath)
+    $RootHandle = [RoundhouseBrokerProfileNative]::OpenDirectory($RootPath)
     if ((Get-BrokerProfileRootId $RootHandle $Authorization.TargetSid) -cne $Authorization.ProfileRootId -or
         -not $RootHandle.FinalPath.Equals($RootPath, [StringComparison]::OrdinalIgnoreCase)) {
         $RootHandle.Dispose(); throw "profile_root_identity_drift"
@@ -3573,7 +3573,7 @@ function Get-BrokerProfileState([object]$Session, [object]$Entry) {
         if ($Session.ByPath.ContainsKey($Key)) { continue }
         if ([IO.File]::Exists($Current)) { throw "profile_path_collision" }
         if (-not [IO.Directory]::Exists($Current)) { $Missing = $true; break }
-        $Handle = [MachineUtilitiesBrokerProfileNative]::OpenDirectory($Current)
+        $Handle = [RoundhouseBrokerProfileNative]::OpenDirectory($Current)
         if (-not $Handle.FinalPath.Equals([IO.Path]::GetFullPath($Current), [StringComparison]::OrdinalIgnoreCase)) {
             $Handle.Dispose(); throw "profile_ancestor_identity_drift"
         }
@@ -3582,7 +3582,7 @@ function Get-BrokerProfileState([object]$Session, [object]$Entry) {
     if ($Missing) { return [pscustomobject]@{ Path = $Entry.Path; Presence = "absent"; Digest = "-"; Manager = "-" } }
     $Path = [IO.Path]::GetFullPath((Join-Path $Session.RootPath ($Entry.Path.Replace('/', '\'))))
     if ([IO.Directory]::Exists($Path)) { throw "profile_path_collision" }
-    $Observed = [MachineUtilitiesBrokerProfileNative]::ReadRegularFile($Path, $Session.RootHandle.FinalPath)
+    $Observed = [RoundhouseBrokerProfileNative]::ReadRegularFile($Path, $Session.RootHandle.FinalPath)
     if (-not $Observed.Exists) { return [pscustomobject]@{ Path = $Entry.Path; Presence = "absent"; Digest = "-"; Manager = "-" } }
     return [pscustomobject]@{ Path = $Entry.Path; Presence = "present"; Digest = Get-Sha256Bytes $Observed.Bytes;
         Manager = (Get-BrokerCompiledProfileContract $Entry.Path $Entry.Handler).Manager }
@@ -3679,8 +3679,8 @@ function Assert-ProfileTask([string]$TargetSid, [string]$ProgramData) {
         $Service = New-Object -ComObject "Schedule.Service"; $Service.Connect()
         $Folder = $Service.GetFolder("\")
         foreach ($Contract in @(
-            [pscustomobject]@{ Name = "MachineUtilitiesBrokerV1"; Kind = "system"; Sid = "S-1-5-18" },
-            [pscustomobject]@{ Name = "MachineUtilitiesProfileV1"; Kind = "profile"; Sid = $TargetSid })) {
+            [pscustomobject]@{ Name = "RoundhouseBrokerV1"; Kind = "system"; Sid = "S-1-5-18" },
+            [pscustomobject]@{ Name = "RoundhouseProfileV1"; Kind = "profile"; Sid = $TargetSid })) {
             $ObservedXml = Export-ScheduledTask -TaskName $Contract.Name -TaskPath "\" -ErrorAction Stop
             $ExpectedXml = Get-FixedTaskXml $Contract.Kind $Contract.Sid $ProgramData
             if ((Get-NormalizedTaskXml $ObservedXml) -cne (Get-NormalizedTaskXml $ExpectedXml)) {
@@ -3711,7 +3711,7 @@ function Write-ProfileOperationIdentity {
         throw "invalid_profile_operation_identity"
     }
     Write-AtomicAscii $Path @(
-        "windows-profile-operation|1", "request-id|$RequestId", "task-name|MachineUtilitiesProfileV1",
+        "windows-profile-operation|1", "request-id|$RequestId", "task-name|RoundhouseProfileV1",
         "instance-guid|$InstanceId", "result-path-sha256|$(Get-Sha256Utf8Text $ResultPath.ToUpperInvariant())",
         "state|$State", "last-task-result|$LastTaskResult", "end-profile-operation|")
     Protect-BrokerPath $Path
@@ -3724,7 +3724,7 @@ function Read-ProfileOperationIdentity([string]$Path, [string]$ExpectedRequestId
         "request-id", "task-name", "instance-guid", "result-path-sha256", "state", "last-task-result"
     ) "windows-profile-operation|1" "end-profile-operation|" "profile_operation_identity"
     if ($Fields.'request-id' -cne $ExpectedRequestId -or
-        $Fields.'task-name' -cne "MachineUtilitiesProfileV1" -or
+        $Fields.'task-name' -cne "RoundhouseProfileV1" -or
         ($Fields.'instance-guid' -cne "-" -and
             $Fields.'instance-guid' -cnotmatch '^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$') -or
         -not (Test-Digest $Fields.'result-path-sha256') -or
@@ -3750,7 +3750,7 @@ function Get-ProfileTaskLiveInstance([string]$ExpectedInstanceId) {
     $Service = $null; $Folder = $null; $Task = $null
     try {
         $Service = New-Object -ComObject "Schedule.Service"; $Service.Connect()
-        $Folder = $Service.GetFolder("\"); $Task = $Folder.GetTask("MachineUtilitiesProfileV1")
+        $Folder = $Service.GetFolder("\"); $Task = $Folder.GetTask("RoundhouseProfileV1")
         $Instances = New-Object Collections.Generic.List[string]
         foreach ($Observed in @($Task.GetInstances(0))) {
             try {
@@ -3787,12 +3787,12 @@ function Invoke-ProfileTaskInstance {
         (-not $ReadinessProbe -and $IdentityRequestId -cne $Request.Fields.'request-id')) {
         throw "invalid_profile_operation_identity"
     }
-    $Before = Get-ScheduledTaskInfo -TaskName "MachineUtilitiesProfileV1" -TaskPath "\"
+    $Before = Get-ScheduledTaskInfo -TaskName "RoundhouseProfileV1" -TaskPath "\"
     $Service = $null; $Folder = $null; $Task = $null; $Instance = $null
     $InstanceId = "-"; $Recovering = $false
     try {
         $Service = New-Object -ComObject "Schedule.Service"; $Service.Connect()
-        $Folder = $Service.GetFolder("\"); $Task = $Folder.GetTask("MachineUtilitiesProfileV1")
+        $Folder = $Service.GetFolder("\"); $Task = $Folder.GetTask("RoundhouseProfileV1")
         Write-ProfileOperationIdentity $IdentityPath $IdentityRequestId $ResultPath "-" "queued"
         # Crossing into the scheduler RPC is the conservative commit boundary. The call can launch
         # and complete before returning an instance object, so any failure from this point is partial.
@@ -3824,7 +3824,7 @@ function Invoke-ProfileTaskInstance {
             }
             Start-Sleep -Seconds 1
         } while ($true)
-        $After = Get-ScheduledTaskInfo -TaskName "MachineUtilitiesProfileV1" -TaskPath "\"
+        $After = Get-ScheduledTaskInfo -TaskName "RoundhouseProfileV1" -TaskPath "\"
         if ($After.LastRunTime -le $Before.LastRunTime -or $After.LastTaskResult -notin @(0, 3) -or
             -not [IO.File]::Exists($ResultPath) -or (Get-Item -LiteralPath $ResultPath).Length -lt 1) {
             throw "profile_task_failed"
@@ -3856,7 +3856,7 @@ function Invoke-ProfileTaskInstance {
                         Start-Sleep -Seconds 1
                     }
                     try {
-                        $AfterFailure = Get-ScheduledTaskInfo -TaskName "MachineUtilitiesProfileV1" -TaskPath "\"
+                        $AfterFailure = Get-ScheduledTaskInfo -TaskName "RoundhouseProfileV1" -TaskPath "\"
                         Write-ProfileOperationIdentity $IdentityPath $IdentityRequestId $ResultPath `
                             $InstanceId "terminal" ([string][int]$AfterFailure.LastTaskResult)
                     } catch { }
@@ -4037,7 +4037,7 @@ function Get-BrokerStartupDisposition([bool]$ProvisionMarkerPresent, [bool]$Host
 }
 
 function Invoke-SelfTest {
-    $Root = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-windows-broker-" + [Guid]::NewGuid().ToString("N"))
+    $Root = Join-Path ([IO.Path]::GetTempPath()) ("roundhouse-windows-broker-" + [Guid]::NewGuid().ToString("N"))
     $script:SelfTestFixture = $true
     try {
         Initialize-BrokerProfileNativeTypes
@@ -4410,7 +4410,7 @@ function Invoke-SelfTest {
         }
         $VectorAuthority = "2b048d26707cdbfdfb379b025237d5bfccb259bdc5fc5d621f3138f39dbd6a87"
         $ProviderContextBytes = ConvertTo-CanonicalAsciiBytes @(
-            "winget-provider-context|1", "state-identifier|machine-utilities-e7-$VectorAuthority",
+            "winget-provider-context|1", "state-identifier|roundhouse-e7-$VectorAuthority",
             "source-id|catalog-id", "source-name|catalog-name", "source-type|Microsoft.PreIndexed.Package",
             "source-argument|https://example.invalid/catalog",
             "source-argument-sha256|84be0dc1f120ab994c9b03c3ad0a4b13a641b2196e290d46130dabcdece68006",
@@ -4422,7 +4422,7 @@ function Invoke-SelfTest {
         $ExplicitDefaultPortArgument = "https://example.invalid:443/catalog"
         try {
             [void](Read-WinGetProviderContext (ConvertTo-CanonicalAsciiBytes @(
-                "winget-provider-context|1", "state-identifier|machine-utilities-e7-$VectorAuthority",
+                "winget-provider-context|1", "state-identifier|roundhouse-e7-$VectorAuthority",
                 "source-id|catalog-id", "source-name|catalog-name", "source-type|Microsoft.PreIndexed.Package",
                 "source-argument|$ExplicitDefaultPortArgument",
                 "source-argument-sha256|$(Get-Sha256Utf8Text $ExplicitDefaultPortArgument)",
@@ -4528,7 +4528,7 @@ function Invoke-SelfTest {
 
         $PointerDigest = Get-GenerationDigest 7 $Digest $Digest $Digest ("b" * 64) $Digest
         $Pointer = Read-ActiveGenerationPointer (ConvertTo-CanonicalAsciiBytes @(
-            "machine-utilities-active-generation|1", "epoch|7", "generation-sha256|$PointerDigest", "end-generation|"))
+            "roundhouse-active-generation|1", "epoch|7", "generation-sha256|$PointerDigest", "end-generation|"))
         if ($Pointer.Epoch -ne 7 -or $Pointer.Digest -cne $PointerDigest) { throw "pointer self-test failed" }
         $NativeCanaryPath = Join-Path $Root "native-canary.receipt"
         $NativeCanaryAccess = Get-TransportAclContract $Request.Fields.'request-sid'
@@ -4817,12 +4817,12 @@ function Invoke-SelfTest {
         $EmptyMarketplaceSet = Read-BrokerMarketplaceSet (ConvertTo-CanonicalAsciiBytes @(
             "profile-marketplace-set|1", "end-marketplace-set|"))
         Assert-BrokerMarketplaceAuthorization $ProfileMap $EmptyMarketplaceSet
-        $MarketplacePath = ".codex/machine-utilities/marketplace-stage/acme/plugin/SKILL.md"
+        $MarketplacePath = ".codex/roundhouse/marketplace-stage/acme/plugin/SKILL.md"
         $MarketplaceDigest = "6" * 64
         $MarketplaceLogical = "marketplace-file:$(Get-Sha256Text $MarketplacePath.ToLowerInvariant())"
         $MarketplaceMap = Read-BrokerProfileEntryMap (ConvertTo-CanonicalAsciiBytes @(
             "profile-entry-map|1",
-            "entry|.codex/machine-utilities/managed/marketplace.desired|marketplace-desired-record|marketplace-desired|fleet-agents|marketplace-desired",
+            "entry|.codex/roundhouse/managed/marketplace.desired|marketplace-desired-record|marketplace-desired|fleet-agents|marketplace-desired",
             "entry|$MarketplacePath|marketplace-file|acme|fleet-agents|$MarketplaceLogical",
             "end-entry-map|"))
         $MarketplaceSet = Read-BrokerMarketplaceSet (ConvertTo-CanonicalAsciiBytes @(
@@ -5017,14 +5017,14 @@ $ProgramData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonA
 if ([string]::IsNullOrWhiteSpace($ProgramData) -or -not [IO.Path]::IsPathFullyQualified($ProgramData)) {
     throw "unsupported_context"
 }
-$Root = Join-Path $ProgramData "MachineUtilities"
+$Root = Join-Path $ProgramData "Roundhouse"
 $StateRoot = Join-Path $Root "state"
 $ReplayRoot = Join-Path $StateRoot "replay"
 $JournalRoot = Join-Path $StateRoot "journal"
 $script:AuditRoot = Join-Path $StateRoot "audit"
 $ProcessingRoot = Join-Path $StateRoot "processing"
 $script:ProcessTempRoot = Join-Path $ProcessingRoot "temp"
-$PublicRoot = Join-Path $ProgramData "MachineUtilities-Public"
+$PublicRoot = Join-Path $ProgramData "Roundhouse-Public"
 $script:PublicRoot = $PublicRoot
 $script:BrokerRoot = $Root
 $LockPath = Join-Path $StateRoot "broker.lock"
@@ -5044,7 +5044,7 @@ if ((Get-BrokerStartupDisposition ([IO.File]::Exists($ProvisionMarkerPath)) ([IO
 }
 $TransportPaths = Get-FixedTransportPaths $Root $PublicRoot
 if (-not [IO.Path]::GetFullPath($TransportPaths.Chroot).Equals(
-        "C:\ProgramData\MachineUtilities\chroot", [StringComparison]::OrdinalIgnoreCase)) {
+        "C:\ProgramData\Roundhouse\chroot", [StringComparison]::OrdinalIgnoreCase)) {
     throw "unsupported_chroot_path"
 }
 $SlotRoot = $TransportPaths.Slot

@@ -32,7 +32,7 @@
           "mode": "posix-ssh",
           "host": "linux.example.invalid",
           "port": 22,
-          "request_user": "machine-utilities",
+          "request_user": "roundhouse",
           "pinned_host_key_fingerprint": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
           "management_networks": ["192.0.2.0/24"]
         }
@@ -53,7 +53,7 @@
           "mode": "windows-sftp",
           "host": "windows.example.invalid",
           "port": 22,
-          "request_user": "MachineUtilitiesRequest",
+          "request_user": "RoundhouseRequest",
           "request_sid": "S-1-5-21-1000-1001-1002-2001",
           "pinned_host_key_fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           "management_networks": ["192.0.2.0/24"]

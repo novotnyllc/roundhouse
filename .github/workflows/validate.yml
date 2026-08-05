@@ -23,7 +23,7 @@ jobs:
         shell: bash
         run: |
           set -eu
-          bash -n plugins/roundhouse/scripts/machine-utilities
+          bash -n plugins/roundhouse/scripts/roundhouse
           bash -n plugins/roundhouse/scripts/certify-ssh-node
           bash -n plugins/roundhouse/scripts/collect-posix
           bash -n plugins/roundhouse/scripts/enroll-privilege-posix
@@ -33,7 +33,7 @@ jobs:
           bash -n plugins/roundhouse/scripts/test-roundhouse
           bash -n plugins/roundhouse/scripts/update-integrity
           if [[ "$RUNNER_OS" == Linux ]]; then
-            shellcheck --severity=warning plugins/roundhouse/scripts/machine-utilities \
+            shellcheck --severity=warning plugins/roundhouse/scripts/roundhouse \
               plugins/roundhouse/scripts/collect-posix \
               plugins/roundhouse/scripts/test-roundhouse \
               plugins/roundhouse/scripts/update-integrity

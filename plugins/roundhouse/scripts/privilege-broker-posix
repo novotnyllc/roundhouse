@@ -27,7 +27,7 @@ unset APT_CONFIG BASH_ENV CDPATH ENV GLOBIGNORE \
 
 readonly broker_protocol=1
 readonly broker_version=1.0.0
-readonly request_namespace=machine-utilities-request
+readonly request_namespace=roundhouse-request
 readonly max_request_bytes=16384
 readonly max_signature_bytes=16384
 readonly max_journal_bytes=131072
@@ -142,15 +142,15 @@ fi
 readonly broker_platform
 
 if [ "$broker_platform" = macos ]; then
-  readonly broker_path=$root_prefix/usr/local/libexec/machine-utilities/posix-broker
+  readonly broker_path=$root_prefix/usr/local/libexec/roundhouse/posix-broker
 else
-  readonly broker_path=$root_prefix/usr/libexec/machine-utilities/posix-broker
+  readonly broker_path=$root_prefix/usr/libexec/roundhouse/posix-broker
 fi
-readonly config_root=$root_prefix/etc/machine-utilities
+readonly config_root=$root_prefix/etc/roundhouse
 readonly generations_root=$config_root/generations
 readonly active_link=$config_root/active
 readonly trust_root=$config_root/trust
-readonly state_root=$root_prefix/var/lib/machine-utilities
+readonly state_root=$root_prefix/var/lib/roundhouse
 readonly revocation_reserve=$state_root/revocation.reserve
 readonly revocation_reserve_bytes=1048576
 readonly revocation_reserve_max_bytes=4194304
@@ -158,7 +158,7 @@ readonly replay_root=$state_root/replay
 readonly journal_root=$state_root/journal
 readonly audit_root=$state_root/audit
 readonly lock_root=$state_root/lock
-readonly public_root=$root_prefix/var/lib/machine-utilities-public
+readonly public_root=$root_prefix/var/lib/roundhouse-public
 readonly max_claims=64
 readonly reserved_claim_slots=8
 readonly max_clock_skew=300
@@ -457,7 +457,7 @@ load_homebrew_bridge_authority() {
     [[ $protected_domain =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$ ]] &&
     fingerprint "$protected_ca_fingerprint" && uint "$protected_ca_generation" &&
     fingerprint "$protected_host_fingerprint" &&
-    [ "$endpoint_principals" = machine-utilities-posix,machine-utilities-windows ] &&
+    [ "$endpoint_principals" = roundhouse-posix,roundhouse-windows ] &&
     [ "$(/usr/bin/wc -l <"$homebrew_host_identity" | /usr/bin/tr -d ' ')" = 1 ] ||
     homebrew_bridge_fail invalid_host_identity 65
   caller_uid=${SUDO_UID:-}
@@ -922,13 +922,13 @@ if [ "$internal_launch" = true ]; then
   exit 70
 fi
 
-request_tmp=$(/usr/bin/mktemp /tmp/machine-utilities-request.XXXXXX)
-certificate_tmp=$(/usr/bin/mktemp /tmp/machine-utilities-certificate.XXXXXX)
-signature_tmp=$(/usr/bin/mktemp /tmp/machine-utilities-signature.XXXXXX)
-printed_key_tmp=$(/usr/bin/mktemp /tmp/machine-utilities-printed-key.XXXXXX)
-verify_output_tmp=$(/usr/bin/mktemp /tmp/machine-utilities-verify-output.XXXXXX)
-certificate_details_tmp=$(/usr/bin/mktemp /tmp/machine-utilities-certificate-details.XXXXXX)
-policy_group_tmp=$(/usr/bin/mktemp -d /tmp/machine-utilities-policy.XXXXXX)
+request_tmp=$(/usr/bin/mktemp /tmp/roundhouse-request.XXXXXX)
+certificate_tmp=$(/usr/bin/mktemp /tmp/roundhouse-certificate.XXXXXX)
+signature_tmp=$(/usr/bin/mktemp /tmp/roundhouse-signature.XXXXXX)
+printed_key_tmp=$(/usr/bin/mktemp /tmp/roundhouse-printed-key.XXXXXX)
+verify_output_tmp=$(/usr/bin/mktemp /tmp/roundhouse-verify-output.XXXXXX)
+certificate_details_tmp=$(/usr/bin/mktemp /tmp/roundhouse-certificate-details.XXXXXX)
+policy_group_tmp=$(/usr/bin/mktemp -d /tmp/roundhouse-policy.XXXXXX)
 readonly request_tmp certificate_tmp signature_tmp printed_key_tmp verify_output_tmp certificate_details_tmp policy_group_tmp
 cleanup() {
   cleanup_claim_stage || true
@@ -1666,7 +1666,7 @@ IFS='|' read -r identity_type identity_version protected_host_id protected_uid \
   [[ $protected_domain =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$ ]] &&
   fingerprint "$protected_ca_fingerprint" &&
   uint "$protected_ca_generation" && fingerprint "$protected_host_fingerprint" &&
-  [ "$endpoint_principals" = machine-utilities-posix,machine-utilities-windows ] || reject invalid_host_identity
+  [ "$endpoint_principals" = roundhouse-posix,roundhouse-windows ] || reject invalid_host_identity
 
 if [ "$fixture_mode" = false ]; then caller_uid=${SUDO_UID:-}
 else caller_uid=$(/usr/bin/id -u)
@@ -1714,7 +1714,7 @@ observed_valid_before=$(/usr/bin/awk '/^[[:space:]]*Valid: from / {gsub(/[-:]/,"
   /^[[:space:]]*Critical Options:/ {section=0}
   section {sub(/^[[:space:]]+/,"");if($0!="(none)") print}
 ' "$certificate_details_tmp" | /usr/bin/sort >"$policy_group_tmp/observed.principals"
-printf '%s\n%s\n%s\n' "$signing_principal" machine-utilities-posix machine-utilities-windows |
+printf '%s\n%s\n%s\n' "$signing_principal" roundhouse-posix roundhouse-windows |
   /usr/bin/sort >"$policy_group_tmp/expected.principals"
 /usr/bin/awk '
   /^[[:space:]]*Critical Options:/ {section=1;next}

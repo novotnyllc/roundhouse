@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "04b5f2efb008928d6fa1ed885033555f066a7f27ad0958e68a58200c916f1590"
+      "sha256": "dafcb8bc463f29551206bdca396f3b53eca09d208c52b5b5ad51bfbfb5efd4de"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "8d6631bf84341f00435a7d0fadc899544fc1187fb24f18497371e0b9a889f323"
+      "sha256": "e1242aea0332a117c9ad847670df490d9b382778f486f3d7f22181dfeb7c89b5"
     },
     {
       "path": "references/privilege-policy.default",
@@ -18,11 +18,11 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "c5d7891f87e3e1fc1705e730e213d5c4d036e0c89b8b15f8c945a4e2e6865b07"
+      "sha256": "cf8334ea8044a002ec56fea7d45cdf1847cf7e737d57023f8ec26ae43c454e17"
     },
     {
       "path": "scripts/certify-ssh-node",
-      "sha256": "5633b509c4ca50ce9a1c220e3345cab7bc37d043cd461f2cff205c044768ebae"
+      "sha256": "db63dbad06a383df553acbc690e70f8ede4939f9f1734f97d6a42fbc46541f0c"
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
@@ -30,64 +30,64 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "de78600fa4e477a47fe58e137bc2bf0d6657c9a6b7469f79c7d7b44e3adb587f"
+      "sha256": "f3fcd44ba72c0f942d94e5f27413a4df8ffe2f04734e2342ce91c0f85610de98"
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "10ce87bb2669b16f7daf7c8219ac18d73bb52d4a81b20d753a7e9eb92d33dee6"
+      "sha256": "6bbecbf5df941e0509c22b8f01ab3be4938d762ed38d7ffaf9deb90ea3d56bb2"
     },
     {
       "path": "scripts/enroll-privilege-posix",
-      "sha256": "8f9e1658e575bcc2ecfef1b84cc107e30f0c644afbcd80d1af809e61f919f7aa"
+      "sha256": "6f2ea1737674efc86b08b167cdeea674a9cb95be0d5662f234c34bf4519ccf89"
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
-      "sha256": "9e06a5565fac49b385618bb61992956c1dd3b94826d4d9ba84950879bf8ab2b8"
+      "sha256": "78ebc37fc1c02b2f773980b8d8c0b1b62507a8bf32412fb1e624c18732ecb2a1"
     },
     {
       "path": "scripts/enroll-ssh-posix",
-      "sha256": "b0200dbfb380081a284a26faf079f69b61dbb2eb0249263e1ccb5d2ce4a3360b"
+      "sha256": "8c9ce3c72dde3c80501c4ae95e2791a0e305b60666a44e130b06b3466c178991"
     },
     {
       "path": "scripts/enroll-windows-sftp.ps1",
-      "sha256": "ace4dce7cf1a523d2ba1085faa3a5f8b0b0696b72be8a6456dbae1b98937304f"
+      "sha256": "d7f07d713340a1481fffc615b6518e847fc9ddbc525f766aae5fa9016597da31"
     },
     {
       "path": "scripts/homebrew-bridge.rb",
-      "sha256": "5febc6c786acf5f70352288494e6678d2c56c092cdcd2bfe01f3b109bbf6a2ba"
-    },
-    {
-      "path": "scripts/machine-utilities",
-      "sha256": "e2071781cd10a01214e8e3d0d16ea81e6ab0f322a9a3b76437eb8987bfb275c2"
+      "sha256": "31e4b44ebac0673c45569440345f55eab598b4406be13244ff4bda8c06abaf65"
     },
     {
       "path": "scripts/prepare-ssh-identity",
-      "sha256": "0d540c8476d63b96df7ddfc727d55fe0af1fc62adb1eac4792fdf9a0033abaeb"
+      "sha256": "ad85b643ca264312e95217d77910e077fbd83de12bda4aaaf0306743bb9ceb0d"
     },
     {
       "path": "scripts/privilege-broker-posix",
-      "sha256": "b908128d0209e088b1cd9e51333bd4729ec07ed2783dbfb9980f97a3ecfbc4e3"
+      "sha256": "767030d5b299b0c2b312b1afbb1683f153629f7aa1c8c32c68b05313ad9490a9"
     },
     {
       "path": "scripts/privilege-broker-windows.ps1",
-      "sha256": "b315a84afcb7ddff4131c24d20cb453f25f2168bf369a513d2ff9ef228b2e9bf"
+      "sha256": "233bd546b7c0c5bf3a825883f09e7ff182f8ffea4747367ef27038a204613a06"
     },
     {
       "path": "scripts/profile-worker-windows.ps1",
-      "sha256": "419c0439361245181d837018eca53e070a5a992012d225c4db19d9abe9879fc4"
+      "sha256": "fbf0041158d353416c04be25ae11ad854735b8c83c39794842b6dd046415c4fc"
     },
     {
       "path": "scripts/register-profile-task-windows.ps1",
-      "sha256": "05edea9878c56122ec4e89810606dff0b9abac989433aba45d703cbaa1711a01"
+      "sha256": "0e9028413c15622a8e5beaca0124f667e0c94f6a2833b99544e616c62e063750"
+    },
+    {
+      "path": "scripts/roundhouse",
+      "sha256": "b63612f6a1083957284714c9869ec1c764e98fc81e452da52c8c2b09cd271c8d"
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",
-      "sha256": "e3aedf573a323a12fc83f4cbb09234b8499e801f0fedaa544bd3fc8d699f6692"
+      "sha256": "a681f02986330eb1315094600ed226dc37af4a7a10532daf6e26756af9d0976b"
     }
   ],
   "marketplace": "novotnyllc",
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

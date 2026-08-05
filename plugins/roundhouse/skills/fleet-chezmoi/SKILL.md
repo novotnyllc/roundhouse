@@ -6,7 +6,7 @@ description: Inspect, compare, and deliberately reconcile chezmoi source and liv
 # Fleet Chezmoi
 
 Set `SKILL_DIR` to the absolute directory containing this loaded `SKILL.md` and
-`CLI="$SKILL_DIR/../../scripts/machine-utilities"`; the shell working directory
+`CLI="$SKILL_DIR/../../scripts/roundhouse"`; the shell working directory
 is not the skill directory. Collect the `chezmoi` section, then use native
 read-only commands such as `chezmoi status`, `chezmoi diff`,
 `chezmoi source-path`, and Git status in the source repository. Determine

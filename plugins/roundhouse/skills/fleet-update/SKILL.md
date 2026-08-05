@@ -6,24 +6,31 @@ description: Plan and explicitly apply package updates across Homebrew, APT, and
 # Fleet Update
 
 Set `SKILL_DIR` to the absolute directory containing this loaded `SKILL.md` and
-`CLI="$SKILL_DIR/../../scripts/machine-utilities"`; the shell working directory
+`CLI="$SKILL_DIR/../../scripts/roundhouse"`; the shell working directory
 is not the skill directory. Resolve exact hosts or groups from the user config
-and inventory the package section first. Default to a read-only plan:
+and inventory the package section first.
 
-- Homebrew: `brew update` changes metadata, so ask before running it; use
-  `brew outdated --json=v2` for the plan and `brew upgrade` only for approved
-  formulae/casks. macOS casks run as the ordinary Homebrew owner through the
+**Authorization model:** an explicit request to update ("update my packages",
+"patch the fleet", a scheduled unattended run) *is* the mutation
+authorization — plan, seal, verify, and apply in one pass without asking
+again. A request to inspect, report, or plan stops at the read-only plan, and
+apply permission is never inferred from it. The sealed pipeline below is
+safety mechanics, not an approval gate.
+
+- Homebrew: on an update request, refresh metadata (`brew update`) and
+  proceed; use `brew outdated --json=v2` for the plan and `brew upgrade` for
+  the planned formulae/casks. macOS casks run as the ordinary Homebrew owner through the
   packaged bridge hook so Homebrew retains Caskroom authority. An unprivileged
   app upgrade (including Visual Studio Code when its destination is writable)
   follows Homebrew normally. A cask package that reaches Homebrew's hardcoded
   `sudo` succeeds only when it byte-matches an active exact
   `sealed-cask-payload-v1` enrollment; other privileged artifacts fail closed.
-- APT: `apt-get update` changes metadata, so ask first; plan with
+- APT: on an update request, `apt-get update` then plan with
   `apt-get --simulate upgrade`. Do not use `full-upgrade`, `dist-upgrade`, or
   `autoremove` unless explicitly selected.
 - winget: plan with `winget upgrade --accept-source-agreements
-  --disable-interactivity`; apply only named approved packages, or `--all` only
-  when the user approves that exact scope.
+  --disable-interactivity`; an update request covers the planned packages
+  (`--all` when the request was fleet-wide).
 
 Present exact host, manager, package, current version, candidate version, and
 command. Every `package-upgrade` operation must carry the exact observed
@@ -34,8 +41,7 @@ operations in a plan draft and run
 platform identity, recapture package inventory, and require
 `"$CLI" verify-preconditions PLAN CURRENT-SNAPSHOT` to succeed. This binds
 config, plan integrity, and preconditions without executing plan text. Then
-obtain separate user approval and execute only the exact argv sealed in the
-plan. For a local target use `"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; for SSH
+execute only the exact argv sealed in the plan. For a local target use `"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; for SSH
 use `"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`. Both recapture trusted
 preflight and enforce the same executor, identity, manager-command,
 fresh-precondition, and semantic post-state checks. If an operation or
@@ -51,6 +57,24 @@ creation or a work-starting follow-up; Claude reports unsupported. Never fall
 back through WSL. Preserve native approval
 prompts, stop per host on failure, and recapture package inventory afterward.
 Cleanup and autoremove are separate explicit actions.
+
+## Unattended schedule
+
+Auto-updating on a schedule uses the OS scheduler calling the harness — no
+new daemon, database, or engine. `yardmaster:setup` installs it on request;
+the shape on macOS is a per-user launchd agent
+(`~/Library/LaunchAgents/com.novotnyllc.roundhouse.autoupdate.plist`) whose
+program runs:
+
+```bash
+claude -p 'Unattended roundhouse maintenance run: run the fleet-agents desired-state sync for this host (timestamped merge; commit any outward desired.json changes to the chezmoi source), refresh the declared marketplaces, then plan and apply pending package updates (fleet-update). Unattended: no questions; skip anything requiring interactive elevation; write a summary to ~/.local/state/roundhouse/autoupdate.log and exit.' --output-format text
+```
+
+(Linux: a systemd user timer; Windows: a per-user scheduled task running the
+same prompt through the installed harness.) Unattended runs use exactly the
+same sealed pipeline and skip protected/privileged actions — those stay
+interactive by design. Failures land in the log and surface at the next
+`yardmaster:doctor` run.
 
 ## Protected package actions
 

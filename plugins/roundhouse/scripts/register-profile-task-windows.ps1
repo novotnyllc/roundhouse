@@ -6,9 +6,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-$script:TaskName = "MachineUtilitiesProfileV1"
+$script:TaskName = "RoundhouseProfileV1"
 $script:ContextName = "windows-user-s4u-v1"
-$script:WorkerRelativePath = "MachineUtilities\entry\profile-worker-windows.ps1"
+$script:WorkerRelativePath = "Roundhouse\entry\profile-worker-windows.ps1"
 $script:TaskCreateOrUpdate = 0x6
 $script:TaskDontAddPrincipalAce = 0x10
 $script:TaskLogonS4U = 0x2
@@ -65,14 +65,14 @@ function Get-ProfileRootIdentityRecord([string]$Sid, [string]$FinalPath, [uint32
 }
 
 function Initialize-ProfileRootIdentityType {
-    if ("MachineUtilitiesRegistrationProfileRoot" -as [type]) { return }
+    if ("RoundhouseRegistrationProfileRoot" -as [type]) { return }
     Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-public sealed class MachineUtilitiesRegistrationProfileRoot
+public sealed class RoundhouseRegistrationProfileRoot
 {
     public string FinalPath { get; private set; }
     public uint VolumeSerial { get; private set; }
@@ -95,7 +95,7 @@ public sealed class MachineUtilitiesRegistrationProfileRoot
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, char[] path, uint length, uint flags);
 
-    public static MachineUtilitiesRegistrationProfileRoot Observe(string path)
+    public static RoundhouseRegistrationProfileRoot Observe(string path)
     {
         SafeFileHandle handle = CreateFileW(path, 0x80, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
         if (handle.IsInvalid) { int error = Marshal.GetLastWin32Error(); handle.Dispose();
@@ -114,7 +114,7 @@ public sealed class MachineUtilitiesRegistrationProfileRoot
             string finalPath = new string(buffer, 0, (int)length);
             if (finalPath.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) finalPath = @"\\" + finalPath.Substring(8);
             else if (finalPath.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) finalPath = finalPath.Substring(4);
-            return new MachineUtilitiesRegistrationProfileRoot { FinalPath = finalPath,
+            return new RoundhouseRegistrationProfileRoot { FinalPath = finalPath,
                 VolumeSerial = info.VolumeSerialNumber,
                 FileId = ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow };
         }
@@ -131,7 +131,7 @@ function Get-FixedTaskContract([string]$Sid, [string]$ProgramData, [string]$Powe
     if ($Sid -notmatch '^S-[0-9]+(?:-[0-9]+){1,14}$' -or
         -not (Test-WindowsAbsolutePath $ProgramData) -or
         -not (Test-WindowsAbsolutePath $PowerShellPath)) { throw "invalid_task_contract_input" }
-    $EntryRoot = $ProgramData.TrimEnd('\') + "\MachineUtilities\entry"
+    $EntryRoot = $ProgramData.TrimEnd('\') + "\Roundhouse\entry"
     $WorkerPath = $ProgramData.TrimEnd('\') + "\" + $script:WorkerRelativePath
     return [pscustomobject]@{
         TaskName = $script:TaskName
@@ -238,7 +238,7 @@ function Invoke-SelfTest {
     if (($script:TaskCreateOrUpdate -bor $script:TaskDontAddPrincipalAce) -ne 0x16 -or
         $script:TaskLogonS4U -ne 0x2) { throw "task registration flags self-test failed" }
     if ($Xml -match 'generations\\|active\.generation|request-' -or
-        $Contract.Arguments -cne '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy AllSigned -File "C:\ProgramData\MachineUtilities\entry\profile-worker-windows.ps1" -Context windows-user-s4u-v1') {
+        $Contract.Arguments -cne '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy AllSigned -File "C:\ProgramData\Roundhouse\entry\profile-worker-windows.ps1" -Context windows-user-s4u-v1') {
         throw "epoch-free task action self-test failed"
     }
     foreach ($Mutation in @(
@@ -305,7 +305,7 @@ if (-not $ProfileRoot.Equals($RegisteredRoot, [StringComparison]::OrdinalIgnoreC
     throw "profile_root_identity_drift"
 }
 Initialize-ProfileRootIdentityType
-$ObservedRoot = [MachineUtilitiesRegistrationProfileRoot]::Observe($ProfileRoot)
+$ObservedRoot = [RoundhouseRegistrationProfileRoot]::Observe($ProfileRoot)
 if (-not $ObservedRoot.FinalPath.Equals($ProfileRoot, [StringComparison]::OrdinalIgnoreCase)) {
     throw "profile_root_identity_drift"
 }
@@ -315,7 +315,7 @@ Assert-TaskXml $Xml $Contract
 Register-FixedProfileTask $Xml $Sid
 $Observed = Export-ScheduledTask -TaskName $script:TaskName -TaskPath "\"
 Assert-TaskXml $Observed $Contract
-$ReceiptRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) "MachineUtilities"
+$ReceiptRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) "Roundhouse"
 [void][IO.Directory]::CreateDirectory($ReceiptRoot)
 $ReceiptPath = Join-Path $ReceiptRoot "profile-task-registration.json"
 $Receipt = [ordered]@{
