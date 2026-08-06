@@ -102,9 +102,46 @@ The only pre-helper fallback is a separately approved self-update of
 `roundhouse@novotnyllc` from an integrity-verified release that lacks
 `update-codex-plugin`. After upgrading the `novotnyllc` marketplace, run exactly
 `codex plugin add roundhouse@novotnyllc --json`, recapture inventory,
-reload the new target-native plugin, and require its version `0.3.0` executor
+reload the new target-native plugin, and require its version `0.3.2` executor
 and integrity verification before any other mutation. Never use that raw-add
 fallback for another plugin or once the helper command is available.
+
+For a native-Windows target with a configured `wsl_interop_via` sibling,
+prefer the WSL interop lane for this whole routine: SSH to the sibling,
+`cd /mnt/c` first — skipping it does NOT fail: cmd silently falls back to
+`C:\Windows` with rc=0 and only a stderr warning, so relative paths target
+the wrong directory invisibly — and run each Windows command through
+`/mnt/c/Windows/System32/cmd.exe /c "..."` — cmd starts faster than
+PowerShell, has fewer quoting layers through the ssh-to-interop chain, and
+resolves the CLIs' native executables directly. When a command genuinely needs
+PowerShell, never pass the script through the quoting chain — the double
+bash parse eats `$env:` and quotes silently (observed: `$env:USERPROFILE`
+resolving against the WSL-side cwd). Instead encode it on the WSL side and
+pass one opaque token:
+`PS_B64=$(printf %s '<script>' | iconv -t UTF-16LE | base64 -w0)` then
+`/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile
+-EncodedCommand "$PS_B64"` — still from a `/mnt/c` working directory.
+The harness CLIs, plugin commands, and the hook-approval helper all execute
+as native Windows processes, and their results are native evidence. WSL is
+purely the launcher: the Windows process knows nothing about WSL, so never
+hand it a WSL-side path — Windows commands operate on Windows files, with
+Windows-side variables written cmd-style (`%USERPROFILE%`, which bash
+passes through unexpanded). For the rare file that must cross the boundary,
+stage it under `/mnt/c` or translate with `wslpath -w`.
+Interop hygiene, each verified live: launch with stdin redirected
+(`</dev/null` — cmd silently consumes inherited stdin, starving any
+surrounding read loop); strip CRLF before comparing or parsing native
+output (`| tr -d '\r'` — most Windows tools emit CRLF; the harness CLIs
+emit clean LF); never nest quotes inside the `cmd /c` payload — cmd's own
+quote-stripping mangles them regardless of escaping, so arguments with
+spaces go through `%VAR%` expansion or the `-EncodedCommand` hatch; cmd
+expands an undefined `%VAR%` to its literal self with rc=0, so echo-verify
+a variable before anything destructive; and never run a bare CLI name in
+the WSL shell expecting the Windows one — sshd sessions get no Windows
+PATH entries, so `claude` resolves to the WSL-side install and yields WSL
+evidence mislabeled as native. Only the full-path cmd.exe wrapper produces
+native evidence. Fall back to `codex-remote-control` only when WSL is
+absent or unreachable, or the work needs the Desktop app surface.
 
 For a configured `codex-remote-control` target, follow the routine-refresh
 path in `"$SKILL_DIR/../../references/codex-remote-control.md"`, using a visible

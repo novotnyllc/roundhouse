@@ -10,7 +10,8 @@ Set `SKILL_DIR` to the absolute directory containing this loaded `SKILL.md` and
 is not the skill directory. Start with `"$CLI" validate-config`, resolve
 requested host names or groups from the config, then collect only the sections
 needed. Default to all configured hosts and a human report; preserve the JSONL
-snapshot when another agent will consume it.
+snapshot when another agent will consume it. In human reports, group
+machine entries sharing a `physical_host` under one hardware heading.
 
 For `local` and `ssh` targets, run `collect --target HOST --section SECTION`.
 Exit 2 means a usable partial snapshot; show its errors instead of discarding

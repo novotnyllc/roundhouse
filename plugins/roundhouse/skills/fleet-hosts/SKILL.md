@@ -15,7 +15,11 @@ individually consented ceremonies, never batched into silence. Resolve
 Ask for (defaults in brackets): display name; SSH alias — it must already
 resolve in `~/.ssh/config`, never invent one; platform
 [detect via `ssh <alias> uname -s`]; transport [`ssh`; `codex-remote-control`
-only for a native-Windows destination]; groups [none].
+only for a native-Windows destination]; groups [none]. For a Windows
+machine, also ask whether WSL runs on the same hardware (and vice versa):
+paired entries share a `physical_host` value, and the Windows entry sets
+`wsl_interop_via: <wsl-entry-name>` so maintenance can use the interop
+lane.
 
 1. **Reachability** — `ssh -o BatchMode=yes <alias> 'echo ok'` through the
    login shell. Fix reachability first (`roundhouse:ssh-doctor` for macOS
@@ -60,7 +64,9 @@ Order matters: clean up over SSH while access still works, revoke second.
    the departing one. Revoke privilege enrollment the same way when present.
 3. **Config removal** — delete the machine entry, re-run
    `"$CLI" validate-config`, and drop the host from any groups.
-4. **Report** — state what was removed, what was revoked, and any residual
+4. **Report** — if the entry shares a `physical_host` with others, say so
+   (removing one environment does not remove the hardware or its siblings).
+   State what was removed, what was revoked, and any residual
    state deliberately left on the machine (an unenrolled box keeps its own
    harnesses and user data — that is expected, name it rather than
    implying a wipe).

@@ -1,5 +1,11 @@
 # Codex Desktop remote control
 
+> **Check the interop lane first.** For a target whose registry entry
+> declares `wsl_interop_via`, CLI-shaped work defaults to the WSL interop
+> lane (SSH to the sibling, `cd /mnt/c`, full-path `cmd.exe /c` — native
+> processes, any harness). This contract is the fallback for Desktop-app
+> surface work, or when WSL is absent or unreachable.
+
 Use this only for a machine whose configured transport is
 `codex-remote-control`. Never substitute WSL or SSH.
 
@@ -221,7 +227,7 @@ provenance, conversions, ambiguous scope, and sealed-plan mutations.
    integrity-verified release that predates this helper: after the marketplace
    upgrade, run exactly
    `codex plugin add roundhouse@novotnyllc --json`, end that task, start a
-   fresh task, and verify the `0.3.0` executor and integrity manifest before any
+   fresh task, and verify the `0.3.2` executor and integrity manifest before any
    other mutation. Never use raw add as a fallback for another plugin or once
    the helper is available. For Claude local or
    SSH use `claude plugin marketplace update novotnyllc` followed by

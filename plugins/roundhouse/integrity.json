@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "ab9278df8742c1378c5c90c197a46770133441fffb0307efa968690700b42602"
+      "sha256": "02728557126a6cd4a16ece3bb247a4a3713c323851e83ab398ded86e10b7cc16"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "7da88bdfe0e46f5166c7b1706b37c8de0fd640577294336fc332a00fc583ff98"
+      "sha256": "ed4c14431a2d11029d11e4b3ad771ea1d214a514e22cd65850b6ccba1f309764"
     },
     {
       "path": "references/privilege-policy.default",
@@ -89,5 +89,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.3.1"
+  "version": "0.3.2"
 }

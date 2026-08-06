@@ -28,8 +28,20 @@ worker over the configured SSH transport — for example a Claude Code
 `claude -p` child with its own session identity in a fleet-verified checkout,
 under `railyard:orchestrate`'s placement contract — is agent
 dispatch, not raw command execution, and is the supported Claude Code
-placement lane. A visible Codex task covers only ordinary native
-Windows work. Protected or logged-off Windows work requires fresh
+placement lane. Machine entries sharing a `physical_host` value are
+environments on one piece of hardware: if the hardware is unreachable, all
+its entries are; report them together. For a native-Windows machine that declares a
+`wsl_interop_via` sibling in the config, the **WSL interop lane** is the
+preferred maintenance path: SSH to the WSL side, `cd /mnt/c`, and launch Windows-native
+CLIs through the full-path `cmd.exe /c` (full-path `powershell.exe` only
+when PowerShell itself is required) — the processes execute
+natively as the Windows user, so their evidence IS native-Windows evidence.
+(Pure WSL-side execution still never proves native Windows; interop-launched
+processes are not WSL-side execution.) A Windows logoff usually stops the
+WSL VM, so a logged-off host presents as plain SSH-unreachable — not an
+interop-specific error. The visible Codex task remains the
+lane for work needing the Desktop app surface, or when WSL is absent or
+unreachable — and it covers only ordinary native Windows work. Protected or logged-off Windows work requires fresh
 `privilege_broker` readiness from the enrolled `windows-sftp` route; never
 substitute the visible task, WSL, or another transport. That `windows-sftp`
 route is also the harness-neutral way to deliver dispatch prerequisites —

@@ -81,7 +81,11 @@ Registry entry per machine (file-per-machine on main): full hostname, SSH
 alias, tailnet name (preferred when present), OS (`mac`/`linux`/`windows`;
 WSL registers as `linux` with `wsl: true` — counts as Linux unless something
 specifically cares), installed harnesses, per-upstream capability (which
-managers/auth this host has), custom group names.
+managers/auth this host has), custom group names, and hardware pairing:
+entries on shared hardware carry the same `physical_host`, and a Windows
+entry with a WSL sibling sets `wsl_interop_via` so maintenance runs
+Windows-native CLIs from the WSL side (`cd /mnt/c` + full-path
+`cmd.exe /c` — native processes, native evidence).
 
 Groups:
 

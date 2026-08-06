@@ -53,11 +53,16 @@ post-inventory remains available. SSH uses bounded connection/keepalive
 timeouts and verifies the configured native hostname/user. Never infer apply
 permission from a request to inspect or plan.
 
-Run each native manager directly on local/SSH hosts. For Windows, Codex reads
-and follows `"$SKILL_DIR/../../references/codex-remote-control.md"`, including
-its exact shared `railyard/model-routing/v1` dispatch before task
-creation or a work-starting follow-up; Claude reports unsupported. Never fall
-back through WSL. Preserve native approval
+Run each native manager directly on local/SSH hosts. For Windows, the
+default lane is WSL interop whenever the machine declares `wsl_interop_via`:
+SSH to the sibling, `cd /mnt/c`, and run winget and the other native
+managers through full-path `cmd.exe /c` — native processes from any
+harness. Only when WSL is absent or unreachable, or the work needs the
+Desktop app surface, does Codex fall back to
+`"$SKILL_DIR/../../references/codex-remote-control.md"` (with its exact
+shared `railyard/model-routing/v1` dispatch before task creation); Claude
+reports that fallback lane as unsupported. Never run the managers
+WSL-side in place of native Windows. Preserve native approval
 prompts, stop per host on failure, and recapture package inventory afterward.
 Cleanup and autoremove are separate explicit actions.
 
