@@ -8210,4 +8210,435 @@ jq -e '.machines["sync-local"].transport == "local" and
 diff <(jq -S . "$sync_config") <(jq -S . "$sync_root/rendered.json") >/dev/null ||
   fail "absorb then render did not round-trip the original config"
 
+# --- fleet-sync fixtures (U4-U5) ---
+
+sync_u4="$sync_root/u4"
+mkdir -p "$sync_u4/jj-bin"
+
+# Real git drives every store operation; the fake jj covers only the two jj
+# surfaces the run driver touches (op-id capture and op restore).
+cat >"$sync_u4/jj-bin/jj" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$JJ_COMMAND_LOG"
+case "$*" in
+  --version) printf 'jj 0.43.1\n' ;;
+  *"git init --colocate"*) "$REAL_GIT" init -q -b main "${@: -1}" ;;
+  *"op restore"*) printf '%s\n' "$*" >>"$JJ_RESTORE_LOG" ;;
+  *"op log"*) printf 'sync-op-0001' ;;
+esac
+SH
+chmod +x "$sync_u4/jj-bin/jj"
+
+sync_run() {
+  sync_run_store=$1
+  sync_run_config=$2
+  shift 2
+  env ROUNDHOUSE_CONFIG="$sync_run_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+    ROUNDHOUSE_SYNC_STORE="$sync_run_store" XDG_CONFIG_HOME="$sync_root/xdg" "$@"
+}
+
+sync_write_config() {
+  # $1 output path, $2 local machine name, $3 remote url
+  jq -n --arg host "$2" --arg url "$3" '{version:1,
+    machines:{($host):{platform:"macos",transport:"local",groups:["development"]}},
+    sync:{enabled:true,remote:{url:$url},cadence_hours:24}}' >"$1"
+}
+
+sync_store_seed() {
+  # $1 store, $2 item path, $3 JSON content, $4 commit message
+  mkdir -p "$1/$(dirname "$2")"
+  printf '%s\n' "$3" >"$1/$2"
+  "$REAL_GIT" -C "$1" add -f "$2"
+  "$REAL_GIT" -C "$1" -c commit.gpgsign=false commit -q -m "$4"
+}
+
+"$REAL_GIT" init -q --bare -b main "$sync_u4/origin.git"
+
+# Run-lock and the first-push visibility gate.
+sync_gate_store="$sync_u4/gate-store"
+sync_gate_config="$sync_u4/gate-config.json"
+sync_write_config "$sync_gate_config" gate-host "$sync_u4/origin.git"
+sync_run "$sync_gate_store" "$sync_gate_config" "$cli" sync-init >/dev/null ||
+  fail "sync-init for the run-begin gate fixture failed"
+sync_gate_status=0
+sync_run "$sync_gate_store" "$sync_gate_config" "$cli" sync-run-begin >/dev/null 2>&1 ||
+  sync_gate_status=$?
+[ "$sync_gate_status" -eq 65 ] ||
+  fail "sync-run-begin with an unverified remote did not exit 65 (got $sync_gate_status)"
+[ ! -d "$sync_gate_store.lock" ] ||
+  fail "sync-run-begin refused on the visibility gate but kept the run-lock"
+
+sync_run "$sync_gate_store" "$sync_gate_config" "$cli" sync-lock >/dev/null ||
+  fail "sync-lock failed on a free store"
+sync_lock_status=0
+sync_run "$sync_gate_store" "$sync_gate_config" "$cli" sync-lock >/dev/null 2>&1 ||
+  sync_lock_status=$?
+[ "$sync_lock_status" -eq 75 ] ||
+  fail "second sync-lock did not exit 75 (got $sync_lock_status)"
+sync_begin_busy_status=0
+sync_run "$sync_gate_store" "$sync_gate_config" "$cli" sync-run-begin >/dev/null 2>&1 ||
+  sync_begin_busy_status=$?
+[ "$sync_begin_busy_status" -eq 75 ] ||
+  fail "sync-run-begin with the lock held did not exit 75 (got $sync_begin_busy_status)"
+sync_run "$sync_gate_store" "$sync_gate_config" "$cli" sync-unlock >/dev/null ||
+  fail "sync-unlock failed"
+[ ! -d "$sync_gate_store.lock" ] ||
+  fail "sync-unlock left the run-lock directory in place"
+
+# Git-only undo refusal is machine-readable (jj is never load-bearing).
+sync_run "$sync_gate_store" "$sync_gate_config" \
+  ROUNDHOUSE_SYNC_VISIBILITY_PROBE='exit 1' "$cli" sync-verify-remote >/dev/null ||
+  fail "sync-verify-remote failed for the gate fixture"
+sync_run "$sync_gate_store" "$sync_gate_config" "$cli" sync-run-begin >/dev/null ||
+  fail "sync-run-begin failed after remote visibility was verified"
+sync_gitonly_undo_status=0
+sync_gitonly_undo=$(sync_run "$sync_gate_store" "$sync_gate_config" "$cli" sync-undo 2>/dev/null) ||
+  sync_gitonly_undo_status=$?
+[ "$sync_gitonly_undo_status" -eq 69 ] ||
+  fail "git-only sync-undo did not exit 69 (got $sync_gitonly_undo_status)"
+printf '%s\n' "$sync_gitonly_undo" | jq -e '
+  .schema == "roundhouse.sync-undo-refusal" and .reason == "git-only-mode" and
+  (.guidance | test("restore flow"))' >/dev/null ||
+  fail "git-only sync-undo refusal record is not machine-readable"
+sync_run "$sync_gate_store" "$sync_gate_config" "$cli" sync-unlock >/dev/null ||
+  fail "releasing the gate fixture run-lock failed"
+
+# jj-mode driver: op-id capture, lease push, undo, journal, pin adoption, run end.
+sync_driver_store="$sync_u4/driver-store"
+sync_driver_config="$sync_u4/driver-config.json"
+sync_driver_state="$sync_driver_store.run/current.json"
+sync_write_config "$sync_driver_config" driver-host "$sync_u4/origin.git"
+sync_jj_env_log="$sync_u4/driver-jj-log"
+sync_jj_restore_log="$sync_u4/driver-jj-restore-log"
+sync_jj_env="PATH=$sync_u4/jj-bin:$PATH"
+sync_run "$sync_driver_store" "$sync_driver_config" "$sync_jj_env" \
+  JJ_COMMAND_LOG="$sync_jj_env_log" JJ_RESTORE_LOG="$sync_jj_restore_log" \
+  "$cli" sync-init >/dev/null ||
+  fail "sync-init for the jj-mode driver fixture failed"
+[ "$(jq -r '.mode' "$sync_driver_store/meta/host.json")" = jj ] ||
+  fail "driver fixture store is not in jj mode"
+sync_run "$sync_driver_store" "$sync_driver_config" \
+  ROUNDHOUSE_SYNC_VISIBILITY_PROBE='exit 1' "$cli" sync-verify-remote >/dev/null ||
+  fail "sync-verify-remote failed for the driver fixture"
+sync_run "$sync_driver_store" "$sync_driver_config" "$sync_jj_env" \
+  JJ_COMMAND_LOG="$sync_jj_env_log" JJ_RESTORE_LOG="$sync_jj_restore_log" \
+  "$cli" sync-run-begin >/dev/null ||
+  fail "sync-run-begin failed for the driver fixture"
+jq -e '.schema == "roundhouse.sync-run-state" and .op_id == "sync-op-0001" and
+  .lease_pushes == [] and .final_pushed == false' "$sync_driver_state" >/dev/null ||
+  fail "sync-run-begin did not record the pre-run jj operation id"
+[ -d "$sync_driver_store.run" ] ||
+  fail "run state directory is not host-local beside the store"
+[ ! -e "$sync_driver_store/current.json" ] ||
+  fail "run state leaked into the store"
+
+jq -n '{sha:"deadbeefcafef00d",version:"99.99.99",updated_by:"driver-host"}' \
+  >"$sync_u4/roundhouse-pin.json"
+sync_pin_status=0
+sync_run "$sync_driver_store" "$sync_driver_config" \
+  "$cli" sync-adopt-pin roundhouse "$sync_u4/roundhouse-pin.json" >/dev/null 2>&1 ||
+  sync_pin_status=$?
+[ "$sync_pin_status" -eq 65 ] ||
+  fail "roundhouse pin without a healthy journal was adopted (got $sync_pin_status)"
+sync_other_pin=$(sync_run "$sync_driver_store" "$sync_driver_config" \
+  "$cli" sync-adopt-pin railyard "$sync_u4/roundhouse-pin.json") ||
+  fail "non-roundhouse pin adoption failed"
+printf '%s\n' "$sync_other_pin" | jq -e '.adopted == true' >/dev/null ||
+  fail "non-roundhouse plugins must adopt pins unconditionally"
+
+sync_run "$sync_driver_store" "$sync_driver_config" "$sync_jj_env" \
+  JJ_COMMAND_LOG="$sync_jj_env_log" JJ_RESTORE_LOG="$sync_jj_restore_log" \
+  "$cli" sync-lease upstream-alpha >/dev/null ||
+  fail "sync-lease failed on an uncontended upstream"
+jq -e '(.lease_pushes | length) == 1 and .lease_pushes[0].upstream == "upstream-alpha" and
+  .final_pushed == false' "$sync_driver_state" >/dev/null ||
+  fail "lease push was not recorded separately from the final-push marker"
+
+sync_run "$sync_driver_store" "$sync_driver_config" "$sync_jj_env" \
+  JJ_COMMAND_LOG="$sync_jj_env_log" JJ_RESTORE_LOG="$sync_jj_restore_log" \
+  "$cli" sync-undo >/dev/null ||
+  fail "sync-undo refused after a lease push (lease pushes must stay undoable)"
+assert_contains "$(cat "$sync_jj_restore_log")" 'op restore sync-op-0001'
+
+jq -n '{outcome:"healthy",items_applied:2,items_held:1,applied_pin:"deadbeefcafef00d"}' \
+  >"$sync_u4/driver-outcome.json"
+sync_journal_record=$(sync_run "$sync_driver_store" "$sync_driver_config" "$sync_jj_env" \
+  JJ_COMMAND_LOG="$sync_jj_env_log" JJ_RESTORE_LOG="$sync_jj_restore_log" \
+  "$cli" sync-journal "$sync_u4/driver-outcome.json") ||
+  fail "sync-journal failed"
+printf '%s\n' "$sync_journal_record" | jq -e '
+  .schema == "roundhouse.sync-journal" and .host == "driver-host" and
+  .outcome == "healthy" and .items_applied == 2 and .items_held == 1 and
+  .run_op_id == "sync-op-0001" and .applied_pin == "deadbeefcafef00d" and
+  (.started_at | type) == "string" and (.ended_at | type) == "string"' >/dev/null ||
+  fail "journal record does not carry the roundhouse.sync-journal shape"
+[ "$("$REAL_GIT" -C "$sync_driver_store" ls-tree -r --name-only \
+  refs/heads/host/driver-host -- journal/ | wc -l | tr -d ' ')" = 1 ] ||
+  fail "journal record was not committed on the host branch"
+
+sync_adopted=$(sync_run "$sync_driver_store" "$sync_driver_config" \
+  "$cli" sync-adopt-pin roundhouse "$sync_u4/roundhouse-pin.json") ||
+  fail "roundhouse pin with a matching healthy journal was refused"
+printf '%s\n' "$sync_adopted" | jq -e '.adopted == true and
+  .reason == "healthy-journal-from-driver-host"' >/dev/null ||
+  fail "pin adoption record does not cite the healthy journal"
+
+sync_run "$sync_driver_store" "$sync_driver_config" "$sync_jj_env" \
+  JJ_COMMAND_LOG="$sync_jj_env_log" JJ_RESTORE_LOG="$sync_jj_restore_log" \
+  "$cli" sync-run-end >/dev/null ||
+  fail "sync-run-end failed"
+jq -e '.final_pushed == true and .phase == "ended"' "$sync_driver_state" >/dev/null ||
+  fail "sync-run-end did not set the final-push marker"
+[ ! -d "$sync_driver_store.lock" ] ||
+  fail "sync-run-end did not release the run-lock"
+"$REAL_GIT" -C "$sync_u4/origin.git" show-ref --verify --quiet refs/heads/host/driver-host ||
+  fail "sync-run-end did not push the host branch"
+sync_pushed_undo_status=0
+sync_run "$sync_driver_store" "$sync_driver_config" "$sync_jj_env" \
+  JJ_COMMAND_LOG="$sync_jj_env_log" JJ_RESTORE_LOG="$sync_jj_restore_log" \
+  "$cli" sync-undo >/dev/null 2>&1 || sync_pushed_undo_status=$?
+[ "$sync_pushed_undo_status" -eq 65 ] ||
+  fail "sync-undo after the end-of-run push did not exit 65 (got $sync_pushed_undo_status)"
+
+# Lease race: two clones of one bare remote; the push race settles the owner.
+"$REAL_GIT" init -q --bare -b main "$sync_u4/lease-remote.git"
+for sync_lease_host in lease-a lease-b; do
+  sync_write_config "$sync_u4/$sync_lease_host-config.json" "$sync_lease_host" \
+    "$sync_u4/lease-remote.git"
+  sync_run "$sync_u4/$sync_lease_host-store" "$sync_u4/$sync_lease_host-config.json" \
+    "$cli" sync-init >/dev/null || fail "sync-init failed for $sync_lease_host"
+  sync_run "$sync_u4/$sync_lease_host-store" "$sync_u4/$sync_lease_host-config.json" \
+    ROUNDHOUSE_SYNC_VISIBILITY_PROBE='exit 1' "$cli" sync-verify-remote >/dev/null ||
+    fail "sync-verify-remote failed for $sync_lease_host"
+  sync_run "$sync_u4/$sync_lease_host-store" "$sync_u4/$sync_lease_host-config.json" \
+    "$cli" sync-run-begin >/dev/null || fail "sync-run-begin failed for $sync_lease_host"
+done
+sync_run "$sync_u4/lease-a-store" "$sync_u4/lease-a-config.json" \
+  "$cli" sync-lease shared-upstream >/dev/null ||
+  fail "the first lease holder failed to take the lease"
+sync_race_status=0
+sync_race_error=$(sync_run "$sync_u4/lease-b-store" "$sync_u4/lease-b-config.json" \
+  "$cli" sync-lease shared-upstream 2>&1 >/dev/null) || sync_race_status=$?
+[ "$sync_race_status" -eq 75 ] ||
+  fail "the losing lease writer did not exit 75 (got $sync_race_status)"
+assert_contains "$sync_race_error" 'lost to lease-a'
+jq -e '.holder == "lease-a"' \
+  "$sync_u4/lease-b-store/leases/shared-upstream.json" >/dev/null ||
+  fail "the losing writer did not converge onto the winning lease record"
+[ -f "$sync_u4/lease-b-store/meta/host.json" ] ||
+  fail "the losing writer lost its host-local store meta"
+
+# A rejected lease push converges onto the winning history and takes over an
+# absent lease. The winning history need carry none of this host's skeleton, so
+# convergence must keep host-local meta and still be able to write the lease.
+"$REAL_GIT" init -q --bare -b main "$sync_u4/foreign-remote.git"
+"$REAL_GIT" init -q -b main "$sync_u4/foreign-seed"
+printf 'foreign\n' >"$sync_u4/foreign-seed/marker.txt"
+"$REAL_GIT" -C "$sync_u4/foreign-seed" add marker.txt
+"$REAL_GIT" -C "$sync_u4/foreign-seed" -c commit.gpgsign=false \
+  -c user.email=foreign@example.invalid -c user.name=foreign commit -q -m 'foreign history'
+"$REAL_GIT" -C "$sync_u4/foreign-seed" push -q "$sync_u4/foreign-remote.git" main
+sync_write_config "$sync_u4/foreign-config.json" foreign-host "$sync_u4/foreign-remote.git"
+sync_run "$sync_u4/foreign-store" "$sync_u4/foreign-config.json" "$cli" sync-init >/dev/null ||
+  fail "sync-init for the foreign-history fixture failed"
+sync_run "$sync_u4/foreign-store" "$sync_u4/foreign-config.json" \
+  ROUNDHOUSE_SYNC_VISIBILITY_PROBE='exit 1' "$cli" sync-verify-remote >/dev/null ||
+  fail "sync-verify-remote failed for the foreign-history fixture"
+sync_run "$sync_u4/foreign-store" "$sync_u4/foreign-config.json" \
+  "$cli" sync-run-begin >/dev/null ||
+  fail "sync-run-begin failed for the foreign-history fixture"
+sync_run "$sync_u4/foreign-store" "$sync_u4/foreign-config.json" \
+  "$cli" sync-lease foreign-upstream >/dev/null ||
+  fail "a lease push rejected by a foreign history did not converge and take over"
+jq -e '.remote_visibility_verified == true' \
+  "$sync_u4/foreign-store/meta/host.json" >/dev/null ||
+  fail "converging onto a meta-less history destroyed host-local store meta"
+jq -e '(.lease_pushes | length) == 1 and .final_pushed == false' \
+  "$sync_u4/foreign-store.run/current.json" >/dev/null ||
+  fail "the takeover lease push was not recorded (and must not set the final marker)"
+"$REAL_GIT" -C "$sync_u4/foreign-remote.git" ls-tree -r --name-only main |
+  grep -qx 'leases/foreign-upstream.json' ||
+  fail "the takeover did not publish the lease onto the winning history"
+
+# Peer fetch: unreachable origin falls back to a registry-listed peer store URL.
+"$REAL_GIT" init -q --bare -b main "$sync_u4/peer-remote.git"
+"$REAL_GIT" init -q -b main "$sync_u4/peer-seed"
+printf 'peer-store\n' >"$sync_u4/peer-seed/marker.txt"
+"$REAL_GIT" -C "$sync_u4/peer-seed" add marker.txt
+"$REAL_GIT" -C "$sync_u4/peer-seed" -c commit.gpgsign=false \
+  -c user.email=sync-peer@example.invalid -c user.name=sync-peer commit -q -m 'peer seed'
+"$REAL_GIT" -C "$sync_u4/peer-seed" push -q "$sync_u4/peer-remote.git" main
+jq -n --arg origin "$sync_u4/absent-origin.git" --arg peer "$sync_u4/peer-remote.git" '{
+  version:1,
+  machines:{
+    "fetch-host":{platform:"macos",transport:"local",groups:["development"]},
+    "peer-host":{platform:"macos",transport:"ssh",ssh_alias:"peer-alias",
+      groups:["development"],sync:{store_url:$peer}}},
+  sync:{enabled:true,remote:{url:$origin},cadence_hours:24}}' \
+  >"$sync_u4/fetch-config.json"
+sync_run "$sync_u4/fetch-store" "$sync_u4/fetch-config.json" "$cli" sync-init >/dev/null ||
+  fail "sync-init for the peer-fetch fixture failed"
+sync_run "$sync_u4/fetch-store" "$sync_u4/fetch-config.json" \
+  "$cli" sync-absorb-registry >/dev/null ||
+  fail "sync-absorb-registry for the peer-fetch fixture failed"
+sync_fetch_record=$(sync_run "$sync_u4/fetch-store" "$sync_u4/fetch-config.json" \
+  "$cli" sync-fetch -) ||
+  fail "sync-fetch did not fall back to the registry peer"
+printf '%s\n' "$sync_fetch_record" | jq -e '
+  .schema == "roundhouse.sync-fetch" and .fetched == true and
+  .source == "peer:peer-host"' >/dev/null ||
+  fail "sync-fetch record does not name the peer it fetched from"
+"$REAL_GIT" -C "$sync_u4/fetch-store" show-ref --verify --quiet refs/remotes/origin/main ||
+  fail "peer fetch did not populate the incoming ref"
+
+# Review mechanics: diff, verdict binding, apply, hook trust, allowlist guard.
+sync_review_store="$sync_u4/review-store"
+sync_review_config="$sync_u4/review-config.json"
+sync_review_item=desired/global/settings/example.json
+sync_approve_marker="$sync_u4/approve-marker"
+sync_approve_cmd="printf '%s\\n' \"\$1\" >>'$sync_approve_marker'"
+sync_write_config "$sync_review_config" review-host "$sync_u4/review-remote.git"
+sync_run "$sync_review_store" "$sync_review_config" "$cli" sync-init >/dev/null ||
+  fail "sync-init for the review fixture failed"
+sync_store_seed "$sync_review_store" "$sync_review_item" \
+  '{"enabled":true,"value":"first"}' 'seed review item'
+
+sync_diff_record=$(sync_run "$sync_review_store" "$sync_review_config" \
+  "$cli" sync-diff "$sync_review_item" -) || fail "sync-diff failed"
+printf '%s\n' "$sync_diff_record" | jq -e --arg item "$sync_review_item" '
+  .schema == "roundhouse.sync-diff" and .item == $item and
+  (.incoming_digest | test("^[0-9a-f]{64}$")) and
+  (.commit | test("^[0-9a-f]{40}$")) and (.diff | test("\\+\\{"))' >/dev/null ||
+  fail "sync-diff record does not carry the incoming digest, commit, and diff text"
+
+sync_noverdict_status=0
+sync_run "$sync_review_store" "$sync_review_config" \
+  "$cli" sync-apply "$sync_review_item" "$sync_u4/never-applied.json" >/dev/null 2>&1 ||
+  sync_noverdict_status=$?
+[ "$sync_noverdict_status" -eq 65 ] ||
+  fail "sync-apply without a verdict did not exit 65 (got $sync_noverdict_status)"
+[ ! -e "$sync_u4/never-applied.json" ] ||
+  fail "sync-apply refused without a verdict but still wrote the destination"
+
+sync_run "$sync_review_store" "$sync_review_config" \
+  "$cli" sync-verdict "$sync_review_item" pass 'reviewed the first revision' >/dev/null ||
+  fail "sync-verdict pass failed"
+sync_store_seed "$sync_review_store" "$sync_review_item" \
+  '{"enabled":true,"value":"second"}' 'change review item after the verdict'
+sync_stale_status=0
+sync_run "$sync_review_store" "$sync_review_config" \
+  "$cli" sync-apply "$sync_review_item" "$sync_u4/stale-applied.json" >/dev/null 2>&1 ||
+  sync_stale_status=$?
+[ "$sync_stale_status" -eq 65 ] ||
+  fail "sync-apply with a stale verdict did not exit 65 (got $sync_stale_status)"
+[ ! -e "$sync_u4/stale-applied.json" ] ||
+  fail "a stale verdict still materialized content"
+
+sync_run "$sync_review_store" "$sync_review_config" \
+  "$cli" sync-verdict "$sync_review_item" pass 'reviewed the second revision' >/dev/null ||
+  fail "re-recording the verdict failed"
+sync_apply_message=$(sync_run "$sync_review_store" "$sync_review_config" \
+  "$cli" sync-apply "$sync_review_item" "$sync_u4/applied-item.json") ||
+  fail "sync-apply with a fresh verdict failed"
+assert_contains "$sync_apply_message" "$sync_u4/applied-item.json"
+jq -e '.value == "second"' "$sync_u4/applied-item.json" >/dev/null ||
+  fail "sync-apply materialized the wrong content"
+[ "$(test_file_mode "$sync_u4/applied-item.json")" = 600 ] ||
+  fail "applied item is not mode 600"
+"$REAL_GIT" -C "$sync_review_store" show \
+  "refs/heads/host/review-host:materialized/$sync_review_item" |
+  jq -e '.value == "second"' >/dev/null ||
+  fail "applied state was not recorded under the host branch materialized tree"
+
+sync_hook_held=desired/global/hooks/held-plugin.json
+sync_store_seed "$sync_review_store" "$sync_hook_held" \
+  '{"plugin_id":"held@test-market","enabled":true}' 'seed held hook item'
+sync_run "$sync_review_store" "$sync_review_config" \
+  "$cli" sync-verdict "$sync_hook_held" hold 'reviewer flagged the hook body' >/dev/null ||
+  fail "sync-verdict hold failed"
+sync_hook_hold_status=0
+sync_run "$sync_review_store" "$sync_review_config" \
+  ROUNDHOUSE_SYNC_APPROVE_CMD="$sync_approve_cmd" \
+  "$cli" sync-apply "$sync_hook_held" "$sync_u4/held-hook.json" >/dev/null 2>&1 ||
+  sync_hook_hold_status=$?
+[ "$sync_hook_hold_status" -eq 65 ] ||
+  fail "applying a held hook did not exit 65 (got $sync_hook_hold_status)"
+[ ! -e "$sync_u4/held-hook.json" ] ||
+  fail "a held hook was materialized"
+"$REAL_GIT" -C "$sync_review_store" show \
+  "refs/heads/host/review-host:materialized/$sync_hook_held" |
+  jq -e '.schema == "roundhouse.sync-hook-hold" and .enabled == false and .held == true' \
+  >/dev/null || fail "a held hook did not record an enablement-off marker"
+[ ! -e "$sync_approve_marker" ] ||
+  fail "a held hook invoked the approval helper (held means disabled AND untrusted)"
+
+sync_hook_passed=desired/global/hooks/passed-plugin.json
+sync_store_seed "$sync_review_store" "$sync_hook_passed" \
+  '{"plugin_id":"passed@test-market","enabled":true}' 'seed passing hook item'
+sync_run "$sync_review_store" "$sync_review_config" \
+  "$cli" sync-verdict "$sync_hook_passed" pass 'hook body reviewed clean' >/dev/null ||
+  fail "sync-verdict pass on a hook failed"
+sync_run "$sync_review_store" "$sync_review_config" \
+  ROUNDHOUSE_SYNC_APPROVE_CMD="$sync_approve_cmd" \
+  "$cli" sync-apply "$sync_hook_passed" "$sync_u4/passed-hook.json" >/dev/null ||
+  fail "applying a review-passed hook failed"
+grep -Fx 'passed@test-market' "$sync_approve_marker" >/dev/null ||
+  fail "a review-passed hook did not invoke the approval helper with its plugin id"
+
+sync_allowlist_item=allowlists/agent-settings.json
+sync_store_seed "$sync_review_store" "$sync_allowlist_item" \
+  '{"keys":["ui.theme","secrets.token"],"excluded_namespaces":["secrets"]}' \
+  'seed widening allowlist'
+sync_run "$sync_review_store" "$sync_review_config" \
+  "$cli" sync-verdict "$sync_allowlist_item" pass 'looked fine to the reviewer' >/dev/null ||
+  fail "sync-verdict pass on an allowlist failed"
+sync_allowlist_status=0
+sync_run "$sync_review_store" "$sync_review_config" \
+  "$cli" sync-apply "$sync_allowlist_item" "$sync_u4/widened-allowlist.json" >/dev/null 2>&1 ||
+  sync_allowlist_status=$?
+[ "$sync_allowlist_status" -eq 65 ] ||
+  fail "an allowlist widening into an excluded namespace was applied (got $sync_allowlist_status)"
+[ ! -e "$sync_u4/widened-allowlist.json" ] ||
+  fail "a widening allowlist was materialized"
+assert_contains "$(cat "$sync_review_store"/alerts/*.json | jq -r '.reason')" \
+  'allowlist widens into excluded namespace'
+
+sync_hold_record=$(sync_run "$sync_review_store" "$sync_review_config" \
+  "$cli" sync-hold "$sync_review_item" 'held pending fleet review') ||
+  fail "sync-hold failed"
+printf '%s\n' "$sync_hold_record" | jq -e --arg item "$sync_review_item" '
+  .schema == "roundhouse.sync-alert" and .item == $item and
+  .host == "review-host" and .reason == "held pending fleet review"' >/dev/null ||
+  fail "sync-hold did not emit a roundhouse.sync-alert record"
+"$REAL_GIT" -C "$sync_review_store" ls-tree -r --name-only refs/heads/main -- alerts/ |
+  grep -q . || fail "sync-hold did not commit the alert record on main"
+
+# Signature gate: a pass verdict never binds to content git cannot verify.
+sync_sig_store="$sync_u4/sig-store"
+sync_sig_config="$sync_u4/sig-config.json"
+sync_write_config "$sync_sig_config" sig-host "$sync_u4/sig-remote.git"
+sync_run "$sync_sig_store" "$sync_sig_config" "$cli" sync-init >/dev/null ||
+  fail "sync-init for the signature fixture failed"
+jq '.signing_enabled = true' "$sync_sig_store/meta/host.json" >"$sync_u4/sig-meta.json"
+cp "$sync_u4/sig-meta.json" "$sync_sig_store/meta/host.json"
+sync_store_seed "$sync_sig_store" "$sync_review_item" \
+  '{"enabled":true,"value":"unsigned"}' 'seed unsigned item'
+sync_sigverdict_status=0
+sync_run "$sync_sig_store" "$sync_sig_config" \
+  "PATH=$sync_root/siggit-bin:$PATH" GIT_VERIFY_LOG="$sync_u4/sig-verify-log" \
+  "$cli" sync-verdict "$sync_review_item" pass 'reviewer approved' >/dev/null 2>&1 ||
+  sync_sigverdict_status=$?
+[ "$sync_sigverdict_status" -eq 65 ] ||
+  fail "a pass verdict on unverifiable content did not exit 65 (got $sync_sigverdict_status)"
+[ ! -d "$sync_sig_store.run/verdicts" ] ||
+  [ -z "$(ls -A "$sync_sig_store.run/verdicts" 2>/dev/null)" ] ||
+  fail "a refused pass verdict was still recorded"
+sync_sig_verify_log=$(cat "$sync_u4/sig-verify-log")
+assert_contains "$sync_sig_verify_log" \
+  "gpg.ssh.allowedSignersFile=$sync_root/xdg/roundhouse/allowed_signers"
+case $sync_sig_verify_log in
+  *"allowedSignersFile=$sync_sig_store"*)
+    fail "the verdict signature gate consulted a store-carried signer file" ;;
+esac
+
 printf 'PASS: roundhouse self-check\n'
