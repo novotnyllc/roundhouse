@@ -4408,7 +4408,8 @@ function Invoke-SelfTest {
             $HelperLines[8] -cne ("provider-lock-sha256|" + ("b" * 64))) {
             throw "helper stdin contract self-test failed"
         }
-        $VectorAuthority = "2b048d26707cdbfdfb379b025237d5bfccb259bdc5fc5d621f3138f39dbd6a87"
+        # Pinned under the "roundhouse-winget-state-authority|1" domain prefix.
+        $VectorAuthority = "b03dcc6b5ab808731241cef4d2b67fdc640a77d7900c3abd1008647338baffe7"
         $ProviderContextBytes = ConvertTo-CanonicalAsciiBytes @(
             "winget-provider-context|1", "state-identifier|roundhouse-e7-$VectorAuthority",
             "source-id|catalog-id", "source-name|catalog-name", "source-type|Microsoft.PreIndexed.Package",

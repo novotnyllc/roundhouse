@@ -22,7 +22,7 @@
     },
     {
       "path": "scripts/certify-ssh-node",
-      "sha256": "db63dbad06a383df553acbc690e70f8ede4939f9f1734f97d6a42fbc46541f0c"
+      "sha256": "8f3ec784c51fa2fdcab34fc2fc6741219b15a9eb05bf6d9be52949c5b03c2a95"
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
@@ -66,7 +66,7 @@
     },
     {
       "path": "scripts/privilege-broker-windows.ps1",
-      "sha256": "233bd546b7c0c5bf3a825883f09e7ff182f8ffea4747367ef27038a204613a06"
+      "sha256": "613202344c52cb41de7a622465bcb68e308ddaa3ac6db3d0c7859681dffb7a54"
     },
     {
       "path": "scripts/profile-worker-windows.ps1",

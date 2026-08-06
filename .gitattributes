@@ -1,0 +1,4 @@
+# integrity.json pins SHA-256 over on-disk bytes, so every checkout must be
+# byte-identical. Windows runners default to core.autocrlf=true, which would
+# rewrite LF to CRLF and break every recorded hash.
+* text=auto eol=lf
