@@ -62,12 +62,16 @@ Doctrine changes that ride on it:
 - Failure handling is unchanged: fail closed, journal, surface at the next
   doctor run. No retry-with-different-shape, no fallback to sudo.
 
-### 2. Publisher-bound bindings for macOS payloads (v2)
+### 2. Publisher-bound bindings for macOS payloads — the standard, not an option
 
-New binding shape for the two macOS payload actions
-(`macos.install-signed-pkg.v2`, `sealed-cask-publisher-v1`): drop the byte
-digest and version pin; keep and extend the signature checks that already
-exist in the broker:
+A byte-hash-per-version binding on software that updates itself is a
+design error, full stop: it turns every release into a human ceremony and
+defeats the point of scheduled updates. No host has ever enrolled under
+the current shape, so there is no migration — the byte-bound payload
+actions are **replaced**, not augmented. `macos.install-signed-pkg.v2` and
+`sealed-cask-publisher-v1` become the only enrollment shape for
+Apple-signed software: drop the byte digest and version pin; keep and
+extend the signature checks that already exist in the broker:
 
 - Apple code-signature validity (`pkgutil --check-signature`, and
   `codesign --verify` / `spctl --assess` for app bundles),
@@ -78,12 +82,13 @@ exist in the broker:
 
 Trust moves from "the exact bytes the owner enrolled" to "any genuine
 package from this publisher with this identity" — Apple's signing chain
-takes over the integrity role the sha256 played. v1 byte-bound actions
-remain in the catalog for payloads the owner wants version-pinned; v2 is
-what an auto-updating app enrolls as. Enrollment of a v2 binding is
-seeded from an observed genuine payload (the enrollment ceremony verifies
-the seed package and records its team/identity), so the owner never types
-a Team ID by hand.
+takes over the integrity role the sha256 played. Enrollment is seeded
+from an observed genuine payload (the ceremony verifies the seed package
+and records its team/identity), so the owner never types a Team ID by
+hand. Byte-hash binding survives in exactly one place: **unsigned or
+ad-hoc artifacts**, which have no publisher identity to bind to — and an
+unsigned artifact is inherently attended-only, because nothing can vouch
+for its next version. Signed software never enrolls byte-bound.
 
 ### 3. Enrollment stance change
 
@@ -114,11 +119,11 @@ exists to name).
   owner-activated policy; sealed plans with fresh preconditions; fail
   closed everywhere.
 - The delta is confined to binding shape on two macOS actions: byte-pin →
-  publisher-pin. Residual risk is a compromised publisher certificate or
-  malicious signed update — the same exposure as every macOS app
-  auto-updater, mitigated by notarization and Apple's revocation
-  machinery. The owner chooses per-package whether that trade is
-  acceptable (v2) or not (stay v1, stay attended).
+  publisher-pin, as the standard for all signed software. Residual risk is
+  a compromised publisher certificate or malicious signed update — the
+  same exposure as every macOS app auto-updater, mitigated by notarization
+  and Apple's revocation machinery. The owner's choice is per-publisher at
+  enrollment (enroll the package or don't), not per-version.
 - apt/winget gain no new trust: their channel bindings already express
   publisher-level trust; they only gain the unattended flag.
 - The unattended flag never widens *what* an action may do — only *when*
