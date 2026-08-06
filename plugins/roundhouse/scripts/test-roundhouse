@@ -173,8 +173,9 @@ esac
 
 # The three-phase run names every command the driver actually exposes.
 for sync_doctrine_command in sync-fetch sync-run-begin sync-lease sync-adopt-pin \
-    sync-diff sync-verdict sync-apply sync-hold sync-materialize sync-propose \
-    sync-journal sync-run-end sync-status sync-undo sync-pending; do
+    sync-diff sync-verdict sync-apply sync-hold sync-canary-check sync-materialize \
+    sync-propose sync-journal sync-run-end sync-status sync-undo sync-pending \
+    sync-finding; do
   assert_contains "$fleet_agents_text" "\"\$CLI\" $sync_doctrine_command"
 done
 assert_ordered "$fleet_agents_skill" '"$CLI" sync-fetch' '"$CLI" sync-run-begin'
@@ -233,12 +234,40 @@ spec'
 # The per-type state-alignment capability table (spec open item 2).
 assert_contains "$fleet_agents_text" '### State-alignment capability per item type'
 assert_contains "$fleet_agents_text" 'claude plugin enable\|disable PLUGIN@MARKETPLACE --scope user'
-assert_contains "$fleet_agents_text" 'codex plugin enable\|disable PLUGIN@MARKETPLACE'
 assert_contains "$fleet_agents_text" 'no enable/disable verb — presence only'
 assert_contains "$fleet_agents_text" 'hooks.state."HOOK-KEY".enabled'
 assert_contains "$fleet_agents_text" 'host-local trust and is never synced'
 assert_contains "$fleet_agents_text" 'only *state* falls back to config edits'
-assert_contains "$fleet_agents_text" 'enable/disable verbs below are unverified per-harness'
+# The verbs are stated as VERIFIED against named harness versions, and the
+# Codex row no longer claims a plugin enable/disable verb that does not exist.
+assert_contains "$fleet_agents_text" 'verified against claude 2.1.222 / codex-cli 0.146.0'
+assert_contains "$fleet_agents_text" '`[plugins."PLUGIN@MARKETPLACE"] enabled` key in `~/.codex/config.toml`'
+case $fleet_agents_text in
+  *'unverified per-harness'*)
+    fail "fleet-agents still hedges the capability verbs as unverified" ;;
+  *'codex plugin enable'* | *'codex plugin disable'*)
+    fail "fleet-agents still claims a codex plugin enable/disable verb" ;;
+esac
+
+# Canary gating doctrine: membership is the only exemption, and the evidence
+# is a digest-matched aged healthy journal.
+assert_contains "$fleet_agents_text" '### Canary gating'
+assert_contains "$fleet_agents_text" '`sync.canary_group`'
+assert_contains "$fleet_agents_text" '`sync.canary_wait_hours`'
+assert_contains "$fleet_agents_text" 'same content digest'
+assert_contains "$fleet_agents_text" 'no bypass flag and no `--canary-exempt`'
+assert_contains "$fleet_agents_text" 'the only exemption is group membership'
+
+# Transcript-mining doctrine: local only, both harness paths named, redacted
+# findings are the only channel out.
+assert_contains "$fleet_agents_text" '### Mining local transcripts for intent evidence'
+assert_contains "$fleet_agents_text" '.claude/projects/*/*.jsonl'
+assert_contains "$fleet_agents_text" '.codex/sessions/YYYY/MM/DD/rollout-*.jsonl'
+assert_contains "$fleet_agents_text" 'last ~48 hours'
+assert_contains "$fleet_agents_text" 'quote
+minimally'
+assert_contains "$fleet_agents_text" 'Transcript text never
+reaches the store any other way'
 
 # The doctor check contract carries the spec's full list.
 assert_contains "$fleet_agents_text" '### Doctor check contract'
@@ -8317,8 +8346,11 @@ git -C "$jj_store" show-ref --verify --quiet refs/heads/host/sync-local ||
   fail "sync-init did not configure the origin remote from config"
 
 git_store="$sync_root/git-store"
+# The key path is pinned at an absent file: the degraded-mode assertions below
+# must not depend on whether the host running the suite happens to be enrolled.
 ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
   ROUNDHOUSE_SYNC_STORE="$git_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_root/absent-node-key" \
   "$cli" sync-init >/dev/null ||
   fail "sync-init without jj failed"
 [ "$(jq -r '.mode' "$git_store/meta/host.json")" = git-only ] ||
@@ -8329,10 +8361,156 @@ ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
 cp "$git_store/meta/host.json" "$sync_root/meta-before-reinit.json"
 ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
   ROUNDHOUSE_SYNC_STORE="$git_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_root/absent-node-key" \
   "$cli" sync-init >/dev/null ||
   fail "re-running sync-init on an existing store did not exit zero"
 cmp -s "$sync_root/meta-before-reinit.json" "$git_store/meta/host.json" ||
   fail "re-running sync-init rewrote store meta (must be non-destructive)"
+
+# --- late enrollment: allowed_signers derivation and the sync-init heal ---
+# A host that enrols AFTER sync-init used to stay permanently degraded: the
+# already-initialized path exited before any signing config was written, and
+# nothing on the host ever wrote the host-local allowed_signers file.
+
+sync_heal="$sync_root/heal"
+mkdir -p "$sync_heal"
+/usr/bin/ssh-keygen -q -t ed25519 -N '' -C roundhouse-fleet-ca -f "$sync_heal/fleet-ca"
+sync_ca_blob=$(awk '{print $2}' "$sync_heal/fleet-ca.pub")
+
+# sync-refresh-signers derives the host-local file from host-local CA material
+# and never from store content (KTD16).
+sync_heal_xdg="$sync_heal/xdg-refresh"
+sync_heal_signers="$sync_heal_xdg/roundhouse/allowed_signers"
+sync_refresh_status=0
+ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  XDG_CONFIG_HOME="$sync_heal_xdg" ROUNDHOUSE_SSH_CA_PATH="$sync_heal/absent-ca.pub" \
+  ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_heal/absent-node-key" \
+  "$cli" sync-refresh-signers >/dev/null 2>&1 || sync_refresh_status=$?
+[ "$sync_refresh_status" -eq 69 ] ||
+  fail "sync-refresh-signers with no CA material did not exit 69 (got $sync_refresh_status)"
+[ ! -e "$sync_heal_signers" ] ||
+  fail "sync-refresh-signers wrote a signers file with nothing to derive it from"
+
+ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  XDG_CONFIG_HOME="$sync_heal_xdg" ROUNDHOUSE_SSH_CA_PATH="$sync_heal/fleet-ca.pub" \
+  ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_heal/absent-node-key" \
+  "$cli" sync-refresh-signers >/dev/null ||
+  fail "sync-refresh-signers failed with fleet CA material present"
+assert_contains "$(cat "$sync_heal_signers")" "* cert-authority ssh-ed25519 $sync_ca_blob"
+case $(cat "$sync_heal_signers") in
+  *roundhouse-fleet-ca*)
+    fail "the derived signers file carried the key comment as a principal" ;;
+esac
+
+# A CA rotation refreshes in place: the file tracks host-local material.
+/usr/bin/ssh-keygen -q -t ed25519 -N '' -C roundhouse-fleet-ca-next -f "$sync_heal/fleet-ca-next"
+sync_ca_next_blob=$(awk '{print $2}' "$sync_heal/fleet-ca-next.pub")
+ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  XDG_CONFIG_HOME="$sync_heal_xdg" ROUNDHOUSE_SSH_CA_PATH="$sync_heal/fleet-ca-next.pub" \
+  ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_heal/absent-node-key" \
+  "$cli" sync-refresh-signers >/dev/null ||
+  fail "sync-refresh-signers failed after a CA rotation"
+assert_contains "$(cat "$sync_heal_signers")" "* cert-authority ssh-ed25519 $sync_ca_next_blob"
+case $(cat "$sync_heal_signers") in
+  *"$sync_ca_blob"*) fail "the rotated signers file still carried the retired CA key" ;;
+esac
+
+# git-only: init without a key records the degraded state, enrolling later heals.
+sync_heal_git_store="$sync_heal/git-store"
+sync_heal_git_xdg="$sync_heal/xdg-git"
+sync_heal_git_key="$sync_heal/git-node-key"
+sync_heal_git_init() {
+  ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+    ROUNDHOUSE_SYNC_STORE="$sync_heal_git_store" XDG_CONFIG_HOME="$sync_heal_git_xdg" \
+    ROUNDHOUSE_SSH_CA_PATH="$sync_heal/fleet-ca.pub" \
+    ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_heal_git_key" \
+    "$cli" sync-init
+}
+sync_heal_git_init >/dev/null || fail "git-only sync-init for the heal fixture failed"
+jq -e '.mode == "git-only" and .signing_enabled == false and .signing_configured == false' \
+  "$sync_heal_git_store/meta/host.json" >/dev/null ||
+  fail "an unenrolled git-only store did not record the degraded signing state"
+[ -z "$("$REAL_GIT" -C "$sync_heal_git_store" config gpg.format || true)" ] ||
+  fail "an unenrolled git-only store configured ssh signing anyway"
+
+/usr/bin/ssh-keygen -q -t ed25519 -N '' -C roundhouse-heal-node -f "$sync_heal_git_key"
+sync_heal_git_out=$(sync_heal_git_init) ||
+  fail "re-running sync-init after enrollment did not exit zero"
+assert_contains "$sync_heal_git_out" 'healed signing config'
+jq -e '.mode == "git-only" and .signing_enabled == true and .signing_configured == true' \
+  "$sync_heal_git_store/meta/host.json" >/dev/null ||
+  fail "the heal did not record signing as enabled and configured"
+[ "$("$REAL_GIT" -C "$sync_heal_git_store" config gpg.format)" = ssh ] ||
+  fail "the git-only heal did not configure ssh signing"
+[ "$("$REAL_GIT" -C "$sync_heal_git_store" config user.signingkey)" = "$sync_heal_git_key.pub" ] ||
+  fail "the git-only heal did not point signing at the public key next to the private one"
+[ "$("$REAL_GIT" -C "$sync_heal_git_store" config gpg.ssh.allowedSignersFile)" = \
+  "$sync_heal_git_xdg/roundhouse/allowed_signers" ] ||
+  fail "the git-only heal did not point verification at the host-local signers file"
+assert_contains "$(cat "$sync_heal_git_xdg/roundhouse/allowed_signers")" \
+  "* cert-authority ssh-ed25519 $sync_ca_blob"
+case $(cat "$sync_heal_git_xdg/roundhouse/allowed_signers") in
+  *"$sync_heal_git_store"*)
+    fail "the derived signers file names a store-carried path" ;;
+esac
+
+# Healing is idempotent: a healed store re-inits as a plain no-op.
+cp "$sync_heal_git_store/meta/host.json" "$sync_heal/meta-after-heal.json"
+sync_heal_git_again=$(sync_heal_git_init) ||
+  fail "re-running sync-init on a healed store did not exit zero"
+case $sync_heal_git_again in
+  *healed*) fail "a healed store healed again instead of no-opping" ;;
+esac
+cmp -s "$sync_heal/meta-after-heal.json" "$sync_heal_git_store/meta/host.json" ||
+  fail "re-running sync-init on a healed store rewrote store meta"
+
+# jj mode: store meta always records signing_enabled, so signing_configured is
+# what says whether the repo-side signing.* config was ever written.
+sync_heal_jj_store="$sync_heal/jj-store"
+sync_heal_jj_xdg="$sync_heal/xdg-jj"
+sync_heal_jj_key="$sync_heal/jj-node-key"
+sync_heal_jj_init() {
+  JJ_COMMAND_LOG="$1" PATH="$sync_root/jj-bin:$PATH" \
+    ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+    ROUNDHOUSE_SYNC_STORE="$sync_heal_jj_store" XDG_CONFIG_HOME="$sync_heal_jj_xdg" \
+    ROUNDHOUSE_SSH_CA_PATH="$sync_heal/fleet-ca.pub" \
+    ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_heal_jj_key" \
+    "$cli" sync-init
+}
+sync_heal_jj_init "$sync_heal/jj-log-init" >/dev/null ||
+  fail "jj-mode sync-init for the heal fixture failed"
+jq -e '.mode == "jj" and .signing_configured == false' \
+  "$sync_heal_jj_store/meta/host.json" >/dev/null ||
+  fail "an unenrolled jj store recorded its signing config as written"
+case $(cat "$sync_heal/jj-log-init") in
+  *'config set --repo signing.'*)
+    fail "an unenrolled jj store configured signing against a key that does not exist" ;;
+esac
+
+/usr/bin/ssh-keygen -q -t ed25519 -N '' -C roundhouse-heal-jj-node -f "$sync_heal_jj_key"
+sync_heal_jj_out=$(sync_heal_jj_init "$sync_heal/jj-log-heal") ||
+  fail "re-running jj-mode sync-init after enrollment did not exit zero"
+assert_contains "$sync_heal_jj_out" 'healed signing config'
+jq -e '.signing_enabled == true and .signing_configured == true' \
+  "$sync_heal_jj_store/meta/host.json" >/dev/null ||
+  fail "the jj heal did not record signing as enabled and configured"
+sync_heal_jj_log=$(cat "$sync_heal/jj-log-heal")
+assert_contains "$sync_heal_jj_log" 'config set --repo signing.backend ssh'
+assert_contains "$sync_heal_jj_log" 'config set --repo signing.behavior own'
+assert_contains "$sync_heal_jj_log" "config set --repo signing.key $sync_heal_jj_key"
+assert_contains "$sync_heal_jj_log" \
+  "config set --repo signing.backends.ssh.allowed-signers $sync_heal_jj_xdg/roundhouse/allowed_signers"
+case $sync_heal_jj_log in
+  *"allowed-signers $sync_heal_jj_store"*)
+    fail "the jj heal pointed allowed-signers inside the store" ;;
+esac
+assert_contains "$(cat "$sync_heal_jj_xdg/roundhouse/allowed_signers")" \
+  "* cert-authority ssh-ed25519 $sync_ca_blob"
+sync_heal_jj_init "$sync_heal/jj-log-again" >/dev/null ||
+  fail "re-running jj-mode sync-init on a healed store did not exit zero"
+case $(cat "$sync_heal/jj-log-again") in
+  *'config set --repo signing.'*) fail "a healed jj store rewrote its signing config" ;;
+esac
 
 if ROUNDHOUSE_SYNC_VISIBILITY_PROBE='exit 0' \
   ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
@@ -8679,7 +8857,11 @@ sync_run "$sync_driver_store" "$sync_driver_config" "$sync_jj_env" \
   fail "sync-undo refused after a lease push (lease pushes must stay undoable)"
 assert_contains "$(cat "$sync_jj_restore_log")" 'op restore sync-op-0001'
 
-jq -n '{outcome:"healthy",items_applied:2,items_held:1,applied_pin:"deadbeefcafef00d"}' \
+# items_applied is NOT caller-supplied: the journal takes it from run state, so
+# a caller claiming an applied set it never wrote is discarded outright.
+jq -n '{outcome:"healthy",items_applied:[{item:"desired/all/plugins/fake.json",
+  digest:"0000000000000000000000000000000000000000000000000000000000000000"}],
+  items_held:1,applied_pin:"deadbeefcafef00d"}' \
   >"$sync_u4/driver-outcome.json"
 sync_journal_record=$(sync_run "$sync_driver_store" "$sync_driver_config" "$sync_jj_env" \
   JJ_COMMAND_LOG="$sync_jj_env_log" JJ_RESTORE_LOG="$sync_jj_restore_log" \
@@ -8687,7 +8869,7 @@ sync_journal_record=$(sync_run "$sync_driver_store" "$sync_driver_config" "$sync
   fail "sync-journal failed"
 printf '%s\n' "$sync_journal_record" | jq -e '
   .schema == "roundhouse.sync-journal" and .host == "driver-host" and
-  .outcome == "healthy" and .items_applied == 2 and .items_held == 1 and
+  .outcome == "healthy" and .items_applied == [] and .items_held == 1 and
   .run_op_id == "sync-op-0001" and .applied_pin == "deadbeefcafef00d" and
   (.started_at | type) == "string" and (.ended_at | type) == "string"' >/dev/null ||
   fail "journal record does not carry the roundhouse.sync-journal shape"
@@ -9619,6 +9801,331 @@ sync_run "$sync_gitsign_store" "$sync_rf/gitsign-config.json" \
 [ ! -e "$sync_rf/introduced.json" ] ||
   fail "the introducing-commit refusal still wrote the destination"
 assert_contains "$(cat "$sync_rf/intro-verify-log")" "verify-commit $sync_intro_commit"
+
+# --- fleet-sync fixtures: the CA trust chain, end to end ---
+# Real ssh-keygen, real certificates, real git — no fakes anywhere in this
+# block. A throwaway CA issues certificates to two "hosts" (two working copies
+# of one bare remote). Host A signs and pushes; host B verifies against ITS OWN
+# host-local allowed_signers, which contains the CA line and B's own key and
+# nothing of A's. That is the property a bare-key signing config cannot have:
+# with `user.signingkey` pointed at node-key.pub, A's commits carry a key no
+# peer lists, so every peer refuses them.
+
+sync_chain="$sync_root/chain"
+mkdir -p "$sync_chain"
+/usr/bin/ssh-keygen -q -t ed25519 -N '' -C roundhouse-chain-ca -f "$sync_chain/fleet-ca"
+sync_chain_ca_blob=$(awk '{print $2}' "$sync_chain/fleet-ca.pub")
+"$REAL_GIT" init -q --bare -b main "$sync_chain/remote.git"
+
+sync_chain_identity() {
+  # Exactly prepare-ssh-identity's layout: node-key, node-key.pub, and the
+  # CA-issued node-key-cert.pub beside them.
+  mkdir -p "$sync_chain/$1"
+  /usr/bin/ssh-keygen -q -t ed25519 -N '' -C "roundhouse-node-$1" \
+    -f "$sync_chain/$1/node-key"
+  /usr/bin/ssh-keygen -q -s "$sync_chain/fleet-ca" -I "$1" -n "roundhouse-sync@$1" \
+    -V -5m:+52w "$sync_chain/$1/node-key.pub" >/dev/null
+  jq -n --arg host "$1" --arg url "$sync_chain/remote.git" '{version:1,
+    machines:{($host):{platform:"macos",transport:"local",groups:["development"]}},
+    sync:{enabled:true,remote:{url:$url},cadence_hours:24}}' \
+    >"$sync_chain/$1-config.json"
+}
+
+sync_chain_run() {
+  # Every host gets its own XDG root, so "host-local allowed_signers" really is
+  # per host and derived only from that host's own copy of the CA public key.
+  sync_chain_host=$1
+  shift
+  env ROUNDHOUSE_CONFIG="$sync_chain/$sync_chain_host-config.json" \
+    ROUNDHOUSE_IDENTITY="$sync_identity" \
+    ROUNDHOUSE_SYNC_STORE="$sync_chain/$sync_chain_host-store" \
+    XDG_CONFIG_HOME="$sync_chain/$sync_chain_host-xdg" \
+    ROUNDHOUSE_SSH_CA_PATH="$sync_chain/fleet-ca.pub" \
+    ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_chain/$sync_chain_host/node-key" \
+    "$@"
+}
+
+sync_chain_commit() {
+  # A real signed store commit through the store's OWN configured signing
+  # identity — the same config sync-init wrote, not a fixture shortcut.
+  mkdir -p "$(dirname "$sync_chain/chain-a-store/$1")"
+  printf '%s\n' "$2" >"$sync_chain/chain-a-store/$1"
+  "$REAL_GIT" -C "$sync_chain/chain-a-store" add -f "$1"
+  "$REAL_GIT" -C "$sync_chain/chain-a-store" commit -q -S -m "$3"
+  "$REAL_GIT" -C "$sync_chain/chain-a-store" push -q origin main
+}
+
+sync_chain_identity chain-a
+sync_chain_run chain-a "$cli" sync-init >/dev/null ||
+  fail "sync-init for the certificate-chain publisher failed"
+[ "$(jq -r '.signing_enabled' "$sync_chain/chain-a-store/meta/host.json")" = true ] ||
+  fail "a certified host did not enable signing"
+# The whole point: the signing key is the CERTIFICATE, not the bare public key.
+[ "$("$REAL_GIT" -C "$sync_chain/chain-a-store" config user.signingkey)" = \
+  "$sync_chain/chain-a/node-key-cert.pub" ] ||
+  fail "signing was pointed at the bare public key instead of the CA-issued certificate"
+assert_contains "$(cat "$sync_chain/chain-a-xdg/roundhouse/allowed_signers")" \
+  "* cert-authority ssh-ed25519 $sync_chain_ca_blob"
+
+sync_chain_item=desired/all/plugins/chain.json
+sync_chain_commit "$sync_chain_item" \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"plugins","id":"chain","enabled":true}' \
+  'certified host publishes an item'
+sync_chain_good_commit=$("$REAL_GIT" -C "$sync_chain/chain-a-store" rev-parse HEAD)
+
+sync_chain_identity chain-b
+sync_chain_run chain-b "$cli" sync-init >/dev/null ||
+  fail "sync-init for the certificate-chain verifier failed"
+# B's signers file is derived from B's own CA copy. It must NOT contain A's
+# public key: peer verification comes from the cert-authority line alone.
+sync_chain_b_signers=$(cat "$sync_chain/chain-b-xdg/roundhouse/allowed_signers")
+assert_contains "$sync_chain_b_signers" "* cert-authority ssh-ed25519 $sync_chain_ca_blob"
+case $sync_chain_b_signers in
+  *"$(awk '{print $2}' "$sync_chain/chain-a/node-key.pub")"*)
+    fail "host B's signers file carries host A's public key (peer keys must never be shipped)" ;;
+esac
+
+# A's certificate-signed commit verifies on B, through the production gate.
+sync_chain_verdict=$(sync_chain_run chain-b "$cli" sync-verdict "$sync_chain_item" \
+  pass 'reviewed the certified publisher') ||
+  fail "a peer could not verify a certificate-signed commit against its CA-derived signers"
+printf '%s\n' "$sync_chain_verdict" | jq -e --arg commit "$sync_chain_good_commit" \
+  '.verdict == "pass" and .commit == $commit' >/dev/null ||
+  fail "the peer verdict did not bind to the certified publisher's commit"
+sync_chain_run chain-b "$cli" sync-apply "$sync_chain_item" \
+  "$sync_chain/applied-chain.json" >/dev/null ||
+  fail "a peer refused to apply an item introduced by a certificate-signed commit"
+jq -e '.id == "chain"' "$sync_chain/applied-chain.json" >/dev/null ||
+  fail "the peer applied the wrong content"
+
+# A revoked certificate is refused even though the CA still vouches for it:
+# host C initializes with the KRL installed, so sync-init points ssh
+# verification at it and the revocation bites at verify time.
+/usr/bin/ssh-keygen -q -k -f "$sync_chain/revoked.krl" "$sync_chain/chain-a/node-key.pub"
+sync_chain_identity chain-c
+sync_chain_run chain-c ROUNDHOUSE_SSH_KRL_PATH="$sync_chain/revoked.krl" \
+  "$cli" sync-init >/dev/null ||
+  fail "sync-init for the revocation verifier failed"
+[ "$("$REAL_GIT" -C "$sync_chain/chain-c-store" config gpg.ssh.revocationFile)" = \
+  "$sync_chain/revoked.krl" ] ||
+  fail "sync-init did not point ssh verification at the installed KRL"
+sync_chain_krl_status=0
+sync_chain_run chain-c "$cli" sync-verdict "$sync_chain_item" pass 'reviewed' \
+  >/dev/null 2>&1 || sync_chain_krl_status=$?
+[ "$sync_chain_krl_status" -eq 65 ] ||
+  fail "a KRL-revoked certificate still verified (got $sync_chain_krl_status)"
+# A KRL installed AFTER a store was initialized bites too: revocation is read
+# from host-local material at verify time, not from what sync-init happened to
+# record. Host B was initialized without one.
+[ -z "$("$REAL_GIT" -C "$sync_chain/chain-b-store" config gpg.ssh.revocationFile || true)" ] ||
+  fail "the un-revoked peer already had a revocation file configured"
+sync_chain_late_krl=0
+sync_chain_run chain-b ROUNDHOUSE_SSH_KRL_PATH="$sync_chain/revoked.krl" \
+  "$cli" sync-verdict "$sync_chain_item" pass 'reviewed' >/dev/null 2>&1 ||
+  sync_chain_late_krl=$?
+[ "$sync_chain_late_krl" -eq 65 ] ||
+  fail "a KRL installed after sync-init did not revoke at verify time (got $sync_chain_late_krl)"
+
+# Control: the same commit, the same CA, no KRL — host B still accepts it, so
+# the refusals above are the revocation and not a broken chain.
+sync_chain_run chain-b "$cli" sync-verdict "$sync_chain_item" pass 'reviewed again' \
+  >/dev/null || fail "the certificate chain stopped verifying on the un-revoked peer"
+
+# An UNCERTIFIED key is refused: the CA line is the only thing B trusts, and a
+# key it never issued a certificate for matches no principal. This lands last,
+# because it leaves an unverifiable commit at the tip of origin/main.
+/usr/bin/ssh-keygen -q -t ed25519 -N '' -C roundhouse-uncertified \
+  -f "$sync_chain/uncertified-key"
+sync_chain_rogue_item=desired/all/plugins/uncertified.json
+"$REAL_GIT" -C "$sync_chain/chain-a-store" config user.signingkey \
+  "$sync_chain/uncertified-key.pub"
+sync_chain_commit "$sync_chain_rogue_item" \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"plugins","id":"uncertified","enabled":true}' \
+  'an uncertified key publishes an item'
+"$REAL_GIT" -C "$sync_chain/chain-a-store" config user.signingkey \
+  "$sync_chain/chain-a/node-key-cert.pub"
+"$REAL_GIT" -C "$sync_chain/chain-b-store" fetch -q origin ||
+  fail "host B could not fetch the uncertified commit"
+sync_chain_rogue_status=0
+sync_chain_run chain-b "$cli" sync-verdict "$sync_chain_rogue_item" pass 'reviewed' \
+  >/dev/null 2>&1 || sync_chain_rogue_status=$?
+[ "$sync_chain_rogue_status" -eq 65 ] ||
+  fail "a commit signed by an uncertified key was accepted (got $sync_chain_rogue_status)"
+sync_chain_rogue_apply=0
+sync_chain_run chain-b "$cli" sync-apply "$sync_chain_rogue_item" \
+  "$sync_chain/never-uncertified.json" >/dev/null 2>&1 || sync_chain_rogue_apply=$?
+[ "$sync_chain_rogue_apply" -eq 65 ] ||
+  fail "an uncertified-key item was applied (got $sync_chain_rogue_apply)"
+[ ! -e "$sync_chain/never-uncertified.json" ] ||
+  fail "the uncertified-key refusal still wrote the destination"
+
+# --- fleet-sync fixtures: canary gating ---
+# Store-side blast-radius gate: canary hosts adopt at once, everyone else waits
+# on a canary's aged healthy journal at the SAME content digest.
+
+sync_can="$sync_root/canary"
+mkdir -p "$sync_can"
+"$REAL_GIT" init -q --bare -b main "$sync_can/remote.git"
+
+sync_canary_write_config() {
+  # $1 output path, $2 the local machine, $3 canary_group ("" to omit it).
+  jq -n --arg local "$2" --arg url "$sync_can/remote.git" --arg group "$3" '
+    def machine($name; $groups):
+      {($name): ({platform:"macos",groups:$groups} +
+        (if $name == $local then {transport:"local"}
+         else {transport:"ssh",ssh_alias:($name + "-alias")} end))};
+    {version:1,
+     machines:(machine("can-host";["development","canary"]) +
+               machine("plain-host";["development"])),
+     sync:({enabled:true,remote:{url:$url},cadence_hours:24,canary_wait_hours:24} +
+       (if $group == "" then {} else {canary_group:$group} end))}' >"$1"
+}
+
+sync_canary_run() {
+  # $1 store, $2 config; the rest is the command. Signing is pinned off at an
+  # absent key so the gate under test is the canary gate and nothing else.
+  sync_canary_store=$1
+  sync_canary_config=$2
+  shift 2
+  env ROUNDHOUSE_CONFIG="$sync_canary_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+    ROUNDHOUSE_SYNC_STORE="$sync_canary_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+    ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_can/absent-node-key" "$@"
+}
+
+sync_canary_write_config "$sync_can/can-config.json" can-host canary
+sync_canary_write_config "$sync_can/plain-config.json" plain-host canary
+sync_canary_write_config "$sync_can/plain-nogroup-config.json" plain-host ''
+sync_can_store="$sync_can/can-store"
+sync_plain_store="$sync_can/plain-store"
+sync_canary_item=desired/all/plugins/canary-item.json
+
+sync_canary_run "$sync_can_store" "$sync_can/can-config.json" "$cli" sync-init >/dev/null ||
+  fail "sync-init for the canary host failed"
+sync_canary_run "$sync_can_store" "$sync_can/can-config.json" \
+  "$cli" sync-absorb-registry >/dev/null ||
+  fail "sync-absorb-registry for the canary host failed"
+sync_store_seed "$sync_can_store" "$sync_canary_item" \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"plugins","id":"canary-item","enabled":true,"revision":1}' \
+  'seed the canary-gated item'
+"$REAL_GIT" -C "$sync_can_store" push -q origin main ||
+  fail "the canary host could not publish the registry and item"
+
+sync_canary_run "$sync_plain_store" "$sync_can/plain-config.json" "$cli" sync-init >/dev/null ||
+  fail "sync-init for the non-canary host failed"
+
+# The canary host is exempt by group membership alone.
+sync_canary_run "$sync_can_store" "$sync_can/can-config.json" \
+  "$cli" sync-verdict "$sync_canary_item" pass 'canary reviewed' >/dev/null ||
+  fail "recording the canary verdict failed"
+sync_canary_allow=$(sync_canary_run "$sync_can_store" "$sync_can/can-config.json" \
+  "$cli" sync-canary-check "$sync_canary_item") ||
+  fail "the canary host was gated on its own adoption"
+printf '%s\n' "$sync_canary_allow" | jq -e '.schema == "roundhouse.sync-canary" and
+  .allowed == true and .reason == "canary-group-member"' >/dev/null ||
+  fail "the canary host's allow record does not cite group membership"
+
+sync_canary_run "$sync_can_store" "$sync_can/can-config.json" \
+  ROUNDHOUSE_SYNC_VISIBILITY_PROBE="$sync_auth_probe" "$cli" sync-verify-remote >/dev/null ||
+  fail "sync-verify-remote for the canary host failed"
+sync_canary_run "$sync_can_store" "$sync_can/can-config.json" "$cli" sync-run-begin >/dev/null ||
+  fail "sync-run-begin for the canary host failed"
+sync_canary_run "$sync_can_store" "$sync_can/can-config.json" \
+  "$cli" sync-apply "$sync_canary_item" "$sync_can/canary-applied.json" >/dev/null ||
+  fail "the canary host could not apply the item it is exempt for"
+sync_canary_digest=$(if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum "$sync_can/canary-applied.json"
+else shasum -a 256 "$sync_can/canary-applied.json"; fi | awk '{print tolower($1)}')
+sync_canary_journal=$(printf '%s' '{"outcome":"healthy","items_held":0}' |
+  sync_canary_run "$sync_can_store" "$sync_can/can-config.json" "$cli" sync-journal -) ||
+  fail "the canary host could not journal its run"
+# The applied set is derived from run state, carries the digest, and is exactly
+# what a peer's canary gate needs to match on.
+printf '%s\n' "$sync_canary_journal" | jq -e --arg item "$sync_canary_item" \
+  --arg digest "$sync_canary_digest" '
+  (.items_applied | length) == 1 and .items_applied[0].item == $item and
+  .items_applied[0].digest == $digest' >/dev/null ||
+  fail "the canary journal does not carry the applied item at its content digest"
+sync_canary_run "$sync_can_store" "$sync_can/can-config.json" "$cli" sync-run-end >/dev/null ||
+  fail "sync-run-end for the canary host failed"
+
+# The non-canary host sees a canary journal that is too fresh: it waits.
+"$REAL_GIT" -C "$sync_plain_store" fetch -q origin ||
+  fail "the non-canary host could not fetch the canary's journal"
+sync_canary_run "$sync_plain_store" "$sync_can/plain-config.json" \
+  "$cli" sync-verdict "$sync_canary_item" pass 'non-canary reviewed' >/dev/null ||
+  fail "recording the non-canary verdict failed"
+sync_canary_wait_status=0
+sync_canary_wait=$(sync_canary_run "$sync_plain_store" "$sync_can/plain-config.json" \
+  "$cli" sync-canary-check "$sync_canary_item" 2>/dev/null) || sync_canary_wait_status=$?
+[ "$sync_canary_wait_status" -eq 75 ] ||
+  fail "a non-canary host adopted before the wait elapsed (got $sync_canary_wait_status)"
+printf '%s\n' "$sync_canary_wait" | jq -e --arg item "$sync_canary_item" '
+  .schema == "roundhouse.sync-canary-hold" and .item == $item and
+  .waiting_on == ["can-host"] and (.since | type) == "string"' >/dev/null ||
+  fail "the canary hold record does not name the item, the canary hosts, and the wait start"
+sync_canary_apply_status=0
+sync_canary_run "$sync_plain_store" "$sync_can/plain-config.json" \
+  "$cli" sync-apply "$sync_canary_item" "$sync_can/never-canary.json" >/dev/null 2>&1 ||
+  sync_canary_apply_status=$?
+[ "$sync_canary_apply_status" -eq 75 ] ||
+  fail "sync-apply ran ahead of the canary gate (got $sync_canary_apply_status)"
+[ ! -e "$sync_can/never-canary.json" ] ||
+  fail "the canary hold still wrote the destination"
+
+# No canary_group configured at all: the gate is inert, same store, same item.
+sync_canary_nogroup=$(sync_canary_run "$sync_plain_store" \
+  "$sync_can/plain-nogroup-config.json" "$cli" sync-canary-check "$sync_canary_item") ||
+  fail "the canary gate refused with no canary_group configured"
+printf '%s\n' "$sync_canary_nogroup" | jq -e '.allowed == true and
+  .reason == "no-canary-group-configured"' >/dev/null ||
+  fail "an unconfigured canary group did not report itself as ungated"
+
+# Age the canary journal past the wait: now the non-canary host adopts.
+sync_canary_branch=$("$REAL_GIT" -C "$sync_can_store" symbolic-ref --short HEAD)
+"$REAL_GIT" -C "$sync_can_store" checkout -q host/can-host
+sync_canary_record=$("$REAL_GIT" -C "$sync_can_store" ls-tree -r --name-only HEAD -- journal/)
+jq -S '.ended_at = (now - 25 * 3600 | todateiso8601)' \
+  "$sync_can_store/$sync_canary_record" >"$sync_can/aged-journal.json"
+cp "$sync_can/aged-journal.json" "$sync_can_store/$sync_canary_record"
+"$REAL_GIT" -C "$sync_can_store" add -f "$sync_canary_record"
+"$REAL_GIT" -C "$sync_can_store" -c commit.gpgsign=false commit -q -m 'age the canary journal'
+"$REAL_GIT" -C "$sync_can_store" push -q origin host/can-host ||
+  fail "publishing the aged canary journal failed"
+"$REAL_GIT" -C "$sync_can_store" checkout -q "$sync_canary_branch"
+"$REAL_GIT" -C "$sync_plain_store" fetch -q origin ||
+  fail "the non-canary host could not refetch the aged journal"
+sync_canary_aged=$(sync_canary_run "$sync_plain_store" "$sync_can/plain-config.json" \
+  "$cli" sync-canary-check "$sync_canary_item") ||
+  fail "a non-canary host still refused after the canary wait elapsed"
+printf '%s\n' "$sync_canary_aged" | jq -e '.allowed == true and
+  .reason == "canary-can-host"' >/dev/null ||
+  fail "the post-wait allow record does not cite the canary host it waited on"
+sync_canary_run "$sync_plain_store" "$sync_can/plain-config.json" \
+  "$cli" sync-apply "$sync_canary_item" "$sync_can/plain-applied.json" >/dev/null ||
+  fail "sync-apply refused after the canary gate allowed"
+jq -e '.revision == 1' "$sync_can/plain-applied.json" >/dev/null ||
+  fail "the non-canary host applied the wrong revision"
+
+# A canary that ran a DIFFERENT version is not evidence: same item, new bytes,
+# the aged journal's digest no longer matches and the gate refuses again.
+sync_store_seed "$sync_can_store" "$sync_canary_item" \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"plugins","id":"canary-item","enabled":true,"revision":2}' \
+  'publish a second revision of the canary-gated item'
+"$REAL_GIT" -C "$sync_can_store" push -q origin main ||
+  fail "publishing the second revision failed"
+"$REAL_GIT" -C "$sync_plain_store" fetch -q origin ||
+  fail "the non-canary host could not fetch the second revision"
+sync_canary_run "$sync_plain_store" "$sync_can/plain-config.json" \
+  "$cli" sync-verdict "$sync_canary_item" pass 'reviewed revision two' >/dev/null ||
+  fail "recording the second-revision verdict failed"
+sync_canary_mismatch_status=0
+sync_canary_mismatch=$(sync_canary_run "$sync_plain_store" "$sync_can/plain-config.json" \
+  "$cli" sync-canary-check "$sync_canary_item" 2>/dev/null) || sync_canary_mismatch_status=$?
+[ "$sync_canary_mismatch_status" -eq 75 ] ||
+  fail "a digest the canary never ran was adopted (got $sync_canary_mismatch_status)"
+printf '%s\n' "$sync_canary_mismatch" | jq -e '
+  .schema == "roundhouse.sync-canary-hold" and .since == null' >/dev/null ||
+  fail "a digest-mismatched hold reported a wait start it does not have"
 
 # --- optional real-jj block (U9) ---
 # Everything above drives the sync machinery against fake bins, which verifies

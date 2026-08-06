@@ -41,6 +41,7 @@ Usage:
   roundhouse apply-ssh-plan PLAN.json PLAN-ID OUTPUT.jsonl
   roundhouse dispatch-posix-request
   roundhouse sync-init
+  roundhouse sync-refresh-signers
   roundhouse sync-verify-remote
   roundhouse sync-status [OUTPUT.json|-]
   roundhouse sync-absorb-registry
@@ -58,6 +59,7 @@ Usage:
   roundhouse sync-verdict ITEM pass|hold REASON
   roundhouse sync-apply ITEM DESTINATION
   roundhouse sync-hold ITEM REASON
+  roundhouse sync-canary-check ITEM
   roundhouse sync-materialize CONFIG_ID DESTINATION
   roundhouse sync-propose ITEM add|remove|state-change|config-key EVIDENCE.json|-
   roundhouse sync-effective HOST [OUTPUT.json|-]
@@ -748,7 +750,8 @@ validate_config_file() {
     ((.sync // null) == null or
       ((.sync | type == "object") and
        ([.sync | keys[] |
-         select(IN("cadence_hours","canary_group","enabled","remote","store_path") | not)
+         select(IN("cadence_hours","canary_group","canary_wait_hours","enabled",
+           "remote","store_path") | not)
        ] | length == 0) and
        (.sync | has("enabled")) and (.sync.enabled | type == "boolean") and
        ((.sync.store_path // null) == null or
@@ -758,7 +761,10 @@ validate_config_file() {
        (.sync.remote.url | valid_sync_url) and
        (.sync.cadence_hours | type == "number" and . > 0 and . <= 8760) and
        ((.sync.canary_group // null) == null or
-         (.sync.canary_group | type == "string" and test("^[A-Za-z0-9._-]+$"))))) and
+         (.sync.canary_group | type == "string" and test("^[A-Za-z0-9._-]+$"))) and
+       ((.sync.canary_wait_hours // null) == null or
+         (.sync.canary_wait_hours | type == "number" and floor == . and
+           . >= 0 and . <= 8760)))) and
     ((.worker // null) == null or
       ((.worker | type == "object") and
        (.worker.target | type == "string" and test("^[A-Za-z0-9._-]+$")) and
@@ -7031,6 +7037,12 @@ sync_krl_path() {
   printf '%s\n' "${ROUNDHOUSE_SSH_KRL_PATH:-/etc/roundhouse/ssh/active/revoked.krl}"
 }
 
+sync_ca_path() {
+  # The fleet CA public key enroll-ssh-posix installs (its native_ca_path).
+  # Host-local CA material, which is the only signer material KTD16 permits.
+  printf '%s\n' "${ROUNDHOUSE_SSH_CA_PATH:-/etc/roundhouse/ssh/active/fleet-ca.pub}"
+}
+
 sync_validate_fetch_url() {
   # Registry content reaches `git fetch` as an argument. Accept only the forms
   # this system can reason about; never an option-looking, whitespace-bearing,
@@ -7055,10 +7067,19 @@ sync_signing_key_path() {
 }
 
 sync_signing_key_config() {
-  # git's ssh signing backend wants the PUBLIC key next to the private one;
-  # naming the private key works only when the .pub is absent from disk.
+  # What git and jj hand to `ssh-keygen -Y sign -f`. Prefer the CA-ISSUED
+  # CERTIFICATE (prepare-ssh-identity's node-key-cert.pub, beside the node key):
+  # a bare public key only verifies where that exact key is listed, and KTD16
+  # forbids shipping per-host public keys through the store, so a bare-key
+  # signature is unverifiable on every PEER. A certificate verifies against the
+  # `* cert-authority` line every host derives from its own CA material, which
+  # is what closes the trust chain. Falling back to the bare .pub keeps a
+  # not-yet-certified host self-verifying; naming the private key works only
+  # when neither public artifact is on disk.
   signing_key_config=$(sync_signing_key_path)
-  if [ -f "$signing_key_config.pub" ]; then
+  if [ -f "$signing_key_config-cert.pub" ]; then
+    printf '%s\n' "$signing_key_config-cert.pub"
+  elif [ -f "$signing_key_config.pub" ]; then
     printf '%s\n' "$signing_key_config.pub"
   else
     printf '%s\n' "$signing_key_config"
@@ -7099,6 +7120,17 @@ sync_cadence_hours() {
   case $cadence in
     '' | *[!0-9]*) printf '24\n' ;;
     *) printf '%s\n' "$cadence" ;;
+  esac
+}
+
+sync_canary_wait_hours() {
+  # How long a canary host's healthy journal must have been on record before a
+  # non-canary host may adopt the same item version. 0 means "as soon as a
+  # canary journaled it"; the spec's default is 24.
+  canary_wait=$(jq -r '.sync.canary_wait_hours // empty' "$(config_path)" 2>/dev/null || true)
+  case $canary_wait in
+    '' | *[!0-9]*) printf '24\n' ;;
+    *) printf '%s\n' "$canary_wait" ;;
   esac
 }
 
@@ -7220,14 +7252,24 @@ sync_store_commit() {
 
 sync_verify_commit() {
   # Signature gate (KTD16): git verify-commit against the HOST-LOCAL allowed
-  # signers file only. sync-init points gpg.ssh.revocationFile at the CA KRL
-  # when enrollment installed one, so KRL revocations bite at verify time. A
+  # signers file and the HOST-LOCAL KRL, both overridden per invocation rather
+  # than read out of stored repo config. sync-init also writes the revocation
+  # path, but a CA revocation rolled out after a store was initialized would
+  # otherwise never bite; whatever the KRL says right now is what counts. A
   # store without the CA node key records signing_enabled false (degraded mode
   # is an honest, recorded state, not a silent bypass).
   verify_repo=$1
   verify_commit_id=$2
   [ "$(jq -r '.signing_enabled // false' "$verify_repo/meta/host.json" 2>/dev/null)" = true ] || return 0
   ! sync_sigverify_bypassed || return 0
+  verify_krl=$(sync_krl_path)
+  if [ -f "$verify_krl" ]; then
+    git -C "$verify_repo" -c gpg.ssh.allowedSignersFile="$(sync_allowed_signers_path)" \
+      -c gpg.ssh.revocationFile="$verify_krl" \
+      verify-commit "$verify_commit_id" >/dev/null 2>&1
+    return
+  fi
+  # No host-local KRL installed: whatever sync-init recorded still applies.
   git -C "$verify_repo" -c gpg.ssh.allowedSignersFile="$(sync_allowed_signers_path)" \
     verify-commit "$verify_commit_id" >/dev/null 2>&1
 }
@@ -7314,6 +7356,16 @@ sync_validate_record() {
     printf 'roundhouse: malformed %s record; refusing to write\n' "$record_schema" >&2
     exit 65
   }
+  # A journal's applied set is what every peer's canary gate reads: it has to
+  # be the digest-bearing shape, not a count, or the gate silently never matches.
+  [ "$record_schema" != roundhouse.sync-journal ] ||
+    jq -e '(.items_applied | type) == "array" and
+      all(.items_applied[]; type == "object" and (.item | type) == "string" and
+        (.digest | type) == "string" and (.digest | test("^[0-9a-f]{64}$")))
+    ' "$record_file" >/dev/null || {
+    printf 'roundhouse: sync journal items_applied must be [{item,digest}]; refusing to write\n' >&2
+    exit 65
+  }
 }
 
 sync_gate_item() {
@@ -7355,6 +7407,149 @@ sync_gate_item() {
     }
   fi
 }
+
+sync_host_journals() {
+  # Every journal record a host published, newest branch copy first, one
+  # compact JSON object per line. The pin-adoption gate and the canary gate ask
+  # the same question of the same records, so they read them the same way.
+  journals_store=$1
+  journals_host=$2
+  for journals_ref in "refs/remotes/origin/host/$journals_host" \
+    "refs/heads/host/$journals_host"; do
+    git -C "$journals_store" show-ref --verify --quiet "$journals_ref" || continue
+    for journals_path in $(git -C "$journals_store" ls-tree -r --name-only \
+      "$journals_ref" -- journal/ 2>/dev/null); do
+      git -C "$journals_store" show "$journals_ref:$journals_path" 2>/dev/null |
+        jq -c 'select(type == "object")' 2>/dev/null || true
+    done
+  done
+}
+
+sync_canary_hosts() {
+  # Canary hosts come from the REVIEWED registry, never from local config: the
+  # question is which fleet hosts carry the canary group, and only the store
+  # knows that for peers.
+  canary_store=$1
+  canary_ref=$2
+  canary_group=$3
+  git -C "$canary_store" ls-tree -r --name-only "$canary_ref" -- registry/machines/ \
+    2>/dev/null | while read -r canary_path; do
+    [ -n "$canary_path" ] || continue
+    git -C "$canary_store" show "$canary_ref:$canary_path" 2>/dev/null |
+      jq -e --arg group "$canary_group" 'any(.groups[]?; . == $group)' >/dev/null 2>&1 ||
+      continue
+    canary_name=${canary_path#registry/machines/}
+    printf '%s\n' "${canary_name%.json}"
+  done
+}
+
+sync_canary_resolve() (
+  # Blast-radius gate (unattended-privileged-updates spec §5): a non-canary
+  # host adopts an item version only after a canary host journaled a healthy
+  # run that applied THAT EXACT content digest, at least canary_wait_hours ago.
+  # There is deliberately no bypass flag — the only exemption is membership in
+  # the canary group.
+  resolve_store=$1
+  resolve_ref=$2
+  resolve_item=$3
+  resolve_digest=$4
+  resolve_group=$(jq -r '.sync.canary_group // empty' "$(config_path)" 2>/dev/null || true)
+  if [ -z "$resolve_group" ]; then
+    jq -S -n --arg item "$resolve_item" '{
+      schema:"roundhouse.sync-canary",schema_version:1,item:$item,allowed:true,
+      reason:"no-canary-group-configured"
+    }'
+    exit 0
+  fi
+  resolve_host=$(sync_host_name)
+  if git -C "$resolve_store" show "$resolve_ref:registry/machines/$resolve_host.json" \
+    2>/dev/null | jq -e --arg group "$resolve_group" 'any(.groups[]?; . == $group)' \
+    >/dev/null 2>&1; then
+    jq -S -n --arg item "$resolve_item" --arg group "$resolve_group" '{
+      schema:"roundhouse.sync-canary",schema_version:1,item:$item,allowed:true,
+      reason:"canary-group-member",canary_group:$group
+    }'
+    exit 0
+  fi
+  resolve_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-canary.XXXXXX")
+  trap 'rm -rf "$resolve_tmp"' EXIT HUP INT TERM
+  sync_canary_hosts "$resolve_store" "$resolve_ref" "$resolve_group" >"$resolve_tmp/hosts"
+  : >"$resolve_tmp/journals"
+  while read -r resolve_peer; do
+    [ -n "$resolve_peer" ] || continue
+    sync_host_journals "$resolve_store" "$resolve_peer" |
+      jq -c --arg host "$resolve_peer" '. + {canary_host:$host}' \
+        >>"$resolve_tmp/journals" 2>/dev/null || true
+  done <"$resolve_tmp/hosts"
+  # One jq pass over every canary journal: a healthy run whose applied set
+  # carries this item at this digest, aged past the wait, allows; the newest
+  # too-recent match becomes the `since` the hold record reports.
+  jq -S -s --arg item "$resolve_item" --arg digest "$resolve_digest" \
+    --argjson cutoff "$(( $(date +%s) - $(sync_canary_wait_hours) * 3600 ))" \
+    --slurpfile hosts <(jq -R -s 'split("\n") | map(select(. != ""))' \
+      "$resolve_tmp/hosts") '
+    [.[] | select(.outcome == "healthy" and
+      any(.items_applied[]?; .item == $item and .digest == $digest))] as $matches |
+    ($matches | map(select((.ended_at | fromdateiso8601) <= $cutoff))
+      | sort_by(.ended_at) | last) as $aged |
+    if $aged != null then
+      {schema:"roundhouse.sync-canary",schema_version:1,item:$item,allowed:true,
+       reason:("canary-" + $aged.canary_host),since:$aged.ended_at}
+    else
+      {schema:"roundhouse.sync-canary-hold",schema_version:1,item:$item,
+       waiting_on:$hosts[0],
+       since:(($matches | map(.ended_at) | sort | last) // null)}
+    end' "$resolve_tmp/journals" >"$resolve_tmp/record.json"
+  cat "$resolve_tmp/record.json"
+  jq -e '.schema == "roundhouse.sync-canary"' "$resolve_tmp/record.json" >/dev/null || exit 75
+  exit 0
+)
+
+sync_canary_gate() {
+  # The gate both store->host write paths run AFTER the verdict and signature
+  # gates and BEFORE materialization. A hold prints the machine-readable record
+  # and exits 75; no flag can wave it through.
+  gate_canary_status=0
+  gate_canary_record=$(sync_canary_resolve "$1" "$2" "$3" "$4") || gate_canary_status=$?
+  [ "$gate_canary_status" -ne 0 ] || return 0
+  printf '%s\n' "$gate_canary_record"
+  printf 'roundhouse: %s is waiting on canary adoption (%s); refusing\n' \
+    "$3" "$(printf '%s' "$gate_canary_record" | jq -r '.waiting_on | join(",")')" >&2
+  exit 75
+}
+
+sync_run_state_record_applied() {
+  # The applied set peer canary gates read out of this host's journal. Recorded
+  # where the digest is already known and already verified, so sync-journal
+  # never has to trust a caller-supplied list.
+  applied_state=$(sync_run_state_path)
+  [ -f "$applied_state" ] || return 0
+  applied_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-applied.XXXXXX")
+  jq -S --arg item "$1" --arg digest "$2" '
+    .items_applied = (((.items_applied // []) + [{item:$item,digest:$digest}]) | unique)
+  ' "$applied_state" >"$applied_tmp/state.json" &&
+    safe_output "$applied_tmp/state.json" "$applied_state"
+  rm -rf "$applied_tmp"
+}
+
+sync_canary_check_command() (
+  item=$1
+  require_jq
+  require_sync_store
+  sync_assert_item_path "$item"
+  store=$(sync_store_path)
+  ref=$(sync_incoming_ref "$store")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-canary-check.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  sync_show_item "$store" "$ref" "$item" "$tmp/incoming"
+  canary_status=0
+  canary_record=$(sync_canary_resolve "$store" "$ref" "$item" "$(sha256_file "$tmp/incoming")") ||
+    canary_status=$?
+  printf '%s\n' "$canary_record"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  exit "$canary_status"
+)
 
 sync_scopes_for_host() {
   # Desired-state scopes in ascending precedence: all < os-<platform> <
@@ -7416,6 +7611,82 @@ sync_write_alert() (
   printf '%s/alerts/%s.json\n' "$alert_store" "$alert_id"
 )
 
+sync_signer_entry() {
+  # keytype + base64 only. The trailing comment in a .pub file is free text and
+  # must never reach a signers entry, where it would be parsed as a principal.
+  awk 'NF >= 2 && $1 ~ /^(ssh-|ecdsa-|sk-)/ { printf "%s %s\n", $1, $2; exit }' "$1"
+}
+
+sync_refresh_signers_command() (
+  # KTD16: the allowed_signers file is host-local and derived from this host's
+  # CA enrollment material — never read or materialized from store content.
+  # Nothing else on the host maintains it, so a host that enrolls (or rotates
+  # its CA) after sync-init needs an explicit refresh; sync-init's heal path
+  # calls this too.
+  signers=$(sync_allowed_signers_path)
+  ca=$(sync_ca_path)
+  own_public="$(sync_signing_key_path).pub"
+  ca_entry=
+  own_entry=
+  [ ! -f "$ca" ] || ca_entry=$(sync_signer_entry "$ca")
+  [ ! -f "$own_public" ] || own_entry=$(sync_signer_entry "$own_public")
+  [ -n "$ca_entry$own_entry" ] || {
+    printf 'roundhouse: no host-local CA enrollment material to derive allowed signers from (%s, %s)\n' \
+      "$ca" "$own_public" >&2
+    exit 69
+  }
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-signers.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  {
+    printf '# roundhouse sync-refresh-signers: derived from host-local CA enrollment material.\n'
+    printf '# Regenerate with `roundhouse sync-refresh-signers`; hand edits are overwritten.\n'
+    # The fleet CA is the only signer material a host can derive locally for
+    # its PEERS: certificates it issued verify without shipping per-host public
+    # keys through the store, which KTD16 forbids.
+    [ -z "$ca_entry" ] || printf '* cert-authority %s\n' "$ca_entry"
+    # This host's own node key, so commits it made verify on this host.
+    [ -z "$own_entry" ] || printf 'roundhouse-sync@%s %s\n' "$(sync_host_name)" "$own_entry"
+  } >"$tmp/allowed_signers"
+  mkdir -p "$(dirname "$signers")"
+  safe_output "$tmp/allowed_signers" "$signers"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  printf 'roundhouse: allowed signers refreshed at %s\n' "$signers"
+)
+
+sync_apply_signing_config() {
+  # The repo-side signing config, identical in fresh init and in the heal path
+  # so a late enrollment converges on exactly what a fresh init would write.
+  signing_store=$1
+  signing_mode=$2
+  # Signing config is worthless without the signers file it points at, and
+  # nothing else on the host writes that file — derive it here, where both the
+  # fresh path and the heal path route through.
+  sync_refresh_signers_command >/dev/null ||
+    printf 'roundhouse: signing configured but no CA material to derive allowed signers from (run sync-refresh-signers after enrollment)\n' >&2
+  # Signing with a bare key is self-verification only: peers hold the CA, not
+  # this host's public key. Say so out loud rather than letting a host believe
+  # it is publishing verifiable commits.
+  [ -f "$(sync_signing_key_path)-cert.pub" ] ||
+    printf 'roundhouse: signing with a bare node key (no %s); this host verifies its OWN commits, peers cannot verify them until it holds a CA-issued certificate\n' \
+      "$(sync_signing_key_path)-cert.pub" >&2
+  if [ "$signing_mode" = jj ]; then
+    jj -R "$signing_store" config set --repo signing.backend ssh
+    jj -R "$signing_store" config set --repo signing.behavior own
+    # jj's ssh backend signs from the private key; only the CERTIFICATE is
+    # worth substituting, because that is the artifact peers can verify.
+    signing_key_jj=$(sync_signing_key_path)
+    [ ! -f "$signing_key_jj-cert.pub" ] || signing_key_jj="$signing_key_jj-cert.pub"
+    jj -R "$signing_store" config set --repo signing.key "$signing_key_jj"
+    jj -R "$signing_store" config set --repo signing.backends.ssh.allowed-signers \
+      "$(sync_allowed_signers_path)"
+  else
+    git -C "$signing_store" config gpg.format ssh
+    git -C "$signing_store" config user.signingkey "$(sync_signing_key_config)"
+    git -C "$signing_store" config gpg.ssh.allowedSignersFile "$(sync_allowed_signers_path)"
+  fi
+}
+
 sync_init_command() (
   require_jq
   validate_config_file
@@ -7439,6 +7710,7 @@ sync_init_command() (
   fi
   fresh=false
   adopted=false
+  signing_configured=false
   if [ ! -d "$store/.git" ]; then
     fresh=true
     mkdir -p "$store"
@@ -7447,7 +7719,6 @@ sync_init_command() (
       signing_enabled=true
       jj git init --colocate "$store"
       signing_key=$(sync_signing_key_path)
-      allowed_signers=$(sync_allowed_signers_path)
       jj -R "$store" config set --repo snapshot.auto-track 'none()'
       jj -R "$store" config set --repo snapshot.max-new-file-size 1MiB
       jj -R "$store" config set --repo ui.paginate never
@@ -7460,10 +7731,8 @@ sync_init_command() (
       # any host that has not enrolled yet. Store meta still records
       # signing_enabled, which is what gates verification before apply.
       if [ -f "$signing_key" ]; then
-        jj -R "$store" config set --repo signing.backend ssh
-        jj -R "$store" config set --repo signing.behavior own
-        jj -R "$store" config set --repo signing.key "$signing_key"
-        jj -R "$store" config set --repo signing.backends.ssh.allowed-signers "$allowed_signers"
+        signing_configured=true
+        sync_apply_signing_config "$store" jj
       fi
     else
       mode=git-only
@@ -7473,9 +7742,8 @@ sync_init_command() (
       # through plain git, so git-only is degraded in tooling, not in trust.
       if [ -f "$(sync_signing_key_path)" ]; then
         signing_enabled=true
-        git -C "$store" config gpg.format ssh
-        git -C "$store" config user.signingkey "$(sync_signing_key_config)"
-        git -C "$store" config gpg.ssh.allowedSignersFile "$(sync_allowed_signers_path)"
+        signing_configured=true
+        sync_apply_signing_config "$store" git-only
       fi
     fi
     # Store content is data, never host paths: a symlink in the store must
@@ -7502,6 +7770,29 @@ sync_init_command() (
     "$store/allowlists" "$store/upstreams" "$store/leases" "$store/alerts" \
     "$store/findings" "$store/canary" "$store/meta"
   if [ "$fresh" = false ]; then
+    # Late-enrollment heal. sync-init used to exit here, so a host that got its
+    # CA node key AFTER the store existed never got signing configured at all:
+    # jj mode wrote no signing.* config, git-only wrote none and left meta
+    # recording signing_enabled false, and neither ever recovered. The recorded
+    # signing_configured flag (absent on 0.4.0 stores, which re-stamp once) says
+    # whether the repo-side config was actually written; the key file says
+    # whether it can be. Both fixed here, with the fresh path's exact config.
+    heal_mode=$(jq -r '.mode // "git-only"' "$store/meta/host.json" 2>/dev/null || true)
+    if [ "$(jq -r '.signing_configured // false' "$store/meta/host.json" 2>/dev/null)" != true ] &&
+      [ -f "$(sync_signing_key_path)" ]; then
+      sync_apply_signing_config "$store" "$heal_mode"
+      krl=$(sync_krl_path)
+      [ ! -f "$krl" ] || git -C "$store" config gpg.ssh.revocationFile "$krl"
+      tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-heal.XXXXXX")
+      trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+      jq -S '.signing_enabled = true | .signing_configured = true' \
+        "$store/meta/host.json" >"$tmp/host.json"
+      safe_output "$tmp/host.json" "$store/meta/host.json"
+      trap - EXIT HUP INT TERM
+      rm -rf "$tmp"
+      printf 'roundhouse: sync store already initialized at %s (healed signing config)\n' "$store"
+      exit 0
+    fi
     printf 'roundhouse: sync store already initialized at %s\n' "$store"
     exit 0
   fi
@@ -7511,9 +7802,10 @@ sync_init_command() (
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   jq -S -n --arg mode "$mode" --arg host "$host_name" \
     --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --argjson signing "$signing_enabled" '{
+    --argjson signing "$signing_enabled" --argjson configured "$signing_configured" '{
       schema:"roundhouse.sync-store-meta",schema_version:1,mode:$mode,host:$host,
-      created_at:$created,signing_enabled:$signing,remote_visibility_verified:false
+      created_at:$created,signing_enabled:$signing,signing_configured:$configured,
+      remote_visibility_verified:false
     }' >"$tmp/host.json"
   safe_output "$tmp/host.json" "$store/meta/host.json"
   git -C "$store" config user.email >/dev/null 2>&1 || {
@@ -7906,7 +8198,7 @@ sync_run_begin_command() (
     schema:"roundhouse.sync-run-state",schema_version:1,op_id:$op_id,
     started_at:$started,
     phase:(if $gate == "refused-visibility-unverified" then "refused" else "begun" end),
-    first_push_gate:$gate,lease_pushes:[],final_pushed:false
+    first_push_gate:$gate,lease_pushes:[],items_applied:[],final_pushed:false
   }' >"$tmp/state.json"
   safe_output "$tmp/state.json" "$(sync_run_state_path)"
   trap - EXIT HUP INT TERM
@@ -8040,11 +8332,14 @@ sync_journal_command() (
     printf 'roundhouse: sync journal outcome must be a JSON object with an outcome string\n' >&2
     exit 65
   }
+  # items_applied comes from RUN STATE, not from the caller: it is the evidence
+  # peer canary gates trust, so it records what the gated write paths actually
+  # wrote, at the digests they verified. A caller-supplied value is discarded.
   jq -S --arg host "$host_name" --arg ended "$(sync_now)" \
     --slurpfile state "$(sync_run_state_path)" '. + {
       schema:"roundhouse.sync-journal",schema_version:1,host:$host,
       started_at:$state[0].started_at,ended_at:$ended,run_op_id:$state[0].op_id,
-      items_applied:(.items_applied // 0),items_held:(.items_held // 0)
+      items_applied:($state[0].items_applied // []),items_held:(.items_held // 0)
     }' "$tmp/outcome.json" >"$tmp/journal.json"
   sync_validate_record "$tmp/journal.json" roundhouse.sync-journal
   sync_commit_stamped_record "$store" "host/$host_name" journal "-$host_name" \
@@ -8156,18 +8451,11 @@ sync_adopt_pin_command() (
       # updating host journaled a healthy run with that pin applied.
       # ponytail: any version difference gates on the healthy journal (no
       # semver compare); tighten to strictly-newer if downgrades need a lane.
-      for adopt_ref in "refs/remotes/origin/host/$updated_by" "refs/heads/host/$updated_by"; do
-        git -C "$store" show-ref --verify --quiet "$adopt_ref" || continue
-        for journal_path in $(git -C "$store" ls-tree -r --name-only "$adopt_ref" -- journal/ 2>/dev/null); do
-          if git -C "$store" show "$adopt_ref:$journal_path" 2>/dev/null |
-            jq -e --arg sha "$pin_sha" \
-              '.outcome == "healthy" and .applied_pin == $sha' >/dev/null 2>&1; then
-            adopt=true
-            reason="healthy-journal-from-$updated_by"
-            break 2
-          fi
-        done
-      done
+      if sync_host_journals "$store" "$updated_by" | jq -e -s --arg sha "$pin_sha" \
+        'any(.[]; .outcome == "healthy" and .applied_pin == $sha)' >/dev/null 2>&1; then
+        adopt=true
+        reason="healthy-journal-from-$updated_by"
+      fi
     fi
   fi
   jq -S -n --arg plugin "$plugin" --arg sha "$pin_sha" --arg version "$pin_version" \
@@ -8314,6 +8602,10 @@ sync_apply_command() (
   # Stale-verdict protection and the signature gate live in sync_gate_item so
   # apply and materialize can never drift apart.
   sync_gate_item "$store" "$item" "$tmp/incoming" "$commit"
+  # Blast-radius gate, after trust and before any write: a non-canary host
+  # waits for a canary's aged healthy journal at this exact digest.
+  apply_digest=$(sha256_file "$tmp/incoming")
+  sync_canary_gate "$store" "$ref" "$item" "$apply_digest"
   case $item in
     allowlists/*)
       # Mechanical backstop for the allowlist review: an allowlist whose key
@@ -8339,6 +8631,7 @@ sync_apply_command() (
   fi
   safe_output "$tmp/incoming" "$apply_destination"
   sync_record_applied "$store" "$host_name" "$item" "$tmp/incoming" "sync: applied $item"
+  sync_run_state_record_applied "$item" "$apply_digest"
   trap - EXIT HUP INT TERM
   rm -rf "$tmp"
   printf 'roundhouse: applied %s to %s\n' "$item" "$apply_destination"
@@ -8388,6 +8681,10 @@ sync_materialize_command() (
   # Same fail-closed gate as sync-apply: materialize is not an independently
   # callable unreviewed write path.
   sync_gate_item "$store" "$allowlist_item" "$tmp/allowlist.json" "$commit"
+  # Same blast-radius gate as sync-apply, keyed on the allowlist item: the
+  # canary adopts a config-key change first, everyone else waits it out.
+  materialize_digest=$(sha256_file "$tmp/allowlist.json")
+  sync_canary_gate "$store" "$ref" "$allowlist_item" "$materialize_digest"
   # Exclusion precedence: an allowed key that intersects an excluded namespace
   # in either direction refuses and alerts, even though the allowlist passed.
   jq -e "$sync_allowed_paths_filter"'excluded_collisions | length == 0' \
@@ -8446,6 +8743,7 @@ sync_materialize_command() (
   safe_output "$tmp/next.json" "$materialize_destination"
   sync_record_applied "$store" "$host_name" "config/$config_id.json" "$tmp/applied.json" \
     "sync: materialized $config_id"
+  sync_run_state_record_applied "$allowlist_item" "$materialize_digest"
   applied_count=$(jq '[.["keys"] | paths(scalars)] | length' "$tmp/applied.json")
   trap - EXIT HUP INT TERM
   rm -rf "$tmp"
@@ -8718,6 +9016,7 @@ case $command in
   apply-ssh-plan) [ $# -eq 3 ] || usage; apply_ssh_plan_command "$1" "$2" "$3" ;;
   dispatch-posix-request) [ $# -eq 0 ] || usage; dispatch_posix_request_command ;;
   sync-init) [ $# -eq 0 ] || usage; sync_init_command ;;
+  sync-refresh-signers) [ $# -eq 0 ] || usage; sync_refresh_signers_command ;;
   sync-verify-remote) [ $# -eq 0 ] || usage; sync_verify_remote_command ;;
   sync-status) [ $# -le 1 ] || usage; sync_status_command "${1:--}" ;;
   sync-absorb-registry) [ $# -eq 0 ] || usage; sync_absorb_registry_command ;;
@@ -8735,6 +9034,7 @@ case $command in
   sync-verdict) [ $# -eq 3 ] || usage; sync_verdict_command "$1" "$2" "$3" ;;
   sync-apply) [ $# -eq 2 ] || usage; sync_apply_command "$1" "$2" ;;
   sync-hold) [ $# -eq 2 ] || usage; sync_hold_command "$1" "$2" ;;
+  sync-canary-check) [ $# -eq 1 ] || usage; sync_canary_check_command "$1" ;;
   sync-materialize) [ $# -eq 2 ] || usage; sync_materialize_command "$1" "$2" ;;
   sync-propose) [ $# -eq 3 ] || usage; sync_propose_command "$1" "$2" "$3" ;;
   sync-effective)

@@ -109,7 +109,8 @@
       "url": "git@configured-git-host:owner/private-fleet-store.git"
     },
     "cadence_hours": 24,
-    "canary_group": "development"
+    "canary_group": "development",
+    "canary_wait_hours": 24
   },
   "capabilities": {
     "last30days": {

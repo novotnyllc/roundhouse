@@ -227,7 +227,7 @@ provenance, conversions, ambiguous scope, and sealed-plan mutations.
    integrity-verified release that predates this helper: after the marketplace
    upgrade, run exactly
    `codex plugin add roundhouse@novotnyllc --json`, end that task, start a
-   fresh task, and verify the `0.4.0` executor and integrity manifest before any
+   fresh task, and verify the `0.5.0` executor and integrity manifest before any
    other mutation. Never use raw add as a fallback for another plugin or once
    the helper is available. For Claude local or
    SSH use `claude plugin marketplace update novotnyllc` followed by

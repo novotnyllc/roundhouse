@@ -62,7 +62,9 @@ Three phases, one run-lock, one journal. Drive them in order:
    REASON` and only then `"$CLI" sync-apply ITEM DESTINATION`. A verdict is
    bound to the content digest it reviewed and apply refuses newer content.
    Never batch one verdict across items and never record a pass for a diff
-   you did not read.
+   you did not read. `"$CLI" sync-canary-check ITEM` reports the blast-radius
+   verdict for this host ahead of the write; apply and materialize enforce it
+   either way, so a hold there is a wait, not a failure.
 3. **Converge and close** — `"$CLI" sync-materialize CONFIG-ID FILE` for
    allowlisted config keys, `"$CLI" sync-propose ITEM KIND EVIDENCE` for
    outward changes, then `"$CLI" sync-journal` and `"$CLI" sync-run-end`.
@@ -119,6 +121,33 @@ whether a human is there to see one. **Any interactive session on any host
 surfaces fleet-wide pending items**: run `"$CLI" sync-pending` and report
 held updates, conflicts, and stale hosts from every host, not just this one.
 
+### Canary gating
+
+Non-canary hosts do not adopt an item version until a canary host has lived
+with it. Canary membership is `sync.canary_group` in `config.json` matched
+against the host's registry groups, and the wait is `sync.canary_wait_hours`
+(default 24). A canary host — or any host when no `canary_group` is
+configured — adopts immediately. Everyone else adopts only once a canary's
+journal records a **healthy** run whose applied set carries that item at the
+**same content digest**, at least the wait ago. A canary that ran a different
+version is not evidence. There is no bypass flag and no `--canary-exempt`:
+the only exemption is group membership, so widening the blast radius is a
+registry change someone else can see.
+
+### Mining local transcripts for intent evidence
+
+When intent resolution needs evidence a store lookup cannot give — who asked
+for a contested item, whether a change was deliberate — mine **this host's**
+session transcripts before proposing or holding. Read the last ~48 hours only:
+Claude sessions live in `~/.claude/projects/*/*.jsonl`, Codex sessions in
+`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (dated directories under
+`~/.codex/sessions/`). Search for mentions of the contested item, quote
+minimally, and record what you found **only** through `"$CLI" sync-finding`,
+which caps quote length and refuses secret-shaped text. Transcript text never
+reaches the store any other way: not into a proposal's evidence, not into an
+alert reason, not into a journal. Mine locally, publish redacted, keep the
+raw transcript on the host that produced it.
+
 ### Seam with the privilege broker
 
 Desired state lives here; root-touching authority lives with the privilege
@@ -131,16 +160,17 @@ spec.
 ### State-alignment capability per item type
 
 Phase 3 aligns enabled/disabled state with manager-native commands where
-they exist and allowlisted config edits where they do not. **The
-enable/disable verbs below are unverified per-harness**: they are the
-documented shape, not a tested capability of the harness version on any
-given host. Confirm the harness actually supports the command on this host
-before relying on it, and fall back to the config-edit path rather than
-guessing.
+they exist and allowlisted config edits where they do not. The verbs below
+are **verified against claude 2.1.222 / codex-cli 0.146.0** by reading each
+harness's own `plugin --help`: Claude has `enable` and `disable`
+subcommands, Codex's `plugin` command has only `add`, `list`, `marketplace`,
+and `remove` — no state verbs at all, so Codex plugin state is a config
+edit. Re-check `plugin --help` when a harness version moves; a verb that
+disappeared must fall back to the config-edit path, never be guessed at.
 
 | Item type | Claude | Codex |
 | --- | --- | --- |
-| Plugins | `claude plugin enable\|disable PLUGIN@MARKETPLACE --scope user` | `codex plugin enable\|disable PLUGIN@MARKETPLACE` |
+| Plugins | `claude plugin enable\|disable PLUGIN@MARKETPLACE --scope user` (verbs exist) | no enable/disable verb — state is the `[plugins."PLUGIN@MARKETPLACE"] enabled` key in `~/.codex/config.toml`, edited through the allowlist |
 | Standalone skills | no enable/disable verb — presence only; state is an allowlisted config edit | no enable/disable verb — presence only; state is an allowlisted config edit |
 | Hooks | no verb; enablement is an allowlisted config edit | no verb; enablement is the `hooks.state."HOOK-KEY".enabled` config surface — the sibling `trusted_hash` leaf is host-local trust and is never synced |
 | MCP servers | config edit through the allowlist | config edit through the allowlist |
@@ -175,6 +205,18 @@ the host, and the CLI has no field for it.
 - scheduler entry singular and alive — agent-computed from the host;
 - co-ownership sanity for any detected second sync engine — agent-computed;
 - store size within budget — agent-computed from the store path.
+
+Codex-side freshness (verified against codex-rs commit 728e25cb, 2026-08-04):
+Codex auto-upgrades `source_type = "git"` marketplaces at startup, but never
+runs `git fetch`/`pull` against `source_type = "local"` marketplaces — for a
+local-checkout marketplace, sync owns pulling that checkout current; Codex
+will not. Once the on-disk marketplace content is current, Codex silently
+advances installed plugin versions itself on the next `plugin/list` (which
+every TUI session issues routinely) — sync never needs to force reinstalls
+or invoke `codex plugin marketplace upgrade`, only to keep the checkout
+current. The 3h remote-catalog TTL and the startup git auto-upgrade are
+catalog-metadata-only and git-type-only respectively; neither gives local
+marketplaces any freshness guarantee.
 
 ## Routine marketplace refresh
 
@@ -238,7 +280,7 @@ The only pre-helper fallback is a separately approved self-update of
 `roundhouse@novotnyllc` from an integrity-verified release that lacks
 `update-codex-plugin`. After upgrading the `novotnyllc` marketplace, run exactly
 `codex plugin add roundhouse@novotnyllc --json`, recapture inventory,
-reload the new target-native plugin, and require its version `0.4.0` executor
+reload the new target-native plugin, and require its version `0.5.0` executor
 and integrity verification before any other mutation. Never use that raw-add
 fallback for another plugin or once the helper command is available.
 
