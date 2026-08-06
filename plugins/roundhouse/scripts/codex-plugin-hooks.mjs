@@ -224,7 +224,14 @@ async function main() {
   const cwd = process.cwd();
   if (command === "approve") {
     const hooks = await listHooks(pluginId, cwd);
-    if (!hooks.length) fail(`no hooks found for ${pluginId}`);
+    if (!hooks.length) {
+      // A hookless plugin is the normal case, not an error: approve means
+      // "trust whatever hooks this plugin currently ships", and zero is a
+      // valid answer. Automation runs approve after every install/update
+      // without knowing the hook count in advance.
+      process.stdout.write(`${JSON.stringify({ pluginId, approved: 0 })}\n`);
+      return;
+    }
     const keys = hooks.map((hook) => hook.key);
     await writeTrust(pluginId, cwd, keys);
     await verifyTrust(pluginId, cwd, keys, false);

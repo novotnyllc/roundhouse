@@ -480,11 +480,17 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
         cwd=$(printf '%s\n' "$request" | jq -r '.params.cwds[0]')
         scenario=${CODEX_HOOK_SCENARIO:-update}
         writes=${CODEX_HOOK_WRITES_FILE:-/nonexistent}
-        if [ "$scenario" = warning ] || [ "$scenario" = error ]; then
+        if [ "$scenario" = warning ] || [ "$scenario" = error ] ||
+          [ "$scenario" = unrelated-warning ] || [ "$scenario" = hookless ]; then
+          # Real discovery warnings name the offending hooks.json path; the
+          # validator only treats warnings mentioning the target plugin as
+          # fatal, so an unrelated plugin's warning must not block approval.
           jq -cn --argjson id "$id" --arg cwd "$cwd" \
             --arg scenario "$scenario" \
             '{id:$id,result:{data:[{cwd:$cwd,hooks:[],
-              warnings:(if $scenario == "warning" then ["fixture warning"] else [] end),
+              warnings:(if $scenario == "warning" then ["clamping hook timeout in cache/test-market/example/hooks.json"]
+                elif $scenario == "unrelated-warning" then ["clamping hook timeout in cache/test-market/other/hooks.json"]
+                else [] end),
               errors:(if $scenario == "error" then [{message:"fixture error"}] else [] end)}]}}'
           continue
         fi
@@ -894,6 +900,17 @@ for hook_discovery_failure in warning error; do
   fi
   [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
     fail "Codex hook approval wrote trust after discovery $hook_discovery_failure"
+done
+
+for benign_scenario in unrelated-warning hookless; do
+  rm -f "$CODEX_HOOK_WRITES_FILE"
+  benign_result=$(CODEX_HOOK_SCENARIO=$benign_scenario \
+    "$cli" approve-codex-plugin-hooks example@test-market) ||
+    fail "Codex hook approval failed on benign $benign_scenario"
+  [ "$(printf '%s\n' "$benign_result" | jq -r '.approved')" -eq 0 ] ||
+    fail "Codex hook approval on $benign_scenario did not report approved:0"
+  [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
+    fail "Codex hook approval wrote trust during benign $benign_scenario"
 done
 
 rm -f "$CODEX_HOOK_WRITES_FILE"
