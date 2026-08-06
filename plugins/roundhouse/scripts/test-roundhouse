@@ -45,7 +45,7 @@ remote_control_text=$(cat "$remote_control_reference")
 
 for routing_consumer in fleet-agents fleet-auth fleet-chezmoi fleet-inventory fleet-projects fleet-update; do
   routing_consumer_text=$(cat "$script_dir/../skills/$routing_consumer/SKILL.md")
-  assert_contains "$routing_consumer_text" 'yardmaster/model-routing/v1'
+  assert_contains "$routing_consumer_text" 'railyard/model-routing/v1'
 done
 
 assert_contains "$fleet_agents_text" 'ROUNDHOUSE_CONFIG'
@@ -77,8 +77,8 @@ assert_contains "$remote_control_text" '`create_thread`'
 assert_contains "$remote_control_text" '`wait_threads`'
 assert_contains "$remote_control_text" '`wait_threads`, and `set_thread_archived`'
 assert_contains "$remote_control_text" 'An absent eager tool listing is not evidence'
-assert_contains "$remote_control_text" '`yardmaster:model-routing`'
-assert_contains "$remote_control_text" '`contractVersion: "yardmaster/model-routing/v1"`'
+assert_contains "$remote_control_text" '`railyard:model-routing`'
+assert_contains "$remote_control_text" '`contractVersion: "railyard/model-routing/v1"`'
 assert_contains "$remote_control_text" '`callerKind: "fleet"`'
 assert_contains "$remote_control_text" '`codex-task-create` or'
 assert_contains "$remote_control_text" '`codex-task-message`'

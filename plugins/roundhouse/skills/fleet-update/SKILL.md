@@ -15,7 +15,10 @@ and inventory the package section first.
 authorization — plan, seal, verify, and apply in one pass without asking
 again. A request to inspect, report, or plan stops at the read-only plan, and
 apply permission is never inferred from it. The sealed pipeline below is
-safety mechanics, not an approval gate.
+safety mechanics, not an approval gate. This is mechanical-tier work: a
+session running a premium model delegates the run to a cheap-model child
+(the routed mechanical tier) rather than executing inline — skills cannot
+switch the session's own model.
 
 - Homebrew: on an update request, refresh metadata (`brew update`) and
   proceed; use `brew outdated --json=v2` for the plan and `brew upgrade` for
@@ -52,7 +55,7 @@ permission from a request to inspect or plan.
 
 Run each native manager directly on local/SSH hosts. For Windows, Codex reads
 and follows `"$SKILL_DIR/../../references/codex-remote-control.md"`, including
-its exact shared `yardmaster/model-routing/v1` dispatch before task
+its exact shared `railyard/model-routing/v1` dispatch before task
 creation or a work-starting follow-up; Claude reports unsupported. Never fall
 back through WSL. Preserve native approval
 prompts, stop per host on failure, and recapture package inventory afterward.
@@ -61,20 +64,20 @@ Cleanup and autoremove are separate explicit actions.
 ## Unattended schedule
 
 Auto-updating on a schedule uses the OS scheduler calling the harness — no
-new daemon, database, or engine. `yardmaster:setup` installs it on request;
+new daemon, database, or engine. `railyard:setup` installs it on request;
 the shape on macOS is a per-user launchd agent
 (`~/Library/LaunchAgents/com.novotnyllc.roundhouse.autoupdate.plist`) whose
 program runs:
 
 ```bash
-claude -p 'Unattended roundhouse maintenance run: run the fleet-agents desired-state sync for this host (timestamped merge; commit any outward desired.json changes to the chezmoi source), refresh the declared marketplaces, then plan and apply pending package updates (fleet-update). Unattended: no questions; skip anything requiring interactive elevation; write a summary to ~/.local/state/roundhouse/autoupdate.log and exit.' --output-format text
+claude -p --model sonnet 'Unattended roundhouse maintenance run: refresh the installed marketplaces and update their plugins (fleet-agents routine refresh), then plan and apply pending package updates (fleet-update). Unattended: no questions; skip anything requiring interactive elevation; write a summary to ~/.local/state/roundhouse/autoupdate.log and exit.' --output-format text
 ```
 
 (Linux: a systemd user timer; Windows: a per-user scheduled task running the
 same prompt through the installed harness.) Unattended runs use exactly the
 same sealed pipeline and skip protected/privileged actions — those stay
 interactive by design. Failures land in the log and surface at the next
-`yardmaster:doctor` run.
+`railyard:doctor` run.
 
 ## Protected package actions
 

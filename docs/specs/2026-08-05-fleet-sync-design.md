@@ -1,7 +1,7 @@
 # Fleet Sync — Design
 
 Status: draft for review · 2026-08-05
-Owner: roundhouse (skills + store), with setup/doctor touchpoints in yardmaster
+Owner: roundhouse (skills + store), with setup/doctor touchpoints in railyard
 
 ## Purpose
 
@@ -192,7 +192,7 @@ alert names the item, the competing states, and the evidence found.
 
 ## Setup and doctor
 
-Setup (yardmaster): mentions the feature once with a one-paragraph pitch;
+Setup (railyard): mentions the feature once with a one-paragraph pitch;
 on opt-in — installs jj (single binary via the OS package manager), scaffolds
 the store (repo, ignore file, snapshot limits), prompts for the transport
 remote (private hosted repo suggested; tailnet relay; peer-only), suggests

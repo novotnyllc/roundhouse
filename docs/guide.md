@@ -15,7 +15,7 @@ box, and is it ready to receive work?*
   and auth artifacts are inventoried and compared across every host.
 - *Privilege stays narrow.* The few operations that need elevation go
   through signed, enrolled broker lanes — never ad-hoc sudo.
-- *Dispatch stops guessing.* [Yardmaster](https://github.com/novotnyllc/yardmaster)
+- *Dispatch stops guessing.* [Railyard](https://github.com/novotnyllc/railyard)
   consults `fleet-readiness` before placing work; unready hosts don't get
   work, they get findings.
 
@@ -27,7 +27,7 @@ Windows lanes).
 
 ```mermaid
 flowchart TD
-    Y[(yardmaster<br/>orchestrate)] -->|"ready to receive?"| FR[fleet-readiness]
+    Y[(railyard<br/>orchestrate)] -->|"ready to receive?"| FR[fleet-readiness]
     FR --> FI[fleet-inventory]
     FR --> FA[fleet-agents<br/>runtimes · plugins · skills]
     FR --> FP[fleet-projects<br/>checkouts · saved projects]
@@ -53,7 +53,7 @@ One file describes the fleet:
 `ROUNDHOUSE_CONFIG`). It names each machine — display name, SSH alias,
 platform, transport, groups — plus the development root and optional
 Codex remote-control and handoff-project settings. Scaffold it from the
-plugin's `config.example.json`, or let `yardmaster:setup` interview you.
+plugin's `config.example.json`, or let `railyard:setup` interview you.
 
 ## Adding and removing machines
 
@@ -112,11 +112,11 @@ privileged actions additionally need prior enrollment (a one-time, consented
 ceremony per host) and ride signed requests validated against an enrolled
 certificate — there is no general "run this as root" anywhere in the system.
 
-## With yardmaster
+## With railyard
 
 Roundhouse never decides or routes work. The seam is exactly two touchpoints:
-`yardmaster:orchestrate` consults `fleet-readiness` before placing work on a
-host, and roundhouse's own dispatch contracts require yardmaster's
+`railyard:orchestrate` consults `fleet-readiness` before placing work on a
+host, and roundhouse's own dispatch contracts require railyard's
 `model-routing` before creating remote tasks. Install both and the seam just
 works; install roundhouse alone and you still have a full fleet-administration
 toolkit.

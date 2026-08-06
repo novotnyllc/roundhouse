@@ -75,7 +75,7 @@ human password/UAC boundary.
 Use local/SSH execution. If a Windows host is configured for Codex remote
 control, read and follow
 `"$SKILL_DIR/../../references/codex-remote-control.md"`, including its exact
-shared `yardmaster/model-routing/v1` dispatch before task creation or a
+shared `railyard/model-routing/v1` dispatch before task creation or a
 work-starting follow-up; Claude reports unsupported and no WSL fallback is
 allowed. Verify `chezmoi status`, rendered
 diff, source Git state, and relevant auth/tool health afterward.

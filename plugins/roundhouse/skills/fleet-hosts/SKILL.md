@@ -32,7 +32,7 @@ only for a native-Windows destination]; groups [none].
    KRL on the target. Do not shortcut with raw `authorized_keys` edits.
 4. **Prerequisites on the target** (consent, via the target's own managers) —
    `tmux` and `jq` through `roundhouse:fleet-update`; agent harnesses
-   verified and plugin/marketplace parity (yardmaster, roundhouse,
+   verified and plugin/marketplace parity (railyard, roundhouse,
    agent-utilities, compound-engineering) through `roundhouse:fleet-agents`'
    routine refresh; project checkouts through `roundhouse:fleet-projects`
    when the host will take delivery work.
@@ -73,5 +73,5 @@ Order matters: clean up over SSH while access still works, revoke second.
   private key between machines; the CSR is public-only by construction.
 - Signing (`certify-ssh-node`) and privilege enrollment always get their own
   explicit consent naming the exact host, even inside a larger add flow.
-- `yardmaster:setup` delegates per-host work here during first-run setup;
+- `railyard:setup` delegates per-host work here during first-run setup;
   this skill is also directly invocable any time after.

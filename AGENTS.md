@@ -11,10 +11,10 @@ work arrives.
 infrastructure —
 
 - *Readiness* — `fleet-readiness` synthesizes go/no-go from the narrow skills
-  below; it is what `yardmaster:orchestrate` consults before dispatch.
+  below; it is what `railyard:orchestrate` consults before dispatch.
 - *Host lifecycle* — `fleet-hosts` adds or removes one machine end to end
   (config, certificate enrollment/revocation, target prerequisites,
-  readiness); `yardmaster:setup` delegates here during onboarding.
+  readiness); `railyard:setup` delegates here during onboarding.
 - *Inventory and parity* — `fleet-inventory` (read-only snapshots),
   `fleet-agents` (harness runtimes, plugins, skills, capabilities),
   `fleet-projects` (checkouts and saved projects), `fleet-auth` (credential
@@ -30,9 +30,9 @@ infrastructure —
 - *Network gear* — `unifi-network-api`.
 
 **Belongs elsewhere:** deciding what work runs and where
-([`yardmaster`](https://github.com/novotnyllc/yardmaster) owns routing,
+([`railyard`](https://github.com/novotnyllc/railyard) owns routing,
 delivery, orchestration, placement, and review gates — Roundhouse's dispatch
-contracts require its `yardmaster/model-routing/v1` router and feed its
+contracts require its `railyard/model-routing/v1` router and feed its
 placement decisions); craft skills
 ([`agent-utilities`](https://github.com/novotnyllc/agent-utilities)).
 

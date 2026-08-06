@@ -60,7 +60,7 @@ Matching SHA-256 proves identical bytes, not valid authentication. Prefer
 per-machine least-privilege credentials for unattended work. For Windows,
 Codex uses a visible saved-project task as described in
 `"$SKILL_DIR/../../references/codex-remote-control.md"`, including its exact
-shared `yardmaster/model-routing/v1` dispatch before task creation or a
+shared `railyard/model-routing/v1` dispatch before task creation or a
 work-starting follow-up; Claude reports unsupported. Never route secrets
 through WSL or another machine as a bridge.
 

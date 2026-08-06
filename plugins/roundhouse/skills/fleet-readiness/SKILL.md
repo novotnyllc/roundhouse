@@ -26,7 +26,7 @@ post-verification contract. Do not duplicate its commands or treat raw SSH
 command execution as a remote agent. Launching a destination-native harness
 worker over the configured SSH transport — for example a Claude Code
 `claude -p` child with its own session identity in a fleet-verified checkout,
-under `yardmaster:orchestrate`'s placement contract — is agent
+under `railyard:orchestrate`'s placement contract — is agent
 dispatch, not raw command execution, and is the supported Claude Code
 placement lane. A visible Codex task covers only ordinary native
 Windows work. Protected or logged-off Windows work requires fresh

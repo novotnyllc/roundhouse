@@ -36,7 +36,7 @@ manually because it has no documented persistent config key or inventory record.
 
 For `codex-remote-control`, Codex must read and follow
 `"$SKILL_DIR/../../references/codex-remote-control.md"`, including its exact
-shared `yardmaster/model-routing/v1` dispatch before task creation or a
+shared `railyard/model-routing/v1` dispatch before task creation or a
 work-starting follow-up. Claude must report that
 transport as unsupported. Never route Windows through WSL unless the config
 explicitly chooses a different transport.

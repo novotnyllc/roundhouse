@@ -18,7 +18,7 @@ one guided flow, and answers the only question a dispatcher cares about:
 - 🔐 **Privilege, narrowly.** Signed, enrolled broker lanes for the few
   privileged operations that need them — never `sudo` sprinkled in scripts.
 - 🚉 **The dispatcher's go/no-go.** `fleet-readiness` is what
-  [yardmaster](https://github.com/novotnyllc/yardmaster) consults before
+  [railyard](https://github.com/novotnyllc/railyard) consults before
   placing work on a host.
 
 ```sh
@@ -49,7 +49,7 @@ doesn't move a train the shop hasn't cleared:
 ## The family
 
 Work routing and delivery live in
-[`yardmaster`](https://github.com/novotnyllc/yardmaster); craft skills in
+[`railyard`](https://github.com/novotnyllc/railyard); craft skills in
 [`agent-utilities`](https://github.com/novotnyllc/agent-utilities). Charter,
 boundaries, and the legacy executor-namespace notes:
 [AGENTS.md](AGENTS.md).

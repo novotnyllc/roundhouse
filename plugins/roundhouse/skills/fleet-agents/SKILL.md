@@ -28,60 +28,17 @@ Use manager-native ownership:
 - local source skills: update their owning repository; do not overwrite them
   with a package manager.
 
-## Desired-state sync
+## Desired-state sync (specified, not yet implemented)
 
-One store, two actuators. **chezmoi is the single desired-state store,
-distributor, and variation engine** for the whole synced surface: config
-files (`~/.claude/settings.json`, `~/.codex/config.toml`, the roundhouse
-fleet config, any yardmaster model-routing catalog) are managed directly,
-and the non-file surface — plugins with enabled/disabled state, Claude
-user-scope MCP servers, standalone skills — is declared in a
-`desired.json.tmpl` template in the chezmoi source. **Sync groups** are
-chezmoi data: each machine declares its groups in its chezmoi config, and
-the template filters entries by group (e.g. only `xcode`-group machines get
-`tart-xcode-runner`), so the rendered
-`${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/desired.json` (shape:
-`"$SKILL_DIR/../../desired.example.json"`) is already machine-specific — no
-runtime override layer, nothing chezmoi already does is repeated here.
-
-This skill is the **actuator** for the non-file surface. A sync request
-("sync my plugins", "converge the fleet", the scheduled unattended run)
-first runs `chezmoi update` (pull + apply, so the rendered desired.json is
-current), then reconciles the host's managers to it — bidirectionally, with
-change time deciding direction so deliberate local changes propagate
-outward instead of being steamrolled as drift:
-
-- Three inputs: the rendered desired.json (per-entry last-change time from
-  `git log` in the chezmoi source; file mtime as fallback), local manager
-  state (`installed_plugins.json` `installedAt`/`lastUpdated`,
-  `claude mcp list`, skill lockfiles), and the host's last-sync snapshot
-  (`~/.local/state/roundhouse/sync-state.json`).
-- **Newest event wins.** Desired-but-missing locally: synced before and
-  desired unchanged since → the local removal is newer → delete the entry
-  in the chezmoi source template; desired's entry newer → reinstall.
-  Locally-present-but-undeclared: never synced → local install → add it to
-  the template (into the right group guard, defaulting to all machines);
-  removed from desired more recently → remove locally. Enabled/disabled
-  merges the same way via `lastUpdated`.
-- **Outward changes are chezmoi-source commits** — `git pull --rebase`,
-  edit `desired.json.tmpl`, commit with a message naming the host and
-  event, push. Concurrent edits from different hosts therefore meet in git,
-  the one reconciliation point for the whole pool; a rebase conflict is
-  resolved by the same newest-event rule, and ambiguity (clock skew,
-  missing snapshot) falls back to desired-wins and says so — never a silent
-  delete.
-- Claude user-scope MCP servers reconcile via `claude mcp add`/`remove`
-  (Codex MCP is `config.toml`, chezmoi's job directly); desired entries
-  carry no secrets — required env vars are checked for presence only.
-  Standalone skills reconcile by their declared manager (skills-cli, JSM,
-  local-source), preserving provenance rules below.
-
-Project-scope plugins/servers and anything undeclared *and never synced*
-are out of scope. With no desired.json, fall back to the routine
-marketplace refresh below (update-only, no removals). `yardmaster:setup`
-bootstraps the template from the current host's installed set and, opt-in,
-schedules this sync with the unattended maintenance run
-(`roundhouse:fleet-update`'s "Unattended schedule").
+Fleet-wide desired-state sync — plugins with enabled state, MCP servers,
+skills, agents, hooks, and harness configs, with groups, provenance-aware
+updates, and agent-ascertained conflict resolution — is designed in
+`docs/specs/2026-08-05-fleet-sync-design.md` at the repository root: the
+skill owns its own store (a jj/git repository at the roundhouse config
+root); personal sync engines the user runs are detected *upstreams*, never
+infrastructure this system depends on. Until that lands, the routine
+marketplace refresh below is the supported convergence path (update-only,
+no removals).
 
 ## Routine marketplace refresh
 
@@ -123,11 +80,16 @@ claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user
 Require every frozen ID to end in the exact `@MARKETPLACE` suffix and attempt
 every ID even if another update fails. Do not add IDs that appear only after the
 catalog refresh. Update `roundhouse@novotnyllc` last when present, then
-recapture inventory and re-resolve its installed executor. The Codex wrapper
-snapshots only each plugin's already trusted or modified hook
-keys, runs the exact idempotent `codex plugin add PLUGIN@MARKETPLACE --json`,
-refreshes trust for those same stable keys, and leaves new or previously
-untrusted hooks untrusted. Do not synchronize unrelated marketplaces, runtimes,
+recapture inventory and re-resolve its installed executor. After every Codex plugin
+install or update, run the hook-approval helper —
+`node "$SKILL_DIR/../../scripts/codex-plugin-hooks.mjs" approve
+PLUGIN@MARKETPLACE` — so ALL of the plugin's current hooks are trusted with
+their fresh hashes: new hooks, changed hooks, hooks never before on this
+machine. An installed plugin is a trusted plugin; a hook left silently
+untrusted after an update is the failure mode this exists to prevent. The
+helper discovers hooks against a fresh Codex app server, writes only
+matching `trusted_hash` leaves, and preserves disabled and unrelated hook
+state. Do not synchronize unrelated marketplaces, runtimes,
 settings, skills, provenance, or configuration. Manager output is progress
 evidence, not post-state. Recapture the bounded `agents` inventory after each
 harness attempt. Require every frozen marketplace plugin record to remain
@@ -148,7 +110,7 @@ For a configured `codex-remote-control` target, follow the routine-refresh
 path in `"$SKILL_DIR/../../references/codex-remote-control.md"`, using a visible
 native task and native PowerShell. Before its task creation and every chunk or
 other work-starting follow-up, invoke the reference's exact shared
-`yardmaster/model-routing/v1` runtime-skill contract; no local model
+`railyard/model-routing/v1` runtime-skill contract; no local model
 policy is permitted. Lazy-discover the task-control app tools before declaring
 them unavailable.
 

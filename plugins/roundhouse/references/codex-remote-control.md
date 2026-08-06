@@ -35,9 +35,9 @@ Do not collapse these states into a generic task-control failure.
 ## Shared model-routing dispatch
 
 Before every visible Codex task creation and every task message or follow-up,
-invoke the installed runtime skill `yardmaster:model-routing`; it is the
+invoke the installed runtime skill `railyard:model-routing`; it is the
 only routing authority used here. Send exact
-`contractVersion: "yardmaster/model-routing/v1"`. Do not call a provider
+`contractVersion: "railyard/model-routing/v1"`. Do not call a provider
 router, copy model constants, effort defaults, a transport matrix, scoring,
 state, or cache lookup into Roundhouse. If the skill or that exact
 compatible contract is absent, stop the affected Codex dispatch with
