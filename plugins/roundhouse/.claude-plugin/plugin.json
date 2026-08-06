@@ -1,6 +1,6 @@
 {
   "name": "roundhouse",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Machine and infrastructure administration for agent fleets: readiness, inventory, harness/plugin/skill parity, package and dotfile baselines, auth artifacts, SSH transport and diagnosis, privileged install lanes, and UniFi network gear.",
   "author": {
     "name": "Claire Novotny LLC",

@@ -104,12 +104,19 @@ class AppServer {
   }
 }
 
-function validateHooks(result, cwd) {
+function validateHooks(result, cwd, pluginId) {
   const row = result?.data?.find((entry) => entry?.cwd === cwd);
   if (!row || !Array.isArray(row.hooks)) fail("hooks/list returned an invalid result");
-  if ((row.errors?.length ?? 0) || (row.warnings?.length ?? 0)) {
-    fail("hook discovery returned warnings or errors");
-  }
+  if (row.errors?.length) fail("hook discovery returned errors");
+  // Warnings are scoped to the target plugin: another installed plugin's
+  // warning (e.g. a timeout clamp in its hooks.json) must not block this
+  // approval. Warning strings carry the offending hooks.json path.
+  const [name, marketplace] = String(pluginId).split("@");
+  const mine = (row.warnings ?? []).filter((w) =>
+    String(w).includes(`${marketplace}/${name}/`) ||
+    String(w).includes(`${marketplace}\\${name}\\`),
+  );
+  if (mine.length) fail(`hook discovery returned warnings for ${pluginId}: ${mine.join("; ")}`);
   return row.hooks;
 }
 
@@ -147,7 +154,7 @@ async function withAppServer(action) {
 
 async function listHooks(pluginId, cwd) {
   return withAppServer(async (server) => {
-    const hooks = validateHooks(await server.request("hooks/list", { cwds: [cwd] }), cwd);
+    const hooks = validateHooks(await server.request("hooks/list", { cwds: [cwd] }), cwd, pluginId);
     return matchingPluginHooks(hooks, pluginId);
   });
 }
@@ -155,7 +162,7 @@ async function listHooks(pluginId, cwd) {
 async function writeTrust(pluginId, cwd, wanted) {
   if (!wanted.length) return;
   await withAppServer(async (server) => {
-    const hooks = validateHooks(await server.request("hooks/list", { cwds: [cwd] }), cwd);
+    const hooks = validateHooks(await server.request("hooks/list", { cwds: [cwd] }), cwd, pluginId);
     const current = new Map(matchingPluginHooks(hooks, pluginId).map((hook) => [hook.key, hook]));
     const edits = wanted.flatMap((key) => {
       const hook = current.get(key);
