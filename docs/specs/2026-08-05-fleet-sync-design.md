@@ -103,11 +103,17 @@ Groups:
 
 ## Surface and provenance
 
-Synced (user scope): plugins with enabled/disabled state, standalone skills,
-agents, hooks, MCP servers (full definitions, no secrets — required env vars
-checked for presence only), and harness config files
-(`~/.claude/settings.json`, `~/.codex/config.toml`, agent definition files),
-with group/per-machine variants supported.
+Synced (user scope): plugins, standalone skills, agents, hooks, and MCP
+servers (full definitions, no secrets — required env vars checked for
+presence only), and harness config files (`~/.claude/settings.json`,
+`~/.codex/config.toml`, agent definition files), with group/per-machine
+variants supported. **Enabled/disabled state is a first-class synced
+property of every item type that carries it** — plugins, standalone
+skills, individual hooks (Codex hook state records enabled per hook; trust
+hashes stay host-local, enablement syncs), and MCP servers — not just
+plugins. Disabling a skill on one machine is a desired-state change like
+removing it: it propagates, it appears in the delta report by name, and
+intent resolution treats it with the same evidence rules.
 
 Every item carries a provenance record: which upstream owns it. Upstreams
 are uniform and generically detected:
@@ -229,7 +235,11 @@ write-back configured where a second engine owns a file).
    (Claude `~/.claude/projects/*/*.jsonl`; Codex sessions; others later).
 3. jj packaging on every fleet OS (brew/winget/apt/cargo) and its Windows
    maturity for the store operations used here.
-4. `claude plugin enable|disable` / Codex equivalents — exact commands for
-   state alignment.
+4. Exact state-alignment commands per item type and harness:
+   `claude plugin enable|disable` / Codex equivalents, skill
+   enable/disable on both harnesses, per-hook enablement (Codex
+   `hooks.state.*.enabled` config surface vs any CLI), and MCP server
+   enable/disable — including which of these only exist as config-file
+   edits rather than commands.
 5. Migration for detected manager auto-updaters (respect vs. absorb) — the
    generic flow, validated against the managers actually present.
