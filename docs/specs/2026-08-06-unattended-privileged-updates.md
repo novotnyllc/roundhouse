@@ -62,33 +62,63 @@ Doctrine changes that ride on it:
 - Failure handling is unchanged: fail closed, journal, surface at the next
   doctor run. No retry-with-different-shape, no fallback to sudo.
 
-### 2. Publisher-bound bindings for macOS payloads — the standard, not an option
+### 2. Provenance-anchored bindings — the standard, not an option
 
-A byte-hash-per-version binding on software that updates itself is a
-design error, full stop: it turns every release into a human ceremony and
+A byte-hash-per-version binding on software that updates is a design
+error, full stop: it turns every release into a human ceremony and
 defeats the point of scheduled updates. No host has ever enrolled under
 the current shape, so there is no migration — the byte-bound payload
-actions are **replaced**, not augmented. `macos.install-signed-pkg.v2` and
-`sealed-cask-publisher-v1` become the only enrollment shape for
-Apple-signed software: drop the byte digest and version pin; keep and
-extend the signature checks that already exist in the broker:
+actions are **replaced**, not augmented. The general principle: **the
+provenance that installed a thing vouches for its updates.** Signedness
+of the individual payload is not the axis; the anchor is. Three anchor
+shapes cover every scenario:
 
-- Apple code-signature validity (`pkgutil --check-signature`, and
-  `codesign --verify` / `spctl --assess` for app bundles),
-- **Team ID** must equal the enrolled value,
-- **package/bundle identity** must equal the enrolled value,
-- notarization ticket present (spctl accepted),
-- size ceiling retained as a sanity bound.
+**Channel-bound (the common case)** — anything owned by a package
+manager: apt packages, winget packages, Homebrew formulae **and casks,
+signed or not**. The binding pins the manager + source/tap + package
+token (the shape `apt.upgrade-package.v1` already has); integrity comes
+from the manager's own attestation chain — apt repo signatures, winget
+source attestation, Homebrew's tap-published checksums verified on every
+download. An unsigned cask is not an orphan: its tap is its provenance,
+exactly as a .deb's repo is. Whatever the enrolled channel currently
+ships for that token is authorized, at any version.
 
-Trust moves from "the exact bytes the owner enrolled" to "any genuine
-package from this publisher with this identity" — Apple's signing chain
-takes over the integrity role the sha256 played. Enrollment is seeded
-from an observed genuine payload (the ceremony verifies the seed package
-and records its team/identity), so the owner never types a Team ID by
-hand. Byte-hash binding survives in exactly one place: **unsigned or
-ad-hoc artifacts**, which have no publisher identity to bind to — and an
-unsigned artifact is inherently attended-only, because nothing can vouch
-for its next version. Signed software never enrolls byte-bound.
+**Publisher-bound** — payloads installed *outside* any manager (a
+directly-downloaded signed pkg): Apple code-signature validity
+(`pkgutil --check-signature`, `codesign --verify` / `spctl --assess`),
+**Team ID** and **package/bundle identity** equal to enrolled values,
+notarization accepted, size ceiling as sanity bound. Enrollment is
+seeded from an observed genuine payload, so the owner never types a
+Team ID by hand.
+
+**Byte-pinned (rare, attended)** — a one-off artifact with neither a
+managed channel nor a publisher identity. Nothing can vouch for its next
+version, so it stays attended — and it should be the exception that
+prompts "why isn't this in a manager?"
+
+**.app placement and ownership**: casks whose app is user-writable in
+`/Applications` update as the ordinary Homebrew user — no broker
+involvement at all. The broker enters only where the update genuinely
+crosses a privilege boundary (cask pkgs reaching Homebrew's hardcoded
+sudo, system-owned app trees via the `macos-cask-app` record, machine
+scope winget). The existing bridge machinery keeps Homebrew as the
+transaction owner; only its byte-match gate changes to the channel
+binding, with the artifact re-verified against the tap attestation at
+apply time.
+
+### 2a. Install is the authorization; installed means updatable
+
+A human-directed install is a two-part consent captured at one moment:
+install *this*, and keep it current from the *same provenance*. When the
+owner says "install X" through a managed channel, the install ceremony
+records or extends the channel binding for X's token — no second ceremony
+later, no per-version anything. Symmetrically, everything already
+installed at enrollment time is seeded into the bindings from the
+observed inventory (its manager and source are known), so "already
+installed" and "just installed" converge on the same rule: **if it's on
+the machine through a known provenance, keeping it current is
+pre-authorized.** Removal of the binding is the deliberate act, not
+renewal.
 
 ### 3. Enrollment stance change
 
@@ -118,12 +148,18 @@ exists to name).
 - Layers unchanged: sudoers → exact broker binary; fixed semantic catalog;
   owner-activated policy; sealed plans with fresh preconditions; fail
   closed everywhere.
-- The delta is confined to binding shape on two macOS actions: byte-pin →
-  publisher-pin, as the standard for all signed software. Residual risk is
-  a compromised publisher certificate or malicious signed update — the
-  same exposure as every macOS app auto-updater, mitigated by notarization
-  and Apple's revocation machinery. The owner's choice is per-publisher at
-  enrollment (enroll the package or don't), not per-version.
+- The delta is the binding shape: byte-pin → provenance-pin
+  (channel-bound for managed software, publisher-bound for direct signed
+  payloads). Residual risk is a compromised channel or publisher — a
+  poisoned tap, a hijacked repo, a stolen signing cert — which is
+  precisely the exposure the owner already accepts by using that manager
+  or vendor interactively today; unattended operation adds no new trust
+  root, it only removes the human from a loop where the human was
+  rubber-stamping the same provenance check. Mitigations stay the
+  channel's own (repo signatures, tap checksums, notarization,
+  revocation) plus the sealed pipeline's fresh-precondition and
+  post-state checks. The owner's decision is per-provenance at
+  install/enrollment, never per-version.
 - apt/winget gain no new trust: their channel bindings already express
   publisher-level trust; they only gain the unattended flag.
 - The unattended flag never widens *what* an action may do — only *when*
@@ -146,10 +182,12 @@ exists to name).
 1. Exact verification command set for v2 on current macOS (pkgutil /
    codesign / spctl flag sets, stapled-vs-online notarization checks) and
    their offline behavior.
-2. Homebrew cask flow for publisher-bound payloads: the bridge currently
-   byte-matches before substituting the protected artifact; v2 needs the
-   match keyed on identity+team with the artifact re-verified at apply
-   time.
+2. Homebrew cask flow under channel binding: the bridge currently
+   byte-matches before substituting the protected artifact; it needs the
+   match keyed on tap+token with the artifact re-verified against the
+   tap's published checksum at apply time. Also: what attests the tap
+   itself (git provenance of the tap checkout, official-vs-third-party
+   taps), and whether third-party taps need a separate consent tier.
 3. Windows parity for publisher binding: winget channel bindings may
    already suffice; confirm whether Authenticode-publisher pinning is
    needed for any machine-scope package outside winget's attestation.
