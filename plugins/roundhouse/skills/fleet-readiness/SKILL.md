@@ -21,6 +21,10 @@ Orchestrator invokes this skill, retain the parent-assigned title.
 - Use `roundhouse:fleet-auth` for credential artifacts, sessions, and
   authentication repair.
 
+Readiness and doctor consumers read the desired-state sync doctor checks
+from `roundhouse:fleet-agents`' doctor check contract; that list is
+authoritative and is never duplicated or paraphrased here.
+
 Let each routed skill retain its inventory, approval, mutation, and
 post-verification contract. Do not duplicate its commands or treat raw SSH
 command execution as a remote agent. Launching a destination-native harness

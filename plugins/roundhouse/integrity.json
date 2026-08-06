@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "1a87023d4068797bf00c747b1f6d69df662f4b91c69a4de8fd622bbb7a805ce6"
+      "sha256": "962fc9c2100cb1099f376e739841e0c3c476ce9eb785caa0a4bfbd25e6d91d7c"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "34ef6b1e837bb8bc5295bf248bbd7b76894d6713eed8d14a2355e13c62e98909"
+      "sha256": "15f12e6a331a8de82c8eb5d0b9d0a53b16627f969c2e8787ac762a93977f31c8"
     },
     {
       "path": "references/privilege-policy.default",
@@ -22,7 +22,7 @@
     },
     {
       "path": "scripts/certify-ssh-node",
-      "sha256": "db63dbad06a383df553acbc690e70f8ede4939f9f1734f97d6a42fbc46541f0c"
+      "sha256": "8f3ec784c51fa2fdcab34fc2fc6741219b15a9eb05bf6d9be52949c5b03c2a95"
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
@@ -66,7 +66,7 @@
     },
     {
       "path": "scripts/privilege-broker-windows.ps1",
-      "sha256": "233bd546b7c0c5bf3a825883f09e7ff182f8ffea4747367ef27038a204613a06"
+      "sha256": "613202344c52cb41de7a622465bcb68e308ddaa3ac6db3d0c7859681dffb7a54"
     },
     {
       "path": "scripts/profile-worker-windows.ps1",
@@ -78,7 +78,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "b63612f6a1083957284714c9869ec1c764e98fc81e452da52c8c2b09cd271c8d"
+      "sha256": "5b50e58281d928d1aea5f74c79fb6228b629d43fcb10066ee6473a57d6d97c98"
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",
@@ -89,5 +89,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.3.5"
+  "version": "0.4.0"
 }

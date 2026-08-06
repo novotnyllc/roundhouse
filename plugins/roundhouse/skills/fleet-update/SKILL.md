@@ -69,20 +69,27 @@ Cleanup and autoremove are separate explicit actions.
 ## Unattended schedule
 
 Auto-updating on a schedule uses the OS scheduler calling the harness — no
-new daemon, database, or engine. `railyard:setup` installs it on request;
-the shape on macOS is a per-user launchd agent
+new daemon, database, or engine. **There is exactly one owned scheduler
+entry per host, and desired-state sync owns it**: the entry below is
+absorbed into sync's single entry, which drives marketplace refresh,
+package updates, and the sync run together. Two local runners racing one
+plugin cache is the failure this prevents. `railyard:setup` installs the
+entry on request and migrates an existing autoupdate entry into it; the
+shape on macOS is a per-user launchd agent
 (`~/Library/LaunchAgents/com.novotnyllc.roundhouse.autoupdate.plist`) whose
 program runs:
 
 ```bash
-claude -p --model sonnet 'Unattended roundhouse maintenance run: refresh the installed marketplaces and update their plugins (fleet-agents routine refresh), then plan and apply pending package updates (fleet-update). Unattended: no questions; skip anything requiring interactive elevation; write a summary to ~/.local/state/roundhouse/autoupdate.log and exit.' --output-format text
+claude -p --model sonnet 'Unattended roundhouse maintenance run: refresh the installed marketplaces and update their plugins (fleet-agents routine refresh), then plan and apply pending package updates (fleet-update), then — when desired-state sync is enabled — drive the three-phase sync run (fleet-agents desired-state sync): fetch and open the run, review and record a verdict on every changed item, then converge, journal, and end the run. Unattended: no questions; skip anything requiring interactive elevation; write a summary to ~/.local/state/roundhouse/autoupdate.log and exit.' --output-format text
 ```
 
 (Linux: a systemd user timer; Windows: a per-user scheduled task running the
-same prompt through the installed harness.) Unattended runs use exactly the
-same sealed pipeline and skip protected/privileged actions — those stay
-interactive by design. Failures land in the log and surface at the next
-`railyard:doctor` run.
+same prompt through the installed harness.) The prompt text is fixed and
+maintained in lockstep with fleet-agents' sync doctrine. A local run-lock
+enforces one runner at a time per host: a second run exits 75 and stops
+rather than forcing. Unattended runs use exactly the same sealed pipeline
+and skip protected/privileged actions — those stay interactive by design.
+Failures land in the log and surface at the next `railyard:doctor` run.
 
 ## Protected package actions
 

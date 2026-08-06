@@ -40,6 +40,29 @@ Usage:
   roundhouse apply-native-plan PLAN.json PLAN-ID OUTPUT.jsonl
   roundhouse apply-ssh-plan PLAN.json PLAN-ID OUTPUT.jsonl
   roundhouse dispatch-posix-request
+  roundhouse sync-init
+  roundhouse sync-verify-remote
+  roundhouse sync-status [OUTPUT.json|-]
+  roundhouse sync-absorb-registry
+  roundhouse sync-render-config HOST OUTPUT.json|-
+  roundhouse sync-lock
+  roundhouse sync-unlock
+  roundhouse sync-fetch [OUTPUT.json|-]
+  roundhouse sync-run-begin
+  roundhouse sync-lease UPSTREAM_ID
+  roundhouse sync-journal OUTCOME.json|-
+  roundhouse sync-run-end
+  roundhouse sync-undo
+  roundhouse sync-adopt-pin PLUGIN PIN.json
+  roundhouse sync-diff ITEM [OUTPUT.json|-]
+  roundhouse sync-verdict ITEM pass|hold REASON
+  roundhouse sync-apply ITEM DESTINATION
+  roundhouse sync-hold ITEM REASON
+  roundhouse sync-materialize CONFIG_ID DESTINATION
+  roundhouse sync-propose ITEM add|remove|state-change|config-key EVIDENCE.json|-
+  roundhouse sync-effective HOST [OUTPUT.json|-]
+  roundhouse sync-pending [OUTPUT.json|-]
+  roundhouse sync-finding FINDING.json|-
 EOF
   exit 64
 }
@@ -701,6 +724,15 @@ validate_config_file() {
     exit 64
   }
   jq -e '
+    # Every sync URL reaches `git fetch`/`git remote add` as an argument, so
+    # only the forms this system can reason about are accepted: scheme URLs
+    # without userinfo, scp-like user@host:path, or a local path. Anything
+    # else (ext::, other transports, credential-bearing URLs, option-looking
+    # or whitespace-bearing strings) is refused at config time.
+    def valid_sync_url:
+      (type == "string") and (length > 0) and (contains("?") | not) and
+      (test("[ \t\n\r]") | not) and
+      (test("^((https|ssh)://[^@]+|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[A-Za-z0-9._~/-]+|(file://)?/[A-Za-z0-9._~/-]+)$"));
     def valid_capability_provider:
       (.provider | IN("plugin","skills-cli","jsm","manual","plugin-source")) and
       (.source | type == "string" and length > 0) and
@@ -713,6 +745,20 @@ validate_config_file() {
       ((.name // null) == null or (.name | type == "string" and test("^[A-Za-z0-9._-]+$")));
     . as $config |
     .version == 1 and
+    ((.sync // null) == null or
+      ((.sync | type == "object") and
+       ([.sync | keys[] |
+         select(IN("cadence_hours","canary_group","enabled","remote","store_path") | not)
+       ] | length == 0) and
+       (.sync | has("enabled")) and (.sync.enabled | type == "boolean") and
+       ((.sync.store_path // null) == null or
+         (.sync.store_path | type == "string" and length > 0)) and
+       ((.sync.remote // null) | type == "object") and
+       ((.sync.remote | keys) == ["url"]) and
+       (.sync.remote.url | valid_sync_url) and
+       (.sync.cadence_hours | type == "number" and . > 0 and . <= 8760) and
+       ((.sync.canary_group // null) == null or
+         (.sync.canary_group | type == "string" and test("^[A-Za-z0-9._-]+$"))))) and
     ((.worker // null) == null or
       ((.worker | type == "object") and
        (.worker.target | type == "string" and test("^[A-Za-z0-9._-]+$")) and
@@ -772,6 +818,14 @@ validate_config_file() {
       ([.package_managers[]? | IN("homebrew","linuxbrew","apt","winget")] | all) and
       (if any(.package_managers[]?; . == "winget") then .platform == "windows" else true end) and
       (if any(.package_managers[]?; . == "apt") then (.platform == "linux" or .platform == "wsl") else true end) and
+      ((.sync // null) == null or
+        ((.sync | type == "object") and
+         ([.sync | keys[] | select(IN("enabled","store_path","store_url") | not)] | length == 0) and
+         (if (.sync | has("enabled")) then (.sync.enabled | type == "boolean") else true end) and
+         (if (.sync | has("store_path")) then
+           (.sync.store_path | type == "string" and length > 0) else true end) and
+         (if (.sync | has("store_url")) then
+           (.sync.store_url | valid_sync_url) else true end))) and
       ((.privilege_broker // null) == null or
         ((.privilege_broker | type == "object") and
          ([.privilege_broker | keys[] | select(IN("automation_transport","policy_proposal") | not)] | length == 0) and
@@ -6939,6 +6993,1670 @@ preview_privilege_revocation_command() (
   rm -rf "$tmp"
 )
 
+sync_store_path() {
+  if [ -n "${ROUNDHOUSE_SYNC_STORE:-}" ]; then
+    printf '%s\n' "$ROUNDHOUSE_SYNC_STORE"
+    return
+  fi
+  configured=$(jq -r '.sync.store_path // empty' "$(config_path)" 2>/dev/null || true)
+  if [ -n "$configured" ]; then
+    expand_user_path "$configured"
+  else
+    printf '%s/roundhouse/store\n' "${XDG_CONFIG_HOME:-"$HOME/.config"}"
+  fi
+}
+
+sync_allowed_signers_path() {
+  # Host-local by doctrine (KTD16): never a path inside the store.
+  printf '%s/roundhouse/allowed_signers\n' "${XDG_CONFIG_HOME:-"$HOME/.config"}"
+}
+
+sync_test_hook() {
+  # Test-only hooks (signature bypass, visibility probe, approval command) are
+  # inert unless the self-check explicitly turns them on: a stray environment
+  # variable must never disable a safety gate on a real host.
+  [ "${ROUNDHOUSE_SELFTEST:-0}" = 1 ] || return 1
+  [ -n "${1:-}" ]
+}
+
+sync_sigverify_bypassed() {
+  sync_test_hook "${ROUNDHOUSE_SYNC_SKIP_SIGVERIFY:-}" &&
+    [ "${ROUNDHOUSE_SYNC_SKIP_SIGVERIFY:-0}" = 1 ]
+}
+
+sync_krl_path() {
+  # The KRL enroll-ssh-posix installs (its native_krl_path). ssh signature
+  # verification consults it when gpg.ssh.revocationFile points here, so CA
+  # revocations bite at verify time.
+  printf '%s\n' "${ROUNDHOUSE_SSH_KRL_PATH:-/etc/roundhouse/ssh/active/revoked.krl}"
+}
+
+sync_validate_fetch_url() {
+  # Registry content reaches `git fetch` as an argument. Accept only the forms
+  # this system can reason about; never an option-looking, whitespace-bearing,
+  # credential-bearing, or alternate-transport (ext::, …) string.
+  case ${1:-} in
+    '' | -* | *[[:space:]]*) return 1 ;;
+  esac
+  printf '%s\n' "$1" | grep -qE \
+    '^((https|ssh)://[^@]+|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[A-Za-z0-9._~/-]+|(file://)?/[A-Za-z0-9._~/-]+)$'
+}
+
+sync_signing_key_path() {
+  if [ -n "${ROUNDHOUSE_SYNC_SIGNING_KEY:-}" ]; then
+    printf '%s\n' "$ROUNDHOUSE_SYNC_SIGNING_KEY"
+    return
+  fi
+  # Mirrors prepare-ssh-identity's per-user identity root (the CA-enrolled node key).
+  case $(uname -s) in
+    Darwin) printf '%s/Library/Application Support/roundhouse/ssh-identity/current/node-key\n' "$HOME" ;;
+    *) printf '%s/roundhouse/ssh-identity/current/node-key\n' "${XDG_STATE_HOME:-"$HOME/.local/state"}" ;;
+  esac
+}
+
+sync_signing_key_config() {
+  # git's ssh signing backend wants the PUBLIC key next to the private one;
+  # naming the private key works only when the .pub is absent from disk.
+  signing_key_config=$(sync_signing_key_path)
+  if [ -f "$signing_key_config.pub" ]; then
+    printf '%s\n' "$signing_key_config.pub"
+  else
+    printf '%s\n' "$signing_key_config"
+  fi
+}
+
+sync_lock_path() {
+  printf '%s.lock\n' "$(sync_store_path)"
+}
+
+sync_lock_acquire() {
+  # One lock shape for both entry points: the directory is the mutex, the meta
+  # file is the evidence sync-status and the stale-lock check read.
+  lock_dir=$1
+  mkdir "$lock_dir" 2>/dev/null || return 1
+  chmod 0700 "$lock_dir"
+  jq -S -n --arg host "$(sync_host_name)" --argjson pid "$$" \
+    --arg started "$(sync_now)" '{
+      schema:"roundhouse.sync-lock",schema_version:1,host:$host,pid:$pid,
+      started_at:$started
+    }' >"$lock_dir/meta.json" 2>/dev/null || true
+}
+
+sync_lock_age_seconds() {
+  # Seconds since the lock was taken, or empty when there is no usable meta.
+  lock_meta="$1/meta.json"
+  [ -f "$lock_meta" ] || return 1
+  lock_started=$(jq -r '.started_at // empty' "$lock_meta" 2>/dev/null || true)
+  [ -n "$lock_started" ] || return 1
+  lock_epoch=$(jq -r --arg at "$lock_started" -n \
+    'try ($at | fromdateiso8601) catch empty' 2>/dev/null || true)
+  [ -n "$lock_epoch" ] || return 1
+  printf '%s\n' "$(($(date +%s) - lock_epoch))"
+}
+
+sync_cadence_hours() {
+  cadence=$(jq -r '.sync.cadence_hours // empty' "$(config_path)" 2>/dev/null || true)
+  case $cadence in
+    '' | *[!0-9]*) printf '24\n' ;;
+    *) printf '%s\n' "$cadence" ;;
+  esac
+}
+
+sync_host_name() {
+  configured=$(jq -r \
+    '[.machines | to_entries[] | select(.value.transport == "local") | .key][0] // empty' \
+    "$(config_path)" 2>/dev/null || true)
+  if [ -n "$configured" ]; then
+    printf '%s\n' "$configured"
+  else
+    hostname -s
+  fi
+}
+
+require_sync_store() {
+  store=$(sync_store_path)
+  [ -f "$store/meta/host.json" ] || {
+    printf 'roundhouse: sync store is not initialized: %s (run sync-init)\n' "$store" >&2
+    exit 66
+  }
+}
+
+sync_run_dir() {
+  # Host-local run state (never in the store): <store>.run sibling directory.
+  printf '%s.run\n' "$(sync_store_path)"
+}
+
+sync_run_state_path() {
+  printf '%s/current.json\n' "$(sync_run_dir)"
+}
+
+sync_verdicts_dir() {
+  printf '%s/verdicts\n' "$(sync_run_dir)"
+}
+
+sync_verdict_path() {
+  # Verdicts are keyed by the digest of the item path (item paths contain '/').
+  printf '%s/%s.json\n' "$(sync_verdicts_dir)" "$(printf '%s' "$1" | sync_sha256_stdin)"
+}
+
+require_sync_run_state() {
+  [ -f "$(sync_run_state_path)" ] || {
+    printf 'roundhouse: no sync run state (run sync-run-begin first)\n' >&2
+    exit 66
+  }
+}
+
+sync_now() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+sync_sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print tolower($1)}'
+  else
+    shasum -a 256 | awk '{print tolower($1)}'
+  fi
+}
+
+sync_assert_item_path() {
+  case $1 in
+    '' | /* | ../* | */../* | */.. | .. | *//*)
+      printf 'roundhouse: invalid sync item path: %s\n' "${1:-<empty>}" >&2
+      exit 64
+      ;;
+  esac
+}
+
+sync_incoming_ref() {
+  # Incoming content is origin/main after a fetch; a store without the remote
+  # ref yet (pre-first-push) reviews its local main.
+  if git -C "$1" show-ref --verify --quiet refs/remotes/origin/main; then
+    printf 'origin/main\n'
+  else
+    printf 'main\n'
+  fi
+}
+
+sync_current_branch() {
+  git -C "$1" symbolic-ref --short HEAD 2>/dev/null || printf 'main\n'
+}
+
+sync_show_item() {
+  # Extract one store path from the reviewed ref, or refuse: every read of
+  # incoming content refuses the same way.
+  show_store=$1
+  show_ref=$2
+  show_item=$3
+  show_destination=$4
+  git -C "$show_store" show "$show_ref:$show_item" >"$show_destination" 2>/dev/null || {
+    printf 'roundhouse: sync item %s is not present at %s\n' "$show_item" "$show_ref" >&2
+    exit 66
+  }
+}
+
+sync_store_commit() {
+  # Commit staged store changes, signed when the store records signing and the
+  # CA-enrolled node key exists (same approach as the sync-init scaffold commit).
+  store_commit_repo=$1
+  store_commit_message=$2
+  git -C "$store_commit_repo" config user.email >/dev/null 2>&1 || {
+    git -C "$store_commit_repo" config user.email "roundhouse-sync@$(sync_host_name)"
+    git -C "$store_commit_repo" config user.name roundhouse-sync
+  }
+  if [ "$(jq -r '.signing_enabled // false' "$store_commit_repo/meta/host.json" 2>/dev/null)" = true ] &&
+    [ -f "$(sync_signing_key_path)" ]; then
+    # No silent unsigned fallback: a store that records signing and holds the
+    # key either produces a signed commit or writes nothing at all.
+    git -C "$store_commit_repo" -c gpg.format=ssh \
+      -c user.signingkey="$(sync_signing_key_config)" \
+      commit -q -S -m "$store_commit_message" || {
+      printf 'roundhouse: signed store commit failed and signing is enabled; refusing to write unsigned\n' >&2
+      exit 65
+    }
+    return
+  fi
+  git -C "$store_commit_repo" -c commit.gpgsign=false commit -q -m "$store_commit_message"
+}
+
+sync_verify_commit() {
+  # Signature gate (KTD16): git verify-commit against the HOST-LOCAL allowed
+  # signers file only. sync-init points gpg.ssh.revocationFile at the CA KRL
+  # when enrollment installed one, so KRL revocations bite at verify time. A
+  # store without the CA node key records signing_enabled false (degraded mode
+  # is an honest, recorded state, not a silent bypass).
+  verify_repo=$1
+  verify_commit_id=$2
+  [ "$(jq -r '.signing_enabled // false' "$verify_repo/meta/host.json" 2>/dev/null)" = true ] || return 0
+  ! sync_sigverify_bypassed || return 0
+  git -C "$verify_repo" -c gpg.ssh.allowedSignersFile="$(sync_allowed_signers_path)" \
+    verify-commit "$verify_commit_id" >/dev/null 2>&1
+}
+
+sync_record_applied() {
+  # Record the as-applied state under the host branch materialized/ tree.
+  applied_store=$1
+  applied_host=$2
+  applied_item=$3
+  applied_source=$4
+  applied_message=$5
+  applied_branch=$(sync_current_branch "$applied_store")
+  mkdir -p "$applied_store/materialized/$(dirname "$applied_item")"
+  # Containment: no component of the recorded path may resolve out of the
+  # store through a symlink (safe_output covers only the leaf). Checked BEFORE
+  # the branch switch so a refusal never strands the store on the host branch.
+  applied_real=$(cd "$applied_store/materialized/$(dirname "$applied_item")" && pwd -P)
+  applied_store_real=$(cd "$applied_store" && pwd -P)
+  case "$applied_real/" in
+    "$applied_store_real"/materialized/*) ;;
+    *)
+      printf 'roundhouse: materialized path for %s resolves outside the store; refusing\n' \
+        "$applied_item" >&2
+      exit 65
+      ;;
+  esac
+  git -C "$applied_store" checkout -q "host/$applied_host"
+  safe_output "$applied_source" "$applied_store/materialized/$applied_item"
+  git -C "$applied_store" add -f "materialized/$applied_item"
+  git -C "$applied_store" diff --cached --quiet ||
+    sync_store_commit "$applied_store" "$applied_message"
+  git -C "$applied_store" checkout -q "$applied_branch"
+}
+
+sync_commit_stamped_record() {
+  # The one shape shared by every append-only store record (journal, proposal,
+  # finding): check out the owning branch, land <dir>/<stamp><extra>.json with a
+  # -N suffix if that name is taken, commit, and return to the prior branch.
+  stamped_store=$1
+  stamped_branch=$2
+  stamped_dir=$3
+  stamped_extra=$4
+  stamped_noun=$5
+  stamped_host=$6
+  stamped_source=$7
+  stamped_return=$(sync_current_branch "$stamped_store")
+  [ "$stamped_return" = "$stamped_branch" ] ||
+    git -C "$stamped_store" checkout -q "$stamped_branch"
+  mkdir -p "$stamped_store/$stamped_dir"
+  stamped_at=$(date -u +%Y%m%dT%H%M%SZ)
+  stamped_record="$stamped_dir/$stamped_at$stamped_extra.json"
+  stamped_suffix=1
+  while [ -e "$stamped_store/$stamped_record" ]; do
+    stamped_suffix=$((stamped_suffix + 1))
+    stamped_record="$stamped_dir/$stamped_at$stamped_extra-$stamped_suffix.json"
+  done
+  safe_output "$stamped_source" "$stamped_store/$stamped_record"
+  git -C "$stamped_store" add -f "$stamped_record"
+  sync_store_commit "$stamped_store" "sync: $stamped_noun $stamped_at ($stamped_host)"
+  [ "$stamped_return" = "$stamped_branch" ] ||
+    git -C "$stamped_store" checkout -q "$stamped_return"
+}
+
+sync_validate_record() {
+  # One documented shape per store record schema: the `schema` field plus the
+  # required keys, checked on every write path (malformed records never land).
+  record_file=$1
+  record_schema=$2
+  case $record_schema in
+    roundhouse.sync-alert) record_keys='["item","reason","host","created_at"]' ;;
+    roundhouse.sync-journal) record_keys='["host","outcome","ended_at","items_applied","items_held"]' ;;
+    roundhouse.sync-finding) record_keys='["host","item","verdict_hint","quote","recorded_at"]' ;;
+    roundhouse.sync-proposal) record_keys='["item","kind","host","scope","evidence","created_at"]' ;;
+    *)
+      printf 'roundhouse: unknown sync record schema: %s\n' "$record_schema" >&2
+      exit 65
+      ;;
+  esac
+  jq -e --arg schema "$record_schema" --argjson required "$record_keys" '
+    . as $record | type == "object" and $record.schema == $schema and
+    ($record.schema_version | type) == "number" and
+    all($required[]; . as $key | ($record | has($key)) and $record[$key] != null)
+  ' "$record_file" >/dev/null || {
+    printf 'roundhouse: malformed %s record; refusing to write\n' "$record_schema" >&2
+    exit 65
+  }
+}
+
+sync_gate_item() {
+  # The fail-closed review gate shared by every store->host write path: a
+  # recorded pass verdict, digest-bound to exactly this content, over a commit
+  # signed by a host-local allowed signer (KTD2/KTD16). No unreviewed writes.
+  gate_store=$1
+  gate_item=$2
+  gate_content=$3
+  gate_commit=$4
+  gate_verdict=$(sync_verdict_path "$gate_item")
+  [ -f "$gate_verdict" ] || {
+    printf 'roundhouse: no recorded verdict for %s (run sync-verdict first); refusing\n' \
+      "$gate_item" >&2
+    exit 65
+  }
+  [ "$(jq -r '.verdict' "$gate_verdict")" = pass ] || {
+    printf 'roundhouse: %s is held (%s); refusing\n' \
+      "$gate_item" "$(jq -r '.reason' "$gate_verdict")" >&2
+    exit 65
+  }
+  [ "$(jq -r '.content_digest' "$gate_verdict")" = "$(sha256_file "$gate_content")" ] || {
+    printf 'roundhouse: incoming content for %s changed since the recorded verdict (stale verdict); refusing\n' \
+      "$gate_item" >&2
+    exit 65
+  }
+  sync_verify_commit "$gate_store" "$gate_commit" || {
+    printf 'roundhouse: incoming store commit is not signed by a host-local allowed signer; refusing\n' >&2
+    exit 65
+  }
+  # A signed tip says nothing about who wrote the bytes: verify the commit that
+  # actually introduced this item too.
+  gate_introduced=$(git -C "$gate_store" rev-list -1 "$gate_commit" -- "$gate_item" 2>/dev/null || true)
+  if [ -n "$gate_introduced" ] && [ "$gate_introduced" != "$gate_commit" ]; then
+    sync_verify_commit "$gate_store" "$gate_introduced" || {
+      printf 'roundhouse: the commit that introduced %s is not signed by a host-local allowed signer; refusing\n' \
+        "$gate_item" >&2
+      exit 65
+    }
+  fi
+}
+
+sync_scopes_for_host() {
+  # Desired-state scopes in ascending precedence: all < os-<platform> <
+  # group-<name> < machine-<host>. Groups come from the absorbed registry,
+  # which sync-absorb-registry commits: every read of store content — registry
+  # and desired/ alike — comes from the reviewed ref, never the working tree.
+  scope_store=$1
+  scope_host=$2
+  scope_ref=$3
+  scope_machine=$(git -C "$scope_store" show "$scope_ref:registry/machines/$scope_host.json" \
+    2>/dev/null || printf '{}')
+  scope_derived=$(printf '%s' "$scope_machine" | jq -r '
+    ((.platform // "") | tostring | select(. != "") | "os-" + .),
+    ([.groups[]? | tostring] | sort[] | "group-" + .)') || {
+    printf 'roundhouse: malformed registry record for %s; refusing\n' "$scope_host" >&2
+    return 65
+  }
+  printf 'all\n'
+  [ -z "$scope_derived" ] || printf '%s\n' "$scope_derived"
+  printf 'machine-%s\n' "$scope_host"
+}
+
+sync_allowed_paths_filter='
+  def haspath($p): try (getpath($p[:-1]) | type == "object" and has($p[-1])) catch false;
+  def allowed_paths: (.allowed // .keys // []) | map(split("."));
+  # An allowed key collides with an excluded namespace when either is a prefix
+  # of the other. One predicate, so the apply backstop and the materialize gate
+  # can never drift into disagreeing about what "widening" means.
+  def excluded_collisions:
+    ((.excluded_namespaces // []) | map(split("."))) as $excluded |
+    [allowed_paths[] as $key | $excluded[] as $namespace |
+      select($key[:($namespace | length)] == $namespace or
+        $namespace[:($key | length)] == $key)];
+'
+
+sync_write_alert() (
+  # Alert record on main; prints the record path.
+  alert_store=$1
+  alert_item=$2
+  alert_reason=$3
+  alert_id="$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%s' "$alert_item" | sync_sha256_stdin | cut -c1-12)"
+  alert_branch=$(sync_current_branch "$alert_store")
+  [ "$alert_branch" = main ] || git -C "$alert_store" checkout -q main
+  mkdir -p "$alert_store/alerts"
+  alert_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-alert.XXXXXX")
+  trap 'rm -rf "$alert_tmp"' EXIT HUP INT TERM
+  jq -S -n --arg item "$alert_item" --arg reason "$alert_reason" \
+    --arg host "$(sync_host_name)" --arg created "$(sync_now)" '{
+      schema:"roundhouse.sync-alert",schema_version:1,item:$item,reason:$reason,
+      host:$host,created_at:$created
+    }' >"$alert_tmp/alert.json"
+  sync_validate_record "$alert_tmp/alert.json" roundhouse.sync-alert
+  safe_output "$alert_tmp/alert.json" "$alert_store/alerts/$alert_id.json"
+  git -C "$alert_store" add -f "alerts/$alert_id.json"
+  sync_store_commit "$alert_store" "sync: alert $alert_id"
+  [ "$alert_branch" = main ] || git -C "$alert_store" checkout -q "$alert_branch"
+  trap - EXIT HUP INT TERM
+  rm -rf "$alert_tmp"
+  printf '%s/alerts/%s.json\n' "$alert_store" "$alert_id"
+)
+
+sync_init_command() (
+  require_jq
+  validate_config_file
+  config=$(config_path)
+  jq -e '.sync.enabled == true' "$config" >/dev/null 2>&1 || {
+    printf 'roundhouse: fleet sync is opt-in and not enabled in %s (set sync.enabled true)\n' "$config" >&2
+    exit 69
+  }
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  remote_url=$(jq -r '.sync.remote.url' "$config")
+  jj_ok=false
+  if command -v jj >/dev/null 2>&1; then
+    jj_version=$(jj --version 2>/dev/null | sed -n 's/^jj \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+    jj_major=${jj_version%%.*}
+    jj_minor=${jj_version#*.}
+    if [ -n "$jj_version" ] &&
+      { [ "$jj_major" -gt 0 ] || [ "$jj_minor" -ge 43 ]; } 2>/dev/null; then
+      jj_ok=true
+    fi
+  fi
+  fresh=false
+  adopted=false
+  if [ ! -d "$store/.git" ]; then
+    fresh=true
+    mkdir -p "$store"
+    if [ "$jj_ok" = true ]; then
+      mode=jj
+      signing_enabled=true
+      jj git init --colocate "$store"
+      signing_key=$(sync_signing_key_path)
+      allowed_signers=$(sync_allowed_signers_path)
+      jj -R "$store" config set --repo snapshot.auto-track 'none()'
+      jj -R "$store" config set --repo snapshot.max-new-file-size 1MiB
+      jj -R "$store" config set --repo ui.paginate never
+      # Only point jj at the CA-enrolled node key when it actually exists —
+      # the same [ -f ] gate the git-side commit paths already apply. Naming a
+      # missing key wedges the repo outright: with signing.behavior=own, every
+      # jj command that touches the working copy dies with "Failed to create
+      # new working-copy commit / SSH sign failed / Couldn't load public key"
+      # (observed with real jj 0.44), so the store becomes jj-inoperable on
+      # any host that has not enrolled yet. Store meta still records
+      # signing_enabled, which is what gates verification before apply.
+      if [ -f "$signing_key" ]; then
+        jj -R "$store" config set --repo signing.backend ssh
+        jj -R "$store" config set --repo signing.behavior own
+        jj -R "$store" config set --repo signing.key "$signing_key"
+        jj -R "$store" config set --repo signing.backends.ssh.allowed-signers "$allowed_signers"
+      fi
+    else
+      mode=git-only
+      signing_enabled=false
+      git init -q "$store"
+      # Same key-presence gate as jj mode: an enrolled host signs and verifies
+      # through plain git, so git-only is degraded in tooling, not in trust.
+      if [ -f "$(sync_signing_key_path)" ]; then
+        signing_enabled=true
+        git -C "$store" config gpg.format ssh
+        git -C "$store" config user.signingkey "$(sync_signing_key_config)"
+        git -C "$store" config gpg.ssh.allowedSignersFile "$(sync_allowed_signers_path)"
+      fi
+    fi
+    # Store content is data, never host paths: a symlink in the store must
+    # materialize as a plain file, not as a link out of it.
+    git -C "$store" config core.symlinks false
+    krl=$(sync_krl_path)
+    [ ! -f "$krl" ] || git -C "$store" config gpg.ssh.revocationFile "$krl"
+    git -C "$store" symbolic-ref HEAD refs/heads/main
+    if [ -n "$remote_url" ] && [ "$remote_url" != null ]; then
+      git -C "$store" remote add origin "$remote_url"
+      # Adopt the fleet's existing history when the remote already has one:
+      # a second host that roots its own main is unrelated to origin's, so
+      # every later push is rejected outright. Only an empty or unreachable
+      # remote gets a fresh root.
+      if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=5' \
+        git -C "$store" fetch -q origin 2>/dev/null &&
+        git -C "$store" show-ref --verify --quiet refs/remotes/origin/main; then
+        git -C "$store" checkout -q -B main origin/main
+        adopted=true
+      fi
+    fi
+  fi
+  mkdir -p "$store/registry/machines" "$store/registry/groups" "$store/desired" \
+    "$store/allowlists" "$store/upstreams" "$store/leases" "$store/alerts" \
+    "$store/findings" "$store/canary" "$store/meta"
+  if [ "$fresh" = false ]; then
+    printf 'roundhouse: sync store already initialized at %s\n' "$store"
+    exit 0
+  fi
+  [ -f "$store/.gitignore" ] ||
+    printf '%s\n' 'identity.json' '*.sock' '*.tmp' '.roundhouse.*' >"$store/.gitignore"
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-init.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -S -n --arg mode "$mode" --arg host "$host_name" \
+    --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson signing "$signing_enabled" '{
+      schema:"roundhouse.sync-store-meta",schema_version:1,mode:$mode,host:$host,
+      created_at:$created,signing_enabled:$signing,remote_visibility_verified:false
+    }' >"$tmp/host.json"
+  safe_output "$tmp/host.json" "$store/meta/host.json"
+  git -C "$store" config user.email >/dev/null 2>&1 || {
+    git -C "$store" config user.email "roundhouse-sync@$host_name"
+    git -C "$store" config user.name roundhouse-sync
+  }
+  if [ "$adopted" = false ]; then
+    git -C "$store" add -f .gitignore meta/host.json
+    # meta/host.json is already written, so the shared commit helper reads the
+    # same signing_enabled flag every later store commit is gated on.
+    sync_store_commit "$store" 'roundhouse sync-init scaffold'
+  fi
+  # Adopted stores commit nothing: main stays exactly origin/main so the first
+  # push fast-forwards, and host-local meta stays working-tree state (the same
+  # host-local-meta rule the lease convergence path already relies on).
+  git -C "$store" show-ref --verify --quiet "refs/heads/host/$host_name" ||
+    git -C "$store" branch "host/$host_name"
+  git -C "$store" remote get-url origin >/dev/null 2>&1 ||
+    git -C "$store" remote add origin "$remote_url"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  init_history='fresh-root'
+  [ "$adopted" = false ] || init_history='adopted-origin-main'
+  printf 'roundhouse: sync store initialized (%s mode, %s) at %s\n' "$mode" "$init_history" "$store"
+)
+
+sync_verify_remote_command() (
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  remote_url=$(git -C "$store" remote get-url origin 2>/dev/null || true)
+  [ -n "$remote_url" ] || {
+    printf 'roundhouse: sync store has no origin remote to verify\n' >&2
+    exit 69
+  }
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-verify.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  probe_status=0
+  if sync_test_hook "${ROUNDHOUSE_SYNC_VISIBILITY_PROBE:-}"; then
+    sh -c "$ROUNDHOUSE_SYNC_VISIBILITY_PROBE" >/dev/null 2>"$tmp/probe.err" || probe_status=$?
+  else
+    # Unauthenticated probe: success means the remote is publicly readable.
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+      GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0='' \
+      GIT_SSH_COMMAND='ssh -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityFile=/dev/null' \
+      git ls-remote --heads -- "$remote_url" >/dev/null 2>"$tmp/probe.err" || probe_status=$?
+  fi
+  # A failed probe is not evidence of privacy: only an authentication refusal
+  # proves the remote is gated. Unreachable, DNS failure, or timeout is
+  # inconclusive and must never satisfy the first-push gate.
+  if [ "$probe_status" -eq 0 ]; then
+    verified=false
+    reason=public
+  elif grep -qE 'Authentication|Permission denied|401|403|could not read Username|terminal prompts disabled' \
+    "$tmp/probe.err"; then
+    verified=true
+    reason=auth-required
+  else
+    verified=false
+    reason=probe-inconclusive
+  fi
+  jq -S --argjson verified "$verified" --arg reason "$reason" \
+    '.remote_visibility_verified = $verified | .remote_visibility_reason = $reason' \
+    "$store/meta/host.json" >"$tmp/host.json"
+  safe_output "$tmp/host.json" "$store/meta/host.json"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  [ "$verified" = true ] || {
+    case $reason in
+      public)
+        printf 'roundhouse: sync remote answers unauthenticated reads (publicly readable); refusing\n' >&2
+        ;;
+      *)
+        printf 'roundhouse: sync remote probe was inconclusive (unreachable, not proven private); refusing\n' >&2
+        ;;
+    esac
+    exit 65
+  }
+  printf 'roundhouse: sync remote visibility verified (authentication required)\n'
+)
+
+sync_status_command() (
+  output=$1
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  mode=$(jq -r '.mode' "$store/meta/host.json")
+  visibility=$(jq '.remote_visibility_verified // false' "$store/meta/host.json")
+  remote=$(git -C "$store" remote get-url origin 2>/dev/null | sanitize_remote || true)
+  lock_held=false
+  lock_age=null
+  if [ -e "$(sync_lock_path)" ]; then
+    lock_held=true
+    lock_age=$(sync_lock_age_seconds "$(sync_lock_path)" || printf 'null\n')
+  fi
+  last_run=null
+  [ ! -f "$(sync_run_dir)/last-run.json" ] ||
+    last_run=$(jq '.ended_at // null' "$(sync_run_dir)/last-run.json")
+  # Detection that cannot run is reported as unknown, never as "nothing found":
+  # a failed probe must not read as a clean store.
+  detection_failed=''
+  conflicted='[]'
+  note=null
+  if [ "$mode" = jj ] && command -v jj >/dev/null 2>&1; then
+    if conflicted_raw=$(jj -R "$store" log -r 'conflicts()' --no-graph --ignore-working-copy \
+      -T 'commit_id ++ "\n"' 2>/dev/null); then
+      conflicted=$(printf '%s' "$conflicted_raw" |
+        jq -R -s 'split("\n") | map(select(length > 0))')
+    else
+      conflicted=null
+      detection_failed="$detection_failed conflicts"
+    fi
+  else
+    note='"conflict detection requires jj; git-only mode reports none"'
+  fi
+  if untracked_raw=$(git -C "$store" status --porcelain --untracked-files=all 2>/dev/null); then
+    untracked=$(printf '%s' "$untracked_raw" | sed -n 's/^?? //p' |
+      jq -R -s 'split("\n") | map(select(length > 0))')
+  else
+    untracked=null
+    detection_failed="$detection_failed untracked"
+  fi
+  store_symlinks='[]'
+  status_ref=$(sync_incoming_ref "$store")
+  if symlink_raw=$(git -C "$store" ls-tree -r "$status_ref" 2>/dev/null); then
+    store_symlinks=$(printf '%s' "$symlink_raw" |
+      awk '$1 == "120000" {sub(/^[^\t]*\t/, ""); print}' |
+      jq -R -s 'split("\n") | map(select(length > 0))')
+  else
+    detection_failed="$detection_failed store_symlinks"
+  fi
+  # Hooks this host applied but never trusted: a hold marker, or an enabled
+  # record carrying no plugin identity the local approval helper could act on.
+  enabled_but_untrusted='[]'
+  status_host_ref="refs/heads/host/$(sync_host_name)"
+  if git -C "$store" show-ref --verify --quiet "$status_host_ref"; then
+    enabled_but_untrusted=$(
+      for hook_path in $(git -C "$store" ls-tree -r --name-only "$status_host_ref" \
+        -- materialized/desired/ 2>/dev/null | grep '/hooks/[^/]*\.json$' || true); do
+        git -C "$store" show "$status_host_ref:$hook_path" 2>/dev/null |
+          jq -r --arg item "${hook_path#materialized/}" '
+            if (.held == true) or (.schema == "roundhouse.sync-hook-hold") or
+              ((.enabled == true) and ((.plugin_id // .plugin // "") == ""))
+            then $item else empty end' 2>/dev/null || true
+      done | jq -R -s 'split("\n") | map(select(length > 0))'
+    )
+  fi
+  detection_failed=$(printf '%s\n' $detection_failed |
+    jq -R -s 'split("\n") | map(select(length > 0))')
+  verification_bypassed=false
+  ! sync_sigverify_bypassed || verification_bypassed=true
+  run_state=null
+  [ ! -f "$(sync_run_state_path)" ] ||
+    run_state=$(jq '{phase:(.phase // null),final_pushed:(.final_pushed // false)}' \
+      "$(sync_run_state_path)")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-status.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -S -n --arg mode "$mode" --arg store "$store" --arg remote "$remote" \
+    --argjson lock_held "$lock_held" --argjson last_run "$last_run" \
+    --argjson conflicted "$conflicted" --argjson untracked "$untracked" \
+    --argjson visibility "$visibility" --argjson note "$note" \
+    --argjson run_state "$run_state" --argjson lock_age "$lock_age" \
+    --argjson detection_failed "$detection_failed" \
+    --argjson store_symlinks "$store_symlinks" \
+    --argjson enabled_but_untrusted "$enabled_but_untrusted" \
+    --argjson verification_bypassed "$verification_bypassed" '{
+      schema:"roundhouse.sync-status",schema_version:1,mode:$mode,store_path:$store,
+      remote:(if $remote == "" then null else $remote end),lock_held:$lock_held,
+      lock_age_seconds:$lock_age,
+      last_run:$last_run,conflicted:$conflicted,untracked_unexpected:$untracked,
+      detection_failed:$detection_failed,store_symlinks:$store_symlinks,
+      enabled_but_untrusted:$enabled_but_untrusted,
+      verification_bypassed:$verification_bypassed,
+      remote_visibility_verified:$visibility,note:$note,run_state:$run_state
+    }' >"$tmp/status.json"
+  safe_output "$tmp/status.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_absorb_registry_command() (
+  require_jq
+  validate_config_file
+  require_sync_store
+  config=$(config_path)
+  store=$(sync_store_path)
+  current=$(sync_current_branch "$store")
+  [ "$current" = main ] || git -C "$store" checkout -q main
+  mkdir -p "$store/registry/machines" "$store/registry/groups"
+  rm -f "$store/registry/machines"/*.json "$store/registry/groups"/*.json
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-absorb.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -S 'del(.machines)' "$config" >"$tmp/config-base.json"
+  safe_output "$tmp/config-base.json" "$store/registry/config-base.json"
+  for name in $(jq -r '.machines | keys[]' "$config"); do
+    jq -S --arg name "$name" '.machines[$name]' "$config" >"$tmp/machine.json"
+    safe_output "$tmp/machine.json" "$store/registry/machines/$name.json"
+  done
+  for group in $(jq -r '[.machines[].groups[]?] | unique[]' "$config"); do
+    jq -S --arg group "$group" '{
+      schema:"roundhouse.sync-group",schema_version:1,name:$group,
+      members:([.machines | to_entries[] | select(.value.groups[]? == $group) | .key] | sort)
+    }' "$config" >"$tmp/group.json"
+    safe_output "$tmp/group.json" "$store/registry/groups/$group.json"
+  done
+  # The registry is store content like any other: committed on main, so every
+  # reader (render, scope resolution, peer fetch) sees a reviewed ref and the
+  # untracked-file tripwire stays meaningful.
+  git -C "$store" add -f -A registry
+  git -C "$store" diff --cached --quiet ||
+    sync_store_commit "$store" "sync: absorb registry ($(sync_host_name))"
+  [ "$current" = main ] || git -C "$store" checkout -q "$current"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  printf 'roundhouse: absorbed %s machine record(s) into %s\n' \
+    "$(jq -r '.machines | length' "$config")" "$store/registry"
+)
+
+sync_render_config_command() (
+  host_name=$1
+  output=$2
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  # Render reads the reviewed ref, so the signature gate must cover that same
+  # ref's commit — the shared gate, not a second inline copy of it.
+  ref=$(sync_incoming_ref "$store")
+  commit=$(git -C "$store" rev-parse "$ref" 2>/dev/null) || {
+    printf 'roundhouse: sync store registry is empty (run sync-absorb-registry)\n' >&2
+    exit 66
+  }
+  sync_verify_commit "$store" "$commit" || {
+    printf 'roundhouse: sync store head is not signed by a host-local allowed signer; refusing to render\n' >&2
+    exit 65
+  }
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-render.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  git -C "$store" show "$ref:registry/config-base.json" >"$tmp/config-base.json" 2>/dev/null || {
+    printf 'roundhouse: sync store registry is empty (run sync-absorb-registry)\n' >&2
+    exit 66
+  }
+  machines=$(
+    for machine_path in $(git -C "$store" ls-tree -r --name-only "$ref" \
+      -- registry/machines/ 2>/dev/null | grep '\.json$' || true); do
+      git -C "$store" show "$ref:$machine_path" |
+        jq --arg name "$(basename "$machine_path" .json)" '{($name): .}'
+    done | jq -s 'add // {}'
+  )
+  printf '%s\n' "$machines" | jq -e --arg host "$host_name" 'has($host)' >/dev/null || {
+    printf 'roundhouse: unknown sync host: %s\n' "$host_name" >&2
+    exit 64
+  }
+  jq -S --arg host "$host_name" --argjson machines "$machines" '. + {
+    machines:($machines | with_entries(
+      if .key == $host then .value.transport = "local" else . end))
+  }' "$tmp/config-base.json" >"$tmp/config.json"
+  ROUNDHOUSE_CONFIG="$tmp/config.json" validate_config_file
+  safe_output "$tmp/config.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_lock_command() (
+  require_jq
+  require_sync_store
+  lock=$(sync_lock_path)
+  sync_lock_acquire "$lock" || {
+    printf 'roundhouse: sync run-lock is held: %s\n' "$lock" >&2
+    exit 75
+  }
+  printf 'roundhouse: sync run-lock acquired: %s\n' "$lock"
+)
+
+sync_unlock_command() (
+  require_sync_store
+  lock=$(sync_lock_path)
+  rm -f "$lock/meta.json"
+  [ ! -d "$lock" ] || rmdir "$lock"
+  printf 'roundhouse: sync run-lock released\n'
+)
+
+sync_fetch_command() (
+  output=$1
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  source=none
+  fetched=false
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-fetch.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  # jj mode still fetches through the colocated .git; jj imports the refs on
+  # its next operation.
+  if git -C "$store" -c protocol.ext.allow=never -c protocol.file.allow=always \
+    fetch -q origin 2>/dev/null; then
+    source=origin
+    fetched=true
+  else
+    fetch_ref=$(sync_incoming_ref "$store")
+    for machine_path in $(git -C "$store" ls-tree -r --name-only "$fetch_ref" \
+      -- registry/machines/ 2>/dev/null); do
+      case $machine_path in *.json) ;; *) continue ;; esac
+      git -C "$store" show "$fetch_ref:$machine_path" >"$tmp/machine.json" 2>/dev/null || continue
+      peer=$(basename "$machine_path" .json)
+      [ "$(jq -r '.transport // empty' "$tmp/machine.json")" != local ] || continue
+      peer_url=$(jq -r '.sync.store_url // empty' "$tmp/machine.json")
+      if [ -z "$peer_url" ]; then
+        peer_alias=$(jq -r '.ssh_alias // empty' "$tmp/machine.json")
+        [ -n "$peer_alias" ] || continue
+        peer_store=$(jq -r '.sync.store_path // empty' "$tmp/machine.json")
+        peer_url="$peer_alias:${peer_store:-.config/roundhouse/store}"
+      fi
+      # The registry is fleet-writable content: a peer URL is untrusted data
+      # reaching `git fetch`, so it passes the same predicate the config does
+      # and is always passed after `--`.
+      sync_validate_fetch_url "$peer_url" || {
+        printf 'roundhouse: skipping peer %s: unsupported sync store URL\n' "$peer" >&2
+        continue
+      }
+      # ponytail: peer fallback force-updates origin/* tracking refs so
+      # downstream origin/main reads see the freshest reachable peer; revisit
+      # with per-peer remotes if peers ever diverge meaningfully.
+      if git -C "$store" -c protocol.ext.allow=never -c protocol.file.allow=always \
+        fetch -q -- "$peer_url" '+refs/heads/*:refs/remotes/origin/*' 2>/dev/null; then
+        source="peer:$peer"
+        fetched=true
+        break
+      fi
+    done
+  fi
+  jq -S -n --arg source "$source" --argjson fetched "$fetched" '{
+    schema:"roundhouse.sync-fetch",schema_version:1,source:$source,fetched:$fetched
+  }' >"$tmp/fetch.json"
+  safe_output "$tmp/fetch.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  [ "$fetched" = true ] || exit 69
+)
+
+sync_run_begin_command() (
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  lock=$(sync_lock_path)
+  sync_lock_acquire "$lock" || {
+    # A lock older than two cadences is not a live runner: name the staleness
+    # and the recovery instead of leaving every later run stuck on exit 75.
+    stale_after=$(( $(sync_cadence_hours) * 7200 ))
+    lock_age=$(sync_lock_age_seconds "$lock" || printf '')
+    if [ -n "$lock_age" ] && [ "$lock_age" -gt "$stale_after" ]; then
+      jq -S -n --argjson age "$lock_age" --argjson after "$stale_after" '{
+        schema:"roundhouse.sync-run-begin-refusal",schema_version:1,
+        reason:"stale-lock",lock_age_seconds:$age,stale_after_seconds:$after,
+        guidance:"confirm no live runner on this host, then release it with sync-unlock"
+      }'
+      printf 'roundhouse: sync run-lock is stale (%ss old, threshold %ss): %s; confirm no runner is live, then run sync-unlock\n' \
+        "$lock_age" "$stale_after" "$lock" >&2
+      exit 75
+    fi
+    printf 'roundhouse: sync run-lock is held: %s (another run is active)\n' "$lock" >&2
+    exit 75
+  }
+  mode=$(jq -r '.mode' "$store/meta/host.json")
+  op_id=null
+  if [ "$mode" = jj ] && command -v jj >/dev/null 2>&1; then
+    # Deliberately WITHOUT --ignore-working-copy: that flag suppresses the
+    # colocated auto-import, so the newest operation would predate jj ever
+    # seeing refs/heads/main. sync-undo restores to this op, and restoring to
+    # a pre-import op makes jj export an empty view — deleting main,
+    # host/<name>, and origin/main from the store outright (observed with real
+    # jj 0.44; `jj git import` cannot substitute, it is a documented no-op in
+    # colocated workspaces). The captured op must already know the run's refs.
+    op_raw=$(jj -R "$store" op log -n1 --no-graph -T 'id' 2>/dev/null || true)
+    [ -z "$op_raw" ] || op_id=$(printf '%s' "$op_raw" | jq -R .)
+  fi
+  gate=not-needed
+  if git -C "$store" remote get-url origin >/dev/null 2>&1 &&
+    ! git -C "$store" show-ref --verify --quiet refs/remotes/origin/main; then
+    if [ "$(jq -r '.remote_visibility_verified // false' "$store/meta/host.json")" = true ]; then
+      gate=pass
+    else
+      gate=refused-visibility-unverified
+    fi
+  fi
+  run_dir=$(sync_run_dir)
+  mkdir -p "$run_dir/verdicts"
+  chmod 0700 "$run_dir"
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-begin.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -S -n --argjson op_id "$op_id" --arg started "$(sync_now)" --arg gate "$gate" '{
+    schema:"roundhouse.sync-run-state",schema_version:1,op_id:$op_id,
+    started_at:$started,
+    phase:(if $gate == "refused-visibility-unverified" then "refused" else "begun" end),
+    first_push_gate:$gate,lease_pushes:[],final_pushed:false
+  }' >"$tmp/state.json"
+  safe_output "$tmp/state.json" "$(sync_run_state_path)"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  if [ "$gate" = refused-visibility-unverified ]; then
+    rm -f "$lock/meta.json"
+    rmdir "$lock"
+    printf 'roundhouse: first push requires a verified-private remote (run sync-verify-remote); refusing to begin\n' >&2
+    exit 65
+  fi
+  printf 'roundhouse: sync run begun\n'
+)
+
+sync_lease_command() (
+  upstream_id=$1
+  require_jq
+  require_sync_store
+  require_sync_run_state
+  case $upstream_id in
+    '' | *[!A-Za-z0-9._-]*)
+      printf 'roundhouse: invalid sync upstream id\n' >&2
+      exit 64
+      ;;
+  esac
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  lease_branch=$(sync_current_branch "$store")
+  [ "$lease_branch" = main ] || git -C "$store" checkout -q main
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-lease.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  write_own_lease() {
+    # Recreated per call: a takeover runs after converging onto the winning
+    # history, which need not carry leases/ at all.
+    mkdir -p "$store/leases"
+    jq -S -n --arg holder "$host_name" --arg taken "$(sync_now)" \
+      --argjson epoch "$(date +%s)" '{
+        schema:"roundhouse.sync-lease",schema_version:1,holder:$holder,
+        taken_at:$taken,taken_at_epoch:$epoch,ttl_minutes:30
+      }' >"$tmp/lease.json"
+    safe_output "$tmp/lease.json" "$store/leases/$upstream_id.json"
+    git -C "$store" add -f "leases/$upstream_id.json"
+    git -C "$store" diff --cached --quiet ||
+      sync_store_commit "$store" "sync: lease $upstream_id ($host_name)"
+  }
+  write_own_lease
+  lease_push_error=''
+  if ! lease_push_error=$(git -C "$store" push origin main 2>&1); then
+    # Only an actual rejection is the lease race. Anything else (unreachable
+    # remote, auth failure, hook refusal) leaves local history untouched.
+    case $lease_push_error in
+      *'non-fast-forward'* | *'rejected'* | *'fetch first'*) ;;
+      *)
+        printf 'roundhouse: sync lease %s push failed (history left intact): %s\n' \
+          "$upstream_id" "$lease_push_error" >&2
+        exit 75
+        ;;
+    esac
+    # Lease CAS: the push race settles the owner; the loser converges onto the
+    # winning history by REPLAYING its local-only commits (alerts, findings,
+    # proposals survive), resolving conflicts in the winner's favour.
+    git -C "$store" fetch -q origin
+    cp "$store/meta/host.json" "$tmp/meta-keep.json"
+    # --autostash: host-local meta/host.json is routinely modified in the
+    # working tree, and a dirty tree must not turn a lease race into a refusal.
+    git -C "$store" rebase -q --autostash -X ours origin/main >/dev/null 2>&1 || {
+      git -C "$store" rebase --abort >/dev/null 2>&1 || true
+      printf 'roundhouse: sync lease %s could not converge onto the winning history; local history left intact\n' \
+        "$upstream_id" >&2
+      exit 75
+    }
+    # Conflicts resolve in the winning history's favour, and meta/host.json is
+    # the one file that must not: it is this host's own state, and another
+    # host's copy of it is never the right answer.
+    mkdir -p "$store/meta"
+    cmp -s "$tmp/meta-keep.json" "$store/meta/host.json" 2>/dev/null ||
+      safe_output "$tmp/meta-keep.json" "$store/meta/host.json"
+    winner=$(git -C "$store" show "origin/main:leases/$upstream_id.json" 2>/dev/null || printf '{}')
+    holder=$(printf '%s' "$winner" | jq -r '.holder // empty')
+    if [ "$holder" != "$host_name" ]; then
+      # A lease record is fleet-writable data: absurd or non-numeric fields are
+      # malformed, not authoritative, and never block a takeover silently.
+      lease_state=$(printf '%s' "$winner" | jq -r --argjson now "$(date +%s)" '
+        if (.taken_at_epoch | type) != "number" or (.ttl_minutes | type) != "number"
+          then "malformed"
+        elif .taken_at_epoch > ($now + 300) then "malformed"
+        elif $now < (.taken_at_epoch + (([.ttl_minutes, 120] | min) * 60)) then "held"
+        else "expired" end' 2>/dev/null || printf 'malformed\n')
+      if [ "$lease_state" = malformed ]; then
+        sync_write_alert "$store" "leases/$upstream_id.json" \
+          'malformed lease record; treated as expired' >/dev/null
+      fi
+      if [ -n "$holder" ] && [ "$lease_state" = held ]; then
+        printf 'roundhouse: sync lease %s lost to %s (unexpired)\n' "$upstream_id" "$holder" >&2
+        exit 75
+      fi
+      # Expired, malformed, or absent lease: take it over on top of the
+      # fetched main.
+      write_own_lease
+      git -C "$store" push -q origin main 2>/dev/null || {
+        printf 'roundhouse: sync lease %s lost (push race)\n' "$upstream_id" >&2
+        exit 75
+      }
+    fi
+  fi
+  # Lease pushes are recorded separately and NEVER set the final-push marker;
+  # only the end-of-run push does (review-corrected undo semantics).
+  jq -S --arg upstream "$upstream_id" --arg at "$(sync_now)" \
+    '.lease_pushes += [{upstream:$upstream,pushed_at:$at}]' \
+    "$(sync_run_state_path)" >"$tmp/state.json"
+  safe_output "$tmp/state.json" "$(sync_run_state_path)"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  printf 'roundhouse: sync lease %s held by %s\n' "$upstream_id" "$host_name"
+)
+
+sync_journal_command() (
+  outcome_source=$1
+  require_jq
+  require_sync_store
+  require_sync_run_state
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-journal.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  if [ "$outcome_source" = - ]; then
+    cat >"$tmp/outcome.json"
+  else
+    cat "$outcome_source" >"$tmp/outcome.json"
+  fi
+  jq -e 'type == "object" and (.outcome | type == "string")' "$tmp/outcome.json" >/dev/null || {
+    printf 'roundhouse: sync journal outcome must be a JSON object with an outcome string\n' >&2
+    exit 65
+  }
+  jq -S --arg host "$host_name" --arg ended "$(sync_now)" \
+    --slurpfile state "$(sync_run_state_path)" '. + {
+      schema:"roundhouse.sync-journal",schema_version:1,host:$host,
+      started_at:$state[0].started_at,ended_at:$ended,run_op_id:$state[0].op_id,
+      items_applied:(.items_applied // 0),items_held:(.items_held // 0)
+    }' "$tmp/outcome.json" >"$tmp/journal.json"
+  sync_validate_record "$tmp/journal.json" roundhouse.sync-journal
+  sync_commit_stamped_record "$store" "host/$host_name" journal "-$host_name" \
+    journal "$host_name" "$tmp/journal.json"
+  cat "$tmp/journal.json"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_run_end_command() (
+  require_jq
+  require_sync_store
+  require_sync_run_state
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  state=$(sync_run_state_path)
+  [ "$(jq -r '.final_pushed' "$state")" != true ] || {
+    printf 'roundhouse: sync run already ended (final push recorded)\n' >&2
+    exit 65
+  }
+  end_branch=$(sync_current_branch "$store")
+  git -C "$store" checkout -q "host/$host_name"
+  for run_end_dir in journal snapshot materialized; do
+    [ ! -d "$store/$run_end_dir" ] || git -C "$store" add -f "$run_end_dir"
+  done
+  git -C "$store" diff --cached --quiet ||
+    sync_store_commit "$store" "sync: run end ($host_name)"
+  git -C "$store" checkout -q "$end_branch"
+  if git -C "$store" remote get-url origin >/dev/null 2>&1; then
+    # The END-OF-RUN push: the only operation allowed to set the final-push
+    # marker. A failed push keeps the marker unset and the lock held so the
+    # run stays undoable and visibly unfinished.
+    git -C "$store" push -q origin main "host/$host_name" || {
+      printf 'roundhouse: sync end-of-run push failed; final marker not set, run-lock kept\n' >&2
+      exit 75
+    }
+  fi
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-end.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  ended_at=$(sync_now)
+  jq -S --arg ended "$ended_at" \
+    '.final_pushed = true | .phase = "ended" | .ended_at = $ended' \
+    "$state" >"$tmp/state.json"
+  safe_output "$tmp/state.json" "$state"
+  # Host-local last-run marker: sync-status reports THIS host's last completed
+  # run, so it never depends on another host's journal landing in the store.
+  jq -S -n --arg ended "$ended_at" '{
+    schema:"roundhouse.sync-last-run",schema_version:1,ended_at:$ended,outcome:"ended"
+  }' >"$tmp/last-run.json"
+  safe_output "$tmp/last-run.json" "$(sync_run_dir)/last-run.json"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  rm -f "$(sync_lock_path)/meta.json"
+  rmdir "$(sync_lock_path)" 2>/dev/null || true
+  printf 'roundhouse: sync run ended; journal and snapshot pushed\n'
+)
+
+sync_undo_command() (
+  require_jq
+  require_sync_store
+  require_sync_run_state
+  store=$(sync_store_path)
+  state=$(sync_run_state_path)
+  [ "$(jq -r '.final_pushed' "$state")" != true ] || {
+    printf 'roundhouse: sync run already pushed; use the restore flow\n' >&2
+    exit 65
+  }
+  if [ "$(jq -r '.mode' "$store/meta/host.json")" != jj ]; then
+    # jj is never load-bearing for safety: degraded mode gets an honest,
+    # machine-readable refusal instead of a reflog approximation.
+    jq -n '{schema:"roundhouse.sync-undo-refusal",schema_version:1,
+      reason:"git-only-mode",guidance:"restore flow"}'
+    exit 69
+  fi
+  op_id=$(jq -r '.op_id // empty' "$state")
+  [ -n "$op_id" ] || {
+    printf 'roundhouse: sync run state has no jj operation id to restore\n' >&2
+    exit 65
+  }
+  jj -R "$store" op restore "$op_id"
+  printf 'roundhouse: restored jj operation %s; post-lease local operations undone (pushed lease/freshness commits on main are not retracted)\n' "$op_id"
+)
+
+sync_adopt_pin_command() (
+  plugin=$1
+  pin_file=$2
+  require_jq
+  require_sync_store
+  [ -f "$pin_file" ] || {
+    printf 'roundhouse: sync pin file not found: %s\n' "$pin_file" >&2
+    exit 66
+  }
+  store=$(sync_store_path)
+  pin_sha=$(jq -r '.sha // empty' "$pin_file")
+  pin_version=$(jq -r '.version // empty' "$pin_file")
+  updated_by=$(jq -r '.updated_by // empty' "$pin_file")
+  adopt=false
+  reason=no-healthy-journal-from-updating-host-for-pin
+  if [ "$plugin" != roundhouse ]; then
+    adopt=true
+    reason=non-roundhouse-plugins-adopt-unconditionally
+  else
+    current_version=$(jq -r '.version' "$plugin_root/.codex-plugin/plugin.json")
+    if [ "$pin_version" = "$current_version" ]; then
+      adopt=true
+      reason=pin-matches-current-version
+    else
+      # Spec containment rule: a roundhouse pin is adopted only after the
+      # updating host journaled a healthy run with that pin applied.
+      # ponytail: any version difference gates on the healthy journal (no
+      # semver compare); tighten to strictly-newer if downgrades need a lane.
+      for adopt_ref in "refs/remotes/origin/host/$updated_by" "refs/heads/host/$updated_by"; do
+        git -C "$store" show-ref --verify --quiet "$adopt_ref" || continue
+        for journal_path in $(git -C "$store" ls-tree -r --name-only "$adopt_ref" -- journal/ 2>/dev/null); do
+          if git -C "$store" show "$adopt_ref:$journal_path" 2>/dev/null |
+            jq -e --arg sha "$pin_sha" \
+              '.outcome == "healthy" and .applied_pin == $sha' >/dev/null 2>&1; then
+            adopt=true
+            reason="healthy-journal-from-$updated_by"
+            break 2
+          fi
+        done
+      done
+    fi
+  fi
+  jq -S -n --arg plugin "$plugin" --arg sha "$pin_sha" --arg version "$pin_version" \
+    --argjson adopted "$adopt" --arg reason "$reason" '{
+      schema:"roundhouse.sync-adopt-pin",schema_version:1,plugin:$plugin,
+      pin_sha:(if $sha == "" then null else $sha end),
+      pin_version:(if $version == "" then null else $version end),
+      adopted:$adopted,reason:$reason
+    }'
+  [ "$adopt" = true ] || exit 65
+)
+
+sync_diff_command() (
+  item=$1
+  output=$2
+  require_jq
+  require_sync_store
+  sync_assert_item_path "$item"
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  ref=$(sync_incoming_ref "$store")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-diff.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  sync_show_item "$store" "$ref" "$item" "$tmp/incoming"
+  git -C "$store" show "host/$host_name:materialized/$item" >"$tmp/current" 2>/dev/null ||
+    : >"$tmp/current"
+  commit=$(git -C "$store" rev-parse "$ref")
+  digest=$(sha256_file "$tmp/incoming")
+  diff -u -L "current/$item" -L "incoming/$item" "$tmp/current" "$tmp/incoming" \
+    >"$tmp/diff" || [ $? -eq 1 ]
+  jq -S -n --arg item "$item" --arg commit "$commit" --arg digest "$digest" \
+    --arg diff "$(cat "$tmp/diff")" '{
+      schema:"roundhouse.sync-diff",schema_version:1,item:$item,
+      incoming_digest:$digest,commit:$commit,diff:$diff
+    }' >"$tmp/record.json"
+  safe_output "$tmp/record.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_verdict_command() (
+  item=$1
+  verdict=$2
+  reason=$3
+  case $verdict in
+    pass | hold) ;;
+    *)
+      printf 'roundhouse: sync verdict must be pass or hold\n' >&2
+      exit 64
+      ;;
+  esac
+  [ -n "$reason" ] || {
+    printf 'roundhouse: sync verdict requires a reason\n' >&2
+    exit 64
+  }
+  require_jq
+  require_sync_store
+  sync_assert_item_path "$item"
+  store=$(sync_store_path)
+  ref=$(sync_incoming_ref "$store")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-verdict.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  sync_show_item "$store" "$ref" "$item" "$tmp/incoming"
+  commit=$(git -C "$store" rev-parse "$ref")
+  if [ "$verdict" = pass ]; then
+    # Signature gate FIRST: a pass verdict must never bind to unverified
+    # content (KTD16 host-local signers).
+    sync_verify_commit "$store" "$commit" || {
+      printf 'roundhouse: incoming store commit is not signed by a host-local allowed signer; refusing pass verdict\n' >&2
+      exit 65
+    }
+  fi
+  digest=$(sha256_file "$tmp/incoming")
+  verdicts=$(sync_verdicts_dir)
+  mkdir -p "$verdicts"
+  chmod 0700 "$(sync_run_dir)" "$verdicts"
+  jq -S -n --arg item "$item" --arg verdict "$verdict" --arg reason "$reason" \
+    --arg digest "$digest" --arg commit "$commit" --arg decided "$(sync_now)" '{
+      schema:"roundhouse.sync-verdict",schema_version:1,item:$item,
+      verdict:$verdict,reason:$reason,content_digest:$digest,commit:$commit,
+      decided_at:$decided
+    }' >"$tmp/verdict.json"
+  safe_output "$tmp/verdict.json" "$(sync_verdict_path "$item")"
+  cat "$tmp/verdict.json"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_apply_command() (
+  item=$1
+  apply_destination=$2
+  require_jq
+  require_sync_store
+  sync_assert_item_path "$item"
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  verdict_file=$(sync_verdict_path "$item")
+  [ -f "$verdict_file" ] || {
+    printf 'roundhouse: no recorded verdict for %s (run sync-verdict first); refusing apply\n' "$item" >&2
+    exit 65
+  }
+  ref=$(sync_incoming_ref "$store")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-apply.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  sync_show_item "$store" "$ref" "$item" "$tmp/incoming"
+  commit=$(git -C "$store" rev-parse "$ref")
+  # Hooks are classified by STORE PATH only. Item content is fleet-writable
+  # data: letting it declare itself a hook would let any record summon the
+  # trust helper (confused deputy). The plugin id likewise comes from the
+  # reviewed path; a record field may only confirm the same value.
+  is_hook=false
+  case $item in desired/*/hooks/*.json) is_hook=true ;; esac
+  plugin_id=''
+  if [ "$is_hook" = true ]; then
+    plugin_id=$(basename "$item" .json)
+    printf '%s\n' "$plugin_id" |
+      jq -eR 'test("^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$")' >/dev/null || {
+        printf 'roundhouse: hook item %s does not name a valid plugin id; refusing\n' "$item" >&2
+        exit 65
+      }
+    record_plugin_id=$(jq -r '.plugin_id // .plugin // empty' "$tmp/incoming" 2>/dev/null || true)
+    [ -z "$record_plugin_id" ] || [ "$record_plugin_id" = "$plugin_id" ] || {
+      printf 'roundhouse: hook item %s declares plugin id %s; refusing\n' \
+        "$item" "$record_plugin_id" >&2
+      exit 65
+    }
+  fi
+  if [ "$(jq -r '.verdict' "$verdict_file")" = hold ]; then
+    hold_reason=$(jq -r '.reason' "$verdict_file")
+    if [ "$is_hook" = true ]; then
+      # Held hook: enablement-off marker in the applied state; the approve
+      # helper is never invoked (held means disabled AND untrusted).
+      jq -S -n --arg item "$item" --arg reason "$hold_reason" \
+        --arg at "$(sync_now)" '{
+          schema:"roundhouse.sync-hook-hold",schema_version:1,item:$item,
+          enabled:false,held:true,reason:$reason,recorded_at:$at
+        }' >"$tmp/marker.json"
+      sync_record_applied "$store" "$host_name" "$item" "$tmp/marker.json" \
+        "sync: hold marker $item"
+    fi
+    printf 'roundhouse: %s is held (%s); refusing apply\n' "$item" "$hold_reason" >&2
+    exit 65
+  fi
+  # Stale-verdict protection and the signature gate live in sync_gate_item so
+  # apply and materialize can never drift apart.
+  sync_gate_item "$store" "$item" "$tmp/incoming" "$commit"
+  case $item in
+    allowlists/*)
+      # Mechanical backstop for the allowlist review: an allowlist whose key
+      # set widens into its own excluded namespaces is held even after a pass.
+      if jq -e "$sync_allowed_paths_filter"'excluded_collisions | length > 0' \
+        "$tmp/incoming" >/dev/null 2>&1; then
+        sync_write_alert "$store" "$item" \
+          'allowlist widens into excluded namespace' >/dev/null
+        printf 'roundhouse: held: allowlist widens into excluded namespace; refusing apply\n' >&2
+        exit 65
+      fi
+      ;;
+  esac
+  if [ "$is_hook" = true ]; then
+    # Review-pass is the approval evidence; the local helper re-trusts (KTD8).
+    # Approval runs BEFORE the write, so a failed approval never leaves an
+    # enabled-but-untrusted hook behind.
+    if sync_test_hook "${ROUNDHOUSE_SYNC_APPROVE_CMD:-}"; then
+      sh -c "$ROUNDHOUSE_SYNC_APPROVE_CMD"' "$1"' roundhouse-sync-approve "$plugin_id"
+    else
+      codex_plugin_hooks_command approve "$plugin_id"
+    fi
+  fi
+  safe_output "$tmp/incoming" "$apply_destination"
+  sync_record_applied "$store" "$host_name" "$item" "$tmp/incoming" "sync: applied $item"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  printf 'roundhouse: applied %s to %s\n' "$item" "$apply_destination"
+)
+
+sync_hold_command() (
+  item=$1
+  reason=$2
+  require_jq
+  require_sync_store
+  sync_assert_item_path "$item"
+  [ -n "$reason" ] || {
+    printf 'roundhouse: sync hold requires a reason\n' >&2
+    exit 64
+  }
+  alert_record=$(sync_write_alert "$(sync_store_path)" "$item" "$reason")
+  cat "$alert_record"
+)
+
+sync_materialize_command() (
+  # Key-level config sync (KTD4). The allowlist's `allowed` array holds
+  # dot-separated jq key paths ("ui.theme"); a literal dot inside a key name is
+  # not expressible, which is the documented limit of the representation.
+  # Desired values come from the `settings` object of the matching
+  # desired/<scope>/config/<id>.json records, merged in scope precedence order.
+  config_id=$1
+  materialize_destination=$2
+  require_jq
+  require_sync_store
+  case $config_id in
+    '' | *[!A-Za-z0-9._-]*)
+      printf 'roundhouse: invalid sync config id: %s\n' "${config_id:-<empty>}" >&2
+      exit 64
+      ;;
+  esac
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  ref=$(sync_incoming_ref "$store")
+  commit=$(git -C "$store" rev-parse "$ref")
+  allowlist_item="allowlists/$config_id.json"
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-materialize.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  git -C "$store" show "$ref:$allowlist_item" >"$tmp/allowlist.json" 2>/dev/null || {
+    printf 'roundhouse: sync allowlist %s is not present at %s\n' "$allowlist_item" "$ref" >&2
+    exit 66
+  }
+  # Same fail-closed gate as sync-apply: materialize is not an independently
+  # callable unreviewed write path.
+  sync_gate_item "$store" "$allowlist_item" "$tmp/allowlist.json" "$commit"
+  # Exclusion precedence: an allowed key that intersects an excluded namespace
+  # in either direction refuses and alerts, even though the allowlist passed.
+  jq -e "$sync_allowed_paths_filter"'excluded_collisions | length == 0' \
+    "$tmp/allowlist.json" >/dev/null || {
+    sync_write_alert "$store" "$allowlist_item" \
+      'allowlisted key intersects an excluded namespace' >/dev/null
+    printf 'roundhouse: allowlist %s claims a key inside an excluded namespace; refusing\n' \
+      "$config_id" >&2
+    exit 65
+  }
+  printf '{}\n' >"$tmp/desired.json"
+  contributing=0
+  sync_scopes_for_host "$store" "$host_name" "$ref" >"$tmp/scopes" || exit 65
+  while read -r scope; do
+    [ -n "$scope" ] || continue
+    scope_item="desired/$scope/config/$config_id.json"
+    git -C "$store" show "$ref:$scope_item" >"$tmp/scope.json" 2>/dev/null || continue
+    sync_gate_item "$store" "$scope_item" "$tmp/scope.json" "$commit"
+    jq -S -s '.[0] * (.[1].settings // {})' "$tmp/desired.json" "$tmp/scope.json" \
+      >"$tmp/desired.next"
+    mv "$tmp/desired.next" "$tmp/desired.json"
+    contributing=$((contributing + 1))
+  done <"$tmp/scopes"
+  [ "$contributing" -gt 0 ] || {
+    printf 'roundhouse: no desired config records for %s in any scope matching %s\n' \
+      "$config_id" "$host_name" >&2
+    exit 66
+  }
+  if [ -f "$materialize_destination" ]; then
+    cp "$materialize_destination" "$tmp/current.json"
+  else
+    printf '{}\n' >"$tmp/current.json"
+  fi
+  jq -e 'type == "object"' "$tmp/current.json" >/dev/null || {
+    printf 'roundhouse: materialize destination is not a JSON object: %s\n' "$materialize_destination" >&2
+    exit 65
+  }
+  # Only the allowed paths are set; every other key (host-local namespaces
+  # included) survives untouched.
+  jq -S "$sync_allowed_paths_filter"'
+    ($desired[0]) as $wanted | ($allowlist[0] | allowed_paths) as $paths |
+    reduce $paths[] as $path (.;
+      if ($wanted | haspath($path)) then setpath($path; $wanted | getpath($path)) else . end)
+  ' --slurpfile desired "$tmp/desired.json" --slurpfile allowlist "$tmp/allowlist.json" \
+    "$tmp/current.json" >"$tmp/next.json"
+  # The recorded state carries ONLY the allowlisted keys: host-local and
+  # secret-bearing namespaces must never reach a store commit.
+  jq -S "$sync_allowed_paths_filter"'
+    . as $applied | ($allowlist[0] | allowed_paths) as $paths |
+    {schema:"roundhouse.sync-materialized",schema_version:1,config_id:$config_id,
+     host:$host,recorded_at:$at,
+     keys:(reduce $paths[] as $path ({};
+       if ($applied | haspath($path)) then setpath($path; $applied | getpath($path)) else . end))}
+  ' --slurpfile allowlist "$tmp/allowlist.json" --arg config_id "$config_id" \
+    --arg host "$host_name" --arg at "$(sync_now)" "$tmp/next.json" >"$tmp/applied.json"
+  safe_output "$tmp/next.json" "$materialize_destination"
+  sync_record_applied "$store" "$host_name" "config/$config_id.json" "$tmp/applied.json" \
+    "sync: materialized $config_id"
+  applied_count=$(jq '[.["keys"] | paths(scalars)] | length' "$tmp/applied.json")
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  printf 'roundhouse: materialized %s into %s (%s allowlisted leaf value(s))\n' \
+    "$config_id" "$materialize_destination" "$applied_count"
+)
+
+sync_propose_command() (
+  # Outward proposals are ALWAYS machine-scoped (narrowest-scope rule): the CLI
+  # takes no scope argument, so it cannot emit a group scope. Widening is an
+  # intent-resolution outcome recorded separately, never a proposal field.
+  item=$1
+  kind=$2
+  evidence_source=$3
+  require_jq
+  require_sync_store
+  sync_assert_item_path "$item"
+  case $kind in
+    add | remove | state-change | config-key) ;;
+    *)
+      printf 'roundhouse: sync proposal kind must be add, remove, state-change or config-key\n' >&2
+      exit 64
+      ;;
+  esac
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-propose.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  if [ "$evidence_source" = - ]; then
+    cat >"$tmp/evidence.json"
+  else
+    cat "$evidence_source" >"$tmp/evidence.json"
+  fi
+  jq -e . "$tmp/evidence.json" >/dev/null 2>&1 || {
+    printf 'roundhouse: sync proposal evidence must be JSON\n' >&2
+    exit 65
+  }
+  jq -S -n --arg item "$item" --arg kind "$kind" --arg host "$host_name" \
+    --slurpfile evidence "$tmp/evidence.json" --arg created "$(sync_now)" '{
+      schema:"roundhouse.sync-proposal",schema_version:1,item:$item,kind:$kind,
+      host:$host,scope:{machine:$host},evidence:$evidence[0],created_at:$created
+    }' >"$tmp/proposal.json"
+  sync_validate_record "$tmp/proposal.json" roundhouse.sync-proposal
+  sync_commit_stamped_record "$store" main "proposals/$host_name" '' \
+    proposal "$host_name" "$tmp/proposal.json"
+  cat "$tmp/proposal.json"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_effective_command() (
+  # Resolve the effective desired set for a host: union of matching scopes,
+  # machine > group > os > all. `exclude` is meaningful only at machine scope,
+  # so presence across overlapping groups is install-wins by construction; a
+  # tie inside the group tier resolves enable-wins, first scope by name.
+  effective_host=$1
+  output=$2
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  ref=$(sync_incoming_ref "$store")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-effective.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  : >"$tmp/records.jsonl"
+  sync_scopes_for_host "$store" "$effective_host" "$ref" >"$tmp/scopes" || exit 65
+  while read -r scope; do
+    [ -n "$scope" ] || continue
+    case $scope in
+      all) tier=0 ;;
+      os-*) tier=1 ;;
+      group-*) tier=2 ;;
+      *) tier=3 ;;
+    esac
+    for record_path in $(git -C "$store" ls-tree -r --name-only "$ref" -- "desired/$scope/" 2>/dev/null); do
+      case $record_path in *.json) ;; *) continue ;; esac
+      git -C "$store" show "$ref:$record_path" >"$tmp/record.json" 2>/dev/null || continue
+      jq -c --arg scope "$scope" --argjson tier "$tier" \
+        --arg item "${record_path#"desired/$scope/"}" '{
+          scope:$scope,tier:$tier,item:($item | sub("\\.json$";"")),
+          enabled:(.enabled // false),exclude:(.exclude // false)
+        }' "$tmp/record.json" >>"$tmp/records.jsonl"
+    done
+  done <"$tmp/scopes"
+  jq -S -n --arg host "$effective_host" --slurpfile records "$tmp/records.jsonl" '{
+    schema:"roundhouse.sync-effective",schema_version:1,host:$host,
+    items:($records | group_by(.item) | map(
+      (map(.tier) | max) as $top | map(select(.tier == $top)) as $winners |
+      (if $top == 3 then $winners[0]
+       else ((($winners | map(select(.enabled))) as $enabled |
+         if ($enabled | length) > 0 then ($enabled | sort_by(.scope))[0]
+         else ($winners | sort_by(.scope))[0] end))
+       end) as $decider |
+      {item:$decider.item,
+       present:(if $decider.tier == 3 then ($decider.exclude | not) else true end),
+       enabled:(if $decider.tier == 3 then ($decider.enabled and ($decider.exclude | not))
+         else $decider.enabled end),
+       deciding_scope:$decider.scope}) | sort_by(.item))
+  }' >"$tmp/effective.json"
+  safe_output "$tmp/effective.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_pending_command() (
+  # Fleet-wide pending items for any interactive session: alerts committed on
+  # main by ANY host, so both the local main and the fetched origin/main.
+  output=$1
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-pending.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  mkdir "$tmp/alerts"
+  pending_refs=main
+  ! git -C "$store" show-ref --verify --quiet refs/remotes/origin/main ||
+    pending_refs='main origin/main'
+  for pending_ref in $pending_refs; do
+    for alert_path in $(git -C "$store" ls-tree -r --name-only "$pending_ref" -- alerts/ 2>/dev/null); do
+      alert_name=$(basename "$alert_path")
+      [ ! -f "$tmp/alerts/$alert_name" ] || continue
+      git -C "$store" show "$pending_ref:$alert_path" >"$tmp/alerts/$alert_name" 2>/dev/null ||
+        rm -f "$tmp/alerts/$alert_name"
+    done
+  done
+  find "$tmp/alerts" -name '*.json' -exec cat {} + 2>/dev/null |
+    jq -S -s '{schema:"roundhouse.sync-pending",schema_version:1,
+      alerts:(sort_by(.created_at // "", .item // ""))}' >"$tmp/pending.json"
+  safe_output "$tmp/pending.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_quote_is_secret() {
+  # Mechanical backstop to agent-side redaction (spec open item 6), not the
+  # primary control: named secret classes plus one bounded high-entropy check.
+  quote_text=$1
+  case $quote_text in *'-----BEGIN'*) return 0 ;; esac
+  if printf '%s' "$quote_text" |
+    grep -qE 'eyJ[A-Za-z0-9_=-]*\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*'; then
+    return 0
+  fi
+  if printf '%s' "$quote_text" |
+    grep -qE '(^|[^A-Za-z0-9_-])(ghp_|gho_|ghu_|ghs_|github_pat_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_-]{8,}'; then
+    return 0
+  fi
+  if printf '%s' "$quote_text" | grep -qE '(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9]{16,}'; then
+    return 0
+  fi
+  if printf '%s' "$quote_text" | grep -qE '(^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}'; then
+    return 0
+  fi
+  # Bounded entropy heuristic: one token of 32+ base64/base64url characters
+  # mixing lower, upper and digits.
+  printf '%s' "$quote_text" | grep -oE '[A-Za-z0-9+/=_-]{32,}' |
+    awk '/[a-z]/ && /[A-Z]/ && /[0-9]/ {found = 1} END {exit(found ? 0 : 1)}'
+}
+
+sync_finding_command() (
+  # Redacted transcript findings are the ONLY mining output that replicates
+  # (R7): the opaque source_session id validates the input but is deliberately
+  # not persisted into the store.
+  finding_source=$1
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-finding.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  if [ "$finding_source" = - ]; then
+    cat >"$tmp/input.json"
+  else
+    cat "$finding_source" >"$tmp/input.json"
+  fi
+  jq -e 'type == "object" and ([.item,.verdict_hint,.quote,.source_session] |
+    all(type == "string" and length > 0))' "$tmp/input.json" >/dev/null 2>&1 || {
+    printf 'roundhouse: sync finding requires item, verdict_hint, quote and source_session strings\n' >&2
+    exit 65
+  }
+  sync_assert_item_path "$(jq -r '.item' "$tmp/input.json")"
+  jq -e '.verdict_hint | test("^[a-z-]{1,32}$")' "$tmp/input.json" >/dev/null || {
+    printf 'roundhouse: sync finding verdict_hint must match ^[a-z-]{1,32}$; refusing\n' >&2
+    exit 65
+  }
+  # Every replicated field carries the same cap and secret screen: a quote is
+  # not the only place a token can hide.
+  for finding_field in item verdict_hint quote; do
+    finding_value=$(jq -r --arg key "$finding_field" '.[$key]' "$tmp/input.json")
+    finding_bytes=$(printf '%s' "$finding_value" | wc -c | tr -d ' ')
+    [ "$finding_bytes" -le 400 ] || {
+      printf 'roundhouse: sync finding %s is %s bytes (cap 400); refusing\n' \
+        "$finding_field" "$finding_bytes" >&2
+      exit 65
+    }
+    if sync_quote_is_secret "$finding_value"; then
+      printf 'roundhouse: sync finding %s matches a secret class; refusing\n' \
+        "$finding_field" >&2
+      exit 65
+    fi
+  done
+  jq -S --arg host "$host_name" --arg at "$(sync_now)" '{
+    schema:"roundhouse.sync-finding",schema_version:1,host:$host,item:.item,
+    verdict_hint:.verdict_hint,quote:.quote,recorded_at:$at
+  }' "$tmp/input.json" >"$tmp/finding.json"
+  sync_validate_record "$tmp/finding.json" roundhouse.sync-finding
+  sync_commit_stamped_record "$store" main "findings/$host_name" '' \
+    finding "$host_name" "$tmp/finding.json"
+  cat "$tmp/finding.json"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
 command=${1:-}
 [ -n "$command" ] || usage
 shift
@@ -6999,5 +8717,31 @@ case $command in
   apply-native-plan) [ $# -eq 3 ] || usage; apply_plan_command "$1" "$2" "$3" true ;;
   apply-ssh-plan) [ $# -eq 3 ] || usage; apply_ssh_plan_command "$1" "$2" "$3" ;;
   dispatch-posix-request) [ $# -eq 0 ] || usage; dispatch_posix_request_command ;;
+  sync-init) [ $# -eq 0 ] || usage; sync_init_command ;;
+  sync-verify-remote) [ $# -eq 0 ] || usage; sync_verify_remote_command ;;
+  sync-status) [ $# -le 1 ] || usage; sync_status_command "${1:--}" ;;
+  sync-absorb-registry) [ $# -eq 0 ] || usage; sync_absorb_registry_command ;;
+  sync-render-config) [ $# -eq 2 ] || usage; sync_render_config_command "$1" "$2" ;;
+  sync-lock) [ $# -eq 0 ] || usage; sync_lock_command ;;
+  sync-unlock) [ $# -eq 0 ] || usage; sync_unlock_command ;;
+  sync-fetch) [ $# -le 1 ] || usage; sync_fetch_command "${1:--}" ;;
+  sync-run-begin) [ $# -eq 0 ] || usage; sync_run_begin_command ;;
+  sync-lease) [ $# -eq 1 ] || usage; sync_lease_command "$1" ;;
+  sync-journal) [ $# -eq 1 ] || usage; sync_journal_command "$1" ;;
+  sync-run-end) [ $# -eq 0 ] || usage; sync_run_end_command ;;
+  sync-undo) [ $# -eq 0 ] || usage; sync_undo_command ;;
+  sync-adopt-pin) [ $# -eq 2 ] || usage; sync_adopt_pin_command "$1" "$2" ;;
+  sync-diff) { [ $# -ge 1 ] && [ $# -le 2 ]; } || usage; sync_diff_command "$1" "${2:--}" ;;
+  sync-verdict) [ $# -eq 3 ] || usage; sync_verdict_command "$1" "$2" "$3" ;;
+  sync-apply) [ $# -eq 2 ] || usage; sync_apply_command "$1" "$2" ;;
+  sync-hold) [ $# -eq 2 ] || usage; sync_hold_command "$1" "$2" ;;
+  sync-materialize) [ $# -eq 2 ] || usage; sync_materialize_command "$1" "$2" ;;
+  sync-propose) [ $# -eq 3 ] || usage; sync_propose_command "$1" "$2" "$3" ;;
+  sync-effective)
+    { [ $# -ge 1 ] && [ $# -le 2 ]; } || usage
+    sync_effective_command "$1" "${2:--}"
+    ;;
+  sync-pending) [ $# -le 1 ] || usage; sync_pending_command "${1:--}" ;;
+  sync-finding) [ $# -eq 1 ] || usage; sync_finding_command "$1" ;;
   *) usage ;;
 esac

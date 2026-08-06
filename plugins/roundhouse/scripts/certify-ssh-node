@@ -2008,7 +2008,9 @@ self_test() {
     "public-key|$public" "node-key-fingerprint|$(key_fingerprint "$key.pub")" \
     'signing-principal|node-a@fleet.example' 'endpoint-principals|mu-posix,mu-request' \
     'source-addresses|10.0.0.0/8,192.0.2.0/24' 'end-csr|' >"$request"
-  [ "$(file_size "$request")" = 363 ] && parse_csr "$request" || return 1
+  # 356 = the nine fixture lines above, with a fixed-length ed25519 public key
+  # (80) and SHA256 fingerprint (50). Update it whenever a fixture field changes.
+  [ "$(file_size "$request")" = 356 ] && parse_csr "$request" || return 1
   invalid_ingress=$root/invalid-ingress
   /usr/bin/sed '1s/roundhouse-ssh-csr|1/roundhouse-ssh-csr|0/' \
     "$request" >"$invalid_ingress" || return 1
