@@ -58,6 +58,11 @@ Usage:
   roundhouse sync-verdict ITEM pass|hold REASON
   roundhouse sync-apply ITEM DESTINATION
   roundhouse sync-hold ITEM REASON
+  roundhouse sync-materialize CONFIG_ID DESTINATION
+  roundhouse sync-propose ITEM add|remove|state-change|config-key EVIDENCE.json|-
+  roundhouse sync-effective HOST [OUTPUT.json|-]
+  roundhouse sync-pending [OUTPUT.json|-]
+  roundhouse sync-finding FINDING.json|-
 EOF
   exit 64
 }
@@ -7138,6 +7143,83 @@ sync_record_applied() {
   git -C "$applied_store" checkout -q "$applied_branch"
 }
 
+sync_validate_record() {
+  # One documented shape per store record schema: the `schema` field plus the
+  # required keys, checked on every write path (malformed records never land).
+  record_file=$1
+  record_schema=$2
+  case $record_schema in
+    roundhouse.sync-alert) record_keys='["item","reason","host","created_at"]' ;;
+    roundhouse.sync-journal) record_keys='["host","outcome","ended_at","items_applied","items_held"]' ;;
+    roundhouse.sync-finding) record_keys='["host","item","verdict_hint","quote","recorded_at"]' ;;
+    roundhouse.sync-proposal) record_keys='["item","kind","host","scope","evidence","created_at"]' ;;
+    *)
+      printf 'roundhouse: unknown sync record schema: %s\n' "$record_schema" >&2
+      exit 65
+      ;;
+  esac
+  jq -e --arg schema "$record_schema" --argjson required "$record_keys" '
+    . as $record | type == "object" and $record.schema == $schema and
+    ($record.schema_version | type) == "number" and
+    all($required[]; . as $key | ($record | has($key)) and $record[$key] != null)
+  ' "$record_file" >/dev/null || {
+    printf 'roundhouse: malformed %s record; refusing to write\n' "$record_schema" >&2
+    exit 65
+  }
+}
+
+sync_gate_item() {
+  # The fail-closed review gate shared by every store->host write path: a
+  # recorded pass verdict, digest-bound to exactly this content, over a commit
+  # signed by a host-local allowed signer (KTD2/KTD16). No unreviewed writes.
+  gate_store=$1
+  gate_item=$2
+  gate_content=$3
+  gate_commit=$4
+  gate_verdict="$(sync_verdicts_dir)/$(printf '%s' "$gate_item" | sync_sha256_stdin).json"
+  [ -f "$gate_verdict" ] || {
+    printf 'roundhouse: no recorded verdict for %s (run sync-verdict first); refusing\n' \
+      "$gate_item" >&2
+    exit 65
+  }
+  [ "$(jq -r '.verdict' "$gate_verdict")" = pass ] || {
+    printf 'roundhouse: %s is held (%s); refusing\n' \
+      "$gate_item" "$(jq -r '.reason' "$gate_verdict")" >&2
+    exit 65
+  }
+  [ "$(jq -r '.content_digest' "$gate_verdict")" = "$(sha256_file "$gate_content")" ] || {
+    printf 'roundhouse: incoming content for %s changed since the recorded verdict (stale verdict); refusing\n' \
+      "$gate_item" >&2
+    exit 65
+  }
+  sync_verify_commit "$gate_store" "$gate_commit" || {
+    printf 'roundhouse: incoming store commit is not signed by a host-local allowed signer; refusing\n' >&2
+    exit 65
+  }
+}
+
+sync_scopes_for_host() {
+  # Desired-state scopes in ascending precedence: all < os-<platform> <
+  # group-<name> < machine-<host>. Groups come from the absorbed registry.
+  # The absorbed registry is working-tree state (sync-absorb-registry writes it
+  # without committing), so it is read from disk exactly like sync-render-config
+  # reads it; only desired/ records are read from the reviewed ref.
+  scope_store=$1
+  scope_host=$2
+  printf 'all\n'
+  scope_machine=$(cat "$scope_store/registry/machines/$scope_host.json" 2>/dev/null ||
+    printf '{}')
+  scope_platform=$(printf '%s' "$scope_machine" | jq -r '.platform // empty')
+  [ -z "$scope_platform" ] || printf 'os-%s\n' "$scope_platform"
+  printf '%s' "$scope_machine" | jq -r '[.groups[]?] | sort[] | "group-" + .'
+  printf 'machine-%s\n' "$scope_host"
+}
+
+sync_allowed_paths_filter='
+  def haspath($p): try (getpath($p[:-1]) | type == "object" and has($p[-1])) catch false;
+  def allowed_paths: (.allowed // .keys // []) | map(split("."));
+'
+
 sync_write_alert() (
   # Alert record on main; prints the record path.
   alert_store=$1
@@ -7154,6 +7236,7 @@ sync_write_alert() (
       schema:"roundhouse.sync-alert",schema_version:1,item:$item,reason:$reason,
       host:$host,created_at:$created
     }' >"$alert_tmp/alert.json"
+  sync_validate_record "$alert_tmp/alert.json" roundhouse.sync-alert
   safe_output "$alert_tmp/alert.json" "$alert_store/alerts/$alert_id.json"
   git -C "$alert_store" add -f "alerts/$alert_id.json"
   sync_store_commit "$alert_store" "sync: alert $alert_id"
@@ -7185,6 +7268,7 @@ sync_init_command() (
     fi
   fi
   fresh=false
+  adopted=false
   if [ ! -d "$store/.git" ]; then
     fresh=true
     mkdir -p "$store"
@@ -7207,6 +7291,19 @@ sync_init_command() (
       git init -q "$store"
     fi
     git -C "$store" symbolic-ref HEAD refs/heads/main
+    if [ -n "$remote_url" ] && [ "$remote_url" != null ]; then
+      git -C "$store" remote add origin "$remote_url"
+      # Adopt the fleet's existing history when the remote already has one:
+      # a second host that roots its own main is unrelated to origin's, so
+      # every later push is rejected outright. Only an empty or unreachable
+      # remote gets a fresh root.
+      if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=5' \
+        git -C "$store" fetch -q origin 2>/dev/null &&
+        git -C "$store" show-ref --verify --quiet refs/remotes/origin/main; then
+        git -C "$store" checkout -q -B main origin/main
+        adopted=true
+      fi
+    fi
   fi
   mkdir -p "$store/registry/machines" "$store/registry/groups" "$store/desired" \
     "$store/allowlists" "$store/upstreams" "$store/leases" "$store/alerts" \
@@ -7215,7 +7312,8 @@ sync_init_command() (
     printf 'roundhouse: sync store already initialized at %s\n' "$store"
     exit 0
   fi
-  printf '%s\n' 'identity.json' '*.sock' '*.tmp' '.roundhouse.*' >"$store/.gitignore"
+  [ -f "$store/.gitignore" ] ||
+    printf '%s\n' 'identity.json' '*.sock' '*.tmp' '.roundhouse.*' >"$store/.gitignore"
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-init.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   jq -S -n --arg mode "$mode" --arg host "$host_name" \
@@ -7229,21 +7327,28 @@ sync_init_command() (
     git -C "$store" config user.email "roundhouse-sync@$host_name"
     git -C "$store" config user.name roundhouse-sync
   }
-  git -C "$store" add -f .gitignore meta/host.json
-  scaffold_signed=false
-  if [ "$signing_enabled" = true ] && [ -f "$(sync_signing_key_path)" ]; then
-    git -C "$store" -c gpg.format=ssh -c user.signingkey="$(sync_signing_key_path)" \
-      commit -q -S -m 'roundhouse sync-init scaffold' && scaffold_signed=true
+  if [ "$adopted" = false ]; then
+    git -C "$store" add -f .gitignore meta/host.json
+    scaffold_signed=false
+    if [ "$signing_enabled" = true ] && [ -f "$(sync_signing_key_path)" ]; then
+      git -C "$store" -c gpg.format=ssh -c user.signingkey="$(sync_signing_key_path)" \
+        commit -q -S -m 'roundhouse sync-init scaffold' && scaffold_signed=true
+    fi
+    [ "$scaffold_signed" = true ] ||
+      git -C "$store" -c commit.gpgsign=false commit -q -m 'roundhouse sync-init scaffold'
   fi
-  [ "$scaffold_signed" = true ] ||
-    git -C "$store" -c commit.gpgsign=false commit -q -m 'roundhouse sync-init scaffold'
+  # Adopted stores commit nothing: main stays exactly origin/main so the first
+  # push fast-forwards, and host-local meta stays working-tree state (the same
+  # host-local-meta rule the lease convergence path already relies on).
   git -C "$store" show-ref --verify --quiet "refs/heads/host/$host_name" ||
     git -C "$store" branch "host/$host_name"
   git -C "$store" remote get-url origin >/dev/null 2>&1 ||
     git -C "$store" remote add origin "$remote_url"
   trap - EXIT HUP INT TERM
   rm -rf "$tmp"
-  printf 'roundhouse: sync store initialized (%s mode) at %s\n' "$mode" "$store"
+  init_history='fresh-root'
+  [ "$adopted" = false ] || init_history='adopted-origin-main'
+  printf 'roundhouse: sync store initialized (%s mode, %s) at %s\n' "$mode" "$init_history" "$store"
 )
 
 sync_verify_remote_command() (
@@ -7601,6 +7706,7 @@ sync_journal_command() (
       started_at:$state[0].started_at,ended_at:$ended,run_op_id:$state[0].op_id,
       items_applied:(.items_applied // 0),items_held:(.items_held // 0)
     }' "$tmp/outcome.json" >"$tmp/journal.json"
+  sync_validate_record "$tmp/journal.json" roundhouse.sync-journal
   journal_branch=$(git -C "$store" symbolic-ref --short HEAD 2>/dev/null || printf 'main')
   git -C "$store" checkout -q "host/$host_name"
   mkdir -p "$store/journal"
@@ -7842,7 +7948,6 @@ sync_apply_command() (
     exit 66
   }
   commit=$(git -C "$store" rev-parse "$ref")
-  digest=$(sha256_file "$tmp/incoming")
   is_hook=false
   case $item in desired/*/hooks/*) is_hook=true ;; esac
   if [ "$is_hook" != true ] && jq -e '.is_hook == true' "$tmp/incoming" >/dev/null 2>&1; then
@@ -7864,22 +7969,16 @@ sync_apply_command() (
       "$item" "$(jq -r '.reason' "$verdict_file")" >&2
     exit 65
   fi
-  [ "$(jq -r '.content_digest' "$verdict_file")" = "$digest" ] || {
-    # Stale-verdict protection: a verdict never authorizes newer content than
-    # it reviewed (review-corrected digest binding).
-    printf 'roundhouse: incoming content for %s changed since the recorded verdict (stale verdict); refusing apply\n' "$item" >&2
-    exit 65
-  }
-  sync_verify_commit "$store" "$commit" || {
-    printf 'roundhouse: incoming store commit is not signed by a host-local allowed signer; refusing apply\n' >&2
-    exit 65
-  }
+  # Stale-verdict protection and the signature gate live in sync_gate_item so
+  # apply and materialize can never drift apart.
+  sync_gate_item "$store" "$item" "$tmp/incoming" "$commit"
   case $item in
     allowlists/*)
       # Mechanical backstop for the allowlist review: an allowlist whose key
       # set widens into its own excluded namespaces is held even after a pass.
-      if jq -e '[(.keys // [])[] as $k | (.excluded_namespaces // [])[] as $ns |
-          select($k == $ns or ($k | startswith($ns + ".")))] | length > 0' \
+      if jq -e "$sync_allowed_paths_filter"'
+          [allowed_paths[] as $k | ((.excluded_namespaces // []) | map(split(".")))[] as $ns |
+            select($k[:($ns | length)] == $ns or $ns[:($k | length)] == $k)] | length > 0' \
         "$tmp/incoming" >/dev/null 2>&1; then
         sync_write_alert "$store" "$item" \
           'allowlist widens into excluded namespace' >/dev/null
@@ -7917,6 +8016,318 @@ sync_hold_command() (
   }
   alert_record=$(sync_write_alert "$(sync_store_path)" "$item" "$reason")
   cat "$alert_record"
+)
+
+sync_materialize_command() (
+  # Key-level config sync (KTD4). The allowlist's `allowed` array holds
+  # dot-separated jq key paths ("ui.theme"); a literal dot inside a key name is
+  # not expressible, which is the documented limit of the representation.
+  # Desired values come from the `settings` object of the matching
+  # desired/<scope>/config/<id>.json records, merged in scope precedence order.
+  config_id=$1
+  materialize_destination=$2
+  require_jq
+  require_sync_store
+  case $config_id in
+    '' | *[!A-Za-z0-9._-]*)
+      printf 'roundhouse: invalid sync config id: %s\n' "${config_id:-<empty>}" >&2
+      exit 64
+      ;;
+  esac
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  ref=$(sync_incoming_ref "$store")
+  commit=$(git -C "$store" rev-parse "$ref")
+  allowlist_item="allowlists/$config_id.json"
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-materialize.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  git -C "$store" show "$ref:$allowlist_item" >"$tmp/allowlist.json" 2>/dev/null || {
+    printf 'roundhouse: sync allowlist %s is not present at %s\n' "$allowlist_item" "$ref" >&2
+    exit 66
+  }
+  # Same fail-closed gate as sync-apply: materialize is not an independently
+  # callable unreviewed write path.
+  sync_gate_item "$store" "$allowlist_item" "$tmp/allowlist.json" "$commit"
+  # Exclusion precedence: an allowed key that intersects an excluded namespace
+  # in either direction refuses and alerts, even though the allowlist passed.
+  jq -e "$sync_allowed_paths_filter"'
+    ((.excluded_namespaces // []) | map(split("."))) as $excluded |
+    [allowed_paths[] as $key | $excluded[] as $namespace |
+      select($key[:($namespace | length)] == $namespace or
+        $namespace[:($key | length)] == $key)] | length == 0
+  ' "$tmp/allowlist.json" >/dev/null || {
+    sync_write_alert "$store" "$allowlist_item" \
+      'allowlisted key intersects an excluded namespace' >/dev/null
+    printf 'roundhouse: allowlist %s claims a key inside an excluded namespace; refusing\n' \
+      "$config_id" >&2
+    exit 65
+  }
+  printf '{}\n' >"$tmp/desired.json"
+  contributing=0
+  for scope in $(sync_scopes_for_host "$store" "$host_name"); do
+    scope_item="desired/$scope/config/$config_id.json"
+    git -C "$store" show "$ref:$scope_item" >"$tmp/scope.json" 2>/dev/null || continue
+    sync_gate_item "$store" "$scope_item" "$tmp/scope.json" "$commit"
+    jq -S -s '.[0] * (.[1].settings // {})' "$tmp/desired.json" "$tmp/scope.json" \
+      >"$tmp/desired.next"
+    mv "$tmp/desired.next" "$tmp/desired.json"
+    contributing=$((contributing + 1))
+  done
+  [ "$contributing" -gt 0 ] || {
+    printf 'roundhouse: no desired config records for %s in any scope matching %s\n' \
+      "$config_id" "$host_name" >&2
+    exit 66
+  }
+  if [ -f "$materialize_destination" ]; then
+    cp "$materialize_destination" "$tmp/current.json"
+  else
+    printf '{}\n' >"$tmp/current.json"
+  fi
+  jq -e 'type == "object"' "$tmp/current.json" >/dev/null || {
+    printf 'roundhouse: materialize destination is not a JSON object: %s\n' "$materialize_destination" >&2
+    exit 65
+  }
+  # Only the allowed paths are set; every other key (host-local namespaces
+  # included) survives untouched.
+  jq -S "$sync_allowed_paths_filter"'
+    ($desired[0]) as $wanted | ($allowlist[0] | allowed_paths) as $paths |
+    reduce $paths[] as $path (.;
+      if ($wanted | haspath($path)) then setpath($path; $wanted | getpath($path)) else . end)
+  ' --slurpfile desired "$tmp/desired.json" --slurpfile allowlist "$tmp/allowlist.json" \
+    "$tmp/current.json" >"$tmp/next.json"
+  # The recorded state carries ONLY the allowlisted keys: host-local and
+  # secret-bearing namespaces must never reach a store commit.
+  jq -S "$sync_allowed_paths_filter"'
+    . as $applied | ($allowlist[0] | allowed_paths) as $paths |
+    {schema:"roundhouse.sync-materialized",schema_version:1,config_id:$config_id,
+     host:$host,recorded_at:$at,
+     keys:(reduce $paths[] as $path ({};
+       if ($applied | haspath($path)) then setpath($path; $applied | getpath($path)) else . end))}
+  ' --slurpfile allowlist "$tmp/allowlist.json" --arg config_id "$config_id" \
+    --arg host "$host_name" --arg at "$(sync_now)" "$tmp/next.json" >"$tmp/applied.json"
+  safe_output "$tmp/next.json" "$materialize_destination"
+  sync_record_applied "$store" "$host_name" "config/$config_id.json" "$tmp/applied.json" \
+    "sync: materialized $config_id"
+  applied_count=$(jq '[.["keys"] | paths(scalars)] | length' "$tmp/applied.json")
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  printf 'roundhouse: materialized %s into %s (%s allowlisted leaf value(s))\n' \
+    "$config_id" "$materialize_destination" "$applied_count"
+)
+
+sync_propose_command() (
+  # Outward proposals are ALWAYS machine-scoped (narrowest-scope rule): the CLI
+  # takes no scope argument, so it cannot emit a group scope. Widening is an
+  # intent-resolution outcome recorded separately, never a proposal field.
+  item=$1
+  kind=$2
+  evidence_source=$3
+  require_jq
+  require_sync_store
+  sync_assert_item_path "$item"
+  case $kind in
+    add | remove | state-change | config-key) ;;
+    *)
+      printf 'roundhouse: sync proposal kind must be add, remove, state-change or config-key\n' >&2
+      exit 64
+      ;;
+  esac
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-propose.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  if [ "$evidence_source" = - ]; then
+    cat >"$tmp/evidence.json"
+  else
+    cat "$evidence_source" >"$tmp/evidence.json"
+  fi
+  jq -e . "$tmp/evidence.json" >/dev/null 2>&1 || {
+    printf 'roundhouse: sync proposal evidence must be JSON\n' >&2
+    exit 65
+  }
+  jq -S -n --arg item "$item" --arg kind "$kind" --arg host "$host_name" \
+    --slurpfile evidence "$tmp/evidence.json" --arg created "$(sync_now)" '{
+      schema:"roundhouse.sync-proposal",schema_version:1,item:$item,kind:$kind,
+      host:$host,scope:{machine:$host},evidence:$evidence[0],created_at:$created
+    }' >"$tmp/proposal.json"
+  sync_validate_record "$tmp/proposal.json" roundhouse.sync-proposal
+  propose_branch=$(git -C "$store" symbolic-ref --short HEAD 2>/dev/null || printf 'main')
+  [ "$propose_branch" = main ] || git -C "$store" checkout -q main
+  mkdir -p "$store/proposals/$host_name"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  record="proposals/$host_name/$stamp.json"
+  suffix=1
+  while [ -e "$store/$record" ]; do
+    suffix=$((suffix + 1))
+    record="proposals/$host_name/$stamp-$suffix.json"
+  done
+  safe_output "$tmp/proposal.json" "$store/$record"
+  git -C "$store" add -f "$record"
+  sync_store_commit "$store" "sync: proposal $stamp ($host_name)"
+  [ "$propose_branch" = main ] || git -C "$store" checkout -q "$propose_branch"
+  cat "$tmp/proposal.json"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_effective_command() (
+  # Resolve the effective desired set for a host: union of matching scopes,
+  # machine > group > os > all. `exclude` is meaningful only at machine scope,
+  # so presence across overlapping groups is install-wins by construction; a
+  # tie inside the group tier resolves enable-wins, first scope by name.
+  effective_host=$1
+  output=$2
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  ref=$(sync_incoming_ref "$store")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-effective.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  : >"$tmp/records.jsonl"
+  for scope in $(sync_scopes_for_host "$store" "$effective_host"); do
+    case $scope in
+      all) tier=0 ;;
+      os-*) tier=1 ;;
+      group-*) tier=2 ;;
+      *) tier=3 ;;
+    esac
+    for record_path in $(git -C "$store" ls-tree -r --name-only "$ref" -- "desired/$scope/" 2>/dev/null); do
+      case $record_path in *.json) ;; *) continue ;; esac
+      git -C "$store" show "$ref:$record_path" >"$tmp/record.json" 2>/dev/null || continue
+      jq -c --arg scope "$scope" --argjson tier "$tier" \
+        --arg item "${record_path#"desired/$scope/"}" '{
+          scope:$scope,tier:$tier,item:($item | sub("\\.json$";"")),
+          enabled:(.enabled // false),exclude:(.exclude // false)
+        }' "$tmp/record.json" >>"$tmp/records.jsonl"
+    done
+  done
+  jq -S -n --arg host "$effective_host" --slurpfile records "$tmp/records.jsonl" '{
+    schema:"roundhouse.sync-effective",schema_version:1,host:$host,
+    items:($records | group_by(.item) | map(
+      (map(.tier) | max) as $top | map(select(.tier == $top)) as $winners |
+      (if $top == 3 then $winners[0]
+       else ((($winners | map(select(.enabled))) as $enabled |
+         if ($enabled | length) > 0 then ($enabled | sort_by(.scope))[0]
+         else ($winners | sort_by(.scope))[0] end))
+       end) as $decider |
+      {item:$decider.item,
+       present:(if $decider.tier == 3 then ($decider.exclude | not) else true end),
+       enabled:(if $decider.tier == 3 then ($decider.enabled and ($decider.exclude | not))
+         else $decider.enabled end),
+       deciding_scope:$decider.scope}) | sort_by(.item))
+  }' >"$tmp/effective.json"
+  safe_output "$tmp/effective.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_pending_command() (
+  # Fleet-wide pending items for any interactive session: alerts committed on
+  # main by ANY host, so both the local main and the fetched origin/main.
+  output=$1
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-pending.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  mkdir "$tmp/alerts"
+  pending_refs=main
+  ! git -C "$store" show-ref --verify --quiet refs/remotes/origin/main ||
+    pending_refs='main origin/main'
+  for pending_ref in $pending_refs; do
+    for alert_path in $(git -C "$store" ls-tree -r --name-only "$pending_ref" -- alerts/ 2>/dev/null); do
+      alert_name=$(basename "$alert_path")
+      [ ! -f "$tmp/alerts/$alert_name" ] || continue
+      git -C "$store" show "$pending_ref:$alert_path" >"$tmp/alerts/$alert_name" 2>/dev/null ||
+        rm -f "$tmp/alerts/$alert_name"
+    done
+  done
+  find "$tmp/alerts" -name '*.json' -exec cat {} + 2>/dev/null |
+    jq -S -s '{schema:"roundhouse.sync-pending",schema_version:1,
+      alerts:(sort_by(.created_at // "", .item // ""))}' >"$tmp/pending.json"
+  safe_output "$tmp/pending.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_quote_is_secret() {
+  # Mechanical backstop to agent-side redaction (spec open item 6), not the
+  # primary control: named secret classes plus one bounded high-entropy check.
+  quote_text=$1
+  case $quote_text in *'-----BEGIN'*) return 0 ;; esac
+  if printf '%s' "$quote_text" |
+    grep -qE 'eyJ[A-Za-z0-9_=-]*\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*'; then
+    return 0
+  fi
+  if printf '%s' "$quote_text" |
+    grep -qE '(^|[^A-Za-z0-9_-])(ghp_|gho_|ghu_|ghs_|github_pat_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_-]{8,}'; then
+    return 0
+  fi
+  if printf '%s' "$quote_text" | grep -qE '(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9]{16,}'; then
+    return 0
+  fi
+  if printf '%s' "$quote_text" | grep -qE '(^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}'; then
+    return 0
+  fi
+  # Bounded entropy heuristic: one token of 32+ base64/base64url characters
+  # mixing lower, upper and digits.
+  printf '%s' "$quote_text" | grep -oE '[A-Za-z0-9+/=_-]{32,}' |
+    awk '/[a-z]/ && /[A-Z]/ && /[0-9]/ {found = 1} END {exit(found ? 0 : 1)}'
+}
+
+sync_finding_command() (
+  # Redacted transcript findings are the ONLY mining output that replicates
+  # (R7): the opaque source_session id validates the input but is deliberately
+  # not persisted into the store.
+  finding_source=$1
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-finding.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  if [ "$finding_source" = - ]; then
+    cat >"$tmp/input.json"
+  else
+    cat "$finding_source" >"$tmp/input.json"
+  fi
+  jq -e 'type == "object" and ([.item,.verdict_hint,.quote,.source_session] |
+    all(type == "string" and length > 0))' "$tmp/input.json" >/dev/null 2>&1 || {
+    printf 'roundhouse: sync finding requires item, verdict_hint, quote and source_session strings\n' >&2
+    exit 65
+  }
+  quote=$(jq -r '.quote' "$tmp/input.json")
+  quote_bytes=$(printf '%s' "$quote" | wc -c | tr -d ' ')
+  [ "$quote_bytes" -le 400 ] || {
+    printf 'roundhouse: sync finding quote is %s bytes (cap 400); refusing\n' "$quote_bytes" >&2
+    exit 65
+  }
+  if sync_quote_is_secret "$quote"; then
+    printf 'roundhouse: sync finding quote matches a secret class; refusing\n' >&2
+    exit 65
+  fi
+  jq -S --arg host "$host_name" --arg at "$(sync_now)" '{
+    schema:"roundhouse.sync-finding",schema_version:1,host:$host,item:.item,
+    verdict_hint:.verdict_hint,quote:.quote,recorded_at:$at
+  }' "$tmp/input.json" >"$tmp/finding.json"
+  sync_validate_record "$tmp/finding.json" roundhouse.sync-finding
+  finding_branch=$(git -C "$store" symbolic-ref --short HEAD 2>/dev/null || printf 'main')
+  [ "$finding_branch" = main ] || git -C "$store" checkout -q main
+  mkdir -p "$store/findings/$host_name"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  record="findings/$host_name/$stamp.json"
+  suffix=1
+  while [ -e "$store/$record" ]; do
+    suffix=$((suffix + 1))
+    record="findings/$host_name/$stamp-$suffix.json"
+  done
+  safe_output "$tmp/finding.json" "$store/$record"
+  git -C "$store" add -f "$record"
+  sync_store_commit "$store" "sync: finding $stamp ($host_name)"
+  [ "$finding_branch" = main ] || git -C "$store" checkout -q "$finding_branch"
+  cat "$tmp/finding.json"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
 )
 
 command=${1:-}
@@ -7997,5 +8408,13 @@ case $command in
   sync-verdict) [ $# -eq 3 ] || usage; sync_verdict_command "$1" "$2" "$3" ;;
   sync-apply) [ $# -eq 2 ] || usage; sync_apply_command "$1" "$2" ;;
   sync-hold) [ $# -eq 2 ] || usage; sync_hold_command "$1" "$2" ;;
+  sync-materialize) [ $# -eq 2 ] || usage; sync_materialize_command "$1" "$2" ;;
+  sync-propose) [ $# -eq 3 ] || usage; sync_propose_command "$1" "$2" "$3" ;;
+  sync-effective)
+    { [ $# -ge 1 ] && [ $# -le 2 ]; } || usage
+    sync_effective_command "$1" "${2:--}"
+    ;;
+  sync-pending) [ $# -le 1 ] || usage; sync_pending_command "${1:--}" ;;
+  sync-finding) [ $# -eq 1 ] || usage; sync_finding_command "$1" ;;
   *) usage ;;
 esac

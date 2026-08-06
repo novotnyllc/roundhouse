@@ -8441,6 +8441,13 @@ printf 'foreign\n' >"$sync_u4/foreign-seed/marker.txt"
 sync_write_config "$sync_u4/foreign-config.json" foreign-host "$sync_u4/foreign-remote.git"
 sync_run "$sync_u4/foreign-store" "$sync_u4/foreign-config.json" "$cli" sync-init >/dev/null ||
   fail "sync-init for the foreign-history fixture failed"
+# sync-init adopts whatever main the remote already had, so the takeover path
+# needs a foreign commit landing after this host initialized.
+printf 'foreign-two\n' >"$sync_u4/foreign-seed/marker.txt"
+"$REAL_GIT" -C "$sync_u4/foreign-seed" add marker.txt
+"$REAL_GIT" -C "$sync_u4/foreign-seed" -c commit.gpgsign=false \
+  -c user.email=foreign@example.invalid -c user.name=foreign commit -q -m 'foreign history two'
+"$REAL_GIT" -C "$sync_u4/foreign-seed" push -q "$sync_u4/foreign-remote.git" main
 sync_run "$sync_u4/foreign-store" "$sync_u4/foreign-config.json" \
   ROUNDHOUSE_SYNC_VISIBILITY_PROBE='exit 1' "$cli" sync-verify-remote >/dev/null ||
   fail "sync-verify-remote failed for the foreign-history fixture"
@@ -8640,5 +8647,250 @@ case $sync_sig_verify_log in
   *"allowedSignersFile=$sync_sig_store"*)
     fail "the verdict signature gate consulted a store-carried signer file" ;;
 esac
+
+# --- fleet-sync fixtures (U6-U7) ---
+
+sync_u6="$sync_root/u6"
+mkdir -p "$sync_u6"
+
+sync_mat_store="$sync_u6/mat-store"
+sync_mat_config="$sync_u6/mat-config.json"
+jq -n --arg url "$sync_u6/mat-remote.git" '{version:1,
+  machines:{
+    "mat-host":{platform:"macos",transport:"local",groups:["development","canary"]},
+    "mat-peer":{platform:"linux",transport:"ssh",ssh_alias:"mat-peer-alias",
+      groups:["development"]}},
+  sync:{enabled:true,remote:{url:$url},cadence_hours:24}}' >"$sync_mat_config"
+sync_run "$sync_mat_store" "$sync_mat_config" "$cli" sync-init >/dev/null ||
+  fail "sync-init for the materialize fixture failed"
+sync_run "$sync_mat_store" "$sync_mat_config" "$cli" sync-absorb-registry >/dev/null ||
+  fail "sync-absorb-registry for the materialize fixture failed"
+
+sync_store_seed "$sync_mat_store" allowlists/agent-settings.json \
+  '{"schema":"roundhouse.sync-allowlist","schema_version":1,"target":"~/.claude/settings.json","allowed":["ui.theme","fleet.channel"],"excluded_namespaces":["secrets","mcpServers"]}' \
+  'seed agent-settings allowlist'
+sync_store_seed "$sync_mat_store" desired/all/config/agent-settings.json \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"config","id":"agent-settings","enabled":true,"settings":{"ui":{"theme":"dark","fontSize":99},"fleet":{"channel":"stable"}}}' \
+  'seed fleet-wide agent-settings values'
+sync_store_seed "$sync_mat_store" desired/group-development/config/agent-settings.json \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"config","id":"agent-settings","enabled":true,"settings":{"fleet":{"channel":"beta"}}}' \
+  'seed group agent-settings override'
+for sync_mat_item in allowlists/agent-settings.json desired/all/config/agent-settings.json \
+  desired/group-development/config/agent-settings.json; do
+  sync_run "$sync_mat_store" "$sync_mat_config" ROUNDHOUSE_SYNC_SKIP_SIGVERIFY=1 \
+    "$cli" sync-verdict "$sync_mat_item" pass 'reviewed for the fixture' >/dev/null ||
+    fail "recording the materialize verdict for $sync_mat_item failed"
+done
+
+sync_mat_target="$sync_u6/settings.json"
+cat >"$sync_mat_target" <<'JSON'
+{"ui":{"theme":"light","fontSize":13},"fleet":{"channel":"latest"},
+ "hostLocalOnly":{"deep":{"a":1,"b":[2,3]}},
+ "secrets":{"apiKey":"fixture-host-local-secret-value"}}
+JSON
+jq -S 'del(.ui.theme, .fleet.channel)' "$sync_mat_target" >"$sync_u6/preserved-before.json"
+sync_run "$sync_mat_store" "$sync_mat_config" "$cli" sync-materialize agent-settings \
+  "$sync_mat_target" >/dev/null || fail "sync-materialize failed"
+jq -e '.ui.theme == "dark"' "$sync_mat_target" >/dev/null ||
+  fail "sync-materialize did not apply the allowlisted key"
+jq -e '.fleet.channel == "beta"' "$sync_mat_target" >/dev/null ||
+  fail "sync-materialize did not resolve group precedence over the fleet-wide value"
+jq -S 'del(.ui.theme, .fleet.channel)' "$sync_mat_target" >"$sync_u6/preserved-after.json"
+cmp -s "$sync_u6/preserved-before.json" "$sync_u6/preserved-after.json" ||
+  fail "sync-materialize changed a non-allowlisted sibling or host-local namespace"
+[ "$(test_file_mode "$sync_mat_target")" = 600 ] ||
+  fail "materialized config is not mode 600"
+"$REAL_GIT" -C "$sync_mat_store" show \
+  'refs/heads/host/mat-host:materialized/config/agent-settings.json' |
+  jq -e '.schema == "roundhouse.sync-materialized" and
+    (.keys | keys) == ["fleet","ui"] and .keys.ui.theme == "dark" and
+    (.keys | has("secrets") | not) and (.keys | has("hostLocalOnly") | not)' >/dev/null ||
+  fail "the recorded materialized key-state is missing or carries non-allowlisted keys"
+if "$REAL_GIT" -C "$sync_mat_store" log --all -p |
+  grep -q 'fixture-host-local-secret-value'; then
+  fail "a host-local secret namespace reached the store history"
+fi
+
+sync_mat_noverdict_status=0
+sync_store_seed "$sync_mat_store" allowlists/unreviewed.json \
+  '{"schema":"roundhouse.sync-allowlist","schema_version":1,"allowed":["ui.theme"],"excluded_namespaces":[]}' \
+  'seed unreviewed allowlist'
+sync_run "$sync_mat_store" "$sync_mat_config" "$cli" sync-materialize unreviewed \
+  "$sync_u6/never-materialized.json" >/dev/null 2>&1 || sync_mat_noverdict_status=$?
+[ "$sync_mat_noverdict_status" -eq 65 ] ||
+  fail "sync-materialize without a verdict did not exit 65 (got $sync_mat_noverdict_status)"
+[ ! -e "$sync_u6/never-materialized.json" ] ||
+  fail "sync-materialize refused without a verdict but still wrote the destination"
+
+# Exclusion precedence: an allowlisted key inside an excluded namespace refuses
+# even with a recorded pass verdict, and records an alert.
+sync_store_seed "$sync_mat_store" allowlists/excluded.json \
+  '{"schema":"roundhouse.sync-allowlist","schema_version":1,"allowed":["secrets.token"],"excluded_namespaces":["secrets"]}' \
+  'seed allowlist claiming an excluded namespace'
+sync_store_seed "$sync_mat_store" desired/all/config/excluded.json \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"config","id":"excluded","enabled":true,"settings":{"secrets":{"token":"fixture-token"}}}' \
+  'seed excluded desired values'
+sync_run "$sync_mat_store" "$sync_mat_config" ROUNDHOUSE_SYNC_SKIP_SIGVERIFY=1 \
+  "$cli" sync-verdict allowlists/excluded.json pass 'reviewer missed the exclusion' >/dev/null ||
+  fail "recording the exclusion-precedence verdict failed"
+sync_mat_excluded_status=0
+sync_run "$sync_mat_store" "$sync_mat_config" "$cli" sync-materialize excluded \
+  "$sync_u6/never-excluded.json" >/dev/null 2>&1 || sync_mat_excluded_status=$?
+[ "$sync_mat_excluded_status" -eq 65 ] ||
+  fail "an allowlisted key inside an excluded namespace was materialized (got $sync_mat_excluded_status)"
+[ ! -e "$sync_u6/never-excluded.json" ] ||
+  fail "the exclusion-precedence refusal still wrote the destination"
+assert_contains "$(cat "$sync_mat_store"/alerts/*.json | jq -r '.reason')" \
+  'allowlisted key intersects an excluded namespace'
+
+# Same signature gate as apply: a verdict recorded before signing was required
+# does not survive a store whose head no longer verifies.
+jq '.signing_enabled = true' "$sync_mat_store/meta/host.json" >"$sync_u6/mat-meta.json"
+cp "$sync_u6/mat-meta.json" "$sync_mat_store/meta/host.json"
+sync_mat_sig_status=0
+sync_run "$sync_mat_store" "$sync_mat_config" "PATH=$sync_root/siggit-bin:$PATH" \
+  GIT_VERIFY_LOG="$sync_u6/mat-verify-log" "$cli" sync-materialize agent-settings \
+  "$sync_u6/never-signed.json" >/dev/null 2>&1 || sync_mat_sig_status=$?
+[ "$sync_mat_sig_status" -eq 65 ] ||
+  fail "sync-materialize from unverifiable store state did not exit 65 (got $sync_mat_sig_status)"
+[ ! -e "$sync_u6/never-signed.json" ] ||
+  fail "the materialize signature gate still wrote the destination"
+assert_contains "$(cat "$sync_u6/mat-verify-log")" \
+  "gpg.ssh.allowedSignersFile=$sync_root/xdg/roundhouse/allowed_signers"
+jq '.signing_enabled = false' "$sync_u6/mat-meta.json" >"$sync_mat_store/meta/host.json"
+
+# Proposals are always machine-scoped; the CLI has no scope argument at all.
+jq -n '{observed:"channel drift",count:2}' >"$sync_u6/evidence.json"
+sync_proposal=$(sync_run "$sync_mat_store" "$sync_mat_config" "$cli" sync-propose \
+  desired/all/config/agent-settings.json config-key "$sync_u6/evidence.json") ||
+  fail "sync-propose failed"
+printf '%s\n' "$sync_proposal" | jq -e '
+  .schema == "roundhouse.sync-proposal" and .kind == "config-key" and
+  .host == "mat-host" and (.scope | keys) == ["machine"] and
+  .scope.machine == "mat-host" and .evidence.count == 2' >/dev/null ||
+  fail "sync-propose did not record a machine-scoped proposal"
+"$REAL_GIT" -C "$sync_mat_store" ls-tree -r --name-only refs/heads/main -- proposals/ |
+  grep -q '^proposals/mat-host/' ||
+  fail "sync-propose did not commit the proposal on main under the host directory"
+sync_propose_scope_status=0
+sync_run "$sync_mat_store" "$sync_mat_config" "$cli" sync-propose \
+  desired/all/config/agent-settings.json config-key "$sync_u6/evidence.json" \
+  group-development >/dev/null 2>&1 || sync_propose_scope_status=$?
+[ "$sync_propose_scope_status" -eq 64 ] ||
+  fail "sync-propose accepted a scope argument (group scope must be unreachable)"
+sync_propose_kind_status=0
+sync_run "$sync_mat_store" "$sync_mat_config" "$cli" sync-propose \
+  desired/all/config/agent-settings.json widen "$sync_u6/evidence.json" >/dev/null 2>&1 ||
+  sync_propose_kind_status=$?
+[ "$sync_propose_kind_status" -eq 64 ] ||
+  fail "sync-propose accepted an unknown proposal kind"
+
+# Effective desired set: machine > group for state and presence, install-wins
+# across overlapping groups.
+sync_store_seed "$sync_mat_store" desired/group-development/plugins/alpha.json \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"plugins","id":"alpha","enabled":true}' \
+  'seed group-enabled alpha'
+sync_store_seed "$sync_mat_store" desired/machine-mat-host/plugins/alpha.json \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"plugins","id":"alpha","enabled":false}' \
+  'seed machine-disabled alpha'
+sync_store_seed "$sync_mat_store" desired/group-canary/plugins/beta.json \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"plugins","id":"beta","enabled":true}' \
+  'seed canary beta'
+sync_store_seed "$sync_mat_store" desired/group-development/plugins/beta.json \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"plugins","id":"beta","enabled":false,"exclude":true}' \
+  'seed development beta exclusion attempt'
+sync_store_seed "$sync_mat_store" desired/all/plugins/gamma.json \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"plugins","id":"gamma","enabled":true}' \
+  'seed fleet-wide gamma'
+sync_store_seed "$sync_mat_store" desired/machine-mat-host/plugins/gamma.json \
+  '{"schema":"roundhouse.sync-desired","schema_version":1,"item_type":"plugins","id":"gamma","enabled":true,"exclude":true}' \
+  'seed machine exclusion of gamma'
+sync_effective=$(sync_run "$sync_mat_store" "$sync_mat_config" \
+  "$cli" sync-effective mat-host -) || fail "sync-effective failed"
+printf '%s\n' "$sync_effective" | jq -e '.schema == "roundhouse.sync-effective" and
+  .host == "mat-host"' >/dev/null || fail "sync-effective record shape is wrong"
+printf '%s\n' "$sync_effective" | jq -e '
+  (.items[] | select(.item == "plugins/alpha")) as $alpha |
+  $alpha.enabled == false and $alpha.present == true and
+  $alpha.deciding_scope == "machine-mat-host"' >/dev/null ||
+  fail "machine scope did not win over the group scope for enabled state"
+printf '%s\n' "$sync_effective" | jq -e '
+  (.items[] | select(.item == "plugins/beta")) as $beta |
+  $beta.present == true and $beta.enabled == true and
+  $beta.deciding_scope == "group-canary"' >/dev/null ||
+  fail "presence across overlapping groups is not install-wins"
+printf '%s\n' "$sync_effective" | jq -e '
+  (.items[] | select(.item == "plugins/gamma")) as $gamma |
+  $gamma.present == false and $gamma.enabled == false and
+  $gamma.deciding_scope == "machine-mat-host"' >/dev/null ||
+  fail "a machine-scope exclusion did not remove a fleet-wide item"
+
+# Findings: the byte cap and every named secret class refuse; a redacted
+# finding lands on main.
+sync_finding_ok=$(jq -n '{item:"desired/all/plugins/alpha.json",verdict_hint:"hold",
+  quote:"the plugin body adds a postinstall hook",source_session:"opaque-session-1"}' |
+  sync_run "$sync_mat_store" "$sync_mat_config" "$cli" sync-finding -) ||
+  fail "a redacted finding was refused"
+printf '%s\n' "$sync_finding_ok" | jq -e '.schema == "roundhouse.sync-finding" and
+  .host == "mat-host" and .verdict_hint == "hold" and
+  (.quote | test("postinstall")) and (has("source_session") | not)' >/dev/null ||
+  fail "the finding record shape is wrong (or persisted the opaque session id)"
+"$REAL_GIT" -C "$sync_mat_store" ls-tree -r --name-only refs/heads/main -- findings/ |
+  grep -q '^findings/mat-host/' ||
+  fail "sync-finding did not commit the record on main under the host directory"
+
+sync_long_quote=$(printf '%0401d' 0)
+for sync_bad_quote in "$sync_long_quote" \
+  '-----BEGIN OPENSSH PRIVATE KEY----- body' \
+  'leaked ghp_A1b2C3d4E5f6G7h8i9J0 in the diff' \
+  'header eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2ln here' \
+  'blob aB3dEfGhIjKlMnOpQrStUvWxYz012345 trailing'; do
+  sync_finding_refusal=0
+  jq -n --arg quote "$sync_bad_quote" '{item:"desired/all/plugins/alpha.json",
+    verdict_hint:"hold",quote:$quote,source_session:"opaque-session-2"}' |
+    sync_run "$sync_mat_store" "$sync_mat_config" "$cli" sync-finding - >/dev/null 2>&1 ||
+    sync_finding_refusal=$?
+  [ "$sync_finding_refusal" -eq 65 ] ||
+    fail "sync-finding accepted a capped or secret-bearing quote (got $sync_finding_refusal)"
+done
+[ "$("$REAL_GIT" -C "$sync_mat_store" ls-tree -r --name-only refs/heads/main -- findings/ |
+  wc -l | tr -d ' ')" = 1 ] ||
+  fail "a refused finding still landed in the store"
+
+# sync-init adopts an existing origin history, and sync-pending lists alerts
+# written by any host on main.
+"$REAL_GIT" init -q --bare -b main "$sync_u6/shared-remote.git"
+sync_write_config "$sync_u6/pend-a-config.json" pend-a "$sync_u6/shared-remote.git"
+sync_write_config "$sync_u6/pend-b-config.json" pend-b "$sync_u6/shared-remote.git"
+sync_run "$sync_u6/pend-a-store" "$sync_u6/pend-a-config.json" "$cli" sync-init >/dev/null ||
+  fail "sync-init for the pending fixture host A failed"
+sync_run "$sync_u6/pend-a-store" "$sync_u6/pend-a-config.json" \
+  "$cli" sync-hold desired/all/plugins/from-a.json 'host A flagged this item' >/dev/null ||
+  fail "sync-hold on host A failed"
+"$REAL_GIT" -C "$sync_u6/pend-a-store" push -q origin main ||
+  fail "host A could not publish its alert"
+
+sync_run "$sync_u6/pend-b-store" "$sync_u6/pend-b-config.json" "$cli" sync-init >/dev/null ||
+  fail "sync-init against a populated remote failed"
+[ "$("$REAL_GIT" -C "$sync_u6/pend-b-store" rev-parse main)" = \
+  "$("$REAL_GIT" -C "$sync_u6/shared-remote.git" rev-parse main)" ] ||
+  fail "sync-init created an unrelated root instead of adopting the remote history"
+"$REAL_GIT" -C "$sync_u6/pend-b-store" show-ref --verify --quiet refs/heads/host/pend-b ||
+  fail "an adopting sync-init did not create the host branch"
+sync_run "$sync_u6/pend-b-store" "$sync_u6/pend-b-config.json" \
+  "$cli" sync-hold desired/all/plugins/from-b.json 'host B flagged this item' >/dev/null ||
+  fail "sync-hold on host B failed"
+"$REAL_GIT" -C "$sync_u6/pend-b-store" push -q origin main ||
+  fail "the adopting host could not fast-forward its first push"
+
+"$REAL_GIT" -C "$sync_u6/pend-a-store" fetch -q origin ||
+  fail "host A could not fetch the shared remote"
+sync_pending=$(sync_run "$sync_u6/pend-a-store" "$sync_u6/pend-a-config.json" \
+  "$cli" sync-pending -) || fail "sync-pending failed"
+printf '%s\n' "$sync_pending" | jq -e '.schema == "roundhouse.sync-pending" and
+  ([.alerts[].host] | sort) == ["pend-a","pend-b"] and
+  ([.alerts[].item] | sort) ==
+    ["desired/all/plugins/from-a.json","desired/all/plugins/from-b.json"]' >/dev/null ||
+  fail "sync-pending did not list alerts from every host on main"
 
 printf 'PASS: roundhouse self-check\n'
