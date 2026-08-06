@@ -295,8 +295,8 @@ something.
 The top-level `sync` block turns on [fleet-wide desired-state
 sync](skills/fleet-agents.md#desired-state-sync). It's optional — omit it
 entirely and nothing about sync activates — but when present it is an
-**exact-key-set** block: only `cadence_hours`, `canary_group`, `enabled`,
-`remote`, and `store_path` are allowed.
+**exact-key-set** block: only `cadence_hours`, `canary_group`,
+`canary_wait_hours`, `enabled`, `remote`, and `store_path` are allowed.
 
 | Key | Required when `sync` present | Shape |
 | --- | --- | --- |
@@ -305,7 +305,8 @@ entirely and nothing about sync activates — but when present it is an
 | `remote.url` | yes | passes the [sync URL predicate](#the-sync-url-predicate) |
 | `cadence_hours` | yes | number, `0 < n ≤ 8760` (one year) |
 | `store_path` | no | non-empty string |
-| `canary_group` | no | id-pattern string |
+| `canary_group` | no | id-pattern string — registry group whose members are canary hosts for this fleet |
+| `canary_wait_hours` | no | integer, `0 ≤ n ≤ 8760`; default `24` — how long a canary's healthy run must have stood before non-canary hosts adopt |
 
 `enabled`, `remote`, and `cadence_hours` are unconditionally required the
 moment the `sync` object exists at all — there's no "present but off"

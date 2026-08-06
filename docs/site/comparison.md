@@ -36,7 +36,9 @@ server configuration. And the thing evaluating a proposed change isn't a
 declarative module applying a diff blindly; it's apply-time review with
 judgment in the loop, screening for deletion behavior, credential access,
 and content that argues for its own approval, on the machine where the
-change is about to run. If your fleet is Linux servers running application
+change is about to run.
+
+If your fleet is Linux servers running application
 workloads, Ansible's model — and its ecosystem — is the right tool. If your
 fleet is the machines *you* sit at, running agent tooling that executes as
 you, the review-gated, harness-native model is built for that instead.

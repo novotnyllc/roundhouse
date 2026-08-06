@@ -82,8 +82,8 @@ parity, it verifies every configured node — not a sample.
 
 ## Boundaries
 
-- Never renames the task it's given. When something upstream (like a
-  task-orchestrator) invokes this skill, it keeps the parent-assigned
+- Never renames the task it's given. When something upstream (like
+  `orchestrate`) invokes this skill, it keeps the parent-assigned
   title in its report.
 - Never mutates anything itself — every fix runs through the owning
   routed skill, with that skill's own approval and verification.

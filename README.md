@@ -50,6 +50,5 @@ doesn't move a train the shop hasn't cleared:
 
 Work routing and delivery live in
 [`railyard`](https://github.com/novotnyllc/railyard); craft skills in
-[`agent-utilities`](https://github.com/novotnyllc/agent-utilities). Charter,
-boundaries, and the legacy executor-namespace notes:
-[AGENTS.md](AGENTS.md).
+[`agent-utilities`](https://github.com/novotnyllc/agent-utilities). Charter
+and boundaries: [AGENTS.md](AGENTS.md).

@@ -40,7 +40,9 @@ nothing runs until `config.json` carries a `sync` block with
 scaffolds the store — a jj repository colocated with git under
 `${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/store/`, git-only where jj is
 not solid — and records the remote-visibility verification the first push
-requires. Personal sync engines the user runs are detected *upstreams* and
+requires. A host that enrolls or rotates its CA identity after `sync-init`
+runs `"$CLI" sync-refresh-signers`; re-init also heals signing config.
+Personal sync engines the user runs are detected *upstreams* and
 co-owners, never infrastructure this system depends on.
 
 ### The scheduled run

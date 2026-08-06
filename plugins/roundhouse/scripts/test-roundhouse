@@ -165,6 +165,8 @@ assert_contains "$fleet_agents_text" '## Desired-state sync'
 assert_contains "$fleet_agents_text" 'opt-in at every layer'
 assert_contains "$fleet_agents_text" 'user consents to `"$CLI" sync-init`'
 assert_contains "$fleet_agents_text" 'a jj repository colocated with git under'
+assert_contains "$fleet_agents_text" 'enrolls or rotates its CA identity after `sync-init`
+runs `"$CLI" sync-refresh-signers`; re-init also heals signing config'
 case $fleet_agents_text in
   *'specified, not yet implemented'*)
     fail "fleet-agents still carries the pre-implementation sync section"

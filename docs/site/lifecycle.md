@@ -142,12 +142,19 @@ The leaseholder runs the upstream's own update mechanism and commits the
 result plus a fresh timestamp. File-carried surfaces (skills, agents,
 hooks, config keys) get their updated content committed straight to the
 store — every *other* host just replicates it, no upstream contact needed.
+
 Manager-installed items (plugins) work differently: the store carries the
 version *pin*, and each host installs that pin locally through its own
 plugin manager. Roundhouse's own plugin updates last, and only on the
 leaseholding host — its new pin doesn't reach the rest of the fleet until
 that host's next run journals healthy. A bad release of the sync machinery
 lands on one host, not four.
+
+Codex adds one wrinkle to that pin story. It never runs `git fetch`
+against a local-checkout marketplace on its own — keeping that checkout
+current is sync's job. Once the checkout is current, though, Codex quietly
+advances its own installed plugin versions on the next plugin listing;
+sync doesn't need to force a reinstall for that part.
 
 **Phase 2 — apply-time review, on every host, every source.** This is the
 phase that matters most. Before anything changed gets materialized or
@@ -166,6 +173,14 @@ Nothing is ever silently applied and nothing is ever silently forgotten: a
 held item is a durable record, and `railyard:doctor` tracks it until
 someone resolves it.
 
+**Canary gating adds a second brake beyond review.** When
+`sync.canary_group` is set, only members of that group adopt a changed
+item right away; every other host waits for a canary's journal to record
+a healthy run carrying that item at the exact same content digest, held
+for `sync.canary_wait_hours` (24 by default). There's no per-host bypass —
+widening who counts as canary is a registry change, visible to the whole
+fleet.
+
 **Phase 3 — converge and propose.** Each host aligns to its effective
 desired set: union of the groups and scopes that apply to it, with
 machine-level settings beating group-level ones whenever they conflict.
@@ -173,7 +188,16 @@ Removals propagate by default — absent from desired state means removed,
 and every removal is reported by name, never silently. The host's full
 snapshot commits to its own `host/<name>` branch (single-writer, enforced
 by commit signatures, so `iris`'s branch can never be written by anything
-but `iris`). If a host makes a genuine local decision — you installed
+but `iris`).
+
+Those signatures check against each host's own
+`allowed_signers` file, derived from its CA enrollment material and
+regenerated with `roundhouse sync-refresh-signers` whenever that identity
+changes; a revocation lands in the KRL that every verification reads
+fresh, so a compromised key stops verifying immediately, no re-sync
+required.
+
+If a host makes a genuine local decision — you installed
 something by hand on `birch` — that becomes an outward proposal at the
 *narrowest* scope: just `birch`, never auto-widened to "all Macs" without
 separate cross-host evidence.

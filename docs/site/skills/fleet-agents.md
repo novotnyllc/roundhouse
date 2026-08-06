@@ -83,6 +83,19 @@ first push requires. A personal sync tool you already run (dotfiles
 managers and the like) is treated as an *upstream* and co-owner, never as
 infrastructure this depends on.
 
+**Commits are signed and verified against a fleet CA.** A host with a
+CA-issued certificate signs its own store commits. Every other host
+verifies that signature against its own host-local `allowed_signers`
+file, derived from CA enrollment material and never read from store
+content. A host that enrolls or rotates its CA identity after `sync-init`
+runs `roundhouse sync-refresh-signers` to regenerate that file;
+re-running `sync-init` heals the same signing config for a host that
+enrolled after the store already existed.
+
+Revocation runs through a KRL passed fresh to every verification call,
+never read from stored config. A revoked key stops verifying the moment
+the KRL says so — no re-sync needed for that to take effect.
+
 **The three-phase run.** One run-lock, one journal, driven in order:
 
 1. **Fetch and open the run** — `roundhouse sync-fetch` (falls back to
@@ -98,7 +111,10 @@ infrastructure this depends on.
    ITEM`, read the diff yourself, record `roundhouse sync-verdict ITEM
    pass|hold REASON`, and only then `roundhouse sync-apply ITEM
    DESTINATION`. A verdict is bound to the content digest it reviewed;
-   apply refuses anything newer. Never batch one verdict across items, and
+   apply refuses anything newer. `roundhouse sync-canary-check ITEM`
+   reports this host's canary blast-radius verdict ahead of the write —
+   apply and materialize both enforce it either way, so a hold here is a
+   wait, not a failure. Never batch one verdict across items, and
    never pass a diff you didn't read.
 3. **Converge and close** — `roundhouse sync-materialize CONFIG-ID FILE`
    for allowlisted config keys, `roundhouse sync-propose ITEM KIND
@@ -142,6 +158,17 @@ session on any host also surfaces fleet-wide pending items: run
 `roundhouse sync-pending` and report held updates, conflicts, and stale
 hosts from *every* host, not just the local one.
 
+**Canary gating holds non-canary hosts back.** No non-canary host adopts a
+changed item until a canary host has lived with it: canary membership is
+`sync.canary_group` matched against a host's registry groups, and the wait
+is `sync.canary_wait_hours` (default 24). A canary host — or any host when
+no `canary_group` is configured — adopts immediately. Every other host
+waits for a canary's journal to record a *healthy* run whose applied set
+carries that exact item at the *same content digest*, at least the wait
+ago; a canary that ran a different version doesn't count. There's no
+bypass flag and no `--canary-exempt` — the only way to widen the blast
+radius is a registry change, which is visible to everyone else.
+
 Recovery from a stuck run-lock is `roundhouse sync-unlock` — but only
 after confirming no runner is actually live on that host (check the
 scheduler entry and running processes first). A lock older than twice the
@@ -155,15 +182,18 @@ does belongs to the privilege broker, per
 The `roundhouse.sync-journal` and `canary/` record shapes are the seam
 between the two specs and don't change without cross-checking the sibling.
 
-**State-alignment commands are unverified per-harness.** The table below
-is the documented shape, not a tested capability of every harness version
-in the field — confirm the command actually works on a given host before
-relying on it, and fall back to the allowlisted config-edit path rather
-than guessing:
+**State-alignment commands are verified against named harness versions.**
+The table below was confirmed against `claude 2.1.222` and `codex-cli
+0.146.0` by reading each harness's own `plugin --help`: Claude ships
+`enable`/`disable` subcommands, but Codex's `plugin` command has only
+`add`, `list`, `marketplace`, and `remove` — no state verb at all, so
+Codex plugin state is always a config edit. Re-check `plugin --help` when
+a harness version moves; a verb that disappeared falls back to the
+config-edit path, never a guess:
 
 | Item type | Claude | Codex |
 | --- | --- | --- |
-| Plugins | `claude plugin enable\|disable PLUGIN@MARKETPLACE --scope user` | `codex plugin enable\|disable PLUGIN@MARKETPLACE` |
+| Plugins | `claude plugin enable\|disable PLUGIN@MARKETPLACE --scope user` (verbs exist) | no enable/disable verb — state is the `[plugins."PLUGIN@MARKETPLACE"] enabled` key in `~/.codex/config.toml`, edited through the allowlist |
 | Standalone skills | no verb — presence only; state is an allowlisted config edit | no verb — presence only; state is an allowlisted config edit |
 | Hooks | no verb; enablement is an allowlisted config edit | no verb; `hooks.state."HOOK-KEY".enabled` is the config surface — `trusted_hash` stays host-local, never synced |
 | MCP servers | config edit through the allowlist | config edit through the allowlist |
@@ -184,6 +214,16 @@ evidence, and it's never duplicated or paraphrased elsewhere:
 - scheduler entry singular and alive
 - co-ownership sanity for any second sync engine detected on the host
 - store size within budget
+
+**Codex keeps itself current once the checkout is current.** Codex
+auto-upgrades a `source_type: git` marketplace at its own startup, but
+never runs `git fetch`/`pull` against a `source_type: local` one — for a
+local-checkout marketplace, sync owns pulling that checkout current,
+because Codex won't. Once the on-disk marketplace content is current,
+Codex silently advances installed plugin versions itself on the next
+`plugin/list` call (which every TUI session issues routinely), so sync
+never needs to force a reinstall or run `codex plugin marketplace upgrade`
+for that — only to keep the checkout current.
 
 ### The WSL interop lane
 
