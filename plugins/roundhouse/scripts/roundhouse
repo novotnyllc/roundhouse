@@ -40,6 +40,11 @@ Usage:
   roundhouse apply-native-plan PLAN.json PLAN-ID OUTPUT.jsonl
   roundhouse apply-ssh-plan PLAN.json PLAN-ID OUTPUT.jsonl
   roundhouse dispatch-posix-request
+  roundhouse sync-init
+  roundhouse sync-verify-remote
+  roundhouse sync-status [OUTPUT.json|-]
+  roundhouse sync-absorb-registry
+  roundhouse sync-render-config HOST OUTPUT.json|-
 EOF
   exit 64
 }
@@ -713,6 +718,22 @@ validate_config_file() {
       ((.name // null) == null or (.name | type == "string" and test("^[A-Za-z0-9._-]+$")));
     . as $config |
     .version == 1 and
+    ((.sync // null) == null or
+      ((.sync | type == "object") and
+       ([.sync | keys[] |
+         select(IN("cadence_hours","canary_group","enabled","remote","store_path") | not)
+       ] | length == 0) and
+       (.sync | has("enabled")) and (.sync.enabled | type == "boolean") and
+       ((.sync.store_path // null) == null or
+         (.sync.store_path | type == "string" and length > 0)) and
+       ((.sync.remote // null) | type == "object") and
+       ((.sync.remote | keys) == ["url"]) and
+       (.sync.remote.url | type == "string" and length > 0) and
+       (.sync.remote.url | contains("?") | not) and
+       (.sync.remote.url | test("^[A-Za-z][A-Za-z0-9+.-]*://(?!git@)[^/@]+@") | not) and
+       (.sync.cadence_hours | type == "number" and . > 0 and . <= 8760) and
+       ((.sync.canary_group // null) == null or
+         (.sync.canary_group | type == "string" and test("^[A-Za-z0-9._-]+$"))))) and
     ((.worker // null) == null or
       ((.worker | type == "object") and
        (.worker.target | type == "string" and test("^[A-Za-z0-9._-]+$")) and
@@ -772,6 +793,12 @@ validate_config_file() {
       ([.package_managers[]? | IN("homebrew","linuxbrew","apt","winget")] | all) and
       (if any(.package_managers[]?; . == "winget") then .platform == "windows" else true end) and
       (if any(.package_managers[]?; . == "apt") then (.platform == "linux" or .platform == "wsl") else true end) and
+      ((.sync // null) == null or
+        ((.sync | type == "object") and
+         ([.sync | keys[] | select(IN("enabled","store_path") | not)] | length == 0) and
+         (if (.sync | has("enabled")) then (.sync.enabled | type == "boolean") else true end) and
+         (if (.sync | has("store_path")) then
+           (.sync.store_path | type == "string" and length > 0) else true end))) and
       ((.privilege_broker // null) == null or
         ((.privilege_broker | type == "object") and
          ([.privilege_broker | keys[] | select(IN("automation_transport","policy_proposal") | not)] | length == 0) and
@@ -6939,6 +6966,287 @@ preview_privilege_revocation_command() (
   rm -rf "$tmp"
 )
 
+sync_store_path() {
+  if [ -n "${ROUNDHOUSE_SYNC_STORE:-}" ]; then
+    printf '%s\n' "$ROUNDHOUSE_SYNC_STORE"
+    return
+  fi
+  configured=$(jq -r '.sync.store_path // empty' "$(config_path)" 2>/dev/null || true)
+  if [ -n "$configured" ]; then
+    expand_user_path "$configured"
+  else
+    printf '%s/roundhouse/store\n' "${XDG_CONFIG_HOME:-"$HOME/.config"}"
+  fi
+}
+
+sync_allowed_signers_path() {
+  # Host-local by doctrine (KTD16): never a path inside the store.
+  printf '%s/roundhouse/allowed_signers\n' "${XDG_CONFIG_HOME:-"$HOME/.config"}"
+}
+
+sync_signing_key_path() {
+  if [ -n "${ROUNDHOUSE_SYNC_SIGNING_KEY:-}" ]; then
+    printf '%s\n' "$ROUNDHOUSE_SYNC_SIGNING_KEY"
+    return
+  fi
+  # Mirrors prepare-ssh-identity's per-user identity root (the CA-enrolled node key).
+  case $(uname -s) in
+    Darwin) printf '%s/Library/Application Support/roundhouse/ssh-identity/current/node-key\n' "$HOME" ;;
+    *) printf '%s/roundhouse/ssh-identity/current/node-key\n' "${XDG_STATE_HOME:-"$HOME/.local/state"}" ;;
+  esac
+}
+
+sync_lock_path() {
+  printf '%s.lock\n' "$(sync_store_path)"
+}
+
+sync_host_name() {
+  configured=$(jq -r \
+    '[.machines | to_entries[] | select(.value.transport == "local") | .key][0] // empty' \
+    "$(config_path)" 2>/dev/null || true)
+  if [ -n "$configured" ]; then
+    printf '%s\n' "$configured"
+  else
+    hostname -s
+  fi
+}
+
+require_sync_store() {
+  store=$(sync_store_path)
+  [ -f "$store/meta/host.json" ] || {
+    printf 'roundhouse: sync store is not initialized: %s (run sync-init)\n' "$store" >&2
+    exit 66
+  }
+}
+
+sync_init_command() (
+  require_jq
+  validate_config_file
+  config=$(config_path)
+  jq -e '.sync.enabled == true' "$config" >/dev/null 2>&1 || {
+    printf 'roundhouse: fleet sync is opt-in and not enabled in %s (set sync.enabled true)\n' "$config" >&2
+    exit 69
+  }
+  store=$(sync_store_path)
+  host_name=$(sync_host_name)
+  remote_url=$(jq -r '.sync.remote.url' "$config")
+  jj_ok=false
+  if command -v jj >/dev/null 2>&1; then
+    jj_version=$(jj --version 2>/dev/null | sed -n 's/^jj \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+    jj_major=${jj_version%%.*}
+    jj_minor=${jj_version#*.}
+    if [ -n "$jj_version" ] &&
+      { [ "$jj_major" -gt 0 ] || [ "$jj_minor" -ge 43 ]; } 2>/dev/null; then
+      jj_ok=true
+    fi
+  fi
+  fresh=false
+  if [ ! -d "$store/.git" ]; then
+    fresh=true
+    mkdir -p "$store"
+    if [ "$jj_ok" = true ]; then
+      mode=jj
+      signing_enabled=true
+      jj git init --colocate "$store"
+      signing_key=$(sync_signing_key_path)
+      allowed_signers=$(sync_allowed_signers_path)
+      jj -R "$store" config set --repo snapshot.auto-track 'none()'
+      jj -R "$store" config set --repo snapshot.max-new-file-size 1MiB
+      jj -R "$store" config set --repo ui.paginate never
+      jj -R "$store" config set --repo signing.backend ssh
+      jj -R "$store" config set --repo signing.behavior own
+      jj -R "$store" config set --repo signing.key "$signing_key"
+      jj -R "$store" config set --repo signing.backends.ssh.allowed-signers "$allowed_signers"
+    else
+      mode=git-only
+      signing_enabled=false
+      git init -q "$store"
+    fi
+    git -C "$store" symbolic-ref HEAD refs/heads/main
+  fi
+  mkdir -p "$store/registry/machines" "$store/registry/groups" "$store/desired" \
+    "$store/allowlists" "$store/upstreams" "$store/leases" "$store/alerts" \
+    "$store/findings" "$store/canary" "$store/meta"
+  if [ "$fresh" = false ]; then
+    printf 'roundhouse: sync store already initialized at %s\n' "$store"
+    exit 0
+  fi
+  printf '%s\n' 'identity.json' '*.sock' '*.tmp' '.roundhouse.*' >"$store/.gitignore"
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-init.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -S -n --arg mode "$mode" --arg host "$host_name" \
+    --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson signing "$signing_enabled" '{
+      schema:"roundhouse.sync-store-meta",schema_version:1,mode:$mode,host:$host,
+      created_at:$created,signing_enabled:$signing,remote_visibility_verified:false
+    }' >"$tmp/host.json"
+  safe_output "$tmp/host.json" "$store/meta/host.json"
+  git -C "$store" config user.email >/dev/null 2>&1 || {
+    git -C "$store" config user.email "roundhouse-sync@$host_name"
+    git -C "$store" config user.name roundhouse-sync
+  }
+  git -C "$store" add -f .gitignore meta/host.json
+  scaffold_signed=false
+  if [ "$signing_enabled" = true ] && [ -f "$(sync_signing_key_path)" ]; then
+    git -C "$store" -c gpg.format=ssh -c user.signingkey="$(sync_signing_key_path)" \
+      commit -q -S -m 'roundhouse sync-init scaffold' && scaffold_signed=true
+  fi
+  [ "$scaffold_signed" = true ] ||
+    git -C "$store" -c commit.gpgsign=false commit -q -m 'roundhouse sync-init scaffold'
+  git -C "$store" show-ref --verify --quiet "refs/heads/host/$host_name" ||
+    git -C "$store" branch "host/$host_name"
+  git -C "$store" remote get-url origin >/dev/null 2>&1 ||
+    git -C "$store" remote add origin "$remote_url"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  printf 'roundhouse: sync store initialized (%s mode) at %s\n' "$mode" "$store"
+)
+
+sync_verify_remote_command() (
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  remote_url=$(git -C "$store" remote get-url origin 2>/dev/null || true)
+  [ -n "$remote_url" ] || {
+    printf 'roundhouse: sync store has no origin remote to verify\n' >&2
+    exit 69
+  }
+  probe_status=0
+  if [ -n "${ROUNDHOUSE_SYNC_VISIBILITY_PROBE:-}" ]; then
+    sh -c "$ROUNDHOUSE_SYNC_VISIBILITY_PROBE" >/dev/null 2>&1 || probe_status=$?
+  else
+    # Unauthenticated probe: success means the remote is publicly readable.
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+      GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0='' \
+      GIT_SSH_COMMAND='ssh -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityFile=/dev/null' \
+      git ls-remote --heads -- "$remote_url" >/dev/null 2>&1 || probe_status=$?
+  fi
+  if [ "$probe_status" -eq 0 ]; then verified=false; else verified=true; fi
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-verify.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -S --argjson verified "$verified" '.remote_visibility_verified = $verified' \
+    "$store/meta/host.json" >"$tmp/host.json"
+  safe_output "$tmp/host.json" "$store/meta/host.json"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  [ "$verified" = true ] || {
+    printf 'roundhouse: sync remote answers unauthenticated reads (publicly readable); refusing\n' >&2
+    exit 65
+  }
+  printf 'roundhouse: sync remote visibility verified (authentication required)\n'
+)
+
+sync_status_command() (
+  output=$1
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  mode=$(jq -r '.mode' "$store/meta/host.json")
+  visibility=$(jq '.remote_visibility_verified // false' "$store/meta/host.json")
+  remote=$(git -C "$store" remote get-url origin 2>/dev/null | sanitize_remote || true)
+  lock_held=false
+  [ ! -e "$(sync_lock_path)" ] || lock_held=true
+  last_run=null
+  [ ! -f "$store/journal/last-run.json" ] ||
+    last_run=$(jq '.completed_at // null' "$store/journal/last-run.json")
+  conflicted='[]'
+  note=null
+  if [ "$mode" = jj ] && command -v jj >/dev/null 2>&1; then
+    conflicted=$(jj -R "$store" log -r 'conflicts()' --no-graph --ignore-working-copy \
+      -T 'commit_id ++ "\n"' 2>/dev/null |
+      jq -R -s 'split("\n") | map(select(length > 0))') || conflicted='[]'
+  else
+    note='"conflict detection requires jj; git-only mode reports none"'
+  fi
+  untracked=$(git -C "$store" status --porcelain --untracked-files=all 2>/dev/null |
+    sed -n 's/^?? //p' | jq -R -s 'split("\n") | map(select(length > 0))')
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-status.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -S -n --arg mode "$mode" --arg store "$store" --arg remote "$remote" \
+    --argjson lock_held "$lock_held" --argjson last_run "$last_run" \
+    --argjson conflicted "$conflicted" --argjson untracked "$untracked" \
+    --argjson visibility "$visibility" --argjson note "$note" '{
+      schema:"roundhouse.sync-status",schema_version:1,mode:$mode,store_path:$store,
+      remote:(if $remote == "" then null else $remote end),lock_held:$lock_held,
+      last_run:$last_run,conflicted:$conflicted,untracked_unexpected:$untracked,
+      remote_visibility_verified:$visibility,note:$note
+    }' >"$tmp/status.json"
+  safe_output "$tmp/status.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+sync_absorb_registry_command() (
+  require_jq
+  validate_config_file
+  require_sync_store
+  config=$(config_path)
+  store=$(sync_store_path)
+  current=$(git -C "$store" symbolic-ref --short HEAD 2>/dev/null || printf 'main\n')
+  [ "$current" = main ] || git -C "$store" checkout -q main
+  mkdir -p "$store/registry/machines" "$store/registry/groups"
+  rm -f "$store/registry/machines"/*.json "$store/registry/groups"/*.json
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-absorb.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -S 'del(.machines)' "$config" >"$tmp/config-base.json"
+  safe_output "$tmp/config-base.json" "$store/registry/config-base.json"
+  for name in $(jq -r '.machines | keys[]' "$config"); do
+    jq -S --arg name "$name" '.machines[$name]' "$config" >"$tmp/machine.json"
+    safe_output "$tmp/machine.json" "$store/registry/machines/$name.json"
+  done
+  for group in $(jq -r '[.machines[].groups[]?] | unique[]' "$config"); do
+    jq -S --arg group "$group" '{
+      schema:"roundhouse.sync-group",schema_version:1,name:$group,
+      members:([.machines | to_entries[] | select(.value.groups[]? == $group) | .key] | sort)
+    }' "$config" >"$tmp/group.json"
+    safe_output "$tmp/group.json" "$store/registry/groups/$group.json"
+  done
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  printf 'roundhouse: absorbed %s machine record(s) into %s\n' \
+    "$(jq -r '.machines | length' "$config")" "$store/registry"
+)
+
+sync_render_config_command() (
+  host_name=$1
+  output=$2
+  require_jq
+  require_sync_store
+  store=$(sync_store_path)
+  [ -f "$store/registry/config-base.json" ] || {
+    printf 'roundhouse: sync store registry is empty (run sync-absorb-registry)\n' >&2
+    exit 66
+  }
+  signing_enabled=$(jq -r '.signing_enabled // false' "$store/meta/host.json")
+  if [ "$signing_enabled" = true ] && [ "${ROUNDHOUSE_SYNC_SKIP_SIGVERIFY:-0}" != 1 ]; then
+    git -C "$store" -c gpg.ssh.allowedSignersFile="$(sync_allowed_signers_path)" \
+      verify-commit HEAD >/dev/null 2>&1 || {
+      printf 'roundhouse: sync store head is not signed by a host-local allowed signer; refusing to render\n' >&2
+      exit 65
+    }
+  fi
+  machines=$(
+    for machine_file in "$store"/registry/machines/*.json; do
+      [ -f "$machine_file" ] || continue
+      jq --arg name "$(basename "$machine_file" .json)" '{($name): .}' "$machine_file"
+    done | jq -s 'add // {}'
+  )
+  printf '%s\n' "$machines" | jq -e --arg host "$host_name" 'has($host)' >/dev/null || {
+    printf 'roundhouse: unknown sync host: %s\n' "$host_name" >&2
+    exit 64
+  }
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-render.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -S --arg host "$host_name" --argjson machines "$machines" '. + {
+    machines:($machines | with_entries(
+      if .key == $host then .value.transport = "local" else . end))
+  }' "$store/registry/config-base.json" >"$tmp/config.json"
+  ROUNDHOUSE_CONFIG="$tmp/config.json" validate_config_file
+  safe_output "$tmp/config.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
 command=${1:-}
 [ -n "$command" ] || usage
 shift
@@ -6999,5 +7307,10 @@ case $command in
   apply-native-plan) [ $# -eq 3 ] || usage; apply_plan_command "$1" "$2" "$3" true ;;
   apply-ssh-plan) [ $# -eq 3 ] || usage; apply_ssh_plan_command "$1" "$2" "$3" ;;
   dispatch-posix-request) [ $# -eq 0 ] || usage; dispatch_posix_request_command ;;
+  sync-init) [ $# -eq 0 ] || usage; sync_init_command ;;
+  sync-verify-remote) [ $# -eq 0 ] || usage; sync_verify_remote_command ;;
+  sync-status) [ $# -le 1 ] || usage; sync_status_command "${1:--}" ;;
+  sync-absorb-registry) [ $# -eq 0 ] || usage; sync_absorb_registry_command ;;
+  sync-render-config) [ $# -eq 2 ] || usage; sync_render_config_command "$1" "$2" ;;
   *) usage ;;
 esac

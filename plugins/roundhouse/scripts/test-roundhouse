@@ -7996,4 +7996,218 @@ if "$cli" check-mutation-config >/dev/null 2>&1; then
   fail "writable mutation config passed integrity check"
 fi
 
+# --- fleet-sync fixtures (U1-U3) ---
+
+sync_root="$tmp/sync"
+mkdir -p "$sync_root/xdg" "$sync_root/jj-bin" "$sync_root/siggit-bin"
+sync_identity="$sync_root/no-identity.json"
+jq -n '{version:1,machines:{
+  "sync-local":{platform:"macos",transport:"local",groups:["development"]},
+  "sync-peer":{platform:"macos",transport:"ssh",ssh_alias:"sync-peer-alias",
+    groups:["development","canary"]}}}' >"$sync_root/base-config.json"
+jq '. + {sync:{enabled:true,remote:{url:"ssh://configured-sync-host/fleet-store.git"},
+  cadence_hours:24,canary_group:"canary"}}' \
+  "$sync_root/base-config.json" >"$sync_root/config.json"
+sync_config="$sync_root/config.json"
+
+ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  "$cli" validate-config ||
+  fail "valid sync config failed validate-config"
+ROUNDHOUSE_CONFIG="$sync_root/base-config.json" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  "$cli" validate-config ||
+  fail "config without a sync block failed validate-config (sync must be opt-in)"
+jq '.sync.cadence_hourz = .sync.cadence_hours | del(.sync.cadence_hours)' \
+  "$sync_config" >"$sync_root/misspelled-config.json"
+if ROUNDHOUSE_CONFIG="$sync_root/misspelled-config.json" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "misspelled key inside sync passed validate-config"
+fi
+jq '.machines["sync-local"].sync = {enable:true}' \
+  "$sync_config" >"$sync_root/machine-misspelled-config.json"
+if ROUNDHOUSE_CONFIG="$sync_root/machine-misspelled-config.json" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "misspelled key inside a machine sync override passed validate-config"
+fi
+jq '.machines["sync-local"].sync = {enabled:false,store_path:"~/alt-store"}' \
+  "$sync_config" >"$sync_root/machine-override-config.json"
+ROUNDHOUSE_CONFIG="$sync_root/machine-override-config.json" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  "$cli" validate-config ||
+  fail "valid machine sync override failed validate-config"
+
+if ROUNDHOUSE_CONFIG="$sync_root/base-config.json" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  ROUNDHOUSE_SYNC_STORE="$sync_root/refused-store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  "$cli" sync-init >/dev/null 2>&1; then
+  fail "sync-init succeeded without an enabled sync block"
+fi
+[ ! -e "$sync_root/refused-store" ] ||
+  fail "refused sync-init still created a store"
+
+cat >"$sync_root/jj-bin/jj" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$JJ_COMMAND_LOG"
+case ${1:-} in
+  --version) printf 'jj 0.43.1\n' ;;
+  git) [ "${2:-}" != init ] || "$REAL_GIT" init -q -b main "${4:-.}" ;;
+esac
+SH
+chmod +x "$sync_root/jj-bin/jj"
+
+jj_store="$sync_root/jj-store"
+JJ_COMMAND_LOG="$sync_root/jj-log" PATH="$sync_root/jj-bin:$PATH" \
+  ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  ROUNDHOUSE_SYNC_STORE="$jj_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  "$cli" sync-init >/dev/null ||
+  fail "sync-init with fake jj failed"
+[ "$(jq -r '.mode' "$jj_store/meta/host.json")" = jj ] ||
+  fail "jj-mode sync-init did not record jj mode in store meta"
+[ "$(jq -r '.signing_enabled' "$jj_store/meta/host.json")" = true ] ||
+  fail "jj-mode sync-init did not record signing as enabled"
+for sync_dir in registry/machines registry/groups desired allowlists upstreams \
+  leases alerts findings canary meta; do
+  [ -d "$jj_store/$sync_dir" ] || fail "sync-init did not create store directory $sync_dir"
+done
+sync_gitignore=$(cat "$jj_store/.gitignore")
+assert_contains "$sync_gitignore" 'identity.json'
+assert_contains "$sync_gitignore" '*.sock'
+sync_jj_log=$(cat "$sync_root/jj-log")
+assert_contains "$sync_jj_log" "git init --colocate $jj_store"
+assert_contains "$sync_jj_log" 'config set --repo snapshot.auto-track none()'
+assert_contains "$sync_jj_log" 'config set --repo snapshot.max-new-file-size 1MiB'
+assert_contains "$sync_jj_log" 'config set --repo ui.paginate never'
+assert_contains "$sync_jj_log" 'config set --repo signing.backend ssh'
+assert_contains "$sync_jj_log" 'config set --repo signing.behavior own'
+assert_contains "$sync_jj_log" 'config set --repo signing.key'
+assert_contains "$sync_jj_log" \
+  "config set --repo signing.backends.ssh.allowed-signers $sync_root/xdg/roundhouse/allowed_signers"
+case $sync_jj_log in
+  *"allowed-signers $jj_store"*)
+    fail "sync-init pointed allowed-signers inside the store (must stay host-local)" ;;
+esac
+git -C "$jj_store" show-ref --verify --quiet refs/heads/host/sync-local ||
+  fail "sync-init did not create the host branch"
+[ "$(git -C "$jj_store" remote get-url origin)" = ssh://configured-sync-host/fleet-store.git ] ||
+  fail "sync-init did not configure the origin remote from config"
+
+git_store="$sync_root/git-store"
+ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  ROUNDHOUSE_SYNC_STORE="$git_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  "$cli" sync-init >/dev/null ||
+  fail "sync-init without jj failed"
+[ "$(jq -r '.mode' "$git_store/meta/host.json")" = git-only ] ||
+  fail "sync-init without jj did not record git-only mode"
+[ "$(jq -r '.signing_enabled' "$git_store/meta/host.json")" = false ] ||
+  fail "git-only sync-init recorded signing as enabled"
+
+cp "$git_store/meta/host.json" "$sync_root/meta-before-reinit.json"
+ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  ROUNDHOUSE_SYNC_STORE="$git_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  "$cli" sync-init >/dev/null ||
+  fail "re-running sync-init on an existing store did not exit zero"
+cmp -s "$sync_root/meta-before-reinit.json" "$git_store/meta/host.json" ||
+  fail "re-running sync-init rewrote store meta (must be non-destructive)"
+
+if ROUNDHOUSE_SYNC_VISIBILITY_PROBE='exit 0' \
+  ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  ROUNDHOUSE_SYNC_STORE="$git_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  "$cli" sync-verify-remote >/dev/null 2>&1; then
+  fail "sync-verify-remote accepted a publicly readable remote"
+fi
+[ "$(jq -r '.remote_visibility_verified' "$git_store/meta/host.json")" = false ] ||
+  fail "public remote probe did not record remote_visibility_verified false"
+ROUNDHOUSE_SYNC_VISIBILITY_PROBE='exit 1' \
+  ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  ROUNDHOUSE_SYNC_STORE="$git_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  "$cli" sync-verify-remote >/dev/null ||
+  fail "sync-verify-remote refused an authentication-requiring remote"
+[ "$(jq -r '.remote_visibility_verified' "$git_store/meta/host.json")" = true ] ||
+  fail "private remote probe did not record remote_visibility_verified true"
+
+mkdir "$git_store.lock"
+git -C "$git_store" remote set-url origin \
+  'ssh://user:sync-remote-secret@configured-sync-host/fleet-store.git'
+sync_status=$(ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  ROUNDHOUSE_SYNC_STORE="$git_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  "$cli" sync-status -) ||
+  fail "sync-status failed"
+rmdir "$git_store.lock"
+printf '%s\n' "$sync_status" | jq -e '
+  .schema == "roundhouse.sync-status" and .mode == "git-only" and
+  .lock_held == true and .remote_visibility_verified == true and
+  .remote == "ssh://configured-sync-host/fleet-store.git" and
+  .conflicted == [] and .note != null and .last_run == null
+' >/dev/null || fail "sync-status record did not match the expected git-only state"
+case $sync_status in
+  *sync-remote-secret*) fail "sync-status printed credential material from the remote URL" ;;
+esac
+
+ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  ROUNDHOUSE_SYNC_STORE="$jj_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  "$cli" sync-absorb-registry >/dev/null ||
+  fail "sync-absorb-registry failed"
+for sync_machine in sync-local sync-peer; do
+  diff <(jq -S --arg name "$sync_machine" '.machines[$name]' "$sync_config") \
+    "$jj_store/registry/machines/$sync_machine.json" >/dev/null ||
+    fail "absorbed machine record for $sync_machine does not match the config"
+done
+jq -e '.schema == "roundhouse.sync-group" and .members == ["sync-local","sync-peer"]' \
+  "$jj_store/registry/groups/development.json" >/dev/null ||
+  fail "absorbed development group record is wrong"
+jq -e '.members == ["sync-peer"]' "$jj_store/registry/groups/canary.json" >/dev/null ||
+  fail "absorbed canary group record is wrong"
+jq -e '(has("machines") | not) and .sync.enabled == true' \
+  "$jj_store/registry/config-base.json" >/dev/null ||
+  fail "absorbed config base retained machines or dropped the sync block"
+
+if ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  ROUNDHOUSE_SYNC_STORE="$sync_root/uninitialized-store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  "$cli" sync-absorb-registry >/dev/null 2>&1; then
+  fail "sync-absorb-registry ran against an uninitialized store"
+fi
+
+cat >"$sync_root/siggit-bin/git" <<'SH'
+#!/usr/bin/env bash
+for sync_arg in "$@"; do
+  if [ "$sync_arg" = verify-commit ]; then
+    printf '%s\n' "$*" >>"$GIT_VERIFY_LOG"
+    exit 1
+  fi
+done
+exec "$REAL_GIT" "$@"
+SH
+chmod +x "$sync_root/siggit-bin/git"
+printf 'attacker@example.invalid ssh-ed25519 AAAA\n' >"$jj_store/allowed_signers"
+sync_render_status=0
+GIT_VERIFY_LOG="$sync_root/git-verify-log" PATH="$sync_root/siggit-bin:$PATH" \
+  ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  ROUNDHOUSE_SYNC_STORE="$jj_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  "$cli" sync-render-config sync-local "$sync_root/unsigned-rendered.json" \
+  >/dev/null 2>&1 || sync_render_status=$?
+[ "$sync_render_status" -eq 65 ] ||
+  fail "render from an unverifiable store did not exit 65 (got $sync_render_status)"
+[ ! -e "$sync_root/unsigned-rendered.json" ] ||
+  fail "refused render still wrote an output file"
+sync_verify_log=$(cat "$sync_root/git-verify-log")
+assert_contains "$sync_verify_log" \
+  "gpg.ssh.allowedSignersFile=$sync_root/xdg/roundhouse/allowed_signers"
+case $sync_verify_log in
+  *"allowedSignersFile=$jj_store"*)
+    fail "signature verification consulted a store-carried signer file" ;;
+esac
+
+ROUNDHOUSE_SYNC_SKIP_SIGVERIFY=1 \
+  ROUNDHOUSE_CONFIG="$sync_config" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  ROUNDHOUSE_SYNC_STORE="$jj_store" XDG_CONFIG_HOME="$sync_root/xdg" \
+  "$cli" sync-render-config sync-local "$sync_root/rendered.json" ||
+  fail "sync-render-config failed with signature verification skipped"
+[ "$(test_file_mode "$sync_root/rendered.json")" = 600 ] ||
+  fail "rendered config is not mode 600"
+ROUNDHOUSE_CONFIG="$sync_root/rendered.json" ROUNDHOUSE_IDENTITY="$sync_identity" \
+  "$cli" validate-config ||
+  fail "rendered config did not pass validate-config"
+jq -e '.machines["sync-local"].transport == "local" and
+  .machines["sync-peer"].transport == "ssh"' "$sync_root/rendered.json" >/dev/null ||
+  fail "rendered config transports are wrong"
+diff <(jq -S . "$sync_config") <(jq -S . "$sync_root/rendered.json") >/dev/null ||
+  fail "absorb then render did not round-trip the original config"
+
 printf 'PASS: roundhouse self-check\n'

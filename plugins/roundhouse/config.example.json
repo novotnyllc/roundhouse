@@ -102,6 +102,15 @@
     }
   },
   "handoff_project": "handoffs",
+  "sync": {
+    "enabled": false,
+    "store_path": "~/.config/roundhouse/store",
+    "remote": {
+      "url": "git@configured-git-host:owner/private-fleet-store.git"
+    },
+    "cadence_hours": 24,
+    "canary_group": "development"
+  },
   "capabilities": {
     "last30days": {
       "groups": [
