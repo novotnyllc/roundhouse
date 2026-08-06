@@ -69,6 +69,12 @@ Three phases, one run-lock, one journal. Drive them in order:
    `"$CLI" sync-status` reports mode, lock state, conflicted items, and the
    untracked-file tripwire at any point in the run.
 
+A run-lock older than twice the configured cadence is reported as a
+distinct stale-lock refusal, not as a live runner. Recovery is
+`"$CLI" sync-unlock`, and only after confirming no runner is actually
+live on that host — check the scheduler entry and any running process
+first; releasing a lock out from under a live run is how two runs collide.
+
 A conflicted item is never materialized: it converges from its last
 conflict-free state, is held item-level with `"$CLI" sync-hold`, and the
 rest of the run proceeds.
@@ -125,9 +131,12 @@ spec.
 ### State-alignment capability per item type
 
 Phase 3 aligns enabled/disabled state with manager-native commands where
-they exist and allowlisted config edits where they do not. Confirm the
-harness actually supports the command on this host before relying on it,
-and fall back to the config-edit path rather than guessing.
+they exist and allowlisted config edits where they do not. **The
+enable/disable verbs below are unverified per-harness**: they are the
+documented shape, not a tested capability of the harness version on any
+given host. Confirm the harness actually supports the command on this host
+before relying on it, and fall back to the config-edit path rather than
+guessing.
 
 | Item type | Claude | Codex |
 | --- | --- | --- |
@@ -142,20 +151,30 @@ install/remove command; only *state* falls back to config edits.
 ### Doctor check contract
 
 `railyard:doctor` consumes these checks from here; this list is the
-roundhouse-side contract and each check is reported by name with evidence:
+roundhouse-side contract and each check is reported by name with evidence.
+Each one is labelled by where its evidence comes from: **CLI-reported**
+means `"$CLI" sync-status` (or another `sync-*` command) emits it directly;
+**agent-computed** means the agent derives it from store history, config, or
+the host, and the CLI has no field for it.
 
-- store reachable and replicating;
-- commit signatures verifying against the host-local allowed-signers file;
-- no upstream stale beyond 2× cadence;
-- no host's last successful sync older than 2× its cadence — the expected
-  staleness of the interactive-session-only `iris-windows` entry is
-  reported as such, by name, never silently;
-- no enabled-but-untrusted hook;
-- no conflict commit older than 24 hours;
-- no held flagged item forgotten;
-- scheduler entry singular and alive;
-- co-ownership sanity for any detected second sync engine;
-- store size within budget.
+- store reachable and replicating — CLI-reported (`sync-fetch`, `sync-status`);
+- commit signatures verifying against the host-local allowed-signers file —
+  CLI-reported (`sync-status.verification_bypassed`, and every gated command
+  refuses on a failed verification);
+- no upstream stale beyond 2× cadence — agent-computed from `leases/`;
+- no host's last successful sync older than 2× its cadence — CLI-reported
+  for this host (`sync-status.last_run`), agent-computed for the rest from
+  host-branch journals; the expected staleness of the interactive-session-only
+  `iris-windows` entry is reported as such, by name, never silently;
+- no enabled-but-untrusted hook — CLI-reported
+  (`sync-status.enabled_but_untrusted`);
+- no conflict commit older than 24 hours — agent-computed: `sync-status`
+  reports conflicted commit ids (or `null` with `detection_failed`), and the
+  agent dates them from store history;
+- no held flagged item forgotten — CLI-reported (`sync-pending`);
+- scheduler entry singular and alive — agent-computed from the host;
+- co-ownership sanity for any detected second sync engine — agent-computed;
+- store size within budget — agent-computed from the store path.
 
 ## Routine marketplace refresh
 
