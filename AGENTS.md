@@ -61,6 +61,11 @@ When changing the plugin version, update:
 
 Never treat an installed plugin cache as the source repository.
 
+Documentation-only changes (`docs/**`, `README.md`) need no version bump,
+no integrity regeneration, no marketplace repin, and no fleet
+redeploy/convergence pass — commit and push them directly. Only changes
+under `plugins/` couple to the release machinery above.
+
 ## Skill Editing Rules
 
 - Keep skills usable by both Codex and Claude Code.

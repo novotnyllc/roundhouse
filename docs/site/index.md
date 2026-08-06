@@ -151,3 +151,8 @@ purpose.
   what's actually different here.
 - **[Configuration reference](config.md)**
 - **[Skills index](skills/)**
+
+---
+
+The fleet runs on tools other people built well — jj, chezmoi, OpenSSH,
+the platform package managers — see [credits and upstream sources](credits.md).
