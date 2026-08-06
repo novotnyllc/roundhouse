@@ -78,7 +78,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "a3b261b60a9576685e4e1a8deb6b733e053d389d0818ab32517056dcf0810432"
+      "sha256": "0d1129983c8e1623041b760540b1f8ed301589ce1b11579b3fcab5925b3b6939"
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",

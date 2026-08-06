@@ -40,11 +40,20 @@ lane.
    agent-utilities, compound-engineering) through `roundhouse:fleet-agents`'
    routine refresh; project checkouts through `roundhouse:fleet-projects`
    when the host will take delivery work.
-5. **Optional privilege enrollment** (separate consent; skip by default) —
+5. **Optional store credential** (separate consent; only when the host opts
+   into desired-state sync) — provision this host's own minimal credential
+   for the sync store's remote: an SSH deploy key generated on the host and
+   kept in `~/.ssh`, or a token held by a credential helper. **Never embed
+   the credential in the remote URL** — a URL-embedded token replicates into
+   config, logs, and every error message. Scope it to the single private
+   store repository and reuse it for nothing else; these are crown-jewel
+   secrets, since the store is a trusted-write surface on every fleet
+   machine.
+6. **Optional privilege enrollment** (separate consent; skip by default) —
    `enroll-privilege-posix`, or on Windows `enroll-windows-sftp.ps1` /
    `enroll-privilege-windows.ps1`, only when the host needs the privileged
    install lane.
-6. **Verify** — finish with `roundhouse:fleet-readiness` for the new host and
+7. **Verify** — finish with `roundhouse:fleet-readiness` for the new host and
    report the go/no-go table. A host is not "added" until readiness reports
    it.
 
@@ -61,7 +70,10 @@ Order matters: clean up over SSH while access still works, revoke second.
    ceremony), tear down the departing host's enrollment with
    `enroll-ssh-posix preview-revoke` then `revoke`, and deliver the new KRL
    to every remaining fleet host with `enroll-ssh-posix repair` — not just
-   the departing one. Revoke privilege enrollment the same way when present.
+   the departing one. **Revoke the store credential alongside SSH trust**:
+   delete the host's deploy key or token at the remote in the same step, so
+   a decommissioned machine loses store write access exactly when it loses
+   SSH trust. Revoke privilege enrollment the same way when present.
 3. **Config removal** — delete the machine entry, re-run
    `"$CLI" validate-config`, and drop the host from any groups.
 4. **Report** — if the entry shares a `physical_host` with others, say so
@@ -70,6 +82,26 @@ Order matters: clean up over SSH while access still works, revoke second.
    state deliberately left on the machine (an unenrolled box keeps its own
    harnesses and user data — that is expected, name it rather than
    implying a wipe).
+
+## Restore a host
+
+Restoring host X from the sync store is **configs plus a shopping list**,
+not a machine image: the store cannot restore secrets, per-machine auth, or
+SSH identity. **Read first** — show the full delta before touching
+anything. Then, in this order:
+
+1. **Enrollment** — run the add-a-host flow above for X: config entry and
+   the SSH certificate ceremony.
+2. **Store credentials** — provision X's own store credential (step 5
+   above), never reusing another host's.
+3. **Materialize file-carried surfaces** — skills, agents, hooks, and
+   allowlisted config keys from the `host/X` branch, each through the
+   ordinary apply-time review.
+4. **Replay manager installs** — reinstall the plugins and manager-owned
+   items recorded in X's inventory snapshot, using each manager's own
+   commands at the recorded pins.
+5. **Per-artifact reauth** — work the auth shopping list with the user;
+   every credential is re-established on X by hand.
 
 ## Boundaries
 

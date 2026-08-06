@@ -7281,10 +7281,20 @@ sync_init_command() (
       jj -R "$store" config set --repo snapshot.auto-track 'none()'
       jj -R "$store" config set --repo snapshot.max-new-file-size 1MiB
       jj -R "$store" config set --repo ui.paginate never
-      jj -R "$store" config set --repo signing.backend ssh
-      jj -R "$store" config set --repo signing.behavior own
-      jj -R "$store" config set --repo signing.key "$signing_key"
-      jj -R "$store" config set --repo signing.backends.ssh.allowed-signers "$allowed_signers"
+      # Only point jj at the CA-enrolled node key when it actually exists —
+      # the same [ -f ] gate the git-side commit paths already apply. Naming a
+      # missing key wedges the repo outright: with signing.behavior=own, every
+      # jj command that touches the working copy dies with "Failed to create
+      # new working-copy commit / SSH sign failed / Couldn't load public key"
+      # (observed with real jj 0.44), so the store becomes jj-inoperable on
+      # any host that has not enrolled yet. Store meta still records
+      # signing_enabled, which is what gates verification before apply.
+      if [ -f "$signing_key" ]; then
+        jj -R "$store" config set --repo signing.backend ssh
+        jj -R "$store" config set --repo signing.behavior own
+        jj -R "$store" config set --repo signing.key "$signing_key"
+        jj -R "$store" config set --repo signing.backends.ssh.allowed-signers "$allowed_signers"
+      fi
     else
       mode=git-only
       signing_enabled=false
@@ -7577,7 +7587,14 @@ sync_run_begin_command() (
   mode=$(jq -r '.mode' "$store/meta/host.json")
   op_id=null
   if [ "$mode" = jj ] && command -v jj >/dev/null 2>&1; then
-    op_raw=$(jj -R "$store" op log -n1 --no-graph --ignore-working-copy -T 'id' 2>/dev/null || true)
+    # Deliberately WITHOUT --ignore-working-copy: that flag suppresses the
+    # colocated auto-import, so the newest operation would predate jj ever
+    # seeing refs/heads/main. sync-undo restores to this op, and restoring to
+    # a pre-import op makes jj export an empty view — deleting main,
+    # host/<name>, and origin/main from the store outright (observed with real
+    # jj 0.44; `jj git import` cannot substitute, it is a documented no-op in
+    # colocated workspaces). The captured op must already know the run's refs.
+    op_raw=$(jj -R "$store" op log -n1 --no-graph -T 'id' 2>/dev/null || true)
     [ -z "$op_raw" ] || op_id=$(printf '%s' "$op_raw" | jq -R .)
   fi
   gate=not-needed
