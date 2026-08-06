@@ -1,6 +1,6 @@
 {
   "name": "roundhouse",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Machine and infrastructure administration for agent fleets: readiness, inventory, harness/plugin/skill parity, package and dotfile baselines, auth artifacts, SSH transport and diagnosis, privileged install lanes, and UniFi network gear.",
   "author": {
     "name": "Claire Novotny LLC",
@@ -29,6 +29,8 @@
       "Inventory the fleet and report drift in runtimes, plugins, and skills.",
       "Plan and apply pending package updates on the fleet."
     ],
-    "brandColor": "#7C2D12"
+    "brandColor": "#7C2D12",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/icon.png"
   }
 }

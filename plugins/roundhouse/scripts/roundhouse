@@ -43,6 +43,7 @@ Usage:
   roundhouse sync-init
   roundhouse sync-refresh-signers
   roundhouse sync-verify-remote
+  roundhouse sync-set-remote NEW_URL
   roundhouse sync-status [OUTPUT.json|-]
   roundhouse sync-absorb-registry
   roundhouse sync-render-config HOST OUTPUT.json|-
@@ -7687,6 +7688,61 @@ sync_apply_signing_config() {
   fi
 }
 
+sync_store_marker_file='.roundhouse-sync-store'
+
+sync_store_marker_token() {
+  # First token of the store fingerprint marker at a ref, or nothing. Both the
+  # sync-init adopt gate and sync-set-remote ask the same question this way, so
+  # "is that remote a roundhouse sync store" has exactly one answer.
+  git -C "$1" show "$2:$sync_store_marker_file" 2>/dev/null |
+    awk 'NR == 1 { print $1; exit }'
+}
+
+sync_write_store_readme() {
+  # The store root files a fresh root scaffolds: a fingerprint marker peers
+  # test before adopting, and a README for whoever opens the repository.
+  printf 'roundhouse-sync-store 1\n' >"$1/$sync_store_marker_file"
+  cat >"$1/README.md" <<'EOF'
+# roundhouse sync store
+
+This repository is the desired-state sync store for a roundhouse agent fleet.
+Enrolled hosts read desired state from it, converge their own machine, and
+publish what they applied back into it.
+
+## Machine-managed
+
+Do not hand-edit this repository. Every change rides a signed commit from an
+enrolled host and passes that host's review gates before any machine applies
+it. A hand edit is unsigned and unreviewed, so the next host to fetch it holds
+or refuses the item instead of converging on it.
+
+## What is inside
+
+- `registry/` — machines and groups absorbed from host configuration
+- `desired/` — desired state per scope (`all`, `os-*`, `group-*`, `machine-*`)
+- `allowlists/` — what each scope is permitted to converge
+- `upstreams/`, `leases/` — upstream ids and the leases that serialize them
+- `alerts/`, `findings/` — held items and review notes every host can read
+- `canary/` — canary-group gating records
+- `journal/`, `materialized/` — on each `host/<name>` branch: what that host
+  ran and the state it actually applied
+
+## What is never inside
+
+Secrets, credentials, tokens, or key material. Agent transcripts or session
+content. Host identity files (`identity.json`, node keys, certificates):
+identity and trust material is host-local by design and never synced.
+
+## Keep this repository private
+
+The store names every machine in the fleet and the state each one runs. Hosts
+refuse their first push to a remote that answers unauthenticated reads.
+
+Operator documentation lives in the roundhouse plugin docs (the `fleet-agents`
+skill), not in this repository.
+EOF
+}
+
 sync_init_command() (
   require_jq
   validate_config_file
@@ -7698,6 +7754,10 @@ sync_init_command() (
   store=$(sync_store_path)
   host_name=$(sync_host_name)
   remote_url=$(jq -r '.sync.remote.url' "$config")
+  # Whether the store directory is ours to remove if the remote turns out to
+  # be someone else's repository (see the collision refusal below).
+  store_existed=true
+  [ -d "$store" ] || store_existed=false
   jj_ok=false
   if command -v jj >/dev/null 2>&1; then
     jj_version=$(jj --version 2>/dev/null | sed -n 's/^jj \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
@@ -7761,6 +7821,17 @@ sync_init_command() (
       if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=5' \
         git -C "$store" fetch -q origin 2>/dev/null &&
         git -C "$store" show-ref --verify --quiet refs/remotes/origin/main; then
+        # Collision gate: adopt only a history that identifies itself as a sync
+        # store. Adopting an unrelated repository would entangle the fleet's
+        # state with someone else's and publish store content into it. Nothing
+        # is left half-built: the only artifacts at this point are the repo
+        # directories this run created, so a retry re-runs the fresh path.
+        if [ "$(sync_store_marker_token "$store" origin/main)" != roundhouse-sync-store ]; then
+          rm -rf "$store/.git" "$store/.jj"
+          [ "$store_existed" = true ] || rm -rf "$store"
+          printf 'roundhouse: remote exists and is not a roundhouse sync store — choose a different sync.remote.url or move/clear the remote\n' >&2
+          exit 65
+        fi
         git -C "$store" checkout -q -B main origin/main
         adopted=true
       fi
@@ -7813,7 +7884,10 @@ sync_init_command() (
     git -C "$store" config user.name roundhouse-sync
   }
   if [ "$adopted" = false ]; then
-    git -C "$store" add -f .gitignore meta/host.json
+    # A fresh root is the only path that scaffolds them; an adopted store gets
+    # both files from the history it adopted.
+    sync_write_store_readme "$store"
+    git -C "$store" add -f .gitignore "$sync_store_marker_file" README.md meta/host.json
     # meta/host.json is already written, so the shared commit helper reads the
     # same signing_enabled flag every later store commit is gated on.
     sync_store_commit "$store" 'roundhouse sync-init scaffold'
@@ -7885,6 +7959,94 @@ sync_verify_remote_command() (
     exit 65
   }
   printf 'roundhouse: sync remote visibility verified (authentication required)\n'
+)
+
+sync_set_remote_command() (
+  # Store migration: move this host's store to a new remote, publishing every
+  # local branch there first. Never edits config.json — the operator owns
+  # sync.remote.url on every host, and this command prints what to set.
+  new_url=$1
+  require_jq
+  require_sync_store
+  sync_validate_fetch_url "$new_url" || {
+    printf 'roundhouse: unsupported sync remote URL: %s\n' "$new_url" >&2
+    exit 64
+  }
+  store=$(sync_store_path)
+  old_url=$(git -C "$store" remote get-url origin 2>/dev/null || true)
+  move_refs=$(GIT_TERMINAL_PROMPT=0 \
+    GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=5' \
+    git ls-remote --heads -- "$new_url" 2>/dev/null) || {
+    # An unreachable target is a fleet outage waiting to happen, not a move.
+    printf 'roundhouse: new sync remote is not reachable: %s\n' "$new_url" >&2
+    exit 69
+  }
+  if printf '%s\n' "$move_refs" | grep -q '[[:space:]]refs/heads/main$'; then
+    GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=5' \
+      git -C "$store" fetch -q --no-tags -- "$new_url" \
+      'refs/heads/main:refs/roundhouse-move/main' 2>/dev/null || {
+      printf 'roundhouse: could not read main from the new sync remote: %s\n' "$new_url" >&2
+      exit 69
+    }
+    move_refused=
+    if [ "$(sync_store_marker_token "$store" refs/roundhouse-move/main)" != roundhouse-sync-store ]; then
+      move_refused='remote exists and is not a roundhouse sync store'
+    elif ! git -C "$store" merge-base --is-ancestor refs/roundhouse-move/main refs/heads/main &&
+      ! git -C "$store" merge-base --is-ancestor refs/heads/main refs/roundhouse-move/main; then
+      # Another fleet's store, or this one forked: one main has to contain the
+      # other or the move would publish two unrelated histories as one store.
+      move_refused='remote carries a divergent sync store history'
+    fi
+    git -C "$store" update-ref -d refs/roundhouse-move/main
+    [ -z "$move_refused" ] || {
+      printf 'roundhouse: %s — choose a different remote or move/clear it (origin unchanged)\n' \
+        "$move_refused" >&2
+      exit 65
+    }
+  elif [ -n "$move_refs" ]; then
+    printf 'roundhouse: remote exists and is not a roundhouse sync store — choose a different remote or move/clear it (origin unchanged)\n' >&2
+    exit 65
+  fi
+  # The alert goes on main BEFORE the push, so the store that lands on the new
+  # remote already carries the record of how it got there.
+  sync_write_alert "$store" "meta/$sync_store_marker_file" \
+    "sync store remote moved to $new_url; set sync.remote.url to it on every host" >/dev/null
+  set --
+  for move_branch in $(git -C "$store" for-each-ref --format='%(refname:short)' refs/heads/); do
+    set -- "$@" "$move_branch"
+  done
+  [ $# -gt 0 ] || {
+    printf 'roundhouse: sync store has no local branches to move\n' >&2
+    exit 65
+  }
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=5' \
+    git -C "$store" push -q -- "$new_url" "$@" || {
+    printf 'roundhouse: pushing the store to the new remote failed; origin unchanged\n' >&2
+    exit 75
+  }
+  # Best effort only: hosts still pointed at the old remote learn of the move
+  # from the alert if that remote still accepts writes, and the move stands
+  # either way.
+  [ -z "$old_url" ] ||
+    GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=5' \
+      git -C "$store" push -q -- "$old_url" main 2>/dev/null || true
+  git -C "$store" remote set-url origin "$new_url"
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sync-move.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  # Visibility evidence belongs to the remote it was gathered against: a moved
+  # store proves the new remote is private before the next run may push to it.
+  jq -S --arg url "$old_url" --arg at "$(sync_now)" '
+    .previous_remotes = ((.previous_remotes // []) +
+      (if $url == "" then [] else [{url:$url,moved_at:$at}] end)) |
+    .remote_visibility_verified = false | .remote_visibility_reason = "remote-moved"' \
+    "$store/meta/host.json" >"$tmp/host.json"
+  safe_output "$tmp/host.json" "$store/meta/host.json"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  printf 'roundhouse: sync store remote moved to %s (%d branch(es) pushed)\n' "$new_url" "$#"
+  printf 'roundhouse: set sync.remote.url to %s on every host; this command never edits config.json\n' \
+    "$new_url"
+  printf 'roundhouse: run sync-verify-remote against the new remote before the next sync run\n'
 )
 
 sync_status_command() (
@@ -9018,6 +9180,7 @@ case $command in
   sync-init) [ $# -eq 0 ] || usage; sync_init_command ;;
   sync-refresh-signers) [ $# -eq 0 ] || usage; sync_refresh_signers_command ;;
   sync-verify-remote) [ $# -eq 0 ] || usage; sync_verify_remote_command ;;
+  sync-set-remote) [ $# -eq 1 ] || usage; sync_set_remote_command "$1" ;;
   sync-status) [ $# -le 1 ] || usage; sync_status_command "${1:--}" ;;
   sync-absorb-registry) [ $# -eq 0 ] || usage; sync_absorb_registry_command ;;
   sync-render-config) [ $# -eq 2 ] || usage; sync_render_config_command "$1" "$2" ;;

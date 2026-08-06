@@ -42,6 +42,13 @@ scaffolds the store — a jj repository colocated with git under
 not solid — and records the remote-visibility verification the first push
 requires. A host that enrolls or rotates its CA identity after `sync-init`
 runs `"$CLI" sync-refresh-signers`; re-init also heals signing config.
+`sync-init` refuses to adopt a remote that is not already a sync store —
+a store identifies itself by the `.roundhouse-sync-store` marker its fresh
+root scaffolds beside the store `README.md`. Moving the store to a new
+remote is `"$CLI" sync-set-remote NEW_URL`, which verifies the target is
+empty or the same store, publishes every local branch there, flips origin,
+and alerts the fleet; it never edits `config.json`, so update
+`sync.remote.url` on every host yourself and re-run `sync-verify-remote`.
 Personal sync engines the user runs are detected *upstreams* and
 co-owners, never infrastructure this system depends on.
 
@@ -278,11 +285,40 @@ outside-marketplace record to be unchanged. Report before/after versions per
 plugin. A failure in one plugin or harness does not erase other evidence or stop
 the remaining marketplace plugins from being attempted.
 
+### Required plugin dependencies
+
+A host that carries `railyard` REQUIRES the `compound-engineering` plugin,
+version 3.20.0 or newer, from the `EveryInc/compound-engineering-plugin`
+marketplace: railyard's delivery, review, and orchestration skills invoke
+compound-engineering skills directly, so railyard without it is a broken
+install, not a lighter one. Converging that dependency is part of the routine
+refresh's existing mutation authorization, not a separate consent: when the
+refresh finds `railyard` installed on a harness and `compound-engineering`
+missing there, add the marketplace and install the plugin on that harness in
+the same pass. Do not ask for a second approval, and do not install it on a
+harness that does not carry railyard. Run only these target-native sequences:
+
+```text
+codex plugin marketplace add EveryInc/compound-engineering-plugin --json
+codex plugin add compound-engineering@compound-engineering-plugin --json
+
+claude plugin marketplace add EveryInc/compound-engineering-plugin
+claude plugin install compound-engineering@compound-engineering-plugin --scope user
+```
+
+The Codex install goes through the hook-approval helper like any other Codex
+plugin install. An installed-but-older `compound-engineering` converges through
+the normal marketplace-refresh path for its own marketplace; do not pin or
+downgrade it. Report the dependency as a converged item in the refresh result —
+per host and harness, with the before state (absent, or the prior version) and
+the installed version — so a fleet that was silently missing it shows up as
+converged evidence rather than as a surprise.
+
 The only pre-helper fallback is a separately approved self-update of
 `roundhouse@novotnyllc` from an integrity-verified release that lacks
 `update-codex-plugin`. After upgrading the `novotnyllc` marketplace, run exactly
 `codex plugin add roundhouse@novotnyllc --json`, recapture inventory,
-reload the new target-native plugin, and require its version `0.5.0` executor
+reload the new target-native plugin, and require its version `0.5.1` executor
 and integrity verification before any other mutation. Never use that raw-add
 fallback for another plugin or once the helper command is available.
 

@@ -72,6 +72,23 @@ assert_contains "$fleet_agents_text" 'codex plugin add roundhouse@novotnyllc --j
 assert_ordered "$fleet_agents_skill" \
   'claude plugin marketplace update MARKETPLACE' \
   'claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user'
+# railyard is broken without compound-engineering, so the routine refresh
+# converges that dependency under its existing mutation authorization.
+assert_contains "$fleet_agents_text" 'A host that carries `railyard` REQUIRES the `compound-engineering` plugin'
+assert_contains "$fleet_agents_text" 'version 3.20.0 or newer'
+assert_contains "$fleet_agents_text" '`EveryInc/compound-engineering-plugin`'
+assert_contains "$fleet_agents_text" 'not a separate consent'
+assert_contains "$fleet_agents_text" 'do not install it on a
+harness that does not carry railyard'
+assert_contains "$fleet_agents_text" \
+  'codex plugin marketplace add EveryInc/compound-engineering-plugin --json'
+assert_contains "$fleet_agents_text" \
+  'codex plugin add compound-engineering@compound-engineering-plugin --json'
+assert_contains "$fleet_agents_text" \
+  'claude plugin marketplace add EveryInc/compound-engineering-plugin'
+assert_contains "$fleet_agents_text" \
+  'claude plugin install compound-engineering@compound-engineering-plugin --scope user'
+assert_contains "$fleet_agents_text" 'Report the dependency as a converged item'
 assert_contains "$remote_control_text" '`list_projects`'
 assert_contains "$remote_control_text" '`create_thread`'
 assert_contains "$remote_control_text" '`wait_threads`'
@@ -172,6 +189,10 @@ case $fleet_agents_text in
     fail "fleet-agents still carries the pre-implementation sync section"
     ;;
 esac
+# The store identifies itself, and moving it is a command, never a hand-edit.
+assert_contains "$fleet_agents_text" '`.roundhouse-sync-store` marker'
+assert_contains "$fleet_agents_text" '`"$CLI" sync-set-remote NEW_URL`'
+assert_contains "$fleet_agents_text" 'it never edits `config.json`'
 
 # The three-phase run names every command the driver actually exposes.
 for sync_doctrine_command in sync-fetch sync-run-begin sync-lease sync-adopt-pin \
@@ -8304,6 +8325,23 @@ done
 sync_gitignore=$(cat "$jj_store/.gitignore")
 assert_contains "$sync_gitignore" 'identity.json'
 assert_contains "$sync_gitignore" '*.sock'
+# A fresh root scaffolds the fingerprint marker peers test before adopting and
+# the README whoever opens the repository reads, and COMMITS both.
+[ "$(cat "$jj_store/.roundhouse-sync-store")" = 'roundhouse-sync-store 1' ] ||
+  fail "sync-init did not write the store fingerprint marker"
+sync_store_readme=$(cat "$jj_store/README.md")
+assert_contains "$sync_store_readme" 'desired-state sync store'
+assert_contains "$sync_store_readme" 'Do not hand-edit this repository'
+assert_contains "$sync_store_readme" 'signed commit from an'
+assert_contains "$sync_store_readme" 'never inside'
+assert_contains "$sync_store_readme" 'identity.json'
+assert_contains "$sync_store_readme" 'Keep this repository private'
+assert_contains "$sync_store_readme" 'fleet-agents'
+for sync_scaffolded in .roundhouse-sync-store README.md; do
+  git -C "$jj_store" ls-tree -r --name-only main -- "$sync_scaffolded" |
+    grep -qx "$sync_scaffolded" ||
+    fail "sync-init left $sync_scaffolded out of the scaffold commit"
+done
 sync_jj_log=$(cat "$sync_root/jj-log")
 assert_contains "$sync_jj_log" "git init --colocate $jj_store"
 assert_contains "$sync_jj_log" 'config set --repo snapshot.auto-track none()'
@@ -8726,6 +8764,118 @@ sync_store_seed() {
 
 "$REAL_GIT" init -q --bare -b main "$sync_u4/origin.git"
 
+# --- sync-init remote-collision gate, and sync-set-remote store migration ---
+# Adopting whatever main a remote happens to carry entangles the fleet's state
+# with an unrelated repository (and publishes store content into it). A store
+# identifies itself by its fingerprint marker; anything else is refused.
+sync_move="$sync_root/move"
+mkdir -p "$sync_move"
+sync_move_absent_key="$sync_move/absent-node-key"
+
+sync_seed_unrelated_remote() {
+  # $1 bare remote path: a plain repository that is nobody's sync store.
+  "$REAL_GIT" init -q --bare -b main "$1"
+  "$REAL_GIT" init -q -b main "$1.seed"
+  printf '# an unrelated repository\n' >"$1.seed/README.md"
+  "$REAL_GIT" -C "$1.seed" add README.md
+  "$REAL_GIT" -C "$1.seed" -c commit.gpgsign=false \
+    -c user.email=other@example.invalid -c user.name=other commit -q -m 'unrelated repository'
+  "$REAL_GIT" -C "$1.seed" push -q "$1" main
+}
+
+sync_seed_unrelated_remote "$sync_move/unrelated.git"
+sync_write_config "$sync_move/collide-config.json" collide-host "$sync_move/unrelated.git"
+sync_collide_status=0
+sync_collide_error=$(sync_run "$sync_move/collide-store" "$sync_move/collide-config.json" \
+  ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_move_absent_key" "$cli" sync-init 2>&1 >/dev/null) ||
+  sync_collide_status=$?
+[ "$sync_collide_status" -eq 65 ] ||
+  fail "sync-init adopted a remote that is not a sync store (got $sync_collide_status)"
+assert_contains "$sync_collide_error" 'not a roundhouse sync store'
+[ ! -e "$sync_move/collide-store" ] ||
+  fail "a refused sync-init left a half-built store behind"
+
+# The refusal is retryable: pointing the same host at an empty remote inits
+# clean, roots a fresh history, and commits the marker and README.
+"$REAL_GIT" init -q --bare -b main "$sync_move/empty.git"
+sync_write_config "$sync_move/move-config.json" move-host "$sync_move/empty.git"
+sync_move_store="$sync_move/move-store"
+sync_move_init=$(sync_run "$sync_move_store" "$sync_move/move-config.json" \
+  ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_move_absent_key" "$cli" sync-init) ||
+  fail "sync-init against an empty remote failed after a collision refusal"
+assert_contains "$sync_move_init" 'fresh-root'
+[ "$("$REAL_GIT" -C "$sync_move_store" show main:.roundhouse-sync-store)" = \
+  'roundhouse-sync-store 1' ] ||
+  fail "a fresh root did not commit the store fingerprint marker"
+"$REAL_GIT" -C "$sync_move_store" ls-tree -r --name-only main -- README.md |
+  grep -qx README.md || fail "a fresh root did not commit the store README"
+
+# sync-set-remote refuses before it touches anything: a malformed URL is a
+# usage error, an unrelated remote and a divergent store history are refusals,
+# and origin survives all three.
+sync_move_url_status=0
+sync_run "$sync_move_store" "$sync_move/move-config.json" \
+  "$cli" sync-set-remote 'ext::sh -c whoami' >/dev/null 2>&1 || sync_move_url_status=$?
+[ "$sync_move_url_status" -eq 64 ] ||
+  fail "sync-set-remote accepted an alternate-transport URL (got $sync_move_url_status)"
+sync_move_unrelated_status=0
+sync_move_unrelated_error=$(sync_run "$sync_move_store" "$sync_move/move-config.json" \
+  "$cli" sync-set-remote "$sync_move/unrelated.git" 2>&1 >/dev/null) ||
+  sync_move_unrelated_status=$?
+[ "$sync_move_unrelated_status" -eq 65 ] ||
+  fail "sync-set-remote accepted an unrelated repository (got $sync_move_unrelated_status)"
+assert_contains "$sync_move_unrelated_error" 'not a roundhouse sync store'
+
+# A different fleet's store is a store, and still the wrong target: neither
+# main contains the other.
+"$REAL_GIT" init -q --bare -b main "$sync_move/other-empty.git"
+sync_write_config "$sync_move/other-config.json" other-host "$sync_move/other-empty.git"
+sync_run "$sync_move/other-store" "$sync_move/other-config.json" \
+  ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_move_absent_key" "$cli" sync-init >/dev/null ||
+  fail "sync-init for the divergent-store fixture failed"
+"$REAL_GIT" -C "$sync_move/other-store" push -q origin main ||
+  fail "publishing the divergent store failed"
+sync_move_divergent_status=0
+sync_move_divergent_error=$(sync_run "$sync_move_store" "$sync_move/move-config.json" \
+  "$cli" sync-set-remote "$sync_move/other-empty.git" 2>&1 >/dev/null) ||
+  sync_move_divergent_status=$?
+[ "$sync_move_divergent_status" -eq 65 ] ||
+  fail "sync-set-remote accepted a divergent store history (got $sync_move_divergent_status)"
+assert_contains "$sync_move_divergent_error" 'divergent'
+[ "$("$REAL_GIT" -C "$sync_move_store" remote get-url origin)" = "$sync_move/empty.git" ] ||
+  fail "a refused sync-set-remote still flipped origin"
+
+# The move itself: every local branch lands on the new remote, origin flips,
+# the store meta records where it came from, and the fleet gets an alert.
+"$REAL_GIT" init -q --bare -b main "$sync_move/new.git"
+sync_move_out=$(sync_run "$sync_move_store" "$sync_move/move-config.json" \
+  ROUNDHOUSE_SYNC_SIGNING_KEY="$sync_move_absent_key" \
+  "$cli" sync-set-remote "$sync_move/new.git") ||
+  fail "sync-set-remote to an empty remote failed"
+assert_contains "$sync_move_out" 'set sync.remote.url'
+assert_contains "$sync_move_out" 'never edits config.json'
+for sync_move_branch in main host/move-host; do
+  "$REAL_GIT" -C "$sync_move/new.git" show-ref --verify --quiet "refs/heads/$sync_move_branch" ||
+    fail "sync-set-remote did not publish $sync_move_branch to the new remote"
+done
+[ "$("$REAL_GIT" -C "$sync_move_store" remote get-url origin)" = "$sync_move/new.git" ] ||
+  fail "sync-set-remote did not flip origin to the new remote"
+jq -e --arg old "$sync_move/empty.git" '
+  (.previous_remotes | length) == 1 and .previous_remotes[0].url == $old and
+  (.previous_remotes[0].moved_at | type) == "string" and
+  .remote_visibility_verified == false and .remote_visibility_reason == "remote-moved"' \
+  "$sync_move_store/meta/host.json" >/dev/null ||
+  fail "sync-set-remote did not record the move in store meta"
+sync_move_alert=$(sync_run "$sync_move_store" "$sync_move/move-config.json" \
+  "$cli" sync-pending -) || fail "sync-pending after the move failed"
+printf '%s\n' "$sync_move_alert" | jq -e --arg url "$sync_move/new.git" '
+  [.alerts[] | select(.reason | test("moved to \($url)"))] | length == 1' >/dev/null ||
+  fail "sync-set-remote wrote no alert naming the new remote"
+# The old remote learns of the move too, best effort, so hosts still pointed at
+# it can read the alert.
+"$REAL_GIT" -C "$sync_move/empty.git" log --format=%s main | grep -q '^sync: alert ' ||
+  fail "the move alert never reached the old remote"
+
 # Run-lock and the first-push visibility gate.
 sync_gate_store="$sync_u4/gate-store"
 sync_gate_config="$sync_u4/gate-config.json"
@@ -8984,7 +9134,10 @@ done
 "$REAL_GIT" init -q --bare -b main "$sync_u4/foreign-remote.git"
 "$REAL_GIT" init -q -b main "$sync_u4/foreign-seed"
 printf 'foreign\n' >"$sync_u4/foreign-seed/marker.txt"
-"$REAL_GIT" -C "$sync_u4/foreign-seed" add marker.txt
+# The remote has to read as a sync store or sync-init refuses to adopt it; the
+# foreign HISTORY (not the repository's identity) is what this fixture is about.
+printf 'roundhouse-sync-store 1\n' >"$sync_u4/foreign-seed/.roundhouse-sync-store"
+"$REAL_GIT" -C "$sync_u4/foreign-seed" add marker.txt .roundhouse-sync-store
 "$REAL_GIT" -C "$sync_u4/foreign-seed" -c commit.gpgsign=false \
   -c user.email=foreign@example.invalid -c user.name=foreign commit -q -m 'foreign history'
 "$REAL_GIT" -C "$sync_u4/foreign-seed" push -q "$sync_u4/foreign-remote.git" main
@@ -9544,6 +9697,11 @@ sync_run "$sync_u6/pend-b-store" "$sync_u6/pend-b-config.json" "$cli" sync-init 
   fail "sync-init created an unrelated root instead of adopting the remote history"
 "$REAL_GIT" -C "$sync_u6/pend-b-store" show-ref --verify --quiet refs/heads/host/pend-b ||
   fail "an adopting sync-init did not create the host branch"
+# The adopted history carries the fingerprint marker (that is what made it
+# adoptable) and the adopting host commits nothing of its own on top.
+[ "$("$REAL_GIT" -C "$sync_u6/pend-b-store" show main:.roundhouse-sync-store)" = \
+  'roundhouse-sync-store 1' ] ||
+  fail "the adopted store history carries no fingerprint marker"
 sync_run "$sync_u6/pend-b-store" "$sync_u6/pend-b-config.json" \
   "$cli" sync-hold desired/all/plugins/from-b.json 'host B flagged this item' >/dev/null ||
   fail "sync-hold on host B failed"
@@ -9701,7 +9859,8 @@ sync_run "$sync_detect_store" "$sync_rf/detect-config.json" "PATH=$sync_root/fai
 "$REAL_GIT" init -q --bare -b main "$sync_rf/gitsign-remote.git"
 "$REAL_GIT" init -q -b main "$sync_rf/gitsign-seed"
 printf 'seed\n' >"$sync_rf/gitsign-seed/marker.txt"
-"$REAL_GIT" -C "$sync_rf/gitsign-seed" add marker.txt
+printf 'roundhouse-sync-store 1\n' >"$sync_rf/gitsign-seed/.roundhouse-sync-store"
+"$REAL_GIT" -C "$sync_rf/gitsign-seed" add marker.txt .roundhouse-sync-store
 "$REAL_GIT" -C "$sync_rf/gitsign-seed" -c commit.gpgsign=false \
   -c user.email=seed@example.invalid -c user.name=seed commit -q -m 'gitsign seed'
 "$REAL_GIT" -C "$sync_rf/gitsign-seed" push -q "$sync_rf/gitsign-remote.git" main
