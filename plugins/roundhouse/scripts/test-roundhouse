@@ -481,7 +481,8 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
         scenario=${CODEX_HOOK_SCENARIO:-update}
         writes=${CODEX_HOOK_WRITES_FILE:-/nonexistent}
         if [ "$scenario" = warning ] || [ "$scenario" = error ] ||
-          [ "$scenario" = unrelated-warning ] || [ "$scenario" = hookless ]; then
+          [ "$scenario" = unrelated-warning ] || [ "$scenario" = hookless ] ||
+          [ "$scenario" = not-installed ]; then
           # Real discovery warnings name the offending hooks.json path; the
           # validator only treats warnings mentioning the target plugin as
           # fatal, so an unrelated plugin's warning must not block approval.
@@ -554,6 +555,7 @@ if [ "${1:-}" = update ] && [ "$#" -eq 1 ]; then
   exit 0
 fi
 if [ "${1:-}" = plugin ] && [ "${2:-}" = list ] && [ "${3:-}" = --json ]; then
+  [ "${CODEX_HOOK_SCENARIO:-}" != not-installed ] || { printf '%s\n' '{"installed":[]}'; exit 0; }
   [ "${CODEX_PLUGIN_LIST_INVALID:-0}" != 1 ] || { printf '{invalid\n'; exit 0; }
   [ "${CODEX_PLUGIN_LIST_INVALID_SHAPE:-0}" != 1 ] || {
     printf '%s\n' '{"installed":[{"pluginId":"broken@test-market","name":"broken","marketplaceName":"test-market","version":7,"installed":true,"enabled":"yes"}]}'
@@ -912,6 +914,12 @@ for benign_scenario in unrelated-warning hookless; do
   [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
     fail "Codex hook approval wrote trust during benign $benign_scenario"
 done
+
+rm -f "$CODEX_HOOK_WRITES_FILE"
+if CODEX_HOOK_SCENARIO=not-installed \
+  "$cli" approve-codex-plugin-hooks example@test-market >/dev/null 2>&1; then
+  fail "Codex hook approval reported success for an uninstalled plugin"
+fi
 
 rm -f "$CODEX_HOOK_WRITES_FILE"
 printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"

@@ -197,6 +197,40 @@ async function verifyTrust(pluginId, cwd, wanted, rejectNewTrusted) {
   return hooks;
 }
 
+function pluginInstalled(pluginId) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("codex", ["plugin", "list", "--json"], {
+      stdio: ["ignore", "pipe", "inherit"],
+      windowsHide: true,
+    });
+    let out = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+      if (out.length > 4 * 1024 * 1024) {
+        child.kill();
+        reject(new Error("codex plugin list output exceeded 4 MiB"));
+      }
+    });
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("codex plugin list timed out"));
+    }, TIMEOUT_MS);
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(`codex plugin list failed (${code ?? "signal"})`));
+      try {
+        const installed = JSON.parse(out)?.installed;
+        resolve(Array.isArray(installed) &&
+          installed.some((p) => p?.pluginId === pluginId && p?.installed !== false));
+      } catch {
+        reject(new Error("codex plugin list returned invalid JSON"));
+      }
+    });
+  });
+}
+
 function runCodexPluginAdd(pluginId) {
   return new Promise((resolve, reject) => {
     const child = spawn("codex", ["plugin", "add", pluginId, "--json"], {
@@ -228,7 +262,11 @@ async function main() {
       // A hookless plugin is the normal case, not an error: approve means
       // "trust whatever hooks this plugin currently ships", and zero is a
       // valid answer. Automation runs approve after every install/update
-      // without knowing the hook count in advance.
+      // without knowing the hook count in advance. But zero hooks also
+      // looks identical to "plugin not installed at all" (observed live:
+      // a codex plugin remove/add cycle dropped a sibling plugin's
+      // registration), so verify registration before calling it benign.
+      if (!(await pluginInstalled(pluginId))) fail(`plugin not installed: ${pluginId}`);
       process.stdout.write(`${JSON.stringify({ pluginId, approved: 0 })}\n`);
       return;
     }

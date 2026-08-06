@@ -102,7 +102,7 @@ The only pre-helper fallback is a separately approved self-update of
 `roundhouse@novotnyllc` from an integrity-verified release that lacks
 `update-codex-plugin`. After upgrading the `novotnyllc` marketplace, run exactly
 `codex plugin add roundhouse@novotnyllc --json`, recapture inventory,
-reload the new target-native plugin, and require its version `0.3.4` executor
+reload the new target-native plugin, and require its version `0.3.5` executor
 and integrity verification before any other mutation. Never use that raw-add
 fallback for another plugin or once the helper command is available.
 
