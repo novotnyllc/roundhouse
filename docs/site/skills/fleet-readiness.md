@@ -41,7 +41,7 @@ command execution.
 **Desired-state sync's doctor checks live in `fleet-agents`, not here.**
 This skill (and `railyard:doctor`) reads that list as authoritative and
 never paraphrases it — see
-[`fleet-agents`'s doctor check contract](fleet-agents.md#desired-state-sync)
+[`fleet-agents`'s Desired-state sync checks](fleet-agents.md#desired-state-sync)
 for the actual checks.
 
 **Hardware pairing.** Machine entries that share a `physical_host` value

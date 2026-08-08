@@ -93,22 +93,33 @@ afterward.
 
 ### Unattended schedule
 
-Auto-updating on a schedule uses the OS scheduler calling the harness — no
+Auto-updating on a schedule uses the OS scheduler calling the CLI — no
 new daemon, database, or engine. **There's exactly one owned scheduler
 entry per host, and desired-state sync owns it**: this update step is
-absorbed into sync's single entry, which drives marketplace refresh,
-package updates, and the sync run together — so two local runners never
-race one plugin cache. `railyard:setup` installs the entry on request and
-migrates an existing autoupdate entry into it. On macOS it's a per-user
-launchd agent
-(`~/Library/LaunchAgents/com.novotnyllc.roundhouse.autoupdate.plist`);
-Linux uses a systemd user timer; Windows a per-user scheduled task — all
-running the same fixed unattended prompt through the installed harness,
-kept in lockstep with [`fleet-agents`](fleet-agents.md)'s sync doctrine. A
-local run-lock enforces one runner at a time per host: a second run exits
-75 and stops rather than forcing through. Failures land in
-`~/.local/state/roundhouse/autoupdate.log` and surface at the next
-`railyard:doctor` run.
+absorbed into sync's single entry, so two local runners never race one
+plugin cache. Package updates aren't a separate job — the full cadence
+does them on the same convergence that applies everything else.
+`railyard:setup` installs the entry on request and absorbs an existing
+autoupdate entry into it.
+
+The entry drives two cadences from one owned slot:
+`roundhouse fleet-run --fast` every 20 minutes ± 5, and
+`roundhouse fleet-run --full` every 12 hours ± 90 minutes, which is the
+pass that refreshes marketplaces and updates unpinned packages. On macOS
+it's a per-user launchd agent
+(`~/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist`); Linux
+uses a systemd user timer pair with `Persistent=true`; Windows a per-user
+scheduled task. Both intervals are jittered from the host **name**, and
+the interval keys live in the store's policy block rather than on the
+machine being governed — see [running it](../operating.md#the-scheduler).
+
+A local run-lock enforces one runner at a time per host: a second run
+finds the lock held and exits 0 without acting, which is the ordinary
+overlap rather than a failure. Exit 75 is the *stale*-lock refusal — a
+lock past two full cadences, or one whose metadata can't be read — and it
+names the recovery instead of forcing. Failures land in the store's own
+alert and journal records, surface in `roundhouse fleet-pending`, and are
+reported at the next `railyard:doctor` run.
 
 ### Protected package actions
 

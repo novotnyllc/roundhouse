@@ -110,45 +110,59 @@ Windows processes under the identity `iris` enrolled with.
 
 You turn sync on a few weeks in — the fleet's grown enough that "did I
 update roundhouse everywhere" stopped being a question you wanted to answer
-by hand. `railyard:setup` (or a direct "turn on fleet sync") scaffolds
+by hand. `roundhouse fleet-init` scaffolds
 `~/.config/roundhouse/store/` on `loom` as a jj repository colocated with
-git, creates or verifies a private remote with an explicit visibility
-check, and absorbs the existing machine registry from `config.json` into
-the store's `main` branch. Each host provisions its own scoped store
-credential when it joins.
+git; `fleet-enroll` mints `loom`'s own node key and writes the roster
+commit that *is* the store's genesis; `fleet-set-remote` and
+`fleet-verify-remote` attach a private remote and prove it's gated before
+the first push; and `fleet-seed` writes `hosts/loom.yaml` and
+`applied/loom.yaml` from what's actually installed, so the first
+convergence is a no-op by construction. See
+[the fleet store](store.md) for what lands in the tree.
 
-From here, one scheduled entry per host — twice daily, jittered, plus
-"sync now" on demand — drives three phases, in order, under a local
-run-lock so two runs on one host can never race each other.
+From here, one scheduled entry per host drives **two cadences**, both
+jittered from the host name, under a local run-lock so two runs on one
+host can never race each other.
 
 ```mermaid
 flowchart TD
     subgraph Host["each host, on its schedule"]
-        A[1. Update] --> B[2. Apply-time review] --> C[3. Sync + converge]
+        F["fast — 20 min ± 5"] --> P[poll floor: head check,<br/>unpushed, dirty, converged]
+        P -->|nothing moved| X[exit]
+        P -->|something moved| G[fetch, reconcile,<br/>promote gate]
+        G --> B[per-item gates:<br/>divergence, signature,<br/>ownership, canary]
+        B -->|passes| A[apply]
+        B -->|flagged| HOLD[hold un-applied,<br/>alert, never guess]
+        A --> J[(applied/ + journal/<br/>+ push + nudge)]
+        HOLD --> J
     end
-    A -->|fresh within cadence| SKIP1[skip, converge from store]
-    A -->|stale, host capable| LEASE[take short-TTL lease,<br/>run upstream's own updater,<br/>commit + freshness]
-    B -->|clean diff| PASS[apply]
-    B -->|flagged| HOLD[hold un-applied,<br/>alert, never guess]
-    C --> J[(host journal<br/>+ store commit)]
+    U["full — 12 h ± 90 min"] --> F
+    U --> M[marketplace refresh,<br/>unpinned packages, re-seed,<br/>proposals, retention, doctor]
 ```
 
-**Phase 1 — update, once per fleet, not per machine.** Freshness per
-upstream lives on `main`. When `loom` wakes up for its scheduled run and
-finds a plugin marketplace stale beyond its cadence, it takes an
-opportunistic short-TTL lease — a marker committed to `main`; if `wharf`
-grabs it first, that's a lost race, not a failure, and `loom` just skips.
-The leaseholder runs the upstream's own update mechanism and commits the
-result plus a fresh timestamp. File-carried surfaces (skills, agents,
-hooks, config keys) get their updated content committed straight to the
-store — every *other* host just replicates it, no upstream contact needed.
+**The fast run is the propagation path.** Its floor is a cheap head check
+— one `git ls-remote` round trip, plus "is anything here unpushed," "is
+the working copy dirty," and "has this host already converged against what
+it's holding." All quiet means exit, so a short interval is a bandwidth
+decision rather than a load one. After a push, the host nudges whichever
+peers it can reach; the nudge carries no data, and a peer that misses it
+converges on its next poll instead.
+
+**The full run is maintenance.** It refreshes marketplaces, updates
+unpinned packages, re-seeds, emits promotion proposals, ages evidence and
+expired leaf entries out, and finishes with `fleet-doctor`. Freshness per
+upstream is one file per host per upstream (`upstreams/<id>/<host>.yaml`),
+so hosts never contend over a shared marker — jitter is the whole
+coordination primitive. File-carried surfaces (skills, agents, hooks,
+config keys) get their content committed straight to the store, and every
+*other* host replicates it with no upstream contact needed.
 
 Manager-installed items (plugins) work differently: the store carries the
 version *pin*, and each host installs that pin locally through its own
-plugin manager. Roundhouse's own plugin updates last, and only on the
-leaseholding host — its new pin doesn't reach the rest of the fleet until
-that host's next run journals healthy. A bad release of the sync machinery
-lands on one host, not four.
+plugin manager. Roundhouse updating *itself* is gated separately, through
+`roundhouse fleet-adopt-pin`, because the code deciding whether an update
+is safe is the code being updated — so a bad release of the sync machinery
+lands on the host that adopted it, not on four.
 
 Codex adds one wrinkle to that pin story. It never runs `git fetch`
 against a local-checkout marketplace on its own — keeping that checkout
@@ -156,8 +170,8 @@ current is sync's job. Once the checkout is current, though, Codex quietly
 advances its own installed plugin versions on the next plugin listing;
 sync doesn't need to force a reinstall for that part.
 
-**Phase 2 — apply-time review, on every host, every source.** This is the
-phase that matters most. Before anything changed gets materialized or
+**Apply-time review, on every host, every source.** This is the
+part that matters most. Before anything changed gets materialized or
 installed, the *applying* host — not the machine that happened to fetch it
 from upstream — diffs current against incoming and reads it. Changes,
 including breaking ones, are expected and fine. What gets held is new
@@ -173,29 +187,36 @@ Nothing is ever silently applied and nothing is ever silently forgotten: a
 held item is a durable record, and `railyard:doctor` tracks it until
 someone resolves it.
 
-**Canary gating adds a second brake beyond review.** When
-`sync.canary_group` is set, only members of that group adopt a changed
-item right away; every other host waits for a canary's journal to record
-a healthy run carrying that item at the exact same content digest, held
-for `sync.canary_wait_hours` (24 by default). There's no per-host bypass —
-widening who counts as canary is a registry change, visible to the whole
-fleet.
+**Canary gating adds a second brake beyond review.** Members of
+`policy.canary_group` adopt a changed item right away; every other host
+waits for a canary's journal to record that item applied at the exact same
+content digest, standing for `policy.canary_wait_hours` (24 by default)
+with no later `held` or `reverted` record — *and* for that canary to have
+published something since, so a machine that applied an item, broke, and
+went quiet blocks promotion instead of granting it. Both keys live in the
+store's own `fleet.yaml`, so widening who counts as canary is a signed,
+reviewed store edit visible to the whole fleet. The one bypass is
+`fleet-rollback --now`, which is bound to a revert that verifies against
+history, journaled as an override, and counted by doctor.
 
-**Phase 3 — converge and propose.** Each host aligns to its effective
-desired set: union of the groups and scopes that apply to it, with
-machine-level settings beating group-level ones whenever they conflict.
-Removals propagate by default — absent from desired state means removed,
-and every removal is reported by name, never silently. The host's full
-snapshot commits to its own `host/<name>` branch (single-writer, enforced
-by commit signatures, so `iris`'s branch can never be written by anything
-but `iris`).
+**Converge and propose.** Each host aligns to its effective desired set —
+the four layers folded low to high, with the host's own file winning ties.
+Removal is bounded by ownership: an item is uninstalled because it appears
+in this host's `applied/<name>.yaml` *and* left the layers, so software
+roundhouse never installed is never touched, and a run whose removal set
+blows past `max_removals_per_run` or `max_removal_fraction` holds the
+whole set. Every removal is reported by name. What a host applied is
+published under its own `applied/<name>.yaml` and `journal/<name>/`
+paths on the single `main` bookmark — single-writer, enforced by the
+path-to-identity rule, so `iris`'s records can never be written by anything
+but `iris`. There is no per-host branch.
 
-Those signatures check against each host's own
-`allowed_signers` file, derived from its CA enrollment material and
-regenerated with `roundhouse sync-refresh-signers` whenever that identity
-changes; a revocation lands in the KRL that every verification reads
-fresh, so a compromised key stops verifying immediately, no re-sync
-required.
+Those signatures check against each host's own `allowed_signers` file,
+derived by the trust ratchet from the roster in `trust/signers.yaml` at
+each commit's own parents — there is no CA and no certificate, only the
+per-machine key each host mints for itself. A revocation lands in the KRL
+that every verification reads fresh, so a compromised key stops verifying
+immediately, no re-sync required.
 
 If a host makes a genuine local decision — you installed
 something by hand on `birch` — that becomes an outward proposal at the
@@ -203,16 +224,21 @@ something by hand on `birch` — that becomes an outward proposal at the
 separate cross-host evidence.
 
 **What gets journaled:** every run's what-and-why lands in the host
-journal and, via jj's operation log, is individually undoable — reverting
-one bad run doesn't disturb three unrelated good ones that happened after
-it.
+journal, and the run records its starting jj operation id, so
+`jj op restore` puts this one machine back to exactly where it was before
+that run — host-local, immediate, and touching nothing anyone else did.
 
 **How conflicts hold rather than guess:** when two hosts touch the same
 item in ways that disagree, jj records it as a real conflict commit
-instead of silently picking a winner or wedging the working copy.
-Convergence never materializes a conflicted item — it keeps serving the
-last conflict-free state, holds that one item, and lets the rest of the run
-proceed normally. `iris`, being interactive-session-only (logged-off
+instead of silently picking a winner or wedging the working copy. The hold
+set comes from comparing each head's *resolved value* per item, so one
+contested key holds that key and everything else in the same file
+converges. The run's own agent then resolves it from evidence — signed
+file content first, a peer's journal next, and a self-asserted line in a
+commit message never winning on its own — escalating only when a human is
+on either side or nothing is grounded enough to decide. Held items are
+journaled as held; nothing is ever applied because it was confusing.
+`iris`, being interactive-session-only (logged-off
 Windows can't produce activation evidence, and logoff kills `iris-wsl` too),
 is *expected* to run stale sometimes — doctor names that explicitly rather
 than treating it as a failure indistinguishable from a genuinely broken
@@ -224,24 +250,35 @@ A month in, `birch` and `loom` both touched the same shared skill config
 key within a day of each other — one from an upstream update, one from you
 editing it by hand on `birch` before a flight.
 
-**Intent resolution** weighs evidence in a fixed order, and timestamps are
-never the decision by themselves:
+**The run's agent resolves it**, on a ladder where every rule is labelled
+by what grounds it. Signed file content is the strongest evidence, a
+peer's journal — bound to that peer by signature, so it can only lie about
+itself — is next, and free text in a commit message is self-asserted. A
+self-asserted field may point at evidence to check or trigger an
+escalation; it can never win a contest on its own. Stopping at the first
+rule that fires:
 
-1. **Store history** — who changed what, on which host, in which run.
-2. **Provenance** — an upstream-driven change isn't a human decision; your
-   hand-edit on `birch` is.
-3. **Redacted transcript findings** — each host mines its *own* session
-   transcripts locally (last ~48 hours, extensible) and contributes only
-   redacted findings — item, verdict, a bounded quote, no secrets — as
-   records on `main`. Resolution happens from those findings anywhere in
-   the fleet; the raw transcripts themselves never leave the host that
-   produced them.
+1. **Not actually contested** — both sides resolve to the same value.
+   Converge.
+2. **A human is on either side** — escalate. A commit with no roundhouse
+   trailers reads as a human edit, so your hand-edit on `birch` escalates
+   whether or not it carries a marker. This is checked before any
+   arbitration, because that's the moment a person's intent is at stake.
+3. **A verified revert** — one side equals what the change it names
+   replaced, *and* the other equals what that change set. That side wins.
+4. **Verified applied-elsewhere, exactly one side** — one value is
+   recorded applied in a peer's journal and not since reverted there, and
+   the other isn't.
+5. **Both sides agent-authored, more than one fast interval apart** — the
+   later one wins, on the reasoning that it saw more recent upstream state.
+6. **Otherwise** — hold the item, alert, converge everything else.
 
-Confident evidence resolves the conflict at the scope the evidence actually
-supports — fleet-wide only when the evidence is fleet-wide. Ambiguous
-evidence **holds the divergence and alerts**, and waits for you. It never
-resolves destructively on a guess, and a long-offline host whose evidence
-window has already lapsed defaults to hold for the same reason.
+A resolution is an ordinary commit: signed, re-reviewed by every receiving
+host, canary-gated, and revertable. It's also journaled with an
+`outcome: resolved` record naming both sides and the resolution commit, so
+any peer can reconstruct what was contested and why. Here, rule 2 fires —
+your `birch` hand-edit is on one side — so the item holds and waits for
+you.
 
 **Holds and alerts:** an alert is three things at once — a durable record
 on `main`, a line in the host journal, and, when someone's actually at a
@@ -251,18 +288,24 @@ terminal on `wharf` can be how you find out `iris` has something waiting.
 `railyard:doctor` is the scheduled backstop for anything nobody happened to
 see live — pending items past a threshold escalate in its report.
 
-**Rollback and the restore sequence:** undoing one bad sync run is a jj
-operation-log revert, scoped to that run alone. Restoring a whole machine —
-say `loom`'s disk dies — is honestly scoped as **configs plus a shopping
-list**, sequenced:
+**Rollback and the restore sequence:** getting a bad *change* off the
+fleet is `roundhouse fleet-rollback ITEM` — a signed revert commit that
+flows through the same review, canary, and apply gates as everything else,
+which is exactly why it can be trusted. Undoing one bad *run on one box*
+is `jj op restore`, host-local and immediate.
+
+Restoring a whole machine — say `loom`'s disk dies — is honestly scoped as
+**configs plus a shopping list**, sequenced:
 
 1. Re-enroll `loom` through `fleet-hosts` (a fresh SSH ceremony — the old
    identity is gone with the disk).
-2. Provision a new store credential for the re-enrolled host.
-3. Materialize every file-carried surface from `host/loom`'s last known
-   snapshot.
-4. Replay manager installs (plugins) from that same snapshot's inventory.
-5. Work the auth shopping list — per-artifact reauth the store was never
+2. `roundhouse fleet-reconstitute loom` from any enrolled host: one commit
+   that records the rebuild in `lineage/`, installs the new node key,
+   retires the old entry, and reparents anything the old `loom` sponsored.
+3. Let the fast run converge `loom` from the store. Every file-carried
+   surface and every plugin pin is desired state it already replicates,
+   and `applied/loom.yaml` is adopted in place rather than mass-disowned.
+4. Work the auth shopping list — per-artifact reauth the store was never
    allowed to carry for you, because it never stored a secret in the first
    place.
 
@@ -367,6 +410,11 @@ the moment it matters, every time.
 ## Go deeper
 
 - **[The value proposition](index.md)**
+- **[The fleet store](store.md)** — what the repository holds, and the layer fold.
+- **[How a change travels](convergence.md)** — this page's chapter 3, in full detail.
+- **[Trust](trust.md)** — the ratchet, enrollment, revocation.
+- **[Why jj](why-jj.md)** — what the version control buys.
+- **[Running it](operating.md)** — the verbs, the schedule, doctor.
 - **[Where this fits next to what you already know](comparison.md)**
 - **[Configuration reference](config.md)**
 - **[Skills index](skills/)**

@@ -1,12 +1,14 @@
 # Configuration reference
 
 One JSON file describes your fleet: every machine, every project, every
-capability, every credential, and — if you've opted in —
-[fleet sync](skills/fleet-agents.md)'s own settings. `roundhouse
-validate-config` checks it against a strict JSON Schema before anything
-reads it, and that schema is stricter than "well-formed JSON": several
-blocks reject *any* key they don't recognize, on top of checking the keys
-they do.
+capability, and every credential. `roundhouse validate-config` checks it
+against a strict JSON Schema before anything reads it, and that schema is
+stricter than "well-formed JSON": several blocks reject *any* key they
+don't recognize, on top of checking the keys they do.
+
+Desired-state sync keeps its own settings elsewhere — in
+[the fleet store](store.md), which is signed, reviewed, and fleet-wide
+rather than a knob on the machine being governed.
 
 ## File location and resolution order
 
@@ -45,7 +47,6 @@ match `^[A-Za-z0-9._-]+$`), and it must have at least one entry.
 | `groups` | no | array of id-pattern strings |
 | `package_managers` | no | array of `homebrew`, `linuxbrew`, `apt`, `winget` |
 | `dev_root` | — | free-form (not schema-validated; conventional value, e.g. `~/dev`) |
-| `sync` | no | per-machine sync override, see below |
 | `privilege_broker` | no | broker enrollment block, see below |
 | `wsl_interop_via` | no | free-form (not schema-validated — see note) |
 | `physical_host` | no | free-form (not schema-validated — see note) |
@@ -77,19 +78,6 @@ entry shows the shape:
 "physical_host": "<shared-hardware-name>"
 ```
 
-### Per-machine `sync` override
-
-Optional, and — unlike most of this schema — an **exact-key-set** block:
-only `enabled`, `store_path`, and `store_url` are allowed; anything else
-fails validation. All three are individually optional:
-
-- `enabled`: boolean.
-- `store_path`: non-empty string.
-- `store_url`: must pass the [sync URL predicate](#the-sync-url-predicate).
-
-This lets one machine point at a different store or opt out of sync
-without touching the top-level [`sync`](#sync) block.
-
 ### `privilege_broker`
 
 Optional; also an **exact-key-set** block — only `automation_transport`
@@ -117,7 +105,7 @@ and `policy_proposal` are allowed.
     `request_sid`.
 
   In every case the key set is checked exactly — an extra key here fails
-  the same way an unknown key in `sync` does.
+  validation rather than passing through ignored.
 
 `config.example.json`'s `linux` and `windows` entries show both shapes.
 
@@ -290,36 +278,26 @@ wired-up contract — flag any change to its meaning against the actual
 skill behavior at the time, rather than assuming these keys already gate
 something.
 
-## sync
+## Where sync gets its settings
 
-The top-level `sync` block turns on [fleet-wide desired-state
-sync](skills/fleet-agents.md#desired-state-sync). It's optional — omit it
-entirely and nothing about sync activates — but when present it is an
-**exact-key-set** block: only `cadence_hours`, `canary_group`,
-`canary_wait_hours`, `enabled`, `remote`, and `store_path` are allowed.
+Desired-state sync is configured in the store it governs, not in
+`config.json`. `roundhouse validate-config` reads no `sync` block, and a
+leftover one in an existing file passes through ignored — delete it.
 
-| Key | Required when `sync` present | Shape |
-| --- | --- | --- |
-| `enabled` | yes | boolean |
-| `remote` | yes | object with *exactly* the key `url` |
-| `remote.url` | yes | passes the [sync URL predicate](#the-sync-url-predicate) |
-| `cadence_hours` | yes | number, `0 < n ≤ 8760` (one year) |
-| `store_path` | no | non-empty string |
-| `canary_group` | no | id-pattern string — registry group whose members are canary hosts for this fleet |
-| `canary_wait_hours` | no | integer, `0 ≤ n ≤ 8760`; default `24` — how long a canary's healthy run must have stood before non-canary hosts adopt |
+| Setting | Where it lives |
+| --- | --- |
+| The store's remote | jj's own `origin`, set by `roundhouse fleet-init` and moved by `roundhouse fleet-set-remote` |
+| The store's path | `ROUNDHOUSE_FLEET_STORE`, else `${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/store` |
+| This host's identity, key, and store id | `~/.config/roundhouse/identity.yaml` |
+| Cadences, jitter, canary group and wait, removal caps, push nudge, evidence retention | `policy:` in the store's own `fleet.yaml` — see [Running it](operating.md#policy-keys) |
 
-`enabled`, `remote`, and `cadence_hours` are unconditionally required the
-moment the `sync` object exists at all — there's no "present but off"
-shape beyond `enabled: false` itself. `config.example.json` ships exactly
-that: `sync.enabled` is `false`, but `remote.url` and `cadence_hours` are
-still filled in, because the schema requires them regardless.
+### The remote URL predicate
 
-### The sync URL predicate
-
-Because `remote.url` (and a machine's `sync.store_url`) travels directly
-into `git fetch` / `git remote add` as an argument, the schema accepts
-only the forms it can fully reason about — no query strings, no whitespace,
-and exactly three URL shapes:
+A remote URL travels directly into `git fetch` / `git remote add` as an
+argument, so one predicate — enforced by `fleet-set-remote`, `fleet-join`,
+and every peer URL the store builds — accepts only the forms it can fully
+reason about: no query strings, no whitespace, and exactly three URL
+shapes.
 
 - `https://` or `ssh://` **without embedded userinfo** — `https://github.com/owner/repo.git` passes; `ssh://git@host/path` does **not**, because the scheme form rejects any `@` in the remainder.
 - **scp-like** `user@host:path` — this is where the SSH+userinfo case
@@ -329,8 +307,12 @@ and exactly three URL shapes:
   `file:///abs/path`.
 
 Anything else — `ext::`, other custom transports, credential-bearing
-URLs, or a string with a space or a `?` in it — is refused at config-load
-time, before it ever reaches `git`.
+URLs, option-looking strings, or anything carrying a space or a `?` — is
+refused before it ever reaches `git`. The same predicate guards every
+`hostname`, `tailnet_name`, `user`, and host name that reaches
+`~/.ssh/config.d/roundhouse` or a peer URL, so a newline in a store field
+can't inject ssh_config directives; a match refuses to render and alerts
+rather than emitting a partial file.
 
 ## Other top-level keys
 
@@ -355,7 +337,7 @@ tied to a specific broker rendering, not a template to copy by hand.
 ## A worked example
 
 Trimmed from `config.example.json` — a two-machine fleet, one project, one
-capability, sync turned on:
+capability:
 
 ```json
 {
@@ -386,13 +368,6 @@ capability, sync turned on:
       "groups": ["development"],
       "codex": true
     }
-  },
-  "sync": {
-    "enabled": true,
-    "store_path": "~/.config/roundhouse/store",
-    "remote": { "url": "git@configured-git-host:owner/private-fleet-store.git" },
-    "cadence_hours": 24,
-    "canary_group": "development"
   },
   "capabilities": {
     "roundhouse": {
@@ -449,18 +424,15 @@ file exists at the resolved identity path — validates that separately too.
 keys on a `machine`, a `project`, or an `auth_artifact` entry are
 ignored (which is how `dev_root`, `groups`, `codex`, `wsl_interop_via`,
 and `physical_host` all pass through unvalidated in the blocks above).
-Three parts of the schema are deliberately the opposite — the top-level
-[`sync`](#sync) block, a machine's [`sync`](#per-machine-sync-override)
-override, and [`privilege_broker.automation_transport`](#privilege_broker)
-— checking `keys == [...]` (or `keys | sort == [...] | sort`) exactly.
-Get one of those three blocks even slightly wrong — a typo'd key, an extra
-field copied from a different example, a leftover key from a prior
-version — and validation fails loudly at config-load time instead of the
-extra key being silently ignored somewhere downstream. That's deliberate:
-these three blocks gate either fleet-wide replication or a network
-transport that reaches a privilege broker, and a silently-ignored unknown
-key in either place is exactly the kind of drift this validator exists to
-catch before it reaches a live host.
+[`privilege_broker.automation_transport`](#privilege_broker) is
+deliberately the opposite, checking `keys == [...]` (or
+`keys | sort == [...] | sort`) exactly. Get it even slightly wrong — a
+typo'd key, an extra field copied from a different example — and
+validation fails loudly at config-load time instead of the extra key being
+silently ignored somewhere downstream. That's deliberate: this block gates
+a network transport that reaches a privilege broker, and a
+silently-ignored unknown key there is exactly the kind of drift this
+validator exists to catch before it reaches a live host.
 
 Every string anywhere in the document, at any depth, is also capped at
 8192 characters and rejected if it contains a control character — a
@@ -474,6 +446,10 @@ blanket backstop, not specific to any one block.
 | `projects`, `handoff_project` | [`fleet-projects`](skills/fleet-projects.md) |
 | `capabilities`, `skill_roots`, `agent_artifacts` | [`fleet-agents`](skills/fleet-agents.md) |
 | `auth_artifacts` | [`fleet-auth`](skills/fleet-auth.md) |
-| top-level `sync`, machine `sync` | [`fleet-agents`](skills/fleet-agents.md)'s desired-state sync |
 | `privilege_broker` | [`fleet-hosts`](skills/fleet-hosts.md) enrollment, consumed at apply time across `fleet-auth`, `fleet-chezmoi`, and `fleet-update` |
 | `package_managers`, `policy` | [`fleet-update`](skills/fleet-update.md) |
+
+Desired-state sync reads none of this file. `fleet-doctor`'s
+`machine-truth` row compares the two facts that overlap — `platform` and
+`groups` — between a machine's entry here and its `hosts/<name>.yaml` in
+the store, and reports a disagreement.

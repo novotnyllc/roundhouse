@@ -52,3 +52,10 @@ Work routing and delivery live in
 [`railyard`](https://github.com/novotnyllc/railyard); craft skills in
 [`agent-utilities`](https://github.com/novotnyllc/agent-utilities). Charter
 and boundaries: [AGENTS.md](AGENTS.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE), which preserves the upstream copyright notice
+for the `remote-mac` and `ssh-doctor` skills adapted from
+`steipete/agent-scripts` (MIT). Incorporations are itemized in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

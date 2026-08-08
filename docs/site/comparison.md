@@ -71,7 +71,7 @@ What it doesn't answer is "is machine four consistent with machine one,"
 "can I trust the version that just showed up before it runs," or "if I
 walked away for a week, what needs my attention now." That's the layer this
 system adds on top: cross-machine convergence with groups and scopes,
-signed commits over a fleet SSH CA with host-local trust verification,
+signed commits over per-machine keys with host-local trust verification,
 apply-time review as a supply-chain gate independent of where content
 originated, and durable evidence — journals, provenance records, held-item
 alerts — instead of a marketplace's point-in-time install log.
@@ -85,16 +85,19 @@ among tools that look similar on the surface:
   the diffing, the review, and the delivery — through skills, in the same
   harness you already talk to — rather than a separate control plane you
   learn independently.
-- **Evidence over timestamps.** When state disagrees between hosts,
-  resolution weighs store history, then provenance, then locally-mined
-  redacted findings — never "whichever wrote last."
+- **Evidence over timestamps.** When state disagrees between hosts, the
+  run's own agent resolves it on a ladder ranked by what grounds each
+  rule — signed file content first, a peer's signed journal next, and a
+  self-asserted line in a commit message never winning on its own. Never
+  "whichever wrote last," and never a merged value that exists in no
+  commit.
 - **Apply-time review as a supply-chain gate.** Every changed item is
   screened on the host where it's about to *run*, regardless of where it
   came from — the gate that actually covers a compromised store, not just a
   compromised upstream.
 - **Signed store, host-local trust.** Commits are signed by enrolled host
-  keys over a fleet SSH CA; every host verifies before applying; there's no
-  step where "the network delivered it" is treated as "therefore trusted."
+  keys the roster lists by value; every host verifies before applying; there's
+  no step where "the network delivered it" is treated as "therefore trusted."
 - **Opt-in, everywhere, by layer.** Fleet sync is off until you turn it on.
   Privileged actions need enrollment, activation, *and* a per-binding grant
   — three separate yeses, not one master switch.
@@ -120,5 +123,7 @@ MDM for device policy — are the right center of gravity, not this one.
 
 - **[The value proposition](index.md)**
 - **[The fleet's life, end to end](lifecycle.md)**
+- **[The fleet store](store.md)**
+- **[Trust](trust.md)**
 - **[Configuration reference](config.md)**
 - **[Skills index](skills/)**

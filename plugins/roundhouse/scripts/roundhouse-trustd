@@ -1,0 +1,427 @@
+#!/usr/bin/env bash
+set -eu
+
+# roundhouse-trustd — the root-owned materializer for §7.9's local trust state.
+#
+# THREAT MODEL, stated where the code that enforces it lives:
+#
+#   WHAT THIS DEFENDS. The host verifies signed history against a set of
+#   LOCAL materialized files — the roster (allowed_signers), reviewed-ref,
+#   generation, and the KRL, under $TRUST (§7.9). Those files are same-user
+#   writable in the degraded rung, so a process that already holds this host's
+#   signing key can locally TRUNCATE the KRL or edit the roster to UN-REVOKE
+#   its own key AFTER the fleet has revoked this host — persistence past
+#   revocation. trustd re-derives those files from the store's verified signed
+#   history and writes them ROOT-OWNED (root:wheel), so a same-user process can
+#   no longer rewrite them and the un-revocation does not survive the next run.
+#
+#   WHAT THIS DOES NOT DEFEND. This is NOT entry protection. A same-user
+#   attacker already holds ~/.ssh/roundhouse_node_ed25519 — the signing key
+#   must be readable by the process that signs — so they ARE this machine and
+#   do not need to self-enrol. Root ownership does not prevent that. It buys
+#   exactly one narrower but genuinely valuable property:
+#   PERSISTENCE PAST REVOCATION of the compromised host. Nothing here is a
+#   substitute for revoking the key in the roster, which is the in-band lever
+#   that bites the host's FUTURE commits everywhere within one interval
+#   (§7.1b, §7.3a C).
+#
+#   WHY INVOKING trustd CANNOT INJECT A HOSTILE ROSTER. trustd is root-invoked
+#   but a same-user attacker can call it directly with any argument, so it
+#   trusts NONE of its same-user input. Its only trusted inputs are the signed
+#   jj history and the genesis pin. It re-derives the roster the same way the
+#   read path does — by REPLAYING THE RATCHET (§7.1) from its own root-owned
+#   reviewed-ref high-water mark (or the genesis pin, on first apply) up to the
+#   revision it is asked to adopt, holding every commit that does not verify
+#   against the roster at ITS OWN parents. A roster edit signed by a key the
+#   parent commit did not trust is refused, so a hostile working-copy edit
+#   committed and handed to `trustd apply` never materializes. And because the
+#   reviewed-ref and generation high-water marks are ROOT-OWNED, the attacker
+#   cannot rewind them: a truncated/rolled-back head fails the descendant and
+#   generation gates and materializes nothing.
+#
+# THE CONTRACT. `roundhouse-trustd apply <store> <reviewed-rev>` is what
+# lib/fleet-trust.sh's fleet_trust_materialize invokes on the privileged lane
+# (fleet_trust_privileged resolves this binary at /usr/local/libexec/
+# roundhouse-trustd). The run replays the ratchet unprivileged and calls this
+# helper, which recomputes the result independently — it does not trust the
+# run's output.
+#
+# INSTALL / CONSENT. trustd is installed ROOT-OWNED via the same one-time,
+# consented privileged step that installs the POSIX broker (the
+# `enroll-privilege-posix install` lane): a deliberate setup action, never
+# interactive sudo in the unattended run path. Until that step has run, the
+# resolver reports no privileged lane and fleet_trust_materialize degrades to
+# same-user WITH a doctor finding (§7.9's degraded rung, residual 5) — the
+# degradation is reported every run, never silently accepted. Installing this
+# helper is the upgrade; nothing else in §7 changes when it lands.
+#
+# ROOT-OWNERSHIP OF THIS BINARY AND THE CODE IT SOURCES IS LOAD-BEARING. A
+# same-user-writable trustd — or a same-user-writable copy of the roundhouse
+# library it sources — is trustd defeated, because root would then run attacker
+# code. fleet-doctor asserts this binary's ownership; the sourced tree must be
+# installed root-owned beside it (see the trustd security-review residual).
+
+umask 022
+export LC_ALL=C LANG=C TZ=UTC
+
+trustd_die() {
+  printf 'roundhouse-trustd: %s\n' "$1" >&2
+  exit "${2:-64}"
+}
+
+# THE HERMETIC ROOT LANE. Everything below the header is what makes a root
+# invocation trust NONE of its same-user-influenceable environment. The
+# same-user caller cannot inject env into the root process — the invocation is
+# `env -i … sudo -n` (lib/fleet-trust.sh, mirroring invoke_fixed_posix_broker)
+# and the sudoers entry is NOSETENV — but trustd re-establishes every trusted
+# input itself rather than relying on that, so the two layers fail independently.
+trustd_is_root() { [ "$(id -u)" -eq 0 ]; }
+
+# Ownership check WITHOUT the sourced library (it runs before the source): a
+# path is trusted only if it is a non-symlink owned by root and not group/world
+# writable. Used to gate the library tree and the toolchain the root run runs.
+trustd_root_owned() {
+  [ -e "$1" ] && [ ! -L "$1" ] || return 1
+  trustd_ro_owner=$(stat -f %Su "$1" 2>/dev/null || stat -c %U "$1" 2>/dev/null || printf '?')
+  [ "$trustd_ro_owner" = root ] || return 1
+  trustd_ro_mode=$(stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null || printf 777)
+  trustd_ro_perm=$(printf '%s' "$trustd_ro_mode" | sed 's/.*\(...\)$/\1/')
+  case $(printf '%s' "$trustd_ro_perm" | cut -c 2-3) in
+    *2* | *3* | *6* | *7*) return 1 ;;
+  esac
+}
+
+# PATH. When root, REPLACE with the trusted system dirs and never append the
+# inherited PATH: awk/sed/grep/sort/cmp/date/mktemp/chown live here root-owned,
+# and jj/yq/jq are pinned to verified absolute paths below (they do NOT live in
+# these dirs, so a bare lookup could otherwise only find an attacker's copy on a
+# user PATH). Off-root (the self-check and dev) the inherited PATH is kept so the
+# suite's own jj/yq resolve.
+if trustd_is_root; then
+  export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+else
+  export PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+# The library this helper reuses so it derives the roster EXACTLY as the read
+# path does — no second, drifting copy of the ratchet. It is the tree co-located
+# beside this binary (the repo layout, and the root-owned install lane's prefix).
+# ROUNDHOUSE_TRUSTD_HOME is the P0 arbitrary-code-as-root vector — sourcing a
+# same-user-pointed library AS ROOT is game over — so it is honoured ONLY under
+# the self-check, never in production, and NEVER when root. The SELFTEST gate is
+# inlined because the library that defines fleet_test_hook is not sourced yet.
+trustd_home=$script_dir
+if [ "${ROUNDHOUSE_SELFTEST:-0}" = 1 ] && ! trustd_is_root &&
+  [ -n "${ROUNDHOUSE_TRUSTD_HOME:-}" ]; then
+  trustd_home=$ROUNDHOUSE_TRUSTD_HOME
+fi
+[ -f "$trustd_home/roundhouse" ] ||
+  trustd_die "cannot locate the roundhouse library at $trustd_home/roundhouse" 69
+# ROOT SOURCES ONLY A ROOT-OWNED TREE. `$trustd_home/roundhouse` sources every
+# `$trustd_home/lib/*.sh`, so a same-user-writable member is code run as root.
+# Verify the whole tree before sourcing and REFUSE otherwise — this is the
+# ownership fleet-doctor also asserts. Off-root the tree is same-user by design,
+# so the check is root-only.
+if trustd_is_root; then
+  trustd_root_owned "$trustd_home/roundhouse" ||
+    trustd_die "refusing to source a non-root-owned library as root: $trustd_home/roundhouse" 77
+  trustd_root_owned "$trustd_home/lib" ||
+    trustd_die "refusing to source a non-root-owned library tree as root: $trustd_home/lib" 77
+  for trustd_lib in "$trustd_home"/lib/*.sh; do
+    [ -e "$trustd_lib" ] || continue
+    trustd_root_owned "$trustd_lib" ||
+      trustd_die "refusing to source a non-root-owned library file as root: $trustd_lib" 77
+  done
+fi
+# shellcheck source=/dev/null
+ROUNDHOUSE_LIB_ONLY=1 . "$trustd_home/roundhouse"
+
+# THE TOOLCHAIN, PINNED WHEN ROOT. jj/yq/jq live in user-writable prefixes
+# (Homebrew, /usr/local), so on a root run they are resolved from a root-owned
+# manifest the install lane co-located beside this binary and each verified
+# root-owned at use, then shadowed as shell functions so every bare `jj`/`yq`/
+# `jq` in the sourced library reaches the verified absolute path and nothing a
+# same-user PATH could shadow. Missing manifest or any non-root-owned tool fails
+# closed. Off-root the ordinary PATH lookup stands (the self-check's own tools).
+trustd_pin_toolchain() {
+  trustd_is_root || return 0
+  trustd_tc=$script_dir/toolchain
+  trustd_root_owned "$trustd_tc" ||
+    trustd_die "no root-owned toolchain manifest beside trustd at $trustd_tc" 77
+  for trustd_tool in jj yq jq; do
+    trustd_tool_abs=$(awk -v n="$trustd_tool" '$1 == n { print $2; exit }' "$trustd_tc")
+    case $trustd_tool_abs in
+      /*) ;;
+      *) trustd_die "toolchain manifest lacks an absolute path for $trustd_tool" 77 ;;
+    esac
+    trustd_root_owned "$trustd_tool_abs" && [ -x "$trustd_tool_abs" ] ||
+      trustd_die "pinned $trustd_tool is not a root-owned executable: $trustd_tool_abs" 77
+    eval "$trustd_tool() { \"$trustd_tool_abs\" \"\$@\"; }"
+  done
+}
+
+# --- root-owned atomic writes -------------------------------------------------
+
+trustd_own() {
+  # root:wheel on a real root run; a NO-OP unprivileged (the self-check runs
+  # the whole suite as an ordinary user) and under the fixture hook. This is
+  # the ONLY root-specific behaviour, and it is gated so the derivation, the
+  # validation and the monotonicity logic are all exercised without root.
+  [ "$(id -u)" -eq 0 ] || return 0
+  [ "${ROUNDHOUSE_TRUSTD_FIXTURE:-0}" != 1 ] || return 0
+  case $(uname -s) in
+    Darwin) /usr/sbin/chown root:wheel "$1" ;;
+    *) /bin/chown root:root "$1" ;;
+  esac
+}
+
+trustd_install() {
+  # trustd_install <source> <destination> <mode> — atomic replace, root-owned.
+  # Same shape as safe_output but it OWNS the mode and the owner, which
+  # safe_output (a same-user helper that always lands 0600) does not.
+  trustd_install_dir=$(dirname "$2")
+  [ -d "$trustd_install_dir" ] || mkdir -p "$trustd_install_dir"
+  trustd_own "$trustd_install_dir"
+  [ ! -L "$2" ] || trustd_die "refusing symlink output: $2"
+  trustd_install_tmp=$(mktemp "$trustd_install_dir/.roundhouse-trustd.XXXXXX") ||
+    trustd_die "cannot create a temporary file under $trustd_install_dir" 73
+  cp "$1" "$trustd_install_tmp" || {
+    rm -f "$trustd_install_tmp"
+    trustd_die "cannot stage $2" 73
+  }
+  chmod "$3" "$trustd_install_tmp"
+  trustd_own "$trustd_install_tmp"
+  mv -f "$trustd_install_tmp" "$2" || {
+    rm -f "$trustd_install_tmp"
+    trustd_die "cannot install $2" 73
+  }
+}
+
+trustd_reject_symlink() {
+  # Refuse a path whose LEAF is a symlink. The root run reads the store and
+  # writes $TRUST; a symlinked store/$TRUST is a same-user redirect to a target
+  # the attacker chose (the P3 TOCTOU). Leaf-only on purpose: macOS ships /var,
+  # /tmp and /etc as symlinks into /private, so rejecting every ancestor would
+  # refuse every real path — the writes themselves are additionally symlink-safe
+  # in trustd_install (mktemp + mv -f replaces, never follows, a racing symlink).
+  [ ! -L "$1" ] || trustd_die "refusing a symlinked path (§7.9 TOCTOU): $1"
+}
+
+# --- apply --------------------------------------------------------------------
+
+trustd_apply() {
+  # trustd_apply <store> <reviewed-rev>. Every argument is untrusted; the only
+  # trusted inputs are the signed jj history and the genesis pin.
+  trustd_store=$1
+  trustd_rev_in=$2
+
+  # 1. STRICT INPUT VALIDATION, fail closed. The store is a jj repo directory;
+  #    the revision is a single token that must resolve to exactly one commit.
+  case $trustd_store in
+    /*) ;;
+    *) trustd_die "store path must be absolute: $trustd_store" ;;
+  esac
+  case /$trustd_store/ in
+    */../* | */./*) trustd_die "store path is not canonical: $trustd_store" ;;
+  esac
+  [ -d "$trustd_store" ] || trustd_die "store is not a directory: $trustd_store"
+  [ -d "$trustd_store/.jj" ] || trustd_die "store is not a jj repo: $trustd_store"
+  # SYMLINK REFUSAL (§7.9 residual, TOCTOU). A symlinked store is a same-user
+  # redirect at a path the root run reads; refuse it rather than follow it. The
+  # root writes go to $TRUST, checked the same way below.
+  trustd_reject_symlink "$trustd_store"
+  # THE GENESIS PIN AND $TRUST ARE DERIVED FROM THE VALIDATED STORE ARG, NOT
+  # INHERITED ENV. A root run under `env -i … sudo` sees neither the user's
+  # ROUNDHOUSE_FLEET_STORE nor the user's HOME, so identity.yaml (the pin) is
+  # located from dirname(store) — the host's own instance root — by fixing the
+  # store resolver here from the argument. This is the only same-user file the
+  # model already trusts (§7.5), and the generation/descendant gates below read
+  # ROOT-OWNED high-water marks, so a minted store cannot rewind them.
+  ROUNDHOUSE_FLEET_STORE=$trustd_store
+  export ROUNDHOUSE_FLEET_STORE
+  # A revision naming a revset function, a range, or shell/space metacharacters
+  # is refused before it reaches jj: trustd adopts ONE named commit, never a
+  # set an attacker chose the shape of.
+  case $trustd_rev_in in
+    '' | *[!0-9A-Za-z@._/-]*) trustd_die "revision is not a bare commit token: $trustd_rev_in" ;;
+  esac
+  # Resolve to a canonical commit id and require EXACTLY ONE — `all()`,
+  # `main@origin`, a bookmark that is diverged, all land as zero or many and
+  # are refused. Downstream uses the resolved id, never the caller's string.
+  trustd_rev=$(jj -R "$trustd_store" log -r "$trustd_rev_in" --no-graph \
+    -T 'commit_id ++ "\n"' 2>/dev/null | grep . || true)
+  [ "$(printf '%s\n' "$trustd_rev" | grep -c .)" -eq 1 ] ||
+    trustd_die "revision does not resolve to exactly one commit: $trustd_rev_in" 65
+
+  # 2. THE GENESIS ANCHOR. Without a pin, roster_derive's genesis branch would
+  #    self-verify any parentless commit an attacker minted; trustd refuses to
+  #    materialize a history that does not descend from this host's pin.
+  trustd_pin=$(fleet_identity_get store_id)
+  [ -n "$trustd_pin" ] ||
+    trustd_die "no genesis pin in identity.yaml; refusing to materialize an unanchored store" 65
+  jj -R "$trustd_store" log -r "$trustd_pin" --no-graph -T '""' >/dev/null 2>&1 ||
+    trustd_die "genesis pin $trustd_pin does not resolve in this store" 65
+  [ -n "$(jj -R "$trustd_store" log -r "$trustd_pin & ::$trustd_rev" \
+    --no-graph -T 'commit_id' 2>/dev/null)" ] ||
+    trustd_die "$trustd_rev does not descend from the genesis pin $trustd_pin" 65
+
+  # $TRUST, resolved once and refused if any component is a symlink: it is where
+  # every root-owned write lands and where scratch is pinned, so a symlinked
+  # component would redirect a root write off the attacker's own doing.
+  trustd_dest=$(fleet_trust_root)
+  [ -d "$trustd_dest" ] || {
+    mkdir -p "$trustd_dest"
+    trustd_own "$trustd_dest"
+  }
+  trustd_reject_symlink "$trustd_dest"
+
+  # 3. GENERATION MONOTONICITY, read against trustd's OWN root-owned high-water
+  #    mark. The generation in the store is attacker-controlled by construction
+  #    (they force-push history), so the value that carries weight is the one
+  #    trustd wrote and owns.
+  # SCRATCH IS PINNED UNDER A ROOT-OWNED DIR WHEN ROOT, never an attacker TMPDIR
+  # (§7.9 residual, P3): mktemp -d already lands 0700, but a root-owned parent
+  # removes the predictable-path/symlink games an attacker-chosen TMPDIR invites.
+  if trustd_is_root; then
+    trustd_scratch=$trustd_dest
+  else
+    trustd_scratch=${TMPDIR:-/tmp}
+  fi
+  trustd_tmp=$(mktemp -d "$trustd_scratch/roundhouse-trustd.XXXXXX")
+  trap 'rm -rf "$trustd_tmp"' EXIT HUP INT TERM
+  fleet_trust_roster_show "$trustd_store" "$trustd_rev" "$trustd_tmp/signers.yaml"
+  trustd_gen=$(fleet_trust_generation "$trustd_tmp/signers.yaml")
+  trustd_gen_seen=$(fleet_trust_seen_generation)
+  [ "$trustd_gen" -ge "$trustd_gen_seen" ] ||
+    trustd_die "roster generation went backward ($trustd_gen < $trustd_gen_seen); refusing (§7.12.3)" 65
+
+  # 4. THE DESCENDANT GATE, §7.12.3's other half. The new head must descend
+  #    from trustd's own root-owned reviewed-ref — unless reviewed-ref is local
+  #    work built atop main@origin (a §10.4 abandon leaves the next head a
+  #    SIBLING, which is this host's own doing, not the rollback attack). Same
+  #    rule fleet_trust_materialize applies unprivileged; trustd recomputes it.
+  trustd_ref=$(fleet_trust_reviewed_ref)
+  if [ -n "$trustd_ref" ] &&
+    jj -R "$trustd_store" log -r "$trustd_ref" --no-graph -T '""' >/dev/null 2>&1 &&
+    [ -z "$(jj -R "$trustd_store" log -r "$trustd_ref & ::$trustd_rev" \
+      --no-graph -T 'commit_id' 2>/dev/null)" ] &&
+    [ -z "$(jj -R "$trustd_store" log -r "present(main@origin) & ::$trustd_ref" \
+      --no-graph -T 'commit_id' 2>/dev/null)" ]; then
+    trustd_die "$trustd_rev is not a descendant of reviewed-ref $trustd_ref; refusing (§7.12.3)" 65
+  fi
+
+  # 5. RE-DERIVE FROM VERIFIED HISTORY. Replay the ratchet from trustd's own
+  #    reviewed-ref high-water mark (or genesis, on first apply) up to the
+  #    adopted revision, and REFUSE if any commit does not verify against the
+  #    roster at its own parents. This is what makes a same-user attacker
+  #    unable to inject a roster by committing a hostile signers.yaml and
+  #    handing trustd the rev: the hostile edit is not signed by a key the
+  #    parent trusted, so commit_hold rejects it and nothing materializes.
+  fleet_trust_roster_at_head "$trustd_store" "$trustd_rev" \
+    "$trustd_tmp/reviewed-roster"
+  if [ -n "$trustd_ref" ] &&
+    jj -R "$trustd_store" log -r "$trustd_ref" --no-graph -T '""' >/dev/null 2>&1; then
+    trustd_replay="$trustd_ref..$trustd_rev"
+  else
+    trustd_replay="::$trustd_rev ~ root()"
+  fi
+  trustd_bad=
+  while IFS= read -r trustd_c; do
+    [ -n "$trustd_c" ] || continue
+    [ -z "$trustd_bad" ] || continue
+    trustd_hold=$(fleet_trust_commit_hold "$trustd_store" "$trustd_c" \
+      "$trustd_tmp/h.$trustd_c" "$trustd_tmp/reviewed-roster") ||
+      trustd_bad="$trustd_c: ${trustd_hold:-unverifiable}"
+  done <<EOF
+$(jj -R "$trustd_store" log -r "$trustd_replay" --no-graph -T 'commit_id ++ "\n"' 2>/dev/null)
+EOF
+  [ -z "$trustd_bad" ] ||
+    trustd_die "the history does not verify at $trustd_bad; refusing to materialize" 65
+
+  # 6. RENDER at one recorded instant, and WRITE ROOT-OWNED. The drift compare
+  #    re-renders the same revision later at this instant, so the roster and
+  #    materialized-at land together and self-consistently (§7.9).
+  trustd_at=$(fleet_now)
+  fleet_trust_roster_at_head "$trustd_store" "$trustd_rev" \
+    "$trustd_tmp/roster" "$trustd_at"
+  printf '%s\n' "$trustd_rev" >"$trustd_tmp/reviewed-ref"
+  printf '%s\n' "$trustd_gen" >"$trustd_tmp/generation"
+  printf '%s\n' "$trustd_at" >"$trustd_tmp/materialized-at"
+  trustd_install "$trustd_tmp/roster" "$(fleet_trust_materialized_path)" 0644
+  trustd_install "$trustd_tmp/reviewed-ref" "$trustd_dest/reviewed-ref" 0644
+  trustd_install "$trustd_tmp/generation" "$trustd_dest/generation" 0644
+  trustd_install "$trustd_tmp/materialized-at" "$trustd_dest/materialized-at" 0644
+
+  # 7. THE KRL, root-owned. It is the emergency retroactive lever (§7.1b), off
+  #    the normal path and NOT derived from history — its content is fanned out
+  #    out-of-band. trustd's job here is CUSTODY: take the existing KRL under
+  #    root ownership so a same-user process can no longer truncate it to
+  #    un-revoke a burned key, and seed an empty valid one where none exists (an
+  #    unresolvable KRL path reports every signature bad).
+  #
+  #    FIRST-RUN CUSTODY (§7.9 residual 2). The truncation attack is a same-user
+  #    process emptying $TRUST/krl BEFORE trustd first roots it, freezing an
+  #    empty (un-revoking) KRL. So on a root run trustd REFUSES to adopt a KRL
+  #    that is not already root-owned: the trusted KRL is the one the install
+  #    lane seeded root-owned from the enrollment bundle, never whatever
+  #    same-user file is present. If none exists yet, an empty root-owned KRL is
+  #    the safe seed (nothing was revoked in $TRUST to lose). Off-root (the
+  #    self-check) custody is a no-op and the existing same-user file is adopted.
+  trustd_krl=$trustd_dest/krl
+  if [ -f "$trustd_krl" ] && [ ! -L "$trustd_krl" ]; then
+    if trustd_is_root && ! trustd_root_owned "$trustd_krl"; then
+      trustd_die "refusing to root a same-user KRL at $trustd_krl (§7.9 residual 2); re-run the trustd install lane to seed the enrollment KRL" 77
+    fi
+    trustd_install "$trustd_krl" "$trustd_krl" 0644
+  else
+    "$(system_ssh_keygen_path)" -q -k -f "$trustd_tmp/krl" >/dev/null 2>&1 ||
+      : >"$trustd_tmp/krl"
+    trustd_install "$trustd_tmp/krl" "$trustd_krl" 0644
+  fi
+
+  # 8. THE WAS-PRIVILEGED MARKER (§7.9 residual 7). Root-owned in the root-owned
+  #    $TRUST, so a same-user attacker who forces a degrade (unlinks trustd or
+  #    drops its execute bit) cannot ALSO delete this — the doctor then reports
+  #    was-root-owned-now-no-lane as a FINDING rather than accepting the silent
+  #    downgrade as OK. Only the privileged lane writes it; the same-user degrade
+  #    branch never does, so a host that never had a lane stays seamlessly OK.
+  printf '%s\n' "$trustd_rev" >"$trustd_tmp/privileged"
+  trustd_install "$trustd_tmp/privileged" "$trustd_dest/privileged" 0644
+
+  rm -rf "$trustd_tmp"
+  trap - EXIT HUP INT TERM
+}
+
+# --- self-test hook -----------------------------------------------------------
+
+trustd_selftest_own() {
+  # `roundhouse-trustd selftest-own <path>` — exercises the root-gated
+  # ownership path in isolation so the suite can assert it is a NO-OP
+  # unprivileged without materializing a whole store. The only actual-root
+  # behaviour lives behind trustd_own; this proves it stays inert off-root.
+  trustd_own "$1"
+  printf '%s\n' "$(file_owner "$1")"
+}
+
+trustd_command=${1:-}
+[ -n "$trustd_command" ] || trustd_die "usage: roundhouse-trustd apply STORE REVIEWED-REV"
+shift || true
+case $trustd_command in
+  apply)
+    [ $# -eq 2 ] || trustd_die "usage: roundhouse-trustd apply STORE REVIEWED-REV"
+    # jq/yq and the pinned toolchain are needed only by the apply path — the
+    # ownership self-check below touches neither — so they are required here, not
+    # at load time where they would make selftest-own demand tools it never runs.
+    trustd_pin_toolchain
+    require_jq
+    require_yq
+    fleet_run_env
+    trustd_apply "$1" "$2"
+    ;;
+  selftest-own)
+    [ $# -eq 1 ] || trustd_die "usage: roundhouse-trustd selftest-own PATH"
+    trustd_selftest_own "$1"
+    ;;
+  *) trustd_die "unknown subcommand: $trustd_command" ;;
+esac

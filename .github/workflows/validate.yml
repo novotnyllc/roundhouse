@@ -19,6 +19,41 @@ jobs:
       - name: Install OpenSSH server for scope validation
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+      # The five real-jj sections (90-94) are the only place the store's
+      # repository half is exercised at all; without jj they print a NOTICE and
+      # the signature gate, the reconcile runbook, the resolution ladder and
+      # rollback go UNVERIFIED on every run. BOTH tools go in: the gate is
+      # `jj AND yq`, ubuntu-latest ships yq and macos-latest does not, so
+      # installing only jj would leave macOS skipping exactly as before.
+      #
+      # From the upstream releases rather than a distro package — Ubuntu
+      # carries no jj at all and brew on the Linux runner builds it — and
+      # PINNED, so neither project's next release can silently change what CI
+      # proved. `/usr/local/bin` is one of the paths the suite probes after it
+      # sanitizes PATH. Adds seconds; the suite stays one job.
+      - name: Install jj and yq for the real-jj sections
+        shell: bash
+        run: |
+          set -eu
+          jj_version=0.44.0
+          yq_version=4.44.3
+          case "$RUNNER_OS-$(uname -m)" in
+            Linux-x86_64) jj_asset=x86_64-unknown-linux-musl; yq_asset=linux_amd64 ;;
+            Linux-aarch64) jj_asset=aarch64-unknown-linux-musl; yq_asset=linux_arm64 ;;
+            macOS-arm64) jj_asset=aarch64-apple-darwin; yq_asset=darwin_arm64 ;;
+            macOS-x86_64) jj_asset=x86_64-apple-darwin; yq_asset=darwin_amd64 ;;
+            *) echo "no pinned build for $RUNNER_OS-$(uname -m)" >&2; exit 1 ;;
+          esac
+          curl -fsSL --retry 3 \
+            "https://github.com/jj-vcs/jj/releases/download/v$jj_version/jj-v$jj_version-$jj_asset.tar.gz" |
+            sudo tar -xz -C /usr/local/bin jj
+          command -v yq >/dev/null 2>&1 || {
+            curl -fsSL --retry 3 -o /tmp/yq \
+              "https://github.com/mikefarah/yq/releases/download/v$yq_version/yq_$yq_asset"
+            sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+          }
+          jj --version
+          yq --version
       - name: Validate Bash and integrity
         shell: bash
         run: |
@@ -32,8 +67,16 @@ jobs:
           bash -n plugins/roundhouse/scripts/privilege-broker-posix
           bash -n plugins/roundhouse/scripts/test-roundhouse
           bash -n plugins/roundhouse/scripts/update-integrity
+          for unit in plugins/roundhouse/scripts/lib/*.sh \
+            plugins/roundhouse/scripts/tests/*.sh; do
+            bash -n "$unit"
+          done
           if [[ "$RUNNER_OS" == Linux ]]; then
-            shellcheck --severity=warning plugins/roundhouse/scripts/roundhouse \
+            # -x follows the `# shellcheck source=` directives in the CLI and in
+            # the self-check driver, so the sourced units and sections are
+            # analysed as the one program each becomes.
+            shellcheck --severity=warning -x -P SCRIPTDIR \
+              plugins/roundhouse/scripts/roundhouse \
               plugins/roundhouse/scripts/collect-posix \
               plugins/roundhouse/scripts/test-roundhouse \
               plugins/roundhouse/scripts/update-integrity
@@ -74,6 +117,59 @@ jobs:
           PY
       - name: Run fixture suite
         shell: bash
+        env:
+          # jj is installed above, so a skipped real-jj block is a broken
+          # install rather than an unequipped host: fail instead of noticing.
+          ROUNDHOUSE_REQUIRE_REAL_JJ: 'true'
+        run: |
+          chmod -R go-w plugins/roundhouse
+          plugins/roundhouse/scripts/test-roundhouse
+
+  # The scoped suites are early-exit shortcuts *inside* the same self-check:
+  # a default invocation defines their bodies and never calls them, so they
+  # ran nowhere until a human typed the variable. The list is derived from
+  # the sections themselves — adding a scope enrolls it in CI, and no list
+  # here can silently rot behind the tree.
+  scope-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      scopes: ${{ steps.derive.outputs.scopes }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - id: derive
+        shell: bash
+        run: |
+          set -eu
+          scopes=$(grep -ho 'ROUNDHOUSE_TEST_SCOPE:-}" != [a-z0-9-]*' \
+            plugins/roundhouse/scripts/tests/*.sh |
+            awk '{ print $NF }' | LC_ALL=C sort -u |
+            jq -Rsc 'split("\n") | map(select(. != ""))')
+          [ "$scopes" != '[]' ] || {
+            printf 'no ROUNDHOUSE_TEST_SCOPE suites found\n' >&2
+            exit 1
+          }
+          printf 'scopes=%s\n' "$scopes" >>"$GITHUB_OUTPUT"
+
+  # One runner per scope per platform. Each scope re-runs the sections ahead
+  # of it, so these are siblings of the `posix` fixture step rather than extra
+  # work bolted onto it: wall time stays one suite, not the sum of eight.
+  scoped:
+    needs: scope-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        scope: ${{ fromJSON(needs.scope-matrix.outputs.scopes) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install OpenSSH server for scope validation
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+      - name: Run scoped fixture suite
+        shell: bash
+        env:
+          ROUNDHOUSE_TEST_SCOPE: ${{ matrix.scope }}
         run: |
           chmod -R go-w plugins/roundhouse
           plugins/roundhouse/scripts/test-roundhouse

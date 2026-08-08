@@ -96,16 +96,19 @@ Order matters — clean up over SSH while access still works, then revoke:
 
 ### Restore a host
 
-Restoring host X from the sync store is *configs plus a shopping list*,
-not a machine image — the store can't restore secrets, per-machine auth,
-or SSH identity. Read the full delta before touching anything, then in
-order: run the add-a-host flow for X (config entry, SSH certificate
-ceremony); provision X's own store credential (never reuse another host's);
-materialize file-carried surfaces (skills, agents, hooks, allowlisted
-config keys) from the `host/X` branch, each through the ordinary
-apply-time review; replay manager installs from X's recorded inventory
-snapshot at their pinned versions; then work the auth shopping list with
-you by hand, since every credential is re-established on X manually.
+Restoring host X is *configs plus a shopping list*, not a machine image —
+the store can't restore secrets, per-machine auth, or SSH identity. Read
+the full delta before touching anything, then in order: re-enroll X
+through the add-a-host flow (a fresh SSH certificate ceremony, since the
+old identity is gone with the disk); run `roundhouse fleet-reconstitute X`
+from any enrolled host — one commit that records the rebuild in `lineage/`,
+installs X's new node key, retires the old entry, and reparents anything
+the old X sponsored; then let the fast run converge X from the store,
+where every file-carried surface (skills, agents, hooks, allowlisted
+config keys) and every plugin pin is desired state it already replicates
+and `applied/X.yaml` is adopted in place rather than mass-disowned. Then
+work the auth shopping list by hand, since every credential is
+re-established on X manually.
 
 ## Boundaries
 

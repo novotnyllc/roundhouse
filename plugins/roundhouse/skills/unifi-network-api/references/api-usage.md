@@ -6,7 +6,7 @@
 
 - Source: `root@unifi:/usr/lib/unifi/webapps/ROOT/api-docs/integration.json`
 - Title: `UniFi Network API`
-- Version: `10.3.58`
+- Version: `10.5.67`
 - OpenAPI: `3.1.0`
 - Server path: `/integration`
 

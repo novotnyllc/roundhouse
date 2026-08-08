@@ -1,6 +1,14 @@
 # Desired-State Store — Storage and Configuration Model (v2)
 
-Status: **draft for review** · 2026-08-07
+Status: **SUPERSEDED** · 2026-08-06 — replaced in full by
+`2026-08-06-dsc-storage-design-v2.md` after owner review rejected this
+draft's storage core (YAML-authoring/canonical-JSON split, absorb/render
+pipeline, schema versions). The replacement was produced by a four-design
+competition with scored judging and a seven-round adversarial review
+(`2026-08-06-dsc-storage-design-v2-review.md`). Kept for the feature
+inventory and the record.
+
+Original status line: draft for review · 2026-08-07
 Supersedes the storage sections of `2026-08-05-fleet-sync-design.md`; the
 threat model, three-phase run, intent resolution, and alerting sections of that
 spec stand unchanged.

@@ -50,6 +50,10 @@ class AppServer {
       else resolve(message.result);
     });
     this.child.on("error", (error) => this.rejectAll(error));
+    // Writing to a dead child's stdin emits EPIPE on the stream. Unhandled,
+    // that is an uncaught exception that kills the process before the pending
+    // request can reject through the intended timeout path.
+    this.child.stdin.on("error", (error) => this.rejectAll(error));
     this.child.on("exit", (code) => {
       if (this.pending.size) {
         this.rejectAll(new Error(`app-server exited before responding (${code ?? "signal"})`));
@@ -181,12 +185,20 @@ async function writeTrust(pluginId, cwd, wanted) {
   });
 }
 
-async function verifyTrust(pluginId, cwd, wanted, rejectNewTrusted) {
+async function verifyTrust(pluginId, cwd, wanted, rejectNewTrusted, requireAllPresent) {
   const hooks = await listHooks(pluginId, cwd);
   const byKey = new Map(hooks.map((hook) => [hook.key, hook]));
   for (const key of wanted) {
     const hook = byKey.get(key);
-    if (hook && hook.trustStatus !== "trusted") fail(`hook did not become trusted: ${key}`);
+    // A key that vanished between write and verify was silently treated as
+    // success while `approved` still counted it as trusted. On approve that is
+    // a false report; on update a hook the new version dropped is expected, and
+    // the refreshed count already excludes it.
+    if (!hook) {
+      if (requireAllPresent) fail(`hook disappeared before verification: ${key}`);
+      continue;
+    }
+    if (hook.trustStatus !== "trusted") fail(`hook did not become trusted: ${key}`);
   }
   if (rejectNewTrusted) {
     const wantedSet = new Set(wanted);
@@ -272,18 +284,25 @@ async function main() {
     }
     const keys = hooks.map((hook) => hook.key);
     await writeTrust(pluginId, cwd, keys);
-    await verifyTrust(pluginId, cwd, keys, false);
+    await verifyTrust(pluginId, cwd, keys, false, true);
     process.stdout.write(`${JSON.stringify({ pluginId, approved: keys.length })}\n`);
     return;
   }
   if (command === "update") {
     const before = await listHooks(pluginId, cwd);
+    // Only hooks this host had already trusted get re-trusted at their new
+    // hashes. "modified" is the tampered-drift state — the content no longer
+    // matches the trusted hash — and writeTrust stamps whatever hash is on disk
+    // with no content comparison, so including it laundered a locally edited
+    // hook into trusted whenever `codex plugin add` was a no-op. Drift is
+    // resolved by an explicit `approve`, which is what "trust what it currently
+    // ships" means.
     const keys = before
-      .filter((hook) => hook.trustStatus === "trusted" || hook.trustStatus === "modified")
+      .filter((hook) => hook.trustStatus === "trusted")
       .map((hook) => hook.key);
     await runCodexPluginAdd(pluginId);
     await writeTrust(pluginId, cwd, keys);
-    const after = await verifyTrust(pluginId, cwd, keys, true);
+    const after = await verifyTrust(pluginId, cwd, keys, true, false);
     process.stdout.write(
       `${JSON.stringify({ pluginId, refreshed: keys.filter((key) => after.some((hook) => hook.key === key)).length })}\n`,
     );

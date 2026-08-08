@@ -6,6 +6,14 @@
 roundhouse orchestrates tools that other people built well. This page names
 the work we depend on — these projects earned it.
 
+This page is credit, not licensing. Almost everything below is a tool
+roundhouse *drives*, which carries no license obligation. The material
+actually copied into this repository — the `remote-mac` and `ssh-doctor`
+skills, and the UniFi API snapshot — is recorded in
+[`THIRD-PARTY-NOTICES.md`](https://github.com/novotnyllc/roundhouse/blob/main/THIRD-PARTY-NOTICES.md),
+with license text in
+[`LICENSE`](https://github.com/novotnyllc/roundhouse/blob/main/LICENSE).
+
 ## The store and its plumbing
 
 **Jujutsu (jj)** — the desired-state sync store is a

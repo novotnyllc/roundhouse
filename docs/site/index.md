@@ -86,7 +86,8 @@ never trusted just because it arrived from upstream. Secrets and session
 transcripts never enter the store. The few operations that need root travel
 through sealed, ceremony-gated broker requests — there's no ad-hoc `sudo`
 anywhere in the system. When two machines disagree about what's true, the
-system holds and asks rather than picking a side by whichever wrote last.
+run's own agent settles it from signed evidence — never from whichever
+wrote last — and holds the item for you when the evidence doesn't reach.
 
 ## How it feels
 
@@ -146,6 +147,19 @@ purpose.
 - **[The fleet's life, end to end](lifecycle.md)** — first machine, growing
   the fleet, the daily sync loop, what happens when things change, delivery
   placed on top, and the unattended-updates roadmap.
+- **[The fleet store](store.md)** — the jj repository of human-editable YAML
+  that keeps every machine's agent surface converged, and the layer fold.
+- **[How a change travels](convergence.md)** — one edit, from the keystroke
+  to the machine at the far end of the fleet.
+- **[Trust](trust.md)** — the ratchet: per-machine keys, the roster, joining,
+  leaving, and what the whole thing actually rests on.
+- **[Threat model](security/threat-model.md)** — the four security boundaries,
+  the trust levels, the actor-capability matrix, and the residuals stated
+  plainly. Written for external review.
+- **[Why jj](why-jj.md)** — the six properties of the version control that do
+  real work here.
+- **[Running it](operating.md)** — the verbs grouped by task, the scheduler,
+  doctor, and the audit trail.
 - **[Where this fits next to what you already know](comparison.md)** —
   dotfile managers, config management, MDM, and plugin marketplaces, and
   what's actually different here.

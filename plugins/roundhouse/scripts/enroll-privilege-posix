@@ -8,7 +8,7 @@ unset APT_CONFIG BASH_ENV CDPATH ENV GLOBIGNORE \
   HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
 
 usage() {
-  printf '%s\n' 'usage: enroll-privilege-posix status|preview|install|revoke' >&2
+  printf '%s\n' 'usage: enroll-privilege-posix status|preview|install|revoke|install-trustd' >&2
   exit 64
 }
 
@@ -3083,6 +3083,171 @@ revoke_bundle() (
   printf 'epoch|%s\nordinary-inventory|preserved\nprotected-journal|preserved\nquarantine|retained\n' "$expected_epoch"
 )
 
+# --- the trustd lane (§7.9) ---------------------------------------------------
+#
+# Root ownership of roundhouse-trustd is only worth something if the LIBRARY and
+# the TOOLCHAIN it runs as root are root-owned too — otherwise root runs
+# attacker code. This lane co-locates all three under one root-owned prefix,
+# seeds the KRL from the enrollment-time trusted origin, and installs the
+# NOPASSWD:NOSETENV sudoers entry the run uses to reach root. It is the SAME
+# one-time consented root step as the broker install (it runs only as root or in
+# the fixture, gated above), reusing this file's own root-owned-write primitives
+# (ensure_application_directory, durable_replace, the chown-root discipline)
+# rather than a second copy of them. WHAT GETS ROOTED, stated plainly:
+#   - the binary            <prefix>/roundhouse-trustd
+#   - the library it sources <prefix>/roundhouse and <prefix>/lib/*.sh
+#   - the pinned toolchain   <prefix>/toolchain.d/{jj,yq,jq} + <prefix>/toolchain
+#   - the KRL under custody  <TRUST>/krl, copied from the enrollment KRL
+#   - the sudo lane          /etc/sudoers.d/roundhouse-trustd
+readonly trustd_prefix=$root_prefix/usr/local/libexec/roundhouse-trustd
+readonly trustd_trust_root=$root_prefix/usr/local/etc/roundhouse
+readonly trustd_sudoers=$root_prefix/etc/sudoers.d/roundhouse-trustd
+
+result_trustd() {
+  printf 'trustd-install|1\nstate|%s\nreason|%s\nplatform-boundary|%s\n' \
+    "$1" "$2" "$platform_boundary"
+}
+
+copy_trustd_file() {
+  # <src> <dst> <mode> — atomic, mode-set, root-owned on a real host (durable_replace
+  # chowns root only when fixture_mode is false). The source must be a regular
+  # non-symlink file so no symlink in the plugin tree redirects what gets rooted.
+  local src=$1 dst=$2 mode=$3 tmp
+  [ -f "$src" ] && [ ! -L "$src" ] || return 1
+  tmp=$(/usr/bin/mktemp "${dst%/*}/.trustd-install.XXXXXX") || return 1
+  /bin/cp "$src" "$tmp" || { /bin/rm -f "$tmp"; return 1; }
+  durable_replace "$tmp" "$dst" "$mode"
+}
+
+find_trustd_tool() {
+  # The absolute source of a pinned tool. jj/yq/jq are NOT on the secure PATH
+  # this script runs with, so a fixed prefix allowlist is searched; the search
+  # is env-overridable ONLY in the fixture (the same SELFTEST discipline the rest
+  # of the system uses — a real host never honours an ambient variable to choose
+  # what it roots). The tool is copied root-owned into the prefix so trustd runs
+  # a root-owned binary regardless of where Homebrew put the original.
+  local name=$1 dir prefixes=/opt/homebrew/bin:/usr/local/bin:/usr/bin
+  if [ "$fixture_mode" = true ] && [ -n "${ROUNDHOUSE_TRUSTD_TOOLCHAIN_SRC:-}" ]; then
+    prefixes=$ROUNDHOUSE_TRUSTD_TOOLCHAIN_SRC
+  fi
+  for dir in $(printf '%s' "$prefixes" | /usr/bin/tr ':' ' '); do
+    [ -n "$dir" ] || continue
+    # A symlink is fine here (Homebrew ships its bins as symlinks) — the copy
+    # below follows it and lands a root-owned REGULAR file, which is what trustd
+    # verifies at use. `-f`/`-x` follow the link, so both hold on a valid tool.
+    if [ -f "$dir/$name" ] && [ -x "$dir/$name" ]; then
+      printf '%s\n' "$dir/$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+install_trustd() {
+  local request_user_in=$1 self_dir source_dir manifest_tmp krl_src member relative
+  local tool tool_src tool_dst tool_tmp
+  token "$request_user_in" || { result_trustd rejected invalid_request_user; exit 64; }
+  if [ "$fixture_mode" = false ]; then
+    /usr/bin/id -u "$request_user_in" >/dev/null 2>&1 ||
+      { result_trustd rejected unknown_request_user; exit 64; }
+  fi
+
+  # The tree that gets rooted is THIS plugin's own scripts dir, beside the
+  # running enrollment script. Require the whole set present and non-symlink and
+  # that both the binary and library parse before rooting anything.
+  self_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) ||
+    { result_trustd rejected source_unresolved; exit 64; }
+  source_dir=$self_dir
+  { [ -f "$source_dir/roundhouse-trustd" ] && [ ! -L "$source_dir/roundhouse-trustd" ] &&
+    [ -f "$source_dir/roundhouse" ] && [ ! -L "$source_dir/roundhouse" ] &&
+    [ -d "$source_dir/lib" ] && [ ! -L "$source_dir/lib" ]; } ||
+    { result_trustd rejected source_tree_incomplete; exit 65; }
+  /bin/bash -n "$source_dir/roundhouse-trustd" ||
+    { result_trustd rejected source_not_parseable; exit 65; }
+
+  ensure_application_directory "$root_prefix/usr" 0755 &&
+    ensure_application_directory "$root_prefix/usr/local" 0755 &&
+    ensure_application_directory "$root_prefix/usr/local/libexec" 0755 &&
+    ensure_application_directory "$root_prefix/usr/local/etc" 0755 &&
+    ensure_application_directory "$trustd_prefix" 0755 &&
+    ensure_application_directory "$trustd_prefix/lib" 0755 &&
+    ensure_application_directory "$trustd_prefix/toolchain.d" 0755 &&
+    ensure_application_directory "$trustd_trust_root" 0755 ||
+    { result_trustd drifted prefix_layout_failed; exit 74; }
+
+  copy_trustd_file "$source_dir/roundhouse-trustd" "$trustd_prefix/roundhouse-trustd" 0755 ||
+    { result_trustd drifted binary_copy_failed; exit 74; }
+  copy_trustd_file "$source_dir/roundhouse" "$trustd_prefix/roundhouse" 0644 ||
+    { result_trustd drifted library_copy_failed; exit 74; }
+  while IFS= read -r member; do
+    [ -n "$member" ] || continue
+    relative=${member##*/}
+    copy_trustd_file "$member" "$trustd_prefix/lib/$relative" 0644 ||
+      { result_trustd drifted library_copy_failed; exit 74; }
+  done <<EOF
+$(/usr/bin/find "$source_dir/lib" -maxdepth 1 -type f -name '*.sh' | /usr/bin/sort)
+EOF
+  /bin/bash -n "$trustd_prefix/roundhouse" ||
+    { result_trustd drifted installed_library_not_parseable; exit 65; }
+
+  # Pin the toolchain root-owned and record ABSOLUTE paths trustd verifies at use.
+  manifest_tmp=$trustd_prefix/.toolchain.tmp
+  : >"$manifest_tmp" || { result_trustd drifted toolchain_manifest_failed; exit 74; }
+  for tool in jj yq jq; do
+    tool_src=$(find_trustd_tool "$tool") || {
+      /bin/rm -f "$manifest_tmp"
+      result_trustd rejected "toolchain_${tool}_not_found"
+      exit 65
+    }
+    tool_dst=$trustd_prefix/toolchain.d/$tool
+    # A dedicated copy that FOLLOWS a symlinked source (copy_trustd_file refuses
+    # symlinks, which is right for the library tree but wrong for a Homebrew
+    # bin): cp resolves the link, durable_replace lands it root-owned regular.
+    tool_tmp=$(/usr/bin/mktemp "$trustd_prefix/toolchain.d/.tool.XXXXXX") || {
+      /bin/rm -f "$manifest_tmp"
+      result_trustd drifted toolchain_copy_failed
+      exit 74
+    }
+    /bin/cp "$tool_src" "$tool_tmp" && durable_replace "$tool_tmp" "$tool_dst" 0755 || {
+      /bin/rm -f "$tool_tmp" "$manifest_tmp"
+      result_trustd drifted toolchain_copy_failed
+      exit 74
+    }
+    printf '%s\t%s\n' "$tool" "$tool_dst" >>"$manifest_tmp"
+  done
+  durable_replace "$manifest_tmp" "$trustd_prefix/toolchain" 0644 ||
+    { result_trustd drifted toolchain_manifest_failed; exit 74; }
+
+  # KRL trusted origin (§7.9 residual 2): seed <TRUST>/krl root-owned from the
+  # enrollment KRL the broker install rooted, so trustd's first apply adopts a
+  # root-owned KRL and never freezes whatever same-user file happens to be there.
+  krl_src=$config_root/trust/revoked.krl
+  if [ -f "$krl_src" ] && [ ! -L "$krl_src" ]; then
+    copy_trustd_file "$krl_src" "$trustd_trust_root/krl" 0644 ||
+      { result_trustd drifted krl_seed_failed; exit 74; }
+  fi
+
+  # The sudo lane: NOPASSWD:NOSETENV for the fixed helper, so the run reaches
+  # root without a password and without carrying any of the caller's environment.
+  [ -d "$root_prefix/etc/sudoers.d" ] || /bin/mkdir -p "$root_prefix/etc/sudoers.d"
+  printf '%s ALL=(root) NOPASSWD:NOSETENV: %s apply *\n' \
+    "$request_user_in" "$trustd_prefix/roundhouse-trustd" >"$trustd_sudoers.tmp" ||
+    { result_trustd drifted sudoers_render_failed; exit 74; }
+  /bin/chmod 0440 "$trustd_sudoers.tmp"
+  if [ "$fixture_mode" = false ]; then
+    /usr/bin/chown root:"$protected_group" "$trustd_sudoers.tmp"
+    [ -x /usr/sbin/visudo ] && /usr/sbin/visudo -cf "$trustd_sudoers.tmp" >/dev/null ||
+      { /bin/rm -f "$trustd_sudoers.tmp"; result_trustd rejected sudoers_invalid; exit 65; }
+  fi
+  /bin/mv -f "$trustd_sudoers.tmp" "$trustd_sudoers" ||
+    { result_trustd drifted sudoers_install_failed; exit 74; }
+  durable_sync
+
+  result_trustd installed ok
+  printf 'prefix|%s\ntrust-root|%s\nsudoers|%s\n' \
+    "$trustd_prefix" "$trustd_trust_root" "$trustd_sudoers"
+}
+
 case $command in
   status)
     [ "$#" -eq 0 ] || usage
@@ -3115,6 +3280,10 @@ case $command in
   revoke)
     [ "$#" -eq 3 ] || usage
     revoke_bundle "$1" "$2" "$3"
+    ;;
+  install-trustd)
+    [ "$#" -eq 1 ] || usage
+    install_trustd "$1"
     ;;
   *) usage ;;
 esac

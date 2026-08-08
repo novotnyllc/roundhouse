@@ -37,8 +37,9 @@ lane.
 4. **Prerequisites on the target** (consent, via the target's own managers) —
    `tmux` and `jq` through `roundhouse:fleet-update`; agent harnesses
    verified and plugin/marketplace parity (railyard, roundhouse,
-   agent-utilities, compound-engineering) through `roundhouse:fleet-agents`'
-   routine refresh; project checkouts through `roundhouse:fleet-projects`
+   agent-utilities, compound-engineering, ponytail) through
+   `roundhouse:fleet-agents`' routine refresh; project checkouts through
+   `roundhouse:fleet-projects`
    when the host will take delivery work.
 5. **Optional store credential** (separate consent; only when the host opts
    into desired-state sync) — provision this host's own minimal credential

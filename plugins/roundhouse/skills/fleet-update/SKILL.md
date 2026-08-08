@@ -18,7 +18,9 @@ apply permission is never inferred from it. The sealed pipeline below is
 safety mechanics, not an approval gate. This is mechanical-tier work: a
 session running a premium model delegates the run to a cheap-model child
 (the routed mechanical tier) rather than executing inline — skills cannot
-switch the session's own model.
+switch the session's own model. That child's dispatch prompt carries
+railyard's dispatch banner instruction (`▸ <model>/<effort> · …` echoed first,
+non-blocking; see railyard's harness-model-invocation reference).
 
 - Homebrew: on an update request, refresh metadata (`brew update`) and
   proceed; use `brew outdated --json=v2` for the plan and `brew upgrade` for
@@ -68,28 +70,64 @@ Cleanup and autoremove are separate explicit actions.
 
 ## Unattended schedule
 
-Auto-updating on a schedule uses the OS scheduler calling the harness — no
-new daemon, database, or engine. **There is exactly one owned scheduler
-entry per host, and desired-state sync owns it**: the entry below is
-absorbed into sync's single entry, which drives marketplace refresh,
-package updates, and the sync run together. Two local runners racing one
-plugin cache is the failure this prevents. `railyard:setup` installs the
-entry on request and migrates an existing autoupdate entry into it; the
-shape on macOS is a per-user launchd agent
-(`~/Library/LaunchAgents/com.novotnyllc.roundhouse.autoupdate.plist`) whose
-program runs:
+Auto-updating on a schedule uses the OS scheduler calling the CLI — no new
+daemon, database, or engine. **There is exactly one owned scheduler
+entry per host**, and it runs `roundhouse fleet-run`. Two local runners racing one
+plugin cache is the failure this prevents, so a second entry is never
+added: the desired-state run **absorbs** the older autoupdate entry rather
+than being given one of its own. Marketplace refresh and package updates are
+not a separate job — the full cadence does both, on the same convergence that
+applies everything else (see `roundhouse:fleet-agents`).
+
+The entry drives **two cadences from one owned slot**:
+
+| Cadence | Command | Default | Covers |
+| --- | --- | --- | --- |
+| Fast | `roundhouse fleet-run --fast` | every 20 min | converge desired state: fetch, review, apply, publish |
+| Full | `roundhouse fleet-run --full` | twice a day | the fast pass plus marketplace refresh, unpinned package updates, re-seed, promotion proposals, and `fleet-doctor` |
+
+Both intervals are jittered from the host **name**, so the fleet does not
+re-synchronise on the same minute; the interval keys live in the store's
+policy block, not on the machine being governed.
+
+`railyard:setup` installs the entry on request. **Absorb, never duplicate**:
+if `com.novotnyllc.roundhouse.autoupdate` (or its systemd/Task Scheduler
+equivalent) exists, unload and remove it in the same step that installs the
+fleet entry. A host carrying both is the exact double-runner this rule exists
+to prevent.
+
+The shape per platform, all three running the same two commands:
+
+- **macOS** — one per-user launchd agent,
+  `~/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist`, with two
+  `StartCalendarInterval`/`StartInterval` slots (or two agents only if the
+  scheduler cannot express both in one).
+- **Linux** — a systemd **user** timer pair,
+  `roundhouse-fleet-fast.timer` and `roundhouse-fleet-full.timer`, with
+  `Persistent=true` so a laptop that was asleep catches up once rather than
+  storming.
+- **Windows** — a **per-user** scheduled task. Where the machine has a
+  configured WSL sibling, register it there and drive the native side through
+  the interop lane rather than registering a second native entry.
 
 ```bash
-claude -p --model sonnet 'Unattended roundhouse maintenance run: refresh the installed marketplaces and update their plugins (fleet-agents routine refresh), then plan and apply pending package updates (fleet-update), then — when desired-state sync is enabled — drive the three-phase sync run (fleet-agents desired-state sync): fetch and open the run, review and record a verdict on every changed item, then converge, journal, and end the run. Unattended: no questions; skip anything requiring interactive elevation; write a summary to ~/.local/state/roundhouse/autoupdate.log and exit.' --output-format text
+roundhouse fleet-run --fast    # the fast slot
+roundhouse fleet-run --full    # the heavy slot
 ```
 
-(Linux: a systemd user timer; Windows: a per-user scheduled task running the
-same prompt through the installed harness.) The prompt text is fixed and
-maintained in lockstep with fleet-agents' sync doctrine. A local run-lock
-enforces one runner at a time per host: a second run exits 75 and stops
-rather than forcing. Unattended runs use exactly the same sealed pipeline
-and skip protected/privileged actions — those stay interactive by design.
-Failures land in the log and surface at the next `railyard:doctor` run.
+The run is non-interactive by construction: every jj, git and ssh invocation
+it makes is closed to editors, pagers and credential prompts, so a scheduled
+run can never block on a human at a machine nobody is sitting at. A local
+run-lock enforces one runner at a time per host: a second run finds the lock
+held and exits 0 without acting, which is the ordinary overlap and not a
+failure. Exit 75 is the STALE-lock refusal — a lock past two full cadences, or
+one whose `meta.json` is missing so its age cannot be read — and it names the
+recovery rather than forcing. `roundhouse fleet-unlock` releases a lock left by
+a killed run; `roundhouse fleet-lock` taken by hand also exits 75 when the lock
+is already held. Unattended runs skip protected/privileged actions — those
+stay interactive by design. Failures land in the store's own alert and journal
+records, surface in `roundhouse fleet-pending`, and are reported at the next
+`railyard:doctor` run.
 
 ## Protected package actions
 

@@ -193,12 +193,23 @@ function Assert-ExecutorShape([object]$Executor, [switch]$RequireEnvelope) {
 }
 
 function Assert-SameExecutorFiles([object]$Expected, [object]$Actual, [string]$Label) {
-    $ExpectedFiles = @($Expected.files | Sort-Object path)
-    $ActualFiles = @($Actual.files | Sort-Object path)
+    # Matched by path, never by sorted position. Sort-Object cannot read a key
+    # off an [ordered] dictionary — the shape Get-InstalledExecutor emits — so
+    # it sorts every element equal and returns them in whatever order its
+    # unstable sort lands on, which only shows up once the list is long enough
+    # to stop being a no-op. Its culture-aware string compare also treats "/"
+    # and "-" as ignorable, so two distinct release paths can tie. Neither trap
+    # can bite a lookup keyed on the path itself.
+    $ExpectedFiles = @($Expected.files)
+    $ActualFiles = @($Actual.files)
     if ($ExpectedFiles.Count -ne $ActualFiles.Count) { throw "$Label file list does not match" }
-    for ($Index = 0; $Index -lt $ExpectedFiles.Count; $Index++) {
-        if ($ExpectedFiles[$Index].path -ne $ActualFiles[$Index].path -or
-            $ExpectedFiles[$Index].sha256 -ne $ActualFiles[$Index].sha256) {
+    $Index = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    foreach ($File in $ExpectedFiles) { $Index[[string]$File.path] = [string]$File.sha256 }
+    if ($Index.Count -ne $ExpectedFiles.Count) { throw "$Label file list does not match" }
+    foreach ($File in $ActualFiles) {
+        $Expectation = $null
+        if (-not $Index.TryGetValue([string]$File.path, [ref]$Expectation) -or
+            $Expectation -cne [string]$File.sha256) {
             throw "$Label file list does not match"
         }
     }
@@ -344,7 +355,10 @@ function Get-InstalledExecutor([string]$Root = $PluginRoot) {
         marketplace = [string]$Manifest.marketplace
         version = [string]$Manifest.version
         integrity_manifest_sha256 = Get-FileSha256 $ManifestPath
-        files = @($Files | Sort-Object path)
+        # Manifest order, which the generator already sorts by path. Re-sorting
+        # here does nothing but reintroduce the Sort-Object traps described in
+        # Assert-SameExecutorFiles.
+        files = @($Files)
         source = $Source
         verified = $true
     }

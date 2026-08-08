@@ -4,6 +4,10 @@ set -eu
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 plugin_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 output=$plugin_root/integrity.json
+# Not release content: the self-check suite and the sections it sources, and
+# this generator itself (its own hash cannot be written into the manifest it
+# produces). Kept byte-identical to executor-status's copy in scripts/roundhouse.
+integrity_excluded_scripts='scripts/(test-roundhouse|update-integrity|tests/.+)'
 
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -29,36 +33,35 @@ version=$(jq -r '.version' "$plugin_root/.codex-plugin/plugin.json")
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-integrity.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 : >"$tmp/files.jsonl"
-for relative in \
-  .claude-plugin/plugin.json \
-  .codex-plugin/plugin.json \
-  references/privilege-policy.default \
-  references/windows-winget-provider.lock \
-  scripts/apply-windows.ps1 \
-  scripts/codex-plugin-hooks.mjs \
-  scripts/certify-ssh-node \
-  scripts/collect-posix \
-  scripts/collect-windows.ps1 \
-  scripts/enroll-privilege-posix \
-  scripts/enroll-privilege-windows.ps1 \
-  scripts/enroll-ssh-posix \
-  scripts/enroll-windows-sftp.ps1 \
-  scripts/homebrew-bridge.rb \
-  scripts/roundhouse \
-  scripts/prepare-ssh-identity \
-  scripts/privilege-broker-posix \
-  scripts/privilege-broker-windows.ps1 \
-  scripts/profile-worker-windows.ps1 \
-  scripts/register-profile-task-windows.ps1 \
-  scripts/windows-native-canary-runner.ps1
-do
+# Enumerated, never hand-listed: a hardcoded list silently stops covering the
+# next file added under scripts/, which then ships unhashed. executor-status
+# derives the same set with the same exclusions and fails closed on a
+# difference, so the two can never drift apart unnoticed.
+{
+  printf '%s\n' .claude-plugin/plugin.json .codex-plugin/plugin.json
+  # THE ROOTS ARE THE WHOLE SHIPPED TREE, not just the executable half. Rooting
+  # this at `scripts references` left every `SKILL.md` — the operator-facing
+  # instruction set an agent reads and acts on — plus `agents/*.yaml`,
+  # `config.example.json` and `assets/` shipping unhashed. Instructions are
+  # release content in exactly the sense the manifest exists for.
+  (cd "$plugin_root" && find scripts references skills assets \
+    config.example.json ! -type d -print) |
+    grep -Ev "^$integrity_excluded_scripts\$" |
+    LC_ALL=C sort
+} >"$tmp/paths"
+while IFS= read -r relative; do
+  [ -n "$relative" ] || continue
   [ -f "$plugin_root/$relative" ] || {
     printf 'update-integrity: missing release file: %s\n' "$relative" >&2
     exit 66
   }
   jq -cn --arg path "$relative" --arg sha256 "$(sha256_file "$plugin_root/$relative")" \
     '{path:$path,sha256:$sha256}' >>"$tmp/files.jsonl"
-done
+done <"$tmp/paths"
+[ -s "$tmp/files.jsonl" ] || {
+  printf 'update-integrity: no release files found\n' >&2
+  exit 66
+}
 
 jq -S -n --arg version "$version" --slurpfile files "$tmp/files.jsonl" '{
   schema:"roundhouse.integrity",
