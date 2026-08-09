@@ -720,12 +720,12 @@ verify_release_bundle() {
     /bin/bash -n "$release_plugin_root/scripts/enroll-ssh-posix" &&
     /bin/bash -n "$release_plugin_root/scripts/roundhouse" &&
     /usr/bin/grep -Fq 'dispatch-posix-request' "$release_plugin_root/scripts/roundhouse" &&
-    /usr/bin/grep -Fq 'invoke_fixed_posix_broker()' "$release_plugin_root/scripts/roundhouse" &&
+    /usr/bin/grep -Fq 'invoke_fixed_posix_broker()' "$release_plugin_root/scripts/lib/broker-posix.sh" &&
     /usr/bin/grep -Fq '/usr/libexec/roundhouse/posix-broker' \
-      "$release_plugin_root/scripts/roundhouse" &&
+      "$release_plugin_root/scripts/lib/broker-posix.sh" &&
     /usr/bin/grep -Fq '/usr/local/libexec/roundhouse/posix-broker' \
-      "$release_plugin_root/scripts/roundhouse" &&
-    /usr/bin/grep -Fq '/usr/bin/sudo -n "$fixed_broker"' "$release_plugin_root/scripts/roundhouse" &&
+      "$release_plugin_root/scripts/lib/broker-posix.sh" &&
+    /usr/bin/grep -Fq '/usr/bin/sudo -n "$fixed_broker"' "$release_plugin_root/scripts/lib/broker-posix.sh" &&
     validate_integrity_manifest
 }
 
@@ -1762,6 +1762,9 @@ selftest_make_bundle() {
   worker_source=${self%/*}/roundhouse
   [ -f "$worker_source" ] && [ ! -L "$worker_source" ] || return 1
   /bin/cp "$worker_source" "$plugin/scripts/roundhouse"
+  # The worker sources scripts/lib/*.sh at load (broker, fold, trust, ...), so a
+  # real bundle ships that tree; stage it or the bundled worker cannot run.
+  /bin/cp -R "${self%/*}/lib" "$plugin/scripts/lib"
   /bin/chmod 0600 "$plugin/scripts/enroll-ssh-posix" "$plugin/scripts/roundhouse"
   worker_digest=$(sha256_file "$plugin/scripts/roundhouse")
   entrypoint_digest=$(sha256_file "$plugin/scripts/enroll-ssh-posix")

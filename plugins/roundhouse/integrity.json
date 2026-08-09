@@ -62,7 +62,7 @@
     },
     {
       "path": "scripts/enroll-privilege-posix",
-      "sha256": "5e6b856d687774a64451ccc8dabb308846744f34f6fe1a9073e435e76e50b1e6"
+      "sha256": "2d22dd1759f729c086b1dbb428cfaa866faed9fcab436464b1a182e29cd1966b"
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
@@ -70,7 +70,7 @@
     },
     {
       "path": "scripts/enroll-ssh-posix",
-      "sha256": "8c9ce3c72dde3c80501c4ae95e2791a0e305b60666a44e130b06b3466c178991"
+      "sha256": "30f5ddfe1ef24b3fa3557aee18497446f70a62c965580b62dcb94b118af9189c"
     },
     {
       "path": "scripts/enroll-windows-sftp.ps1",

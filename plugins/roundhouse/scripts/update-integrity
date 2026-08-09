@@ -33,27 +33,35 @@ version=$(jq -r '.version' "$plugin_root/.codex-plugin/plugin.json")
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-integrity.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 : >"$tmp/files.jsonl"
-# Enumerate the TRACKED release tree with git ls-files, never a working-dir
-# find: only committed or staged files are release content, so OS cruft (a
-# macOS .DS_Store, an editor scratch file) can never be sealed even while it
-# sits in the tree, and the set is identical on every checkout. The roots are
-# the whole shipped tree — .claude-plugin/.codex-plugin manifests, every
-# SKILL.md, agents/*.yaml, config.example.json and assets/ are the
-# operator-facing instructions an agent acts on, release content in exactly the
-# sense the manifest exists for — not just the executable half. executor-status
-# cross-checks coverage over the same tracked scripts/ set and fails closed on
-# any file it omits. A new release file must be `git add`ed before it can be
-# sealed, then committed alongside the manifest.
-if ! { command -v git >/dev/null 2>&1 &&
-  git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; }; then
-  printf 'update-integrity: must run inside the git work tree\n' >&2
-  exit 69
+# Enumerate the release tree. The roots are the whole shipped tree —
+# .claude-plugin/.codex-plugin manifests, every SKILL.md, agents/*.yaml,
+# config.example.json and assets/ are the operator-facing instructions an agent
+# acts on, release content in exactly the sense the manifest exists for — not
+# just the executable half. executor-status cross-checks coverage over the same
+# tracked scripts/ set and fails closed on any file it omits.
+#
+# Prefer git ls-files: only committed or staged files are release content, so
+# OS cruft (a macOS .DS_Store, an editor scratch file) can never be sealed even
+# while it sits in the tree, and the set is identical on every checkout. But the
+# self-check builds fixture plugin trees in bare temp dirs (no VCS) and seals
+# them with this same generator; there is no OS cruft in a freshly built
+# fixture, so a plain find is correct there. A new real-repo release file must
+# be `git add`ed before it can be sealed, then committed alongside the manifest.
+if command -v git >/dev/null 2>&1 &&
+  git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "$plugin_root" ls-files -- \
+    .claude-plugin/plugin.json .codex-plugin/plugin.json \
+    scripts references skills assets config.example.json |
+    grep -Ev "^$integrity_excluded_scripts\$" |
+    LC_ALL=C sort >"$tmp/paths"
+else
+  {
+    printf '%s\n' .claude-plugin/plugin.json .codex-plugin/plugin.json
+    (cd "$plugin_root" && find scripts references skills assets \
+      config.example.json ! -type d -print 2>/dev/null) |
+      grep -Ev "^$integrity_excluded_scripts\$"
+  } | LC_ALL=C sort >"$tmp/paths"
 fi
-git -C "$plugin_root" ls-files -- \
-  .claude-plugin/plugin.json .codex-plugin/plugin.json \
-  scripts references skills assets config.example.json |
-  grep -Ev "^$integrity_excluded_scripts\$" |
-  LC_ALL=C sort >"$tmp/paths"
 while IFS= read -r relative; do
   [ -n "$relative" ] || continue
   [ -f "$plugin_root/$relative" ] || {

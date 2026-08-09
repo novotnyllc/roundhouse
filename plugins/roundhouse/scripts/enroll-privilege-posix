@@ -1413,8 +1413,23 @@ acquire_lifecycle_guard() {
   lifecycle_guard_owned=false
   lifecycle_guard_method=
   if [ "$fixture_mode" = true ]; then
-    [ -x /usr/bin/shlock ] || return 74
-    if ! /usr/bin/shlock -f "$lifecycle_guard" -p "$owner_pid"; then return 75; fi
+    if [ -x /usr/bin/shlock ] && [ -z "${ROUNDHOUSE_TEST_NO_SHLOCK:-}" ]; then
+      if ! /usr/bin/shlock -f "$lifecycle_guard" -p "$owner_pid"; then return 75; fi
+    else
+      # Portable userspace pidfile guard for fixtures on hosts without shlock
+      # (Linux CI). Atomic O_EXCL create. A live owner means the operation is
+      # in progress, so report busy (75) exactly like shlock -- never loop, or a
+      # live holder would spin kill -0 forever. Only a provably dead owner may
+      # be reclaimed, then re-created atomically. Fixture-only: production never
+      # reaches this branch (it uses the root-owned lockf/flock paths below).
+      if ! ( set -C; /bin/echo "$owner_pid" >"$lifecycle_guard" ) 2>/dev/null; then
+        guard_pid=$(/usr/bin/sed -n '1p' "$lifecycle_guard" 2>/dev/null || true)
+        [[ $guard_pid =~ ^[1-9][0-9]{0,9}$ ]] || return 74
+        if kill -0 "$guard_pid" 2>/dev/null; then return 75; fi
+        /bin/rm -f "$lifecycle_guard" || return 74
+        ( set -C; /bin/echo "$owner_pid" >"$lifecycle_guard" ) 2>/dev/null || return 75
+      fi
+    fi
     /bin/chmod 0600 "$lifecycle_guard" || return 74
     protected_file "$lifecycle_guard" 1024 && exact_mode "$lifecycle_guard" 600 || return 74
     guard_pid=$(/usr/bin/sed -n '1p' "$lifecycle_guard") || return 74
