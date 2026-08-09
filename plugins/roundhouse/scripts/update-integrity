@@ -33,37 +33,27 @@ version=$(jq -r '.version' "$plugin_root/.codex-plugin/plugin.json")
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-integrity.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 : >"$tmp/files.jsonl"
-# Enumerated, never hand-listed: a hardcoded list silently stops covering the
-# next file added under scripts/, which then ships unhashed. executor-status
-# derives the same set with the same exclusions and fails closed on a
-# difference, so the two can never drift apart unnoticed.
-{
-  printf '%s\n' .claude-plugin/plugin.json .codex-plugin/plugin.json
-  # THE ROOTS ARE THE WHOLE SHIPPED TREE, not just the executable half. Rooting
-  # this at `scripts references` left every `SKILL.md` — the operator-facing
-  # instruction set an agent reads and acts on — plus `agents/*.yaml`,
-  # `config.example.json` and `assets/` shipping unhashed. Instructions are
-  # release content in exactly the sense the manifest exists for.
-  (cd "$plugin_root" && find scripts references skills assets \
-    config.example.json ! -type d -print) |
-    grep -Ev "^$integrity_excluded_scripts\$" |
-    LC_ALL=C sort
-} >"$tmp/enumerated"
-# find walks the working tree, so a git-ignored stray (a macOS .DS_Store, an
-# editor scratch file) enumerates like release content and gets sealed — then
-# a clean checkout that lacks it fails executor verification. Drop anything git
-# ignores; a tracked file is never reported ignored, and a genuinely new
-# release file (untracked, not ignored) is still kept so it can be sealed
-# before commit. update-integrity only ever runs inside the repo, so git is
-# present; if it somehow is not, seal the enumerated set unchanged.
-if command -v git >/dev/null 2>&1 &&
-  git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  git -C "$plugin_root" check-ignore --stdin <"$tmp/enumerated" 2>/dev/null |
-    LC_ALL=C sort >"$tmp/ignored" || :
-  LC_ALL=C comm -23 "$tmp/enumerated" "$tmp/ignored" >"$tmp/paths"
-else
-  cp "$tmp/enumerated" "$tmp/paths"
+# Enumerate the TRACKED release tree with git ls-files, never a working-dir
+# find: only committed or staged files are release content, so OS cruft (a
+# macOS .DS_Store, an editor scratch file) can never be sealed even while it
+# sits in the tree, and the set is identical on every checkout. The roots are
+# the whole shipped tree — .claude-plugin/.codex-plugin manifests, every
+# SKILL.md, agents/*.yaml, config.example.json and assets/ are the
+# operator-facing instructions an agent acts on, release content in exactly the
+# sense the manifest exists for — not just the executable half. executor-status
+# cross-checks coverage over the same tracked scripts/ set and fails closed on
+# any file it omits. A new release file must be `git add`ed before it can be
+# sealed, then committed alongside the manifest.
+if ! { command -v git >/dev/null 2>&1 &&
+  git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; }; then
+  printf 'update-integrity: must run inside the git work tree\n' >&2
+  exit 69
 fi
+git -C "$plugin_root" ls-files -- \
+  .claude-plugin/plugin.json .codex-plugin/plugin.json \
+  scripts references skills assets config.example.json |
+  grep -Ev "^$integrity_excluded_scripts\$" |
+  LC_ALL=C sort >"$tmp/paths"
 while IFS= read -r relative; do
   [ -n "$relative" ] || continue
   [ -f "$plugin_root/$relative" ] || {
