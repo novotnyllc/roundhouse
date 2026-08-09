@@ -50,11 +50,13 @@ jobs:
             tar -xz -C "$jj_tmp"
           sudo install -m 0755 "$jj_tmp/jj" /usr/local/bin/jj
           rm -rf "$jj_tmp"
-          command -v yq >/dev/null 2>&1 || {
-            curl -fsSL --retry 3 -o /tmp/yq \
-              "https://github.com/mikefarah/yq/releases/download/v$yq_version/yq_$yq_asset"
-            sudo install -m 0755 /tmp/yq /usr/local/bin/yq
-          }
+          # Always install the pinned yq — never fall back to the runner's
+          # pre-installed one. Number-form handling differs across yq versions
+          # (some preserve 12.0, 4.44.3 normalizes it to 12), and the fold
+          # digest's item identity depends on it, so the version must be pinned.
+          curl -fsSL --retry 3 -o /tmp/yq \
+            "https://github.com/mikefarah/yq/releases/download/v$yq_version/yq_$yq_asset"
+          sudo install -m 0755 /tmp/yq /usr/local/bin/yq
           jj --version
           yq --version
       - name: Validate Bash and integrity
