@@ -42,7 +42,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "7059e77122029d33eaa203d9f1972502da500ae4a3f6f13d92d5d8bd4ddee632"
+      "sha256": "6ef223bf0ee1889034cc33e1f1909e68fa129a2872097fa04a91acad68aa912f"
     },
     {
       "path": "scripts/certify-ssh-node",
@@ -58,7 +58,7 @@
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "d8ed26b3fc69b6d45ca7b381aef97a0c8abec9efbaea560e82ce81f821542f36"
+      "sha256": "6bbecbf5df941e0509c22b8f01ab3be4938d762ed38d7ffaf9deb90ea3d56bb2"
     },
     {
       "path": "scripts/enroll-privilege-posix",
@@ -66,7 +66,7 @@
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
-      "sha256": "2de756fe773716fc15071b5f05e168d13d6219dfb6868fdd6415d1a60da75a22"
+      "sha256": "78ebc37fc1c02b2f773980b8d8c0b1b62507a8bf32412fb1e624c18732ecb2a1"
     },
     {
       "path": "scripts/enroll-ssh-posix",
@@ -74,7 +74,7 @@
     },
     {
       "path": "scripts/enroll-windows-sftp.ps1",
-      "sha256": "92fad4aadb02bcd53f63933f5048a24a1f6f4efbedc73a44eca5aceaa4cfc84c"
+      "sha256": "d7f07d713340a1481fffc615b6518e847fc9ddbc525f766aae5fa9016597da31"
     },
     {
       "path": "scripts/homebrew-bridge.rb",
@@ -170,15 +170,15 @@
     },
     {
       "path": "scripts/privilege-broker-windows.ps1",
-      "sha256": "d060222501b7d4e68e2ad9772301575c5dd719a54d8b41f481683794907c0d31"
+      "sha256": "613202344c52cb41de7a622465bcb68e308ddaa3ac6db3d0c7859681dffb7a54"
     },
     {
       "path": "scripts/profile-worker-windows.ps1",
-      "sha256": "72d7f9c92284f5c04b4157c36303ee3adc11914f955a002ad3036c7816486549"
+      "sha256": "fbf0041158d353416c04be25ae11ad854735b8c83c39794842b6dd046415c4fc"
     },
     {
       "path": "scripts/register-profile-task-windows.ps1",
-      "sha256": "506100066ec73273fe47dedd8472cfe1ddebe5c0cde75dd59826108c9f704586"
+      "sha256": "0e9028413c15622a8e5beaca0124f667e0c94f6a2833b99544e616c62e063750"
     },
     {
       "path": "scripts/roundhouse",
@@ -190,7 +190,7 @@
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",
-      "sha256": "0ab6f1c3716f54e375875c13ca0fba26a9ea0fb1ee3b9cb3c2a56d4fda0108ca"
+      "sha256": "a681f02986330eb1315094600ed226dc37af4a7a10532daf6e26756af9d0976b"
     },
     {
       "path": "skills/fleet-agents/SKILL.md",

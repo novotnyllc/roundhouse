@@ -1,14 +1,10 @@
 # integrity.json pins SHA-256 over on-disk bytes, so every checkout must be
-# byte-identical on every platform. Normalize line endings to LF in the repo
-# and on checkout; the Windows-native script types are the deliberate
-# exception and check out as CRLF (byte-identical CRLF everywhere, so the
-# recorded hashes still hold).
+# byte-identical on every platform — LF everywhere, no exceptions. The Windows
+# .ps1 executors self-verify their own byte content (hash-of-self, exact-length
+# here-strings), so CRLF would break their native self-test; they run under
+# PowerShell 7, which reads LF fine. This is the deliberate reason roundhouse
+# does NOT follow the usual "CRLF for Windows script types" convention.
 * text=auto eol=lf
-*.ps1  text eol=crlf
-*.psm1 text eol=crlf
-*.psd1 text eol=crlf
-*.bat  text eol=crlf
-*.cmd  text eol=crlf
 
 # Binary assets: never touch their bytes.
 *.png  binary
