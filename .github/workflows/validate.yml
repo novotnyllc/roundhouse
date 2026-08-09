@@ -44,9 +44,12 @@ jobs:
             macOS-x86_64) jj_asset=x86_64-apple-darwin; yq_asset=darwin_amd64 ;;
             *) echo "no pinned build for $RUNNER_OS-$(uname -m)" >&2; exit 1 ;;
           esac
+          jj_tmp=$(mktemp -d)
           curl -fsSL --retry 3 \
             "https://github.com/jj-vcs/jj/releases/download/v$jj_version/jj-v$jj_version-$jj_asset.tar.gz" |
-            sudo tar -xz -C /usr/local/bin jj
+            tar -xz -C "$jj_tmp"
+          sudo install -m 0755 "$jj_tmp/jj" /usr/local/bin/jj
+          rm -rf "$jj_tmp"
           command -v yq >/dev/null 2>&1 || {
             curl -fsSL --retry 3 -o /tmp/yq \
               "https://github.com/mikefarah/yq/releases/download/v$yq_version/yq_$yq_asset"

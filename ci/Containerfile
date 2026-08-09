@@ -1,0 +1,43 @@
+# roundhouse CI/dev base — the Linux toolchain the self-check needs, baked in
+# so no run installs it ad hoc. Arch-aware (arm64 for local Apple containers,
+# amd64 for GitHub runners).
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+      bash coreutils findutils grep sed gawk \
+      jq git openssh-client openssh-server nodejs \
+      curl ca-certificates xz-utils shellcheck && \
+    rm -rf /var/lib/apt/lists/*
+
+# The self-check pins toolchain behaviour: jq 1.8 preserves number literals
+# (12 vs 12.0), which apt's 1.7 does not; jj and yq are not packaged at all.
+ARG JJ_VERSION=0.44.0
+ARG YQ_VERSION=4.44.3
+ARG JQ_VERSION=1.8.1
+RUN set -eu; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  jj_asset=x86_64-unknown-linux-musl;  yq_asset=linux_amd64; jq_asset=linux-amd64 ;; \
+      aarch64) jj_asset=aarch64-unknown-linux-musl; yq_asset=linux_arm64; jq_asset=linux-arm64 ;; \
+      *) echo "unsupported arch $arch" >&2; exit 1 ;; \
+    esac; \
+    tmp="$(mktemp -d)"; \
+    curl -fsSL --retry 3 \
+      "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-${jj_asset}.tar.gz" \
+      | tar -xz -C "$tmp"; \
+    install -m 0755 "$tmp/jj" /usr/local/bin/jj; \
+    curl -fsSL --retry 3 -o "$tmp/yq" \
+      "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_${yq_asset}"; \
+    install -m 0755 "$tmp/yq" /usr/local/bin/yq; \
+    curl -fsSL --retry 3 -o "$tmp/jq" \
+      "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-${jq_asset}"; \
+    install -m 0755 "$tmp/jq" /usr/local/bin/jq; \
+    rm -rf "$tmp"; \
+    jj --version; yq --version; jq --version
+
+# ubuntu:24.04 ships a non-root 'ubuntu' user (uid 1000). The self-check's
+# permission contracts assume a non-root actor (root bypasses the
+# writable/ownership rejections), matching the CI runner user.
+
