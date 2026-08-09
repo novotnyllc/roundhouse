@@ -269,10 +269,6 @@
       "sha256": "e27babddc7db9c285b4776b2139c4b7784c377d36c2f5715ab836aa94b905343"
     },
     {
-      "path": "skills/unifi-network-api/.DS_Store",
-      "sha256": "4bc5bea83610f1c5d3bb972d6cd2b262bdeb1a93c60a1c55030f357478a8abe3"
-    },
-    {
       "path": "skills/unifi-network-api/SKILL.md",
       "sha256": "1f720ddcdf6e43d6115d8d574fab5a51d882819c0eb5d72507cca83078288c42"
     },

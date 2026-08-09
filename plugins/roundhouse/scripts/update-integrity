@@ -48,7 +48,22 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
     config.example.json ! -type d -print) |
     grep -Ev "^$integrity_excluded_scripts\$" |
     LC_ALL=C sort
-} >"$tmp/paths"
+} >"$tmp/enumerated"
+# find walks the working tree, so a git-ignored stray (a macOS .DS_Store, an
+# editor scratch file) enumerates like release content and gets sealed — then
+# a clean checkout that lacks it fails executor verification. Drop anything git
+# ignores; a tracked file is never reported ignored, and a genuinely new
+# release file (untracked, not ignored) is still kept so it can be sealed
+# before commit. update-integrity only ever runs inside the repo, so git is
+# present; if it somehow is not, seal the enumerated set unchanged.
+if command -v git >/dev/null 2>&1 &&
+  git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "$plugin_root" check-ignore --stdin <"$tmp/enumerated" 2>/dev/null |
+    LC_ALL=C sort >"$tmp/ignored" || :
+  LC_ALL=C comm -23 "$tmp/enumerated" "$tmp/ignored" >"$tmp/paths"
+else
+  cp "$tmp/enumerated" "$tmp/paths"
+fi
 while IFS= read -r relative; do
   [ -n "$relative" ] || continue
   [ -f "$plugin_root/$relative" ] || {
