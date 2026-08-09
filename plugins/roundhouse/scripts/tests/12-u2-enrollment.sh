@@ -505,11 +505,10 @@ test_u2_enrollment_contracts() {
     [ -f "$u2_root/var/lib/roundhouse-public/canary" ] ||
     fail "U2 enrollment did not create public status before the first request"
   u2_revocation_reserve="$u2_root/var/lib/roundhouse/revocation.reserve"
-  u2_reserve_size=$(stat -f %z "$u2_revocation_reserve" 2>/dev/null || stat -c %s "$u2_revocation_reserve")
-  u2_reserve_blocks=$(stat -f %b "$u2_revocation_reserve" 2>/dev/null || stat -c %b "$u2_revocation_reserve")
-  u2_reserve_device=$(stat -f %d "$u2_revocation_reserve" 2>/dev/null || stat -c %d "$u2_revocation_reserve")
-  u2_state_device=$(stat -f %d "$u2_root/var/lib/roundhouse" 2>/dev/null || \
-    stat -c %d "$u2_root/var/lib/roundhouse")
+  u2_reserve_size=$(stat -c %s "$u2_revocation_reserve" 2>/dev/null || stat -f %z "$u2_revocation_reserve")
+  u2_reserve_blocks=$(stat -c %b "$u2_revocation_reserve" 2>/dev/null || stat -f %b "$u2_revocation_reserve")
+  u2_reserve_device=$(stat -c %d "$u2_revocation_reserve" 2>/dev/null || stat -f %d "$u2_revocation_reserve")
+  u2_state_device=$(stat -c %d "$u2_root/var/lib/roundhouse" 2>/dev/null || stat -f %d "$u2_root/var/lib/roundhouse")
   [ "$u2_reserve_size" -eq 4194304 ] && [ $((u2_reserve_blocks * 512)) -ge 1048576 ] &&
     [ "$u2_reserve_device" = "$u2_state_device" ] ||
     fail "U2 enrollment did not allocate a real same-filesystem revocation reserve"
@@ -634,8 +633,7 @@ EOF
   /bin/dd if=/dev/zero of="$u2_revocation_reserve" bs=1048576 count=0 seek=4 \
     >/dev/null 2>&1
   chmod 600 "$u2_revocation_reserve"
-  u2_sparse_blocks=$(stat -f %b "$u2_revocation_reserve" 2>/dev/null || \
-    stat -c %b "$u2_revocation_reserve")
+  u2_sparse_blocks=$(stat -c %b "$u2_revocation_reserve" 2>/dev/null || stat -f %b "$u2_revocation_reserve")
   [ $((u2_sparse_blocks * 512)) -lt 1048576 ] || fail "U2 sparse reserve fixture was physically allocated"
   u2_sparse_reserve=$(u2_make_envelope apt.update-metadata.v1 \
     request-000000000000000000000000000000f1 "$u2_now" $((u2_now + 300)))

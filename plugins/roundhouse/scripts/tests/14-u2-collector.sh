@@ -631,8 +631,8 @@ EOF
   kill -TERM "$u2_pause_owner"
   wait "$u2_pause_job" 2>/dev/null || true
   rm -f "$u2_pause_marker" "$u2_pause_marker.continue" "$u2_pause_marker.kill"
-  [ "$(stat -f %z "$u2_revocation_reserve" 2>/dev/null || stat -c %s "$u2_revocation_reserve")" -eq 4194304 ] &&
-    [ $((($(stat -f %b "$u2_revocation_reserve" 2>/dev/null || stat -c %b "$u2_revocation_reserve")) * 512)) -ge 1048576 ] &&
+  [ "$(stat -c %s "$u2_revocation_reserve" 2>/dev/null || stat -f %z "$u2_revocation_reserve")" -eq 4194304 ] &&
+    [ $((($(stat -c %b "$u2_revocation_reserve" 2>/dev/null || stat -f %b "$u2_revocation_reserve")) * 512)) -ge 1048576 ] &&
     [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
     [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/2 ] ||
     fail "U2 interrupted pre-intent revocation did not restore its emergency reserve and enrollment"
@@ -657,7 +657,7 @@ EOF
     fail "U2 reserve-temp recovery unexpectedly passed its forced failpoint"
   fi
   [ ! -e "$u2_root/var/lib/roundhouse/.revocation.reserve.pending" ] &&
-    [ "$(stat -f %z "$u2_revocation_reserve" 2>/dev/null || stat -c %s "$u2_revocation_reserve")" -eq 4194304 ] &&
+    [ "$(stat -c %s "$u2_revocation_reserve" 2>/dev/null || stat -f %z "$u2_revocation_reserve")" -eq 4194304 ] &&
     [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
     [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] &&
     [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&

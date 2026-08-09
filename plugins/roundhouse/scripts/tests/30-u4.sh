@@ -628,8 +628,7 @@ EOF
     ROUNDHOUSE_LIB_ONLY=1 . "$cli"
     /bin/dd if=/dev/zero of="$tmp/u4-windows-payload-boundary" bs=1048576 count=0 seek=64 \
       2>/dev/null
-    u4_sparse_blocks=$(stat -f %b "$tmp/u4-windows-payload-boundary" 2>/dev/null || \
-      stat -c %b "$tmp/u4-windows-payload-boundary")
+    u4_sparse_blocks=$(stat -c %b "$tmp/u4-windows-payload-boundary" 2>/dev/null || stat -f %b "$tmp/u4-windows-payload-boundary")
     [ $((u4_sparse_blocks * 512)) -lt 1048576 ] ||
       fail "U4 Windows payload boundary fixture was physically allocated"
     u4_boundary_length=$(wc -c <"$tmp/u4-windows-payload-boundary" | tr -d ' ')

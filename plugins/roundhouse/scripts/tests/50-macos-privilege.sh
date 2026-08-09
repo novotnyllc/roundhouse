@@ -6,6 +6,14 @@
 # shellcheck shell=bash
 
 test_macos_privilege_contracts() {
+  # macOS-only by construction: it pins platform_boundary=macos, validates the
+  # macos-root-v1 privileged-action catalog, and its inline stat stubs use the
+  # BSD `stat -f` idiom. The cross-platform lifecycle guard it also exercises is
+  # covered on Linux by u2/u4, so skip the whole section off darwin.
+  if [ "$(/usr/bin/uname -s)" != Darwin ]; then
+    printf 'skip: macOS privilege contracts run only on darwin\n'
+    return 0
+  fi
   macos_broker="$plugin_cache/scripts/privilege-broker-posix"
   macos_policy="$plugin_cache/references/privilege-policy.default"
   macos_functions="$tmp/macos-contract-functions.sh"

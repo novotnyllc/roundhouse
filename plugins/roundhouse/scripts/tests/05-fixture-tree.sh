@@ -5,8 +5,8 @@
 # shellcheck shell=bash
 
 test_file_mode() {
-  value=$(stat -f %Lp "$1" 2>/dev/null) ||
-    value=$(stat -c %a "$1" 2>/dev/null) ||
+  value=$(stat -c %a "$1" 2>/dev/null) ||
+    value=$(stat -f %Lp "$1" 2>/dev/null) ||
     value=unknown
   printf '%s\n' "$value"
 }
