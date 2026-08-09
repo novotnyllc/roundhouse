@@ -40,21 +40,31 @@ assert_ordered "$fleet_agents_skill" \
   'claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user'
 # railyard is broken without compound-engineering, so the routine refresh
 # converges that dependency under its existing mutation authorization.
-assert_contains "$fleet_agents_text" 'A host that carries `railyard` REQUIRES the `compound-engineering` plugin'
+assert_contains "$fleet_agents_text" 'A host that carries `railyard` REQUIRES two plugins'
+assert_contains "$fleet_agents_text" 'the `compound-engineering` plugin'
 assert_contains "$fleet_agents_text" 'version 3.20.0 or newer'
 assert_contains "$fleet_agents_text" '`EveryInc/compound-engineering-plugin`'
+assert_contains "$fleet_agents_text" 'the `ponytail` plugin'
+assert_contains "$fleet_agents_text" '`DietrichGebert/ponytail`'
 assert_contains "$fleet_agents_text" 'not a separate consent'
-assert_contains "$fleet_agents_text" 'do not install it on a
-harness that does not carry railyard'
+assert_contains "$fleet_agents_text" 'do not install them on a'
 assert_contains "$fleet_agents_text" \
   'codex plugin marketplace add EveryInc/compound-engineering-plugin --json'
 assert_contains "$fleet_agents_text" \
   'codex plugin add compound-engineering@compound-engineering-plugin --json'
 assert_contains "$fleet_agents_text" \
+  'codex plugin marketplace add DietrichGebert/ponytail --json'
+assert_contains "$fleet_agents_text" \
+  'codex plugin add ponytail@ponytail --json'
+assert_contains "$fleet_agents_text" \
   'claude plugin marketplace add EveryInc/compound-engineering-plugin'
 assert_contains "$fleet_agents_text" \
   'claude plugin install compound-engineering@compound-engineering-plugin --scope user'
-assert_contains "$fleet_agents_text" 'Report the dependency as a converged item'
+assert_contains "$fleet_agents_text" \
+  'claude plugin marketplace add DietrichGebert/ponytail'
+assert_contains "$fleet_agents_text" \
+  'claude plugin install ponytail@ponytail --scope user'
+assert_contains "$fleet_agents_text" 'Report each dependency as a'
 assert_contains "$remote_control_text" '`list_projects`'
 assert_contains "$remote_control_text" '`create_thread`'
 assert_contains "$remote_control_text" '`wait_threads`'
