@@ -102,7 +102,7 @@
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
-      "sha256": "7c3b4d7064ba8219a0f5ac9fc527035c8ac8609ca90a13ea1c807d1e9cd9179b"
+      "sha256": "5a0c0e8c4c7476de35e21a13b77fd50a28311eb29bc4ccf1d721f26982975d9d"
     },
     {
       "path": "scripts/lib/fleet-init.sh",

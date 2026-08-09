@@ -191,7 +191,12 @@ fleet_item_value() {
     'getpath([$c, $n]) // empty'
 }
 
-fleet_value_normalize='if type == "object" then . else {state: .} end'
+# Canonicalize numbers with jq arithmetic (`. + 0`) so number FORM never binds a
+# verdict: 12 and 12.0 are one value/one item. yq's own number output is not
+# reliable for this — the same yq version normalizes 12.0 on some hosts and
+# preserves it on others — so the digest must not depend on it.
+fleet_value_normalize='(if type == "object" then . else {state: .} end)
+  | walk(if type == "number" then . + 0 else . end)'
 
 fleet_value_digest() {
   # §7.2, and the pipeline is pinned rather than described: yq does YAML->JSON
@@ -205,10 +210,10 @@ fleet_value_digest() {
   #                       polymorphism re-reviews an item fleet-wide the day
   #                       someone adds a `marketplace:` key.
   #
-  # Known and accepted: yq normalizes number form (12 and 12.0 are the same
-  # item, one verdict), and YAML 1.1 coercion happens before the digest and is
-  # visible in it (0755 -> 755, yes -> "yes"). Quote anything where the literal
-  # matters.
+  # Known and accepted: the digest canonicalizes number form (12 and 12.0 are
+  # the same item, one verdict — see fleet_value_normalize), and YAML 1.1
+  # coercion happens before the digest and is visible in it (0755 -> 755,
+  # yes -> "yes"). Quote anything where the literal matters.
   # The `|| return 1` cannot see a yq failure on its own: this program sets no
   # `pipefail`, so a failed yq leaves jq reading empty stdin, and jq exits 0
   # having printed nothing. Emptiness IS the failure signal, so it is the one
