@@ -286,14 +286,15 @@ YAML
       "$fold_store/hosts/crlf.yaml"
 
     # YAML 1.1 coercion happens BEFORE the digest and is visible in it, and
-    # number form survives. Both are documented consequences, not bugs.
+    # yq normalizes number form (12 and 12.0 are the same value/item). Both are
+    # documented consequences, not bugs.
     [ "$(printf '{mode: 0755, flag: yes, toggle: on}\n' |
       yq -o=json -I=0 | jq -Sc "$fleet_value_normalize")" = \
       '{"flag":"yes","mode":755,"toggle":"on"}' ] ||
       fail "YAML 1.1 coercion did not reach the digest input unchanged"
-    [ "$(printf '12\n' | fleet_value_digest policy.cadence_hours)" != \
+    [ "$(printf '12\n' | fleet_value_digest policy.cadence_hours)" = \
       "$(printf '12.0\n' | fleet_value_digest policy.cadence_hours)" ] ||
-      fail "12 and 12.0 digested identically (jq 1.8 preserves number literals)"
+      fail "12 and 12.0 did not digest identically (yq normalizes number form)"
 
     # --- item identity ---
     [ "$(fleet_item_split config_files.~/.claude/settings.json | tr '\n' '|')" = \

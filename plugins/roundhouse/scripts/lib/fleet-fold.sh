@@ -205,9 +205,10 @@ fleet_value_digest() {
   #                       polymorphism re-reviews an item fleet-wide the day
   #                       someone adds a `marketplace:` key.
   #
-  # Known and accepted: number FORM survives (12 vs 12.0 are different items),
-  # and YAML 1.1 coercion happens before the digest and is visible in it
-  # (0755 -> 755, yes -> "yes"). Quote anything where the literal matters.
+  # Known and accepted: yq normalizes number form (12 and 12.0 are the same
+  # item, one verdict), and YAML 1.1 coercion happens before the digest and is
+  # visible in it (0755 -> 755, yes -> "yes"). Quote anything where the literal
+  # matters.
   # The `|| return 1` cannot see a yq failure on its own: this program sets no
   # `pipefail`, so a failed yq leaves jq reading empty stdin, and jq exits 0
   # having printed nothing. Emptiness IS the failure signal, so it is the one

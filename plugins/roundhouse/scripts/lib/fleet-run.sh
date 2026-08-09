@@ -1019,7 +1019,10 @@ fleet_run_nudge_peer() {
 }
 
 fleet_run_mtime() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || printf '0\n'
+  # stat -c first: on Linux `stat -f` is filesystem stat and dumps a report to
+  # stdout, so the -f-first form leaks that into the value; on macOS `stat -c`
+  # is an illegal option and cleanly falls through to `stat -f`.
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '0\n'
 }
 
 # --- the commands -------------------------------------------------------------

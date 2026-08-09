@@ -494,7 +494,10 @@ exact_mode() {
 }
 
 symlink_owner() {
-  /usr/bin/stat -f %Su "$1" 2>/dev/null || /usr/bin/stat -c %U "$1" 2>/dev/null
+  # Via the shared portable_stat, never a bare `stat -f || stat -c`: on Linux
+  # `stat -f` is filesystem stat and prints a whole report to stdout before it
+  # fails, so the || form captures that report AND the fallback's output.
+  portable_stat %Su %U "$1"
 }
 
 durable_sync() {

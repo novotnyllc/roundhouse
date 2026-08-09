@@ -62,7 +62,7 @@
     },
     {
       "path": "scripts/enroll-privilege-posix",
-      "sha256": "2d22dd1759f729c086b1dbb428cfaa866faed9fcab436464b1a182e29cd1966b"
+      "sha256": "855e6b0b186a97abfb2b72cee341f597376a2b3a0dcb4b60403a099887f18dc5"
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
@@ -102,7 +102,7 @@
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
-      "sha256": "e24e8cf832f1f37b4a097b6bb622dd6b2b73c7dd3b7139258f9a6f06e9a4807a"
+      "sha256": "7c3b4d7064ba8219a0f5ac9fc527035c8ac8609ca90a13ea1c807d1e9cd9179b"
     },
     {
       "path": "scripts/lib/fleet-init.sh",
@@ -118,7 +118,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "cd5c5dd0ea8b71d8b3dc3238a8deea088f66312deb4f2114dbcf1a0c8698cac7"
+      "sha256": "189d54a4c20c8da1dfc0e3427ede17b52b8e51c849704acb82939ec0ad757c71"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
