@@ -182,6 +182,18 @@ YAML
     fleet_run_apply_item "$run_store" vireo "$run_defs" \
       definitions.packages.jj '{"homebrew":"jj"}' '' ||
       fail "the unknown-state guard caught a definitions map that states no state"
+    # POLICY AND DEFINITIONS ARE NOT STATES and must dispatch BEFORE the guard.
+    # `policy.cadence_hours: 12` is a scalar that is neither enabled nor
+    # disabled, so guarding it first would hold every policy item on every host
+    # forever and downstream hosts could never get the canary evidence a policy
+    # change needs.
+    for run_policy_item in 'policy.cadence_hours 12' \
+      'policy.canary_group "canary"' 'policy.canary_wait_hours 0' \
+      'definitions.packages.jj "jj"'; do
+      fleet_run_apply_item "$run_store" vireo "$run_defs" \
+        "${run_policy_item%% *}" "${run_policy_item#* }" '' ||
+        fail "a policy/definitions item was held by the state guard: $run_policy_item"
+    done
     # A desired state of `disabled` on a package is the same shape: removal is
     # §10.3's separate capped decision driven by applied/, never this path, so
     # there is nothing to do rather than something that was refused — and that

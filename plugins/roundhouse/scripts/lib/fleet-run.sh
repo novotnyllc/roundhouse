@@ -809,8 +809,17 @@ fleet_run_apply_item() {
   # per-item trust gate below — and the predicate stays because "held" is a
   # position a category can be put back into in one line.
   ! fleet_category_held "$fleet_run_category" || return 75
-  # AN UNRECOGNISED STATE IS HELD, checked ONCE for every category rather than
-  # per arm. §4's reader's choice makes a bare scalar the state and a map's
+  # POLICY AND DEFINITIONS DISPATCH FIRST, ahead of the state guard below.
+  # Their values are not states at all — `policy.cadence_hours: 12`,
+  # `policy.canary_group: canary`, a definitions map — so subjecting them to an
+  # enabled/disabled check holds every policy item on every host forever, and
+  # downstream hosts could never obtain the canary evidence a policy change
+  # needs. Policy is read, not installed; a definition is a lookup, not a want.
+  case $fleet_run_category in
+    policy | definitions.*) return 0 ;;
+  esac
+  # AN UNRECOGNISED STATE IS HELD, checked ONCE for every remaining category
+  # rather than per arm. §4's reader's choice makes a bare scalar the state and a map's
   # `state:` key the state, and every arm below then asks `= enabled`, so a
   # typo (`enable`) or a wrong type (`state: false`) fell into whatever the arm
   # does with "not enabled": packages returned SATISFIED — positive canary
@@ -823,10 +832,6 @@ fleet_run_apply_item() {
     *) return 75 ;;
   esac
   case $fleet_run_category in
-    policy | definitions.*)
-      # Policy is read, not installed; a definition is a lookup, not a want.
-      return 0
-      ;;
     packages)
       # SATISFIED, and asked BEFORE the resolver: a desired state of `disabled`
       # has no removal verb by design (§10.3 makes removal a separate, capped
