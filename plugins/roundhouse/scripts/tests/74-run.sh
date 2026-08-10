@@ -136,7 +136,9 @@ YAML
     [ "$(jq -r '.model' "$HOME/.claude/settings.json")" = opus ] ||
       fail "the drift report modified the config file — it must change nothing"
 
-    # Declared boundary B-3: no state verb and no observed state either.
+    # Declared boundary B-3: no state verb and no observed state either. 70 is
+    # SATISFIED — nothing to do, here or on any host — and the canary gate
+    # reads it as evidence, so the split from 75 is not cosmetic.
     for run_gap in agents.triage-bot mcp_servers.linear projects.roundhouse; do
       run_status=0
       fleet_run_apply_item "$run_store" vireo "$run_defs" "$run_gap" \
@@ -144,6 +146,31 @@ YAML
       [ "$run_status" -eq 70 ] ||
         fail "$run_gap claimed an apply path it does not have (got $run_status)"
     done
+    # A desired state of `disabled` on a package is the same shape: removal is
+    # §10.3's separate capped decision driven by applied/, never this path, so
+    # there is nothing to do rather than something that was refused.
+    run_status=0
+    fleet_run_apply_item "$run_store" vireo "$run_defs" packages.jj \
+      '"disabled"' homebrew >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 70 ] ||
+      fail "a disabled package did not read as satisfied (got $run_status)"
+    # …and the other side of the split: a miss about THIS HOST's capability is
+    # HELD, never satisfied. A peer that CAN apply the item must not converge
+    # on this host's inability, so those misses have to keep blocking.
+    # A standalone skill this host has nowhere to put (no `skill_roots` in the
+    # host-local config) is exactly that shape.
+    run_status=0
+    fleet_run_apply_item "$run_store" vireo "$run_defs" skills.tdd \
+      '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "a host that cannot place a standalone skill reported it satisfied (got $run_status)"
+    # The harness-absent arm is the same rule and cannot be reached
+    # behaviourally here — the fixture PATH ships a `claude` stub — so it is
+    # asserted on the apply layer's own text, the way tests/75-guards.sh
+    # asserts the publish guards.
+    cli_function_body fleet_run_apply_item |
+      grep -q 'command -v claude >/dev/null 2>&1 || return 75' ||
+      fail "a host with no harness no longer HOLDS a plugin item; it would read as satisfied evidence"
     # A plugin-qualified skill rides its plugin and needs nothing of its own.
     fleet_run_apply_item "$run_store" vireo "$run_defs" \
       skills.superpowers/brainstorming '"enabled"' '' ||

@@ -1004,7 +1004,7 @@ confident wrong merge.
 # ~/.config/roundhouse/store.run/ on vireo and are never replicated.
 - item: plugins.railyard
   digest: 4f1c9a02e8...
-  outcome: applied              # applied | held | reverted | alive
+  outcome: applied              # applied | satisfied | held | reverted | alive
   change: qpvuntsmwlqt          # jj change id of the last commit touching a layer
   commit: 8a3f19c4bb21          # what the signature was verified against
   at: 2026-08-07T09:14:02Z
@@ -1013,6 +1013,16 @@ confident wrong merge.
   digest: b71e...
   outcome: held
   at: 2026-08-07T09:14:05Z
+
+# `satisfied` is the no-op-BECAUSE-CORRECT record, and it is a distinct outcome
+# from `held` so an audit can tell it from no-op-because-blocked. It is written
+# when the item resolved, was reviewed, and this design has no state-alignment
+# verb to run for its category (boundary B-3) — so there was nothing to do,
+# here or on any other host.
+- item: mcp_servers.context7
+  digest: 5a7b...
+  outcome: satisfied
+  at: 2026-08-07T09:14:06Z
 
 # A conflict the run's agent resolved (§8.2). This is the one replicated record
 # that carries a rationale, and it is the exception that proves the rule: a hold
@@ -3236,8 +3246,8 @@ its own measurement of jj on Windows. This design does not depend on one.
 
 A non-canary host applies item X at digest D only when, for some canary host `c`:
 
-1. `journal/c/` contains `outcome: applied` for `{X, D}`, at least
-   `canary_wait_hours` ago, **and**
+1. `journal/c/` contains `outcome: applied` **or `outcome: satisfied`** for
+   `{X, D}`, at least `canary_wait_hours` ago, **and**
 2. no later record for X from `c` with `outcome: held` or `reverted`, **and**
 3. **`c` has published *some* record — any item, or an `alive` heartbeat — dated
    at or after `applied_at + canary_wait_hours`.**
@@ -3257,6 +3267,14 @@ Attribution is real because of §7.3: the commit introducing a record under
 exemption is canary membership. Time comes from journal `at` fields, never commit
 timestamps. `outcome: applied` claims only "the run refused nothing" — a weaker
 claim than a health probe, and the design does not pretend otherwise.
+
+`satisfied` counts in condition 1 and `held` does not, and the asymmetry is
+what makes the gate terminate. An item whose category has no state-alignment
+verb can never produce an `applied` record **on any host**, so gating peers on
+one holds it forever and buys nothing — the peer would no-op identically. An
+item a host tried and could not apply, or that a gate refused, still journals
+`held` and still blocks: a genuine apply failure must never read as evidence of
+success.
 
 *Ceiling:* "who is in canary" is a grep across 5 host files. At ~30 hosts that
 flips and membership should move into `groups/canary.yaml`.

@@ -772,10 +772,28 @@ fleet_config_drift() {
 fleet_run_apply_item() {
   # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
-  # Exit 0 applied, 70 no apply path for this category, 75 held. Presence for
-  # manager-installed items is always the manager's own command; only STATE
-  # falls back to a config edit, and where a harness has no state verb this
-  # design does not invent one.
+  # Exit 0 applied, 70 SATISFIED, 75 held. Presence for manager-installed items
+  # is always the manager's own command; only STATE falls back to a config
+  # edit, and where a harness has no state verb this design does not invent
+  # one.
+  #
+  # 70 vs 75 is load-bearing and is read by the canary gate, so the split has
+  # to mean something a gate can act on:
+  #
+  #   70 SATISFIED  this design has no state-alignment verb for the item, so
+  #                 there is nothing to do — here or on any other host. A no-op
+  #                 BECAUSE CORRECT. It journals `satisfied` and counts as
+  #                 canary evidence, because gating peers on an `applied`
+  #                 record that can never exist deadlocks the item forever and
+  #                 buys nothing: the peer would no-op identically.
+  #   75 HELD       this host tried and could not, or a gate refused. A no-op
+  #                 BECAUSE BLOCKED. It journals `held` and blocks downstream,
+  #                 which is the property a genuine apply failure must keep.
+  #
+  # A miss that is about THIS HOST's capability (no `claude` on the box, no
+  # skill root configured, no resolvable source) is 75 and not 70: another host
+  # may well be able to apply it, so this host's inability is not evidence
+  # about the item.
   fleet_run_split=$(fleet_item_split "$4") || return 70
   fleet_run_category=$(printf '%s\n' "$fleet_run_split" | sed -n 1p)
   fleet_run_name=$(printf '%s\n' "$fleet_run_split" | sed -n 2p)
@@ -794,6 +812,9 @@ fleet_run_apply_item() {
       fleet_run_resolved=$(fleet_resolve_package "$3" "$fleet_run_name" $6) || :
       [ "$(printf '%s\n' "$fleet_run_resolved" | jq -r '.resolved')" = true ] ||
         return 75
+      # SATISFIED: a desired state of `disabled` has no removal verb by design
+      # (§10.3 makes removal a separate, capped decision driven by applied/),
+      # so there is nothing to do here or anywhere else.
       [ "$(fleet_run_state_of "$5")" = enabled ] || return 70
       # THE VERSION RIDES ALONG. The resolver reports `pin: flag` plus the
       # version and `fleet_package_pinned` then makes the update pass skip the
@@ -813,7 +834,10 @@ fleet_run_apply_item() {
         if type == "object" then (.marketplace // "") else "" end')
       [ -n "$fleet_run_market" ] || fleet_run_market=$(printf '%s\n' \
         "$fleet_run_surface" | jq -r '.marketplace // ""')
-      command -v claude >/dev/null 2>&1 || return 70
+      # HELD, not satisfied: a host with no `claude` cannot speak to the item
+      # at all, and a peer that has one still must not converge on this host's
+      # inability. See the exit-code contract above.
+      command -v claude >/dev/null 2>&1 || return 75
       # A NULL MARKETPLACE IS THE ZERO-CONFIG CASE, not a missing one.
       # `fleet_resolve_surface`'s own contract is "a null marketplace means
       # 'wherever this harness looks'", and §5's worked example — `plugins:
@@ -841,11 +865,14 @@ fleet_run_apply_item() {
       fleet_run_surface=$(fleet_resolve_surface "$3" skills "$fleet_run_name")
       [ "$(printf '%s\n' "$fleet_run_surface" | jq -r '.delivery')" = standalone ] ||
         return 0
+      # Both misses are HELD, not satisfied: an unresolvable source is a
+      # definitions gap someone has to close, and a missing skill root is this
+      # host's own configuration. Neither is evidence the item needs no work.
       fleet_run_source=$(printf '%s\n' "$fleet_run_surface" | jq -r '.source // ""')
-      [ -n "$fleet_run_source" ] || return 70
+      [ -n "$fleet_run_source" ] || return 75
       fleet_run_root=$(jq -r '(.skill_roots // [])[0].path // empty' \
         "$(config_path)" 2>/dev/null) || fleet_run_root=
-      [ -n "$fleet_run_root" ] || return 70
+      [ -n "$fleet_run_root" ] || return 75
       fleet_run_root=$(expand_user_path "$fleet_run_root")
       [ ! -d "$fleet_run_root/$fleet_run_name" ] || return 0
       fleet_validate_fetch_url "$fleet_run_source" || return 75
@@ -1473,6 +1500,21 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         run_applied_items="$run_applied_items$run_item "
         printf '  applied %s\n' "$run_item"
         ;;
+      70)
+        # No-op BECAUSE CORRECT: the item resolved and reviewed, and this
+        # design has no state-alignment verb to run for it (B-3). A DISTINCT
+        # outcome from `held` so an audit can tell the two apart, and the one
+        # non-`applied` outcome the canary gate accepts as evidence —
+        # otherwise every such item deadlocks the whole fleet behind a record
+        # that can never be written. applied/ stays untouched: nothing was
+        # installed, so nothing is owned, and §10.3's removal legality is
+        # unchanged.
+        fleet_journal_append "$run_store" "$run_host" \
+          "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
+            '{item:$item,digest:$d,outcome:"satisfied",at:$at}')" || :
+        printf '  satisfied %s (no state-alignment verb for this category)\n' \
+          "$run_item"
+        ;;
       *)
         [ "$run_status" -ne 75 ] || [ "$run_category" != packages ] ||
           fleet_alert_write "$run_store" "$run_host" package-hold \
@@ -1493,7 +1535,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         fleet_journal_append "$run_store" "$run_host" \
           "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
             '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
-        printf '  held    %s (no apply path or the category is held)\n' "$run_item"
+        printf '  held    %s (this host could not apply it, or a gate refused)\n' \
+          "$run_item"
         ;;
     esac
   done 9<"$run_tmp/verdicts"
@@ -2218,12 +2261,24 @@ fleet_apply_command() (
       printf 'roundhouse: applied %s at %s (working copy only — the next run publishes it)\n' \
         "$apply_item" "$apply_digest"
       ;;
+    70)
+      # The same split the run makes, for the same reason — and here it also
+      # stops the manual verb from WITHDRAWING evidence: a `held` record dated
+      # after an earlier `applied`/`satisfied` fails canary condition 2 and
+      # would silently re-block every downstream host.
+      fleet_journal_append "$apply_store" "$apply_host" \
+        "$(jq -cn --arg item "$apply_item" --arg d "$apply_digest" \
+          --arg at "$apply_now" \
+          '{item:$item,digest:$d,outcome:"satisfied",at:$at}')" || :
+      printf 'roundhouse: %s is satisfied at %s — this design has no state-alignment verb for its category (working copy only)\n' \
+        "$apply_item" "$apply_digest"
+      ;;
     *)
       fleet_journal_append "$apply_store" "$apply_host" \
         "$(jq -cn --arg item "$apply_item" --arg d "$apply_digest" \
           --arg at "$apply_now" \
           '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
-      printf 'roundhouse: %s has no apply path on this host, or its category is held\n' \
+      printf 'roundhouse: this host could not apply %s, or a gate refused it\n' \
         "$apply_item" >&2
       exit "$apply_status"
       ;;

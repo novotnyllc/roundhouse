@@ -110,7 +110,7 @@
     },
     {
       "path": "scripts/lib/fleet-records.sh",
-      "sha256": "496e059d8f5d1ea4c955f6449d75c9a9c5f484fca0fec8508dded44001ea51c9"
+      "sha256": "f4052196744972db15905f83aec70dff99bfd088fcfc9f7737b76d0eb53ca493"
     },
     {
       "path": "scripts/lib/fleet-resolve.sh",
@@ -118,7 +118,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "189d54a4c20c8da1dfc0e3427ede17b52b8e51c849704acb82939ec0ad757c71"
+      "sha256": "493bfe217aaf77f0b68c53d520c0b3e322c8a07f165111b0f1991024e5998da6"
     },
     {
       "path": "scripts/lib/fleet-store.sh",

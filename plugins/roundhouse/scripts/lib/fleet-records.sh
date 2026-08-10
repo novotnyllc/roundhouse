@@ -143,9 +143,16 @@ fleet_journal_entry_ok() {
         ((.sides // []) | length) == 2 and
         all(.sides[]; (.change | type == "string") and (.host | type == "string")) and
         (.resolution | type == "string")
-      elif ($o == "applied" or $o == "held" or $o == "reverted") then
+      elif ($o == "applied" or $o == "satisfied" or $o == "held" or
+            $o == "reverted") then
         # `applied` claims only "the run refused nothing" — a weaker claim
         # than a health probe, and the design does not pretend otherwise.
+        # `satisfied` is the no-op-BECAUSE-CORRECT record: the item resolved,
+        # was reviewed, and this design has no state-alignment verb to run for
+        # it (declared boundary B-3), so there was nothing to do. It is a
+        # DISTINCT outcome from `held` on purpose — an audit that cannot tell
+        # "no-op because correct" from "no-op because blocked" cannot answer
+        # the only question anyone asks of the journal.
         (.item | type == "string") and (.digest | type == "string")
       else false end)' >/dev/null 2>&1
 }
@@ -457,11 +464,20 @@ fleet_canary_gate() {
   # `fleet_canary_gate STORE ITEM DIGEST WAIT_HOURS NOW CANARY...`. A
   # non-canary host applies item X at digest D only when, for SOME canary c:
   #
-  #   1. journal/c/ carries `outcome: applied` for {X, D}, at least
-  #      canary_wait_hours ago, and
+  #   1. journal/c/ carries `outcome: applied` OR `outcome: satisfied` for
+  #      {X, D}, at least canary_wait_hours ago, and
   #   2. no LATER record for X from c with `outcome: held` or `reverted`, and
   #   3. c has published SOME record — any item, or an `alive` heartbeat —
   #      dated at or after applied_at + canary_wait_hours.
+  #
+  # `satisfied` counts in condition 1 and `held` does not, and that asymmetry
+  # is the whole point. An item the canary resolved and had nothing to do about
+  # (B-3: no state-alignment verb for its category) can never produce an
+  # `applied` record on any host — so gating downstream on one deadlocked the
+  # item forever, on every host, with no safety bought: downstream will no-op
+  # identically. An item the canary tried and COULD NOT apply, or that a gate
+  # refused, still journals `held` and still blocks — a genuine apply failure
+  # must never read as evidence of success.
   #
   # Condition 3 closes a lie by omission: a canary that applies an item, is
   # wrecked by it and stops journaling satisfies (1) and (2), and so does a
@@ -496,7 +512,7 @@ fleet_canary_gate() {
         ($now | fromdateiso8601) as $now_epoch |
         ($wait * 3600) as $wait_seconds |
         [.[] | select(.item == $item and .digest == $digest and
-          .outcome == "applied")] as $applied |
+          (.outcome == "applied" or .outcome == "satisfied"))] as $applied |
         ($applied | map(.at | fromdateiso8601) | min) as $applied_epoch |
         $applied_epoch != null and
         ($applied_epoch + $wait_seconds) <= $now_epoch and

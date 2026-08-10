@@ -409,5 +409,42 @@ YAML
     ! fleet_canary_gate "$rec_canary_store" plugins.brand-new ff00 24 \
       2026-08-07T12:00:00Z canary-1 canary-2 ||
       fail "an item no canary ever applied was released"
+
+    # --- `satisfied` IS evidence; `held` is not, and the pair is the fix ---
+    # An item in a category with no state-alignment verb (B-3) can never
+    # produce an `applied` record on any host, so gating peers on one deadlocks
+    # it forever and buys nothing — the peer would no-op identically.
+    rec_sat_store="$tmp/records/canary-satisfied"
+    rm -rf "$rec_sat_store"
+    mkdir -p "$rec_sat_store"
+    fleet_journal_append "$rec_sat_store" canary-1 \
+      "$(rec_entry mcp_servers.context7 5a7b satisfied 2026-08-06T09:00:00Z)" ||
+      fail "a satisfied journal entry was refused as not evidence-shaped"
+    fleet_journal_append "$rec_sat_store" canary-1 \
+      "$(jq -cn '{outcome: "alive", at: "2026-08-07T10:00:00Z"}')"
+    fleet_canary_gate "$rec_sat_store" mcp_servers.context7 5a7b 24 \
+      2026-08-07T12:00:00Z canary-1 ||
+      fail "a satisfied canary record did not release the item"
+    # It is still keyed on the digest, and still withdrawable: `satisfied` buys
+    # the item nothing `applied` would not have bought it.
+    ! fleet_canary_gate "$rec_sat_store" mcp_servers.context7 deadbeef 24 \
+      2026-08-07T12:00:00Z canary-1 ||
+      fail "a satisfied record released the item at a digest no canary saw"
+    fleet_journal_append "$rec_sat_store" canary-1 \
+      "$(rec_entry mcp_servers.context7 5a7b held 2026-08-06T20:00:00Z)"
+    ! fleet_canary_gate "$rec_sat_store" mcp_servers.context7 5a7b 24 \
+      2026-08-07T12:00:00Z canary-1 ||
+      fail "a later hold did not withdraw a satisfied record"
+    # And the property that keeps this from being a false green: an item the
+    # canary genuinely could not apply journals `held` and still blocks.
+    rm -rf "$rec_sat_store"
+    mkdir -p "$rec_sat_store"
+    fleet_journal_append "$rec_sat_store" canary-1 \
+      "$(rec_entry plugins.railyard 91ac33 held 2026-08-06T09:00:00Z)"
+    fleet_journal_append "$rec_sat_store" canary-1 \
+      "$(jq -cn '{outcome: "alive", at: "2026-08-07T10:00:00Z"}')"
+    ! fleet_canary_gate "$rec_sat_store" plugins.railyard 91ac33 24 \
+      2026-08-07T12:00:00Z canary-1 ||
+      fail "an item the canary could not apply was released as canary evidence"
   )
 fi
