@@ -290,6 +290,20 @@ JSONC
       *'command -v roundhouse'*) ;;
       *) fail "the remote prologue does not prefer a launcher already on PATH" ;;
     esac
+    # THE SPONSOR'S OWN VERSION IS TRIED FIRST, by exact path: falling straight
+    # to "whichever cached copy sorts last" drives bytes this host did not
+    # choose, and lexically last is not even newest (0.9.0 sorts after 0.10.0),
+    # so it could be an arbitrarily old build whose gates this one has added.
+    guard_version=$(jq -r '.version' \
+      "$(dirname -- "$cli")/../.codex-plugin/plugin.json")
+    case $guard_prologue in
+      *"/roundhouse/$guard_version/scripts/roundhouse"*) ;;
+      *) fail "the remote prologue does not ask for the sponsor's own version first: $guard_version" ;;
+    esac
+    printf '%s\n' "$guard_prologue" >"$tmp/guards-prologue.sh"
+    assert_ordered "$tmp/guards-prologue.sh" \
+      "/roundhouse/$guard_version/scripts/roundhouse" \
+      '/roundhouse/*/scripts/roundhouse'
     for guard_cache in .claude/plugins/cache .codex/plugins/cache; do
       case $guard_prologue in
         *"$guard_cache"*) ;;

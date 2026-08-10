@@ -146,6 +146,18 @@ YAML
       [ "$run_status" -eq 70 ] ||
         fail "$run_gap claimed an apply path it does not have (got $run_status)"
     done
+    # An UNKNOWN category is HELD, never satisfied. §7.7 holds the whole store
+    # on a top-level key that is neither a category nor a host fact, so the run
+    # never reaches the apply layer for one — but `fleet-apply ITEM` is invoked
+    # directly and does. 70 here would journal `satisfied` for state this build
+    # cannot interpret, which is positive canary evidence peers act on.
+    for run_unknown in widgets.thing definitions_typo.x 'Plugins.Railyard'; do
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo "$run_defs" "$run_unknown" \
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+      [ "$run_status" -eq 75 ] ||
+        fail "unknown category $run_unknown reached satisfied evidence (got $run_status)"
+    done
     # A desired state of `disabled` on a package is the same shape: removal is
     # §10.3's separate capped decision driven by applied/, never this path, so
     # there is nothing to do rather than something that was refused — and that

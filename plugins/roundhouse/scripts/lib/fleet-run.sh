@@ -913,11 +913,21 @@ fleet_run_apply_item() {
       fleet_config_drift "$2" "$fleet_run_name" "$5"
       return 0
       ;;
-    *)
-      # agents, mcp_servers, projects: no state-alignment verb and no observed
-      # state either (declared boundary B-3). They resolve, review and journal;
-      # they do not apply.
+    agents | mcp_servers | projects)
+      # The B-3 categories, NAMED rather than caught by a wildcard: no
+      # state-alignment verb and no observed state either. They resolve, review
+      # and journal; they do not apply.
       return 70
+      ;;
+    *)
+      # AN UNKNOWN CATEGORY IS HELD, never satisfied. §7.7 holds the whole store
+      # on a top-level key that is neither a category nor a host fact, and the
+      # run never reaches this function for one — but `fleet-apply ITEM` is
+      # invoked directly and does. Returning 70 here would journal `satisfied`
+      # for state this build cannot interpret, which is positive canary evidence
+      # that peers act on. The closed set (§4/fleet_categories) is the point:
+      # anything outside it is exactly what nobody has decided about yet.
+      return 75
       ;;
   esac
 }

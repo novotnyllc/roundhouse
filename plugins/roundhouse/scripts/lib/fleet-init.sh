@@ -360,9 +360,21 @@ fleet_store_lineage_ok() {
   # up, and every later verb failed somewhere further downstream with a message
   # about the symptom. Refusing here costs one `jj file show` and names the
   # remedy while it is still one command.
-  lineage_head=$(jj -R "$1" log \
+  # FAIL CLOSED ON AN UNREADABLE HISTORY, the same trap lib/fleet-doctor.sh's
+  # sweep already documents: piping `jj log` straight into `head` reports
+  # HEAD's status, so a failed enumeration — unreadable metadata, a bad revset
+  # after a version bump, a corrupt store — comes back empty and
+  # indistinguishable from "no history", which is the one answer that
+  # authorizes everything. Capture jj's own status, and refuse on it.
+  lineage_rc=0
+  lineage_log=$(jj -R "$1" log \
     -r 'heads(bookmarks(exact:"main")) | present(main@origin)' \
-    --no-graph -T 'commit_id ++ "\n"' 2>/dev/null | head -1)
+    --no-graph -T 'commit_id ++ "\n"' 2>/dev/null) || lineage_rc=$?
+  [ "$lineage_rc" -eq 0 ] || {
+    printf 'its history could not be read (jj log exit %s)\n' "$lineage_rc"
+    return 1
+  }
+  lineage_head=$(printf '%s\n' "$lineage_log" | grep . | head -1)
   [ -n "$lineage_head" ] || return 0
   # FAIL CLOSED. This is a preflight whose whole job is refusing a store the
   # build cannot join, so "I could not run the check" must never read as "the
@@ -563,6 +575,15 @@ fleet_remote_cli_prologue() {
   # A POSIX-sh prologue that resolves THIS PLUGIN'S CLI on the far side of an
   # SSH lane and leaves it in `$rh`, or exits 69 saying why not.
   #
+  # The version this host is running, so the peer can be asked for the same one
+  # by exact path. A `*` when it cannot be read keeps the glob well-formed and
+  # degrades to the ordinary fallback rather than composing a broken path.
+  fleet_remote_cli_version=$(jq -r '.version // empty' \
+    "$plugin_root/.codex-plugin/plugin.json" 2>/dev/null) || fleet_remote_cli_version=
+  case ${fleet_remote_cli_version:-} in
+    '' | *[!0-9.]*) fleet_remote_cli_version='*' ;;
+  esac
+  #
   # `fleet-add` used to run a bare `roundhouse …` on the newcomer, but the
   # plugin ships no `roundhouse` on anybody's PATH — skills invoke it through
   # its relative `scripts/roundhouse`. Every host enrolled this way therefore
@@ -577,12 +598,31 @@ fleet_remote_cli_prologue() {
   # arm the iris-windows native-membership plan adds is another entry here, not
   # a rewrite of the call sites.
   #
-  # ponytail: last-glob-wins picks the highest version LEXICALLY, so a future
-  # 0.10.0 would sort behind 0.9.0. Fine for a one-shot bootstrap that only has
-  # to produce a working CLI; sort with `sort -V` if it ever has to pick the
-  # newest exactly.
+  # THE SPONSOR'S OWN VERSION IS TRIED FIRST, by exact path. Falling straight
+  # to "whichever cached copy sorts last" means the sponsor drives bytes it did
+  # not choose — and lexically last is not even newest (0.9.0 sorts after
+  # 0.10.0), so it could be an arbitrarily old build whose gates this one has
+  # since added. Naming the version this host is running makes the common case
+  # deterministic and matched.
+  #
+  # ponytail: the fallback is still last-glob-wins, and it is REACHED only when
+  # the newcomer has no copy of the sponsor's version at all. The full fix the
+  # reviewer asks for — transfer or verify the exact executor, against
+  # integrity.json — is a real hardening and a bigger change than a bootstrap
+  # prologue: `scripts/roundhouse executor-status` already produces the manifest
+  # it would compare, so the follow-up has its input. Note that the channel
+  # already grants this host full code execution on the peer (§7.3a), so this
+  # is about determinism and matched gates, not about a new trust boundary.
+  printf 'rh=$(command -v roundhouse 2>/dev/null) || rh=\n'
+  printf 'if [ -z "$rh" ]; then\n'
+  printf '  for rh_candidate in "$HOME"/.claude/plugins/cache/*/roundhouse/%s/scripts/roundhouse \\\n' \
+    "$fleet_remote_cli_version"
+  printf '    "$HOME"/.codex/plugins/cache/*/roundhouse/%s/scripts/roundhouse; do\n' \
+    "$fleet_remote_cli_version"
+  printf '    [ ! -x "$rh_candidate" ] || rh=$rh_candidate\n'
+  printf '  done\n'
+  printf 'fi\n'
   cat <<'SH'
-rh=$(command -v roundhouse 2>/dev/null) || rh=
 if [ -z "$rh" ]; then
   for rh_candidate in "$HOME"/.claude/plugins/cache/*/roundhouse/*/scripts/roundhouse \
     "$HOME"/.codex/plugins/cache/*/roundhouse/*/scripts/roundhouse; do
