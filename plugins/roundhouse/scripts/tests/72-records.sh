@@ -319,9 +319,20 @@ YAML
     printf '%s\n' "$rec_fresh" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' ||
       fail "upstream freshness is not max(updated_at) across the directory"
     # Hand-written older stamps: the maximum wins, and nothing takes a turn.
+    #
+    # Compared against VIREO'S OWN stamp, read back from its record, not against
+    # the max captured above. Both writes are stamped from the wall clock at
+    # second granularity, so when they straddle a second boundary the captured
+    # max is WREN's stamp — and overwriting wren then legitimately lowers the
+    # maximum to vireo's, failing an assertion that had nothing to do with the
+    # behaviour under test. That made this fixture fail on roughly the fraction
+    # of runs where the two writes land in different seconds.
+    rec_vireo_at=$(yq -r '.updated_at' \
+      "$rec_store/upstreams/claude-marketplace/vireo.yaml")
     fleet_record_write "$rec_store/upstreams/claude-marketplace/wren.yaml" \
       '{"updated_at":"2020-01-01T00:00:00Z","result":"sha256:old"}'
-    [ "$(fleet_upstream_freshness "$rec_store" claude-marketplace)" = "$rec_fresh" ] ||
+    [ "$(fleet_upstream_freshness "$rec_store" claude-marketplace)" = \
+      "$rec_vireo_at" ] ||
       fail "an older per-host record moved the fleet's freshness backwards"
 
     # --- §5 policy, read from the store rather than from the box ---

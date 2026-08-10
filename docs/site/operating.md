@@ -107,8 +107,11 @@ remote is gated. A remote that answers unauthenticated reads is public and
 is refused; an unreachable remote is inconclusive and never satisfies the
 gate, because a failed probe is not evidence of privacy. Host 1 runs it in
 the order above; hosts 2..N have `fleet-add` run it for them over the
-enrollment channel, so a newly added host publishes on its first
-`fleet-run`.
+enrollment channel, once that host carries the store. `fleet-add` does not
+clone the store for the newcomer — `fleet-init` leaves one with no origin —
+so on a genuinely fresh host it names the two commands that remain there:
+`jj git clone --colocate <remote> ~/.config/roundhouse/store`, then
+`roundhouse fleet-verify-remote`.
 
 `fleet-set-remote URL` moves the store to a new remote. It writes the move
 alert *before* the push, so a crash between the two still leaves the store

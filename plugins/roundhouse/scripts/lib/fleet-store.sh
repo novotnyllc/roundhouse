@@ -286,10 +286,43 @@ fleet_allowed_paths_filter='
         $namespace[:($key | length)] == $key)];
 '
 
+fleet_quote_is_content_address() {
+  # fleet_quote_is_content_address TOKEN [STORE] — is TOKEN a commit id in
+  # STORE's own history? PROOF, never shape.
+  #
+  # This exists because the reverse — exempting a token because its LENGTH
+  # looks like a digest — is not safe: a 40-character lowercase-hex API token
+  # and a git commit id are the same string shape, so a length test would let a
+  # real credential into permanent replicated history. The question that can be
+  # answered honestly is "does this name an object this repository already
+  # contains", and a token that does names something every peer can already
+  # read, so publishing it discloses nothing.
+  #
+  # WITHOUT A STORE THERE IS NO EXEMPTION. `fleet_record_quote_ok`'s free text
+  # (findings/, holds) has no repository context, so nothing there is ever
+  # exempt — the strictest answer for the surface a human types prose into.
+  case $1 in
+    '' | *[!0-9a-f]*) return 1 ;;
+  esac
+  # 40 exactly: a git/jj commit id. Not a prefix (a short id is under the
+  # entropy floor and never reaches here) and not 64 — a sha256 content digest
+  # has no cheap proof available, so it gets no exemption either.
+  [ "${#1}" -eq 40 ] || return 1
+  [ -n "${2:-}" ] || return 1
+  [ -n "$(jj -R "$2" log -r "$1" --no-graph -T 'commit_id ++ "\n"' \
+    2>/dev/null | head -1)" ]
+}
+
 fleet_quote_is_secret() {
-  # Mechanical backstop to agent-side redaction, not the primary control:
-  # named secret classes plus one bounded high-entropy check. Every field a
-  # record replicates passes through here, under the same 400-byte cap.
+  # fleet_quote_is_secret TEXT [STORE] — mechanical backstop to agent-side
+  # redaction, not the primary control: named secret classes plus one bounded
+  # high-entropy check. Every field a record replicates passes through here,
+  # under the same 400-byte cap.
+  #
+  # STORE is optional and is used for exactly one thing: proving a
+  # high-entropy token is a commit id this repository already contains
+  # (`fleet_quote_is_content_address`). The sweep passes it because it is
+  # walking a store; the free-text guard does not, and gets no exemption.
   #
   # NORMALIZE FIRST, because every check below is line-oriented `grep` and the
   # input is attacker-influenced free text (a `$2`/`$3` handed to
@@ -327,24 +360,29 @@ fleet_quote_is_secret() {
   # letters-only single-case run (a jj change id is `k`-`z`, no digit) is NOT
   # flagged, which is why change ids in trailers stay publishable.
   #
-  # ONE EXEMPTION, and it is a length equality rather than a shape: a whole
-  # token that is exactly 40 or exactly 64 lowercase hex digits is a git commit
-  # id or a sha256 digest. Both are CONTENT ADDRESSES — public by construction,
-  # printed by every tool in this system, and quoted into ordinary descriptions
-  # ("checkpoint 3 through <sha>", an integrity digest). The heuristic flagged
-  # them as single-case hex high-entropy and refused the guarded publish, and a
-  # guard that fires on the most ordinary string in a version-control system is
-  # a guard people learn to route around — which is the failure this closes.
+  # ONE EXEMPTION, and it is PROVED rather than assumed: a whole token that
+  # names a commit this repository already contains. The heuristic used to flag
+  # a bare git commit id as single-case hex high-entropy and refuse the guarded
+  # publish — and `fleet-checkpoint`'s own description quotes one, so a guard
+  # that fires on the most ordinary string in a version-control system is a
+  # guard people learn to route around. That is the failure this closes. It is
+  # closed by asking the repository, not by measuring the string: a 40-character
+  # lowercase-hex credential and a commit id are the same shape, so a length
+  # test would publish the credential.
   #
-  # Deliberately NOT a general hex exemption: 32, 48 and every other length
-  # still flag, because a real key is usually not exactly a digest length and
-  # the two shapes above are the only ones this system actually emits. `grep
-  # -oE` yields maximal runs, so each awk line IS a whole token — a secret with
-  # a 40-hex prefix does not slip through, it arrives as a longer run.
-  printf '%s' "$quote_text" | grep -oE '[A-Za-z0-9_]{32,}' |
-    awk '/^[0-9a-f]{40}$/ || /^[0-9a-f]{64}$/ { next }
-      (/[0-9]/ && /[A-Za-z]/) || (/[a-z]/ && /[A-Z]/) { found = 1 }
-      END { exit(found ? 0 : 1) }'
+  # `grep -oE` yields maximal runs, so each token below is a WHOLE token — a
+  # secret that merely opens with 40 hex arrives as one longer run and is
+  # accounted for as itself.
+  quote_hits=$(printf '%s' "$quote_text" | grep -oE '[A-Za-z0-9_]{32,}' |
+    awk '(/[0-9]/ && /[A-Za-z]/) || (/[a-z]/ && /[A-Z]/) { print }')
+  [ -n "$quote_hits" ] || return 1
+  # EVERY candidate has to be accounted for. One token this store cannot
+  # explain is a secret, however many of its neighbours are commit ids.
+  # shellcheck disable=SC2086 # the charset excludes whitespace; one token per word
+  for quote_token in $quote_hits; do
+    fleet_quote_is_content_address "$quote_token" "${2:-}" || return 0
+  done
+  return 1
 }
 
 fleet_store_id_at() {

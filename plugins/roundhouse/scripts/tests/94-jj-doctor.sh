@@ -328,29 +328,68 @@ roundhouse-items: -" "$docjj_host_yaml"
       *) fail "the cap refusal did not say what it capped: $docjj_out" ;;
     esac
 
-    # …and the other direction, over the same real range: a CONTENT ADDRESS in
-    # a description publishes. A 40-hex commit id and a 64-hex sha256 digest
-    # are public by construction and are the most ordinary strings this system
-    # emits — `fleet-checkpoint`'s own description quotes one. The entropy
-    # heuristic read them as single-case hex secrets and refused the guarded
-    # publish, which is how a guard teaches people to route around it.
+    # …and the other direction, over the same real range: a description that
+    # quotes a COMMIT ID THIS STORE CONTAINS publishes. `fleet-checkpoint`'s own
+    # description quotes one, and the entropy heuristic read it as single-case
+    # hex and refused the guarded publish — which is how a guard teaches people
+    # to route around it.
+    #
+    # The exemption is PROVED, not inferred from shape: a 40-character
+    # lowercase-hex credential and a commit id are the same string, so the
+    # sweep asks the repository. That is why this fixture quotes a REAL id out
+    # of this store rather than a plausible-looking constant, and why the two
+    # refusals below still stand.
     jj -R "$doc" abandon -r "$(docjj_lib fleet_vcs_heads_local "$doc")" >/dev/null
     jj -R "$doc" bookmark set main \
       -r "$(jj -R "$doc" log -r 'present(main@origin)' --no-graph -T 'commit_id')" >/dev/null
     jj -R "$doc" new "$(docjj_lib fleet_vcs_heads_local "$doc")" >/dev/null
-    docjj_sweep_commit "checkpoint 3 through 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172
+    docjj_real=$(jj -R "$doc" log -r 'present(main@origin)' --no-graph -T 'commit_id')
+    [ "${#docjj_real}" -eq 40 ] ||
+      fail "the fixture commit id is not 40 hex: $docjj_real"
+    docjj_sweep_commit "checkpoint 3 through $docjj_real
 
 roundhouse-host: vireo
 roundhouse-session: scheduled/agent
-roundhouse-intent: seal through 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172 (integrity 9f2c1a4b7e0d3856af91cc42b7e5d80613a4f29cbd75e01834a6c9b2df75e013)
+roundhouse-intent: seal through $docjj_real
 roundhouse-items: -" "$docjj_host_yaml
 groups: [development]
 "
     docjj_out=$(docjj "$cli" fleet-run --fast 2>&1) ||
-      fail "the sweep refused a description carrying a git commit id and a sha256 digest: $docjj_out"
+      fail "the sweep refused a description quoting a commit id this store contains: $docjj_out"
     [ "$(jj -R "$doc" log -r 'present(main@origin)' --no-graph -T 'commit_id')" = \
       "$(docjj_lib fleet_vcs_heads_local "$doc")" ] ||
       fail "the content-address description did not reach the remote"
+
+    # A 40-hex token this store CANNOT resolve is not a content address, and a
+    # 64-hex digest has no cheap proof available either. Both still refuse —
+    # this is the pair that keeps the exemption from being a hex pass.
+    for docjj_notaddr in 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172 \
+      9f2c1a4b7e0d3856af91cc42b7e5d80613a4f29cbd75e01834a6c9b2df75e013; do
+      jj -R "$doc" abandon -r "$(docjj_lib fleet_vcs_heads_local "$doc")" >/dev/null
+      jj -R "$doc" bookmark set main \
+        -r "$(jj -R "$doc" log -r 'present(main@origin)' --no-graph -T 'commit_id')" >/dev/null
+      jj -R "$doc" new "$(docjj_lib fleet_vcs_heads_local "$doc")" >/dev/null
+      docjj_sweep_commit "converge on vireo
+
+roundhouse-host: vireo
+roundhouse-session: scheduled/agent
+roundhouse-intent: seal through $docjj_notaddr
+roundhouse-items: -" "$docjj_host_yaml
+groups: [development]
+"
+      docjj_status=0
+      docjj_out=$(docjj "$cli" fleet-run --fast 2>&1) || docjj_status=$?
+      [ "$docjj_status" -ne 0 ] ||
+        fail "a hex token this store cannot resolve was published as a content address: $docjj_notaddr"
+      case $docjj_out in
+        *'secret class'*) ;;
+        *) fail "the refusal did not name what it matched for $docjj_notaddr: $docjj_out" ;;
+      esac
+    done
+    jj -R "$doc" abandon -r "$(docjj_lib fleet_vcs_heads_local "$doc")" >/dev/null
+    jj -R "$doc" bookmark set main \
+      -r "$(jj -R "$doc" log -r 'present(main@origin)' --no-graph -T 'commit_id')" >/dev/null
+    jj -R "$doc" new "$(docjj_lib fleet_vcs_heads_local "$doc")" >/dev/null
 
     # A secret CREATED AND THEN DELETED inside the push range. This is the case
     # the sweep exists for and the one a range diff elides: the working tree is

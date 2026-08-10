@@ -306,9 +306,16 @@ Before it records anything, `fleet-add` settles §10.6 for the store remote: if
 the remote answers unauthenticated reads it **refuses and records nothing** — no
 roster edit, no alert, no identity written on the newcomer. Once the roster line
 is published it has the newcomer run its own visibility probe over the same
-channel, so a freshly added host publishes on its first `fleet-run` with no
-further step. Posture is host-local and keyed on the URL that host resolves, so
-the probe runs *there* rather than being copied from the sponsor.
+channel. Posture is host-local and keyed on the URL that host resolves, so the
+probe runs *there* rather than being copied from the sponsor.
+
+**`fleet-add` does not clone the store for the newcomer.** `fleet-init` leaves a
+store with no origin and §12's runbook has the newcomer clone, so on a genuinely
+fresh host the probe has nothing to measure and `fleet-add` reports the two
+commands that remain there — `jj git clone --colocate <remote>
+~/.config/roundhouse/store`, then `roundhouse fleet-verify-remote`. For a host
+that already carries the store — a re-add, or one that was cloned — the posture
+lands automatically and its next `fleet-run` publishes.
 
 Enrollment is **two-sided and needs no bearer credential**: an enrolled host
 supplies authorization (its roster key makes the commit ratchet-valid) and the

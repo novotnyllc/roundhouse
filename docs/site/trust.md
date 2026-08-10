@@ -147,6 +147,11 @@ store id over that channel, commits the roster line, pushes, and has wren
 prove the remote is gated for itself. **Nothing runs on any other host, and
 no human touches any other host.**
 
+Cloning the store is still wren's own step: `fleet-init` leaves a store with
+no origin, so on a genuinely fresh host `fleet-add` names the two commands
+that remain there — the clone, then `fleet-verify-remote`. A host that
+already carries the store has its posture established automatically.
+
 Enrollment is two-sided and needs no bearer credential. An enrolled host
 supplies **authorisation** — its roster key makes the commit
 ratchet-valid. The channel supplies **identity binding** — the key was

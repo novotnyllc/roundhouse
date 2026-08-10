@@ -66,7 +66,10 @@ fleet_sweep_range() {
           sweep_line=0
           while IFS= read -r sweep_text; do
             sweep_line=$((sweep_line + 1))
-            ! fleet_quote_is_secret "$sweep_text" ||
+            # The STORE rides along so the one exemption can be proved rather
+            # than guessed: a high-entropy token that names a commit this
+            # repository already contains discloses nothing by being published.
+            ! fleet_quote_is_secret "$sweep_text" "$1" ||
               printf '%s description line %s matches a secret class\n' \
                 "$sweep_commit" "$sweep_line"
             # The 400-byte cap on replicated free text, applied where the free
@@ -100,7 +103,7 @@ fleet_sweep_range() {
                 sweep_line=$((sweep_line + 1))
                 # The line number is §10.4's own promise: "names the file and
                 # the line within it".
-                ! fleet_quote_is_secret "$sweep_text" ||
+                ! fleet_quote_is_secret "$sweep_text" "$1" ||
                   printf '%s %s:%s matches a secret class\n' \
                     "$sweep_commit" "$sweep_path" "$sweep_line"
               done

@@ -198,34 +198,52 @@ YAML
       fail "a UUID-shaped store path false-positived as a secret"
     ! fleet_quote_is_secret 'kxrntvmqzuwstrpqwxrwprquoloswvxymn' ||
       fail "a jj change id (single-case letters, no digit) false-positived"
-    # --- content addresses are not secrets (§10.4) ---
-    # A 40-hex git commit id and a 64-hex sha256 digest are public by
-    # construction and are the most ordinary strings in this system. Flagging
-    # them refused the guarded publish on descriptions like the one below, and
-    # a guard that fires on that is a guard people route around.
-    ! fleet_quote_is_secret \
+    # --- the ONE exemption is PROVED, never inferred from shape (§10.4) ---
+    # The heuristic used to flag a bare git commit id as single-case hex
+    # high-entropy and refuse the guarded publish — and `fleet-checkpoint`'s own
+    # description quotes one. But a 40-character lowercase-hex credential and a
+    # commit id are the same STRING SHAPE, so a length test would publish the
+    # credential. The exemption therefore asks the repository whether the token
+    # names a commit it already contains; the resolving case is exercised
+    # against a real store in tests/94-jj-doctor.sh. Here: the shape predicate,
+    # and the default with no store — which is NO exemption.
+    #
+    # `fleet_record_quote_ok`'s free text (findings/, holds) has no repository
+    # context, so nothing a human types there is ever exempt.
+    ! fleet_quote_is_content_address 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172 ||
+      fail "a 40-hex token was called a content address with no store to prove it"
+    ! fleet_quote_is_content_address 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172 \
+      "$guard_root/no-such-store" ||
+      fail "a token resolved as a content address against a store that does not exist"
+    for guard_notaddr in '' 0123456789abcdef0123456789abcdef \
+      9f2c1a4b7e0d3856af91cc42b7e5d80613a4f29cbd75e01834a6c9b2df75e013 \
+      8E765ED0C1B24A97FF3D6E5A0B1C2D3E4F506172 \
+      8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172ff \
+      8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f5061_z; do
+      ! fleet_quote_is_content_address "$guard_notaddr" "$guard_store" ||
+        fail "the content-address predicate accepted a non-commit-id: '$guard_notaddr'"
+    done
+    # With no store, a commit-id-shaped token in free text is still a match —
+    # the strictest answer, and the one the sweep's own call site upgrades by
+    # passing its store.
+    fleet_quote_is_secret \
       'checkpoint 3 through 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172' ||
-      fail "a bare 40-hex git commit id in a description flagged as a secret"
-    ! fleet_quote_is_secret \
-      'integrity 9f2c1a4b7e0d3856af91cc42b7e5d80613a4f29cbd75e01834a6c9b2df75e013' ||
-      fail "a 64-hex sha256 digest flagged as a secret"
-    ! fleet_quote_is_secret 'store_id 4c9e13d0a7b28e51c3f9046d18a2b7e5c60d93f1' ||
-      fail "a store id (a git commit id) flagged as a secret"
-    # The exemption is a LENGTH EQUALITY on a whole token, never a general
-    # hex pass. Other lengths still flag, and a secret that merely opens with
-    # hex arrives as one longer run and still flags.
-    fleet_quote_is_secret '0123456789abcdef0123456789abcdef' ||
-      fail "a 32-hex token stopped being flagged; the exemption is too wide"
-    fleet_quote_is_secret '8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172ff' ||
-      fail "a 42-hex token stopped being flagged; the exemption is too wide"
-    fleet_quote_is_secret '8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172_trailing_key' ||
-      fail "a longer token that merely opens with a 40-hex run slipped the sweep"
+      fail "free text with no repository context got an exemption anyway"
+    # EVERY candidate token has to be accounted for: one the store cannot
+    # explain is a secret however many commit ids sit beside it.
+    cli_function_body fleet_quote_is_secret |
+      grep -q 'fleet_quote_is_content_address "$quote_token" "${2:-}" || return 0' ||
+      fail "the sweep predicate no longer requires every high-entropy token to be accounted for"
     # And every named class still refuses, which is what the exemption must
     # not have cost.
     fleet_quote_is_secret 'rotate ghp_0123456789abcdefghij' ||
       fail "a GitHub token stopped being refused"
     fleet_quote_is_secret '-----BEGIN OPENSSH PRIVATE KEY-----' ||
       fail "a PEM header stopped being refused"
+    fleet_quote_is_secret '0123456789abcdef0123456789abcdef' ||
+      fail "a 32-hex token stopped being flagged"
+    fleet_quote_is_secret '9f2c1a4b7e0d3856af91cc42b7e5d80613a4f29cbd75e01834a6c9b2df75e013' ||
+      fail "a 64-hex token stopped being flagged; only a proved commit id is exempt"
     # A hyphenated UUID in a path or remote URL is not a secret: `-` is out of
     # the entropy class, so it splits into its short segments.
     ! fleet_quote_is_secret 'move the store remote to /tmp/store-bf513ef6-0107-492a-ba74-f4a72b1b4fb4.git' ||

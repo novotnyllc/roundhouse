@@ -792,16 +792,27 @@ fleet_add_command() (
     "printf 'store_id: %s\nprincipal: %s\nname: %s\n' '$add_genesis' '$add_principal' '$add_target' > \"\$HOME/.config/roundhouse/identity.yaml\"" \
     >/dev/null 2>&1 || :
 
-  # §10.6's posture, established HERE rather than left as one manual step per
-  # host. `fleet-verify-remote` is a one-time per-host probe that nothing ever
-  # self-invoked, so a freshly added host could review and journal but not
-  # PUBLISH — its first push hit the first-push gate and stopped. Three hosts
-  # sat in exactly that state.
+  # §10.6's posture, established HERE where it can be, rather than left as one
+  # manual step per host. `fleet-verify-remote` is a one-time per-host probe
+  # that nothing ever self-invoked, so an added host could review and journal
+  # but not PUBLISH — its first push hit the first-push gate and stopped. Three
+  # hosts sat in exactly that state.
   #
   # The probe runs ON THE NEWCOMER, over the channel that is already
   # authenticated, and not here: posture is host-local by design and keyed on
   # the URL that host resolves. Copying this host's verdict onto that host
   # would be asserting something nobody measured there.
+  #
+  # KNOWN GAP, stated rather than papered over: `fleet-add` does not give the
+  # newcomer the store. The bootstrap above runs `fleet-init`, which creates a
+  # store with NO origin, and §12's runbook has the newcomer CLONE — no verb in
+  # this system clones it for them (`fleet-set-remote` refuses a store whose own
+  # genesis does not match the remote's, which is every fresh store). So the
+  # probe below succeeds for a host that already has the store — a re-add, or
+  # one an operator cloned, which is exactly the state the stranded hosts were
+  # in — and for a genuinely fresh host it reports the two commands still
+  # needed. Closing the gap means teaching enrollment to clone, which is a
+  # change to the bootstrap contract and not to this seam.
   add_posture=$(ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
 \"\$rh\" fleet-verify-remote 2>&1" 2>&1) || add_posture=
   printf 'roundhouse: enrolled %s as %s over %s (channel_auth %s, store id %s)\n' \
@@ -811,11 +822,15 @@ fleet_add_command() (
       printf 'roundhouse: %s verified the remote as private; its first fleet-run publishes with no further step\n' \
         "$add_target"
       ;;
+    *'no origin remote'*)
+      # The fresh-host case, and the honest report of it: enrollment is
+      # COMPLETE — the roster line is published and the ratchet is satisfied —
+      # and these are the two commands between here and its first publish.
+      printf 'roundhouse: %s has no fleet store yet. Two commands remain there: `jj git clone --colocate %s ~/.config/roundhouse/store`, then `roundhouse fleet-verify-remote`\n' \
+        "$add_target" "${add_remote:-<remote>}" >&2
+      ;;
     *)
-      # NOT a failure of the enrollment — the roster line is published and the
-      # ratchet is satisfied. It is the one step left, named, with the reason
-      # the newcomer gave, instead of a host that silently never publishes.
-      printf 'roundhouse: %s has no verified remote posture yet, so its first push will be refused (§10.6). Clone the store there, then run `roundhouse fleet-verify-remote` on it. It reported: %s\n' \
+      printf 'roundhouse: %s could not verify the remote as private, so its first push will be refused (§10.6). It reported: %s\n' \
         "$add_target" "${add_posture:-<no answer over the ssh lane>}" >&2
       ;;
   esac
