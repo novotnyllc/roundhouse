@@ -256,7 +256,7 @@ jobs:
         shell: bash
         run: |
           set -eu
-          results='${{ join(needs.*.result, ",") }}'
+          results='${{ join(needs.*.result, ',') }}'
           printf 'needed results: %s\n' "$results"
           case ",$results," in
             *,failure,*|*,cancelled,*|*,skipped,*)
