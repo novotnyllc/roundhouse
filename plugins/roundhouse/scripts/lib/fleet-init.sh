@@ -342,6 +342,56 @@ fleet_enroll_require_enrolled() {
 
 # --- §12 host 1: fleet-init, then fleet-enroll --------------------------------
 
+fleet_store_lineage_ok() {
+  # fleet_store_lineage_ok STORE — does this store's PUBLISHED history carry a
+  # roster this build can read? Prints the reason it does not.
+  #
+  # A store id and a roster are the same fact seen twice: §7.5 says the store id
+  # IS the genesis commit, and §12 says the genesis commit is the one that
+  # writes the roster. A store with history but no readable
+  # `trust/signers.yaml` is therefore not "a store mid-setup" — it is a
+  # DIFFERENT store's remains, or one written by a build whose layout this one
+  # does not share.
+  #
+  # This is what a leftover v0.5 store looked like from here: a store id
+  # existed, no roster did, and both `fleet-init` and `fleet-enroll` read the
+  # store id alone and took their "already enrolled, just heal" path. They then
+  # healed a store that could never verify anything into looking freshly set
+  # up, and every later verb failed somewhere further downstream with a message
+  # about the symptom. Refusing here costs one `jj file show` and names the
+  # remedy while it is still one command.
+  lineage_head=$(jj -R "$1" log \
+    -r 'heads(bookmarks(exact:"main")) | present(main@origin)' \
+    --no-graph -T 'commit_id ++ "\n"' 2>/dev/null | head -1)
+  [ -n "$lineage_head" ] || return 0
+  lineage_tmp=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lineage.XXXXXX") || return 0
+  fleet_trust_roster_show "$1" "$lineage_head" "$lineage_tmp"
+  lineage_reason=
+  if [ ! -s "$lineage_tmp" ]; then
+    lineage_reason="its published history carries no $fleet_trust_roster_file"
+  elif ! yq -e '.generation | tag == "!!int"' "$lineage_tmp" >/dev/null 2>&1; then
+    # `generation:` is the roster's whole custody mechanism (§7.9) and the one
+    # field every reader needs. A roster without a whole-number generation is a
+    # roster this build cannot ratchet against, whatever else it contains.
+    lineage_reason="its $fleet_trust_roster_file carries no whole-number \`generation:\`"
+  fi
+  rm -f "$lineage_tmp"
+  [ -n "$lineage_reason" ] || return 0
+  printf '%s\n' "$lineage_reason"
+  return 1
+}
+
+fleet_store_lineage_assert() {
+  # The refusal, shared by fleet-init and fleet-enroll so neither can heal into
+  # a store the other would have refused.
+  lineage_bad=$(fleet_store_lineage_ok "$1") && return 0
+  printf 'roundhouse: %s has history but %s — this is not a store this build can join, and healing it would produce one that verifies nothing\n' \
+    "$1" "$lineage_bad" >&2
+  printf 'roundhouse: move it aside (`mv %s %s.bak`) and re-init: `roundhouse fleet-init` then `roundhouse fleet-enroll` to root a new fleet, or `jj git clone --colocate <remote> %s` to join an existing one\n' \
+    "$1" "$1" "$1" >&2
+  return 65
+}
+
 fleet_init_command() (
   fleet_run_env
   require_yq
@@ -367,6 +417,7 @@ fleet_init_command() (
   fleet_apply_git_pins "$store"
 
   if [ -n "$(fleet_store_id "$store")" ]; then
+    fleet_store_lineage_assert "$store" || exit $?
     fleet_store_id_assert "$store" || exit 65
   else
     # Rooting a new fleet. The scaffold is WRITTEN, not committed: the roster
@@ -407,6 +458,12 @@ fleet_enroll_command() (
     # heal path, the rename path (§9.1), the reconstitution path (§7.8 C) and
     # the second-identity path for an operated host (§9.2). The roster line
     # itself is the sponsor's to write.
+    #
+    # …but ONLY for a store this build can actually join. The heal path is
+    # keyed on the store id alone, and a store id with no roster behind it is a
+    # different store's remains — healing it produces something that looks
+    # enrolled and verifies nothing.
+    fleet_store_lineage_assert "$store" || exit $?
     jj -R "$store" new -m '' >/dev/null
     fleet_trust_materialize "$store" \
       "$(fleet_vcs_heads_local "$store" | head -1)" || :
@@ -495,6 +552,43 @@ fleet_enroll_channel_auth() {
   fi
 }
 
+fleet_remote_cli_prologue() {
+  # A POSIX-sh prologue that resolves THIS PLUGIN'S CLI on the far side of an
+  # SSH lane and leaves it in `$rh`, or exits 69 saying why not.
+  #
+  # `fleet-add` used to run a bare `roundhouse …` on the newcomer, but the
+  # plugin ships no `roundhouse` on anybody's PATH — skills invoke it through
+  # its relative `scripts/roundhouse`. Every host enrolled this way therefore
+  # needed a hand-written shim in ~/.local/bin before enrollment would do
+  # anything at all, and the sponsor could not see that it had not: the
+  # bootstrap call is `|| :`, so a missing CLI looked exactly like success
+  # until the key read-back came back empty.
+  #
+  # PATH first, so a host that DOES ship a launcher keeps using it; then the
+  # plugin cache of each harness. POSIX sh with no bashisms and no `local`, and
+  # the harness roots are a list rather than a hard-coded pair — the Windows
+  # arm the iris-windows native-membership plan adds is another entry here, not
+  # a rewrite of the call sites.
+  #
+  # ponytail: last-glob-wins picks the highest version LEXICALLY, so a future
+  # 0.10.0 would sort behind 0.9.0. Fine for a one-shot bootstrap that only has
+  # to produce a working CLI; sort with `sort -V` if it ever has to pick the
+  # newest exactly.
+  cat <<'SH'
+rh=$(command -v roundhouse 2>/dev/null) || rh=
+if [ -z "$rh" ]; then
+  for rh_candidate in "$HOME"/.claude/plugins/cache/*/roundhouse/*/scripts/roundhouse \
+    "$HOME"/.codex/plugins/cache/*/roundhouse/*/scripts/roundhouse; do
+    [ ! -x "$rh_candidate" ] || rh=$rh_candidate
+  done
+fi
+[ -n "$rh" ] || {
+  printf 'roundhouse: no roundhouse CLI on this host — not on PATH and no plugin cache under ~/.claude or ~/.codex\n' >&2
+  exit 69
+}
+SH
+}
+
 fleet_add_command() (
   # `roundhouse fleet-add HOST [--ephemeral --job J --ttl HOURS]` — §7.3a A and
   # D. Nothing is run on any other host; no human touches any other host.
@@ -557,6 +651,32 @@ fleet_add_command() (
   add_genesis=$(fleet_store_id "$add_store")
   add_remote=$(jj -R "$add_store" git remote list 2>/dev/null |
     awk '$1 == "origin" { print $2; exit }')
+  # The ROSTER identity stays `$add_target` — the config machine name, which is
+  # what every host-keyed path and every signature is checked against. Only the
+  # TRANSPORT follows the machine's configured ssh alias.
+  add_ssh=$(fleet_ssh_destination "$add_target") || {
+    printf 'roundhouse: %s resolves to an unusable ssh destination in config.json\n' \
+      "$add_target" >&2
+    exit 64
+  }
+
+  # §10.6 AT ENROLLMENT, not one manual step per host afterwards. The sponsor
+  # is about to push the newcomer's roster line to this remote and then tell
+  # the newcomer to publish to it, so the question "does this remote answer
+  # unauthenticated reads" has to be settled BEFORE anything is recorded — a
+  # public remote must not acquire a roster line naming a new machine.
+  #
+  # Refuse and record nothing: no roster edit, no alert, no journal, no
+  # identity written on the newcomer. Nothing to unwind.
+  if [ -n "$add_remote" ]; then
+    add_visibility=$(fleet_remote_visibility_probe "$add_remote")
+    [ "${add_visibility%% *}" = true ] || {
+      printf 'roundhouse: refusing to enrol %s: the fleet store remote is %s (%s), and nothing has been recorded\n' \
+        "$add_target" "${add_visibility#* }" "$add_remote" >&2
+      exit 65
+    }
+  fi
+
   add_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-fleet-add.XXXXXX")
   trap 'rm -rf "$add_tmp"' EXIT HUP INT TERM
 
@@ -570,21 +690,25 @@ fleet_add_command() (
     add_pub=$add_tmp/leaf.pub
     fleet_enroll_proof_write "$add_principal" "$add_tmp/leaf" "$add_tmp/proof.sig"
   else
-    add_channel=$(fleet_enroll_channel_auth "$add_target")
+    # The channel is authenticated against the machine this host will actually
+    # reach, so the known_hosts/tailscale lookup takes the transport
+    # destination — checking the roster name would grade a channel nobody uses.
+    add_channel=$(fleet_enroll_channel_auth "$add_ssh")
     # Step 3-4: over that channel, bootstrap and read the key back. The
-    # newcomer's own agent mints; this host only reads.
-    ssh_run "$add_target" \
-      'roundhouse fleet-init >/dev/null && roundhouse fleet-enroll >/dev/null 2>&1; :' \
+    # newcomer's own agent mints; this host only reads. The CLI is RESOLVED on
+    # the far side rather than assumed on PATH — see fleet_remote_cli_prologue.
+    ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
+\"\$rh\" fleet-init >/dev/null && \"\$rh\" fleet-enroll >/dev/null 2>&1; :" \
       >/dev/null 2>&1 || :
-    ssh_run "$add_target" 'cat "$HOME/.ssh/roundhouse_node_ed25519.pub"' \
+    ssh_run "$add_ssh" 'cat "$HOME/.ssh/roundhouse_node_ed25519.pub"' \
       >"$add_tmp/leaf.pub" 2>/dev/null || :
     add_pub=$add_tmp/leaf.pub
     [ -s "$add_pub" ] || {
       printf 'roundhouse: could not read a node key back from %s over the SSH lane; the newcomer holds a keypair and nothing else\n' \
-        "$add_target" >&2
+        "$add_ssh" >&2
       exit 69
     }
-    ssh_run "$add_target" \
+    ssh_run "$add_ssh" \
       "printf '%s' '$add_principal' | ssh-keygen -Y sign -n $fleet_trust_enroll_namespace -f \"\$HOME/.ssh/roundhouse_node_ed25519\" 2>/dev/null" \
       >"$add_tmp/proof.sig" 2>/dev/null || :
   fi
@@ -664,11 +788,37 @@ fleet_add_command() (
   # Step 5-7: hand wren the remote URL and store_id over the SAME channel —
   # data, not a paste — and let it clone, check genesis == store_id and ratchet
   # to head on its own.
-  ssh_run "$add_target" \
+  ssh_run "$add_ssh" \
     "printf 'store_id: %s\nprincipal: %s\nname: %s\n' '$add_genesis' '$add_principal' '$add_target' > \"\$HOME/.config/roundhouse/identity.yaml\"" \
     >/dev/null 2>&1 || :
-  printf 'roundhouse: enrolled %s as %s (channel_auth %s, store id %s)\n' \
-    "$add_target" "$add_principal" "$add_channel" "$add_genesis"
+
+  # §10.6's posture, established HERE rather than left as one manual step per
+  # host. `fleet-verify-remote` is a one-time per-host probe that nothing ever
+  # self-invoked, so a freshly added host could review and journal but not
+  # PUBLISH — its first push hit the first-push gate and stopped. Three hosts
+  # sat in exactly that state.
+  #
+  # The probe runs ON THE NEWCOMER, over the channel that is already
+  # authenticated, and not here: posture is host-local by design and keyed on
+  # the URL that host resolves. Copying this host's verdict onto that host
+  # would be asserting something nobody measured there.
+  add_posture=$(ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
+\"\$rh\" fleet-verify-remote 2>&1" 2>&1) || add_posture=
+  printf 'roundhouse: enrolled %s as %s over %s (channel_auth %s, store id %s)\n' \
+    "$add_target" "$add_principal" "$add_ssh" "$add_channel" "$add_genesis"
+  case $add_posture in
+    *'first push is permitted'*)
+      printf 'roundhouse: %s verified the remote as private; its first fleet-run publishes with no further step\n' \
+        "$add_target"
+      ;;
+    *)
+      # NOT a failure of the enrollment — the roster line is published and the
+      # ratchet is satisfied. It is the one step left, named, with the reason
+      # the newcomer gave, instead of a host that silently never publishes.
+      printf 'roundhouse: %s has no verified remote posture yet, so its first push will be refused (§10.6). Clone the store there, then run `roundhouse fleet-verify-remote` on it. It reported: %s\n' \
+        "$add_target" "${add_posture:-<no answer over the ssh lane>}" >&2
+      ;;
+  esac
 )
 
 fleet_enroll_deadline() {

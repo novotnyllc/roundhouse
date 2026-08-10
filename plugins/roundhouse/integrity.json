@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
-      "sha256": "74325ef7778e4d9f73296d7c1110a08ab0b85b2091cdd42bb03b7661103097df"
+      "sha256": "d9b2c9c47e15510ed89213844a651e9a4788fa8fd279c141aeb0efe357dc3f7a"
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
@@ -106,7 +106,7 @@
     },
     {
       "path": "scripts/lib/fleet-init.sh",
-      "sha256": "e0a2f1cacf10967b98e07b22d4015c2ef71fe61defa8f643c8db9f3875200041"
+      "sha256": "e63a83a8f6589bd22a5d2f765c68d0af303ab2f747b032885c254ea19b2ea294"
     },
     {
       "path": "scripts/lib/fleet-records.sh",
@@ -118,7 +118,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "493bfe217aaf77f0b68c53d520c0b3e322c8a07f165111b0f1991024e5998da6"
+      "sha256": "99b5971dfca5242dab4baee33a6b65780494e805ff5ed2dfdee3a8c7f4cfb2b6"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -134,7 +134,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "38bae353c4fff23d7ed7c900922023e38cae6e8b1098143f6b93f2d2ab11acef"
+      "sha256": "a3eb1d837650fb467d84af22198fce03f25855cae44b950051f068d01629e978"
     },
     {
       "path": "scripts/lib/identity.sh",

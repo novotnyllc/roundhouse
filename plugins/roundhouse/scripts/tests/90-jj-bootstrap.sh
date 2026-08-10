@@ -477,6 +477,46 @@ TOML
     [ "$rjj_reroot_status" -eq 65 ] ||
       fail "a host named the fleet's store id and minted a second genesis anyway"
 
-    printf 'real-jj: OK (brick order, config pins, op-ssh-sign containment, keygen enrollment, genesis-as-store-id, materialization drift)\n'
+    # 9. A store with HISTORY but no roster behind it: refuse, never heal.
+    #    Both verbs keyed their "already set up, just heal" path on the store id
+    #    alone — and §7.5/§12 make the store id and the roster the same fact
+    #    seen twice, so a store id with no `trust/signers.yaml` is a DIFFERENT
+    #    store's remains. A leftover v0.5 store looked exactly like this, and
+    #    healing it produced something that looked enrolled and verified
+    #    nothing; every later verb then failed somewhere further downstream.
+    rjj_legacy="$rjj/legacy/store"
+    mkdir -p "$rjj/legacy"
+    jj git clone --colocate --config ui.editor='"true"' \
+      --config ui.paginate=never "$rjj/remote.git" "$rjj_legacy" >/dev/null 2>&1 ||
+      fail "could not clone the fleet store for the legacy-remnant fixture"
+    printf 'name: legacy\nstore_id: %s\n' "$rjj_store_id" \
+      >"$rjj/legacy/identity.yaml"
+    # Same lineage, same store id — only the roster is gone, which is the whole
+    # point: the store id check passes and this one has to be what refuses.
+    rm -f "$rjj_legacy/$fleet_trust_roster_file"
+    jj -R "$rjj_legacy" describe -m 'drop the roster' >/dev/null
+    jj -R "$rjj_legacy" bookmark set main \
+      -r "$(jj -R "$rjj_legacy" log -r @ --no-graph -T 'commit_id')" >/dev/null
+    jj -R "$rjj_legacy" new "$(jj -R "$rjj_legacy" log \
+      -r 'heads(bookmarks(exact:"main"))' --no-graph -T 'commit_id')" >/dev/null
+    for rjj_legacy_verb in fleet-init fleet-enroll; do
+      rjj_legacy_status=0
+      rjj_legacy_out=$(rjj_run legacy "$cli" "$rjj_legacy_verb" 2>&1) ||
+        rjj_legacy_status=$?
+      [ "$rjj_legacy_status" -eq 65 ] ||
+        fail "$rjj_legacy_verb healed a store with history and no roster (got $rjj_legacy_status)"
+      case $rjj_legacy_out in
+        *'re-init'* | *'move it aside'*) ;;
+        *) fail "$rjj_legacy_verb refused without naming the remedy: $rjj_legacy_out" ;;
+      esac
+    done
+    # …and the ordinary clone, which has a roster, is unaffected. (corvid's
+    # identity was rewritten by the foreign-store fixture above; restore it.)
+    printf 'name: corvid\nstore_id: %s\n' "$rjj_store_id" \
+      >"$rjj/corvid/identity.yaml"
+    rjj_run corvid "$cli" fleet-init >/dev/null ||
+      fail "the lineage check refused a healthy cloned store"
+
+    printf 'real-jj: OK (brick order, config pins, op-ssh-sign containment, keygen enrollment, genesis-as-store-id, legacy-remnant refusal, materialization drift)\n'
   ) || fail "real-jj bootstrap block failed (see the FAIL: real-jj: line above)"
 fi

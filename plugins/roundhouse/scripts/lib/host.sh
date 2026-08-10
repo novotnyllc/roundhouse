@@ -70,6 +70,29 @@ ssh_run() {
     "$host" "if [ -z \"\${SHELL:-}\" ] || [ ! -x \"\$SHELL\" ]; then printf 'roundhouse: configured login shell is unavailable\\n' >&2; exit 69; fi; exec \"\$SHELL\" -lc '$quoted_command'"
 }
 
+fleet_ssh_destination() {
+  # fleet_ssh_destination NAME -> the SSH destination for a fleet machine.
+  #
+  # A machine's ROSTER IDENTITY and its TRANSPORT ADDRESS are two different
+  # facts, and the enrollment path conflated them: `fleet-add mac-mini` used
+  # `mac-mini` as both, so a machine whose ssh alias is `claires-mac-mini` did
+  # not connect until somebody hand-added a `Host mac-mini` block to
+  # ~/.ssh/config. config.json already carries the mapping and lib/inventory.sh
+  # already reads it — this is that read, in one place, so the roster keeps the
+  # config machine name and the transport follows the alias.
+  #
+  # An unlisted name falls back to itself rather than refusing: a scratch host
+  # or a fixture that is not in config.json keeps working exactly as before.
+  ssh_destination=$(jq -r --arg host "$1" '.machines[$host].ssh_alias // empty' \
+    "$(config_path)" 2>/dev/null) || ssh_destination=
+  [ -n "$ssh_destination" ] || ssh_destination=$1
+  # The value comes out of a file this code did not write and reaches ssh as
+  # argv, so it passes the same allowlist every other destination passes: an
+  # option-shaped alias is refused here rather than becoming an ssh flag.
+  fleet_host_name_ok "$ssh_destination" || return 64
+  printf '%s\n' "$ssh_destination"
+}
+
 scp_run() {
   scp -q -o BatchMode=yes -o ConnectTimeout=10 \
     -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "$@"
