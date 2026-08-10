@@ -198,6 +198,34 @@ YAML
       fail "a UUID-shaped store path false-positived as a secret"
     ! fleet_quote_is_secret 'kxrntvmqzuwstrpqwxrwprquoloswvxymn' ||
       fail "a jj change id (single-case letters, no digit) false-positived"
+    # --- content addresses are not secrets (§10.4) ---
+    # A 40-hex git commit id and a 64-hex sha256 digest are public by
+    # construction and are the most ordinary strings in this system. Flagging
+    # them refused the guarded publish on descriptions like the one below, and
+    # a guard that fires on that is a guard people route around.
+    ! fleet_quote_is_secret \
+      'checkpoint 3 through 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172' ||
+      fail "a bare 40-hex git commit id in a description flagged as a secret"
+    ! fleet_quote_is_secret \
+      'integrity 9f2c1a4b7e0d3856af91cc42b7e5d80613a4f29cbd75e01834a6c9b2df75e013' ||
+      fail "a 64-hex sha256 digest flagged as a secret"
+    ! fleet_quote_is_secret 'store_id 4c9e13d0a7b28e51c3f9046d18a2b7e5c60d93f1' ||
+      fail "a store id (a git commit id) flagged as a secret"
+    # The exemption is a LENGTH EQUALITY on a whole token, never a general
+    # hex pass. Other lengths still flag, and a secret that merely opens with
+    # hex arrives as one longer run and still flags.
+    fleet_quote_is_secret '0123456789abcdef0123456789abcdef' ||
+      fail "a 32-hex token stopped being flagged; the exemption is too wide"
+    fleet_quote_is_secret '8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172ff' ||
+      fail "a 42-hex token stopped being flagged; the exemption is too wide"
+    fleet_quote_is_secret '8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172_trailing_key' ||
+      fail "a longer token that merely opens with a 40-hex run slipped the sweep"
+    # And every named class still refuses, which is what the exemption must
+    # not have cost.
+    fleet_quote_is_secret 'rotate ghp_0123456789abcdefghij' ||
+      fail "a GitHub token stopped being refused"
+    fleet_quote_is_secret '-----BEGIN OPENSSH PRIVATE KEY-----' ||
+      fail "a PEM header stopped being refused"
     # A hyphenated UUID in a path or remote URL is not a secret: `-` is out of
     # the entropy class, so it splits into its short segments.
     ! fleet_quote_is_secret 'move the store remote to /tmp/store-bf513ef6-0107-492a-ba74-f4a72b1b4fb4.git' ||

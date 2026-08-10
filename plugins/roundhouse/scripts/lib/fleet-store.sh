@@ -326,8 +326,24 @@ fleet_quote_is_secret() {
   # high-entropy too and slipped through the all-three requirement, while a
   # letters-only single-case run (a jj change id is `k`-`z`, no digit) is NOT
   # flagged, which is why change ids in trailers stay publishable.
+  #
+  # ONE EXEMPTION, and it is a length equality rather than a shape: a whole
+  # token that is exactly 40 or exactly 64 lowercase hex digits is a git commit
+  # id or a sha256 digest. Both are CONTENT ADDRESSES — public by construction,
+  # printed by every tool in this system, and quoted into ordinary descriptions
+  # ("checkpoint 3 through <sha>", an integrity digest). The heuristic flagged
+  # them as single-case hex high-entropy and refused the guarded publish, and a
+  # guard that fires on the most ordinary string in a version-control system is
+  # a guard people learn to route around — which is the failure this closes.
+  #
+  # Deliberately NOT a general hex exemption: 32, 48 and every other length
+  # still flag, because a real key is usually not exactly a digest length and
+  # the two shapes above are the only ones this system actually emits. `grep
+  # -oE` yields maximal runs, so each awk line IS a whole token — a secret with
+  # a 40-hex prefix does not slip through, it arrives as a longer run.
   printf '%s' "$quote_text" | grep -oE '[A-Za-z0-9_]{32,}' |
-    awk '(/[0-9]/ && /[A-Za-z]/) || (/[a-z]/ && /[A-Z]/) { found = 1 }
+    awk '/^[0-9a-f]{40}$/ || /^[0-9a-f]{64}$/ { next }
+      (/[0-9]/ && /[A-Za-z]/) || (/[a-z]/ && /[A-Z]/) { found = 1 }
       END { exit(found ? 0 : 1) }'
 }
 

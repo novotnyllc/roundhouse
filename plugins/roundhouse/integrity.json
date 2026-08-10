@@ -122,7 +122,7 @@
     },
     {
       "path": "scripts/lib/fleet-store.sh",
-      "sha256": "6ee4fbfc03146d2b802c5b365136b8a44e1e0a02871d38f37184da6279422f87"
+      "sha256": "660c010382d5edc597674265e1f5e476f44b0181a2de9921da28665d1bc016a5"
     },
     {
       "path": "scripts/lib/fleet-trust.sh",

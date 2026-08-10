@@ -328,6 +328,30 @@ roundhouse-items: -" "$docjj_host_yaml"
       *) fail "the cap refusal did not say what it capped: $docjj_out" ;;
     esac
 
+    # …and the other direction, over the same real range: a CONTENT ADDRESS in
+    # a description publishes. A 40-hex commit id and a 64-hex sha256 digest
+    # are public by construction and are the most ordinary strings this system
+    # emits — `fleet-checkpoint`'s own description quotes one. The entropy
+    # heuristic read them as single-case hex secrets and refused the guarded
+    # publish, which is how a guard teaches people to route around it.
+    jj -R "$doc" abandon -r "$(docjj_lib fleet_vcs_heads_local "$doc")" >/dev/null
+    jj -R "$doc" bookmark set main \
+      -r "$(jj -R "$doc" log -r 'present(main@origin)' --no-graph -T 'commit_id')" >/dev/null
+    jj -R "$doc" new "$(docjj_lib fleet_vcs_heads_local "$doc")" >/dev/null
+    docjj_sweep_commit "checkpoint 3 through 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172
+
+roundhouse-host: vireo
+roundhouse-session: scheduled/agent
+roundhouse-intent: seal through 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172 (integrity 9f2c1a4b7e0d3856af91cc42b7e5d80613a4f29cbd75e01834a6c9b2df75e013)
+roundhouse-items: -" "$docjj_host_yaml
+groups: [development]
+"
+    docjj_out=$(docjj "$cli" fleet-run --fast 2>&1) ||
+      fail "the sweep refused a description carrying a git commit id and a sha256 digest: $docjj_out"
+    [ "$(jj -R "$doc" log -r 'present(main@origin)' --no-graph -T 'commit_id')" = \
+      "$(docjj_lib fleet_vcs_heads_local "$doc")" ] ||
+      fail "the content-address description did not reach the remote"
+
     # A secret CREATED AND THEN DELETED inside the push range. This is the case
     # the sweep exists for and the one a range diff elides: the working tree is
     # clean by the time anything looks at it.
