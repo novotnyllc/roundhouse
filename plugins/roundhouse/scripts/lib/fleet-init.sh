@@ -430,13 +430,17 @@ fleet_init_command() (
     mkdir -p "$store"
     jj git init --colocate "$store" >/dev/null
   fi
+  # Same rule as fleet-enroll: the preflight runs BEFORE the writes. Pinning the
+  # repo config of a store this command is about to declare unusable leaves the
+  # operator a refused store that has nonetheless been reconfigured.
+  fleet_store_lineage_assert "$store" || exit $?
+
   # The repo config is host-local and outside the store, so a clone does not
   # inherit it: fleet-init runs on EVERY host, not just the first (§12).
   fleet_apply_jj_pins "$store"
   fleet_apply_git_pins "$store"
 
   if [ -n "$(fleet_store_id "$store")" ]; then
-    fleet_store_lineage_assert "$store" || exit $?
     fleet_store_id_assert "$store" || exit 65
   else
     # Rooting a new fleet. The scaffold is WRITTEN, not committed: the roster
@@ -463,6 +467,15 @@ fleet_enroll_command() (
       "$store" >&2
     exit 69
   }
+  # THE PREFLIGHT RUNS BEFORE ANY WRITE. A refusal that has already minted the
+  # node key, seeded the KRL and pointed the repository's `[signing]` block at
+  # that key leaves the operator a store this build just declared unusable AND
+  # configured to sign with a fresh identity — refusing after mutating is worse
+  # than not refusing, because the state now looks half-enrolled. A store with
+  # no history passes here (there is nothing to disagree with), so genesis is
+  # unaffected.
+  fleet_store_lineage_assert "$store" || exit $?
+
   host=$(fleet_host_name)
   principal=$(fleet_principal)
   key=$(fleet_signing_key_path)
@@ -478,11 +491,11 @@ fleet_enroll_command() (
     # the second-identity path for an operated host (§9.2). The roster line
     # itself is the sponsor's to write.
     #
-    # …but ONLY for a store this build can actually join. The heal path is
-    # keyed on the store id alone, and a store id with no roster behind it is a
+    # …but ONLY for a store this build can actually join, which the preflight
+    # above already settled before anything was written: the heal path is keyed
+    # on the store id alone, and a store id with no roster behind it is a
     # different store's remains — healing it produces something that looks
     # enrolled and verifies nothing.
-    fleet_store_lineage_assert "$store" || exit $?
     jj -R "$store" new -m '' >/dev/null
     fleet_trust_materialize "$store" \
       "$(fleet_vcs_heads_local "$store" | head -1)" || :

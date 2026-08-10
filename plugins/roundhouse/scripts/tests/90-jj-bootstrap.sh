@@ -499,6 +499,21 @@ TOML
       -r "$(jj -R "$rjj_legacy" log -r @ --no-graph -T 'commit_id')" >/dev/null
     jj -R "$rjj_legacy" new "$(jj -R "$rjj_legacy" log \
       -r 'heads(bookmarks(exact:"main"))' --no-graph -T 'commit_id')" >/dev/null
+    # THE REFUSAL LEAVES NOTHING BEHIND. A preflight that fires after minting the
+    # node key and pointing the repo's [signing] block at it hands back a store
+    # this build just called unusable AND reconfigured — half-enrolled state is
+    # worse than no refusal. So the key must not exist and the config must not
+    # be rewritten when the verb refuses.
+    # Pins are read as EFFECTIVE values through fleet_pins_drift, never as file
+    # contents: jj 0.44 migrates a written `.jj/repo/config.toml` out to
+    # $XDG_CONFIG_HOME/jj/repos/<hash>/, so a path-based check here would
+    # compare two absent files and pass vacuously. A fresh clone carries no
+    # pins, so drift is non-empty now and must STAY non-empty across a refusal
+    # — the corvid case above is the positive control where a successful
+    # fleet-init drives it to empty.
+    rm -f "$rjj/legacy-key" "$rjj/legacy-key.pub"
+    [ -n "$(fleet_pins_drift "$rjj_legacy" || true)" ] ||
+      fail "the legacy fixture was already pinned; the no-write assertion below would be vacuous"
     for rjj_legacy_verb in fleet-init fleet-enroll; do
       rjj_legacy_status=0
       rjj_legacy_out=$(rjj_run legacy "$cli" "$rjj_legacy_verb" 2>&1) ||
@@ -509,6 +524,10 @@ TOML
         *'re-init'* | *'move it aside'*) ;;
         *) fail "$rjj_legacy_verb refused without naming the remedy: $rjj_legacy_out" ;;
       esac
+      [ ! -f "$rjj/legacy-key" ] ||
+        fail "$rjj_legacy_verb minted a node key before refusing the store"
+      [ -n "$(fleet_pins_drift "$rjj_legacy" || true)" ] ||
+        fail "$rjj_legacy_verb pinned the repository config before refusing the store"
     done
     # A preflight that CANNOT RUN must refuse, never authorize: "I could not
     # check" is not "the check passed", and reading it as one would let
