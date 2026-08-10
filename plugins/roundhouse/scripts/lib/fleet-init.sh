@@ -364,7 +364,14 @@ fleet_store_lineage_ok() {
     -r 'heads(bookmarks(exact:"main")) | present(main@origin)' \
     --no-graph -T 'commit_id ++ "\n"' 2>/dev/null | head -1)
   [ -n "$lineage_head" ] || return 0
-  lineage_tmp=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lineage.XXXXXX") || return 0
+  # FAIL CLOSED. This is a preflight whose whole job is refusing a store the
+  # build cannot join, so "I could not run the check" must never read as "the
+  # check passed" — that would authorize exactly the repository and enrollment
+  # mutations it exists to stop.
+  lineage_tmp=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lineage.XXXXXX") || {
+    printf 'its lineage could not be checked (no writable temporary directory)\n'
+    return 1
+  }
   fleet_trust_roster_show "$1" "$lineage_head" "$lineage_tmp"
   lineage_reason=
   if [ ! -s "$lineage_tmp" ]; then
@@ -804,15 +811,28 @@ fleet_add_command() (
   # would be asserting something nobody measured there.
   #
   # KNOWN GAP, stated rather than papered over: `fleet-add` does not give the
-  # newcomer the store. The bootstrap above runs `fleet-init`, which creates a
-  # store with NO origin, and §12's runbook has the newcomer CLONE — no verb in
-  # this system clones it for them (`fleet-set-remote` refuses a store whose own
-  # genesis does not match the remote's, which is every fresh store). So the
-  # probe below succeeds for a host that already has the store — a re-add, or
-  # one an operator cloned, which is exactly the state the stranded hosts were
-  # in — and for a genuinely fresh host it reports the two commands still
-  # needed. Closing the gap means teaching enrollment to clone, which is a
-  # change to the bootstrap contract and not to this seam.
+  # newcomer the store, and the bootstrap actively puts a different one in its
+  # place. `fleet-init` creates a store with no origin and `fleet-enroll`, run
+  # against history-less store, writes the newcomer its OWN self-signed genesis
+  # (§12 — that is what enrolling host 1 means). §12's runbook has a newcomer
+  # CLONE instead, and no verb in this system clones for it:
+  # `fleet-set-remote` refuses a store whose own genesis does not match the
+  # remote's, which is every fresh store, so it cannot serve as the bootstrap
+  # either.
+  #
+  # So the probe below lands the posture for a host that ALREADY carries this
+  # fleet's store — a re-add, or one an operator cloned, which is exactly the
+  # state the stranded hosts were in — and for a genuinely fresh host it names
+  # the recovery, move included.
+  #
+  # Closing this properly is a change to the bootstrap CONTRACT, not to this
+  # seam, and the shape is known: write identity.yaml (store_id, principal,
+  # name) BEFORE the bootstrap rather than after. `fleet_enroll_command` mints
+  # the key first and only then reaches its genesis branch, where a store_id it
+  # cannot match makes it refuse with "clone the fleet store first" — so the
+  # key still gets minted, no rival genesis is ever written, and the newcomer's
+  # principal agrees with the one this host is about to verify the possession
+  # proof against. It needs its own review; it is not a comment fix.
   add_posture=$(ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
 \"\$rh\" fleet-verify-remote 2>&1" 2>&1) || add_posture=
   printf 'roundhouse: enrolled %s as %s over %s (channel_auth %s, store id %s)\n' \
@@ -825,9 +845,19 @@ fleet_add_command() (
     *'no origin remote'*)
       # The fresh-host case, and the honest report of it: enrollment is
       # COMPLETE — the roster line is published and the ratchet is satisfied —
-      # and these are the two commands between here and its first publish.
-      printf 'roundhouse: %s has no fleet store yet. Two commands remain there: `jj git clone --colocate %s ~/.config/roundhouse/store`, then `roundhouse fleet-verify-remote`\n' \
-        "$add_target" "${add_remote:-<remote>}" >&2
+      # and this is what remains between here and its first publish.
+      #
+      # THE BOOTSTRAP STORE IS IN THE WAY, which is why the first step is a
+      # move and not a clone. `fleet-enroll` above ran against a store with no
+      # history, so it did what §12 says to do there: it wrote its OWN
+      # self-signed genesis. That store is a different fleet from this one, its
+      # path is occupied, and `jj git clone` into an occupied path refuses. The
+      # node key is at ~/.ssh/roundhouse_node_ed25519, OUTSIDE the store, so
+      # moving the store aside costs the newcomer nothing it needs — the key
+      # this host just enrolled survives, which is what makes this recoverable
+      # rather than a re-add.
+      printf 'roundhouse: %s has no fleet store yet — its bootstrap store is its own genesis, not this fleet. On %s: `mv ~/.config/roundhouse/store ~/.config/roundhouse/store.bootstrap`, `jj git clone --colocate %s ~/.config/roundhouse/store`, then `roundhouse fleet-init && roundhouse fleet-enroll && roundhouse fleet-verify-remote`. The node key is outside the store and survives the move.\n' \
+        "$add_target" "$add_ssh" "${add_remote:-<remote>}" >&2
       ;;
     *)
       printf 'roundhouse: %s could not verify the remote as private, so its first push will be refused (§10.6). It reported: %s\n' \

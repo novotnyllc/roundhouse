@@ -106,7 +106,7 @@
     },
     {
       "path": "scripts/lib/fleet-init.sh",
-      "sha256": "6209b4b99307b2f63b7d21f0956ea059b027ee4f3e7efe7507cca9a9c1236129"
+      "sha256": "0830d03730e7fc7b6d68edc0e2821102e5f9deb7defda310efa15d94172ac9c6"
     },
     {
       "path": "scripts/lib/fleet-records.sh",

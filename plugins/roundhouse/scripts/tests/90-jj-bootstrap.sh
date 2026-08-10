@@ -510,6 +510,19 @@ TOML
         *) fail "$rjj_legacy_verb refused without naming the remedy: $rjj_legacy_out" ;;
       esac
     done
+    # A preflight that CANNOT RUN must refuse, never authorize: "I could not
+    # check" is not "the check passed", and reading it as one would let
+    # fleet-init/fleet-enroll mutate exactly the history this exists to reject.
+    rjj_legacy_status=0
+    rjj_legacy_out=$(TMPDIR="$rjj/no-such-tmpdir" rjj_run legacy "$cli" fleet-init 2>&1) ||
+      rjj_legacy_status=$?
+    [ "$rjj_legacy_status" -eq 65 ] ||
+      fail "fleet-init proceeded when the lineage preflight could not allocate a tempfile (got $rjj_legacy_status)"
+    case $rjj_legacy_out in
+      *'could not be checked'*) ;;
+      *) fail "the unrunnable preflight did not say it could not check: $rjj_legacy_out" ;;
+    esac
+
     # …and the ordinary clone, which has a roster, is unaffected. (corvid's
     # identity was rewritten by the foreign-store fixture above; restore it.)
     printf 'name: corvid\nstore_id: %s\n' "$rjj_store_id" \
