@@ -142,6 +142,24 @@ YAML
     grep -rhq 'outcome: alive' "$runjj_journal" ||
       fail "the run wrote no §10.1 liveness heartbeat"
 
+    # --- CHARACTERIZATION: where convergence evidence is PUBLISHED (§2) ---
+    # Asserted, not assumed, because a plan proposed relocating it. The v2
+    # design deleted `host/<name>` branches outright and replaced them with
+    # host-keyed PATHS on the one `main` bookmark — the same single-writer
+    # guarantee (§7.3's path->identity table enforces it) without a branch
+    # checkout that can strand the store. So evidence on `main` is the DESIGN,
+    # not a hub leak, and this pins it: the day the topology is deliberately
+    # changed, this fixture is the one that says so out loud.
+    # See docs/specs/2026-08-10-dsc-scaling.md for the bounding mitigation
+    # (journal compaction/TTL) that addresses the growth this shape implies.
+    runjj_published=$(jj -R "$vireo" file list \
+      -r "$(fleet_vcs_heads_local "$vireo")" -T 'path ++ "\n"')
+    printf '%s\n' "$runjj_published" | grep -q "^journal/vireo/" ||
+      fail "the hub's convergence journal is not on the published main tree"
+    [ -z "$(jj -R "$vireo" bookmark list -a -T 'name ++ "\n"' 2>/dev/null |
+      grep '^host/' || true)" ] ||
+      fail "a host/<name> bookmark exists; §2 of the v2 design deleted that topology"
+
     # §5's rendered aliases and the include line that makes them reachable.
     grep -Fq 'Host rh-wren' "$HOME/.ssh/config.d/roundhouse" ||
       fail "the run rendered no ssh aliases from hosts/*.yaml"
