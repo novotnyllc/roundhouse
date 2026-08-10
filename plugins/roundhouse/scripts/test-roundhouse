@@ -38,6 +38,25 @@ assert_ordered() {
     fail "expected ordered contract: $2 before $3"
 }
 
+# Portable file stat for fixtures. Always GNU `stat -c` first, BSD/macOS
+# `stat -f` as the fallback — never `stat -f` first: on Linux `stat -f` is
+# FILESYSTEM stat and prints a report to stdout that the `||` form would splice
+# into the value. Every fixture that stats a file goes through these so the
+# idiom lives in one place.
+t_size()   { stat -c %s "$1" 2>/dev/null || stat -f %z  "$1"; }
+t_blocks() { stat -c %b "$1" 2>/dev/null || stat -f %b  "$1"; }
+t_device() { stat -c %d "$1" 2>/dev/null || stat -f %d  "$1"; }
+t_mode()   { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+
+# A section that only applies to one OS gates on this and lives in its own
+# clearly-named file (e.g. 50-macos-privilege.sh). Only genuinely
+# platform-specific fixtures may gate; everything else must run on every OS.
+skip_unless_darwin() {
+  [ "$(uname -s)" = Darwin ] && return 1
+  printf 'skip: %s runs only on macOS\n' "$1"
+  return 0
+}
+
 # The CLI is an entrypoint plus the units it sources from lib/. Fixtures that
 # assert on its text go through these two, so no fixture has to know which unit
 # a definition landed in — or where inside that unit it sits.

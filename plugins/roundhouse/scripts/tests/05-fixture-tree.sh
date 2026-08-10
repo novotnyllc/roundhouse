@@ -5,10 +5,7 @@
 # shellcheck shell=bash
 
 test_file_mode() {
-  value=$(stat -c %a "$1" 2>/dev/null) ||
-    value=$(stat -f %Lp "$1" 2>/dev/null) ||
-    value=unknown
-  printf '%s\n' "$value"
+  t_mode "$1" 2>/dev/null || printf 'unknown\n'
 }
 
 cat >"$tmp/config.json" <<'JSON'
