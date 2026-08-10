@@ -731,11 +731,18 @@ fleet_run_ssh_include() {
 }
 
 fleet_run_state_of() {
-  # `enabled` | `disabled` — §4's reader's choice: a scalar IS the state, a map
-  # carries it under `state:` and defaults to enabled when it says something
-  # else entirely.
+  # §4's reader's choice: a scalar IS the state, a map carries it under
+  # `state:`, and a map that states none at all defaults to enabled.
+  #
+  # `has("state")` rather than `.state // "enabled"`: jq's alternative operator
+  # treats FALSE and NULL alike, so `state: false` — a plausible hand-edit —
+  # read as ABSENT and therefore as `enabled`, quietly turning a stop into a
+  # start. lib/fleet-run.sh's own seeder carries this same warning about
+  # `.enabled // true`. Returning the value verbatim lets the apply layer's
+  # guard hold anything that is not `enabled`/`disabled`.
   printf '%s\n' "$1" |
-    jq -r 'if type == "object" then (.state // "enabled") else . end'
+    jq -r 'if type == "object" then (if has("state") then .state else "enabled" end)
+      else . end'
 }
 
 fleet_config_drift() {
@@ -802,6 +809,19 @@ fleet_run_apply_item() {
   # per-item trust gate below — and the predicate stays because "held" is a
   # position a category can be put back into in one line.
   ! fleet_category_held "$fleet_run_category" || return 75
+  # AN UNRECOGNISED STATE IS HELD, checked ONCE for every category rather than
+  # per arm. §4's reader's choice makes a bare scalar the state and a map's
+  # `state:` key the state, and every arm below then asks `= enabled`, so a
+  # typo (`enable`) or a wrong type (`state: false`) fell into whatever the arm
+  # does with "not enabled": packages returned SATISFIED — positive canary
+  # evidence that malformed desired state had converged fleet-wide — and
+  # plugins silently DISABLED the plugin. Neither is a decision anybody made.
+  # A value carrying no state at all still reads `enabled` (§4), so
+  # config_files and definitions maps are unaffected.
+  case $(fleet_run_state_of "$5") in
+    enabled | disabled) ;;
+    *) return 75 ;;
+  esac
   case $fleet_run_category in
     policy | definitions.*)
       # Policy is read, not installed; a definition is a lookup, not a want.

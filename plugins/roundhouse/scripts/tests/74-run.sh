@@ -77,6 +77,10 @@ if [ -n "$fleet_fixture_yq" ]; then
       fail "a scalar state did not read as itself"
     [ "$(fleet_run_state_of '{"state":"disabled","marketplace":"x"}')" = disabled ] ||
       fail "the map form's state key did not win"
+    # `state: false` is a STATE, not an absence: jq's `//` treats false and null
+    # alike, so this used to read as `enabled` and turn a stop into a start.
+    [ "$(fleet_run_state_of '{"state":false}')" = false ] ||
+      fail "a false state read as something else; jq's // swallowed it"
     [ "$(fleet_run_state_of '{"marketplace":"x"}')" = enabled ] ||
       fail "a map with no state key did not default to enabled"
 
@@ -158,6 +162,26 @@ YAML
       [ "$run_status" -eq 75 ] ||
         fail "unknown category $run_unknown reached satisfied evidence (got $run_status)"
     done
+    # An UNRECOGNISED STATE is HELD, for every category. A typo (`enable`) or a
+    # wrong type (`state: false`) used to fall into whatever each arm does with
+    # "not enabled": packages reported SATISFIED — positive canary evidence that
+    # malformed desired state had converged fleet-wide — and plugins silently
+    # DISABLED the plugin.
+    for run_badstate in '"enable"' '"Enabled"' '{"state":false}' '{"state":"on"}' \
+      '"present"'; do
+      for run_baditem in packages.jj plugins.railyard skills.tdd agents.triage-bot; do
+        run_status=0
+        fleet_run_apply_item "$run_store" vireo "$run_defs" "$run_baditem" \
+          "$run_badstate" homebrew >/dev/null 2>&1 || run_status=$?
+        [ "$run_status" -eq 75 ] ||
+          fail "$run_baditem at state $run_badstate was not held (got $run_status)"
+      done
+    done
+    # …and a value that carries NO state at all still reads `enabled` (§4), so
+    # the guard does not catch config_files or definitions maps.
+    fleet_run_apply_item "$run_store" vireo "$run_defs" \
+      definitions.packages.jj '{"homebrew":"jj"}' '' ||
+      fail "the unknown-state guard caught a definitions map that states no state"
     # A desired state of `disabled` on a package is the same shape: removal is
     # §10.3's separate capped decision driven by applied/, never this path, so
     # there is nothing to do rather than something that was refused — and that
