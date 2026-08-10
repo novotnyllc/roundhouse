@@ -241,3 +241,24 @@ jobs:
           } finally {
             Remove-Item -LiteralPath $requirementPath -Force -ErrorAction SilentlyContinue
           }
+
+  # Single stable required-status-check context for main's branch protection.
+  # A matrix exposes one context per cell (and `scoped` fans out per suite), so
+  # there is no fixed name to require; this gate collapses every job's result
+  # into one context. Require `ci-ok` in protection instead of the volatile
+  # per-cell contexts — adding or renaming a scope never desyncs the rule.
+  ci-ok:
+    needs: [posix, scope-matrix, scoped, windows]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required jobs succeeded
+        shell: bash
+        run: |
+          set -eu
+          results='${{ join(needs.*.result, ",") }}'
+          printf 'needed results: %s\n' "$results"
+          case ",$results," in
+            *,failure,*|*,cancelled,*|*,skipped,*)
+              printf 'a required job did not succeed\n' >&2; exit 1 ;;
+          esac
