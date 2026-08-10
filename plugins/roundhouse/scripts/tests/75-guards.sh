@@ -319,6 +319,16 @@ JSONC
       fleet_remote_visibility_probe https://example.invalid/store.git)" = \
       'false probe-inconclusive' ] ||
       fail "an unreachable remote was treated as evidence of privacy"
+    # It ALWAYS prints a verdict, so no caller can be handed an empty one: a
+    # tempdir it cannot allocate is the "could not measure" case
+    # `probe-inconclusive` already exists for, and that never satisfies the
+    # first-push gate. Silence here would put an empty reason in posture.yaml
+    # and a blank explanation in fleet-add's refusal.
+    [ "$(TMPDIR="$tmp/guards-no-such-tmpdir" ROUNDHOUSE_SELFTEST=1 \
+      ROUNDHOUSE_FLEET_VISIBILITY_PROBE='exit 0' \
+      fleet_remote_visibility_probe https://example.invalid/store.git \
+      2>/dev/null)" = 'false probe-inconclusive' ] ||
+      fail "the probe produced no verdict when it could not allocate a tempdir"
     # …and `fleet-add` consumes it as a REFUSAL that records nothing. The
     # verdict is read before any roster write, so a public remote never
     # acquires a roster line naming a new machine.

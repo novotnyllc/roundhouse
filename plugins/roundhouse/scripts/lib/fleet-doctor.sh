@@ -188,8 +188,19 @@ fleet_remote_visibility_probe() (
   # needs the same verdict about the same URL before it enrols anybody onto it.
   # A second copy of this three-way logic is a second thing to get wrong on the
   # one question that decides whether private topology reaches a public host.
+  #
+  # IT ALWAYS PRINTS A VERDICT. Every caller reads the two words, so a path that
+  # returns non-zero with empty output leaves one caller writing an empty reason
+  # into posture.yaml and the other refusing with a blank explanation. A
+  # tempdir this function cannot allocate is exactly the "could not measure"
+  # case `probe-inconclusive` already exists for — which never satisfies the
+  # first-push gate — so it degrades to that rather than inventing a third
+  # protocol.
   probe_url=$1
-  probe_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-visibility.XXXXXX") || return 70
+  probe_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-visibility.XXXXXX") || {
+    printf 'false probe-inconclusive\n'
+    return 0
+  }
   trap 'rm -rf "$probe_tmp"' EXIT HUP INT TERM
   probe_status=0
   if fleet_test_hook "${ROUNDHOUSE_FLEET_VISIBILITY_PROBE:-}"; then
