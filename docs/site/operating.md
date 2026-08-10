@@ -105,7 +105,10 @@ without it.** It probes the remote with every credential path closed and
 takes a three-way verdict — only an *authentication refusal* proves the
 remote is gated. A remote that answers unauthenticated reads is public and
 is refused; an unreachable remote is inconclusive and never satisfies the
-gate, because a failed probe is not evidence of privacy.
+gate, because a failed probe is not evidence of privacy. Host 1 runs it in
+the order above; hosts 2..N have `fleet-add` run it for them over the
+enrollment channel, so a newly added host publishes on its first
+`fleet-run`.
 
 `fleet-set-remote URL` moves the store to a new remote. It writes the move
 alert *before* the push, so a crash between the two still leaves the store
@@ -116,7 +119,15 @@ re-verifies.
 
 `fleet-seed` writes this host's own `hosts/<name>.yaml` and
 `applied/<name>.yaml` from discovery, which makes the **first convergence
-after seeding a no-op by construction.**
+after seeding a no-op by construction.** It carries this machine's
+`platform` and `groups` across from `config.json` as well, so the host
+file the fold reads is complete from the first seed; a value already in the
+host file wins.
+
+The store remote is proved gated before anything is recorded: `fleet-add`
+reads the same three-way verdict first, and a remote that answers
+unauthenticated reads means the enrollment is refused with nothing
+written — no roster line, no alert, no identity on the newcomer.
 
 ## Maintenance
 

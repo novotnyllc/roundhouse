@@ -175,7 +175,15 @@ A real conflict is two hosts changing the same value, and the posture is:
   the value you actually want and let it flow through the gates.
 
 Held items are journaled as held. Nothing is ever applied because it was
-confusing.
+confusing. An item this design has **no state-alignment verb** for — an
+`agents`, `mcp_servers` or `projects` entry, a package desired `disabled` —
+journals `satisfied` instead: it resolved, it was reviewed, and there was
+nothing to do here or on any other host. That is a distinct record from `held`
+so an audit can tell no-op-because-correct from no-op-because-blocked, and it is
+the one non-`applied` outcome the canary gate accepts as evidence — gating peers
+on an `applied` record that can never be written would hold the item forever and
+buy nothing. An item a host **tried and could not apply**, or that a gate
+refused, still journals `held` and still blocks downstream.
 
 ### Rollback
 
@@ -263,7 +271,9 @@ roundhouse fleet-set-remote <url>  # adds origin. fleet-init creates the store
                                # the store one — it MOVES an existing remote and
                                # ADDS a missing one.
 roundhouse fleet-verify-remote # REQUIRED before the first push
-roundhouse fleet-seed          # discovery -> hosts/<name>.yaml + applied/<name>.yaml
+roundhouse fleet-seed          # discovery -> hosts/<name>.yaml + applied/<name>.yaml,
+                               # including this machine's platform and groups
+                               # from config.json — no hand-authored facts
 $EDITOR fleet.yaml             # lift the commonalities
 roundhouse fleet-doctor        # every check must pass before host 2
 roundhouse fleet-run --fast    # the first convergence
@@ -279,12 +289,26 @@ genesis. So `fleet-init` cannot be the step that names `store_id`.
 roundhouse fleet-add wren
 ```
 
-That is the whole bootstrap. The agent resolves `wren`, reaches it over the
-**existing SSH lane the fleet already uses to run commands there**, installs
+That is the whole bootstrap. `wren` is the **roster identity** — the config
+machine name every host-keyed path and every signature is checked against — and
+the **transport** is resolved separately from that machine's configured
+`ssh_alias`, so a machine reachable as `claires-mac-mini` is still `mac-mini` in
+the roster and needs no hand-added SSH `Host` block. The agent reaches it over
+the **existing SSH lane the fleet already uses to run commands there**, resolves
+roundhouse on the far side (a launcher on PATH if there is one, otherwise the
+plugin cache under `~/.claude` or `~/.codex` — no shim to install), installs
 prerequisites, runs `fleet-init`, has wren mint a key, reads the key and a
 `roundhouse-enroll` possession proof back over the same channel, hands wren the
 remote URL and `store_id` over that channel, commits the roster line, and pushes.
 **Nothing is run on any other host, and no human touches any other host.**
+
+Before it records anything, `fleet-add` settles §10.6 for the store remote: if
+the remote answers unauthenticated reads it **refuses and records nothing** — no
+roster edit, no alert, no identity written on the newcomer. Once the roster line
+is published it has the newcomer run its own visibility probe over the same
+channel, so a freshly added host publishes on its first `fleet-run` with no
+further step. Posture is host-local and keyed on the URL that host resolves, so
+the probe runs *there* rather than being copied from the sponsor.
 
 Enrollment is **two-sided and needs no bearer credential**: an enrolled host
 supplies authorization (its roster key makes the commit ratchet-valid) and the
@@ -329,7 +353,9 @@ refuses without it**, by design. It probes the remote with every credential path
 closed and takes a three-way verdict — only an *authentication refusal* proves
 the remote is gated. A remote that answers unauthenticated reads is public and is
 refused; an unreachable remote is **inconclusive and never
-satisfies the gate**, because a failed probe is not evidence of privacy.
+satisfies the gate**, because a failed probe is not evidence of privacy. Host 1
+runs it by hand, in the runbook order above; hosts 2..N have `fleet-add` run it
+for them over the enrollment channel.
 
 `roundhouse fleet-set-remote URL` moves the store to a new remote. It writes the
 move alert *before* the push so a crash between the two still leaves the store

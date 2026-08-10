@@ -134,13 +134,18 @@ casing — a leaf cannot forge anyone else's evidence.
 roundhouse fleet-add wren
 ```
 
-That is the whole bootstrap for a new host. On the machine you're already
-on, the agent resolves `wren`, reaches it over the existing SSH lane,
-installs the prerequisites, runs `fleet-init`, has wren mint its own key,
-reads the public key and a possession proof back over the same channel,
-hands wren the remote URL and store id over that channel, commits the
-roster line, and pushes. **Nothing runs on any other host, and no human
-touches any other host.**
+That is the whole bootstrap for a new host. `wren` is the **roster
+identity** — the name every host-keyed path and every signature is checked
+against — and the **transport** comes from that machine's configured
+`ssh_alias`, so a machine you reach as `claires-wren` is still `wren` in
+the roster. On the machine you're already on, the agent reaches it over the
+existing SSH lane, resolves roundhouse on the far side (a launcher on PATH
+if there is one, otherwise the plugin cache), installs the prerequisites,
+runs `fleet-init`, has wren mint its own key, reads the public key and a
+possession proof back over the same channel, hands wren the remote URL and
+store id over that channel, commits the roster line, pushes, and has wren
+prove the remote is gated for itself. **Nothing runs on any other host, and
+no human touches any other host.**
 
 Enrollment is two-sided and needs no bearer credential. An enrolled host
 supplies **authorisation** — its roster key makes the commit
