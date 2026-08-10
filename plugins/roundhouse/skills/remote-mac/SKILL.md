@@ -17,6 +17,12 @@ through the target user's configured login shell. This preserves user-level
 paths such as `$HOME/.local/bin`; never infer that tooling is absent from a raw
 non-login SSH `PATH`.
 
+When the user names a specific CLI for the operation, that named tool is the
+contract. Locate it on the target (`command -v <cli>`, then `<cli> --help`) and
+drive the operation through it. If it genuinely lacks the operation, stop and
+say so — never silently fall back to hand-editing the files it manages behind
+its back, which desyncs whatever state that CLI owns.
+
 ```bash
 ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none \
   -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \

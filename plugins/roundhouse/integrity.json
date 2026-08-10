@@ -254,7 +254,7 @@
     },
     {
       "path": "skills/remote-mac/SKILL.md",
-      "sha256": "fa6dc7b8976ca6802f682e4f6b1b063e558ed535e8d70d7524d276e981e33753"
+      "sha256": "e1f46161ba9ba95f6b6e6da6eeba3b9a7b9babbb67a7cf881cf75e9c393bc88f"
     },
     {
       "path": "skills/remote-mac/agents/openai.yaml",
