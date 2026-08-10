@@ -148,12 +148,18 @@ YAML
     done
     # A desired state of `disabled` on a package is the same shape: removal is
     # §10.3's separate capped decision driven by applied/, never this path, so
-    # there is nothing to do rather than something that was refused.
-    run_status=0
-    fleet_run_apply_item "$run_store" vireo "$run_defs" packages.jj \
-      '"disabled"' homebrew >/dev/null 2>&1 || run_status=$?
-    [ "$run_status" -eq 70 ] ||
-      fail "a disabled package did not read as satisfied (got $run_status)"
+    # there is nothing to do rather than something that was refused — and that
+    # holds whether or not this host has a manager that could have PROVIDED the
+    # package, which is why the state is asked before the resolver. Asking the
+    # resolver first made an unprovidable disabled package journal `held` and
+    # block every downstream host on evidence nobody could ever produce.
+    for run_pkg_managers in homebrew apt ''; do
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo "$run_defs" packages.jj \
+        '"disabled"' "$run_pkg_managers" >/dev/null 2>&1 || run_status=$?
+      [ "$run_status" -eq 70 ] ||
+        fail "a disabled package with managers '$run_pkg_managers' did not read as satisfied (got $run_status)"
+    done
     # …and the other side of the split: a miss about THIS HOST's capability is
     # HELD, never satisfied. A peer that CAN apply the item must not converge
     # on this host's inability, so those misses have to keep blocking.
@@ -377,20 +383,49 @@ JSONC
       fail "re-seeding failed over a hand-authored fact"
     yq -e '.platform == "macos"' "$run_seeded" >/dev/null ||
       fail "seeding overwrote a hand-authored platform with the config's"
-    # A machine config.json does not list keeps working — a scratch host or a
-    # fixture must not be refused for being unlisted, and must not have facts
-    # invented for it either.
-    cat >"$run_root/seed-unlisted.json" <<JSONC
+    # An EMPTY groups list is a fact, not an absence. The `machine-truth` doctor
+    # row compares `.groups // null` on both sides and jq's `//` passes `[]`
+    # through, so omitting the field reads as `null` against the config's `[]`
+    # and the row fires forever on a correctly configured ungrouped machine.
+    cat >"$run_root/seed-nogroups.json" <<JSONC
 {"version":1,"machines":{"$run_seed_host":{"platform":"linux","transport":"local",
   "groups":[],"package_managers":[]}}}
 JSONC
     rm -f "$run_seeded"
-    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-unlisted.json" \
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-nogroups.json" \
       ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
       fleet_seed_command >/dev/null 2>&1 ||
       fail "fleet-seed refused a machine with no groups to seed"
-    yq -e '.groups == null and .plugins.ponytail != null' "$run_seeded" >/dev/null ||
-      fail "an empty groups list was seeded as a fact instead of left absent"
+    # `yq -e '.groups == []'` is NOT usable here: this yq compares sequences by
+    # identity, so it reports false for two equal empty lists. Assert the tag
+    # and the length, which is what the claim actually is.
+    [ "$(yq -r '.groups | tag' "$run_seeded")" = '!!seq' ] &&
+      [ "$(yq -r '.groups | length' "$run_seeded")" -eq 0 ] ||
+      fail "an empty groups list was dropped instead of seeded; machine-truth would fire forever"
+    yq -e '.plugins.ponytail != null' "$run_seeded" >/dev/null ||
+      fail "seeding the empty groups list cost the observed surfaces"
+    # …and a config that states NO opinion has none invented for it. (The
+    # machine stays listed with `transport: local`, because that entry is also
+    # how fleet_host_name resolves this machine's own name — drop it and the
+    # seed writes a different host file and the assertion below reads a file
+    # nothing wrote.)
+    cat >"$run_root/seed-silent.json" <<JSONC
+{"version":1,"machines":{"$run_seed_host":{"transport":"local"}}}
+JSONC
+    rm -f "$run_seeded"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-silent.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >/dev/null 2>&1 ||
+      fail "fleet-seed refused a machine whose config states no facts"
+    [ -f "$run_seeded" ] ||
+      fail "the seed wrote a different host file than the fixture expects"
+    yq -e '.platform == null and .groups == null and .plugins.ponytail != null' \
+      "$run_seeded" >/dev/null ||
+      fail "an unlisted machine had facts invented for it"
+    # An ABSENT field and an empty list are different answers, and the doctor
+    # row reads them differently — so the two cases above must not collapse.
+    [ "$(yq -r '.groups | tag' "$run_seeded")" = '!!null' ] ||
+      fail "an unlisted machine seeded a groups value rather than leaving it absent"
 
     # --- §6.1(b) the push-nudge: outbound only, bounded, and deletable ---
     mkdir -p "$run_root/bin"

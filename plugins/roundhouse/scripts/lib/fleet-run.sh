@@ -808,14 +808,18 @@ fleet_run_apply_item() {
       return 0
       ;;
     packages)
+      # SATISFIED, and asked BEFORE the resolver: a desired state of `disabled`
+      # has no removal verb by design (§10.3 makes removal a separate, capped
+      # decision driven by applied/), so there is nothing to do here or on any
+      # other host — and that is true whether or not this host has a manager
+      # that could have provided the package. Asking the resolver first made an
+      # unprovidable disabled package journal `held` and block every downstream
+      # host forever on evidence nobody could ever produce.
+      [ "$(fleet_run_state_of "$5")" = enabled ] || return 70
       # shellcheck disable=SC2086 # the host's package_managers list, in order
       fleet_run_resolved=$(fleet_resolve_package "$3" "$fleet_run_name" $6) || :
       [ "$(printf '%s\n' "$fleet_run_resolved" | jq -r '.resolved')" = true ] ||
         return 75
-      # SATISFIED: a desired state of `disabled` has no removal verb by design
-      # (§10.3 makes removal a separate, capped decision driven by applied/),
-      # so there is nothing to do here or anywhere else.
-      [ "$(fleet_run_state_of "$5")" = enabled ] || return 70
       # THE VERSION RIDES ALONG. The resolver reports `pin: flag` plus the
       # version and `fleet_package_pinned` then makes the update pass skip the
       # package forever — so dropping the version here meant the store asserted
@@ -1916,10 +1920,17 @@ fleet_seed_command() (
   # hosts/<name>.yaml before its own layers resolved. config.json already
   # carries both, validated (platform is one of macos/linux/wsl/windows and
   # every group matches the name charset), so there is nothing to infer.
+  #
+  # PRESENCE, not truthiness: a machine legitimately in no groups carries
+  # `groups: []`, and dropping an empty list is not the same as having no
+  # opinion. The `machine-truth` doctor row compares `.groups // null` on both
+  # sides, and jq's `//` passes `[]` through — so an omitted field reads as
+  # `null` against the config's `[]` and the row fires forever on a host that
+  # is correctly configured.
   seed_facts=$(jq -c --arg host "$seed_host" '
     (.machines[$host] // {}) |
-    {} + (if .platform then {platform: .platform} else {} end)
-       + (if (.groups // []) != [] then {groups: .groups} else {} end)
+    {} + (if has("platform") then {platform: .platform} else {} end)
+       + (if has("groups") then {groups: .groups} else {} end)
     ' "$(config_path)" 2>/dev/null) || seed_facts='{}'
   [ -n "$seed_facts" ] || seed_facts='{}'
 
