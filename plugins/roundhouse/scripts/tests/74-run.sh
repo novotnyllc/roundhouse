@@ -344,6 +344,54 @@ YAML
     [ ! -e "$run_store/.jj" ] ||
       fail "fleet-seed created a repository"
 
+    # --- machine truth is SEEDED, not hand-authored (G4) ---
+    # `platform` and `groups` are host FACTS the fold reads to pick the `os/`
+    # and `groups/` layers. Seeding captured the three observed surfaces and
+    # not these, so every enrolled host needed a hand-written hosts/<name>.yaml
+    # before its own layers resolved at all. config.json already states both,
+    # validated, so there is nothing to infer.
+    # `transport: local` because that is how fleet_host_name resolves this
+    # machine's own name out of config.json — the same machine the seed writes.
+    cat >"$run_root/seed-config.json" <<JSONC
+{"version":1,"machines":{"$run_seed_host":{"platform":"linux","transport":"local",
+  "groups":["development","canary"],"package_managers":["apt"]}}}
+JSONC
+    rm -f "$run_seeded"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >/dev/null 2>&1 ||
+      fail "fleet-seed failed with machine facts to seed"
+    yq -e '.platform == "linux"' "$run_seeded" >/dev/null ||
+      fail "seeding did not take platform from config.json — machine-truth still needs a hand-authored host file"
+    [ "$(yq -r '(.groups // []) | join(",")' "$run_seeded")" = development,canary ] ||
+      fail "seeding did not take groups from config.json"
+    yq -e '.plugins.ponytail != null' "$run_seeded" >/dev/null ||
+      fail "seeding the facts cost the observed surfaces"
+    # A fact already in the host file WINS: someone wrote it deliberately and
+    # seeding is not the place to relitigate it.
+    fleet_record_write "$run_seeded" \
+      "$(fleet_record_read "$run_seeded" '{}' | jq -c '.platform = "macos"')"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >/dev/null 2>&1 ||
+      fail "re-seeding failed over a hand-authored fact"
+    yq -e '.platform == "macos"' "$run_seeded" >/dev/null ||
+      fail "seeding overwrote a hand-authored platform with the config's"
+    # A machine config.json does not list keeps working — a scratch host or a
+    # fixture must not be refused for being unlisted, and must not have facts
+    # invented for it either.
+    cat >"$run_root/seed-unlisted.json" <<JSONC
+{"version":1,"machines":{"$run_seed_host":{"platform":"linux","transport":"local",
+  "groups":[],"package_managers":[]}}}
+JSONC
+    rm -f "$run_seeded"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-unlisted.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >/dev/null 2>&1 ||
+      fail "fleet-seed refused a machine with no groups to seed"
+    yq -e '.groups == null and .plugins.ponytail != null' "$run_seeded" >/dev/null ||
+      fail "an empty groups list was seeded as a fact instead of left absent"
+
     # --- §6.1(b) the push-nudge: outbound only, bounded, and deletable ---
     mkdir -p "$run_root/bin"
     cat >"$run_root/bin/ssh" <<'STUB'

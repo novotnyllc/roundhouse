@@ -1908,12 +1908,30 @@ fleet_seed_command() (
       elif $r.kind == "package" then .packages[$r.data.name] = "enabled"
       else . end)' "$seed_tmp/snapshot.jsonl")
 
+  # MACHINE TRUTH, seeded from the one file that already states it. `platform`
+  # and `groups` are host FACTS rather than desired items — the fold reads them
+  # to pick the `os/` and `groups/` layers, and `machine-truth` reports a host
+  # file without them as incomplete. Seeding captured the three observed
+  # surfaces and not these, so every enrolled host needed a hand-authored
+  # hosts/<name>.yaml before its own layers resolved. config.json already
+  # carries both, validated (platform is one of macos/linux/wsl/windows and
+  # every group matches the name charset), so there is nothing to infer.
+  seed_facts=$(jq -c --arg host "$seed_host" '
+    (.machines[$host] // {}) |
+    {} + (if .platform then {platform: .platform} else {} end)
+       + (if (.groups // []) != [] then {groups: .groups} else {} end)
+    ' "$(config_path)" 2>/dev/null) || seed_facts='{}'
+  [ -n "$seed_facts" ] || seed_facts='{}'
+
   seed_file="$seed_store/hosts/$seed_host.yaml"
   mkdir -p "$(dirname "$seed_file")"
   seed_existing=$(fleet_record_read "$seed_file" '{}')
+  # Facts are the BASE, not an override: a value already in the host file wins,
+  # because someone wrote it deliberately and seeding is not a place to
+  # relitigate it. Observed surfaces still win over both, unchanged.
   fleet_record_write "$seed_file" \
     "$(printf '%s\n' "$seed_existing" | jq -c --argjson seeded "$seed_desired" \
-      '. * $seeded')"
+      --argjson facts "$seed_facts" '$facts * . * $seeded')"
 
   seed_fold=$(fleet_fold "$seed_store" "$seed_host")
   fleet_items "$seed_desired" | while IFS= read -r seed_item; do
