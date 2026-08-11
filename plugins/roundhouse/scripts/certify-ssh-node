@@ -1912,12 +1912,12 @@ fixture_transaction_tree_clean() {
     \( -name '.sign-candidate.*' -o -name '.serial.*' \) -print | /usr/bin/grep -q . || return 1
   ! /usr/bin/find "$signer_root/.work" -mindepth 1 -maxdepth 1 -print | /usr/bin/grep -q .
 }
-# Every fixture wait is bounded, and every bound that is reached says what it
-# was waiting for.  A bare `return 1` here reaches the caller as a silent
-# `|| return 1`, which an `||` context also hides from the ERR trap: the whole
-# self-check then ends as an exit status with no line of output.
-fixture_timeout() {
-  printf 'FAIL: certify-ssh-node self-test: timed out waiting for %s\n' "$*" >&2
+# Every fixture wait is bounded, and every bound that is reached says what
+# went wrong in its own words.  A bare `return 1` here reaches the caller as a
+# silent `|| return 1`, which an `||` context also hides from the ERR trap: the
+# whole self-check then ends as an exit status with no line of output.
+fixture_wait_failed() {
+  printf 'FAIL: certify-ssh-node self-test: %s\n' "$*" >&2
   return 1
 }
 wait_for_fixture_marker() {
@@ -1927,7 +1927,7 @@ wait_for_fixture_marker() {
     /bin/sleep 0.05
     count=$((count + 1))
   done
-  fixture_timeout "fixture marker $marker"
+  fixture_wait_failed "timed out waiting for fixture marker $marker"
 }
 wait_for_either_fixture_marker() {
   local first=$1 second=$2 count=0
@@ -1936,19 +1936,30 @@ wait_for_either_fixture_marker() {
     /bin/sleep 0.01
     count=$((count + 1))
   done
-  fixture_timeout "either fixture marker $first or $second"
+  fixture_wait_failed "timed out waiting for either fixture marker $first or $second"
 }
 wait_for_fixture_stop() {
   local pid=$1 count=0 state
-  [[ $pid =~ ^[1-9][0-9]*$ ]] || fixture_timeout "a valid fixture pid, got [$pid]" || return 1
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || fixture_wait_failed "invalid fixture pid [$pid]" || return 1
   while [ "$count" -lt 400 ]; do
     state=$(/bin/ps -o state= -p "$pid" 2>/dev/null | /usr/bin/tr -d ' ') ||
-      fixture_timeout "fixture pid $pid to stop, but it is already gone" || return 1
+      fixture_wait_failed "fixture pid $pid is already gone" || return 1
     case $state in T*) return 0 ;; esac
     /bin/sleep 0.01
     count=$((count + 1))
   done
-  fixture_timeout "fixture pid $pid to stop"
+  fixture_wait_failed "timed out waiting for fixture pid $pid to stop"
+}
+fixture_kill_worker_tree() {
+  # SIGKILL skips the worker's EXIT trap, so any reader it already launched
+  # would be reparented to init and outlive the step — the very orphan this
+  # section exists to keep out of the job log.  Take the children first.
+  local pid=$1 child parent
+  while read -r child parent; do
+    [ "$parent" = "$pid" ] && [[ $child =~ ^[1-9][0-9]*$ ]] || continue
+    /bin/kill -KILL "$child" >/dev/null 2>&1 || :
+  done < <(/bin/ps -A -o pid=,ppid= 2>/dev/null || :)
+  /bin/kill -KILL "$pid" >/dev/null 2>&1 || :
 }
 fixture_reap_signalled_worker() {
   # A signalled worker gets a bounded window to exit on its own.  Name the
@@ -1961,7 +1972,7 @@ fixture_reap_signalled_worker() {
     count=$((count + 1))
   done
   printf 'FAIL: certify-ssh-node self-test: %s did not exit after its signal\n' "$label" >&2
-  /bin/kill -KILL "$pid" >/dev/null 2>&1 || :
+  fixture_kill_worker_tree "$pid"
   return 1
 }
 fixture_signal_observer() {
@@ -1976,7 +1987,7 @@ fixture_signal_observer() {
   if ! { wait_for_fixture_marker "$control/$phase" && wait_for_fixture_stop "$pid" &&
       /bin/kill -"$signal_name" "$pid"; }; then
     printf 'FAIL: certify-ssh-node self-test: %s never reached %s\n' "$label" "$phase" >&2
-    /bin/kill -KILL "$pid" >/dev/null 2>&1 || :
+    fixture_kill_worker_tree "$pid"
     return 1
   fi
   /bin/kill -CONT "$pid" >/dev/null 2>&1 || :
@@ -2552,7 +2563,7 @@ self_test() {
   ! fixture_worker_quiet probe "$root/fixture-quiet" "$root/fixture-noise" 2>"$fixture_report" || return 1
   /usr/bin/grep -Fq 'probe spoke stdout[] stderr[handler noise]' "$fixture_report" || return 1
   ! wait_for_fixture_stop '' 2>"$fixture_report" || return 1
-  /usr/bin/grep -Fq 'timed out waiting for a valid fixture pid' "$fixture_report" || return 1
+  /usr/bin/grep -Fq 'invalid fixture pid []' "$fixture_report" || return 1
   /bin/rm -f "$root/fixture-quiet" "$root/fixture-noise" "$fixture_report" || return 1
 
   # Blocking FIFO reads exercise each signal independently.  Handlers must
