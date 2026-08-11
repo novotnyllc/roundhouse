@@ -198,10 +198,184 @@ YAML
       fail "a UUID-shaped store path false-positived as a secret"
     ! fleet_quote_is_secret 'kxrntvmqzuwstrpqwxrwprquoloswvxymn' ||
       fail "a jj change id (single-case letters, no digit) false-positived"
+    # --- the ONE exemption is PROVED, never inferred from shape (§10.4) ---
+    # The heuristic used to flag a bare git commit id as single-case hex
+    # high-entropy and refuse the guarded publish — and `fleet-checkpoint`'s own
+    # description quotes one. But a 40-character lowercase-hex credential and a
+    # commit id are the same STRING SHAPE, so a length test would publish the
+    # credential. The exemption therefore asks the repository whether the token
+    # names a commit it already contains; the resolving case is exercised
+    # against a real store in tests/94-jj-doctor.sh. Here: the shape predicate,
+    # and the default with no store — which is NO exemption.
+    #
+    # `fleet_record_quote_ok`'s free text (findings/, holds) has no repository
+    # context, so nothing a human types there is ever exempt.
+    ! fleet_quote_is_content_address 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172 ||
+      fail "a 40-hex token was called a content address with no store to prove it"
+    ! fleet_quote_is_content_address 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172 \
+      "$guard_root/no-such-store" ||
+      fail "a token resolved as a content address against a store that does not exist"
+    for guard_notaddr in '' 0123456789abcdef0123456789abcdef \
+      9f2c1a4b7e0d3856af91cc42b7e5d80613a4f29cbd75e01834a6c9b2df75e013 \
+      8E765ED0C1B24A97FF3D6E5A0B1C2D3E4F506172 \
+      8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172ff \
+      8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f5061_z; do
+      ! fleet_quote_is_content_address "$guard_notaddr" "$guard_store" ||
+        fail "the content-address predicate accepted a non-commit-id: '$guard_notaddr'"
+    done
+    # With no store, a commit-id-shaped token in free text is still a match —
+    # the strictest answer, and the one the sweep's own call site upgrades by
+    # passing its store.
+    fleet_quote_is_secret \
+      'checkpoint 3 through 8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172' ||
+      fail "free text with no repository context got an exemption anyway"
+    # EVERY candidate token has to be accounted for: one the store cannot
+    # explain is a secret however many commit ids sit beside it.
+    cli_function_body fleet_quote_is_secret |
+      grep -q 'fleet_quote_is_content_address "$quote_token" "${2:-}" || return 0' ||
+      fail "the sweep predicate no longer requires every high-entropy token to be accounted for"
+    # And every named class still refuses, which is what the exemption must
+    # not have cost.
+    fleet_quote_is_secret 'rotate ghp_0123456789abcdefghij' ||
+      fail "a GitHub token stopped being refused"
+    fleet_quote_is_secret '-----BEGIN OPENSSH PRIVATE KEY-----' ||
+      fail "a PEM header stopped being refused"
+    fleet_quote_is_secret '0123456789abcdef0123456789abcdef' ||
+      fail "a 32-hex token stopped being flagged"
+    fleet_quote_is_secret '9f2c1a4b7e0d3856af91cc42b7e5d80613a4f29cbd75e01834a6c9b2df75e013' ||
+      fail "a 64-hex token stopped being flagged; only a proved commit id is exempt"
     # A hyphenated UUID in a path or remote URL is not a secret: `-` is out of
     # the entropy class, so it splits into its short segments.
     ! fleet_quote_is_secret 'move the store remote to /tmp/store-bf513ef6-0107-492a-ba74-f4a72b1b4fb4.git' ||
       fail "a hyphenated UUID in a remote URL false-positived as a secret"
+
+    # --- enrollment ergonomics: identity vs transport, and the remote CLI ---
+    # G2. A machine's ROSTER IDENTITY and its TRANSPORT ADDRESS are two facts,
+    # and `fleet-add mac-mini` used the argument as both — so a machine whose
+    # ssh alias is `claires-mac-mini` did not connect until somebody hand-added
+    # a `Host mac-mini` block. The roster keeps the config machine name; only
+    # the transport follows the alias.
+    cat >"$tmp/guards-config.json" <<'JSONC'
+{"version":1,"machines":{
+  "mac-mini":{"platform":"macos","transport":"ssh","ssh_alias":"claires-mac-mini",
+    "groups":[],"package_managers":[]},
+  "hostile":{"platform":"linux","transport":"ssh","ssh_alias":"-oProxyCommand=curl|sh",
+    "groups":[],"package_managers":[]}}}
+JSONC
+    [ "$(ROUNDHOUSE_CONFIG="$tmp/guards-config.json" \
+      fleet_ssh_destination mac-mini)" = claires-mac-mini ] ||
+      fail "the ssh destination did not resolve through the machine's configured alias"
+    # An unlisted machine falls back to its own name rather than refusing: a
+    # scratch host or a fixture must keep working.
+    [ "$(ROUNDHOUSE_CONFIG="$tmp/guards-config.json" \
+      fleet_ssh_destination scratch-box)" = scratch-box ] ||
+      fail "an unlisted machine did not fall back to its own name"
+    [ "$(ROUNDHOUSE_CONFIG="$tmp/missing-config.json" \
+      fleet_ssh_destination mac-mini)" = mac-mini ] ||
+      fail "an unreadable config did not fall back to the name"
+    # The alias comes out of a file this code did not write and reaches ssh as
+    # argv, so it passes the SAME allowlist every other destination passes: an
+    # option-shaped alias is refused here, never turned into an ssh flag.
+    ! ROUNDHOUSE_CONFIG="$tmp/guards-config.json" \
+      fleet_ssh_destination hostile >/dev/null 2>&1 ||
+      fail "an option-shaped ssh_alias reached the transport"
+
+    # G1. The plugin ships no `roundhouse` on anybody's PATH — skills invoke it
+    # through its relative scripts/roundhouse — so `fleet-add`'s bare remote
+    # `roundhouse fleet-init` did nothing on every host that had no hand-written
+    # shim, and the `|| :` made that indistinguishable from success. The
+    # prologue RESOLVES the CLI on the far side instead of assuming it.
+    guard_prologue=$(fleet_remote_cli_prologue)
+    case $guard_prologue in
+      *'command -v roundhouse'*) ;;
+      *) fail "the remote prologue does not prefer a launcher already on PATH" ;;
+    esac
+    # THE SPONSOR'S OWN VERSION IS TRIED FIRST, by exact path: falling straight
+    # to "whichever cached copy sorts last" drives bytes this host did not
+    # choose, and lexically last is not even newest (0.9.0 sorts after 0.10.0),
+    # so it could be an arbitrarily old build whose gates this one has added.
+    guard_version=$(jq -r '.version' \
+      "$(dirname -- "$cli")/../.codex-plugin/plugin.json")
+    case $guard_prologue in
+      *"/roundhouse/$guard_version/scripts/roundhouse"*) ;;
+      *) fail "the remote prologue does not ask for the sponsor's own version first: $guard_version" ;;
+    esac
+    printf '%s\n' "$guard_prologue" >"$tmp/guards-prologue.sh"
+    assert_ordered "$tmp/guards-prologue.sh" \
+      "/roundhouse/$guard_version/scripts/roundhouse" \
+      '/roundhouse/*/scripts/roundhouse'
+    for guard_cache in .claude/plugins/cache .codex/plugins/cache; do
+      case $guard_prologue in
+        *"$guard_cache"*) ;;
+        *) fail "the remote prologue cannot find the CLI under ~/$guard_cache" ;;
+      esac
+    done
+    # POSIX sh on the far side: no `local`, no bash arrays, no `[[`.
+    ! printf '%s\n' "$guard_prologue" | grep -qE '(^|[^A-Za-z])(local |\[\[)' ||
+      fail "the remote prologue uses a bashism; it runs under the peer's /bin/sh"
+    printf '%s\n' "$guard_prologue" | sh -n ||
+      fail "the remote prologue is not valid POSIX sh"
+    # It FAILS LOUD rather than falling through to a bare command name.
+    case $guard_prologue in
+      *'exit 69'*) ;;
+      *) fail "the remote prologue does not refuse when it finds no CLI" ;;
+    esac
+    guard_status=0
+    (
+      # An empty HOME (no plugin cache) and a PATH with no roundhouse on it —
+      # /usr/bin:/bin so `sh` itself still resolves, which is what the prologue
+      # runs under on the peer.
+      HOME=$tmp/guards-empty-home
+      mkdir -p "$HOME"
+      PATH=/usr/bin:/bin
+      export HOME PATH
+      printf '%s\n' "$guard_prologue" | sh
+    ) >/dev/null 2>&1 || guard_status=$?
+    [ "$guard_status" -eq 69 ] ||
+      fail "the remote prologue did not exit 69 on a host with no CLI (got $guard_status)"
+
+    # U2. §10.6's probe, as ONE function both the verb and `fleet-add` call.
+    # A FAILED PROBE IS NOT EVIDENCE OF PRIVACY: only an authentication refusal
+    # proves the remote is gated.
+    [ "$(ROUNDHOUSE_SELFTEST=1 \
+      ROUNDHOUSE_FLEET_VISIBILITY_PROBE='printf "Permission denied (publickey)\n" >&2; exit 128' \
+      fleet_remote_visibility_probe https://example.invalid/store.git)" = \
+      'true auth-required' ] ||
+      fail "an authentication refusal was not read as a private remote"
+    [ "$(ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_FLEET_VISIBILITY_PROBE='exit 0' \
+      fleet_remote_visibility_probe https://example.invalid/store.git)" = \
+      'false public' ] ||
+      fail "a remote that answered unauthenticated reads was not read as public"
+    [ "$(ROUNDHOUSE_SELFTEST=1 \
+      ROUNDHOUSE_FLEET_VISIBILITY_PROBE='printf "could not resolve host\n" >&2; exit 128' \
+      fleet_remote_visibility_probe https://example.invalid/store.git)" = \
+      'false probe-inconclusive' ] ||
+      fail "an unreachable remote was treated as evidence of privacy"
+    # It ALWAYS prints a verdict, so no caller can be handed an empty one: a
+    # tempdir it cannot allocate is the "could not measure" case
+    # `probe-inconclusive` already exists for, and that never satisfies the
+    # first-push gate. Silence here would put an empty reason in posture.yaml
+    # and a blank explanation in fleet-add's refusal.
+    [ "$(TMPDIR="$tmp/guards-no-such-tmpdir" ROUNDHOUSE_SELFTEST=1 \
+      ROUNDHOUSE_FLEET_VISIBILITY_PROBE='exit 0' \
+      fleet_remote_visibility_probe https://example.invalid/store.git \
+      2>/dev/null)" = 'false probe-inconclusive' ] ||
+      fail "the probe produced no verdict when it could not allocate a tempdir"
+    # …and `fleet-add` consumes it as a REFUSAL that records nothing. The
+    # verdict is read before any roster write, so a public remote never
+    # acquires a roster line naming a new machine.
+    cli_function_body fleet_add_command >"$tmp/guards-add.sh"
+    grep -q 'fleet_remote_visibility_probe' "$tmp/guards-add.sh" ||
+      fail "fleet-add does not establish the remote's posture at enrollment (§10.6 stays one manual step per host)"
+    assert_ordered "$tmp/guards-add.sh" 'fleet_remote_visibility_probe' \
+      'fleet_enroll_roster_touch'
+    # The roster identity stays the config machine name; only the transport
+    # follows the alias, so every host-keyed path and signature still checks
+    # against the name the instruction gave.
+    grep -q 'add_ssh=$(fleet_ssh_destination "$add_target")' "$tmp/guards-add.sh" ||
+      fail "fleet-add does not resolve its transport separately from the roster identity"
+    ! grep -q 'ssh_run "\$add_target"' "$tmp/guards-add.sh" ||
+      fail "fleet-add still uses the roster name as an ssh destination"
 
     # --- §7.3a the host-name allowlist, the sink joins/<h>.yaml reaches ---
     # A joins/ file is written by a NON-MEMBER, and its `.address` (and file

@@ -66,7 +66,10 @@ fleet_sweep_range() {
           sweep_line=0
           while IFS= read -r sweep_text; do
             sweep_line=$((sweep_line + 1))
-            ! fleet_quote_is_secret "$sweep_text" ||
+            # The STORE rides along so the one exemption can be proved rather
+            # than guessed: a high-entropy token that names a commit this
+            # repository already contains discloses nothing by being published.
+            ! fleet_quote_is_secret "$sweep_text" "$1" ||
               printf '%s description line %s matches a secret class\n' \
                 "$sweep_commit" "$sweep_line"
             # The 400-byte cap on replicated free text, applied where the free
@@ -100,7 +103,7 @@ fleet_sweep_range() {
                 sweep_line=$((sweep_line + 1))
                 # The line number is §10.4's own promise: "names the file and
                 # the line within it".
-                ! fleet_quote_is_secret "$sweep_text" ||
+                ! fleet_quote_is_secret "$sweep_text" "$1" ||
                   printf '%s %s:%s matches a secret class\n' \
                     "$sweep_commit" "$sweep_path" "$sweep_line"
               done
@@ -175,14 +178,58 @@ fleet_first_push_gate() {
   return 65
 }
 
-fleet_verify_remote_command() (
-  # `roundhouse fleet-verify-remote` — the unauthenticated probe, and the
-  # three-way verdict that makes it honest.
+fleet_remote_visibility_probe() (
+  # fleet_remote_visibility_probe URL -> `<verified> <reason>` on stdout:
+  # `true auth-required`, `false public`, or `false probe-inconclusive`.
   #
   # A FAILED PROBE IS NOT EVIDENCE OF PRIVACY. Only an authentication refusal
   # proves the remote is gated; unreachable, DNS failure and timeout are
   # inconclusive and must never satisfy the first-push gate. `git ls-remote` is
   # §6.1's own admitted call and moves no ref.
+  #
+  # ONE probe, called from both the verb below and from `fleet-add`, which
+  # needs the same verdict about the same URL before it enrols anybody onto it.
+  # A second copy of this three-way logic is a second thing to get wrong on the
+  # one question that decides whether private topology reaches a public host.
+  #
+  # IT ALWAYS PRINTS A VERDICT. Every caller reads the two words, so a path that
+  # returns non-zero with empty output leaves one caller writing an empty reason
+  # into posture.yaml and the other refusing with a blank explanation. A
+  # tempdir this function cannot allocate is exactly the "could not measure"
+  # case `probe-inconclusive` already exists for — which never satisfies the
+  # first-push gate — so it degrades to that rather than inventing a third
+  # protocol.
+  probe_url=$1
+  probe_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-visibility.XXXXXX") || {
+    printf 'false probe-inconclusive\n'
+    return 0
+  }
+  trap 'rm -rf "$probe_tmp"' EXIT HUP INT TERM
+  probe_status=0
+  if fleet_test_hook "${ROUNDHOUSE_FLEET_VISIBILITY_PROBE:-}"; then
+    sh -c "$ROUNDHOUSE_FLEET_VISIBILITY_PROBE" >/dev/null 2>"$probe_tmp/probe.err" ||
+      probe_status=$?
+  else
+    # Every credential path is closed: what answers here answers for anyone.
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+      GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0='' \
+      GIT_SSH_COMMAND='ssh -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityFile=/dev/null' \
+      git ls-remote --heads -- "$probe_url" >/dev/null 2>"$probe_tmp/probe.err" ||
+      probe_status=$?
+  fi
+  if [ "$probe_status" -eq 0 ]; then
+    printf 'false public\n'
+  elif grep -qE 'Authentication|Permission denied|401|403|could not read Username|terminal prompts disabled' \
+    "$probe_tmp/probe.err"; then
+    printf 'true auth-required\n'
+  else
+    printf 'false probe-inconclusive\n'
+  fi
+)
+
+fleet_verify_remote_command() (
+  # `roundhouse fleet-verify-remote` — the unauthenticated probe, and the
+  # three-way verdict that makes it honest.
   fleet_run_env
   require_jq
   require_yq
@@ -195,31 +242,9 @@ fleet_verify_remote_command() (
     printf 'roundhouse: the fleet store has no origin remote to verify; run `roundhouse fleet-set-remote URL` first (it adds the remote as well as moving it)\n' >&2
     exit 69
   }
-  verify_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-verify-remote.XXXXXX")
-  trap 'rm -rf "$verify_tmp"' EXIT HUP INT TERM
-  verify_status=0
-  if fleet_test_hook "${ROUNDHOUSE_FLEET_VISIBILITY_PROBE:-}"; then
-    sh -c "$ROUNDHOUSE_FLEET_VISIBILITY_PROBE" >/dev/null 2>"$verify_tmp/probe.err" ||
-      verify_status=$?
-  else
-    # Every credential path is closed: what answers here answers for anyone.
-    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
-      GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0='' \
-      GIT_SSH_COMMAND='ssh -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityFile=/dev/null' \
-      git ls-remote --heads -- "$verify_url" >/dev/null 2>"$verify_tmp/probe.err" ||
-      verify_status=$?
-  fi
-  if [ "$verify_status" -eq 0 ]; then
-    verify_verified=false
-    verify_reason=public
-  elif grep -qE 'Authentication|Permission denied|401|403|could not read Username|terminal prompts disabled' \
-    "$verify_tmp/probe.err"; then
-    verify_verified=true
-    verify_reason=auth-required
-  else
-    verify_verified=false
-    verify_reason=probe-inconclusive
-  fi
+  verify_verdict=$(fleet_remote_visibility_probe "$verify_url")
+  verify_verified=${verify_verdict%% *}
+  verify_reason=${verify_verdict#* }
   # The URL the verdict was gathered against is recorded WITH it: §10.6's gate
   # keys on the URL, so evidence for remote A must not open the gate for remote
   # B. A verdict for a URL that is not the current origin reads as unverified.

@@ -77,6 +77,10 @@ if [ -n "$fleet_fixture_yq" ]; then
       fail "a scalar state did not read as itself"
     [ "$(fleet_run_state_of '{"state":"disabled","marketplace":"x"}')" = disabled ] ||
       fail "the map form's state key did not win"
+    # `state: false` is a STATE, not an absence: jq's `//` treats false and null
+    # alike, so this used to read as `enabled` and turn a stop into a start.
+    [ "$(fleet_run_state_of '{"state":false}')" = false ] ||
+      fail "a false state read as something else; jq's // swallowed it"
     [ "$(fleet_run_state_of '{"marketplace":"x"}')" = enabled ] ||
       fail "a map with no state key did not default to enabled"
 
@@ -136,7 +140,9 @@ YAML
     [ "$(jq -r '.model' "$HOME/.claude/settings.json")" = opus ] ||
       fail "the drift report modified the config file — it must change nothing"
 
-    # Declared boundary B-3: no state verb and no observed state either.
+    # Declared boundary B-3: no state verb and no observed state either. 70 is
+    # SATISFIED — nothing to do, here or on any host — and the canary gate
+    # reads it as evidence, so the split from 75 is not cosmetic.
     for run_gap in agents.triage-bot mcp_servers.linear projects.roundhouse; do
       run_status=0
       fleet_run_apply_item "$run_store" vireo "$run_defs" "$run_gap" \
@@ -144,6 +150,81 @@ YAML
       [ "$run_status" -eq 70 ] ||
         fail "$run_gap claimed an apply path it does not have (got $run_status)"
     done
+    # An UNKNOWN category is HELD, never satisfied. §7.7 holds the whole store
+    # on a top-level key that is neither a category nor a host fact, so the run
+    # never reaches the apply layer for one — but `fleet-apply ITEM` is invoked
+    # directly and does. 70 here would journal `satisfied` for state this build
+    # cannot interpret, which is positive canary evidence peers act on.
+    for run_unknown in widgets.thing definitions_typo.x 'Plugins.Railyard'; do
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo "$run_defs" "$run_unknown" \
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+      [ "$run_status" -eq 75 ] ||
+        fail "unknown category $run_unknown reached satisfied evidence (got $run_status)"
+    done
+    # An UNRECOGNISED STATE is HELD, for every category. A typo (`enable`) or a
+    # wrong type (`state: false`) used to fall into whatever each arm does with
+    # "not enabled": packages reported SATISFIED — positive canary evidence that
+    # malformed desired state had converged fleet-wide — and plugins silently
+    # DISABLED the plugin.
+    for run_badstate in '"enable"' '"Enabled"' '{"state":false}' '{"state":"on"}' \
+      '"present"'; do
+      for run_baditem in packages.jj plugins.railyard skills.tdd agents.triage-bot; do
+        run_status=0
+        fleet_run_apply_item "$run_store" vireo "$run_defs" "$run_baditem" \
+          "$run_badstate" homebrew >/dev/null 2>&1 || run_status=$?
+        [ "$run_status" -eq 75 ] ||
+          fail "$run_baditem at state $run_badstate was not held (got $run_status)"
+      done
+    done
+    # …and a value that carries NO state at all still reads `enabled` (§4), so
+    # the guard does not catch config_files or definitions maps.
+    fleet_run_apply_item "$run_store" vireo "$run_defs" \
+      definitions.packages.jj '{"homebrew":"jj"}' '' ||
+      fail "the unknown-state guard caught a definitions map that states no state"
+    # POLICY AND DEFINITIONS ARE NOT STATES and must dispatch BEFORE the guard.
+    # `policy.cadence_hours: 12` is a scalar that is neither enabled nor
+    # disabled, so guarding it first would hold every policy item on every host
+    # forever and downstream hosts could never get the canary evidence a policy
+    # change needs.
+    for run_policy_item in 'policy.cadence_hours 12' \
+      'policy.canary_group "canary"' 'policy.canary_wait_hours 0' \
+      'definitions.packages.jj "jj"'; do
+      fleet_run_apply_item "$run_store" vireo "$run_defs" \
+        "${run_policy_item%% *}" "${run_policy_item#* }" '' ||
+        fail "a policy/definitions item was held by the state guard: $run_policy_item"
+    done
+    # A desired state of `disabled` on a package is the same shape: removal is
+    # §10.3's separate capped decision driven by applied/, never this path, so
+    # there is nothing to do rather than something that was refused — and that
+    # holds whether or not this host has a manager that could have PROVIDED the
+    # package, which is why the state is asked before the resolver. Asking the
+    # resolver first made an unprovidable disabled package journal `held` and
+    # block every downstream host on evidence nobody could ever produce.
+    for run_pkg_managers in homebrew apt ''; do
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo "$run_defs" packages.jj \
+        '"disabled"' "$run_pkg_managers" >/dev/null 2>&1 || run_status=$?
+      [ "$run_status" -eq 70 ] ||
+        fail "a disabled package with managers '$run_pkg_managers' did not read as satisfied (got $run_status)"
+    done
+    # …and the other side of the split: a miss about THIS HOST's capability is
+    # HELD, never satisfied. A peer that CAN apply the item must not converge
+    # on this host's inability, so those misses have to keep blocking.
+    # A standalone skill this host has nowhere to put (no `skill_roots` in the
+    # host-local config) is exactly that shape.
+    run_status=0
+    fleet_run_apply_item "$run_store" vireo "$run_defs" skills.tdd \
+      '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "a host that cannot place a standalone skill reported it satisfied (got $run_status)"
+    # The harness-absent arm is the same rule and cannot be reached
+    # behaviourally here — the fixture PATH ships a `claude` stub — so it is
+    # asserted on the apply layer's own text, the way tests/75-guards.sh
+    # asserts the publish guards.
+    cli_function_body fleet_run_apply_item |
+      grep -q 'command -v claude >/dev/null 2>&1 || return 75' ||
+      fail "a host with no harness no longer HOLDS a plugin item; it would read as satisfied evidence"
     # A plugin-qualified skill rides its plugin and needs nothing of its own.
     fleet_run_apply_item "$run_store" vireo "$run_defs" \
       skills.superpowers/brainstorming '"enabled"' '' ||
@@ -316,6 +397,83 @@ YAML
     # no repository here at all, and seeding must not need one.
     [ ! -e "$run_store/.jj" ] ||
       fail "fleet-seed created a repository"
+
+    # --- machine truth is SEEDED, not hand-authored (G4) ---
+    # `platform` and `groups` are host FACTS the fold reads to pick the `os/`
+    # and `groups/` layers. Seeding captured the three observed surfaces and
+    # not these, so every enrolled host needed a hand-written hosts/<name>.yaml
+    # before its own layers resolved at all. config.json already states both,
+    # validated, so there is nothing to infer.
+    # `transport: local` because that is how fleet_host_name resolves this
+    # machine's own name out of config.json — the same machine the seed writes.
+    cat >"$run_root/seed-config.json" <<JSONC
+{"version":1,"machines":{"$run_seed_host":{"platform":"linux","transport":"local",
+  "groups":["development","canary"],"package_managers":["apt"]}}}
+JSONC
+    rm -f "$run_seeded"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >/dev/null 2>&1 ||
+      fail "fleet-seed failed with machine facts to seed"
+    yq -e '.platform == "linux"' "$run_seeded" >/dev/null ||
+      fail "seeding did not take platform from config.json — machine-truth still needs a hand-authored host file"
+    [ "$(yq -r '(.groups // []) | join(",")' "$run_seeded")" = development,canary ] ||
+      fail "seeding did not take groups from config.json"
+    yq -e '.plugins.ponytail != null' "$run_seeded" >/dev/null ||
+      fail "seeding the facts cost the observed surfaces"
+    # A fact already in the host file WINS: someone wrote it deliberately and
+    # seeding is not the place to relitigate it.
+    fleet_record_write "$run_seeded" \
+      "$(fleet_record_read "$run_seeded" '{}' | jq -c '.platform = "macos"')"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >/dev/null 2>&1 ||
+      fail "re-seeding failed over a hand-authored fact"
+    yq -e '.platform == "macos"' "$run_seeded" >/dev/null ||
+      fail "seeding overwrote a hand-authored platform with the config's"
+    # An EMPTY groups list is a fact, not an absence. The `machine-truth` doctor
+    # row compares `.groups // null` on both sides and jq's `//` passes `[]`
+    # through, so omitting the field reads as `null` against the config's `[]`
+    # and the row fires forever on a correctly configured ungrouped machine.
+    cat >"$run_root/seed-nogroups.json" <<JSONC
+{"version":1,"machines":{"$run_seed_host":{"platform":"linux","transport":"local",
+  "groups":[],"package_managers":[]}}}
+JSONC
+    rm -f "$run_seeded"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-nogroups.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >/dev/null 2>&1 ||
+      fail "fleet-seed refused a machine with no groups to seed"
+    # `yq -e '.groups == []'` is NOT usable here: this yq compares sequences by
+    # identity, so it reports false for two equal empty lists. Assert the tag
+    # and the length, which is what the claim actually is.
+    [ "$(yq -r '.groups | tag' "$run_seeded")" = '!!seq' ] &&
+      [ "$(yq -r '.groups | length' "$run_seeded")" -eq 0 ] ||
+      fail "an empty groups list was dropped instead of seeded; machine-truth would fire forever"
+    yq -e '.plugins.ponytail != null' "$run_seeded" >/dev/null ||
+      fail "seeding the empty groups list cost the observed surfaces"
+    # …and a config that states NO opinion has none invented for it. (The
+    # machine stays listed with `transport: local`, because that entry is also
+    # how fleet_host_name resolves this machine's own name — drop it and the
+    # seed writes a different host file and the assertion below reads a file
+    # nothing wrote.)
+    cat >"$run_root/seed-silent.json" <<JSONC
+{"version":1,"machines":{"$run_seed_host":{"transport":"local"}}}
+JSONC
+    rm -f "$run_seeded"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-silent.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >/dev/null 2>&1 ||
+      fail "fleet-seed refused a machine whose config states no facts"
+    [ -f "$run_seeded" ] ||
+      fail "the seed wrote a different host file than the fixture expects"
+    yq -e '.platform == null and .groups == null and .plugins.ponytail != null' \
+      "$run_seeded" >/dev/null ||
+      fail "an unlisted machine had facts invented for it"
+    # An ABSENT field and an empty list are different answers, and the doctor
+    # row reads them differently — so the two cases above must not collapse.
+    [ "$(yq -r '.groups | tag' "$run_seeded")" = '!!null' ] ||
+      fail "an unlisted machine seeded a groups value rather than leaving it absent"
 
     # --- §6.1(b) the push-nudge: outbound only, bounded, and deletable ---
     mkdir -p "$run_root/bin"

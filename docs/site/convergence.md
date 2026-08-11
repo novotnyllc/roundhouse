@@ -104,12 +104,22 @@ either way.
    host files up to `fleet.yaml` — keeps its digest and passes silently,
    because the value never changed.
 6. **Canary.** A non-canary host applies item X at digest D only when some
-   canary host has journaled `outcome: applied` for that exact pair at
-   least `canary_wait_hours` ago, has no later `held` or `reverted` record
-   for it, **and** has published something — any item, or its `alive`
-   heartbeat — dated at or after the wait elapsed. That third condition is
-   what stops a canary that applied an item, was wrecked by it, and went
-   quiet from reading as a pass.
+   canary host has journaled `outcome: applied` — or `outcome: satisfied`
+   — for that exact pair at least `canary_wait_hours` ago, has no later
+   `held` or `reverted` record for it, **and** has published something —
+   any item, or its `alive` heartbeat — dated at or after the wait
+   elapsed. That third condition is what stops a canary that applied an
+   item, was wrecked by it, and went quiet from reading as a pass.
+
+   `satisfied` is the record a host writes for an item it resolved and had
+   nothing to do about — an `agents`, `mcp_servers` or `projects` entry, a
+   package desired `disabled` — because this design carries no
+   state-alignment verb for those. It counts as canary evidence and `held`
+   does not, and that asymmetry is what lets the gate terminate: an item
+   that can never produce an `applied` record anywhere would otherwise wait
+   on one forever, and the peer waiting would no-op identically once
+   released. An item a host **tried and could not apply** journals `held`
+   and keeps blocking.
 7. **Review, then apply.** The review is provenance rather than a file
    diff — which layer won, the effective value, the digest — and it prints
    *before* the apply, so a crash mid-apply still leaves you the value

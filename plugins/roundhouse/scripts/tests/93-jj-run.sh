@@ -142,6 +142,24 @@ YAML
     grep -rhq 'outcome: alive' "$runjj_journal" ||
       fail "the run wrote no §10.1 liveness heartbeat"
 
+    # --- CHARACTERIZATION: where convergence evidence is PUBLISHED (§2) ---
+    # Asserted, not assumed, because a plan proposed relocating it. The v2
+    # design deleted `host/<name>` branches outright and replaced them with
+    # host-keyed PATHS on the one `main` bookmark — the same single-writer
+    # guarantee (§7.3's path->identity table enforces it) without a branch
+    # checkout that can strand the store. So evidence on `main` is the DESIGN,
+    # not a hub leak, and this pins it: the day the topology is deliberately
+    # changed, this fixture is the one that says so out loud.
+    # See docs/specs/2026-08-10-dsc-scaling.md for the bounding mitigation
+    # (journal compaction/TTL) that addresses the growth this shape implies.
+    runjj_published=$(jj -R "$vireo" file list \
+      -r "$(fleet_vcs_heads_local "$vireo")" -T 'path ++ "\n"')
+    printf '%s\n' "$runjj_published" | grep -q "^journal/vireo/" ||
+      fail "the hub's convergence journal is not on the published main tree"
+    [ -z "$(jj -R "$vireo" bookmark list -a -T 'name ++ "\n"' 2>/dev/null |
+      grep '^host/' || true)" ] ||
+      fail "a host/<name> bookmark exists; §2 of the v2 design deleted that topology"
+
     # §5's rendered aliases and the include line that makes them reachable.
     grep -Fq 'Host rh-wren' "$HOME/.ssh/config.d/roundhouse" ||
       fail "the run rendered no ssh aliases from hosts/*.yaml"
@@ -384,6 +402,60 @@ $(fleet_vcs_trailers wren scheduled/agent 'wren edit' 'config_files.~/.codex/con
       *) fail "the --now refusal did not say what it refused: $runjj_out" ;;
     esac
 
-    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, revert and --now binding)\n'
+    # --- §10.1: `satisfied` IS canary evidence; `held` still is not ---
+    # THE BUG THIS REPRODUCES: an item in a category with no state-alignment
+    # verb (B-3 — agents, mcp_servers, projects) can never produce an `applied`
+    # record on ANY host. The canary gate accepted only `applied`, so every
+    # non-canary host waited on evidence that could not exist, forever, while
+    # the canary itself journaled the item as `held` — indistinguishable in an
+    # audit from an item a gate refused.
+    #
+    # A new GROUP layer rather than another fleet.yaml rewrite: both hosts are
+    # in `development`, wren has no copy of this file, so it propagates with no
+    # contest and this fixture cannot be read as a conflict-resolution test.
+    # `canary_wait_hours: 0` because the soak is not what is under test here —
+    # tests/72-records.sh owns the wait, the withdrawal and the liveness term.
+    mkdir -p "$vireo/groups"
+    cat >"$vireo/groups/development.yaml" <<'YAML'
+policy:
+  canary_wait_hours: 0
+mcp_servers:
+  context7: enabled
+YAML
+    runjj vireo "$cli" fleet-run --fast >/dev/null ||
+      fail "the canary could not publish the no-apply-path item"
+    # The canary records it SATISFIED, not held: no-op-because-correct is a
+    # different fact from no-op-because-blocked and the journal says which.
+    grep -rh -A2 'item: mcp_servers.context7' "$vireo/journal/vireo" |
+      grep -q 'outcome: satisfied' ||
+      fail "the canary journaled no satisfied outcome for an item with no apply verb"
+    ! grep -rh -A2 'item: mcp_servers.context7' "$vireo/journal/vireo" |
+      grep -q 'outcome: held' ||
+      fail "the canary still journaled held for an already-satisfied item"
+
+    runjj_out=$(runjj wren "$cli" fleet-run --fast) ||
+      fail "wren's run failed on the satisfied item"
+    case $runjj_out in
+      *'wait  mcp_servers.context7'*)
+        fail "the downstream host is still waiting on canary evidence that can never exist: $runjj_out"
+        ;;
+    esac
+    grep -rh -A2 'item: mcp_servers.context7' "$wren/journal/wren" |
+      grep -q 'outcome: satisfied' ||
+      fail "the downstream host never converged the satisfied item"
+
+    # …and the other half, which is what keeps this from being a false green:
+    # a genuinely BLOCKED item on the canary still blocks downstream. The
+    # standalone hook is held by §5.1.3's trust gate on every host, so its
+    # journal record stays `held` and wren must keep waiting on it.
+    grep -rh -A2 'item: hooks.commit-guard' "$vireo/journal/vireo" |
+      grep -q 'outcome: held' ||
+      fail "the blocked item stopped journaling held"
+    case $runjj_out in
+      *'wait  hooks.commit-guard'*) ;;
+      *) fail "a downstream host stopped waiting on an item the canary could not apply: $runjj_out" ;;
+    esac
+
+    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding)\n'
   ) || fail "real-jj run block failed (see the FAIL: real-jj: line above)"
 fi

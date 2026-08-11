@@ -477,6 +477,78 @@ TOML
     [ "$rjj_reroot_status" -eq 65 ] ||
       fail "a host named the fleet's store id and minted a second genesis anyway"
 
-    printf 'real-jj: OK (brick order, config pins, op-ssh-sign containment, keygen enrollment, genesis-as-store-id, materialization drift)\n'
+    # 9. A store with HISTORY but no roster behind it: refuse, never heal.
+    #    Both verbs keyed their "already set up, just heal" path on the store id
+    #    alone — and §7.5/§12 make the store id and the roster the same fact
+    #    seen twice, so a store id with no `trust/signers.yaml` is a DIFFERENT
+    #    store's remains. A leftover v0.5 store looked exactly like this, and
+    #    healing it produced something that looked enrolled and verified
+    #    nothing; every later verb then failed somewhere further downstream.
+    rjj_legacy="$rjj/legacy/store"
+    mkdir -p "$rjj/legacy"
+    jj git clone --colocate --config ui.editor='"true"' \
+      --config ui.paginate=never "$rjj/remote.git" "$rjj_legacy" >/dev/null 2>&1 ||
+      fail "could not clone the fleet store for the legacy-remnant fixture"
+    printf 'name: legacy\nstore_id: %s\n' "$rjj_store_id" \
+      >"$rjj/legacy/identity.yaml"
+    # Same lineage, same store id — only the roster is gone, which is the whole
+    # point: the store id check passes and this one has to be what refuses.
+    rm -f "$rjj_legacy/$fleet_trust_roster_file"
+    jj -R "$rjj_legacy" describe -m 'drop the roster' >/dev/null
+    jj -R "$rjj_legacy" bookmark set main \
+      -r "$(jj -R "$rjj_legacy" log -r @ --no-graph -T 'commit_id')" >/dev/null
+    jj -R "$rjj_legacy" new "$(jj -R "$rjj_legacy" log \
+      -r 'heads(bookmarks(exact:"main"))' --no-graph -T 'commit_id')" >/dev/null
+    # THE REFUSAL LEAVES NOTHING BEHIND. A preflight that fires after minting the
+    # node key and pointing the repo's [signing] block at it hands back a store
+    # this build just called unusable AND reconfigured — half-enrolled state is
+    # worse than no refusal. So the key must not exist and the config must not
+    # be rewritten when the verb refuses.
+    # Pins are read as EFFECTIVE values through fleet_pins_drift, never as file
+    # contents: jj 0.44 migrates a written `.jj/repo/config.toml` out to
+    # $XDG_CONFIG_HOME/jj/repos/<hash>/, so a path-based check here would
+    # compare two absent files and pass vacuously. A fresh clone carries no
+    # pins, so drift is non-empty now and must STAY non-empty across a refusal
+    # — the corvid case above is the positive control where a successful
+    # fleet-init drives it to empty.
+    rm -f "$rjj/legacy-key" "$rjj/legacy-key.pub"
+    [ -n "$(fleet_pins_drift "$rjj_legacy" || true)" ] ||
+      fail "the legacy fixture was already pinned; the no-write assertion below would be vacuous"
+    for rjj_legacy_verb in fleet-init fleet-enroll; do
+      rjj_legacy_status=0
+      rjj_legacy_out=$(rjj_run legacy "$cli" "$rjj_legacy_verb" 2>&1) ||
+        rjj_legacy_status=$?
+      [ "$rjj_legacy_status" -eq 65 ] ||
+        fail "$rjj_legacy_verb healed a store with history and no roster (got $rjj_legacy_status)"
+      case $rjj_legacy_out in
+        *'re-init'* | *'move it aside'*) ;;
+        *) fail "$rjj_legacy_verb refused without naming the remedy: $rjj_legacy_out" ;;
+      esac
+      [ ! -f "$rjj/legacy-key" ] ||
+        fail "$rjj_legacy_verb minted a node key before refusing the store"
+      [ -n "$(fleet_pins_drift "$rjj_legacy" || true)" ] ||
+        fail "$rjj_legacy_verb pinned the repository config before refusing the store"
+    done
+    # A preflight that CANNOT RUN must refuse, never authorize: "I could not
+    # check" is not "the check passed", and reading it as one would let
+    # fleet-init/fleet-enroll mutate exactly the history this exists to reject.
+    rjj_legacy_status=0
+    rjj_legacy_out=$(TMPDIR="$rjj/no-such-tmpdir" rjj_run legacy "$cli" fleet-init 2>&1) ||
+      rjj_legacy_status=$?
+    [ "$rjj_legacy_status" -eq 65 ] ||
+      fail "fleet-init proceeded when the lineage preflight could not allocate a tempfile (got $rjj_legacy_status)"
+    case $rjj_legacy_out in
+      *'could not be checked'*) ;;
+      *) fail "the unrunnable preflight did not say it could not check: $rjj_legacy_out" ;;
+    esac
+
+    # …and the ordinary clone, which has a roster, is unaffected. (corvid's
+    # identity was rewritten by the foreign-store fixture above; restore it.)
+    printf 'name: corvid\nstore_id: %s\n' "$rjj_store_id" \
+      >"$rjj/corvid/identity.yaml"
+    rjj_run corvid "$cli" fleet-init >/dev/null ||
+      fail "the lineage check refused a healthy cloned store"
+
+    printf 'real-jj: OK (brick order, config pins, op-ssh-sign containment, keygen enrollment, genesis-as-store-id, legacy-remnant refusal, materialization drift)\n'
   ) || fail "real-jj bootstrap block failed (see the FAIL: real-jj: line above)"
 fi
