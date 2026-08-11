@@ -584,6 +584,15 @@ read_csr() {
     terminate_owned_input_child >/dev/null 2>&1 || :
     return 1
   fi
+  # The blocking read is the only point at which a signal fixture may deliver
+  # its signal.  Anywhere earlier the shell is still inside a command
+  # substitution, and bash 5.2 splices that unread input into the trap it is
+  # dispatching ("trap: line 2: unexpected EOF") instead of running the
+  # handler, so the helper exits 2 with no handler having run.
+  if ! fixture_transition before-input-wait; then
+    terminate_owned_input_child >/dev/null 2>&1 || :
+    return 1
+  fi
   if wait "$owned_input_child_pid"; then :; else result=$?; fi
   owned_input_child_pid=
   [ "$result" = 0 ] || return 1
@@ -1903,6 +1912,14 @@ fixture_transaction_tree_clean() {
     \( -name '.sign-candidate.*' -o -name '.serial.*' \) -print | /usr/bin/grep -q . || return 1
   ! /usr/bin/find "$signer_root/.work" -mindepth 1 -maxdepth 1 -print | /usr/bin/grep -q .
 }
+# Every fixture wait is bounded, and every bound that is reached says what
+# went wrong in its own words.  A bare `return 1` here reaches the caller as a
+# silent `|| return 1`, which an `||` context also hides from the ERR trap: the
+# whole self-check then ends as an exit status with no line of output.
+fixture_wait_failed() {
+  printf 'FAIL: certify-ssh-node self-test: %s\n' "$*" >&2
+  return 1
+}
 wait_for_fixture_marker() {
   local marker=$1 count=0
   while [ "$count" -lt 400 ]; do
@@ -1910,7 +1927,7 @@ wait_for_fixture_marker() {
     /bin/sleep 0.05
     count=$((count + 1))
   done
-  return 1
+  fixture_wait_failed "timed out waiting for fixture marker $marker"
 }
 wait_for_either_fixture_marker() {
   local first=$1 second=$2 count=0
@@ -1919,17 +1936,70 @@ wait_for_either_fixture_marker() {
     /bin/sleep 0.01
     count=$((count + 1))
   done
-  return 1
+  fixture_wait_failed "timed out waiting for either fixture marker $first or $second"
 }
 wait_for_fixture_stop() {
   local pid=$1 count=0 state
-  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || fixture_wait_failed "invalid fixture pid [$pid]" || return 1
   while [ "$count" -lt 400 ]; do
-    state=$(/bin/ps -o state= -p "$pid" 2>/dev/null | /usr/bin/tr -d ' ') || return 1
+    state=$(/bin/ps -o state= -p "$pid" 2>/dev/null | /usr/bin/tr -d ' ') ||
+      fixture_wait_failed "fixture pid $pid is already gone" || return 1
     case $state in T*) return 0 ;; esac
     /bin/sleep 0.01
     count=$((count + 1))
   done
+  fixture_wait_failed "timed out waiting for fixture pid $pid to stop"
+}
+fixture_kill_worker_tree() {
+  # SIGKILL skips the worker's EXIT trap, so any reader it already launched
+  # would be reparented to init and outlive the step — the very orphan this
+  # section exists to keep out of the job log.  Take the children first.
+  local pid=$1 child parent
+  while read -r child parent; do
+    [ "$parent" = "$pid" ] && [[ $child =~ ^[1-9][0-9]*$ ]] || continue
+    /bin/kill -KILL "$child" >/dev/null 2>&1 || :
+  done < <(/bin/ps -A -o pid=,ppid= 2>/dev/null || :)
+  /bin/kill -KILL "$pid" >/dev/null 2>&1 || :
+}
+fixture_reap_signalled_worker() {
+  # A signalled worker gets a bounded window to exit on its own.  Name the
+  # worker that ignored its signal before killing it: an unexplained SIGKILL
+  # here is what turned a handler defect into a self-check that just stopped.
+  local pid=$1 label=$2 count=0
+  while [ "$count" -lt 400 ]; do
+    /bin/kill -0 "$pid" 2>/dev/null || return 0
+    /bin/sleep 0.05
+    count=$((count + 1))
+  done
+  printf 'FAIL: certify-ssh-node self-test: %s did not exit after its signal\n' "$label" >&2
+  fixture_kill_worker_tree "$pid"
+  return 1
+}
+fixture_signal_observer() {
+  # Signal one blocking reader at the phase it declares, then let it exit on
+  # its own.  The reader is a foreground child of the self-check with no other
+  # way out of its FIFO read, so every abandoned handshake still kills it:
+  # a give-up that just returns would leave the whole self-check stalled
+  # instead of failed.
+  local control=$1 phase=$2 signal_name=$3 label=$4 pid
+  wait_for_fixture_marker "$control/ready" || return 1
+  pid=$(/bin/cat "$control/ready") || return 1
+  if ! { wait_for_fixture_marker "$control/$phase" && wait_for_fixture_stop "$pid" &&
+      /bin/kill -"$signal_name" "$pid"; }; then
+    printf 'FAIL: certify-ssh-node self-test: %s never reached %s\n' "$label" "$phase" >&2
+    fixture_kill_worker_tree "$pid"
+    return 1
+  fi
+  /bin/kill -CONT "$pid" >/dev/null 2>&1 || :
+  fixture_reap_signalled_worker "$pid" "$label"
+}
+fixture_worker_quiet() {
+  # A fixture worker publishes nothing on either stream.  Quote what it did
+  # say — the handler diagnostic is the evidence, not the exit status.
+  local label=$1 output=$2 error=$3
+  { [ ! -s "$output" ] && [ ! -s "$error" ]; } && return 0
+  printf 'FAIL: certify-ssh-node self-test: %s spoke stdout[%s] stderr[%s]\n' \
+    "$label" "$(/bin/cat "$output")" "$(/bin/cat "$error")" >&2
   return 1
 }
 self_test() {
@@ -1948,9 +2018,9 @@ self_test() {
   local contender_winner_output contender_loser_output contender_winner_error contender_loser_error
   local candidate_count stage_count interruption_backup foreign_claim foreign_claim_id external_candidate original_candidate
   local replacement_candidate_id
-  local background_pids='' fixture_pid
+  local background_pids='' fixture_pid self_test_rc self_test_line fixture_report
   root=$(private_temp_directory) || return 1
-  trap 'for fixture_pid in ${background_pids:-}; do /bin/kill -KILL "$fixture_pid" >/dev/null 2>&1 || :; wait "$fixture_pid" 2>/dev/null || :; done; if [ -n "${agent_pid:-}" ]; then /bin/kill "$agent_pid" >/dev/null 2>&1 || :; wait "$agent_pid" 2>/dev/null || :; fi; /usr/bin/find "$root" -depth -delete >/dev/null 2>&1 || :' RETURN
+  trap 'self_test_rc=$?; self_test_line=$LINENO; [ "$self_test_rc" = 0 ] || printf "FAIL: certify-ssh-node self-test line %s rc %s\n" "$self_test_line" "$self_test_rc" >&2; for fixture_pid in ${background_pids:-}; do /bin/kill -KILL "$fixture_pid" >/dev/null 2>&1 || :; wait "$fixture_pid" 2>/dev/null || :; done; if [ -n "${agent_pid:-}" ]; then /bin/kill "$agent_pid" >/dev/null 2>&1 || :; wait "$agent_pid" 2>/dev/null || :; fi; /usr/bin/find "$root" -depth -delete >/dev/null 2>&1 || :' RETURN
   trap 'self_test_rc=$?; printf "FAIL: certify-ssh-node self-test line %s rc %s\n" "$LINENO" "$self_test_rc" >&2' ERR
 
   # The claim primitive must never reinterpret an existing destination as a
@@ -2465,14 +2535,8 @@ self_test() {
         wait_for_fixture_stop "$signal_pid" || exit 1
         /bin/kill -"$signal_number" "$signal_pid" || exit 1
         /bin/kill -CONT "$signal_pid" >/dev/null 2>&1 || :
-        next_value=0
-        while [ "$next_value" -lt 400 ]; do
-          ! /bin/kill -0 "$signal_pid" 2>/dev/null && exit 0
-          /bin/sleep 0.05
-          next_value=$((next_value + 1))
-        done
-        /bin/kill -KILL "$signal_pid" >/dev/null 2>&1 || :
-        exit 1
+        fixture_reap_signalled_worker "$signal_pid" \
+          "bootstrap worker $bootstrap_phase/$signal_name" || exit 1
       ) &
       bootstrap_worker=$!
       background_pids=$bootstrap_worker
@@ -2484,15 +2548,30 @@ self_test() {
       fi
       wait "$bootstrap_worker" || return 1
       background_pids=
-      [ "$fixture_result" = "$signal_expected" ] &&
-        [ ! -s "$bootstrap_control/output" ] && [ ! -s "$bootstrap_control/error" ] || return 1
+      fixture_worker_quiet "bootstrap worker $bootstrap_phase/$signal_name" \
+        "$bootstrap_control/output" "$bootstrap_control/error" || return 1
+      [ "$fixture_result" = "$signal_expected" ] || return 1
       ! /usr/bin/find "$root/bootstrap-temp" -mindepth 1 -maxdepth 1 -print | /usr/bin/grep -q . || return 1
     done
   done
 
+  # The fixture reporters are what stands between a named failure and a bare
+  # exit status, so prove they speak before the sections below depend on them.
+  fixture_report=$root/fixture-report
+  : >"$root/fixture-quiet" && printf '%s\n' 'handler noise' >"$root/fixture-noise" || return 1
+  fixture_worker_quiet probe "$root/fixture-quiet" "$root/fixture-quiet" || return 1
+  ! fixture_worker_quiet probe "$root/fixture-quiet" "$root/fixture-noise" 2>"$fixture_report" || return 1
+  /usr/bin/grep -Fq 'probe spoke stdout[] stderr[handler noise]' "$fixture_report" || return 1
+  ! wait_for_fixture_stop '' 2>"$fixture_report" || return 1
+  /usr/bin/grep -Fq 'invalid fixture pid []' "$fixture_report" || return 1
+  /bin/rm -f "$root/fixture-quiet" "$root/fixture-noise" "$fixture_report" || return 1
+
   # Blocking FIFO reads exercise each signal independently.  Handlers must
   # remove only the owned CSR, close its explicit stdin descriptor, and
-  # terminate with the conventional status.
+  # terminate with the conventional status.  Stop the reader on the blocking
+  # read itself before signalling: that is the boundary this section is about,
+  # and it is the only one where the shell is not inside a command
+  # substitution whose unread input bash 5.2 splices into the dispatched trap.
   for signal_name in HUP INT TERM; do
     case $signal_name in HUP) signal_number=HUP; signal_expected=129 ;; INT) signal_number=INT; signal_expected=130 ;; TERM) signal_number=TERM; signal_expected=143 ;; esac
     signal_control=$root/signal-$signal_name-control
@@ -2501,32 +2580,21 @@ self_test() {
     signal_error=$root/signal-$signal_name.err
     /bin/mkdir "$signal_control" && normalise_created_directory "$signal_control" || return 1
     /usr/bin/mkfifo "$signal_fifo" || return 1
-    (
-      wait_for_fixture_marker "$signal_control/ready" || exit 1
-      signal_pid=$(/bin/cat "$signal_control/ready") || exit 1
-      /bin/kill -"$signal_number" "$signal_pid" || exit 1
-      next_value=0
-      while [ "$next_value" -lt 400 ]; do
-        ! /bin/kill -0 "$signal_pid" 2>/dev/null && exit 0
-        /bin/sleep 0.05
-        next_value=$((next_value + 1))
-      done
-      /bin/kill -KILL "$signal_pid" >/dev/null 2>&1 || :
-      exit 1
-    ) &
+    fixture_signal_observer "$signal_control" before-input-wait "$signal_number" \
+      "blocking-read worker $signal_name" &
     signal_worker=$!
     background_pids=$signal_worker
     if fixture_signal_worker "$self_path" "$root" "$signal_name" "$signal_control" "$signal_fifo" \
-        >"$signal_output" 2>"$signal_error"; then
+        before-input-wait >"$signal_output" 2>"$signal_error"; then
       fixture_result=0
     else
       fixture_result=$?
     fi
     wait "$signal_worker" || return 1
     background_pids=
+    fixture_worker_quiet "blocking-read worker $signal_name" "$signal_output" "$signal_error" || return 1
     [ "$fixture_result" = "$signal_expected" ] || return 1
     [ ! -e "$root/signal-$signal_name-csr" ] && [ ! -L "$root/signal-$signal_name-csr" ] || return 1
-    [ ! -s "$signal_output" ] && [ ! -s "$signal_error" ] || return 1
     /bin/rm -f "$signal_fifo" || return 1
   done
 
@@ -2541,21 +2609,8 @@ self_test() {
     signal_error=$root/input-critical-$signal_name.err
     /bin/mkdir "$signal_control" && normalise_created_directory "$signal_control" || return 1
     /usr/bin/mkfifo "$signal_fifo" || return 1
-    (
-      wait_for_fixture_marker "$signal_control/input-child-before-registration" || exit 1
-      signal_pid=$(/bin/cat "$signal_control/input-child-before-registration") || exit 1
-      wait_for_fixture_stop "$signal_pid" || exit 1
-      /bin/kill -"$signal_number" "$signal_pid" || exit 1
-      /bin/kill -CONT "$signal_pid" >/dev/null 2>&1 || :
-      next_value=0
-      while [ "$next_value" -lt 400 ]; do
-        ! /bin/kill -0 "$signal_pid" 2>/dev/null && exit 0
-        /bin/sleep 0.05
-        next_value=$((next_value + 1))
-      done
-      /bin/kill -KILL "$signal_pid" >/dev/null 2>&1 || :
-      exit 1
-    ) &
+    fixture_signal_observer "$signal_control" input-child-before-registration "$signal_number" \
+      "pre-registration worker $signal_name" &
     signal_worker=$!
     background_pids=$signal_worker
     if fixture_signal_worker "$self_path" "$root" "$signal_name" "$signal_control" "$signal_fifo" \
@@ -2566,9 +2621,9 @@ self_test() {
     fi
     wait "$signal_worker" || return 1
     background_pids=
+    fixture_worker_quiet "pre-registration worker $signal_name" "$signal_output" "$signal_error" || return 1
     [ "$fixture_result" = "$signal_expected" ] || return 1
     [ ! -e "$root/signal-$signal_name-csr" ] && [ ! -L "$root/signal-$signal_name-csr" ] || return 1
-    [ ! -s "$signal_output" ] && [ ! -s "$signal_error" ] || return 1
     /bin/rm -f "$signal_fifo" || return 1
   done
 
