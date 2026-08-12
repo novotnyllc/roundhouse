@@ -548,6 +548,12 @@ fleet_readiness_command() (
   # and must never fall through to SSH or be reported ready from local state.
   fleet_run_env
   require_jq
+  # Same config trust gate `collect` applies before it ever reads the
+  # inventory config (scripts/lib/inventory.sh) — a malformed, symlinked, or
+  # group/world-writable config must not be trusted to decide readiness
+  # either.
+  validate_config_file
+  check_private_owned_file "$(config_path)" "readiness configuration"
   # Not require_yq: yq is one of the per-host prerequisites this preflight
   # itself reports on (the `tools` row below), not a precondition for running
   # it — a host missing yq must still get a full row, not an early exit.
@@ -574,6 +580,24 @@ fleet_readiness_command() (
     fi
     fleet_readiness_transport=$(jq -r --arg host "$fleet_readiness_host" \
       '.machines[$host].transport // "local"' "$(config_path)" 2>/dev/null || printf unknown)
+    if [ "$fleet_readiness_transport" = local ]; then
+      # A `transport: "local"` entry is a claim to BE this machine — inventory
+      # (scripts/lib/inventory.sh) verifies expected_hostname/expected_user
+      # before treating a target as native, and readiness must too: without
+      # this, any host misconfigured (or mistakenly duplicated) as "local"
+      # reports ready off whichever machine happens to run the command.
+      fleet_readiness_expected_hostname=$(jq -r --arg host "$fleet_readiness_host" \
+        '.machines[$host].expected_hostname // empty' "$(config_path)")
+      fleet_readiness_expected_user=$(jq -r --arg host "$fleet_readiness_host" \
+        '.machines[$host].expected_user // empty' "$(config_path)")
+      if [ -n "$fleet_readiness_expected_hostname" ] && [ -n "$fleet_readiness_expected_user" ] &&
+        { [ "$(hostname)" != "$fleet_readiness_expected_hostname" ] ||
+          [ "$(id -un)" != "$fleet_readiness_expected_user" ]; }; then
+        fleet_readiness_row "$fleet_readiness_host" identity finding \
+          'local target identity does not match configured hostname/user'
+        continue
+      fi
+    fi
     if [ "$fleet_readiness_transport" = local ] ||
       [ "$fleet_readiness_transport" = ssh ]; then
       fleet_readiness_destination=$(fleet_ssh_destination "$fleet_readiness_host" 2>/dev/null || \

@@ -127,6 +127,20 @@ YAML
     printf '%s\n' "$u22_unknown" | grep -Fq 'absent from inventory' ||
       fail "U22 readiness did not reject an absent inventory target: $u22_unknown"
 
+    # U22: a "local" entry is a claim to BE this machine — a mismatched
+    # expected_hostname must not let readiness report ready off whichever
+    # machine happens to run the command.
+    u22_mismatch_config="$u20_root/config-identity-mismatch.json"
+    jq '.machines["test-host"].expected_hostname = "not-this-machine.invalid"' \
+      "$u20_root/config.json" >"$u22_mismatch_config"
+    u22_identity_status=0
+    u22_identity=$(ROUNDHOUSE_CONFIG="$u22_mismatch_config" \
+      u20_run "$cli" fleet-readiness test-host 2>&1) || u22_identity_status=$?
+    [ "$u22_identity_status" -eq 1 ] ||
+      fail "U22 identity-mismatch readiness exited $u22_identity_status"
+    printf '%s\n' "$u22_identity" | grep -Fq 'local target identity does not match' ||
+      fail "U22 readiness did not flag a local identity mismatch: $u22_identity"
+
     # U22: two explicit host arguments are checked independently — "$*"
     # would join them into one space-separated string and check it as a
     # single (invalid) name instead of two separate hosts.
