@@ -47,7 +47,15 @@ TOML
     git init -q --bare -b main "$rjj/remote.git"
     mkdir -p "$rjj/test-host"
     printf 'name: test-host\ndomain: fleet.example.invalid\n' >"$rjj/test-host/identity.yaml"
-    export ROUNDHOUSE_CONFIG="$tmp/config.json"
+    # A private copy, not the shared "$tmp/config.json": section 68's last
+    # act is `chmod 666` on that shared file to prove an insecure config is
+    # rejected, and it never restores the mode. Reusing it directly would
+    # fail this section on that residue rather than on anything U20 actually
+    # exercises. The copy keeps 05-fixture-tree.sh's test-host registration
+    # (expected_hostname/expected_user already resolved for this machine).
+    cp "$tmp/config.json" "$u20_root/config.json"
+    chmod 600 "$u20_root/config.json"
+    export ROUNDHOUSE_CONFIG="$u20_root/config.json"
     u20_store="$rjj/test-host/store"
     u20_run() {
       env ROUNDHOUSE_FLEET_STORE="$u20_store" \
