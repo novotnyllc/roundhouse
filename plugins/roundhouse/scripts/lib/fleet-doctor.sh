@@ -643,9 +643,16 @@ fleet_readiness_command() (
       # uninformative "remote tools unavailable" as one missing all three,
       # and never emitted the separate `roundhouse` row the local branch
       # above always does.
+      # jq is included alongside jj/yq: it's a hard prerequisite the local
+      # branch above never needs to check (require_jq already gates the
+      # whole command for the invoking host), but the remote host is a
+      # separate machine, and the remote-posture probe below runs
+      # `roundhouse fleet-doctor` over SSH — itself require_jq-gated — with
+      # its stderr suppressed, so a missing remote jq otherwise surfaces
+      # only as an uninformative posture finding.
       fleet_readiness_remote_status=0
       fleet_readiness_remote_missing=$(ssh_run "$fleet_readiness_destination" \
-        'm=; for t in jj yq roundhouse; do command -v "$t" >/dev/null 2>&1 || m="$m $t"; done; printf "%s\n" "${m# }"' \
+        'm=; for t in jj yq jq roundhouse; do command -v "$t" >/dev/null 2>&1 || m="$m $t"; done; printf "%s\n" "${m# }"' \
         2>&1) || fleet_readiness_remote_status=$?
       if [ "$fleet_readiness_remote_status" -ne 0 ]; then
         fleet_readiness_row "$fleet_readiness_host" tools finding \
@@ -654,17 +661,17 @@ fleet_readiness_command() (
           'remote probe failed'
       else
         fleet_readiness_remote_missing_tools=
-        case " $fleet_readiness_remote_missing " in *' jj '*)
-          fleet_readiness_remote_missing_tools="$fleet_readiness_remote_missing_tools jj" ;;
-        esac
-        case " $fleet_readiness_remote_missing " in *' yq '*)
-          fleet_readiness_remote_missing_tools="$fleet_readiness_remote_missing_tools yq" ;;
-        esac
+        for fleet_readiness_remote_tool in jj yq jq; do
+          case " $fleet_readiness_remote_missing " in
+            *" $fleet_readiness_remote_tool "*)
+              fleet_readiness_remote_missing_tools="$fleet_readiness_remote_missing_tools $fleet_readiness_remote_tool" ;;
+          esac
+        done
         if [ -n "$fleet_readiness_remote_missing_tools" ]; then
           fleet_readiness_row "$fleet_readiness_host" tools finding \
             "missing:${fleet_readiness_remote_missing_tools# }"
         else
-          fleet_readiness_row "$fleet_readiness_host" tools ok 'remote jj and yq present'
+          fleet_readiness_row "$fleet_readiness_host" tools ok 'remote jj, yq, and jq present'
         fi
         case " $fleet_readiness_remote_missing " in
           *' roundhouse '*)
