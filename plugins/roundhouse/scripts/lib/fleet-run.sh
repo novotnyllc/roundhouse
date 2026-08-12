@@ -776,6 +776,62 @@ fleet_config_drift() {
     done
 }
 
+fleet_run_plugin_catalog() {
+  # `claude plugin list --available --json` is the manager's resolved
+  # marketplace view. The source SHA is the byte identity; the catalog version
+  # remains useful for the ordinary release advance but is never sufficient by
+  # itself.
+  fleet_run_catalog_json=$(claude plugin list --available --json 2>/dev/null) || return 75
+  printf '%s\n' "$fleet_run_catalog_json" |
+    jq -e -c --arg id "$1" '.available[] | select(.pluginId == $id)' 2>/dev/null
+}
+
+fleet_run_installed_plugin() {
+  # No installed-plugins file, or the plugin absent from it, means "not
+  # installed yet" — an empty identity that must proceed to install, not a
+  # hold. Only a file that fails to parse as JSON is genuinely malformed and
+  # still holds: we cannot trust its absence of the plugin in that case.
+  fleet_run_installed_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
+  [ -f "$fleet_run_installed_file" ] || { printf '{}\n'; return 0; }
+  jq -c --arg id "$1" \
+    '(.plugins[$id] // []) | map(select(.scope == "user")) | (.[0] // {})' \
+    "$fleet_run_installed_file" 2>/dev/null && return 0
+  return 75
+}
+
+fleet_run_plugin_identity_matches() {
+  # fleet_run_plugin_identity_matches DEFS NAME VALUE — compare a resolved
+  # marketplace plugin with the user-scoped installed record before ownership
+  # can turn an already-applied item into `nothing`. Return 0 for matching
+  # bytes/version, 1 for a reinstall, and 75 when the manager cannot prove the
+  # identity.
+  fleet_run_identity_surface=$(fleet_resolve_surface "$1" plugins "$2") || return 75
+  fleet_run_identity_market=$(printf '%s\n' "$3" | jq -r \
+    'if type == "object" then (.marketplace // "") else "" end')
+  [ -n "$fleet_run_identity_market" ] || fleet_run_identity_market=$(printf '%s\n' \
+    "$fleet_run_identity_surface" | jq -r '.marketplace // ""')
+  # An unqualified plugin is resolved by the native harness, so there is no
+  # marketplace SHA to compare here; the existing manager presence path stays
+  # authoritative for that zero-config form.
+  [ -n "$fleet_run_identity_market" ] || return 0
+  command -v claude >/dev/null 2>&1 || return 75
+  fleet_run_identity_id="$2@$fleet_run_identity_market"
+  fleet_run_identity_catalog=$(fleet_run_plugin_catalog "$fleet_run_identity_id") || return 75
+  fleet_run_identity_installed=$(fleet_run_installed_plugin "$fleet_run_identity_id") || return 75
+  fleet_run_identity_sha=$(printf '%s\n' "$fleet_run_identity_catalog" |
+    jq -r '.source.sha // empty')
+  fleet_run_identity_version=$(printf '%s\n' "$fleet_run_identity_catalog" |
+    jq -r '.version // empty')
+  fleet_run_identity_installed_sha=$(printf '%s\n' "$fleet_run_identity_installed" |
+    jq -r '.gitCommitSha // empty')
+  fleet_run_identity_installed_version=$(printf '%s\n' "$fleet_run_identity_installed" |
+    jq -r '.version // empty')
+  printf '%s\n' "$fleet_run_identity_sha" |
+    grep -Eq '^[0-9a-fA-F]{40}$' || return 75
+  [ "$fleet_run_identity_sha" = "$fleet_run_identity_installed_sha" ] &&
+    [ "$fleet_run_identity_version" = "$fleet_run_identity_installed_version" ]
+}
+
 fleet_run_apply_item() {
   # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
@@ -879,7 +935,46 @@ fleet_run_apply_item() {
       fleet_run_id=$fleet_run_name
       [ -z "$fleet_run_market" ] ||
         fleet_run_id="$fleet_run_name@$fleet_run_market"
-      claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || :
+      if [ -n "$fleet_run_market" ]; then
+        fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id") || return 75
+        fleet_run_resolved_sha=$(printf '%s\n' "$fleet_run_catalog" |
+          jq -r '.source.sha // empty')
+        fleet_run_resolved_version=$(printf '%s\n' "$fleet_run_catalog" |
+          jq -r '.version // empty')
+        fleet_run_installed=$(fleet_run_installed_plugin "$fleet_run_id") || return 75
+        fleet_run_installed_sha=$(printf '%s\n' "$fleet_run_installed" |
+          jq -r '.gitCommitSha // empty')
+        fleet_run_installed_version=$(printf '%s\n' "$fleet_run_installed" |
+          jq -r '.version // empty')
+        # A marketplace entry without a resolved SHA cannot prove installed
+        # bytes. Hold it instead of silently trusting a version string.
+        printf '%s\n' "$fleet_run_resolved_sha" |
+          grep -Eq '^[0-9a-fA-F]{40}$' || return 75
+        if [ "$fleet_run_resolved_sha" != "$fleet_run_installed_sha" ] ||
+          [ "$fleet_run_resolved_version" != "$fleet_run_installed_version" ]; then
+          # install is for the absent-record case; an existing user-scoped
+          # record with stale bytes goes through the manager's own update
+          # verb (the target-native refresh sequence in
+          # fleet-agents/SKILL.md), which installing an already-installed
+          # plugin can reject or no-op instead of actually refreshing it.
+          if [ -n "$fleet_run_installed_sha" ]; then
+            claude plugin update "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+          else
+            claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+          fi
+          # Trust the manager's exit status for nothing beyond "it ran": a
+          # success exit with the catalog identity still unmatched (a no-op
+          # install, a race against a catalog refresh) must not journal as
+          # applied on stale bytes.
+          fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 75
+          [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // empty')" \
+            = "$fleet_run_resolved_sha" ] &&
+            [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
+              = "$fleet_run_resolved_version" ] || return 75
+        fi
+      else
+        claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+      fi
       if [ "$(fleet_run_state_of "$5")" = enabled ]; then
         claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1
       else
@@ -1479,6 +1574,22 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     run_match=no
     [ "$(fleet_applied_digest "$run_store" "$run_host" "$run_item")" != "$run_digest" ] ||
       run_match=yes
+    if [ "$run_category" = plugins ] && [ "$run_in_applied" = yes ] &&
+      [ "$run_match" = yes ]; then
+      run_plugin_identity_status=0
+      fleet_run_plugin_identity_matches "$run_defs" "${run_item#plugins.}" \
+        "$run_value" || run_plugin_identity_status=$?
+      case $run_plugin_identity_status in
+        1) run_match=no ;;
+        75)
+          printf '  hold  %s — installed marketplace identity unavailable\n' "$run_item"
+          fleet_journal_append "$run_store" "$run_host" \
+            "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
+              '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
+          continue
+          ;;
+      esac
+    fi
     # ponytail: on-host observation exists for no category yet (declared
     # boundary B-3), so row 2 reads as row 1 — adopt, which reviews before it
     # applies. Wrong in the safe direction; the dangerous row (not ours, never

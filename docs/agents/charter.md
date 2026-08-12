@@ -18,8 +18,8 @@ Administering the operator's own machines and infrastructure —
   `fleet-agents` (harness runtimes, plugins, skills, capabilities),
   `fleet-projects` (checkouts and saved projects), `fleet-auth` (credential
   artifacts).
-- *Baselines* — `fleet-update` (packages and tools such as tmux and jq),
-  `fleet-chezmoi` (dotfiles).
+- *Baselines* — `fleet-update` (packages and tools such as tmux and jq).
+  Optional chezmoi cooperation is `agent-utilities:fleet-chezmoi`.
 - *Transport and privileged lanes* — see
   [transports](transports.md).
 - *Network gear* — `unifi-network-api`.

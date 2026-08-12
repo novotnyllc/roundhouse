@@ -474,6 +474,8 @@ would be a second policy to keep in step with the first.
 
 ### Health
 
+Before a fleet-wide operation, run `roundhouse fleet-readiness [HOST]...`; it reports per-host `jj`/`yq`, `roundhouse` PATH, SSH-name resolution, and verified-private remote rows. Chezmoi is not a prerequisite.
+
 `roundhouse fleet-doctor` runs at the end of every full pass and on demand.
 Its rows are advisory — a failing row reports, it does not abort a convergence
 that already happened. One row compares the overlapping facts between
@@ -536,6 +538,10 @@ guess an SSH alias or substitute WSL for native Windows.
 Before changing a target, capture a bounded `agents` inventory and freeze a
 de-duplicated set of every installed plugin owned by the marketplace. Treat the
 two harnesses independently and refresh each available, applicable runtime.
+For Claude, compare the marketplace entry's resolved source SHA with the
+installed plugin's `gitCommitSha` as well as its version: the same version with
+new bytes is stale and must reinstall, while matching version and SHA is a
+no-op.
 For local execution set `TARGET_CLI="$CLI"` and verify the loaded executor. For
 SSH, use the configured alias and target login shell (`$SHELL -lc`), resolve the
 target's installed Roundhouse version from its active Codex plugin
@@ -707,8 +713,8 @@ conversion are unsupported by sealed plans.
 Configured `agent_artifacts` may declare an allowlisted `settings` object for a
 JSON or TOML config file. Inventory emits one `agent_setting` record per key,
 including observed value, desired value, presence, and `in_sync`; it never emits
-unlisted config fields. Reconcile the owning file through `fleet-chezmoi` where
-possible. Do not write Claude Desktop internal state or undocumented Codex
+unlisted config fields. Reconcile the owning file through
+`agent-utilities:fleet-chezmoi` when chezmoi is present. Do not write Claude Desktop internal state or undocumented Codex
 Desktop preferences. Claude's supported Remote Control default lives in the
 shared Code settings file; the invoking agent must check Codex Desktop host
 enablement manually.

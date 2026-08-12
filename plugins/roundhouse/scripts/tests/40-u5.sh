@@ -677,7 +677,7 @@ SH
     fi
   )
 
-  for u5_skill in fleet-inventory fleet-update fleet-agents fleet-auth fleet-chezmoi fleet-projects; do
+  for u5_skill in fleet-inventory fleet-update fleet-agents fleet-auth fleet-projects; do
     u5_skill_file="$script_dir/../skills/$u5_skill/SKILL.md"
     [ "$(sed -n '1p' "$u5_skill_file")" = --- ] &&
       [ "$(sed -n '2p' "$u5_skill_file")" = "name: $u5_skill" ] &&

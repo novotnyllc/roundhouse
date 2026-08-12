@@ -211,17 +211,76 @@ if [ "\${1:-}" = update ] && [ "\$#" -eq 1 ]; then
   [ -z "\${RUNTIME_UPDATE_MARKER:-}" ] || printf '%s\n' claude >"\$RUNTIME_UPDATE_MARKER"
   exit 0
 fi
-if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] && [ "\${3:-}" = --json ]; then
+if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] &&
+  { [ "\${3:-}" = --json ] ||
+    { [ "\${3:-}" = --available ] && [ "\${4:-}" = --json ]; }; }; then
+  [ "\${3:-}" != --available ] || {
+    [ -z "\${CLAUDE_PLUGIN_CATALOG_FILE:-}" ] || {
+      cat "\$CLAUDE_PLUGIN_CATALOG_FILE"
+      exit 0
+    }
+  }
   printf '%s\n' "[{\"id\":\"claude-example@test-market\",\"version\":\"\$version\",\"scope\":\"user\",\"enabled\":true,\"installPath\":\"$tmp/home/.claude/plugins/cache/test-market/claude-example/\$version\",\"installedAt\":\"2026-01-03T04:05:06.000Z\",\"lastUpdated\":\"2026-01-04T05:06:07.000Z\"}]"
   exit 0
 fi
+if [ "\${1:-}" = plugin ] && [ "\${2:-}" = install ]; then
+  [ -z "\${CLAUDE_INSTALL_MARKER:-}" ] || printf '%s\n' "\$3" >>"\$CLAUDE_INSTALL_MARKER"
+  # A real install replaces the installed-plugin record with the catalog's
+  # resolved identity. Simulate that here so a caller that re-reads
+  # installed_plugins.json after installing sees a genuine post-install
+  # state, not a stale fixture — CLAUDE_INSTALL_SKIP_RECORD opts a specific
+  # scenario out, to prove that same re-read catches a no-op install.
+  if [ -z "\${CLAUDE_INSTALL_SKIP_RECORD:-}" ] &&
+    [ -n "\${CLAUDE_CONFIG_DIR:-}" ] &&
+    [ -n "\${CLAUDE_PLUGIN_CATALOG_FILE:-}" ] && [ -f "\${CLAUDE_PLUGIN_CATALOG_FILE}" ]; then
+    installed_file="\$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+    mkdir -p "\$(dirname "\$installed_file")"
+    [ -f "\$installed_file" ] || printf '{"version":2,"plugins":{}}\n' >"\$installed_file"
+    resolved=\$(jq -c --arg id "\$3" '.available[] | select(.pluginId == \$id)' \
+      "\$CLAUDE_PLUGIN_CATALOG_FILE")
+    if [ -n "\$resolved" ]; then
+      record=\$(printf '%s\n' "\$resolved" |
+        jq -c '{scope:"user", version: .version, gitCommitSha: .source.sha}')
+      jq -c --arg id "\$3" --argjson rec "\$record" \
+        '.plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user")) + [\$rec])' \
+        "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"
+    fi
+  fi
+  exit 0
+fi
+if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = enable ] || [ "\${2:-}" = disable ]; }; then
+  [ -n "\${CLAUDE_INSTALL_MARKER:-}" ] || exit 64
+  exit 0
+fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
-  [ "\${3:-}" = claude-example@test-market ] &&
   [ "\${4:-}" = --scope ] && [ "\${5:-}" = user ]; then
-  [ -z "\${AGENT_EXEC_MARKER:-}" ] || : >"\$AGENT_EXEC_MARKER"
-  printf '%s\n' 3.0.0 >"\$CLAUDE_STATE_FILE"
-  [ "\${CLAUDE_MANAGER_STDOUT:-0}" != 1 ] ||
-    printf '%s\n' 'manager progress must not enter JSONL'
+  if [ "\${3:-}" = claude-example@test-market ]; then
+    [ -z "\${AGENT_EXEC_MARKER:-}" ] || : >"\$AGENT_EXEC_MARKER"
+    printf '%s\n' 3.0.0 >"\$CLAUDE_STATE_FILE"
+    [ "\${CLAUDE_MANAGER_STDOUT:-0}" != 1 ] ||
+      printf '%s\n' 'manager progress must not enter JSONL'
+  fi
+  # Same post-install record simulation as the install stub above, keyed off
+  # \$3 rather than the marketplace-refresh test's fixed ID: fleet-run's
+  # existing-record path calls update, not install, and expects the same
+  # catalog-resolved identity to land in installed_plugins.json.
+  [ -z "\${CLAUDE_INSTALL_MARKER:-}" ] || printf '%s\n' "\$3" >>"\$CLAUDE_INSTALL_MARKER"
+  if [ -z "\${CLAUDE_INSTALL_SKIP_RECORD:-}" ] &&
+    [ -n "\${CLAUDE_CONFIG_DIR:-}" ] &&
+    [ -n "\${CLAUDE_PLUGIN_CATALOG_FILE:-}" ] && [ -f "\${CLAUDE_PLUGIN_CATALOG_FILE}" ]; then
+    installed_file="\$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+    mkdir -p "\$(dirname "\$installed_file")"
+    [ -f "\$installed_file" ] || printf '{"version":2,"plugins":{}}\n' >"\$installed_file"
+    resolved=\$(jq -c --arg id "\$3" '.available[] | select(.pluginId == \$id)' \
+      "\$CLAUDE_PLUGIN_CATALOG_FILE")
+    if [ -n "\$resolved" ]; then
+      record=\$(printf '%s\n' "\$resolved" |
+        jq -c '{scope:"user", version: .version, gitCommitSha: .source.sha}')
+      jq -c --arg id "\$3" --argjson rec "\$record" \
+        '.plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user")) + [\$rec])' \
+        "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"
+    fi
+  fi
   exit 0
 fi
 exit 64

@@ -523,6 +523,256 @@ fleet_doctor_check() {
   fi
 }
 
+fleet_readiness_row() {
+  # fleet_readiness_row HOST CHECK STATUS DETAIL — the preflight is a table,
+  # not a first-failure probe, so one invocation exposes every missing
+  # prerequisite for every requested host. A row this command cannot itself
+  # assess (a Codex remote-control host's tools and posture require the
+  # controller-side capability check, not a CLI probe) is still a finding,
+  # never "ok": a go/no-go gate that silently trusts an unverified host is a
+  # false-ready signal, worse than one that always asks for the check it
+  # cannot perform itself.
+  case $3 in
+    ok) printf 'ok       %-24s %-18s %s\n' "$1" "$2" "$4" ;;
+    *)
+      printf 'FINDING  %-24s %-18s %s\n' "$1" "$2" "$4"
+      fleet_readiness_findings=$((fleet_readiness_findings + 1))
+      ;;
+  esac
+}
+
+fleet_readiness_command() (
+  # `roundhouse fleet-readiness [HOST]...` — read-only checks before a fleet
+  # operation. SSH targets are checked through their configured SSH transport;
+  # Codex remote-control targets require the controller-side app-tool contract
+  # and must never fall through to SSH or be reported ready from local state.
+  fleet_run_env
+  require_jq
+  # Same config trust gate `collect` applies before it ever reads the
+  # inventory config (scripts/lib/inventory.sh) — a malformed, symlinked, or
+  # group/world-writable config must not be trusted to decide readiness
+  # either.
+  validate_config_file
+  check_private_owned_file "$(config_path)" "readiness configuration"
+  # Not require_yq: yq is one of the per-host prerequisites this preflight
+  # itself reports on (the `tools` row below), not a precondition for running
+  # it — a host missing yq must still get a full row, not an early exit.
+  fleet_readiness_findings=0
+  if [ "$#" -eq 0 ]; then
+    fleet_readiness_targets=$(jq -r '.machines | keys[]' "$(config_path)")
+  else
+    # One argument per line — "$*" would join multiple hosts into a single
+    # space-joined string and check it as one (invalid) name.
+    fleet_readiness_targets=$(printf '%s\n' "$@")
+  fi
+
+  while IFS= read -r fleet_readiness_host; do
+    [ -n "$fleet_readiness_host" ] || continue
+    fleet_host_name_ok "$fleet_readiness_host" || {
+      fleet_readiness_row "$fleet_readiness_host" identity finding 'invalid machine name'
+      continue
+    }
+    if ! jq -e --arg host "$fleet_readiness_host" \
+      '.machines[$host] != null' "$(config_path)" >/dev/null 2>&1; then
+      fleet_readiness_row "$fleet_readiness_host" identity finding \
+        'machine is absent from inventory'
+      continue
+    fi
+    fleet_readiness_transport=$(jq -r --arg host "$fleet_readiness_host" \
+      '.machines[$host].transport // "local"' "$(config_path)" 2>/dev/null || printf unknown)
+    if [ "$fleet_readiness_transport" = local ]; then
+      # A `transport: "local"` entry is a claim to BE this machine — inventory
+      # (scripts/lib/inventory.sh) verifies expected_hostname/expected_user
+      # before treating a target as native, and readiness must too: without
+      # this, any host misconfigured (or mistakenly duplicated) as "local"
+      # reports ready off whichever machine happens to run the command.
+      fleet_readiness_expected_hostname=$(jq -r --arg host "$fleet_readiness_host" \
+        '.machines[$host].expected_hostname // empty' "$(config_path)")
+      fleet_readiness_expected_user=$(jq -r --arg host "$fleet_readiness_host" \
+        '.machines[$host].expected_user // empty' "$(config_path)")
+      # Verify only when the pair is configured. Unlike --native-target
+      # (an explicit assertion that an SSH-configured host is also this
+      # machine) and the SSH-remote-worker identity check, both fields are
+      # optional for an ordinary "local" entry, and ordinary `collect`
+      # performs no such check on it — config.example.json's own bare
+      # "local" entry ships with neither field set. Requiring them here
+      # would make that ordinary, common entry permanently unready.
+      if [ -n "$fleet_readiness_expected_hostname" ] && [ -n "$fleet_readiness_expected_user" ] &&
+        { [ "$(hostname)" != "$fleet_readiness_expected_hostname" ] ||
+          [ "$(id -un)" != "$fleet_readiness_expected_user" ]; }; then
+        fleet_readiness_row "$fleet_readiness_host" identity finding \
+          'local target identity does not match configured hostname/user'
+        continue
+      fi
+    fi
+    if [ "$fleet_readiness_transport" = local ] ||
+      [ "$fleet_readiness_transport" = ssh ]; then
+      fleet_readiness_destination=$(fleet_ssh_destination "$fleet_readiness_host" 2>/dev/null || \
+        printf '%s\n' "$fleet_readiness_host")
+    else
+      fleet_readiness_destination=
+    fi
+
+    if [ "$fleet_readiness_transport" = local ]; then
+      fleet_readiness_missing=
+      for fleet_readiness_tool in jj yq; do
+        command -v "$fleet_readiness_tool" >/dev/null 2>&1 ||
+          fleet_readiness_missing="$fleet_readiness_missing $fleet_readiness_tool"
+      done
+      if [ -n "$fleet_readiness_missing" ]; then
+        fleet_readiness_row "$fleet_readiness_host" tools finding \
+          "missing:${fleet_readiness_missing# }"
+      else
+        fleet_readiness_row "$fleet_readiness_host" tools ok 'jj and yq present'
+      fi
+      if command -v roundhouse >/dev/null 2>&1; then
+        fleet_readiness_row "$fleet_readiness_host" roundhouse ok "$(command -v roundhouse)"
+      else
+        fleet_readiness_row "$fleet_readiness_host" roundhouse finding \
+          'roundhouse is not on PATH'
+      fi
+    elif [ "$fleet_readiness_transport" = codex-remote-control ]; then
+      fleet_readiness_row "$fleet_readiness_host" tools finding \
+        'requires controller-side Codex remote-control readiness check'
+      fleet_readiness_row "$fleet_readiness_host" roundhouse finding \
+        'native tools are verified by the Codex remote-control contract'
+    else
+      # One remote round-trip that enumerates every missing tool, not a
+      # short-circuiting `&&` chain: the previous form stopped at the first
+      # missing command, so a host missing only `jj` reported the same
+      # uninformative "remote tools unavailable" as one missing all three,
+      # and never emitted the separate `roundhouse` row the local branch
+      # above always does.
+      # jq is included alongside jj/yq: it's a hard prerequisite the local
+      # branch above never needs to check (require_jq already gates the
+      # whole command for the invoking host), but the remote host is a
+      # separate machine, and the remote-posture probe below runs
+      # `roundhouse fleet-doctor` over SSH — itself require_jq-gated — with
+      # its stderr suppressed, so a missing remote jq otherwise surfaces
+      # only as an uninformative posture finding.
+      #
+      # hostname/id -un ride the same round trip: a stale or misdirected SSH
+      # alias would otherwise have every row below probe whichever machine
+      # it actually reaches, not the configured target — the same identity
+      # verification SSH collection already performs
+      # (scripts/lib/inventory.sh:150-156) before trusting any collected
+      # data, applied here before trusting any probed readiness state.
+      fleet_readiness_remote_status=0
+      fleet_readiness_remote_probe=$(ssh_run "$fleet_readiness_destination" \
+        'm=; for t in jj yq jq roundhouse; do command -v "$t" >/dev/null 2>&1 || m="$m $t"; done; printf "missing:%s\nhostname:%s\nuser:%s\n" "${m# }" "$(hostname)" "$(id -un)"' \
+        2>&1) || fleet_readiness_remote_status=$?
+      fleet_readiness_remote_missing=$(printf '%s\n' "$fleet_readiness_remote_probe" |
+        sed -n 's/^missing://p')
+      fleet_readiness_remote_hostname=$(printf '%s\n' "$fleet_readiness_remote_probe" |
+        sed -n 's/^hostname://p')
+      fleet_readiness_remote_user=$(printf '%s\n' "$fleet_readiness_remote_probe" |
+        sed -n 's/^user://p')
+      fleet_readiness_expected_hostname=$(jq -r --arg host "$fleet_readiness_host" \
+        '.machines[$host].expected_hostname // empty' "$(config_path)")
+      fleet_readiness_expected_user=$(jq -r --arg host "$fleet_readiness_host" \
+        '.machines[$host].expected_user // empty' "$(config_path)")
+      if [ "$fleet_readiness_remote_status" -ne 0 ]; then
+        fleet_readiness_row "$fleet_readiness_host" tools finding \
+          "remote probe failed: $(printf '%s' "$fleet_readiness_remote_probe" | tr '\n' ' ')"
+        fleet_readiness_row "$fleet_readiness_host" roundhouse finding \
+          'remote probe failed'
+      elif [ -z "$fleet_readiness_expected_hostname" ] ||
+        [ -z "$fleet_readiness_expected_user" ] ||
+        [ "$fleet_readiness_remote_hostname" != "$fleet_readiness_expected_hostname" ] ||
+        [ "$fleet_readiness_remote_user" != "$fleet_readiness_expected_user" ]; then
+        fleet_readiness_row "$fleet_readiness_host" identity finding \
+          'SSH target identity does not match configured hostname/user'
+        continue
+      else
+        fleet_readiness_remote_missing_tools=
+        for fleet_readiness_remote_tool in jj yq jq; do
+          case " $fleet_readiness_remote_missing " in
+            *" $fleet_readiness_remote_tool "*)
+              fleet_readiness_remote_missing_tools="$fleet_readiness_remote_missing_tools $fleet_readiness_remote_tool" ;;
+          esac
+        done
+        if [ -n "$fleet_readiness_remote_missing_tools" ]; then
+          fleet_readiness_row "$fleet_readiness_host" tools finding \
+            "missing:${fleet_readiness_remote_missing_tools# }"
+        else
+          fleet_readiness_row "$fleet_readiness_host" tools ok 'remote jj, yq, and jq present'
+        fi
+        case " $fleet_readiness_remote_missing " in
+          *' roundhouse '*)
+            fleet_readiness_row "$fleet_readiness_host" roundhouse finding \
+              'roundhouse is not on remote PATH'
+            ;;
+          *) fleet_readiness_row "$fleet_readiness_host" roundhouse ok 'present on remote PATH' ;;
+        esac
+      fi
+    fi
+
+    if [ "$fleet_readiness_transport" = codex-remote-control ]; then
+      fleet_readiness_codex_host=$(jq -r --arg host "$fleet_readiness_host" \
+        '.machines[$host].codex_host // empty' "$(config_path)")
+      fleet_readiness_row "$fleet_readiness_host" ssh-name finding \
+        "not applicable: Codex remote-control host $fleet_readiness_codex_host is checked by the controller"
+    else
+      fleet_readiness_ssh_status=0
+      fleet_readiness_ssh_detail=$(/usr/bin/ssh -G "$fleet_readiness_destination" 2>&1) ||
+        fleet_readiness_ssh_status=$?
+      if [ "$fleet_readiness_ssh_status" -eq 0 ] &&
+        printf '%s\n' "$fleet_readiness_ssh_detail" | grep -q '^hostname '; then
+        fleet_readiness_row "$fleet_readiness_host" ssh-name ok \
+          "$fleet_readiness_destination"
+      else
+        fleet_readiness_row "$fleet_readiness_host" ssh-name finding \
+          "SSH cannot resolve $fleet_readiness_destination"
+      fi
+    fi
+
+    if [ "$fleet_readiness_transport" = local ]; then
+      fleet_readiness_store=$(fleet_store_path)
+      fleet_readiness_remote=$(fleet_remote_url "$fleet_readiness_store" 2>/dev/null || true)
+      fleet_readiness_posture=$(fleet_posture_get remote_visibility_verified 2>/dev/null || true)
+      fleet_readiness_posture_url=$(fleet_posture_get remote_visibility_url 2>/dev/null || true)
+      if [ -n "$fleet_readiness_remote" ] &&
+        [ "$fleet_readiness_posture" = true ] &&
+        [ "$fleet_readiness_posture_url" = "$fleet_readiness_remote" ]; then
+        fleet_readiness_row "$fleet_readiness_host" remote-posture ok \
+          'verified-private remote'
+      else
+        fleet_readiness_row "$fleet_readiness_host" remote-posture finding \
+          'remote is not verified-private for the configured URL'
+      fi
+    elif [ "$fleet_readiness_transport" = ssh ]; then
+      fleet_readiness_posture_status=0
+      fleet_readiness_posture_detail=$(ssh_run "$fleet_readiness_destination" \
+        "roundhouse fleet-doctor 2>/dev/null | grep -E '^ok +remote-posture '" \
+        2>&1) || fleet_readiness_posture_status=$?
+      if [ "$fleet_readiness_posture_status" -eq 0 ] &&
+        [ -n "$fleet_readiness_posture_detail" ]; then
+        fleet_readiness_row "$fleet_readiness_host" remote-posture ok \
+          'verified-private remote'
+      else
+        fleet_readiness_row "$fleet_readiness_host" remote-posture finding \
+          'remote doctor did not prove a verified-private remote'
+      fi
+    elif [ "$fleet_readiness_transport" = codex-remote-control ]; then
+      fleet_readiness_row "$fleet_readiness_host" remote-posture finding \
+        'requires controller-side Codex remote-control readiness evidence'
+    else
+      fleet_readiness_row "$fleet_readiness_host" remote-posture finding \
+        "unsupported transport: $fleet_readiness_transport"
+    fi
+  done <<EOF
+$fleet_readiness_targets
+EOF
+
+  if [ "$fleet_readiness_findings" -eq 0 ]; then
+    printf 'roundhouse: fleet-readiness ready\n'
+    exit 0
+  fi
+  printf 'roundhouse: fleet-readiness found %s finding(s)\n' \
+    "$fleet_readiness_findings"
+  exit 1
+)
+
 fleet_doctor_command() (
   # `roundhouse fleet-doctor` — read-only. One row per line, exit 1 on any
   # finding, and never a repair: a doctor that fixes things is a second

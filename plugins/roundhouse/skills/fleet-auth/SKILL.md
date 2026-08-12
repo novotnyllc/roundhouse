@@ -16,7 +16,7 @@ Claude CLI/Desktop and Codex credential boundaries.
 
 Honor each configured strategy:
 
-- `chezmoi`: delegate declarative state to `fleet-chezmoi`.
+- `chezmoi`: delegate declarative state to `agent-utilities:fleet-chezmoi`.
 - `reauth`: run the tool's native login on that machine.
 - `encrypted-install`: resolve the configured secret reference only after the
   user approves exact source, target hosts, and destination path.
