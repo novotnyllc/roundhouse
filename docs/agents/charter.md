@@ -27,11 +27,10 @@ Administering the operator's own machines and infrastructure —
 ## Belongs elsewhere
 
 Deciding what work runs and where:
-[`railyard`](https://github.com/novotnyllc/railyard) owns routing, delivery,
+[`railyard`](https://novotnyllc.github.io/) owns routing, delivery,
 orchestration, placement, and review gates — Roundhouse's dispatch contracts
 require its `railyard/model-routing/v1` router and feed its placement
-decisions. Craft skills live in
-[`agent-utilities`](https://github.com/novotnyllc/agent-utilities).
+decisions. Craft skills are maintained outside Roundhouse.
 
 Scope discipline inside the plugin follows the same rule: reuse existing
 chezmoi and package-manager commands instead of reimplementing them.
