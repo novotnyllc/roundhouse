@@ -253,12 +253,34 @@ if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = enable ] || [ "\${2:-}" = disable ]
   exit 0
 fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
-  [ "\${3:-}" = claude-example@test-market ] &&
   [ "\${4:-}" = --scope ] && [ "\${5:-}" = user ]; then
-  [ -z "\${AGENT_EXEC_MARKER:-}" ] || : >"\$AGENT_EXEC_MARKER"
-  printf '%s\n' 3.0.0 >"\$CLAUDE_STATE_FILE"
-  [ "\${CLAUDE_MANAGER_STDOUT:-0}" != 1 ] ||
-    printf '%s\n' 'manager progress must not enter JSONL'
+  if [ "\${3:-}" = claude-example@test-market ]; then
+    [ -z "\${AGENT_EXEC_MARKER:-}" ] || : >"\$AGENT_EXEC_MARKER"
+    printf '%s\n' 3.0.0 >"\$CLAUDE_STATE_FILE"
+    [ "\${CLAUDE_MANAGER_STDOUT:-0}" != 1 ] ||
+      printf '%s\n' 'manager progress must not enter JSONL'
+  fi
+  # Same post-install record simulation as the install stub above, keyed off
+  # \$3 rather than the marketplace-refresh test's fixed ID: fleet-run's
+  # existing-record path calls update, not install, and expects the same
+  # catalog-resolved identity to land in installed_plugins.json.
+  [ -z "\${CLAUDE_INSTALL_MARKER:-}" ] || printf '%s\n' "\$3" >>"\$CLAUDE_INSTALL_MARKER"
+  if [ -z "\${CLAUDE_INSTALL_SKIP_RECORD:-}" ] &&
+    [ -n "\${CLAUDE_CONFIG_DIR:-}" ] &&
+    [ -n "\${CLAUDE_PLUGIN_CATALOG_FILE:-}" ] && [ -f "\${CLAUDE_PLUGIN_CATALOG_FILE}" ]; then
+    installed_file="\$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+    mkdir -p "\$(dirname "\$installed_file")"
+    [ -f "\$installed_file" ] || printf '{"version":2,"plugins":{}}\n' >"\$installed_file"
+    resolved=\$(jq -c --arg id "\$3" '.available[] | select(.pluginId == \$id)' \
+      "\$CLAUDE_PLUGIN_CATALOG_FILE")
+    if [ -n "\$resolved" ]; then
+      record=\$(printf '%s\n' "\$resolved" |
+        jq -c '{scope:"user", version: .version, gitCommitSha: .source.sha}')
+      jq -c --arg id "\$3" --argjson rec "\$record" \
+        '.plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user")) + [\$rec])' \
+        "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"
+    fi
+  fi
   exit 0
 fi
 exit 64

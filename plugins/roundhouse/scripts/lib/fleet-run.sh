@@ -952,7 +952,16 @@ fleet_run_apply_item() {
           grep -Eq '^[0-9a-fA-F]{40}$' || return 75
         if [ "$fleet_run_resolved_sha" != "$fleet_run_installed_sha" ] ||
           [ "$fleet_run_resolved_version" != "$fleet_run_installed_version" ]; then
-          claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+          # install is for the absent-record case; an existing user-scoped
+          # record with stale bytes goes through the manager's own update
+          # verb (the target-native refresh sequence in
+          # fleet-agents/SKILL.md), which installing an already-installed
+          # plugin can reject or no-op instead of actually refreshing it.
+          if [ -n "$fleet_run_installed_sha" ]; then
+            claude plugin update "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+          else
+            claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+          fi
           # Trust the manager's exit status for nothing beyond "it ran": a
           # success exit with the catalog identity still unmatched (a no-op
           # install, a race against a catalog refresh) must not journal as
