@@ -225,6 +225,27 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] &&
 fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = install ]; then
   [ -z "\${CLAUDE_INSTALL_MARKER:-}" ] || printf '%s\n' "\$3" >>"\$CLAUDE_INSTALL_MARKER"
+  # A real install replaces the installed-plugin record with the catalog's
+  # resolved identity. Simulate that here so a caller that re-reads
+  # installed_plugins.json after installing sees a genuine post-install
+  # state, not a stale fixture — CLAUDE_INSTALL_SKIP_RECORD opts a specific
+  # scenario out, to prove that same re-read catches a no-op install.
+  if [ -z "\${CLAUDE_INSTALL_SKIP_RECORD:-}" ] &&
+    [ -n "\${CLAUDE_CONFIG_DIR:-}" ] &&
+    [ -n "\${CLAUDE_PLUGIN_CATALOG_FILE:-}" ] && [ -f "\${CLAUDE_PLUGIN_CATALOG_FILE}" ]; then
+    installed_file="\$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+    mkdir -p "\$(dirname "\$installed_file")"
+    [ -f "\$installed_file" ] || printf '{"version":2,"plugins":{}}\n' >"\$installed_file"
+    resolved=\$(jq -c --arg id "\$3" '.available[] | select(.pluginId == \$id)' \
+      "\$CLAUDE_PLUGIN_CATALOG_FILE")
+    if [ -n "\$resolved" ]; then
+      record=\$(printf '%s\n' "\$resolved" |
+        jq -c '{scope:"user", version: .version, gitCommitSha: .source.sha}')
+      jq -c --arg id "\$3" --argjson rec "\$record" \
+        '.plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user")) + [\$rec])' \
+        "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"
+    fi
+  fi
   exit 0
 fi
 if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = enable ] || [ "\${2:-}" = disable ]; }; then

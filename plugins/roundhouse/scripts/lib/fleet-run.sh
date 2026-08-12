@@ -953,6 +953,15 @@ fleet_run_apply_item() {
         if [ "$fleet_run_resolved_sha" != "$fleet_run_installed_sha" ] ||
           [ "$fleet_run_resolved_version" != "$fleet_run_installed_version" ]; then
           claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+          # Trust the manager's exit status for nothing beyond "it ran": a
+          # success exit with the catalog identity still unmatched (a no-op
+          # install, a race against a catalog refresh) must not journal as
+          # applied on stale bytes.
+          fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 75
+          [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // empty')" \
+            = "$fleet_run_resolved_sha" ] &&
+            [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
+              = "$fleet_run_resolved_version" ] || return 75
         fi
       else
         claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75

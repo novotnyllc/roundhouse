@@ -142,16 +142,20 @@ YAML
     ! printf '%s\n' "$u22_multi" | grep -Fq 'test-host ../unsafe' ||
       fail "U22 multi-host readiness joined args into one name: $u22_multi"
 
-    # Codex remote-control targets are controller-side app-tool checks. The
-    # shell preflight must expose that state and must not reinterpret the
-    # native Windows target as an SSH target.
+    # Codex remote-control targets are controller-side app-tool checks — this
+    # shell preflight cannot itself assess them. It must say so (n/a, not a
+    # finding) rather than either claiming an unrun check passed or blocking
+    # readiness on a check it was never able to perform, and it must not
+    # reinterpret the native Windows target as an SSH target.
     u22_codex_status=0
     u22_codex=$(u20_run "$cli" fleet-readiness test-windows 2>&1) ||
       u22_codex_status=$?
-    [ "$u22_codex_status" -eq 1 ] ||
-      fail "U22 Codex remote-control readiness exited $u22_codex_status"
+    [ "$u22_codex_status" -eq 0 ] ||
+      fail "U22 Codex remote-control readiness exited $u22_codex_status: $u22_codex"
     printf '%s\n' "$u22_codex" | grep -Fq 'controller-side Codex remote-control' ||
-      fail "U22 Codex readiness did not require the controller contract: $u22_codex"
+      fail "U22 Codex readiness did not name the controller contract: $u22_codex"
+    ! printf '%s\n' "$u22_codex" | grep -Fq 'FINDING' ||
+      fail "U22 Codex readiness reported a finding it cannot itself assess: $u22_codex"
     ! printf '%s\n' "$u22_codex" | grep -Fq 'unsupported transport' ||
       fail "U22 Codex readiness fell through to unsupported transport: $u22_codex"
 
