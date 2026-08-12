@@ -541,11 +541,16 @@ fleet_readiness_command() (
   # transport; the local target uses this host's own doctor posture.
   fleet_run_env
   require_jq
-  require_yq
+  # Not require_yq: yq is one of the per-host prerequisites this preflight
+  # itself reports on (the `tools` row below), not a precondition for running
+  # it — a host missing yq must still get a full row, not an early exit.
   fleet_readiness_findings=0
-  fleet_readiness_targets=$*
-  if [ -z "$fleet_readiness_targets" ]; then
+  if [ "$#" -eq 0 ]; then
     fleet_readiness_targets=$(jq -r '.machines | keys[]' "$(config_path)")
+  else
+    # One argument per line — "$*" would join multiple hosts into a single
+    # space-joined string and check it as one (invalid) name.
+    fleet_readiness_targets=$(printf '%s\n' "$@")
   fi
 
   while IFS= read -r fleet_readiness_host; do

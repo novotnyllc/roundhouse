@@ -787,11 +787,16 @@ fleet_run_plugin_catalog() {
 }
 
 fleet_run_installed_plugin() {
+  # No installed-plugins file, or the plugin absent from it, means "not
+  # installed yet" — an empty identity that must proceed to install, not a
+  # hold. Only a file that fails to parse as JSON is genuinely malformed and
+  # still holds: we cannot trust its absence of the plugin in that case.
   fleet_run_installed_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
-  [ -f "$fleet_run_installed_file" ] || return 75
-  jq -e -c --arg id "$1" \
-    '.plugins[$id] | map(select(.scope == "user")) | .[0]' \
-    "$fleet_run_installed_file" 2>/dev/null
+  [ -f "$fleet_run_installed_file" ] || { printf '{}\n'; return 0; }
+  jq -c --arg id "$1" \
+    '(.plugins[$id] // []) | map(select(.scope == "user")) | (.[0] // {})' \
+    "$fleet_run_installed_file" 2>/dev/null && return 0
+  return 75
 }
 
 fleet_run_apply_item() {

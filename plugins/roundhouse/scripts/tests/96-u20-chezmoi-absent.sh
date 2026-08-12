@@ -112,6 +112,21 @@ YAML
     printf '%s\n' "$u22_invalid" | grep -Fq 'invalid machine name' ||
       fail "U22 readiness did not name invalid machine identity: $u22_invalid"
 
+    # U22: two explicit host arguments are checked independently — "$*"
+    # would join them into one space-separated string and check it as a
+    # single (invalid) name instead of two separate hosts.
+    u22_multi_status=0
+    u22_multi=$(u20_run "$cli" fleet-readiness test-host '../unsafe' 2>&1) ||
+      u22_multi_status=$?
+    [ "$u22_multi_status" -eq 1 ] ||
+      fail "U22 multi-host readiness exited $u22_multi_status"
+    printf '%s\n' "$u22_multi" | grep -Fq 'test-host' ||
+      fail "U22 multi-host readiness dropped test-host: $u22_multi"
+    printf '%s\n' "$u22_multi" | grep -Fq 'invalid machine name' ||
+      fail "U22 multi-host readiness did not flag ../unsafe: $u22_multi"
+    ! printf '%s\n' "$u22_multi" | grep -Fq 'test-host ../unsafe' ||
+      fail "U22 multi-host readiness joined args into one name: $u22_multi"
+
     u20_doctor_status=0
     u20_doctor=$(u20_run "$cli" fleet-doctor 2>&1) || u20_doctor_status=$?
     [ "$u20_doctor_status" -eq 0 ] || {

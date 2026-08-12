@@ -128,6 +128,27 @@ YAML
     grep -qx 'example@test-market' "$run_plugin_install_marker" ||
       fail "version-advance plugin was not reinstalled"
 
+    # U23 regression: a plugin never installed before has no record at all
+    # (no installed_plugins.json, or no entry for its id) — that is an empty
+    # identity requiring install, not a malformed-metadata hold.
+    : >"$run_plugin_install_marker"
+    rm -f "$run_plugin_installed"
+    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.3.0\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
+    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null || fail "never-installed plugin apply failed"
+    grep -qx 'example@test-market' "$run_plugin_install_marker" ||
+      fail "never-installed plugin (no installed_plugins.json) was not installed"
+    : >"$run_plugin_install_marker"
+    printf '%s\n' '{"version":2,"plugins":{}}' >"$run_plugin_installed"
+    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null || fail "no-record plugin apply failed"
+    grep -qx 'example@test-market' "$run_plugin_install_marker" ||
+      fail "never-installed plugin (no entry in installed_plugins.json) was not installed"
+
     # §5.1.3: a STANDALONE hook is arbitrary code from outside the plugin trust
     # flow. It folds, resolves, reviews and journals — and the apply path
     # refuses it. The gate itself is exercised in tests/75-guards.sh; what is
