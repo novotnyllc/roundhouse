@@ -150,16 +150,16 @@ activation, and revocation all stop at the local password/UAC boundary
 (on macOS, that's owner-local interactive elevation, never an SSH
 fallback).
 
-## Boundaries
+## Scope
 
-- Doesn't touch plugins, skills, or agent runtimes — that's
+- Plugin, skill, and agent-runtime updates belong to
   [`fleet-agents`](fleet-agents.md).
-- Doesn't touch project checkouts — that's [`fleet-projects`](fleet-projects.md).
-- Cleanup and autoremove are always separate, explicit actions — never
-  bundled into an ordinary update request.
-- Never runs an arbitrary installer script, arbitrary `sudo`, or an
-  unenrolled privileged path; the protected-action list above is
-  exhaustive, not a starting point.
+- Project checkout work belongs to [`fleet-projects`](fleet-projects.md).
+- Cleanup and autoremove remain separate, explicit actions alongside an
+  ordinary update request.
+- Installer scripts, arbitrary `sudo`, and unenrolled privileged paths stay
+  outside the update surface. The protected-action list above is exhaustive
+  and defines the enrolled actions this skill can run.
 
 ## Example session
 

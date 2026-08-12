@@ -89,22 +89,21 @@ task doesn't move its automation with it — the skill makes sure the
 checkout and automation both exist on the intended runner, and disables
 the old copy only when you want a single runner.
 
-## Boundaries
+## Scope
 
-- Read-only checks come first, always. The skill does not install, start,
-  stop, restart, unload, or edit a service unless you ask.
-- Never stops a tmux session or dev service the current task didn't start,
-  without your explicit approval.
-- GUI automation is used only for explicitly GUI-bound work or a visible
-  security prompt — SSH and service APIs are preferred everywhere else.
-- Never types or exposes a secret in chat; keychain and browser prompts are
-  left for you to approve directly on the machine.
-- If the host is unreachable, every attempted configured route is reported
-  — not just "unreachable."
-- Never substitutes WSL for a direct Windows Codex Desktop transport; that
-  substitution is explicitly out of scope even when a WSL sibling exists.
-- Capture current state before an action and verify afterward — every
-  time, not just for mutations.
+- Read-only checks lead every invocation. Installation, start, stop, restart,
+  unload, and service edits wait for your explicit request.
+- A tmux session or development service started by another task is stopped
+  only with your explicit approval.
+- GUI automation serves explicitly GUI-bound work and visible security
+  prompts; SSH and service APIs are the preferred paths for other work.
+- Secrets stay in the keychain or browser prompts for you to approve directly
+  on the machine; they remain out of chat.
+- An unreachable host produces a report for every attempted configured route,
+  with the specific reachability evidence.
+- Native Windows transport uses direct Windows Codex Desktop; WSL serves as
+  the launcher for its documented interop lane.
+- Current state is captured before every action and verified afterward.
 
 Adapted from `steipete/agent-scripts` `skills/remote-mac` (MIT).
 

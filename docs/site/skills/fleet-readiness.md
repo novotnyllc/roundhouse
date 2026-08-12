@@ -80,18 +80,16 @@ the evidence, what changed, what's unknown, and any restart or
 saved-project action still required. When a request implies fleet-wide
 parity, it verifies every configured node — not a sample.
 
-## Boundaries
+## Scope
 
-- Never renames the task it's given. When something upstream (like
-  `orchestrate`) invokes this skill, it keeps the parent-assigned
-  title in its report.
-- Never mutates anything itself — every fix runs through the owning
-  routed skill, with that skill's own approval and verification.
-- Doesn't do host onboarding or removal — that's
-  [`fleet-hosts`](fleet-hosts.md), which calls this skill to prove
-  readiness once a host is added.
-- Doesn't decide package or agent-tooling drift on its own — it reports
-  what the routed skills found.
+- The task title assigned upstream remains in the report; when
+  `orchestrate` invokes this skill, the parent-assigned title carries through.
+- Fixes flow through the owning routed skill, with that skill's approval and
+  verification; this skill reports the resulting readiness evidence.
+- Host onboarding and removal flow through [`fleet-hosts`](fleet-hosts.md),
+  which calls this skill to prove readiness after a host is added.
+- Package and agent-tooling drift comes from the routed skills, and this skill
+  reports those findings.
 
 ## Example session
 

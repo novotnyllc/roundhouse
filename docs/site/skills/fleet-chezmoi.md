@@ -106,20 +106,23 @@ For a Windows host configured for Codex remote control, the skill follows
 `railyard/model-routing/v1` dispatch step before creating a task. Claude
 reports this transport as unsupported; there's no WSL shell fallback for it.
 
-## Boundaries
+## Scope
 
-- Never uses newest-wins or a blanket `chezmoi add` / `chezmoi apply`
-  before path-level reconciliation has actually happened.
-- Never force-resets, auto-commits, or reveals a template's secret values.
-- `chezmoi add` is a plan output, not an executable action this skill runs.
+- Path-level reconciliation establishes precedence before this skill emits a
+  `chezmoi add` / `chezmoi apply` plan; timestamps remain evidence rather
+  than a winner-selection rule.
+- Force-resets, auto-commits, and template secret values remain outside this
+  skill's action surface.
+- `chezmoi add` yields plan output, which this skill records without
+  executing as an action.
 - The privilege broker's enrollment vocabulary
   (`prepare-privilege-identity`, `verify-privilege-plan`, and the rest) is
-  available for status only; profile mutation still stops at the local
-  human password/UAC boundary, and no sudo or Administrator password is
-  ever requested or relayed.
-- Uses local or SSH execution, or the Windows remote-control worker
-  contract — never a WSL shell as a stand-in for a native Windows path, and
-  never a visible Codex task as a silent fallback.
+  available for status. Profile mutation stops at the local human
+  password/UAC boundary, with sudo and Administrator passwords remaining
+  with the local human.
+- Execution uses local or SSH paths, or the Windows remote-control worker
+  contract. WSL serves as a launcher, and a visible Codex task appears only
+  when the transport contract explicitly selects it.
 
 ## Example session
 

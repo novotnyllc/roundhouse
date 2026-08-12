@@ -112,16 +112,15 @@ remote, or any push all require your explicit approval first. After
 approval, it verifies the resulting remote is actually private before
 recording it as both an ordinary project and `handoff_project`.
 
-## Boundaries
+## Scope
 
-- Never resets, stashes, switches, merges, or discards work automatically
-  — a dirty or diverged checkout is reported, not touched.
-- Doesn't set up SSH access or enroll hosts — that's
-  [`fleet-hosts`](fleet-hosts.md), a prerequisite this skill assumes is
-  already done.
-- Doesn't touch package managers — that's [`fleet-update`](fleet-update.md).
-- Doesn't edit Codex's internal project database — registration happens
-  in Codex Desktop, by you, on the host itself.
+- Dirty or diverged checkouts are reported and preserved in place; reset,
+  stash, switch, merge, and discard operations remain operator-controlled.
+- SSH access and host enrollment flow through [`fleet-hosts`](fleet-hosts.md),
+  the prerequisite this skill assumes is complete.
+- Package-manager work flows through [`fleet-update`](fleet-update.md).
+- Codex's internal project database is registered in Codex Desktop by you on
+  the host itself.
 
 ## Example session
 

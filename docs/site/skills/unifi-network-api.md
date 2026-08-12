@@ -105,22 +105,21 @@ The important endpoint set: `GET/POST .../firewall/policies`,
 - Remove any temporary runtime-only emergency rule once the managed policy
   is compiled and confirmed.
 
-## Boundaries
+## Scope
 
-- Never mines API keys from browser cookies, local storage, or a
-  password/session store — ask the user, use a password manager, or use an
-  environment variable they've already provided.
-- Avoids direct Mongo writes for persistent configuration; Mongo is
-  read-only forensics or emergency-rollback investigation only.
-- Never adds persistent shell hooks or custom on-boot scripts for UniFi
-  configuration.
-- For scoped blocking (an "Alexandria"/Synology-style single host), uses an
-  explicit destination-scoped firewall policy rather than global
-  CyberSecure region blocking, and never creates a broader block than the
-  host, service, or zone the user actually named.
-- A temporary emergency runtime rule is always labeled clearly, kept
-  host-scoped, and removed once the managed policy is confirmed compiled —
-  never left in place as a silent parallel rule set.
+- API keys come from you, a password manager, or an environment variable you
+  have already provided; browser cookies, local storage, and password/session
+  stores remain outside key discovery.
+- Persistent configuration flows through the supported API. Mongo remains a
+  read-only surface for forensics and emergency-rollback investigation.
+- Persistent shell hooks and custom on-boot scripts stay outside UniFi's
+  configuration path.
+- Scoped blocking for an "Alexandria"/Synology-style single host uses an
+  explicit destination-scoped firewall policy for the named host, service,
+  or zone; global CyberSecure region blocking remains a separate broader
+  policy.
+- A temporary emergency runtime rule carries a clear label, stays
+  host-scoped, and is removed after the managed policy is confirmed compiled.
 
 ## Example session
 

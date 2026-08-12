@@ -98,18 +98,17 @@ fallback substitutes for the configured protected adapter.
 Every run concludes with observed drift, unavailable evidence, and exact
 next actions — never a mutation.
 
-## Boundaries
+## Scope
 
-- Read-only, always — nothing here writes to a target. Mutations belong to
-  the skill that owns the surface: [`fleet-update`](fleet-update.md) for
-  packages, [`fleet-agents`](fleet-agents.md) for runtimes/plugins/skills,
-  [`fleet-hosts`](fleet-hosts.md) for host lifecycle, `fleet-auth` for
+- Inventory remains read-only. Mutations flow through the owning skill:
+  [`fleet-update`](fleet-update.md) for packages,
+  [`fleet-agents`](fleet-agents.md) for runtimes/plugins/skills,
+  [`fleet-hosts`](fleet-hosts.md) for host lifecycle, and `fleet-auth` for
   credentials.
-- Doesn't synthesize a ready/not-ready verdict — that's
-  [`fleet-readiness`](fleet-readiness.md), which consumes this skill's
-  evidence rather than duplicating its collection logic.
-- Doesn't update the target's plugin executor even when it detects one is
-  stale — it reports `executor_update_required` and stops.
+- [`fleet-readiness`](fleet-readiness.md) consumes this skill's evidence to
+  synthesize the ready/not-ready verdict and keeps collection logic here.
+- A stale target plugin executor produces `executor_update_required` and
+  ends the inventory run for that target.
 
 ## Example session
 

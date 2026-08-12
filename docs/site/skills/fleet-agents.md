@@ -135,22 +135,20 @@ unreachable, or the work needs the Desktop app surface — and only Codex
 can drive that surface; Claude reports it as an unsupported transport
 rather than substituting WSL.
 
-## Boundaries
+## Scope
 
-- Doesn't decide package updates — Homebrew/APT/winget drift and patching
-  is [`fleet-update`](fleet-update.md).
-- Doesn't onboard or retire hosts — SSH enrollment, prerequisites, and
-  trust revocation are [`fleet-hosts`](fleet-hosts.md).
-- Doesn't synthesize a fleet-wide ready/not-ready verdict — that's
-  [`fleet-readiness`](fleet-readiness.md), which routes here for the
-  agent-tooling half of the answer.
-- Doesn't handle credentials or session auth — that's `fleet-auth`.
-- Doesn't touch root. Package and profile privilege belongs to the
-  broker described in
+- Homebrew/APT/winget drift and patching belong to
+  [`fleet-update`](fleet-update.md).
+- SSH enrollment, prerequisites, and trust revocation belong to
+  [`fleet-hosts`](fleet-hosts.md).
+- [`fleet-readiness`](fleet-readiness.md) synthesizes the fleet-wide
+  ready/not-ready verdict and routes here for the agent-tooling evidence.
+- Credential and session-auth handling belongs to `fleet-auth`.
+- Package and profile privilege belongs to the broker described in
   [`docs/specs/2026-08-06-unattended-privileged-updates.md`](../../specs/2026-08-06-unattended-privileged-updates.md);
-  this skill only proposes and records.
-- Never asks for or relays a sudo or Administrator password; protected
-  profile actions stop at the local human password/UAC boundary.
+  this skill proposes and records those operations.
+- Protected profile actions stop at the local human password/UAC boundary;
+  sudo and Administrator passwords remain with the local human.
 
 ## Example session
 

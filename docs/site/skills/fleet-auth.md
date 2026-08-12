@@ -77,33 +77,31 @@ verification command alone; the skill doesn't infer where the credential
 backend actually lives. An unhealthy result is reported as
 `reauth_required`, with a manual host action, never silently retried.
 
-## Boundaries
+## Scope
 
-- Credential *contents* never enter the conversation, logs, snapshots, or
-  command arguments — only metadata and hashes. Matching SHA-256 proves
-  identical bytes, not valid authentication.
-- Native Windows auth mutation isn't supported by this release —
-  reauthenticate interactively on that host instead of copying credentials
-  through a task.
-- SSH reauthentication is rejected outright: login needs a visible
-  interactive terminal or browser. Complete the one-time login on the
-  target yourself, then re-run inventory; `apply-ssh-plan` stays available
-  for noninteractive encrypted installs.
-- A full Claude login is required once per Remote Control host — a setup
-  token can't substitute, and Claude state is never copied between
-  machines.
-- Codex's file-backed `auth.json` is portable only when you explicitly
-  choose `encrypted-install`; otherwise it stays per-machine.
-- Secrets never route through WSL or another fleet machine as a bridge.
-- Prefer per-machine least-privilege credentials for unattended work over
-  anything portable.
-- The privilege broker's own enrollment records are status-only here: this
-  skill can read `privilege-status` and the shared broker vocabulary, but
-  never places an auth artifact, credential, secret reference, encrypted
-  file, token, or private key inside a profile bundle or protected request.
-  It never asks for or relays a sudo or Administrator password —
-  enrollment and lifecycle changes stop at the local human password/UAC
-  boundary.
+- Credential *contents* stay out of conversations, logs, snapshots, and
+  command arguments; this skill reports metadata and hashes. Matching
+  SHA-256 establishes identical bytes, while the artifact's own verify
+  command establishes authentication validity.
+- This release handles native Windows auth changes through interactive
+  reauthentication on that host, with credentials staying outside task
+  payloads.
+- SSH reauthentication uses a visible interactive terminal or browser.
+  Complete the one-time login on the target, then re-run inventory;
+  `apply-ssh-plan` remains available for noninteractive encrypted installs.
+- Each Remote Control host receives a full Claude login once. Setup tokens
+  do not substitute for that login, and Claude state remains per-machine.
+- Codex's file-backed `auth.json` becomes portable through an explicit
+  `encrypted-install`; its ordinary storage remains per-machine.
+- Secrets stay on their owning machine; WSL and other fleet machines provide
+  no credential bridge.
+- Per-machine least-privilege credentials are preferred for unattended work.
+- The privilege broker's enrollment records are status-only here: this skill
+  reads `privilege-status` and the shared broker vocabulary. Profile bundles
+  and protected requests carry zero auth artifacts, credential material,
+  secret references, encrypted files, tokens, or private keys. Enrollment
+  and lifecycle changes stop at the local human password/UAC boundary, with
+  sudo and Administrator passwords remaining with the local human.
 
 ## Example session
 

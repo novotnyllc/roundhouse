@@ -110,20 +110,18 @@ and `applied/X.yaml` is adopted in place rather than mass-disowned. Then
 work the auth shopping list by hand, since every credential is
 re-established on X manually.
 
-## Boundaries
+## Scope
 
-- One host per invocation — a fleet-wide sweep belongs to
-  [`fleet-readiness`](fleet-readiness.md) / [`fleet-agents`](fleet-agents.md).
-- Never generates an SSH key anywhere but the host it identifies, and
-  never moves a private key between machines — the CSR that travels is
-  public-only by construction.
-- Signing (`certify-ssh-node`) and privilege enrollment always get their
-  own explicit consent naming the exact host, even inside a larger add
-  flow — they're never folded into a single "yes" for the whole
-  onboarding.
-- Doesn't decide package drift, plugin parity in depth, or auth repair
-  itself — it hands those off to `fleet-update`, `fleet-agents`, and
-  `fleet-auth` as prerequisites, then verifies through `fleet-readiness`.
+- Each invocation handles one host; fleet-wide sweeps flow through
+  [`fleet-readiness`](fleet-readiness.md) and [`fleet-agents`](fleet-agents.md).
+- SSH keys are generated on the host they identify, and private keys stay on
+  that host; the traveling CSR is public-only by construction.
+- Signing (`certify-ssh-node`) and privilege enrollment each receive their
+  own explicit consent naming the exact host, including inside a larger add
+  flow.
+- Package drift, deep plugin parity, and auth repair flow to
+  `fleet-update`, `fleet-agents`, and `fleet-auth` as prerequisites; this
+  skill verifies the result through `fleet-readiness`.
 
 ## Example session
 

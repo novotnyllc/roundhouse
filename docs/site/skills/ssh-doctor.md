@@ -94,19 +94,18 @@ sudo pfctl -sr
 sudo pfctl -si
 ```
 
-## Boundaries
+## Scope
 
-- Never prints secrets, tokens, broad environment dumps, or credential
-  file contents.
-- Enabling Remote Login and kickstarting `sshd` are the only two mutations
-  in this skill's normal flow, and both require your approval first.
-- Terminating a session is scoped to the exact PIDs identified as
-  blocking, never a broad `pkill`, and `KILL` is reserved for after
-  ownership is confirmed.
-- Firewall and PF inspection only happens after loopback has already
-  succeeded — it's diagnostic order, not an optional shortcut.
-- Closes every session with root cause, the exact changes made, evidence
-  that validates the fix, and whether the remote client should retry.
+- Secrets, tokens, broad environment dumps, and credential-file contents stay
+  out of output.
+- Enabling Remote Login and kickstarting `sshd` are the two mutations in the
+  normal flow, and each requires your approval first.
+- Session termination targets the exact PIDs identified as blockers; `KILL`
+  becomes available after ownership is confirmed.
+- Firewall and PF inspection follows successful loopback, preserving the
+  diagnostic order.
+- Every session closes with the root cause, exact changes, validating
+  evidence, and whether the remote client should retry.
 
 Adapted from `steipete/agent-scripts` `skills/ssh-doctor` (MIT).
 
