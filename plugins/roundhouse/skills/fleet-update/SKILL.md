@@ -79,6 +79,10 @@ than being given one of its own. Marketplace refresh and package updates are
 not a separate job — the full cadence does both, on the same convergence that
 applies everything else (see `roundhouse:fleet-agents`).
 
+Marketplace convergence compares resolved source bytes with the installed
+plugin identity; a same-version SHA change reinstalls, while a matching SHA is
+already current.
+
 The entry drives **two cadences from one owned slot**:
 
 | Cadence | Command | Default | Covers |

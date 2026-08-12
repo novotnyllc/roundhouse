@@ -211,8 +211,23 @@ if [ "\${1:-}" = update ] && [ "\$#" -eq 1 ]; then
   [ -z "\${RUNTIME_UPDATE_MARKER:-}" ] || printf '%s\n' claude >"\$RUNTIME_UPDATE_MARKER"
   exit 0
 fi
-if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] && [ "\${3:-}" = --json ]; then
+if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] &&
+  { [ "\${3:-}" = --json ] ||
+    { [ "\${3:-}" = --available ] && [ "\${4:-}" = --json ]; }; }; then
+  [ "\${3:-}" != --available ] || {
+    [ -z "\${CLAUDE_PLUGIN_CATALOG_FILE:-}" ] || {
+      cat "\$CLAUDE_PLUGIN_CATALOG_FILE"
+      exit 0
+    }
+  }
   printf '%s\n' "[{\"id\":\"claude-example@test-market\",\"version\":\"\$version\",\"scope\":\"user\",\"enabled\":true,\"installPath\":\"$tmp/home/.claude/plugins/cache/test-market/claude-example/\$version\",\"installedAt\":\"2026-01-03T04:05:06.000Z\",\"lastUpdated\":\"2026-01-04T05:06:07.000Z\"}]"
+  exit 0
+fi
+if [ "\${1:-}" = plugin ] && [ "\${2:-}" = install ]; then
+  [ -z "\${CLAUDE_INSTALL_MARKER:-}" ] || printf '%s\n' "\$3" >>"\$CLAUDE_INSTALL_MARKER"
+  exit 0
+fi
+if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = enable ] || [ "\${2:-}" = disable ]; }; then
   exit 0
 fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&

@@ -776,6 +776,24 @@ fleet_config_drift() {
     done
 }
 
+fleet_run_plugin_catalog() {
+  # `claude plugin list --available --json` is the manager's resolved
+  # marketplace view. The source SHA is the byte identity; the catalog version
+  # remains useful for the ordinary release advance but is never sufficient by
+  # itself.
+  fleet_run_catalog_json=$(claude plugin list --available --json 2>/dev/null) || return 75
+  printf '%s\n' "$fleet_run_catalog_json" |
+    jq -e -c --arg id "$1" '.available[] | select(.pluginId == $id)' 2>/dev/null
+}
+
+fleet_run_installed_plugin() {
+  fleet_run_installed_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
+  [ -f "$fleet_run_installed_file" ] || return 75
+  jq -e -c --arg id "$1" \
+    '.plugins[$id] | map(select(.scope == "user")) | .[0]' \
+    "$fleet_run_installed_file" 2>/dev/null
+}
+
 fleet_run_apply_item() {
   # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
@@ -879,7 +897,28 @@ fleet_run_apply_item() {
       fleet_run_id=$fleet_run_name
       [ -z "$fleet_run_market" ] ||
         fleet_run_id="$fleet_run_name@$fleet_run_market"
-      claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || :
+      if [ -n "$fleet_run_market" ]; then
+        fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id") || return 75
+        fleet_run_resolved_sha=$(printf '%s\n' "$fleet_run_catalog" |
+          jq -r '.source.sha // empty')
+        fleet_run_resolved_version=$(printf '%s\n' "$fleet_run_catalog" |
+          jq -r '.version // empty')
+        fleet_run_installed=$(fleet_run_installed_plugin "$fleet_run_id") || return 75
+        fleet_run_installed_sha=$(printf '%s\n' "$fleet_run_installed" |
+          jq -r '.gitCommitSha // empty')
+        fleet_run_installed_version=$(printf '%s\n' "$fleet_run_installed" |
+          jq -r '.version // empty')
+        # A marketplace entry without a resolved SHA cannot prove installed
+        # bytes. Hold it instead of silently trusting a version string.
+        printf '%s\n' "$fleet_run_resolved_sha" |
+          grep -Eq '^[0-9a-fA-F]{40}$' || return 75
+        if [ "$fleet_run_resolved_sha" != "$fleet_run_installed_sha" ] ||
+          [ "$fleet_run_resolved_version" != "$fleet_run_installed_version" ]; then
+          claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+        fi
+      else
+        claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+      fi
       if [ "$(fleet_run_state_of "$5")" = enabled ]; then
         claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1
       else

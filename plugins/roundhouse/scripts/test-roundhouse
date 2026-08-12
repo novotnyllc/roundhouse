@@ -160,5 +160,7 @@ if want_section 93; then . "$script_dir/tests/93-jj-run.sh"; fi
 if want_section 94; then . "$script_dir/tests/94-jj-doctor.sh"; fi
 # shellcheck source=tests/95-jj-trustd.sh
 if want_section 95; then . "$script_dir/tests/95-jj-trustd.sh"; fi
+# shellcheck source=tests/96-u20-chezmoi-absent.sh
+if want_section 96; then . "$script_dir/tests/96-u20-chezmoi-absent.sh"; fi
 
 printf 'PASS: roundhouse self-check\n'

@@ -9,7 +9,7 @@ remote_control_reference="$script_dir/../references/codex-remote-control.md"
 fleet_agents_text=$(cat "$fleet_agents_skill")
 remote_control_text=$(cat "$remote_control_reference")
 
-for routing_consumer in fleet-agents fleet-auth fleet-chezmoi fleet-inventory fleet-projects fleet-update; do
+for routing_consumer in fleet-agents fleet-auth fleet-inventory fleet-projects fleet-update; do
   routing_consumer_text=$(cat "$script_dir/../skills/$routing_consumer/SKILL.md")
   assert_contains "$routing_consumer_text" 'railyard/model-routing/v1'
 done
@@ -367,6 +367,9 @@ jq -e '.skills | index("./skills/fleet-readiness") != null' \
   "$script_dir/../.claude-plugin/plugin.json" >/dev/null ||
   fail "Claude manifest does not expose fleet-readiness"
 readiness_text=$(cat "$readiness_skill")
-assert_contains "$readiness_text" 'Desired-state readiness is `roundhouse fleet-doctor`, whose contract lives in
-`roundhouse:fleet-agents` and is authoritative there'
-assert_contains "$readiness_text" 'never duplicate or paraphrase them here'
+assert_contains "$readiness_text" 'Run `roundhouse fleet-readiness [HOST]...` first.'
+assert_contains "$readiness_text" 'check chezmoi: chezmoi is an optional personal integration'
+assert_contains "$readiness_text" 'optional personal integration, not a fleet'
+assert_contains "$readiness_text" '`roundhouse fleet-doctor`, whose contract lives in'
+assert_contains "$readiness_text" 'never duplicate or'
+assert_contains "$readiness_text" 'paraphrase them here'

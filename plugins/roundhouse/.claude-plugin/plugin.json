@@ -1,7 +1,7 @@
 {
   "name": "roundhouse",
   "version": "0.6.2",
-  "description": "Machine and infrastructure administration for agent fleets: readiness, inventory, harness/plugin/skill parity, package and dotfile baselines, auth artifacts, SSH transport and diagnosis, privileged install lanes, and UniFi network gear.",
+  "description": "Machine and infrastructure administration for agent fleets: readiness, inventory, harness/plugin/skill parity, package baselines, auth artifacts, SSH transport and diagnosis, privileged install lanes, and UniFi network gear.",
   "author": {
     "name": "Claire Novotny LLC",
     "url": "https://github.com/novotnyllc"
@@ -24,7 +24,6 @@
   "skills": [
     "./skills/fleet-agents",
     "./skills/fleet-auth",
-    "./skills/fleet-chezmoi",
     "./skills/fleet-hosts",
     "./skills/fleet-inventory",
     "./skills/fleet-projects",

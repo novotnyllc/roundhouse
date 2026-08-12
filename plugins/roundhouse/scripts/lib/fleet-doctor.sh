@@ -523,6 +523,130 @@ fleet_doctor_check() {
   fi
 }
 
+fleet_readiness_row() {
+  # fleet_readiness_row HOST CHECK STATUS DETAIL — the preflight is a table,
+  # not a first-failure probe, so one invocation exposes every missing
+  # prerequisite for every requested host.
+  if [ "$3" = ok ]; then
+    printf 'ok       %-24s %-18s %s\n' "$1" "$2" "$4"
+  else
+    printf 'FINDING  %-24s %-18s %s\n' "$1" "$2" "$4"
+    fleet_readiness_findings=$((fleet_readiness_findings + 1))
+  fi
+}
+
+fleet_readiness_command() (
+  # `roundhouse fleet-readiness [HOST]...` — read-only checks before a fleet
+  # operation. Remote targets are checked through their configured SSH
+  # transport; the local target uses this host's own doctor posture.
+  fleet_run_env
+  require_jq
+  require_yq
+  fleet_readiness_findings=0
+  fleet_readiness_targets=$*
+  if [ -z "$fleet_readiness_targets" ]; then
+    fleet_readiness_targets=$(jq -r '.machines | keys[]' "$(config_path)")
+  fi
+
+  while IFS= read -r fleet_readiness_host; do
+    [ -n "$fleet_readiness_host" ] || continue
+    fleet_host_name_ok "$fleet_readiness_host" || {
+      fleet_readiness_row "$fleet_readiness_host" identity finding 'invalid machine name'
+      continue
+    }
+    fleet_readiness_transport=$(jq -r --arg host "$fleet_readiness_host" \
+      '.machines[$host].transport // "local"' "$(config_path)" 2>/dev/null || printf unknown)
+    fleet_readiness_destination=$(fleet_ssh_destination "$fleet_readiness_host" 2>/dev/null || \
+      printf '%s\n' "$fleet_readiness_host")
+
+    if [ "$fleet_readiness_transport" = local ]; then
+      fleet_readiness_missing=
+      for fleet_readiness_tool in jj yq; do
+        command -v "$fleet_readiness_tool" >/dev/null 2>&1 ||
+          fleet_readiness_missing="$fleet_readiness_missing $fleet_readiness_tool"
+      done
+      if [ -n "$fleet_readiness_missing" ]; then
+        fleet_readiness_row "$fleet_readiness_host" tools finding \
+          "missing:${fleet_readiness_missing# }"
+      else
+        fleet_readiness_row "$fleet_readiness_host" tools ok 'jj and yq present'
+      fi
+      if command -v roundhouse >/dev/null 2>&1; then
+        fleet_readiness_row "$fleet_readiness_host" roundhouse ok "$(command -v roundhouse)"
+      else
+        fleet_readiness_row "$fleet_readiness_host" roundhouse finding \
+          'roundhouse is not on PATH'
+      fi
+    else
+      fleet_readiness_remote_status=0
+      fleet_readiness_remote_detail=$(ssh_run "$fleet_readiness_destination" \
+        'command -v jj >/dev/null && command -v yq >/dev/null && command -v roundhouse' \
+        2>&1) || fleet_readiness_remote_status=$?
+      if [ "$fleet_readiness_remote_status" -eq 0 ]; then
+        fleet_readiness_row "$fleet_readiness_host" tools ok \
+          'remote jj, yq, and roundhouse present'
+      else
+        fleet_readiness_row "$fleet_readiness_host" tools finding \
+          "remote tools unavailable: $(printf '%s' "$fleet_readiness_remote_detail" | tr '\n' ' ')"
+      fi
+    fi
+
+    fleet_readiness_ssh_status=0
+    fleet_readiness_ssh_detail=$(/usr/bin/ssh -G "$fleet_readiness_destination" 2>&1) ||
+      fleet_readiness_ssh_status=$?
+    if [ "$fleet_readiness_ssh_status" -eq 0 ] &&
+      printf '%s\n' "$fleet_readiness_ssh_detail" | grep -q '^hostname '; then
+      fleet_readiness_row "$fleet_readiness_host" ssh-name ok \
+        "$fleet_readiness_destination"
+    else
+      fleet_readiness_row "$fleet_readiness_host" ssh-name finding \
+        "SSH cannot resolve $fleet_readiness_destination"
+    fi
+
+    if [ "$fleet_readiness_transport" = local ]; then
+      fleet_readiness_store=$(fleet_store_path)
+      fleet_readiness_remote=$(fleet_remote_url "$fleet_readiness_store" 2>/dev/null || true)
+      fleet_readiness_posture=$(fleet_posture_get remote_visibility_verified 2>/dev/null || true)
+      fleet_readiness_posture_url=$(fleet_posture_get remote_visibility_url 2>/dev/null || true)
+      if [ -n "$fleet_readiness_remote" ] &&
+        [ "$fleet_readiness_posture" = true ] &&
+        [ "$fleet_readiness_posture_url" = "$fleet_readiness_remote" ]; then
+        fleet_readiness_row "$fleet_readiness_host" remote-posture ok \
+          'verified-private remote'
+      else
+        fleet_readiness_row "$fleet_readiness_host" remote-posture finding \
+          'remote is not verified-private for the configured URL'
+      fi
+    elif [ "$fleet_readiness_transport" = ssh ]; then
+      fleet_readiness_posture_status=0
+      fleet_readiness_posture_detail=$(ssh_run "$fleet_readiness_destination" \
+        "roundhouse fleet-doctor 2>/dev/null | grep -E '^ok +remote-posture '" \
+        2>&1) || fleet_readiness_posture_status=$?
+      if [ "$fleet_readiness_posture_status" -eq 0 ] &&
+        [ -n "$fleet_readiness_posture_detail" ]; then
+        fleet_readiness_row "$fleet_readiness_host" remote-posture ok \
+          'verified-private remote'
+      else
+        fleet_readiness_row "$fleet_readiness_host" remote-posture finding \
+          'remote doctor did not prove a verified-private remote'
+      fi
+    else
+      fleet_readiness_row "$fleet_readiness_host" remote-posture finding \
+        "unsupported transport: $fleet_readiness_transport"
+    fi
+  done <<EOF
+$fleet_readiness_targets
+EOF
+
+  if [ "$fleet_readiness_findings" -eq 0 ]; then
+    printf 'roundhouse: fleet-readiness ready\n'
+    exit 0
+  fi
+  printf 'roundhouse: fleet-readiness found %s finding(s)\n' \
+    "$fleet_readiness_findings"
+  exit 1
+)
+
 fleet_doctor_command() (
   # `roundhouse fleet-doctor` — read-only. One row per line, exit 1 on any
   # finding, and never a repair: a doctor that fixes things is a second

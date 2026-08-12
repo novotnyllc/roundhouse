@@ -71,6 +71,7 @@ Usage:
   roundhouse fleet-adopt-pin PLUGIN PIN.json
   roundhouse fleet-verify-remote
   roundhouse fleet-set-remote URL
+  roundhouse fleet-readiness [HOST]...
   roundhouse fleet-doctor
   roundhouse ensure-tools
 EOF
@@ -215,6 +216,7 @@ case $command in
   fleet-adopt-pin) [ $# -eq 2 ] || usage; fleet_adopt_pin_command "$1" "$2" ;;
   fleet-verify-remote) [ $# -eq 0 ] || usage; fleet_verify_remote_command ;;
   fleet-set-remote) [ $# -eq 1 ] || usage; fleet_set_remote_command "$1" ;;
+  fleet-readiness) fleet_readiness_command "$@" ;;
   fleet-doctor) [ $# -eq 0 ] || usage; fleet_doctor_command ;;
   ensure-tools) [ $# -eq 0 ] || usage; fleet_ensure_tools_command ;;
   *) usage ;;

@@ -1,6 +1,6 @@
 ---
 name: fleet-inventory
-description: Inventory and compare a configured fleet of macOS, Linux, WSL, and Windows machines. Use for packages, agent runtimes, allowlisted Claude/Codex settings, plugins, standalone skills and provenance, auth-file or native session status, projects, startup tasks, chezmoi state, SHA-256 comparisons, install-time inference, or human and JSONL status reports.
+description: Inventory and compare a configured fleet of macOS, Linux, WSL, and Windows machines. Use for packages, agent runtimes, allowlisted Claude/Codex settings, plugins, standalone skills and provenance, auth-file or native session status, projects, startup tasks, SHA-256 comparisons, install-time inference, or human and JSONL status reports.
 ---
 
 # Fleet Inventory

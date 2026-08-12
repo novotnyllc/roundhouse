@@ -21,10 +21,15 @@ Orchestrator invokes this skill, retain the parent-assigned title.
 - Use `roundhouse:fleet-auth` for credential artifacts, sessions, and
   authentication repair.
 
-Desired-state readiness is `roundhouse fleet-doctor`, whose contract lives in
-`roundhouse:fleet-agents` and is authoritative there: consume its rows, and
-never duplicate or paraphrase them here. Open alerts from any host are
-`roundhouse fleet-pending`.
+Run `roundhouse fleet-readiness [HOST]...` first. It emits one table row per
+host and prerequisite for `jj` plus `yq`, `roundhouse` on PATH, SSH-name
+resolvability, and a verified-private remote. A nonzero exit means at least one
+row is not ready; it is a preflight, not a repair. It deliberately does not
+check chezmoi: chezmoi is an optional personal integration, not a fleet
+prerequisite. After the preflight, desired-state readiness is
+`roundhouse fleet-doctor`, whose contract lives in `roundhouse:fleet-agents`
+and is authoritative there: consume its rows, and never duplicate or
+paraphrase them here. Open alerts from any host are `roundhouse fleet-pending`.
 
 Let each routed skill retain its inventory, approval, mutation, and
 post-verification contract. Do not duplicate its commands or treat raw SSH

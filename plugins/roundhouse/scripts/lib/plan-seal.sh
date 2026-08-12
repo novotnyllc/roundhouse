@@ -283,7 +283,8 @@ seal_plan_command() {
             .status == "present" and .data.dirty_count == 0)
         else true end)
     ' >/dev/null || {
-      printf 'roundhouse: plan does not match an actionable observed state\n' >&2
+      printf 'roundhouse: %s plan does not match an actionable observed state\n' \
+        "$domain" >&2
       exit 65
     }
   fi
