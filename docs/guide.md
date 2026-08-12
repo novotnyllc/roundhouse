@@ -2,121 +2,27 @@
 
 <img src="assets/roundhouse.png" alt="Roundhouse" width="170" align="right"/>
 
-Roundhouse keeps a fleet of machines serviceable for AI agents. It answers,
-continuously and with evidence, the questions a multi-machine setup otherwise
-answers with vibes: *what's installed where, is it in sync, can I reach that
-box, and is it ready to receive work?*
+Roundhouse keeps machines ready for agent work through inventory, readiness,
+transport, and fleet convergence. The public site is the canonical guide for
+the product story, installation, first-machine flow, and operating scenarios:
 
-**What it gets you:**
+<https://novotnyllc.github.io/>
 
-- *A machine joins the fleet in one guided flow* — and leaves it just as
-  cleanly, with trust actually revoked.
-- *Drift can't hide.* Harness versions, plugins, skills, packages, dotfiles,
-  and auth artifacts are inventoried and compared across every host.
-- *Privilege stays narrow.* The few operations that need elevation go
-  through signed, enrolled broker lanes — never ad-hoc sudo.
-- *Dispatch stops guessing.* [Railyard](https://github.com/novotnyllc/railyard)
-  consults `fleet-readiness` before placing work; unready hosts don't get
-  work, they get findings.
+## Repo-local orientation
 
-## The mental model
+- Configuration: `${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/config.json`,
+  overridable with `ROUNDHOUSE_CONFIG`.
+- Install: use the Claude Code or Codex commands in the public site's
+  [installation guide](https://novotnyllc.github.io/start/install/).
+- First machine: follow the public site's
+  [first-machine guide](https://novotnyllc.github.io/start/first-machine/).
+- Fleet operations: see the public site's
+  [fleet section](https://novotnyllc.github.io/fleet/).
+- Repository rules and local engineering references live in
+  [`AGENTS.md`](../AGENTS.md), [`docs/agents/charter.md`](agents/charter.md),
+  [`docs/agents/verification.md`](agents/verification.md),
+  [`docs/agents/transports.md`](agents/transports.md), and
+  [`docs/agents/release-coupling.md`](agents/release-coupling.md).
 
-Every skill fronts one shared, sealed engine: inventory feeds readiness;
-mutations travel as sealed plans; transport is verified SSH (or the two
-Windows lanes).
-
-```mermaid
-flowchart TD
-    Y[(railyard<br/>orchestrate)] -->|"ready to receive?"| FR[fleet-readiness]
-    FR --> FI[fleet-inventory]
-    FR --> FA[fleet-agents<br/>runtimes · plugins · skills]
-    FR --> FP[fleet-projects<br/>checkouts · saved projects]
-    FR --> FAU[fleet-auth]
-    FH[fleet-hosts<br/>add / remove] --> FR
-    subgraph engine [fleet CLI engine]
-        C[collect] --> S[seal-plan] --> V[verify-preconditions] --> A[apply / apply-ssh-plan]
-    end
-    FI & FA & FP & FAU -.-> engine
-    FU[fleet-update<br/>packages] -.-> engine
-    FC[fleet-chezmoi<br/>dotfiles] -.-> engine
-```
-
-Reads are free-form; **mutations are sealed**: a plan is drafted from a
-fresh inventory snapshot, sealed with digests, re-verified against current
-state immediately before apply, and executed only as the exact sealed argv.
-Nothing "just runs a command" on a remote machine.
-
-## The fleet config
-
-One file describes the fleet:
-`${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/config.json` (override with
-`ROUNDHOUSE_CONFIG`). It names each machine — display name, SSH alias,
-platform, transport, groups — plus the development root and optional
-Codex remote-control and handoff-project settings. Scaffold it from the
-plugin's `config.example.json`, or let `railyard:setup` interview you.
-
-## Adding and removing machines
-
-Say "add my laptop to the fleet" — `fleet-hosts` runs the whole flow, with
-consent at each trust step:
-
-```mermaid
-flowchart LR
-    R[reachability<br/>ssh check] --> CFG[config entry<br/>+ validate]
-    CFG --> E1["identity on the new host<br/>(prepare-ssh-identity)"]
-    E1 --> E2["owner signing ceremony<br/>(certify-ssh-node)"]
-    E2 --> E3["install CA + KRL<br/>(enroll-ssh-posix)"]
-    E3 --> P[prereqs on target<br/>tmux · jq · harnesses · plugins]
-    P --> RD[fleet-readiness<br/>go/no-go]
-```
-
-Keys are generated only on the machine they identify; the CSR that travels is
-public-only; the signing step is its own consented ceremony. Removal runs in
-the safe order — clean up over SSH *while access still works*, then revoke
-the certificate and push the updated revocation list to every remaining
-host, then drop the config entry.
-
-## Everyday operations
-
-| You say | What runs |
-| --- | --- |
-| "what's on my machines?" / "any drift?" | `fleet-inventory` (read-only snapshot, human or JSONL) |
-| "are the agents in sync?" / "update my plugins everywhere" | `fleet-agents` — runtime/plugin/skill parity and the routine marketplace refresh |
-| "update packages on the fleet" | `fleet-update` — plan first, apply on approval |
-| "did my dotfiles drift?" | `fleet-chezmoi` |
-| "add/remove this machine" | `fleet-hosts` |
-| "ssh to my mac is broken" | `ssh-doctor` |
-| "do X on my other mac" | `remote-mac` — verified SSH, named tmux sessions for long work |
-| "fix the guest network / DNS" | `unifi-network-api` |
-
-Everything defaults to audit/report; mutations need your explicit request and
-ride the sealed-plan pipeline.
-
-## Transports
-
-- **SSH** (macOS/Linux) — the workhorse: certificate-authenticated, bounded
-  timeouts, always through the target's login shell.
-- **Codex remote control** (native Windows) — a visible Codex Desktop task on
-  the destination's saved project runs the verified native executor;
-  interactive Windows work needs this lane.
-- **`windows-sftp`** — the signed, harness-neutral lane: a four-file slot
-  (request, signature, payload, commit-last) that the broker's scheduled task
-  picks up within one minute. It carries declarative state — marketplace
-  desired-records, profile bundles, and the narrow privileged actions — even
-  to a logged-off machine, from any harness including Claude Code.
-
-## Trust model, in one paragraph
-
-Reads need reachability; mutations need a sealed plan and your approval;
-privileged actions additionally need prior enrollment (a one-time, consented
-ceremony per host) and ride signed requests validated against an enrolled
-certificate — there is no general "run this as root" anywhere in the system.
-
-## With railyard
-
-Roundhouse never decides or routes work. The seam is exactly two touchpoints:
-`railyard:orchestrate` consults `fleet-readiness` before placing work on a
-host, and roundhouse's own dispatch contracts require railyard's
-`model-routing` before creating remote tasks. Install both and the seam just
-works; install roundhouse alone and you still have a full fleet-administration
-toolkit.
+Roundhouse's source and plugin skills remain in this repository. The public
+site is the reader-facing home for the human documentation.
