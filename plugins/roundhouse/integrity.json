@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
-      "sha256": "0f84e32dbbc8a56f5935b8bb640a94fd35fe32132c6d8a9d5ea89df491e8210a"
+      "sha256": "884b52243d24281fcafb132b09896fc6cd1d6cfdd9a9edb07f9c6cc8af30319c"
     },
     {
       "path": "scripts/lib/fleet-fold.sh",

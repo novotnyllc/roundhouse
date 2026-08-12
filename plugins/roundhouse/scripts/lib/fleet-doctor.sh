@@ -650,15 +650,39 @@ fleet_readiness_command() (
       # `roundhouse fleet-doctor` over SSH — itself require_jq-gated — with
       # its stderr suppressed, so a missing remote jq otherwise surfaces
       # only as an uninformative posture finding.
+      #
+      # hostname/id -un ride the same round trip: a stale or misdirected SSH
+      # alias would otherwise have every row below probe whichever machine
+      # it actually reaches, not the configured target — the same identity
+      # verification SSH collection already performs
+      # (scripts/lib/inventory.sh:150-156) before trusting any collected
+      # data, applied here before trusting any probed readiness state.
       fleet_readiness_remote_status=0
-      fleet_readiness_remote_missing=$(ssh_run "$fleet_readiness_destination" \
-        'm=; for t in jj yq jq roundhouse; do command -v "$t" >/dev/null 2>&1 || m="$m $t"; done; printf "%s\n" "${m# }"' \
+      fleet_readiness_remote_probe=$(ssh_run "$fleet_readiness_destination" \
+        'm=; for t in jj yq jq roundhouse; do command -v "$t" >/dev/null 2>&1 || m="$m $t"; done; printf "missing:%s\nhostname:%s\nuser:%s\n" "${m# }" "$(hostname)" "$(id -un)"' \
         2>&1) || fleet_readiness_remote_status=$?
+      fleet_readiness_remote_missing=$(printf '%s\n' "$fleet_readiness_remote_probe" |
+        sed -n 's/^missing://p')
+      fleet_readiness_remote_hostname=$(printf '%s\n' "$fleet_readiness_remote_probe" |
+        sed -n 's/^hostname://p')
+      fleet_readiness_remote_user=$(printf '%s\n' "$fleet_readiness_remote_probe" |
+        sed -n 's/^user://p')
+      fleet_readiness_expected_hostname=$(jq -r --arg host "$fleet_readiness_host" \
+        '.machines[$host].expected_hostname // empty' "$(config_path)")
+      fleet_readiness_expected_user=$(jq -r --arg host "$fleet_readiness_host" \
+        '.machines[$host].expected_user // empty' "$(config_path)")
       if [ "$fleet_readiness_remote_status" -ne 0 ]; then
         fleet_readiness_row "$fleet_readiness_host" tools finding \
-          "remote probe failed: $(printf '%s' "$fleet_readiness_remote_missing" | tr '\n' ' ')"
+          "remote probe failed: $(printf '%s' "$fleet_readiness_remote_probe" | tr '\n' ' ')"
         fleet_readiness_row "$fleet_readiness_host" roundhouse finding \
           'remote probe failed'
+      elif [ -z "$fleet_readiness_expected_hostname" ] ||
+        [ -z "$fleet_readiness_expected_user" ] ||
+        [ "$fleet_readiness_remote_hostname" != "$fleet_readiness_expected_hostname" ] ||
+        [ "$fleet_readiness_remote_user" != "$fleet_readiness_expected_user" ]; then
+        fleet_readiness_row "$fleet_readiness_host" identity finding \
+          'SSH target identity does not match configured hostname/user'
+        continue
       else
         fleet_readiness_remote_missing_tools=
         for fleet_readiness_remote_tool in jj yq jq; do
