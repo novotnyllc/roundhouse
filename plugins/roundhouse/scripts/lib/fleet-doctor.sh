@@ -590,6 +590,13 @@ fleet_readiness_command() (
         '.machines[$host].expected_hostname // empty' "$(config_path)")
       fleet_readiness_expected_user=$(jq -r --arg host "$fleet_readiness_host" \
         '.machines[$host].expected_user // empty' "$(config_path)")
+      # Verify only when the pair is configured. Unlike --native-target
+      # (an explicit assertion that an SSH-configured host is also this
+      # machine) and the SSH-remote-worker identity check, both fields are
+      # optional for an ordinary "local" entry, and ordinary `collect`
+      # performs no such check on it — config.example.json's own bare
+      # "local" entry ships with neither field set. Requiring them here
+      # would make that ordinary, common entry permanently unready.
       if [ -n "$fleet_readiness_expected_hostname" ] && [ -n "$fleet_readiness_expected_user" ] &&
         { [ "$(hostname)" != "$fleet_readiness_expected_hostname" ] ||
           [ "$(id -un)" != "$fleet_readiness_expected_user" ]; }; then
