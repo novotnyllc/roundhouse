@@ -537,8 +537,9 @@ fleet_readiness_row() {
 
 fleet_readiness_command() (
   # `roundhouse fleet-readiness [HOST]...` — read-only checks before a fleet
-  # operation. Remote targets are checked through their configured SSH
-  # transport; the local target uses this host's own doctor posture.
+  # operation. SSH targets are checked through their configured SSH transport;
+  # Codex remote-control targets require the controller-side app-tool contract
+  # and must never fall through to SSH or be reported ready from local state.
   fleet_run_env
   require_jq
   # Not require_yq: yq is one of the per-host prerequisites this preflight
@@ -559,10 +560,21 @@ fleet_readiness_command() (
       fleet_readiness_row "$fleet_readiness_host" identity finding 'invalid machine name'
       continue
     }
+    if ! jq -e --arg host "$fleet_readiness_host" \
+      '.machines[$host] != null' "$(config_path)" >/dev/null 2>&1; then
+      fleet_readiness_row "$fleet_readiness_host" identity finding \
+        'machine is absent from inventory'
+      continue
+    fi
     fleet_readiness_transport=$(jq -r --arg host "$fleet_readiness_host" \
       '.machines[$host].transport // "local"' "$(config_path)" 2>/dev/null || printf unknown)
-    fleet_readiness_destination=$(fleet_ssh_destination "$fleet_readiness_host" 2>/dev/null || \
-      printf '%s\n' "$fleet_readiness_host")
+    if [ "$fleet_readiness_transport" = local ] ||
+      [ "$fleet_readiness_transport" = ssh ]; then
+      fleet_readiness_destination=$(fleet_ssh_destination "$fleet_readiness_host" 2>/dev/null || \
+        printf '%s\n' "$fleet_readiness_host")
+    else
+      fleet_readiness_destination=
+    fi
 
     if [ "$fleet_readiness_transport" = local ]; then
       fleet_readiness_missing=
@@ -582,6 +594,11 @@ fleet_readiness_command() (
         fleet_readiness_row "$fleet_readiness_host" roundhouse finding \
           'roundhouse is not on PATH'
       fi
+    elif [ "$fleet_readiness_transport" = codex-remote-control ]; then
+      fleet_readiness_row "$fleet_readiness_host" tools finding \
+        'requires controller-side Codex remote-control readiness check'
+      fleet_readiness_row "$fleet_readiness_host" roundhouse finding \
+        'native tools are verified by the Codex remote-control contract'
     else
       fleet_readiness_remote_status=0
       fleet_readiness_remote_detail=$(ssh_run "$fleet_readiness_destination" \
@@ -596,16 +613,23 @@ fleet_readiness_command() (
       fi
     fi
 
-    fleet_readiness_ssh_status=0
-    fleet_readiness_ssh_detail=$(/usr/bin/ssh -G "$fleet_readiness_destination" 2>&1) ||
-      fleet_readiness_ssh_status=$?
-    if [ "$fleet_readiness_ssh_status" -eq 0 ] &&
-      printf '%s\n' "$fleet_readiness_ssh_detail" | grep -q '^hostname '; then
-      fleet_readiness_row "$fleet_readiness_host" ssh-name ok \
-        "$fleet_readiness_destination"
-    else
+    if [ "$fleet_readiness_transport" = codex-remote-control ]; then
+      fleet_readiness_codex_host=$(jq -r --arg host "$fleet_readiness_host" \
+        '.machines[$host].codex_host // empty' "$(config_path)")
       fleet_readiness_row "$fleet_readiness_host" ssh-name finding \
-        "SSH cannot resolve $fleet_readiness_destination"
+        "not applicable: Codex remote-control host $fleet_readiness_codex_host is checked by the controller"
+    else
+      fleet_readiness_ssh_status=0
+      fleet_readiness_ssh_detail=$(/usr/bin/ssh -G "$fleet_readiness_destination" 2>&1) ||
+        fleet_readiness_ssh_status=$?
+      if [ "$fleet_readiness_ssh_status" -eq 0 ] &&
+        printf '%s\n' "$fleet_readiness_ssh_detail" | grep -q '^hostname '; then
+        fleet_readiness_row "$fleet_readiness_host" ssh-name ok \
+          "$fleet_readiness_destination"
+      else
+        fleet_readiness_row "$fleet_readiness_host" ssh-name finding \
+          "SSH cannot resolve $fleet_readiness_destination"
+      fi
     fi
 
     if [ "$fleet_readiness_transport" = local ]; then
@@ -635,6 +659,9 @@ fleet_readiness_command() (
         fleet_readiness_row "$fleet_readiness_host" remote-posture finding \
           'remote doctor did not prove a verified-private remote'
       fi
+    elif [ "$fleet_readiness_transport" = codex-remote-control ]; then
+      fleet_readiness_row "$fleet_readiness_host" remote-posture finding \
+        'requires controller-side Codex remote-control readiness evidence'
     else
       fleet_readiness_row "$fleet_readiness_host" remote-posture finding \
         "unsupported transport: $fleet_readiness_transport"

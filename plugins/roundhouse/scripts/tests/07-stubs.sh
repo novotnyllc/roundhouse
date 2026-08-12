@@ -228,6 +228,7 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = install ]; then
   exit 0
 fi
 if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = enable ] || [ "\${2:-}" = disable ]; }; then
+  [ -n "\${CLAUDE_INSTALL_MARKER:-}" ] || exit 64
   exit 0
 fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&

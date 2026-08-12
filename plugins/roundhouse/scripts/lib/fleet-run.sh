@@ -799,6 +799,39 @@ fleet_run_installed_plugin() {
   return 75
 }
 
+fleet_run_plugin_identity_matches() {
+  # fleet_run_plugin_identity_matches DEFS NAME VALUE — compare a resolved
+  # marketplace plugin with the user-scoped installed record before ownership
+  # can turn an already-applied item into `nothing`. Return 0 for matching
+  # bytes/version, 1 for a reinstall, and 75 when the manager cannot prove the
+  # identity.
+  fleet_run_identity_surface=$(fleet_resolve_surface "$1" plugins "$2") || return 75
+  fleet_run_identity_market=$(printf '%s\n' "$3" | jq -r \
+    'if type == "object" then (.marketplace // "") else "" end')
+  [ -n "$fleet_run_identity_market" ] || fleet_run_identity_market=$(printf '%s\n' \
+    "$fleet_run_identity_surface" | jq -r '.marketplace // ""')
+  # An unqualified plugin is resolved by the native harness, so there is no
+  # marketplace SHA to compare here; the existing manager presence path stays
+  # authoritative for that zero-config form.
+  [ -n "$fleet_run_identity_market" ] || return 0
+  command -v claude >/dev/null 2>&1 || return 75
+  fleet_run_identity_id="$2@$fleet_run_identity_market"
+  fleet_run_identity_catalog=$(fleet_run_plugin_catalog "$fleet_run_identity_id") || return 75
+  fleet_run_identity_installed=$(fleet_run_installed_plugin "$fleet_run_identity_id") || return 75
+  fleet_run_identity_sha=$(printf '%s\n' "$fleet_run_identity_catalog" |
+    jq -r '.source.sha // empty')
+  fleet_run_identity_version=$(printf '%s\n' "$fleet_run_identity_catalog" |
+    jq -r '.version // empty')
+  fleet_run_identity_installed_sha=$(printf '%s\n' "$fleet_run_identity_installed" |
+    jq -r '.gitCommitSha // empty')
+  fleet_run_identity_installed_version=$(printf '%s\n' "$fleet_run_identity_installed" |
+    jq -r '.version // empty')
+  printf '%s\n' "$fleet_run_identity_sha" |
+    grep -Eq '^[0-9a-fA-F]{40}$' || return 75
+  [ "$fleet_run_identity_sha" = "$fleet_run_identity_installed_sha" ] &&
+    [ "$fleet_run_identity_version" = "$fleet_run_identity_installed_version" ]
+}
+
 fleet_run_apply_item() {
   # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
@@ -1523,6 +1556,22 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     run_match=no
     [ "$(fleet_applied_digest "$run_store" "$run_host" "$run_item")" != "$run_digest" ] ||
       run_match=yes
+    if [ "$run_category" = plugins ] && [ "$run_in_applied" = yes ] &&
+      [ "$run_match" = yes ]; then
+      run_plugin_identity_status=0
+      fleet_run_plugin_identity_matches "$run_defs" "${run_item#plugins.}" \
+        "$run_value" || run_plugin_identity_status=$?
+      case $run_plugin_identity_status in
+        1) run_match=no ;;
+        75)
+          printf '  hold  %s — installed marketplace identity unavailable\n' "$run_item"
+          fleet_journal_append "$run_store" "$run_host" \
+            "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
+              '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
+          continue
+          ;;
+      esac
+    fi
     # ponytail: on-host observation exists for no category yet (declared
     # boundary B-3), so row 2 reads as row 1 — adopt, which reviews before it
     # applies. Wrong in the safe direction; the dangerous row (not ours, never

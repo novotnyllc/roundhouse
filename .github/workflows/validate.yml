@@ -255,7 +255,7 @@ jobs:
   # into one context. Require `ci-ok` in protection instead of the volatile
   # per-cell contexts — adding or renaming a scope never desyncs the rule.
   ci-ok:
-    needs: [posix, scope-matrix, scoped, windows]
+    needs: [actionlint, posix, scope-matrix, scoped, windows]
     if: always()
     runs-on: ubuntu-latest
     steps:

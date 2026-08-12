@@ -6,7 +6,7 @@
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "e1020a1e35a4746ef12725d7af132eb3a53539107fc65767b4c434004e475520"
+      "sha256": "244f1d80700b2ef8faaba71d2132c853826bc72f2bc56ac569ba750a3e859cef"
     },
     {
       "path": "assets/icon.png",
@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
-      "sha256": "ce91a3730a9f8ae735b4905b4602e7adbff31e95c1541f7cea222d5e4d85ce3c"
+      "sha256": "f041079544968e4d69a7bcfa278374db232472f22d34dbb4fa7c215143b3d69c"
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
@@ -118,7 +118,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "a03eb73c8ffe10c5a032daf8643f9b12e4b675206ca3db9cf44dd17c7d33ee79"
+      "sha256": "15c630258c69d46c3f1f624c7fd7cea905acb3962f7bce7c18e04663aa9c8d66"
     },
     {
       "path": "scripts/lib/fleet-store.sh",

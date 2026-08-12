@@ -111,6 +111,13 @@ YAML
       fail "U22 invalid-host readiness exited $u22_status"
     printf '%s\n' "$u22_invalid" | grep -Fq 'invalid machine name' ||
       fail "U22 readiness did not name invalid machine identity: $u22_invalid"
+    u22_unknown_status=0
+    u22_unknown=$(u20_run "$cli" fleet-readiness missing-host 2>&1) ||
+      u22_unknown_status=$?
+    [ "$u22_unknown_status" -eq 1 ] ||
+      fail "U22 absent-inventory readiness exited $u22_unknown_status"
+    printf '%s\n' "$u22_unknown" | grep -Fq 'absent from inventory' ||
+      fail "U22 readiness did not reject an absent inventory target: $u22_unknown"
 
     # U22: two explicit host arguments are checked independently — "$*"
     # would join them into one space-separated string and check it as a
@@ -126,6 +133,19 @@ YAML
       fail "U22 multi-host readiness did not flag ../unsafe: $u22_multi"
     ! printf '%s\n' "$u22_multi" | grep -Fq 'test-host ../unsafe' ||
       fail "U22 multi-host readiness joined args into one name: $u22_multi"
+
+    # Codex remote-control targets are controller-side app-tool checks. The
+    # shell preflight must expose that state and must not reinterpret the
+    # native Windows target as an SSH target.
+    u22_codex_status=0
+    u22_codex=$(u20_run "$cli" fleet-readiness test-windows 2>&1) ||
+      u22_codex_status=$?
+    [ "$u22_codex_status" -eq 1 ] ||
+      fail "U22 Codex remote-control readiness exited $u22_codex_status"
+    printf '%s\n' "$u22_codex" | grep -Fq 'controller-side Codex remote-control' ||
+      fail "U22 Codex readiness did not require the controller contract: $u22_codex"
+    ! printf '%s\n' "$u22_codex" | grep -Fq 'unsupported transport' ||
+      fail "U22 Codex readiness fell through to unsupported transport: $u22_codex"
 
     u20_doctor_status=0
     u20_doctor=$(u20_run "$cli" fleet-doctor 2>&1) || u20_doctor_status=$?

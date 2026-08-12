@@ -106,12 +106,23 @@ YAML
     printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.2.3\",\"source\":{\"sha\":\"$run_sha_old\"}}]}" >"$run_plugin_catalog"
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_old\"}]}}" >"$run_plugin_installed"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_plugin_identity_matches \
+      "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
+      fail "same-version/same-SHA ownership identity did not match"
+    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "same-SHA plugin apply failed"
     [ ! -s "$run_plugin_install_marker" ] ||
       fail "same-version/same-SHA plugin was reinstalled"
     printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.2.3\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
+    run_identity_status=0
+    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_plugin_identity_matches \
+      "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
+      run_identity_status=$?
+    [ "$run_identity_status" -eq 1 ] ||
+      fail "same-version/new-SHA ownership identity did not require reinstall"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
