@@ -11,7 +11,7 @@ the product story, installation, first-machine flow, and operating scenarios:
 ## Repo-local orientation
 
 - Configuration: `${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/config.json`,
-  overrideable with `ROUNDHOUSE_CONFIG`.
+  overridable with `ROUNDHOUSE_CONFIG`.
 - Install: use the Claude Code or Codex commands in the public site's
   [installation guide](https://novotnyllc.github.io/start/install/).
 - First machine: follow the public site's
