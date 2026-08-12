@@ -1,8 +1,8 @@
 # Third-party notices
 
 roundhouse incorporates the material below. This file is the licensing
-record; [`docs/site/credits.md`](docs/site/credits.md) is the human-facing
-credit page.
+record; the [public credits page](https://novotnyllc.github.io/credits/) is
+the human-facing credit page.
 
 Only *incorporated* material is listed — code or text copied or adapted into
 this repository. The tools roundhouse drives (jj, git, OpenSSH, chezmoi,
