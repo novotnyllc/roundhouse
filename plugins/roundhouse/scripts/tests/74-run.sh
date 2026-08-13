@@ -139,6 +139,7 @@ YAML
     run_plugin_defs='{"plugins":{"example":{"marketplace":"test-market"}}}'
     run_sha_old=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     run_sha_new=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    export CODEX_PLUGIN_SHA=$run_sha_new
     run_plugin_catalog="$run_root/plugin-catalog.json"
     run_plugin_installed="$HOME/.claude/plugins/installed_plugins.json"
     run_plugin_install_marker="$run_root/plugin-installs"
@@ -182,7 +183,8 @@ JSON
       "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
       fail "a failed --available query did not fall back to the marketplace manifest"
     : >"$run_plugin_install_marker"
-    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
+    CODEX_PLUGIN_SHA="$run_sha_old" \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
       CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_plugin_marketplace_file" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
@@ -480,6 +482,32 @@ JSON
       fail "modified-hook refusal attempted a later state verb"
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
       fail "modified-hook refusal wrote Codex hook trust"
+
+    # An untrusted hook is a separate state from modified drift. Matching
+    # Codex bytes do not make a previously untrusted hook safe to stamp during
+    # scheduled convergence; it needs an explicit owner approval.
+    : >"$run_plugin_order_log"
+    rm -f "$CODEX_HOOK_WRITES_FILE"
+    printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.3.0","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    run_status=0
+    CODEX_HOOK_SCENARIO=untrusted \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '{"state":"enabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
+      run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "automatic approval accepted an untrusted Codex hook (got $run_status)"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'update example@test-market' ] ||
+      fail "untrusted-hook refusal did not enter the update ledger"
+    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
+      fail "untrusted-hook refusal attempted a later state verb"
+    [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
+      fail "untrusted-hook refusal wrote Codex hook trust"
 
     # A Claude-only qualified plugin must not turn the absent Codex identity
     # into a held DSC item. The manager update still runs, but there is no

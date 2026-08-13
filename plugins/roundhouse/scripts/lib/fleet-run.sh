@@ -908,6 +908,10 @@ fleet_run_approve_plugin_hooks() {
     *@*) ;;
     *) return 0 ;;
   esac
+  fleet_run_expected_sha=${2:-}
+  [ -z "$fleet_run_expected_sha" ] ||
+    printf '%s\n' "$fleet_run_expected_sha" | grep -Eq '^[0-9a-fA-F]{40}$' ||
+    return 75
   # Claude's marketplace namespace is not proof that Codex owns the same
   # plugin. A Claude-only install has no Codex hook trust state to mutate;
   # asking the helper to approve it would turn a successful Claude apply into
@@ -915,19 +919,25 @@ fleet_run_approve_plugin_hooks() {
   # inability to prove ownership and remains held.
   command -v codex >/dev/null 2>&1 || return 0
   fleet_run_codex_plugins=$(codex plugin list --json 2>/dev/null) || return 75
-  printf '%s\n' "$fleet_run_codex_plugins" | jq -e --arg id "$1" '
+  fleet_run_codex_plugin_state=$(printf '%s\n' "$fleet_run_codex_plugins" | jq -e -r \
+    --arg id "$1" --arg expected_sha "$fleet_run_expected_sha" '
     def records:
       if type == "array" then .
       elif type == "object" and (.installed | type == "array") then .installed
       else error("invalid plugin list")
       end;
-    any(records[]; (.pluginId // .id) == $id and (.installed != false))
-  ' >/dev/null 2>&1
-  fleet_run_codex_plugins_status=$?
-  [ "$fleet_run_codex_plugins_status" -eq 0 ] || {
-    [ "$fleet_run_codex_plugins_status" -eq 1 ] && return 0
-    return 75
-  }
+    [records[] | select((.pluginId // .id) == $id and (.installed != false))] as $matches |
+      if ($matches | length) == 0 then "absent"
+      elif $expected_sha == "" or any($matches[]; .source.sha == $expected_sha)
+      then "match"
+      else "mismatch"
+      end
+  ' 2>/dev/null) || return 75
+  case "$fleet_run_codex_plugin_state" in
+    absent) return 0 ;;
+    match) ;;
+    *) return 75 ;;
+  esac
   fleet_run_hooks_node=$(fleet_node_path) || {
     printf 'roundhouse: Node.js is required to approve hooks for %s\n' "$1" >&2
     return 75
@@ -1076,6 +1086,7 @@ fleet_run_apply_item() {
       fleet_run_want_enabled=false
       [ "$(fleet_run_state_of "$5")" = enabled ] && fleet_run_want_enabled=true
       fleet_run_plugin_mutated=false
+      fleet_run_resolved_sha=
       if [ -n "$fleet_run_market" ]; then
         fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id") || return 75
         fleet_run_resolved_sha=$(printf '%s\n' "$fleet_run_catalog" |
@@ -1113,7 +1124,8 @@ fleet_run_apply_item() {
             [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
               = "$fleet_run_resolved_version" ] || return 75
           if [ "$fleet_run_want_enabled" = true ]; then
-            fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+            fleet_run_approve_plugin_hooks "$fleet_run_id" \
+              "$fleet_run_resolved_sha" || return 75
           fi
           fleet_run_plugin_mutated=true
         fi
@@ -1160,7 +1172,8 @@ fleet_run_apply_item() {
       if [ "$fleet_run_want_enabled" = true ] &&
         [ "$fleet_run_enable_attempted" = true ] &&
         [ "$fleet_run_enable_status" -eq 0 ]; then
-        fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+        fleet_run_approve_plugin_hooks "$fleet_run_id" \
+          "${fleet_run_resolved_sha:-}" || return 75
       fi
       ;;
     skills)

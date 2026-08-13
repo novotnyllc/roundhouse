@@ -122,7 +122,7 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
         modified_status=modified
         removed_status=trusted
         untrusted_status=untrusted
-        if [ "$scenario" = approve ] || [ "$scenario" = auto-approve ]; then
+        if [ "$scenario" = approve ]; then
           trusted_status=untrusted
           modified_status=modified
           removed_status=untrusted
@@ -133,14 +133,30 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
             removed_status=trusted
             untrusted_status=trusted
           }
+        elif [ "$scenario" = auto-approve ]; then
+          # This is the post-install identity-verified state. Automatic
+          # approval may refresh the trust hashes, but it must never be the
+          # first owner decision for an untrusted hook.
+          trusted_status=trusted
+          modified_status=trusted
+          removed_status=trusted
+          untrusted_status=trusted
+        elif [ "$scenario" = untrusted ]; then
+          # Keep exactly one untrusted hook so the automatic guard is tested
+          # independently from locally modified drift.
+          trusted_status=trusted
+          modified_status=trusted
+          removed_status=trusted
         elif [ "$version" = 1.3.0 ] && [ -f "$writes" ]; then
           grep -q 'stable-trusted' "$writes" && trusted_status=trusted
           grep -q 'stable-modified' "$writes" && modified_status=trusted
         fi
         if [ "$version" = 1.3.0 ]; then
           stop_status=untrusted
-          [ "$scenario" != approve ] && [ "$scenario" != auto-approve ] ||
-            [ ! -f "$writes" ] || stop_status=trusted
+          if [ "$scenario" = auto-approve ] || [ "$scenario" = untrusted ] ||
+            { [ "$scenario" = approve ] && [ -f "$writes" ]; }; then
+            stop_status=trusted
+          fi
           hooks=$(jq -cn \
             --arg trusted "$trusted_status" --arg modified "$modified_status" \
             --arg untrusted "$untrusted_status" --arg stop "$stop_status" '[
@@ -189,7 +205,8 @@ if [ "${1:-}" = plugin ] && [ "${2:-}" = list ] && [ "${3:-}" = --json ]; then
     printf '%s\n' '{"installed":[{"pluginId":"broken@test-market","name":"broken","marketplaceName":"test-market","version":7,"installed":true,"enabled":"yes"}]}'
     exit 0
   }
-  printf '{"installed":[{"pluginId":"example@test-market","name":"example","marketplaceName":"test-market","version":"%s","installed":true,"enabled":true,"source":{"source":"local","path":"fixture-codex-active"}},{"pluginId":"disabled-example@test-market","name":"disabled-example","marketplaceName":"test-market","version":"3.0.0","installed":true,"enabled":false,"source":{"source":"local","path":"fixture-codex-disabled"}}]}\n' "$version"
+  codex_plugin_sha="${CODEX_PLUGIN_SHA:-}"
+  printf '{"installed":[{"pluginId":"example@test-market","name":"example","marketplaceName":"test-market","version":"%s","installed":true,"enabled":true,"source":{"source":"local","path":"fixture-codex-active","sha":"%s"}},{"pluginId":"disabled-example@test-market","name":"disabled-example","marketplaceName":"test-market","version":"3.0.0","installed":true,"enabled":false,"source":{"source":"local","path":"fixture-codex-disabled"}}]}\n' "$version" "$codex_plugin_sha"
   exit 0
 fi
 if [ "${1:-}" = plugin ] && [ "${2:-}" = add ] &&

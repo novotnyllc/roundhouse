@@ -26,8 +26,9 @@ Changes under `plugins/` ship to installed fleets. They couple to a release:
    whose desired state is enabled must invoke
    `scripts/codex-plugin-hooks.mjs approve PLUGIN@MARKETPLACE` immediately
    afterward. A disabled desired state must not mutate Codex hook trust; a
-   locally modified Codex hook makes automatic approval refuse and hold the
-   item until it is repaired or explicitly approved; a
+   Codex source identity mismatch, untrusted hook, or locally modified Codex
+   hook makes automatic approval refuse and hold the item until the Codex copy
+   is refreshed/repaired or the hook is explicitly approved; a
    steady-state enabled no-op must not invoke the manager verb or re-approve
    locally modified hooks. Claude-only plugins have no Codex hook state and are
    explicitly skipped after the ownership check. Keep the Node/login-shell

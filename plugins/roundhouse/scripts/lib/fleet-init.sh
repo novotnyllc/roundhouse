@@ -1459,7 +1459,14 @@ fleet_reroot_command() (
       fleet-reroot "$reroot_head" || exit $?
   reroot_ref=$(fleet_trust_archive_ref "$(date -u +%Y%m%d)")
   git -C "$reroot_store" update-ref "$reroot_ref" "$reroot_head" || exit 65
-  git -C "$reroot_store" push origin "$reroot_ref:$reroot_ref" >/dev/null 2>&1 || {
+  # Publish the archive and assert that the fetched origin main is still the
+  # value this preflight covered. The no-op main refspec is intentional: with
+  # --atomic, a concurrent main advance rejects the whole transaction and the
+  # archive cannot strand a host behind an unseen reviewed commit.
+  git -C "$reroot_store" push --atomic \
+    --force-with-lease="refs/heads/main:$reroot_origin_head" origin \
+    "$reroot_ref:$reroot_ref" \
+    "$reroot_origin_head:refs/heads/main" >/dev/null 2>&1 || {
     printf 'roundhouse: the archive ref did not publish; REFUSING to re-root — without it every offline host reads this as a rollback attack and holds\n' >&2
     git -C "$reroot_store" update-ref -d "$reroot_ref" 2>/dev/null || :
     exit 65

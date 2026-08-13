@@ -142,6 +142,13 @@ if [ -n "$fleet_fixture_yq" ]; then
     printf '%s\n' "$guard_reroot_body" | grep -q \
       'fleet_vcs_fetch.*origin' ||
       fail "fleet-reroot does not refresh origin before archiving"
+    printf '%s\n' "$guard_reroot_body" | grep -q -- '--atomic' ||
+      fail "fleet-reroot does not publish the archive atomically"
+    printf '%s\n' "$guard_reroot_body" | grep -q -- '--force-with-lease' ||
+      fail "fleet-reroot does not lease the fetched origin main"
+    printf '%s\n' "$guard_reroot_body" | grep -q \
+      'reroot_origin_head:refs/heads/main' ||
+      fail "fleet-reroot archive publication is not bound to fetched main"
     printf '%s\n' "$guard_reroot_body" | grep -q \
       'origin main .*not covered by checkpoint' ||
       fail "fleet-reroot does not refuse a stale checkpoint"
