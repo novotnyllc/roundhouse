@@ -1072,6 +1072,8 @@ fleet_run_apply_item() {
       fleet_run_id=$fleet_run_name
       [ -z "$fleet_run_market" ] ||
         fleet_run_id="$fleet_run_name@$fleet_run_market"
+      fleet_run_want_enabled=false
+      [ "$(fleet_run_state_of "$5")" = enabled ] && fleet_run_want_enabled=true
       fleet_run_plugin_mutated=false
       if [ -n "$fleet_run_market" ]; then
         fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id") || return 75
@@ -1109,12 +1111,16 @@ fleet_run_apply_item() {
             = "$fleet_run_resolved_sha" ] &&
             [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
               = "$fleet_run_resolved_version" ] || return 75
-          fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+          if [ "$fleet_run_want_enabled" = true ]; then
+            fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+          fi
           fleet_run_plugin_mutated=true
         fi
       else
         claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
-        fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+        if [ "$fleet_run_want_enabled" = true ]; then
+          fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+        fi
         fleet_run_plugin_mutated=true
       fi
       # State-verb status is not convergence: read it before attempting the
@@ -1130,8 +1136,7 @@ fleet_run_apply_item() {
         fleet_run_before_enabled=$(fleet_run_plugin_enabled "$fleet_run_id" true) ||
           return 75
       }
-      if [ "$(fleet_run_state_of "$5")" = enabled ]; then
-        fleet_run_want_enabled=true
+      if [ "$fleet_run_want_enabled" = true ]; then
         if [ "$fleet_run_plugin_mutated" = true ] ||
           [ "$fleet_run_before_enabled" != true ]; then
           fleet_run_enable_attempted=true

@@ -433,6 +433,29 @@ JSON
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
       fail "steady-state enable re-trusted a locally modified hook"
 
+    # A disabled desired state must not approve an independently enabled Codex
+    # copy just because Claude refreshed its stale installation. The later
+    # enable transition is the point at which hook trust becomes active.
+    : >"$run_plugin_order_log"
+    rm -f "$CODEX_HOOK_WRITES_FILE"
+    printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.3.0","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    CODEX_HOOK_SCENARIO=approve \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '{"state":"disabled","marketplace":"test-market"}' '' >/dev/null ||
+      fail "disabled stale plugin apply failed"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'update example@test-market' ] ||
+      fail "disabled stale plugin did not enter the update ledger"
+    ! grep -qx approve "$run_plugin_order_log" ||
+      fail "disabled desired state approved Codex hooks during refresh"
+    [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
+      fail "disabled desired state wrote Codex hook trust during refresh"
+
     # A Claude-only qualified plugin must not turn the absent Codex identity
     # into a held DSC item. The manager update still runs, but there is no
     # Codex approval ledger entry to write.
