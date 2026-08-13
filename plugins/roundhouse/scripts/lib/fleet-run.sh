@@ -1166,12 +1166,14 @@ fleet_run_apply_item() {
       fi
       fleet_run_actual_enabled=$(fleet_run_plugin_enabled "$fleet_run_id") || return 75
       [ "$fleet_run_actual_enabled" = "$fleet_run_want_enabled" ] || return 75
-      # Approval follows a verified state transition. Install/update approval
-      # above covers byte changes; a steady-state enable is not a mutation and
-      # must not launder a locally modified hook.
+      # Approval follows the verified post-state, not the manager's exit code.
+      # Some native managers write enabled state and then return nonzero; the
+      # before/after read is the authoritative transition proof. Install/update
+      # approval above covers byte changes; a steady-state enable is not a
+      # mutation and must not launder a locally modified hook.
       if [ "$fleet_run_want_enabled" = true ] &&
         [ "$fleet_run_enable_attempted" = true ] &&
-        [ "$fleet_run_enable_status" -eq 0 ]; then
+        [ "$fleet_run_actual_enabled" = true ]; then
         fleet_run_approve_plugin_hooks "$fleet_run_id" \
           "${fleet_run_resolved_sha:-}" || return 75
       fi

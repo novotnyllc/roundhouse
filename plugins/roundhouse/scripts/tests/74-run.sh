@@ -385,6 +385,31 @@ JSON
       fail "plugin enable did not enter the honest action ledger"
     [ "$(sed -n '4p' "$run_plugin_order_log")" = approve ] ||
       fail "hook approval did not follow the plugin enable"
+
+    # A native manager may persist the enabled state and then report a
+    # nonzero exit. The verified post-state must still trigger approval and
+    # let the apply path finish with an honest ledger.
+    : >"$run_plugin_order_log"
+    rm -f "$CODEX_HOOK_WRITES_FILE"
+    printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.2.3","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":false}' >"$run_plugin_enabled_file"
+    CLAUDE_ENABLE_EXIT_AFTER_STATE=1 \
+      CODEX_HOOK_SCENARIO=auto-approve \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null ||
+      fail "post-state enable approval did not survive manager refusal"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'enable example@test-market' ] ||
+      fail "post-state enable did not enter the honest action ledger"
+    [ "$(sed -n '2p' "$run_plugin_order_log")" = approve ] ||
+      fail "post-state enable did not trigger hook approval"
+    [ -s "$CODEX_HOOK_WRITES_FILE" ] ||
+      fail "post-state enable approval did not write Codex hook trust"
+
     : >"$run_plugin_install_marker"
     printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.3.0\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"

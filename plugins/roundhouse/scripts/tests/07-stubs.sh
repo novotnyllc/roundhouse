@@ -325,6 +325,9 @@ if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = enable ] || [ "\${2:-}" = disable ]
   [ "\$current" != "\$want" ] || exit 1
   jq -c --arg id "\$ledger_id" --argjson v "\$want" '.[\$id] = \$v' "\$enabled_file" \
     >"\$enabled_file.tmp" 2>/dev/null && mv "\$enabled_file.tmp" "\$enabled_file" || exit 1
+  if [ "\$2" = enable ] && [ "\${CLAUDE_ENABLE_EXIT_AFTER_STATE:-0}" = 1 ]; then
+    exit 75
+  fi
   exit 0
 fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
