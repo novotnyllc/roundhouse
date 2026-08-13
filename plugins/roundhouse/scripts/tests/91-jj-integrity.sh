@@ -899,6 +899,20 @@ YAML
       export ROUNDHOUSE_FLEET_SIGNING_KEY="$rjj/compose-key"
       export ROUNDHOUSE_TRUST_ROOT="$compose_root"
       export ROUNDHOUSE_SELFTEST=1
+      printf 'pending supervised mutation\n' >"$compose_store/supervised-pending.txt"
+      compose_dirty_status=0
+      compose_dirty_out=$("$cli" fleet-checkpoint 2>&1) ||
+        compose_dirty_status=$?
+      [ "$compose_dirty_status" -ne 0 ] ||
+        fail "fleet-checkpoint discarded a nonempty jj working copy"
+      case $compose_dirty_out in
+        *'nonempty jj working copy'*) ;;
+        *) fail "dirty working-copy refusal was not explicit: $compose_dirty_out" ;;
+      esac
+      [ -f "$compose_store/supervised-pending.txt" ] ||
+        fail "dirty working-copy refusal discarded the pending mutation"
+      rm -f "$compose_store/supervised-pending.txt"
+      jj -R "$compose_store" new "$compose_genesis" >/dev/null
       "$cli" fleet-checkpoint >"$compose_root/checkpoint.out" ||
         fail "fleet-checkpoint could not stage the diverged-store fixture"
       compose_tag=$(git -C "$compose_store" tag --list 'rh-checkpoint-*' | head -1)

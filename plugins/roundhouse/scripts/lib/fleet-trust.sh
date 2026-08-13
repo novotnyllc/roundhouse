@@ -969,11 +969,33 @@ fleet_trust_authority_receipt_verify_and_consume() {
   # only after every check above succeeds; replay sees the existing directory
   # and cannot replace or reuse the consumed artifact.
   fleet_trust_receipt_consumed="$fleet_trust_receipt_root/consumed"
-  mkdir -p "$fleet_trust_receipt_consumed"
-  chmod 700 "$fleet_trust_receipt_consumed"
+  if [ -e "$fleet_trust_receipt_consumed" ] ||
+    [ -L "$fleet_trust_receipt_consumed" ]; then
+    check_safe_owned_path "$fleet_trust_receipt_consumed" \
+      'consumed authority receipt directory' directory >/dev/null 2>&1 || {
+      printf 'roundhouse: consumed authority receipt directory is unsafe\n' >&2
+      return 65
+    }
+  else
+    mkdir "$fleet_trust_receipt_consumed" || {
+      printf 'roundhouse: could not create consumed authority receipt directory\n' >&2
+      return 65
+    }
+  fi
+  chmod 700 "$fleet_trust_receipt_consumed" || {
+    printf 'roundhouse: could not secure consumed authority receipt directory\n' >&2
+    return 65
+  }
   check_safe_owned_path "$fleet_trust_receipt_consumed" \
     'consumed authority receipt directory' directory >/dev/null 2>&1 || {
     printf 'roundhouse: consumed authority receipt directory is unsafe\n' >&2
+    return 65
+  }
+  fleet_trust_receipt_mode=$(file_mode "$fleet_trust_receipt_consumed")
+  fleet_trust_receipt_permissions=$(printf '%s' "$fleet_trust_receipt_mode" |
+    sed 's/.*\(...\)$/\1/')
+  [ "$(printf '%s' "$fleet_trust_receipt_permissions" | cut -c 2-3)" = 00 ] || {
+    printf 'roundhouse: consumed authority receipt directory must be owner-only\n' >&2
     return 65
   }
   fleet_trust_receipt_claim="$fleet_trust_receipt_consumed/$fleet_trust_receipt_ref"
@@ -981,7 +1003,25 @@ fleet_trust_authority_receipt_verify_and_consume() {
     printf 'roundhouse: authority receipt has already been consumed\n' >&2
     return 65
   }
-  chmod 700 "$fleet_trust_receipt_claim"
+  chmod 700 "$fleet_trust_receipt_claim" || {
+    rmdir "$fleet_trust_receipt_claim" 2>/dev/null || :
+    printf 'roundhouse: could not secure consumed authority receipt claim\n' >&2
+    return 65
+  }
+  check_safe_owned_path "$fleet_trust_receipt_claim" \
+    'consumed authority receipt claim' directory >/dev/null 2>&1 || {
+    rmdir "$fleet_trust_receipt_claim" 2>/dev/null || :
+    printf 'roundhouse: consumed authority receipt claim is unsafe\n' >&2
+    return 65
+  }
+  fleet_trust_receipt_mode=$(file_mode "$fleet_trust_receipt_claim")
+  fleet_trust_receipt_permissions=$(printf '%s' "$fleet_trust_receipt_mode" |
+    sed 's/.*\(...\)$/\1/')
+  [ "$(printf '%s' "$fleet_trust_receipt_permissions" | cut -c 2-3)" = 00 ] || {
+    rmdir "$fleet_trust_receipt_claim" 2>/dev/null || :
+    printf 'roundhouse: consumed authority receipt claim must be owner-only\n' >&2
+    return 65
+  }
   if ! mv "$fleet_trust_receipt_path" \
     "$fleet_trust_receipt_claim/receipt.json"; then
     rmdir "$fleet_trust_receipt_claim" 2>/dev/null || :

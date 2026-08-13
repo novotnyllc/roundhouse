@@ -1283,6 +1283,14 @@ fleet_checkpoint_command() (
   fleet_vcs_store_ready "$ckpt_store" || exit $?
   ckpt_host=$(fleet_host_name)
   ckpt_head=$(fleet_vcs_heads_local "$ckpt_store" | head -1)
+  ckpt_working_copy_empty=$(jj -R "$ckpt_store" log -r @ --no-graph -T 'empty' 2>/dev/null) || {
+    printf 'roundhouse: could not inspect the jj working copy before checkpointing\n' >&2
+    exit 65
+  }
+  [ "$ckpt_working_copy_empty" = true ] || {
+    printf 'roundhouse: checkpoint refuses a nonempty jj working copy; publish or reconcile it first\n' >&2
+    exit 65
+  }
   # `@` may be jj's empty working-copy child on an older line while `main`
   # carries an unpushed local head. Stage the checkpoint on the selected
   # bookmark head before fleet_enroll_commit describes @; otherwise the

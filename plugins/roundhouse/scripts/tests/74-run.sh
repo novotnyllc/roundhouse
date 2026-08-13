@@ -388,6 +388,28 @@ JSON
     grep -qx 'example@test-market' "$run_plugin_install_marker" ||
       fail "version-advance plugin was not reinstalled"
 
+    # The manager can report success while leaving the old record in place;
+    # the identity re-read must hold before any Codex hook trust mutation.
+    : >"$run_plugin_order_log"
+    : >"$run_plugin_install_marker"
+    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.4.0\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.3.0\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
+    run_status=0
+    CLAUDE_INSTALL_SKIP_RECORD=1 \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "a stale post-update identity did not hold (got $run_status)"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'update example@test-market' ] ||
+      fail "the stale post-update case did not enter the update ledger"
+    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
+      fail "hook approval ran before stale post-update identity was rejected"
+
     # U23 regression: a plugin never installed before has no record at all
     # (no installed_plugins.json, or no entry for its id) — that is an empty
     # identity requiring install, not a malformed-metadata hold.
