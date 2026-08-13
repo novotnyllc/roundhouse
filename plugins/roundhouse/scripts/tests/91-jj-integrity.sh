@@ -923,6 +923,29 @@ YAML
         -T commit_id 2>/dev/null)" ] ||
         fail "the checkpoint was not staged on the unpushed local main line"
 
+      # A later reviewed commit cannot be hidden by archiving the older
+      # checkpoint. Reroot must refuse until that newer line is checkpointed;
+      # this leaves the archive chain's reviewed-ref -> checkpoint proof
+      # complete while still allowing a sibling-diverged main below.
+      jj -R "$compose_store" new "$compose_checkpoint" >/dev/null
+      printf 'packages:\n  probe: post-checkpoint\n' >"$compose_store/fleet.yaml"
+      jj -R "$compose_store" describe -r @ -m 'post-checkpoint reviewed line' >/dev/null
+      compose_post_checkpoint=$(jj -R "$compose_store" log -r @ --no-graph -T commit_id)
+      jj -R "$compose_store" bookmark set main -r "$compose_post_checkpoint" \
+        --allow-backwards >/dev/null
+      jj -R "$compose_store" new "$compose_genesis" >/dev/null
+      compose_post_status=0
+      compose_post_out=$("$cli" fleet-reroot 2>&1) || compose_post_status=$?
+      [ "$compose_post_status" -ne 0 ] ||
+        fail "fleet-reroot hid a reviewed commit after its checkpoint"
+      case $compose_post_out in
+        *'advanced beyond checkpoint'*) ;;
+        *) fail "post-checkpoint reroot refusal was not explicit: $compose_post_out" ;;
+      esac
+      jj -R "$compose_store" bookmark set main -r "$compose_checkpoint" \
+        --allow-backwards >/dev/null
+      jj -R "$compose_store" new "$compose_genesis" >/dev/null
+
       # Move main to a sibling local line and leave @ as an empty, untagged
       # working-copy head. The checkpoint remains the only immutable anchor.
       jj -R "$compose_store" new "$compose_genesis" >/dev/null

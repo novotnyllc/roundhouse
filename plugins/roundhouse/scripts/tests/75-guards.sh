@@ -71,17 +71,33 @@ if [ -n "$fleet_fixture_yq" ]; then
       chmod 600 "$guard_receipt_root/$guard_receipt_id.json"
     }
     guard_reroot_receipt=receipt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    guard_receipt_write "$guard_reroot_receipt" '{"command":"fleet-reroot"}'
+    guard_reroot_checkpoint=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    guard_receipt_write "$guard_reroot_receipt" \
+      "{\"checkpoint\":\"$guard_reroot_checkpoint\",\"command\":\"fleet-reroot\"}"
     fleet_trust_authority_receipt_verify_and_consume \
-      "$guard_reroot_receipt" fleet-reroot ||
+      "$guard_reroot_receipt" fleet-reroot "$guard_reroot_checkpoint" ||
       fail "a valid reroot authority receipt was refused"
     [ -f "$guard_receipt_root/consumed/$guard_reroot_receipt/receipt.json" ] ||
       fail "a valid authority receipt was not atomically consumed"
     guard_status=0
     fleet_trust_authority_receipt_verify_and_consume \
-      "$guard_reroot_receipt" fleet-reroot >/dev/null 2>&1 || guard_status=$?
+      "$guard_reroot_receipt" fleet-reroot "$guard_reroot_checkpoint" \
+      >/dev/null 2>&1 || guard_status=$?
     [ "$guard_status" -ne 0 ] ||
       fail "a consumed authority receipt was replayed"
+
+    guard_reroot_drift_receipt=receipt_dddddddddddddddddddddddddddddddd
+    guard_receipt_write "$guard_reroot_drift_receipt" \
+      '{"checkpoint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","command":"fleet-reroot"}'
+    guard_status=0
+    fleet_trust_authority_receipt_verify_and_consume \
+      "$guard_reroot_drift_receipt" fleet-reroot \
+      cccccccccccccccccccccccccccccccccccccccc >/dev/null 2>&1 ||
+      guard_status=$?
+    [ "$guard_status" -ne 0 ] ||
+      fail "a reroot receipt bound to one checkpoint was accepted for another"
+    [ -f "$guard_receipt_root/$guard_reroot_drift_receipt.json" ] ||
+      fail "a checkpoint-drift receipt was consumed"
 
     guard_target_receipt=receipt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     guard_receipt_write "$guard_target_receipt" \
@@ -94,7 +110,8 @@ if [ -n "$fleet_fixture_yq" ]; then
       fail "a receipt bound to one remove target was accepted for another"
 
     guard_expired_receipt=receipt_cccccccccccccccccccccccccccccccc
-    guard_receipt_write "$guard_expired_receipt" '{"command":"fleet-reroot"}' \
+    guard_receipt_write "$guard_expired_receipt" \
+      '{"checkpoint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","command":"fleet-reroot"}' \
       2020-01-01T00:00:00Z 2020-01-01T01:00:00Z
     guard_status=0
     fleet_trust_authority_receipt_verify_and_consume \

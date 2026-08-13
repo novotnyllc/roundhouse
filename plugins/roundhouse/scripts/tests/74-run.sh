@@ -410,6 +410,25 @@ JSON
     [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
       fail "hook approval ran before stale post-update identity was rejected"
 
+    # A Claude-only qualified plugin must not turn the absent Codex identity
+    # into a held DSC item. The manager update still runs, but there is no
+    # Codex approval ledger entry to write.
+    : >"$run_plugin_order_log"
+    : >"$run_plugin_install_marker"
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.3.0\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
+    run_status=0
+    CODEX_HOOK_SCENARIO=not-installed \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 0 ] ||
+      fail "a Claude-only plugin was held by absent Codex ownership (got $run_status)"
+    ! grep -qx approve "$run_plugin_order_log" ||
+      fail "a Claude-only plugin attempted Codex hook approval"
+
     # U23 regression: a plugin never installed before has no record at all
     # (no installed_plugins.json, or no entry for its id) — that is an empty
     # identity requiring install, not a malformed-metadata hold.

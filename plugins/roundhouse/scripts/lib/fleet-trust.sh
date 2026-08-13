@@ -888,7 +888,7 @@ fleet_trust_authority_receipt_verify_and_consume() {
     return 65
   }
   case $fleet_trust_receipt_command in
-    fleet-reroot) [ -z "$fleet_trust_receipt_target" ] || return 65 ;;
+    fleet-reroot) [ -n "$fleet_trust_receipt_target" ] || return 65 ;;
     fleet-remove) [ -n "$fleet_trust_receipt_target" ] || return 65 ;;
     *) return 65 ;;
   esac
@@ -931,8 +931,8 @@ fleet_trust_authority_receipt_verify_and_consume() {
       (.instructionDigest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
       (.action | type == "object") and
       (if $command == "fleet-reroot" then
-        ((.action | keys_unsorted | sort) == ["command"] and
-          .action.command == $command)
+        ((.action | keys_unsorted | sort) == ["checkpoint", "command"] and
+          .action.command == $command and .action.checkpoint == $target)
        else
         ((.action | keys_unsorted | sort) == ["burn", "command", "target"] and
           .action.command == $command and .action.target == $target and

@@ -22,10 +22,11 @@ Changes under `plugins/` ship to installed fleets. They couple to a release:
    and `.agents/plugins/plugin-versions.json` — and verifies them. Do not
    hand-edit those files.
 4. Keep plugin lifecycle trust coupled to the bytes: every DSC `install`,
-   `update`, or `enable` path must invoke
+   `update`, or `enable` path for a Codex-owned qualified plugin must invoke
    `scripts/codex-plugin-hooks.mjs approve PLUGIN@MARKETPLACE` immediately
-   afterward, with the Node/login-shell requirement and native-Windows Node
-   gap documented in `fleet-update`.
+   afterward. Claude-only plugins have no Codex hook state and are explicitly
+   skipped after the ownership check. Keep the Node/login-shell requirement
+   and native-Windows Node gap documented in `fleet-update`.
 
 Never treat an installed plugin cache as the source repository.
 

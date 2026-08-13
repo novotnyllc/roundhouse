@@ -86,8 +86,11 @@ already current.
 After every plugin `install`, `update`, or `enable` operation performed by the
 DSC apply path, immediately run
 `scripts/codex-plugin-hooks.mjs approve PLUGIN@MARKETPLACE` and verify its
-result before journaling the item as applied. This is the automatic local hook
-trust step for fresh and changed hook hashes; it is not a copied settings table.
+result before journaling the item as applied when Codex owns that qualified
+plugin. The apply path checks Codex's installed-plugin list first; a Claude-only
+plugin has no Codex hook state and skips the helper rather than becoming a
+false hold. This is the automatic local hook trust step for fresh and changed
+hook hashes; it is not a copied settings table.
 On POSIX schedulers, invoke the CLI through the user's login shell or provide a
 PATH containing the harnesses and Node.js. The runtime also checks the standard
 Homebrew Node locations on macOS. The native Windows helper still requires

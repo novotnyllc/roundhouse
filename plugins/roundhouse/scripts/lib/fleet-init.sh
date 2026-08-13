@@ -1386,9 +1386,21 @@ fleet_reroot_command() (
     printf 'roundhouse: re-root starts from a tagged checkpoint; run `roundhouse fleet-checkpoint` first (§7.11.2 step 1)\n' >&2
     exit 65
   }
+  # The archive verifier proves the reviewed-ref -> checkpoint chain. Do not
+  # hide a newer reviewed main commit behind an older root; checkpoint that
+  # line again. A sibling-diverged main is deliberately allowed below.
+  reroot_main_head=$(fleet_vcs_heads_local "$reroot_store" | head -1)
+  if [ -n "$reroot_main_head" ] &&
+    [ -n "$(jj -R "$reroot_store" log \
+      -r "$reroot_head:: & ::$reroot_main_head ~ $reroot_head" \
+      --no-graph -T commit_id 2>/dev/null)" ]; then
+    printf 'roundhouse: local main advanced beyond checkpoint %s; run fleet-checkpoint again before re-rooting\n' \
+      "$reroot_head" >&2
+    exit 65
+  fi
   [ -z "$reroot_receipt" ] ||
     fleet_trust_authority_receipt_verify_and_consume "$reroot_receipt" \
-      fleet-reroot || exit $?
+      fleet-reroot "$reroot_head" || exit $?
   reroot_ref=$(fleet_trust_archive_ref "$(date -u +%Y%m%d)")
   git -C "$reroot_store" update-ref "$reroot_ref" "$reroot_head" || exit 65
   git -C "$reroot_store" push origin "$reroot_ref:$reroot_ref" >/dev/null 2>&1 || {

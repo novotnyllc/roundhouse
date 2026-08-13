@@ -904,6 +904,26 @@ fleet_run_approve_plugin_hooks() {
     *@*) ;;
     *) return 0 ;;
   esac
+  # Claude's marketplace namespace is not proof that Codex owns the same
+  # plugin. A Claude-only install has no Codex hook trust state to mutate;
+  # asking the helper to approve it would turn a successful Claude apply into
+  # a false hold. If Codex is present, a malformed/failed list is a real
+  # inability to prove ownership and remains held.
+  command -v codex >/dev/null 2>&1 || return 0
+  fleet_run_codex_plugins=$(codex plugin list --json 2>/dev/null) || return 75
+  printf '%s\n' "$fleet_run_codex_plugins" | jq -e --arg id "$1" '
+    def records:
+      if type == "array" then .
+      elif type == "object" and (.installed | type == "array") then .installed
+      else error("invalid plugin list")
+      end;
+    any(records[]; (.pluginId // .id) == $id and (.installed != false))
+  ' >/dev/null 2>&1
+  fleet_run_codex_plugins_status=$?
+  [ "$fleet_run_codex_plugins_status" -eq 0 ] || {
+    [ "$fleet_run_codex_plugins_status" -eq 1 ] && return 0
+    return 75
+  }
   fleet_run_hooks_node=$(fleet_node_path) || {
     printf 'roundhouse: Node.js is required to approve hooks for %s\n' "$1" >&2
     return 75

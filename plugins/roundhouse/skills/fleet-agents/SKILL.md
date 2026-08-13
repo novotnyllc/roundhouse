@@ -424,7 +424,7 @@ The receipt is a JSON file at the host-local, owner-only
   "schema": "roundhouse/authority-receipt/v1",
   "receiptId": "receipt_<32 lowercase hex>",
   "authorityId": "bounded opaque id",
-  "action": {"command": "fleet-reroot"},
+  "action": {"checkpoint": "<selected checkpoint commit>", "command": "fleet-reroot"},
   "actionDigest": "sha256:<64 lowercase hex>",
   "objectiveDigest": "sha256:<64 lowercase hex>",
   "instructionDigest": "sha256:<64 lowercase hex>",
@@ -473,7 +473,9 @@ byte-for-byte indistinguishable from a rollback attack except by the archive: a
 host offline across one finds its monotonic `reviewed-ref` is not an ancestor of
 the new root, which the rollback rule says to treat as an attack, hold and alert.
 That behaviour is correct and is not softened. `fleet-reroot` refuses to proceed
-if the archive ref does not publish.
+if local `main` has advanced beyond the selected checkpoint or if the archive
+ref does not publish. Take another checkpoint first; a sibling-diverged local
+line and jj's empty working-copy child are the supported recovery shape.
 
 Three things would grow forever and each gets its **own** lever: expired leaf
 entries are pruned on the existing 12 h full pass; evidence (`journal/`,
