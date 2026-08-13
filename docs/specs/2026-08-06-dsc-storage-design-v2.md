@@ -157,8 +157,8 @@ store/
                                            # trusted at the PARENT commit.
   joins/<host>.yaml                        # inert enrollment requests (§7.3a B)
   checkpoints/<epoch>.yaml                 # signed roster+state snapshots (§7.11)
-  definitions.yaml                         # logical name -> concrete artifact,
-                                           # keyed by category (packages/plugins/
+  definitions.yaml plus optional           # logical name -> concrete artifact,
+  definitions/*.yaml                       # keyed by category (packages/plugins/
                                            # skills). DEFINITIONS, not desired
                                            # state: fleet-wide, outside the fold,
                                            # exceptions only. §5.1
@@ -189,7 +189,7 @@ thing in the shipped tree and its consumers (`fleet-inventory`) collect live.
 
 | Kind | Paths | Concurrent-write behaviour |
 |---|---|---|
-| Hand-edited, fleet-shared | the four layers, `trust/signers.yaml`, `definitions.yaml`, `lineage/`, `proposals/`, `checkpoints/` | jj line-merge; contested keys become a conflict the run's **agent** resolves from evidence (§8.2b), escalating to a human only when both sides are deliberate human edits |
+| Hand-edited, fleet-shared | the four layers, `trust/signers.yaml`, `definitions.yaml` plus optional `definitions/*.yaml`, `lineage/`, `proposals/`, `checkpoints/` | jj line-merge; contested keys become a conflict the run's **agent** resolves from evidence (§8.2b), escalating to a human only when both sides are deliberate human edits |
 | Machine-appended, host-keyed | `journal/`, `applied/`, `alerts/`, `findings/`, `upstreams/<id>/<host>.yaml` | **cannot conflict** — different directories |
 | *(exception)* Inert, non-member-written | `joins/<host>.yaml` | cannot conflict (one file per requester); **never applied**, only read as a hint (§7.3a B) |
 | ~~Derived, shared, discardable~~ | *(none)* | host-keying `upstreams/` eliminated the category |
@@ -431,7 +431,7 @@ No configuration knob. `absent` cannot fail at depth the way Hiera's
 
 **Item identity** is `<category>.<name>`, and the name is **logical**: `packages`,
 `plugins`, `skills`, `agents` and `hooks` names are mapped to concrete artifacts by
-`definitions.yaml` (§5.1), which carries only the exceptions. **A definition is
+the definitions tier (§5.1), which carries only the exceptions. **A definition is
 itself an item, under the reserved `definitions.` prefix** —
 `definitions.packages.jj` is the mapping, `packages.jj` is the desired state, and
 they are different items with different digests and different verdicts. A **plugin-qualified**
@@ -446,7 +446,7 @@ closed set:
   with an alert naming it** (could under-converge, so never silent). **The
   recognised top-level set is therefore part of the design, not discovered at
   runtime:** the four layer paths, plus `trust/`, `joins/`, `checkpoints/`,
-  `definitions.yaml`, `lineage/`, `proposals/`, and the host-keyed evidence
+  `definitions.yaml` plus optional `definitions/*.yaml`, `lineage/`, `proposals/`, and the host-keyed evidence
   directories. **A directory this document adds is added to that set in the same
   change** — otherwise every host holds everything the first time it fetches the
   new layout, which is the rule working exactly as designed against its own
@@ -555,18 +555,22 @@ packages:
   gh: enabled
 ```
 
-### 5.1 `definitions.yaml` — logical name → concrete artifact
+### 5.1 `definitions.yaml` plus optional `definitions/*.yaml` — logical name → concrete artifact
 
 Every category in the layers names things **logically**. `jj` is not a package
 name; it is the name of a thing this fleet wants, and every manager spells it
 differently — `jj` on homebrew, `jj-vcs.jj` on winget, nothing at all on apt.
-`ponytail` is not a marketplace coordinate. `definitions.yaml` is the one place
-those mappings live, keyed by the same categories the layers use.
+`ponytail` is not a marketplace coordinate. The definitions tier is the one
+place those mappings live, keyed by the same categories the layers use. The
+scalar `definitions.yaml` file may be accompanied by an ordered
+`definitions/*.yaml` directory; the scalar file folds first, followed by the
+directory files in filename order, into the same mapping.
 
 *(Supersedes the `packages.yaml` filename of the first amendment: the owner's
 requirement was the mapping, not the file, and once plugins needed the identical
-treatment a file per category would have been three paths and one reader. Keying
-one file by category also gives it exactly the shape of a layer file.)*
+treatment a file per category would have been three paths and one reader. The
+scalar file and optional directory use one keyed mapping and one reader, with
+the same file-splitting form as the layers.)*
 
 ```yaml
 # ONLY exceptions live here. No entry means the logical name IS the concrete
@@ -627,7 +631,7 @@ hooks:
 **The default rule is the whole point.** Absent an entry, the logical name is the
 concrete name, resolved by that category's default source: the package manager's
 own index, the fleet's default marketplace, or the owning plugin. `jq` needs no
-definition and never will. `definitions.yaml` carries divergent names, install
+definition and never will. The definitions tier carries divergent names, install
 attributes, version pins, non-default sources, and explicit `unavailable`
 markers — nothing else. A fleet that never hits a divergence never creates the
 file, and a missing file reads exactly like an empty one (§4's "no opinion").
@@ -662,8 +666,8 @@ some-debian-box           [apt]       ->  jj  ->  unavailable  => HOLD + alert
 
 **The prerequisites read the same mapping.** `jj`, `jq` and `yq` are hard
 prerequisites installed before the store exists (§12), and they resolve through
-this same file — one mapping, one code path, no second table of "bootstrap package
-names" to drift. The bootstrap reads `definitions.yaml` when there is a store and
+this same tier — one mapping, one code path, no second table of "bootstrap package
+names" to drift. The bootstrap reads the definitions tier when there is a store and
 falls back to the default rule when there is not, which is the fresh-host case.
 
 **Definitions are items like any others, under their own namespace.** An entry is
@@ -815,7 +819,7 @@ definition and no separate approval path.
 > which §5.1.3 introduces.
 >
 > **What the re-implemented gate reads instead:** the desired `hooks:` map and
-> `definitions.yaml` **at the reviewed ref `R`** (§8.1) through the ordinary §4
+> the definitions tier (`definitions.yaml` plus optional `definitions/*.yaml`) **at the reviewed ref `R`** (§8.1) through the ordinary §4
 > fold and `jj file show` — no status branch, no `materialized/`, no `schema` key,
 > no raw git. It classifies a hook as trusted only when its resolved source is a
 > plugin whose approval this host holds, or a standalone source explicitly
@@ -859,7 +863,7 @@ rationalization:
 | `skills` / `agents` / `hooks` | the owning plugin, or a standalone source | the plugin that provides it, else the category's default location above |
 
 One rule in several costumes: **logical name → concrete artifact, defaulting to
-zero configuration, with `definitions.yaml` carrying only the exceptions.**
+zero configuration, with the definitions tier carrying only the exceptions.**
 
 ### `groups/development.yaml`
 
@@ -1454,7 +1458,7 @@ counter, §7.11's rollback defence.
 
 | | `durable` | `ephemeral` (leaf) |
 |---|---|---|
-| Fleet-shared layers (`fleet/`, `os/`, `groups/`, `hosts/`, `definitions.yaml`, `lineage/`, `proposals/`) | write | **refused** |
+| Fleet-shared layers (`fleet/`, `os/`, `groups/`, `hosts/`, `definitions.yaml` plus optional `definitions/*.yaml`, `lineage/`, `proposals/`) | write | **refused** |
 | Own host-keyed paths (`journal/<self>/`, `applied/<self>.yaml`, `alerts/<self>/`, `findings/<self>/`) | write | write |
 | Another member's host-keyed paths | refused | refused |
 | `trust/signers.yaml` — i.e. sponsoring | write | **refused** |
@@ -1777,7 +1781,7 @@ comparison:
 
 | Path | Required identity | Class required |
 |---|---|---|
-| a layer file (`fleet/`, `os/`, `groups/`, `hosts/`), `definitions.yaml`, `lineage/`, `proposals/` | any `<h>@<domain>` in the roster at the parent | **durable** |
+| a layer file (`fleet/`, `os/`, `groups/`, `hosts/`), `definitions.yaml` plus optional `definitions/*.yaml`, `lineage/`, `proposals/` | any `<h>@<domain>` in the roster at the parent | **durable** |
 | `trust/signers.yaml` | any `<h>@<domain>` in the roster at the parent | **durable** |
 | `journal/<h>/`, `applied/<h>.yaml`, `alerts/<h>/`, `findings/<h>/`, `upstreams/*/<h>.yaml` | **exactly `<h>@<domain>`. No exception, for any host.** | either |
 | `joins/<h>.yaml` | any signer, including `unknown` — **inert, never applied** (§7.5B) | n/a |
@@ -1884,7 +1888,7 @@ agent on vireo, told: "add wren to the fleet"
                  else FIRST CONTACT, key unknown         => channel_auth = tofu
                       (proceeds — §7.12.4 — but takes the 72 h soak and a
                        distinct alert class naming tofu on every host)
-  3. over that channel: install jj/jq/yq via definitions.yaml default rule;
+  3. over that channel: install jj/jq/yq via the definitions-tier default rule;
      roundhouse fleet-init; mint ~/.ssh/roundhouse_node_ed25519
   4. read the pubkey + roundhouse-enroll possession proof back over that channel
   5. hand wren the remote URL + store_id over that channel      <- data, not paste
@@ -3655,7 +3659,7 @@ step.
 | A logical package is `unavailable` on every manager the host has | Held + alert naming the logical name and the managers tried (§5.1). Never a guess, never a silent skip. |
 | A `version:` pin the manager cannot express | Same treatment as `unavailable` — held + alert naming package, manager and requested version (§5.1.1). Never best-effort: a pin that degrades to "whatever installed" reads as a guarantee it is not. |
 | `fleet-update` runs against a pinned package | Skipped by the update pass (§5.1.1), so the pin cannot be quietly undone. |
-| `definitions.yaml` maps a name to the **wrong** artifact | Not caught by the store — the mapping is signed, reviewed and internally consistent, so nothing mechanical can know `jj-vcs.jj` was meant to be something else. Three things bound it: the definition is reviewed as its own item when it lands; the apply-time diff shows the **concrete resolution** rather than the logical name, so the wrong package is visible before it installs; and it reaches non-canary hosts only after `canary_wait_hours` (§10.1). Correction is an ordinary revert (§10.8). |
+| The definitions tier maps a name to the **wrong** artifact | Not caught by the store — the mapping is signed, reviewed and internally consistent, so nothing mechanical can know `jj-vcs.jj` was meant to be something else. Three things bound it: the definition is reviewed as its own item when it lands; the apply-time diff shows the **concrete resolution** rather than the logical name, so the wrong package is visible before it installs; and it reaches non-canary hosts only after `canary_wait_hours` (§10.1). Correction is an ordinary revert (§10.8). |
 | Whole host file deleted or truncated | Removal guards trip (§10.3). A ≤5-item deletion is not caught by the cap and is not meant to be — apply-time review names each item. |
 | Fetch fails entirely | Converge from last known. Never prune. Journal `source: none`. |
 | Host reinstalled; `applied/<host>.yaml` gone or stale | §10.3 row 2 — adopt in place, review on digest mismatch. Never mass-disown. |
@@ -3870,9 +3874,9 @@ finding really is that judge's and really is about the chassis.
 - **Language version managers and per-project versioning** — `nvm`, `pyenv`,
   `rbenv`, `asdf`. Host-level packages only (§5.1.2). Coexisting major streams
   are two logical names, which needs no mechanism at all.
-- **A file per definition category** — one `definitions.yaml` keyed by category
-  has the shape of a layer file and one reader; three files would have three
-  paths and the same reader.
+- **A file per definition category** — the definitions tier keeps one keyed
+  mapping and one reader; `definitions.yaml` plus optional ordered
+  `definitions/*.yaml` files is file splitting, not three category readers.
 - **Per-host or per-layer definitions** — §5.1's ceiling: a genuine divergence
   means two logical names, not four layers of lookup tables.
 - **`physical_host:` and `node_key:`** — no consumer anywhere in the design.
@@ -3929,7 +3933,7 @@ finding really is that judge's and really is about the chassis.
 | Two cadences; `git ls-remote` poll floor; opportunistic push-nudge; traveling-laptop case | **owner direction** | owner: "the Tuesday machine should have already had the update"; "something should be checking at some reasonable frequency, but don't overload the machine"; hub-and-spoke baseline, Tailscale a recommendation not a requirement |
 | §10.8 rollback: signed revert through the normal gates, per-category semantics, change-ID verdict clause | **owner direction** | owner: "there does need to be a robust rollback mechanism" |
 | Offline reframed as tolerated exception, not steady state | **owner direction** | owner clarification: steady state is minutes-fresh; the agent absorbs offline reconvergence too |
-| `definitions.yaml` — logical-name → concrete-artifact mapping, outside the fold, absent-entry-means-default | **owner direction** | owner: "there needs to be a specific definition of the package mapping, because jj could have different names depending on which manager and operating system installs it" |
+| `definitions.yaml` plus optional `definitions/*.yaml` — logical-name → concrete-artifact mapping, outside the fold, absent-entry-means-default | **owner direction** | owner: "there needs to be a specific definition of the package mapping, because jj could have different names depending on which manager and operating system installs it" |
 | `latest` by default with opt-in exact pins, enforced-or-held per manager; update pass skips pinned | **owner direction** | owner: pinning is opt-in because the fleet auto-updates |
 | Major streams as separate logical packages (`node@24` / `node@26`); nvm/pyenv/asdf and per-project versioning explicitly out | **owner direction** | owner: "I don't want to get into the messiness of Node versioning for Python… don't overcomplicate it" |
 | `plugins:`/`skills:` definitions on the same pattern; host map-form override beats the definition | **owner direction** | owner: "ponytail could be defined as a plugin somewhere — rationalize the process" |

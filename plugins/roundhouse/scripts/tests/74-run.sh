@@ -60,17 +60,57 @@ if [ -n "$fleet_fixture_yq" ]; then
       fail "a fold carrying no policy block produced no fast interval"
 
     # --- which store paths the fold reads ---
-    for run_layer in fleet.yaml definitions.yaml os/macos.yaml \
+    for run_layer in fleet.yaml definitions.yaml definitions/10-overrides.yaml os/macos.yaml \
       groups/development.yaml hosts/vireo.yaml hosts/wren/skills.yaml \
       fleet/policy.yaml; do
       fleet_run_layer_path "$run_layer" ||
         fail "a layer file was not recognised as one: $run_layer"
     done
     for run_record in journal/vireo/2026-08-07.yaml applied/vireo.yaml \
-      alerts/vireo/x.yaml README.md .roundhouse-sync-store; do
+      alerts/vireo/x.yaml definitions/nested/file.yaml README.md .roundhouse-sync-store; do
       ! fleet_run_layer_path "$run_record" ||
         fail "a replicated record was treated as a layer: $run_record"
     done
+    # B-2: ssh_run must not consume the host-list stdin that feeds readiness.
+    # A real SSH transport is replaced with a fixture function here; each of
+    # three hosts still exercises both readiness probes, so one drained
+    # heredoc would leave a visible missing host and call count.
+    (
+    run_readiness_config="$run_root/readiness-config.json"
+    run_readiness_calls="$run_root/readiness-ssh-calls"
+    cat >"$run_readiness_config" <<'JSON'
+{
+  "version": 1,
+  "machines": {
+    "readiness-a": {"platform":"linux","transport":"ssh","ssh_alias":"readiness-a","expected_hostname":"readiness-a","expected_user":"fixture","groups":[],"package_managers":[]},
+    "readiness-b": {"platform":"linux","transport":"ssh","ssh_alias":"readiness-b","expected_hostname":"readiness-b","expected_user":"fixture","groups":[],"package_managers":[]},
+    "readiness-c": {"platform":"linux","transport":"ssh","ssh_alias":"readiness-c","expected_hostname":"readiness-c","expected_user":"fixture","groups":[],"package_managers":[]}
+  }
+}
+JSON
+    chmod 600 "$run_readiness_config"
+    : >"$run_readiness_calls"
+    ssh_run() {
+      cat >/dev/null
+      printf '%s\n' "$1" >>"$run_readiness_calls"
+      case $* in
+        *'roundhouse fleet-doctor'*) printf 'ok remote-posture\n' ;;
+        *) printf 'missing:\nhostname:%s\nuser:fixture\n' "$1" ;;
+      esac
+    }
+    run_readiness_status=0
+    ROUNDHOUSE_CONFIG="$run_readiness_config" \
+      fleet_readiness_command readiness-a readiness-b readiness-c \
+      >"$run_root/readiness-output" 2>&1 || run_readiness_status=$?
+    [ "$run_readiness_status" -eq 0 ] ||
+      fail "three-host readiness fixture exited $run_readiness_status: $(cat "$run_root/readiness-output")"
+    for run_readiness_host in readiness-a readiness-b readiness-c; do
+      grep -Fqx "$run_readiness_host" "$run_readiness_calls" ||
+        fail "readiness never called ssh_run for $run_readiness_host"
+      [ "$(grep -Fc "$run_readiness_host" "$run_readiness_calls")" -eq 2 ] ||
+        fail "readiness did not complete both SSH probes for $run_readiness_host"
+    done
+    )
 
     # §4's reader's choice: a scalar IS the state, a map carries it.
     [ "$(fleet_run_state_of '"enabled"')" = enabled ] ||
@@ -103,6 +143,99 @@ YAML
     run_plugin_installed="$HOME/.claude/plugins/installed_plugins.json"
     run_plugin_install_marker="$run_root/plugin-installs"
     mkdir -p "$(dirname "$run_plugin_installed")"
+
+    # B-1 characterization first: on Claude 2.1.229 the installed plugin is
+    # absent from --available, so the existing identity gate has no SHA and
+    # must hold. The next assertion supplies the marketplace manifest and
+    # inverts that same failure without changing the installed record.
+    run_plugin_missing_catalog="$run_root/plugin-catalog-missing.json"
+    run_plugin_marketplace="$run_root/test-marketplace"
+    run_plugin_marketplace_file="$run_root/plugin-marketplaces.json"
+    printf '%s\n' '{"available":[]}' >"$run_plugin_missing_catalog"
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_old\"}]}}" >"$run_plugin_installed"
+    run_identity_status=0
+    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      fleet_run_plugin_identity_matches \
+      "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
+      run_identity_status=$?
+    [ "$run_identity_status" -eq 75 ] ||
+      fail "an installed plugin missing from --available did not hold (got $run_identity_status)"
+    mkdir -p "$run_plugin_marketplace/.claude-plugin"
+    cat >"$run_plugin_marketplace/.claude-plugin/marketplace.json" <<JSON
+{"name":"test-market","plugins":[{"name":"example","version":"1.2.3","source":{"source":"git","url":"https://example.invalid/roundhouse.git","sha":"$run_sha_old"}}]}
+JSON
+    printf '%s\n' "[{\"name\":\"test-market\",\"installLocation\":\"$run_plugin_marketplace\"}]" \
+      >"$run_plugin_marketplace_file"
+    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
+      CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_plugin_marketplace_file" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_plugin_identity_matches \
+      "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
+      fail "the marketplace manifest did not invert the installed-plugin hold"
+    CLAUDE_PLUGIN_LIST_FAIL=1 CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_plugin_marketplace_file" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_plugin_identity_matches \
+      "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
+      fail "a failed --available query did not fall back to the marketplace manifest"
+    : >"$run_plugin_install_marker"
+    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
+      CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_plugin_marketplace_file" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null || fail "fallback catalog apply failed"
+    [ ! -s "$run_plugin_install_marker" ] ||
+      fail "fallback catalog reapplied an already-matching plugin"
+    run_marketplace_update_marker="$run_root/marketplace-updates"
+    : >"$run_marketplace_update_marker"
+    (
+      fleet_trust_prune_expired() { :; }
+      fleet_trust_age_evidence() { :; }
+      fleet_enroll_process_joins() { :; }
+      fleet_seed_command() { :; }
+      fleet_run_proposals() { :; }
+      fleet_package_pinned() { return 0; }
+      fleet_doctor_command() { :; }
+      CLAUDE_MARKETPLACE_UPDATE_MARKER="$run_marketplace_update_marker" \
+        fleet_run_full_pass "$run_store" vireo \
+        '{"plugins":{"example":"enabled"}}' "$run_plugin_defs" \
+        "$run_root/layers" "$run_root/full-tmp" >/dev/null
+      grep -Fqx test-market "$run_marketplace_update_marker" ||
+        fail "full cadence did not refresh a marketplace supplied by definitions"
+    )
+    run_unsafe_market=$(fleet_run_plugin_marketplaces \
+      '{"plugins":{"example":"enabled"}}' \
+      '{"plugins":{"example":{"marketplace":"../hosts"}}}')
+    [ -z "$run_unsafe_market" ] ||
+      fail "full cadence exposed an unsafe definitions marketplace"
+    run_held_market_dir="$run_root/held-market"
+    mkdir -p "$run_held_market_dir"
+    printf '%s\n' 'definitions.plugins.example held-by-test' \
+      >"$run_held_market_dir/sigholds"
+    run_held_market=$(fleet_run_plugin_marketplaces \
+      '{"plugins":{"example":"enabled"}}' "$run_plugin_defs" \
+      "$run_held_market_dir/sigholds" "$run_held_market_dir/verdicts")
+    [ -z "$run_held_market" ] ||
+      fail "full cadence refreshed a marketplace from a held definition"
+    run_unsafe_store="$run_root/unsafe-upstream-store"
+    mkdir -p "$run_unsafe_store"
+    ! fleet_upstream_write "$run_unsafe_store" ../hosts vireo failed ||
+      fail "the upstream record sink accepted a traversal id"
+    [ ! -e "$run_unsafe_store/hosts/vireo.yaml" ] ||
+      fail "an unsafe upstream id escaped into the store"
+    cat >"$run_plugin_marketplace/.claude-plugin/marketplace.json" <<JSON
+{"name":"test-market","plugins":[{"name":"example","version":"1.2.3","source":{"source":"git","url":"https://example.invalid/roundhouse.git"}}]}
+JSON
+    run_identity_status=0
+    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
+      CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_plugin_marketplace_file" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_plugin_identity_matches \
+      "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
+      run_identity_status=$?
+    [ "$run_identity_status" -eq 75 ] ||
+      fail "a marketplace entry without a SHA did not hold"
+    cat >"$run_plugin_marketplace/.claude-plugin/marketplace.json" <<JSON
+{"name":"test-market","plugins":[{"name":"example","version":"1.2.3","source":{"source":"git","url":"https://example.invalid/roundhouse.git","sha":"$run_sha_old"}}]}
+JSON
+
     printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.2.3\",\"source\":{\"sha\":\"$run_sha_old\"}}]}" >"$run_plugin_catalog"
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_old\"}]}}" >"$run_plugin_installed"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \

@@ -22,7 +22,7 @@ mkdir -p "$integrity_root"
   # non-layer paths any enrolled host may author. definitions.yaml is here on
   # purpose: the reserved `definitions.` prefix is about item identity, not
   # about who may write the file.
-  for integrity_shared in fleet.yaml definitions.yaml os/macos.yaml \
+  for integrity_shared in fleet.yaml definitions.yaml definitions/10-overrides.yaml os/macos.yaml \
     groups/development.yaml hosts/vireo.yaml hosts/wren/base.yaml \
     fleet/policy.yaml lineage/1785024000-macbook-pro.yaml \
     proposals/promote-ponytail-to-fleet.yaml; do
@@ -43,7 +43,7 @@ mkdir -p "$integrity_root"
   # position of a row 2 pattern.
   for integrity_unowned in README.md .gitignore .roundhouse-sync-store \
     applied/vireo/extra.yaml upstreams/claude-marketplace/deep/vireo.yaml \
-    hosts journal/vireo; do
+    definitions/nested/file.yaml hosts journal/vireo; do
     ! fleet_vcs_path_owner "$integrity_unowned" >/dev/null ||
       fail "§7.3 claimed an identity for an unrecognised path: $integrity_unowned"
   done
@@ -237,7 +237,7 @@ YAML
     # Rule 6, the whole security boundary: a leaf writes its own evidence and
     # nothing else, and it MAY NOT SPONSOR.
     for integrity_refused in fleet.yaml os/macos.yaml groups/development.yaml \
-      hosts/vireo.yaml definitions.yaml trust/signers.yaml \
+      hosts/vireo.yaml definitions.yaml definitions/10-overrides.yaml trust/signers.yaml \
       checkpoints/1785024000.yaml lineage/x.yaml proposals/x.yaml; do
       ! fleet_trust_class_allows ephemeral "$integrity_refused" ||
         fail "rule 6 let a leaf write $integrity_refused"

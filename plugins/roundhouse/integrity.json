@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "5d398af0debd30d1814542796f50cad92461dba9bc5bfa4eddd38942e2793d9a"
+      "sha256": "4050e5d8ab1660353bcbd7d99df462f00f1001bb9817e1f3429d11c5010df052"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "08682a4deeaea8c2e3f94d05ae41fdc9404bbe7ee5b8366d0275b8e38f053ff4"
+      "sha256": "fd3afb9b77ce905c2553c9f83b848427cd3f3fb1ff0dc3c47e599adfb9e5d69f"
     },
     {
       "path": "assets/icon.png",
@@ -98,11 +98,11 @@
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
-      "sha256": "884b52243d24281fcafb132b09896fc6cd1d6cfdd9a9edb07f9c6cc8af30319c"
+      "sha256": "45f084eb2a1c1c7931cfb1ae72619dc2ef040df2c981c201712e316a37e2636e"
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
-      "sha256": "5a0c0e8c4c7476de35e21a13b77fd50a28311eb29bc4ccf1d721f26982975d9d"
+      "sha256": "109764e999b1bf15195d7b8b12eafdecdf43b91941061d9a4ac3514249c2c395"
     },
     {
       "path": "scripts/lib/fleet-init.sh",
@@ -110,7 +110,7 @@
     },
     {
       "path": "scripts/lib/fleet-records.sh",
-      "sha256": "f4052196744972db15905f83aec70dff99bfd088fcfc9f7737b76d0eb53ca493"
+      "sha256": "42399122ca285b27af4e8f7bc08cc7c87f82b36b0fd77916b59e76b86302cee7"
     },
     {
       "path": "scripts/lib/fleet-resolve.sh",
@@ -118,7 +118,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "c0e0911b8e4b32a1bf01a20fa68cdc101d460486de76732a2f7c6b90415d6935"
+      "sha256": "d1f64c4fa58e4725a987b039ee8e712577692fde8dd32341d487022f7daaf421"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -130,7 +130,7 @@
     },
     {
       "path": "scripts/lib/fleet-vcs.sh",
-      "sha256": "4bba712b93f76ca5fcbd42b91d8d2816f19737c5ddb35c7f4c275993d328870a"
+      "sha256": "bbd74fe4558ab743fd234a2a4576bcfb911e7985a29cd2beecc1709f32fc8dda"
     },
     {
       "path": "scripts/lib/host.sh",
@@ -281,5 +281,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.7.0"
+  "version": "0.7.1"
 }
