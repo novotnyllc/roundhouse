@@ -12,7 +12,7 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Roundhouse",
-    "shortDescription": "Fleet readiness, inventory, updates, auth, SSH transport, and network gear",
+    "shortDescription": "Fleet readiness, inventory, updates, auth, and SSH transport",
     "longDescription": "Roundhouse keeps machines and infrastructure serviceable: fleet readiness and inventory, agent harness/plugin/skill parity, package baselines, credential artifacts, SSH transport with diagnosis and enrollment, narrow privileged install lanes. The sibling railyard plugin decides and routes work; Roundhouse keeps the engines ready to run it.",
     "developerName": "Claire Novotny LLC",
     "category": "Productivity",
