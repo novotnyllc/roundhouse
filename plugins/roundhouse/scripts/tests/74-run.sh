@@ -147,7 +147,7 @@ YAML
     : >"$run_plugin_order_log"
     export CLAUDE_PLUGIN_ACTION_LOG="$run_plugin_order_log"
     export CODEX_HOOK_ORDER_FILE="$run_plugin_order_log"
-    export CODEX_HOOK_SCENARIO=approve
+    export CODEX_HOOK_SCENARIO=auto-approve
 
     # B-1 characterization first: on Claude 2.1.229 the installed plugin is
     # absent from --available, so the existing identity gate has no SHA and
@@ -455,6 +455,31 @@ JSON
       fail "disabled desired state approved Codex hooks during refresh"
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
       fail "disabled desired state wrote Codex hook trust during refresh"
+
+    # Automatic approval must hold rather than launder an independently
+    # modified Codex hook when Claude refreshes the same qualified plugin.
+    : >"$run_plugin_order_log"
+    rm -f "$CODEX_HOOK_WRITES_FILE"
+    printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.3.0","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    run_status=0
+    CODEX_HOOK_SCENARIO=approve \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '{"state":"enabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
+      run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "automatic approval accepted a locally modified Codex hook (got $run_status)"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'update example@test-market' ] ||
+      fail "modified-hook refusal did not enter the update ledger"
+    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
+      fail "modified-hook refusal attempted a later state verb"
+    [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
+      fail "modified-hook refusal wrote Codex hook trust"
 
     # A Claude-only qualified plugin must not turn the absent Codex identity
     # into a held DSC item. The manager update still runs, but there is no

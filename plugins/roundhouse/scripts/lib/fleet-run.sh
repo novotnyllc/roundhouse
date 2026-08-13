@@ -932,7 +932,8 @@ fleet_run_approve_plugin_hooks() {
     printf 'roundhouse: Node.js is required to approve hooks for %s\n' "$1" >&2
     return 75
   }
-  "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
+  ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
+    "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
     >/dev/null || return 75
 }
 

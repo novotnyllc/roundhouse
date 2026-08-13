@@ -95,6 +95,9 @@ state that is already enabled is a no-op: the manager enable verb and approval
 helper are not invoked, so a locally modified hook cannot be laundered by
 steady-state convergence. This is the automatic local hook trust step for
 fresh and changed hook hashes; it is not a copied settings table.
+If Codex reports a locally modified hook during an automatic approval, the
+helper refuses and the DSC item is held; repair or explicitly approve that
+Codex hook before retrying.
 On POSIX schedulers, invoke the CLI through the user's login shell or provide a
 PATH containing the harnesses and Node.js. The runtime also checks the standard
 Homebrew Node locations on macOS. The native Windows helper still requires

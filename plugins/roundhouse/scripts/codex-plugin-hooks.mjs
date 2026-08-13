@@ -270,6 +270,12 @@ async function main() {
   const cwd = process.cwd();
   if (command === "approve") {
     const hooks = await listHooks(pluginId, cwd);
+    if (
+      process.env.ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL === "1" &&
+      hooks.some((hook) => hook.trustStatus === "modified")
+    ) {
+      fail(`automatic approval refuses a locally modified hook: ${pluginId}`);
+    }
     if (!hooks.length) {
       // A hookless plugin is the normal case, not an error: approve means
       // "trust whatever hooks this plugin currently ships", and zero is a

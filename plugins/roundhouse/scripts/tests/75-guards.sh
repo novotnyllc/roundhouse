@@ -154,6 +154,19 @@ if [ -n "$fleet_fixture_yq" ]; then
     printf '%s\n' "$guard_reroot_body" | grep -q \
       'not in the checkpoint archive; refusing to re-root' ||
       fail "fleet-reroot does not refuse a sibling reviewed line"
+    guard_checkpoint_body=$(cli_function_body fleet_checkpoint_command)
+    printf '%s\n' "$guard_checkpoint_body" | grep -q \
+      'ckpt_head_count=' ||
+      fail "fleet-checkpoint does not count local main heads before staging"
+    printf '%s\n' "$guard_checkpoint_body" | grep -q \
+      'local main is conflicted; resolve it before checkpointing' ||
+      fail "fleet-checkpoint does not refuse conflicted local main"
+    guard_checkpoint_heads_line=$(printf '%s\n' "$guard_checkpoint_body" |
+      grep -n 'ckpt_head_count=' | head -1 | cut -d: -f1)
+    guard_checkpoint_stage_line=$(printf '%s\n' "$guard_checkpoint_body" |
+      grep -n 'jj -R "\$ckpt_store" new' | head -1 | cut -d: -f1)
+    [ "$guard_checkpoint_heads_line" -lt "$guard_checkpoint_stage_line" ] ||
+      fail "fleet-checkpoint stages @ before refusing conflicted local main"
 
     # …and it is the predicate the deleting verb actually calls. Asserted on
     # the SOURCE, because the destructive path cannot be exercised safely.

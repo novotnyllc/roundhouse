@@ -1282,7 +1282,18 @@ fleet_checkpoint_command() (
   ckpt_store=$(fleet_store_path)
   fleet_vcs_store_ready "$ckpt_store" || exit $?
   ckpt_host=$(fleet_host_name)
-  ckpt_head=$(fleet_vcs_heads_local "$ckpt_store" | head -1)
+  ckpt_heads=$(fleet_vcs_heads_local "$ckpt_store") || {
+    printf 'roundhouse: could not inspect local main before checkpointing\n' >&2
+    exit 65
+  }
+  ckpt_head_count=$(printf '%s\n' "$ckpt_heads" | grep -c . || true)
+  [ "$ckpt_head_count" -eq 1 ] || {
+    [ "$ckpt_head_count" -gt 1 ] &&
+      printf 'roundhouse: local main is conflicted; resolve it before checkpointing\n' >&2 ||
+      printf 'roundhouse: local main is absent; initialize or reconcile it before checkpointing\n' >&2
+    exit 65
+  }
+  ckpt_head=$(printf '%s\n' "$ckpt_heads" | head -1)
   ckpt_working_copy_empty=$(jj -R "$ckpt_store" log -r @ --no-graph -T 'empty' 2>/dev/null) || {
     printf 'roundhouse: could not inspect the jj working copy before checkpointing\n' >&2
     exit 65

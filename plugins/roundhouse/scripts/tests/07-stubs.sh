@@ -122,10 +122,11 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
         modified_status=modified
         removed_status=trusted
         untrusted_status=untrusted
-        if [ "$scenario" = approve ]; then
+        if [ "$scenario" = approve ] || [ "$scenario" = auto-approve ]; then
           trusted_status=untrusted
           modified_status=modified
           removed_status=untrusted
+          [ "$scenario" != auto-approve ] || modified_status=untrusted
           [ ! -f "$writes" ] || {
             trusted_status=trusted
             modified_status=trusted
@@ -138,7 +139,8 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
         fi
         if [ "$version" = 1.3.0 ]; then
           stop_status=untrusted
-          [ "$scenario" != approve ] || [ ! -f "$writes" ] || stop_status=trusted
+          [ "$scenario" != approve ] && [ "$scenario" != auto-approve ] ||
+            [ ! -f "$writes" ] || stop_status=trusted
           hooks=$(jq -cn \
             --arg trusted "$trusted_status" --arg modified "$modified_status" \
             --arg untrusted "$untrusted_status" --arg stop "$stop_status" '[
