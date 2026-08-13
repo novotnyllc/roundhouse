@@ -118,7 +118,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "3b9fd04c18856c7f6a8ad563180f34bf2425c3943daa5adb8357d23b67c578c1"
+      "sha256": "7fe35e6b314bfb5d1ee74f281fa0946116fd81801cdad122ef353d0b9037dfe6"
     },
     {
       "path": "scripts/lib/fleet-store.sh",

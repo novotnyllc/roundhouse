@@ -201,6 +201,45 @@ JSON
       grep -Fqx test-market "$run_marketplace_update_marker" ||
         fail "full cadence did not refresh a marketplace supplied by definitions"
     )
+    run_package_upgrade_marker="$run_root/package-upgrades"
+    run_package_bin="$run_root/package-bin"
+    mkdir -p "$run_package_bin" "$run_root/package-held-tmp" \
+      "$run_root/package-open-tmp"
+    cat >"$run_package_bin/brew" <<'SH'
+#!/bin/sh
+case $1 in
+  info) exit 0 ;;
+  upgrade) printf '%s\n' "$*" >>"$ROUNDHOUSE_TEST_BREW_UPGRADES" ;;
+esac
+SH
+    chmod 755 "$run_package_bin/brew"
+    printf '%s\n' 'definitions.packages.example refused definition' \
+      >"$run_root/package-held-tmp/sigholds"
+    (
+      fleet_trust_prune_expired() { :; }
+      fleet_trust_age_evidence() { :; }
+      fleet_enroll_process_joins() { :; }
+      fleet_seed_command() { :; }
+      fleet_run_proposals() { :; }
+      fleet_package_pinned() { return 1; }
+      fleet_doctor_command() { :; }
+      PATH="$run_package_bin:$PATH"
+      ROUNDHOUSE_TEST_BREW_UPGRADES="$run_package_upgrade_marker"
+      export PATH ROUNDHOUSE_TEST_BREW_UPGRADES
+      : >"$run_package_upgrade_marker"
+      fleet_run_full_pass "$run_store" vireo \
+        '{"packages":{"example":"enabled"},"package_managers":["homebrew"]}' \
+        '{"packages":{"example":{"homebrew":"example"}}}' \
+        "$run_root/layers" "$run_root/package-held-tmp" >/dev/null
+      [ ! -s "$run_package_upgrade_marker" ] ||
+        fail "full cadence upgraded a package whose definition was held"
+      fleet_run_full_pass "$run_store" vireo \
+        '{"packages":{"example":"enabled"},"package_managers":["homebrew"]}' \
+        '{"packages":{"example":{"homebrew":"example"}}}' \
+        "$run_root/layers" "$run_root/package-open-tmp" >/dev/null
+      grep -Fqx 'upgrade example' "$run_package_upgrade_marker" ||
+        fail "full cadence package control did not run an unheld upgrade"
+    )
     run_unsafe_market=$(fleet_run_plugin_marketplaces \
       '{"plugins":{"example":"enabled"}}' \
       '{"plugins":{"example":{"marketplace":"../hosts"}}}')
@@ -255,11 +294,19 @@ JSON
     printf '%s\n' 'converge plugins.example desired-digest' \
       >"$run_definition_verdict_file"
     fleet_run_definition_hold_consumers "$run_definition_hold_file" \
-      "$run_definition_values" "$run_root"
+      "$run_definition_verdict_file" "$run_definition_values" "$run_root"
     fleet_run_hold_items_into_verdicts "$run_definition_hold_file" \
       "$run_definition_verdict_file" "$run_root"
     grep -Fqx 'held plugins.example' "$run_definition_verdict_file" ||
       fail "a held definition did not hold its desired consumer"
+    printf '%s\n' 'held definitions.plugins.example head disagreement' \
+      >"$run_definition_verdict_file"
+    : >"$run_definition_hold_file"
+    fleet_run_definition_hold_consumers "$run_definition_hold_file" \
+      "$run_definition_verdict_file" "$run_definition_values" "$run_root"
+    grep -Fqx 'plugins.example held by definitions.plugins.example' \
+      "$run_definition_hold_file" ||
+      fail "a conflicted definition verdict did not hold its desired consumer"
     run_unsafe_store="$run_root/unsafe-upstream-store"
     mkdir -p "$run_unsafe_store"
     ! fleet_upstream_write "$run_unsafe_store" ../hosts vireo failed ||

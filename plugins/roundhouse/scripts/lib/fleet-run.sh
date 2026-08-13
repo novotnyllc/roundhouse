@@ -1511,7 +1511,7 @@ fleet_run_command() (
   # writes, so the apply loop below reads one surface and not two.
   grep -v '^!hold ' "$run_tmp/detections" >>"$run_tmp/sigholds" || :
   fleet_run_definition_hold_consumers "$run_tmp/sigholds" \
-    "$run_tmp/values" "$run_tmp" \
+    "$run_tmp/verdicts" "$run_tmp/values" "$run_tmp" \
     || exit 65
   fleet_run_hold_items_into_verdicts "$run_tmp/sigholds" \
     "$run_tmp/verdicts" "$run_tmp"
@@ -1982,13 +1982,18 @@ fleet_run_item_is_held() {
 }
 
 fleet_run_definition_hold_consumers() {
-  # fleet_run_definition_hold_consumers HOLDS VALUES TMP — a definitions
+  # fleet_run_definition_hold_consumers HOLDS VERDICTS VALUES TMP — a definitions
   # refusal also holds the desired item that would resolve through it. The
   # mapping is one-to-one by design: definitions.packages.foo governs
   # packages.foo, and the same shape applies to agent-surface categories.
   # This protects both a changed mapping and a deleted mapping, whose current
   # tree no longer has an entry from which a resolver could detect the hold.
-  fleet_run_definition_consumer_holds=$3/definition-consumer-holds
+  fleet_run_definition_hold_items=$4/definition-hold-items
+  awk '$1 != "" && $1 != "!hold" { print $1 }' "$1" \
+    >"$fleet_run_definition_hold_items"
+  awk '$1 == "held" { print $2 }' "$2" \
+    >>"$fleet_run_definition_hold_items"
+  fleet_run_definition_consumer_holds=$4/definition-consumer-holds
   : >"$fleet_run_definition_consumer_holds"
   while IFS= read -r fleet_run_definition_hold; do
     fleet_run_definition_item=${fleet_run_definition_hold%% *}
@@ -2001,12 +2006,12 @@ fleet_run_definition_hold_consumers() {
         [ -n "$fleet_run_definition_name" ] || continue
         fleet_run_definition_consumer=$fleet_run_definition_category.$fleet_run_definition_name
         awk -v item="$fleet_run_definition_consumer" \
-          '$1 == item { found = 1 } END { exit !found }' "$2" || continue
+          '$1 == item { found = 1 } END { exit !found }' "$3" || continue
         printf '%s held by %s\n' "$fleet_run_definition_consumer" \
           "$fleet_run_definition_item" >>"$fleet_run_definition_consumer_holds"
         ;;
     esac
-  done <"$1"
+  done < <(LC_ALL=C sort -u "$fleet_run_definition_hold_items")
   [ ! -s "$fleet_run_definition_consumer_holds" ] || {
     LC_ALL=C sort -u "$fleet_run_definition_consumer_holds" \
       >>"$1"
@@ -2019,7 +2024,8 @@ fleet_run_hold_items_into_verdicts() {
   # the removal pass and the apply loop never see the hold: an existing host
   # can forget the item, while a new host can resolve a deleted definition by
   # its default. Preserve existing converge/held verdicts and add only the
-  # missing held entries.
+  # missing held entries. A `converge` verdict for a held item is replaced, so
+  # the removal and apply loops consume the same effective decision.
   fleet_run_hold_item_list=$3/held-items
   awk '$1 != "" && $1 != "!hold" { print $1 }' "$1" |
     LC_ALL=C sort -u >"$fleet_run_hold_item_list"
@@ -2104,6 +2110,7 @@ fleet_run_full_pass() (
   full_fold=$3
   full_defs=$4
   full_layers=$5
+  full_hold_dir=${6:-}
 
   # §10.5: one file per host per upstream. No leases, no CAS, no TTLs, no
   # takeover — jitter is the coordination primitive.
@@ -2160,6 +2167,16 @@ fleet_run_full_pass() (
   printf '%s\n' "$full_fold" | jq -r '(.packages // {}) | keys[]' |
     while IFS= read -r full_package; do
       [ -n "$full_package" ] || continue
+      if [ -n "$full_hold_dir" ] &&
+        fleet_run_item_is_held "packages.$full_package" "" \
+          "$full_hold_dir/sigholds" "$full_hold_dir/verdicts"; then
+        continue
+      fi
+      if [ -n "$full_hold_dir" ] &&
+        fleet_run_item_is_held "definitions.packages.$full_package" "" \
+          "$full_hold_dir/sigholds" "$full_hold_dir/verdicts"; then
+        continue
+      fi
       ! fleet_package_pinned "$full_defs" "$full_package" || continue
       # shellcheck disable=SC2046,SC2086 # the host's package_managers, in order
       full_resolved=$(fleet_resolve_package "$full_defs" "$full_package" \
