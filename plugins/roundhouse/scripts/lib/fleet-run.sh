@@ -1510,6 +1510,9 @@ fleet_run_command() (
   # The item-scoped detections join the same hold file the signature gate
   # writes, so the apply loop below reads one surface and not two.
   grep -v '^!hold ' "$run_tmp/detections" >>"$run_tmp/sigholds" || :
+  fleet_run_definition_hold_consumers "$run_tmp/sigholds" \
+    "$run_tmp/values" "$run_tmp" \
+    || exit 65
   fleet_run_hold_items_into_verdicts "$run_tmp/sigholds" \
     "$run_tmp/verdicts" "$run_tmp"
 
@@ -1978,6 +1981,38 @@ fleet_run_item_is_held() {
   return 1
 }
 
+fleet_run_definition_hold_consumers() {
+  # fleet_run_definition_hold_consumers HOLDS VALUES TMP — a definitions
+  # refusal also holds the desired item that would resolve through it. The
+  # mapping is one-to-one by design: definitions.packages.foo governs
+  # packages.foo, and the same shape applies to agent-surface categories.
+  # This protects both a changed mapping and a deleted mapping, whose current
+  # tree no longer has an entry from which a resolver could detect the hold.
+  fleet_run_definition_consumer_holds=$3/definition-consumer-holds
+  : >"$fleet_run_definition_consumer_holds"
+  while IFS= read -r fleet_run_definition_hold; do
+    fleet_run_definition_item=${fleet_run_definition_hold%% *}
+    case $fleet_run_definition_item in
+      definitions.*.*)
+        fleet_run_definition_rest=${fleet_run_definition_item#definitions.}
+        fleet_run_definition_category=${fleet_run_definition_rest%%.*}
+        fleet_run_definition_name=${fleet_run_definition_rest#*.}
+        [ -n "$fleet_run_definition_category" ] || continue
+        [ -n "$fleet_run_definition_name" ] || continue
+        fleet_run_definition_consumer=$fleet_run_definition_category.$fleet_run_definition_name
+        awk -v item="$fleet_run_definition_consumer" \
+          '$1 == item { found = 1 } END { exit !found }' "$2" || continue
+        printf '%s held by %s\n' "$fleet_run_definition_consumer" \
+          "$fleet_run_definition_item" >>"$fleet_run_definition_consumer_holds"
+        ;;
+    esac
+  done <"$1"
+  [ ! -s "$fleet_run_definition_consumer_holds" ] || {
+    LC_ALL=C sort -u "$fleet_run_definition_consumer_holds" \
+      >>"$1"
+  }
+}
+
 fleet_run_hold_items_into_verdicts() {
   # fleet_run_hold_items_into_verdicts HOLDS VERDICTS TMP — a held item that
   # vanished from every reviewed head still needs a verdict entry. Otherwise
@@ -1988,12 +2023,24 @@ fleet_run_hold_items_into_verdicts() {
   fleet_run_hold_item_list=$3/held-items
   awk '$1 != "" && $1 != "!hold" { print $1 }' "$1" |
     LC_ALL=C sort -u >"$fleet_run_hold_item_list"
-  while IFS= read -r fleet_run_hold_item; do
-    [ -n "$fleet_run_hold_item" ] || continue
-    awk -v item="$fleet_run_hold_item" \
-      '$2 == item { found = 1 } END { exit !found }' "$2" ||
-      printf 'held %s\n' "$fleet_run_hold_item" >>"$2"
-  done <"$fleet_run_hold_item_list"
+  fleet_run_held_verdicts=$3/held-verdicts
+  awk '
+    FILENAME == ARGV[1] { held[$1] = 1; next }
+    {
+      if ($2 in held) {
+        print "held", $2
+        emitted[$2] = 1
+      } else {
+        print
+      }
+    }
+    END {
+      for (item in held)
+        if (!(item in emitted)) print "held", item
+    }
+  ' "$fleet_run_hold_item_list" "$2" |
+    LC_ALL=C sort >"$fleet_run_held_verdicts"
+  mv -f "$fleet_run_held_verdicts" "$2"
 }
 
 fleet_run_runtime_hold() {

@@ -246,6 +246,20 @@ JSON
       fail "a held parent-only item did not enter the effective verdicts"
     [ "$(grep -Fc 'plugins.example' "$run_effective_verdict_file")" -eq 1 ] ||
       fail "an existing verdict was duplicated while promoting holds"
+    run_definition_hold_file="$run_root/definition-sigholds"
+    run_definition_values="$run_root/definition-values"
+    run_definition_verdict_file="$run_root/definition-verdicts"
+    printf '%s\n' 'definitions.plugins.example refused definition' \
+      >"$run_definition_hold_file"
+    printf '%s\n' 'plugins.example desired-digest' >"$run_definition_values"
+    printf '%s\n' 'converge plugins.example desired-digest' \
+      >"$run_definition_verdict_file"
+    fleet_run_definition_hold_consumers "$run_definition_hold_file" \
+      "$run_definition_values" "$run_root"
+    fleet_run_hold_items_into_verdicts "$run_definition_hold_file" \
+      "$run_definition_verdict_file" "$run_root"
+    grep -Fqx 'held plugins.example' "$run_definition_verdict_file" ||
+      fail "a held definition did not hold its desired consumer"
     run_unsafe_store="$run_root/unsafe-upstream-store"
     mkdir -p "$run_unsafe_store"
     ! fleet_upstream_write "$run_unsafe_store" ../hosts vireo failed ||
