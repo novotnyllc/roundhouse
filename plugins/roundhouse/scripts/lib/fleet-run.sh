@@ -1510,6 +1510,8 @@ fleet_run_command() (
   # The item-scoped detections join the same hold file the signature gate
   # writes, so the apply loop below reads one surface and not two.
   grep -v '^!hold ' "$run_tmp/detections" >>"$run_tmp/sigholds" || :
+  fleet_run_hold_items_into_verdicts "$run_tmp/sigholds" \
+    "$run_tmp/verdicts" "$run_tmp"
 
   # §5's rendered aliases, and the include line that makes them reachable. The
   # destination directory is this run's to create: the render is pure and
@@ -1974,6 +1976,24 @@ fleet_run_item_is_held() {
     "$4" && return 0
   [ -n "$2" ] && fleet_run_verdict_held "$1" "$2" && return 0
   return 1
+}
+
+fleet_run_hold_items_into_verdicts() {
+  # fleet_run_hold_items_into_verdicts HOLDS VERDICTS TMP — a held item that
+  # vanished from every reviewed head still needs a verdict entry. Otherwise
+  # the removal pass and the apply loop never see the hold: an existing host
+  # can forget the item, while a new host can resolve a deleted definition by
+  # its default. Preserve existing converge/held verdicts and add only the
+  # missing held entries.
+  fleet_run_hold_item_list=$3/held-items
+  awk '$1 != "" && $1 != "!hold" { print $1 }' "$1" |
+    LC_ALL=C sort -u >"$fleet_run_hold_item_list"
+  while IFS= read -r fleet_run_hold_item; do
+    [ -n "$fleet_run_hold_item" ] || continue
+    awk -v item="$fleet_run_hold_item" \
+      '$2 == item { found = 1 } END { exit !found }' "$2" ||
+      printf 'held %s\n' "$fleet_run_hold_item" >>"$2"
+  done <"$fleet_run_hold_item_list"
 }
 
 fleet_run_runtime_hold() {

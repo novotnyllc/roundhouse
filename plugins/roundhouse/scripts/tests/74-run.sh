@@ -233,6 +233,19 @@ JSON
       "$run_runtime_verdict_file")
     [ -z "$run_runtime_market" ] ||
       fail "full cadence ignored a held verdict while refreshing a marketplace"
+    run_effective_hold_file="$run_root/effective-sigholds"
+    run_effective_verdict_file="$run_root/effective-verdicts"
+    printf '%s\n' 'definitions.packages.deleted-a deleted by test' \
+      'plugins.example held by test' >"$run_effective_hold_file"
+    printf '%s\n' 'converge plugins.example digest-from-verdict' \
+      >"$run_effective_verdict_file"
+    fleet_run_hold_items_into_verdicts "$run_effective_hold_file" \
+      "$run_effective_verdict_file" "$run_root"
+    grep -Fqx 'held definitions.packages.deleted-a' \
+      "$run_effective_verdict_file" ||
+      fail "a held parent-only item did not enter the effective verdicts"
+    [ "$(grep -Fc 'plugins.example' "$run_effective_verdict_file")" -eq 1 ] ||
+      fail "an existing verdict was duplicated while promoting holds"
     run_unsafe_store="$run_root/unsafe-upstream-store"
     mkdir -p "$run_unsafe_store"
     ! fleet_upstream_write "$run_unsafe_store" ../hosts vireo failed ||
