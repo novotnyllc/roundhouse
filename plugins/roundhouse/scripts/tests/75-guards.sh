@@ -145,6 +145,9 @@ if [ -n "$fleet_fixture_yq" ]; then
     printf '%s\n' "$guard_reroot_body" | grep -q \
       'local main is conflicted; resolve it before re-rooting' ||
       fail "fleet-reroot does not refuse a conflicted main bookmark"
+    printf '%s\n' "$guard_reroot_body" | grep -q \
+      'not in the checkpoint archive; refusing to re-root' ||
+      fail "fleet-reroot does not refuse a sibling reviewed line"
 
     # …and it is the predicate the deleting verb actually calls. Asserted on
     # the SOURCE, because the destructive path cannot be exercised safely.

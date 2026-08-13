@@ -1386,6 +1386,20 @@ fleet_reroot_command() (
     printf 'roundhouse: re-root starts from a tagged checkpoint; run `roundhouse fleet-checkpoint` first (§7.11.2 step 1)\n' >&2
     exit 65
   }
+  # The archive must contain every resolvable reviewed commit on this host. A
+  # sibling reviewed line cannot be proved by an archive that ends at this
+  # checkpoint, so refuse before consuming authority or mutating refs.
+  reroot_reviewed_ref=$(fleet_trust_reviewed_ref)
+  if [ -n "$reroot_reviewed_ref" ] &&
+    jj -R "$reroot_store" log -r "$reroot_reviewed_ref" --no-graph \
+      -T 'commit_id' >/dev/null 2>&1 &&
+    [ -z "$(jj -R "$reroot_store" log \
+      -r "$reroot_reviewed_ref & ::$reroot_head" --no-graph \
+      -T commit_id 2>/dev/null)" ]; then
+    printf 'roundhouse: reviewed-ref %s is not in the checkpoint archive; refusing to re-root\n' \
+      "$reroot_reviewed_ref" >&2
+    exit 65
+  fi
   # The archive verifier proves the reviewed-ref -> checkpoint chain. Do not
   # hide a newer reviewed main commit behind an older root; checkpoint that
   # line again. A sibling-diverged main is deliberately allowed below. A

@@ -968,6 +968,24 @@ YAML
       [ "$(jj -R "$compose_store" log -r @ --no-graph -T 'empty')" = true ] ||
         fail "the composition fixture did not leave an empty jj working-copy head"
 
+      # A reviewed commit on the sibling line cannot be proved by an archive
+      # ending at the checkpoint. Refuse it before consuming a receipt or
+      # creating the archive ref; the actual §7.11.2 orphaned-ref shape below
+      # then proves that a reviewed checkpoint still composes.
+      printf '%s\n' "$compose_diverged_main" >"$compose_root/reviewed-ref"
+      compose_sibling_status=0
+      compose_sibling_out=$("$cli" fleet-reroot 2>&1) || compose_sibling_status=$?
+      [ "$compose_sibling_status" -ne 0 ] ||
+        fail "fleet-reroot archived a sibling reviewed line it cannot prove"
+      case $compose_sibling_out in
+        *'not in the checkpoint archive'*) ;;
+        *) fail "sibling reviewed-line refusal was not explicit: $compose_sibling_out" ;;
+      esac
+      ! "$REAL_GIT" -C "$compose_store" show-ref --verify --quiet \
+        "refs/roundhouse/archive/$(date -u +%Y%m%d)" ||
+        fail "sibling reviewed-line refusal mutated the archive ref"
+      printf '%s\n' "$compose_checkpoint" >"$compose_root/reviewed-ref"
+
       compose_reroot_status=0
       compose_reroot_out=$("$cli" fleet-reroot 2>&1) || compose_reroot_status=$?
       [ "$compose_reroot_status" -eq 0 ] ||
