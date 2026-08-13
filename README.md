@@ -29,7 +29,7 @@ claude plugin install roundhouse@novotnyllc
 
 (Codex: `codex plugin add roundhouse --marketplace novotnyllc`.)
 
-**Read the [public guide](https://novotnyllc.github.io/)** — the fleet config,
+**Read the [public guide](https://novotnyllc.github.io/railyard/)** — the fleet config,
 the enrollment ceremony, transports, and how readiness feeds dispatch, with
 diagrams.
 
@@ -51,7 +51,7 @@ doesn't move a train the shop hasn't cleared:
 ## The family
 
 Work routing and delivery live in
-[`railyard`](https://novotnyllc.github.io/). The public site describes how
+[`railyard`](https://novotnyllc.github.io/railyard/). The public site describes how
 the two products connect. Charter and boundaries: [AGENTS.md](AGENTS.md).
 
 ## License

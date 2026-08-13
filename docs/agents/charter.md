@@ -27,7 +27,7 @@ Administering the operator's own machines and infrastructure —
 ## Belongs elsewhere
 
 Deciding what work runs and where:
-[`railyard`](https://novotnyllc.github.io/) owns routing, delivery,
+[`railyard`](https://novotnyllc.github.io/railyard/) owns routing, delivery,
 orchestration, placement, and review gates — Roundhouse's dispatch contracts
 require its `railyard/model-routing/v1` router and feed its placement
 decisions. Craft skills are maintained outside Roundhouse.

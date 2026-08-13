@@ -6,18 +6,18 @@ Roundhouse keeps machines ready for agent work through inventory, readiness,
 transport, and fleet convergence. The public site is the canonical guide for
 the product story, installation, first-machine flow, and operating scenarios:
 
-<https://novotnyllc.github.io/>
+<https://novotnyllc.github.io/railyard/>
 
 ## Repo-local orientation
 
 - Configuration: `${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/config.json`,
   overridable with `ROUNDHOUSE_CONFIG`.
 - Install: use the Claude Code or Codex commands in the public site's
-  [installation guide](https://novotnyllc.github.io/start/install/).
+  [installation guide](https://novotnyllc.github.io/railyard/start/install/).
 - First machine: follow the public site's
-  [first-machine guide](https://novotnyllc.github.io/start/first-machine/).
+  [first-machine guide](https://novotnyllc.github.io/railyard/start/first-machine/).
 - Fleet operations: see the public site's
-  [fleet section](https://novotnyllc.github.io/fleet/).
+  [fleet section](https://novotnyllc.github.io/railyard/fleet/).
 - Repository rules and local engineering references live in
   [`AGENTS.md`](../AGENTS.md), [`docs/agents/charter.md`](agents/charter.md),
   [`docs/agents/verification.md`](agents/verification.md),

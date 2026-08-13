@@ -1,7 +1,7 @@
 # Third-party notices
 
 roundhouse incorporates the material below. This file is the licensing
-record; the [public credits page](https://novotnyllc.github.io/credits/) is
+record; the [public credits page](https://novotnyllc.github.io/railyard/credits/) is
 the human-facing credit page.
 
 Only *incorporated* material is listed — code or text copied or adapted into
