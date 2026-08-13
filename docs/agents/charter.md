@@ -22,8 +22,6 @@ Administering the operator's own machines and infrastructure —
   Optional chezmoi cooperation is `agent-utilities:fleet-chezmoi`.
 - *Transport and privileged lanes* — see
   [transports](transports.md).
-- *Network gear* — `unifi-network-api`.
-
 ## Belongs elsewhere
 
 Deciding what work runs and where:

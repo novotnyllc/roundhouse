@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "2ca6b6546eb96a6edb0eb2c3db60641a0d1792a3be6a4459f8c9a0205ce908b7"
+      "sha256": "894d7d2e51d55a8bfdf8fbc25178c3babe9d502fc65d0678f4bea17a70f7d0d8"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "a3d0cfdf9784ace12cf0e8edb9e53cb2533347c7143c289b4b1bed5150301c2d"
+      "sha256": "c999bac2f12388b8dac7721ec998d09daec583c0fc21dece619a0c1514b2d455"
     },
     {
       "path": "assets/icon.png",
@@ -259,27 +259,11 @@
     {
       "path": "skills/ssh-doctor/agents/openai.yaml",
       "sha256": "e27babddc7db9c285b4776b2139c4b7784c377d36c2f5715ab836aa94b905343"
-    },
-    {
-      "path": "skills/unifi-network-api/SKILL.md",
-      "sha256": "1f720ddcdf6e43d6115d8d574fab5a51d882819c0eb5d72507cca83078288c42"
-    },
-    {
-      "path": "skills/unifi-network-api/agents/openai.yaml",
-      "sha256": "b86ea395fbf63b2dcbcae10f072ae78a502931021c6a2c1aacbafd96ddf746d3"
-    },
-    {
-      "path": "skills/unifi-network-api/references/api-usage.md",
-      "sha256": "d98cafae44681894b0521917906a9737c4420c478e9ea4974793d9f320405b7e"
-    },
-    {
-      "path": "skills/unifi-network-api/references/current-openapi.json",
-      "sha256": "a1aa75b92c36492057b57e6d4db1b50896b2d24c909791cbe8c02fafac93b881"
     }
   ],
   "marketplace": "novotnyllc",
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.7.3"
+  "version": "0.7.4"
 }

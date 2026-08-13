@@ -1,7 +1,7 @@
 {
   "name": "roundhouse",
-  "version": "0.7.3",
-  "description": "Machine and infrastructure administration for agent fleets: readiness, inventory, harness/plugin/skill parity, package baselines, auth artifacts, SSH transport and diagnosis, privileged install lanes, and UniFi network gear.",
+  "version": "0.7.4",
+  "description": "Machine and infrastructure administration for agent fleets: readiness, inventory, harness/plugin/skill parity, package baselines, auth artifacts, SSH transport and diagnosis, privileged install lanes.",
   "author": {
     "name": "Claire Novotny LLC",
     "url": "https://github.com/novotnyllc"
@@ -13,7 +13,7 @@
   "interface": {
     "displayName": "Roundhouse",
     "shortDescription": "Fleet readiness, inventory, updates, auth, SSH transport, and network gear",
-    "longDescription": "Roundhouse keeps machines and infrastructure serviceable: fleet readiness and inventory, agent harness/plugin/skill parity, package baselines, credential artifacts, SSH transport with diagnosis and enrollment, narrow privileged install lanes, and UniFi network administration. The sibling railyard plugin decides and routes work; Roundhouse keeps the engines ready to run it.",
+    "longDescription": "Roundhouse keeps machines and infrastructure serviceable: fleet readiness and inventory, agent harness/plugin/skill parity, package baselines, credential artifacts, SSH transport with diagnosis and enrollment, narrow privileged install lanes. The sibling railyard plugin decides and routes work; Roundhouse keeps the engines ready to run it.",
     "developerName": "Claire Novotny LLC",
     "category": "Productivity",
     "capabilities": [
