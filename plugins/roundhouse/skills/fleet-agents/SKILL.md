@@ -407,6 +407,53 @@ clears. Use it only when the instruction is genuinely "burn its history too" —
 **The in-band lever bites first and bites everywhere; the KRL is the deliberate
 second one.**
 
+### Delegated owner-authority receipts
+
+The two trust-mutating delegated verbs accept an optional one-use receipt:
+
+```text
+roundhouse fleet-remove HOST --burn --authority-receipt receipt_<32 lowercase hex>
+roundhouse fleet-reroot --authority-receipt receipt_<32 lowercase hex>
+```
+
+The receipt is a JSON file at the host-local, owner-only
+`<instance-root>/authority-receipts/<receipt-id>.json`. Its v1 contract is:
+
+```json
+{
+  "schema": "roundhouse/authority-receipt/v1",
+  "receiptId": "receipt_<32 lowercase hex>",
+  "authorityId": "bounded opaque id",
+  "action": {"command": "fleet-reroot"},
+  "actionDigest": "sha256:<64 lowercase hex>",
+  "objectiveDigest": "sha256:<64 lowercase hex>",
+  "instructionDigest": "sha256:<64 lowercase hex>",
+  "issuedAt": "UTC ISO-8601 instant",
+  "expiresAt": "UTC ISO-8601 instant",
+  "source": "explicit_user_instruction"
+}
+```
+
+For `fleet-remove --burn`, `action` is exactly
+`{"burn":true,"command":"fleet-remove","target":"HOST"}`. Roundhouse
+canonicalizes that object as compact sorted-key JSON, verifies the digest,
+checks the exact command/target, timestamps, schema, owner-only non-symlink
+file and fixed receipt reference, then atomically consumes the file before
+the roster or archive operation. A supplied invalid or replayed receipt
+refuses; no receipt preserves the existing deliberate, instruction-driven
+behavior, with owner confirmation expected in the invoking session. `--burn`
+still prints the burn procedure rather than executing it. The receipt verifier
+does not claim to authenticate the originating user turn or the attestor:
+Railyard owns that minting boundary.
+
+Railyard follow-up: its trusted in-process `user-turn-attestor` must mint and
+bind the exact Roundhouse action/objective/instruction digests, write the
+owner-only artifact, and return only the opaque receipt ID. Raw JSON, an
+environment variable, or a caller Boolean must not mint one. Its tests should
+cover expiry, action/target drift, tampering, replay, and public-CLI forgery;
+cross-host use needs a signed/MACed artifact and trust anchor rather than a
+cooperative private file.
+
 ### Checkpoints, re-root, and aging
 
 ```text

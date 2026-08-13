@@ -895,6 +895,23 @@ fleet_run_plugin_enabled() {
   printf '%s\n' "$fleet_run_plugin_state"
 }
 
+fleet_run_approve_plugin_hooks() {
+  # The DSC plugin item is a Claude manager operation, but the hook trust state
+  # is Codex-local. Qualified marketplace IDs are the shared seam accepted by
+  # codex-plugin-hooks.mjs; an unqualified Claude-only name has no Codex
+  # identity to approve and remains on the native manager path.
+  case ${1:-} in
+    *@*) ;;
+    *) return 0 ;;
+  esac
+  fleet_run_hooks_node=$(fleet_node_path) || {
+    printf 'roundhouse: Node.js is required to approve hooks for %s\n' "$1" >&2
+    return 75
+  }
+  "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
+    >/dev/null || return 75
+}
+
 fleet_run_plugin_identity_matches() {
   # fleet_run_plugin_identity_matches DEFS NAME VALUE — compare a resolved
   # marketplace plugin with the user-scoped installed record before ownership
@@ -1058,6 +1075,7 @@ fleet_run_apply_item() {
           else
             claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
           fi
+          fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
           # Trust the manager's exit status for nothing beyond "it ran": a
           # success exit with the catalog identity still unmatched (a no-op
           # install, a race against a catalog refresh) must not journal as
@@ -1070,11 +1088,13 @@ fleet_run_apply_item() {
         fi
       else
         claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+        fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
       fi
       # State-verb status is not convergence: re-read the manager afterward.
       if [ "$(fleet_run_state_of "$5")" = enabled ]; then
         fleet_run_want_enabled=true
         claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
+        fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
       else
         fleet_run_want_enabled=false
         claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
@@ -1512,9 +1532,10 @@ fleet_run_command() (
     # sibling hold in this function exits 65 and alerts — this one silently
     # converged on. Take the same branch the drift compare below takes.
     if ! fleet_trust_materialize "$run_store" "$run_reference"; then
+      run_reference_short=${run_reference:0:12}
       fleet_alert_write "$run_store" "$run_host" materialization \
         materialization-refused \
-        "materialization refused for $run_reference: a roster generation rollback or a non-descendant head (§7.12.3); holding everything" ||
+        "materialization refused for commit[$run_reference_short] (abbreviated commit id): a roster generation rollback or a non-descendant head (§7.12.3); holding everything" ||
         :
       printf 'roundhouse: materialization refused (§7.12.3); holding everything (§7.9)\n' >&2
       exit 65

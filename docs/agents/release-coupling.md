@@ -21,6 +21,11 @@ Changes under `plugins/` ship to installed fleets. They couple to a release:
    That one command updates every catalog file — both marketplace manifests
    and `.agents/plugins/plugin-versions.json` — and verifies them. Do not
    hand-edit those files.
+4. Keep plugin lifecycle trust coupled to the bytes: every DSC `install`,
+   `update`, or `enable` path must invoke
+   `scripts/codex-plugin-hooks.mjs approve PLUGIN@MARKETPLACE` immediately
+   afterward, with the Node/login-shell requirement and native-Windows Node
+   gap documented in `fleet-update`.
 
 Never treat an installed plugin cache as the source repository.
 

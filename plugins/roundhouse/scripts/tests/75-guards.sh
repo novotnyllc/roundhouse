@@ -45,6 +45,81 @@ if [ -n "$fleet_fixture_yq" ]; then
       fleet_host_name_ok "$guard_ok" ||
         fail "fleet_host_name_ok refused a legitimate host name: '$guard_ok'"
     done
+
+    # --- delegated owner-authority receipts: exact binding and one use ---
+    guard_receipt_root=$(fleet_instance_path authority-receipts)
+    mkdir -p "$guard_receipt_root"
+    chmod 700 "$guard_receipt_root"
+    guard_receipt_zero_digest=$(printf '%064d' 0)
+    guard_receipt_write() {
+      guard_receipt_id=$1
+      guard_receipt_action=$2
+      guard_receipt_issued=${3:-$(fleet_now)}
+      guard_receipt_expires=${4:-$(fleet_trust_iso_plus_hours "$guard_receipt_issued" 1)}
+      guard_receipt_action_digest=$(printf '%s\n' "$guard_receipt_action" |
+        jq -cS . | sha256_stream)
+      jq -n --arg id "$guard_receipt_id" --arg action_digest \
+        "sha256:$guard_receipt_action_digest" --arg issued "$guard_receipt_issued" \
+        --arg expires "$guard_receipt_expires" --argjson action \
+        "$guard_receipt_action" --arg zero "$guard_receipt_zero_digest" \
+        '{schema:"roundhouse/authority-receipt/v1",receiptId:$id,
+          authorityId:"guard-test",action:$action,
+          actionDigest:$action_digest,objectiveDigest:("sha256:" + $zero),
+          instructionDigest:("sha256:" + $zero),issuedAt:$issued,
+          expiresAt:$expires,source:"explicit_user_instruction"}' \
+        >"$guard_receipt_root/$guard_receipt_id.json"
+      chmod 600 "$guard_receipt_root/$guard_receipt_id.json"
+    }
+    guard_reroot_receipt=receipt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    guard_receipt_write "$guard_reroot_receipt" '{"command":"fleet-reroot"}'
+    fleet_trust_authority_receipt_verify_and_consume \
+      "$guard_reroot_receipt" fleet-reroot ||
+      fail "a valid reroot authority receipt was refused"
+    [ -f "$guard_receipt_root/consumed/$guard_reroot_receipt/receipt.json" ] ||
+      fail "a valid authority receipt was not atomically consumed"
+    guard_status=0
+    fleet_trust_authority_receipt_verify_and_consume \
+      "$guard_reroot_receipt" fleet-reroot >/dev/null 2>&1 || guard_status=$?
+    [ "$guard_status" -ne 0 ] ||
+      fail "a consumed authority receipt was replayed"
+
+    guard_target_receipt=receipt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    guard_receipt_write "$guard_target_receipt" \
+      '{"burn":true,"command":"fleet-remove","target":"vireo"}'
+    guard_status=0
+    fleet_trust_authority_receipt_verify_and_consume \
+      "$guard_target_receipt" fleet-remove wren >/dev/null 2>&1 || guard_status=$?
+    [ "$guard_status" -ne 0 ] &&
+      [ -f "$guard_receipt_root/$guard_target_receipt.json" ] ||
+      fail "a receipt bound to one remove target was accepted for another"
+
+    guard_expired_receipt=receipt_cccccccccccccccccccccccccccccccc
+    guard_receipt_write "$guard_expired_receipt" '{"command":"fleet-reroot"}' \
+      2020-01-01T00:00:00Z 2020-01-01T01:00:00Z
+    guard_status=0
+    fleet_trust_authority_receipt_verify_and_consume \
+      "$guard_expired_receipt" fleet-reroot >/dev/null 2>&1 || guard_status=$?
+    [ "$guard_status" -ne 0 ] || fail "an expired authority receipt was accepted"
+    [ -f "$guard_receipt_root/$guard_expired_receipt.json" ] ||
+      fail "an invalid authority receipt was consumed"
+
+    guard_remove_body=$(cli_function_body fleet_remove_command)
+    printf '%s\n' "$guard_remove_body" | grep -q \
+      'fleet_trust_authority_receipt_verify_and_consume' ||
+      fail "fleet-remove does not validate supplied authority receipts"
+    printf '%s\n' "$guard_remove_body" | grep -q 'fleet_enroll_cascade' ||
+      fail "fleet-remove source no longer contains its roster mutation"
+    guard_reroot_body=$(cli_function_body fleet_reroot_command)
+    printf '%s\n' "$guard_reroot_body" | grep -q \
+      'fleet_trust_authority_receipt_verify_and_consume' ||
+      fail "fleet-reroot does not validate supplied authority receipts"
+    guard_reroot_verify_line=$(printf '%s\n' "$guard_reroot_body" |
+      grep -n 'fleet_trust_authority_receipt_verify_and_consume' | head -1 | cut -d: -f1)
+    guard_reroot_mutation_line=$(printf '%s\n' "$guard_reroot_body" |
+      grep -n 'update-ref' | head -1 | cut -d: -f1)
+    [ "$guard_reroot_verify_line" -lt "$guard_reroot_mutation_line" ] ||
+      fail "fleet-reroot can update the archive ref before receipt validation"
+
     # …and it is the predicate the deleting verb actually calls. Asserted on
     # the SOURCE, because the destructive path cannot be exercised safely.
     cli_function_body fleet_remove_command | grep -q 'fleet_host_name_ok' ||

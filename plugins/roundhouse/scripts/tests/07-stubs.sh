@@ -137,13 +137,15 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
           grep -q 'stable-modified' "$writes" && modified_status=trusted
         fi
         if [ "$version" = 1.3.0 ]; then
+          stop_status=untrusted
+          [ "$scenario" != approve ] || [ ! -f "$writes" ] || stop_status=trusted
           hooks=$(jq -cn \
             --arg trusted "$trusted_status" --arg modified "$modified_status" \
-            --arg untrusted "$untrusted_status" '[
+            --arg untrusted "$untrusted_status" --arg stop "$stop_status" '[
               {key:"example@test-market:hooks/hooks.json:session_start:0:0",pluginId:"example@test-market",currentHash:"sha256:stable-trusted-new",trustStatus:$trusted,enabled:false},
               {key:"example@test-market:hooks/hooks.json:post_tool_use:0:0",pluginId:"example@test-market",currentHash:"sha256:stable-modified-new",trustStatus:$modified,enabled:true},
               {key:"example@test-market:hooks/hooks.json:pre_tool_use:0:0",pluginId:"example@test-market",currentHash:"sha256:untrusted",trustStatus:$untrusted,enabled:true},
-              {key:"example@test-market:hooks/hooks.json:stop:0:0",pluginId:"example@test-market",currentHash:"sha256:new",trustStatus:"untrusted",enabled:true},
+              {key:"example@test-market:hooks/hooks.json:stop:0:0",pluginId:"example@test-market",currentHash:"sha256:new",trustStatus:$stop,enabled:true},
               {key:"other@test-market:hooks/hooks.json:stop:0:0",pluginId:"other@test-market",currentHash:"sha256:other",trustStatus:"trusted",enabled:false}
             ]')
         else
@@ -162,6 +164,7 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
         ;;
       config/batchWrite)
         printf '%s\n' "$request" | jq -c '.params' >>"$CODEX_HOOK_WRITES_FILE"
+        [ -z "${CODEX_HOOK_ORDER_FILE:-}" ] || printf '%s\n' approve >>"$CODEX_HOOK_ORDER_FILE"
         jq -cn --argjson id "$id" '{id:$id,result:{}}'
         ;;
       *) exit 64 ;;
@@ -260,6 +263,7 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] &&
 fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = install ]; then
   [ -z "\${CLAUDE_INSTALL_MARKER:-}" ] || printf '%s\n' "\$3" >>"\$CLAUDE_INSTALL_MARKER"
+  [ -z "\${CLAUDE_PLUGIN_ACTION_LOG:-}" ] || printf '%s %s\n' install "\$3" >>"\$CLAUDE_PLUGIN_ACTION_LOG"
   # A real install replaces the installed-plugin record with the catalog's
   # resolved identity. Simulate that here so a caller that re-reads
   # installed_plugins.json after installing sees a genuine post-install
@@ -287,6 +291,7 @@ if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = enable ] || [ "\${2:-}" = disable ]
   [ -n "\${CLAUDE_INSTALL_MARKER:-}" ] || exit 64
   want=true
   [ "\$2" = enable ] || want=false
+  [ -z "\${CLAUDE_PLUGIN_ACTION_LOG:-}" ] || printf '%s %s\n' "\$2" "\$3" >>"\$CLAUDE_PLUGIN_ACTION_LOG"
   enabled_file=\${CLAUDE_PLUGIN_ENABLED_FILE:-$tmp/plugin-enabled.json}
   fixed_id=claude-example@test-market
   ledger_id=\$3
@@ -316,6 +321,7 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
   # existing-record path calls update, not install, and expects the same
   # catalog-resolved identity to land in installed_plugins.json.
   [ -z "\${CLAUDE_INSTALL_MARKER:-}" ] || printf '%s\n' "\$3" >>"\$CLAUDE_INSTALL_MARKER"
+  [ -z "\${CLAUDE_PLUGIN_ACTION_LOG:-}" ] || printf '%s %s\n' update "\$3" >>"\$CLAUDE_PLUGIN_ACTION_LOG"
   if [ -z "\${CLAUDE_INSTALL_SKIP_RECORD:-}" ] &&
     [ -n "\${CLAUDE_CONFIG_DIR:-}" ] &&
     [ -n "\${CLAUDE_PLUGIN_CATALOG_FILE:-}" ] && [ -f "\${CLAUDE_PLUGIN_CATALOG_FILE}" ]; then

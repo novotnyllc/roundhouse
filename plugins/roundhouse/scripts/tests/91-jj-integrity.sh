@@ -852,6 +852,119 @@ YAML
       *'absent from the archive'*) ;;
       *) fail "the no-archive refusal is not the rollback message: '$integrity_catch'" ;;
     esac
+
+    # 12e. VERB COMPOSITION — the producer and consumer must agree on the same
+    # checkpoint even when local main has since diverged and @ is jj's empty
+    # working-copy child. This is the exact §7.11.2 recovery shape: the reviewed
+    # ref is local host state, the checkpoint is immutable, and the current
+    # bookmark is not allowed to hide which checkpoint the reroot instruction
+    # named.
+    compose_fixture_status=0
+    (
+      compose_root="$rjj/compose"
+      compose_store="$compose_root/store"
+      compose_remote="$rjj/compose-remote.git"
+      rjj_key compose
+      mkdir -p "$compose_root"
+      printf 'name: compose\ndomain: fleet.example.invalid\n' \
+        >"$compose_root/identity.yaml"
+      env ROUNDHOUSE_FLEET_STORE="$compose_store" \
+        ROUNDHOUSE_FLEET_SIGNING_KEY="$rjj/compose-key" \
+        ROUNDHOUSE_TRUST_ROOT="$compose_root" ROUNDHOUSE_SELFTEST=1 \
+        "$cli" fleet-init >/dev/null
+      env ROUNDHOUSE_FLEET_STORE="$compose_store" \
+        ROUNDHOUSE_FLEET_SIGNING_KEY="$rjj/compose-key" \
+        ROUNDHOUSE_TRUST_ROOT="$compose_root" ROUNDHOUSE_SELFTEST=1 \
+        "$cli" fleet-enroll >/dev/null
+      compose_genesis=$(fleet_store_id "$compose_store")
+      "$REAL_GIT" init -q --bare -b main "$compose_remote"
+      jj -R "$compose_store" git remote add origin "$compose_remote" >/dev/null
+      "$REAL_GIT" -C "$compose_store" push -q origin main
+      jj -R "$compose_store" bookmark track main@origin >/dev/null
+      compose_remote_url=$(fleet_remote_url "$compose_store")
+      mkdir -p "$compose_root/store.local"
+      printf 'remote_visibility_verified: true\nremote_visibility_reason: auth-required\nremote_visibility_url: %s\n' \
+        "$compose_remote_url" >"$compose_root/store.local/posture.yaml"
+
+      # An unpushed local main exists while @ is an empty head on the old line.
+      jj -R "$compose_store" new "$compose_genesis" >/dev/null
+      printf 'packages:\n  probe: latest\n' >"$compose_store/fleet.yaml"
+      jj -R "$compose_store" describe -r @ -m 'local main before checkpoint' >/dev/null
+      compose_local_main=$(jj -R "$compose_store" log -r @ --no-graph -T commit_id)
+      jj -R "$compose_store" bookmark set main -r "$compose_local_main" >/dev/null
+      jj -R "$compose_store" new "$compose_genesis" >/dev/null
+      printf '%s\n' "$compose_genesis" >"$compose_root/reviewed-ref"
+
+      export ROUNDHOUSE_FLEET_STORE="$compose_store"
+      export ROUNDHOUSE_FLEET_SIGNING_KEY="$rjj/compose-key"
+      export ROUNDHOUSE_TRUST_ROOT="$compose_root"
+      export ROUNDHOUSE_SELFTEST=1
+      "$cli" fleet-checkpoint >"$compose_root/checkpoint.out" ||
+        fail "fleet-checkpoint could not stage the diverged-store fixture"
+      compose_tag=$(git -C "$compose_store" tag --list 'rh-checkpoint-*' | head -1)
+      [ -n "$compose_tag" ] || fail "fleet-checkpoint published no checkpoint tag"
+      compose_checkpoint=$(git -C "$compose_store" rev-parse "$compose_tag^{commit}")
+      [ -n "$(jj -R "$compose_store" log \
+        -r "$compose_local_main & ::$compose_checkpoint" --no-graph \
+        -T commit_id 2>/dev/null)" ] ||
+        fail "the checkpoint was not staged on the unpushed local main line"
+
+      # Move main to a sibling local line and leave @ as an empty, untagged
+      # working-copy head. The checkpoint remains the only immutable anchor.
+      jj -R "$compose_store" new "$compose_genesis" >/dev/null
+      printf 'packages:\n  probe: pinned\n' >"$compose_store/fleet.yaml"
+      jj -R "$compose_store" describe -r @ -m 'diverged local main' >/dev/null
+      compose_diverged_main=$(jj -R "$compose_store" log -r @ --no-graph -T commit_id)
+      jj -R "$compose_store" bookmark set main -r "$compose_diverged_main" \
+        --allow-backwards >/dev/null
+      jj -R "$compose_store" new "$compose_genesis" >/dev/null
+      [ "$(fleet_vcs_heads_local "$compose_store" | head -1)" = \
+        "$compose_diverged_main" ] ||
+        fail "the composition fixture did not move main to the divergent local line"
+      printf '%s\n' "$compose_local_main" >"$compose_root/reviewed-ref"
+      [ -z "$(jj -R "$compose_store" log -r "$compose_diverged_main & ::$compose_checkpoint" \
+        --no-graph -T commit_id 2>/dev/null)" ] ||
+        fail "the composition fixture did not diverge main from its checkpoint"
+      [ -z "$(jj -R "$compose_store" log -r "$compose_local_main & ::$compose_diverged_main" \
+        --no-graph -T commit_id 2>/dev/null)" ] ||
+        fail "the composition fixture did not orphan reviewed-ref from local main"
+      [ "$(jj -R "$compose_store" log -r @ --no-graph -T 'empty')" = true ] ||
+        fail "the composition fixture did not leave an empty jj working-copy head"
+
+      compose_reroot_status=0
+      compose_reroot_out=$("$cli" fleet-reroot 2>&1) || compose_reroot_status=$?
+      [ "$compose_reroot_status" -eq 0 ] ||
+        fail "checkpoint then reroot refused the diverged-store state: $compose_reroot_out"
+      compose_archive_ref=$(fleet_trust_archive_ref "$(date -u +%Y%m%d)")
+      [ "$(git -C "$compose_store" rev-parse "$compose_archive_ref")" = \
+        "$compose_checkpoint" ] ||
+        fail "reroot archived a commit other than the immutable checkpoint"
+      "$REAL_GIT" ls-remote --exit-code "$compose_remote" \
+        "$compose_archive_ref" >/dev/null ||
+        fail "reroot did not publish the archive ref"
+
+      # A genuine parentless rollback remains refused even though the archive
+      # exists: the new root is not signed by the checkpoint roster. This keeps
+      # the signing requirement in fleet-trust.sh §7.11.2 intact.
+      jj -R "$compose_store" new 'root()' -m '' >/dev/null
+      jj -R "$compose_store" config set --repo user.email mallory@fleet.example.invalid
+      jj -R "$compose_store" config set --repo signing.key "$rjj/mallory-key"
+      jj -R "$compose_store" new 'root()' -m '' >/dev/null
+      printf 'rollback root\n' >"$compose_store/fleet.yaml"
+      compose_attack=$(jj -R "$compose_store" describe -r @ -m 'rollback root' \
+        >/dev/null && jj -R "$compose_store" log -r @ --no-graph -T commit_id)
+      compose_attack_status=0
+      compose_attack_out=$(fleet_trust_catch_up "$compose_store" "$compose_attack") ||
+        compose_attack_status=$?
+      [ "$compose_attack_status" -ne 0 ] ||
+        fail "the composition fixture adopted a genuine rollback root"
+      case $compose_attack_out in
+        *'not signed by a key the checkpoint trusts'*) ;;
+        *) fail "the composition rollback refusal lost the checkpoint signing guard: $compose_attack_out" ;;
+      esac
+    ) || compose_fixture_status=$?
+    [ "$compose_fixture_status" -eq 0 ] ||
+      fail "the checkpoint/reroot composition fixture failed"
     printf 'name: vireo\ndomain: fleet.example.invalid\n' \
       >"$rjj/vireo/identity.yaml"
     rm -f "$rjj/vireo/reviewed-ref"

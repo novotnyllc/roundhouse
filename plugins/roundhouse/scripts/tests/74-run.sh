@@ -142,7 +142,12 @@ YAML
     run_plugin_catalog="$run_root/plugin-catalog.json"
     run_plugin_installed="$HOME/.claude/plugins/installed_plugins.json"
     run_plugin_install_marker="$run_root/plugin-installs"
+    run_plugin_order_log="$run_root/plugin-order.log"
     mkdir -p "$(dirname "$run_plugin_installed")"
+    : >"$run_plugin_order_log"
+    export CLAUDE_PLUGIN_ACTION_LOG="$run_plugin_order_log"
+    export CODEX_HOOK_ORDER_FILE="$run_plugin_order_log"
+    export CODEX_HOOK_SCENARIO=approve
 
     # B-1 characterization first: on Claude 2.1.229 the installed plugin is
     # absent from --available, so the existing identity gate has no SHA and
@@ -356,12 +361,23 @@ JSON
       run_identity_status=$?
     [ "$run_identity_status" -eq 1 ] ||
       fail "same-version/new-SHA ownership identity did not require reinstall"
+    : >"$run_plugin_order_log"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "same-version/new-SHA plugin apply failed"
     grep -qx 'example@test-market' "$run_plugin_install_marker" ||
       fail "same-version/new-SHA plugin was not reinstalled"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'update example@test-market' ] ||
+      fail "plugin update did not enter the honest action ledger"
+    [ "$(sed -n '2p' "$run_plugin_order_log")" = approve ] ||
+      fail "hook approval did not follow the plugin update"
+    [ "$(sed -n '3p' "$run_plugin_order_log")" = \
+      'enable example@test-market' ] ||
+      fail "plugin enable did not enter the honest action ledger"
+    [ "$(sed -n '4p' "$run_plugin_order_log")" = approve ] ||
+      fail "hook approval did not follow the plugin enable"
     : >"$run_plugin_install_marker"
     printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.3.0\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"

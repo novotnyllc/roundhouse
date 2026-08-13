@@ -83,6 +83,17 @@ Marketplace convergence compares resolved source bytes with the installed
 plugin identity; a same-version SHA change reinstalls, while a matching SHA is
 already current.
 
+After every plugin `install`, `update`, or `enable` operation performed by the
+DSC apply path, immediately run
+`scripts/codex-plugin-hooks.mjs approve PLUGIN@MARKETPLACE` and verify its
+result before journaling the item as applied. This is the automatic local hook
+trust step for fresh and changed hook hashes; it is not a copied settings table.
+On POSIX schedulers, invoke the CLI through the user's login shell or provide a
+PATH containing the harnesses and Node.js. The runtime also checks the standard
+Homebrew Node locations on macOS. The native Windows helper still requires
+`node` on the Windows task PATH; that is a current gap, not a reason to claim
+Windows auto-approval is complete.
+
 The entry drives **two cadences from one owned slot**:
 
 | Cadence | Command | Default | Covers |
@@ -118,6 +129,10 @@ The shape per platform, all three running the same two commands:
 roundhouse fleet-run --fast    # the fast slot
 roundhouse fleet-run --full    # the heavy slot
 ```
+
+The scheduler entry must preserve that Node requirement: a POSIX entry uses
+`$SHELL -lc 'roundhouse fleet-run --fast|--full'` (or an equivalent explicit
+tool PATH), while a Windows task must declare its current Node prerequisite.
 
 The run is non-interactive by construction: every jj, git and ssh invocation
 it makes is closed to editors, pagers and credential prompts, so a scheduled

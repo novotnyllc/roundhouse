@@ -337,6 +337,36 @@ prepare_privilege_enrollment_command() (
   rm -rf "$tmp"
 )
 
+fleet_node_path() {
+  # Scheduled fleet runs normally inherit the scheduler's PATH. Homebrew Node
+  # is not on launchd's minimal PATH on every macOS host, so keep the same
+  # fixed-path fallback used by the other system tools instead of making hook
+  # approval depend on an interactive shell.
+  fleet_node=$(command -v node 2>/dev/null || true)
+  [ -n "$fleet_node" ] && [ -x "$fleet_node" ] && {
+    printf '%s\n' "$fleet_node"
+    return 0
+  }
+  case $(uname -s) in
+    Darwin)
+      for fleet_node_candidate in /opt/homebrew/bin/node /usr/local/bin/node \
+        /usr/bin/node; do
+        [ -x "$fleet_node_candidate" ] || continue
+        printf '%s\n' "$fleet_node_candidate"
+        return 0
+      done
+      ;;
+    Linux)
+      for fleet_node_candidate in /usr/local/bin/node /usr/bin/node; do
+        [ -x "$fleet_node_candidate" ] || continue
+        printf '%s\n' "$fleet_node_candidate"
+        return 0
+      done
+      ;;
+  esac
+  return 69
+}
+
 codex_plugin_hooks_command() {
   action=$1
   shift
@@ -347,9 +377,9 @@ codex_plugin_hooks_command() {
       printf 'roundhouse: invalid Codex plugin ID\n' >&2
       exit 64
     }
-  command -v node >/dev/null 2>&1 || {
+  codex_hooks_node=$(fleet_node_path) || {
     printf 'roundhouse: Node.js is required for Codex hook approval\n' >&2
     exit 69
   }
-  node "$script_dir/codex-plugin-hooks.mjs" "$action" "$plugin_id"
+  "$codex_hooks_node" "$script_dir/codex-plugin-hooks.mjs" "$action" "$plugin_id"
 }

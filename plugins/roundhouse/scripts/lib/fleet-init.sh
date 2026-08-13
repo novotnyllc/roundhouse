@@ -1028,7 +1028,8 @@ fleet_enroll_process_joins() {
 # --- §7.3a C / §7.8: removal, renewal, reparenting, reconstitution ------------
 
 fleet_remove_command() (
-  # `roundhouse fleet-remove HOST [--burn]` — one instruction, no fan-out.
+  # `roundhouse fleet-remove HOST [--burn] [--authority-receipt REF]` — one
+  # instruction, no fan-out.
   # Every host, next fetch: the removed host's FUTURE commits verify against a
   # roster-at-parent that no longer lists it and are held; its PAST commits
   # verify against rosters that did list it and stay good. That is why the fleet
@@ -1036,8 +1037,48 @@ fleet_remove_command() (
   fleet_run_env
   require_jq
   require_yq
-  remove_target=$1
-  remove_burn=${2:-}
+  remove_target=
+  remove_burn=
+  remove_receipt=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --burn)
+        [ -z "$remove_burn" ] || {
+          printf 'roundhouse: duplicate --burn\n' >&2
+          exit 64
+        }
+        remove_burn=--burn
+        ;;
+      --authority-receipt)
+        shift
+        [ -n "${1:-}" ] || {
+          printf 'roundhouse: --authority-receipt needs a reference\n' >&2
+          exit 64
+        }
+        [ -z "$remove_receipt" ] || {
+          printf 'roundhouse: duplicate --authority-receipt\n' >&2
+          exit 64
+        }
+        remove_receipt=$1
+        ;;
+      -* )
+        printf 'roundhouse: unknown fleet-remove option: %s\n' "$1" >&2
+        exit 64
+        ;;
+      *)
+        [ -z "$remove_target" ] || {
+          printf 'roundhouse: fleet-remove takes one host name\n' >&2
+          exit 64
+        }
+        remove_target=$1
+        ;;
+    esac
+    shift
+  done
+  [ -z "$remove_receipt" ] || [ "$remove_burn" = --burn ] || {
+    printf 'roundhouse: --authority-receipt is only valid with --burn\n' >&2
+    exit 64
+  }
   # THE SAME GUARD `fleet_add_command` HAS, on the verb that DELETES. Two `rm`s
   # below build their paths straight from this argument, and dispatch accepts
   # one argument including the empty string: `fleet-remove ''` resolved to
@@ -1060,6 +1101,9 @@ fleet_remove_command() (
     exit 65
   }
   remove_head=$(fleet_vcs_heads_local "$remove_store" | head -1)
+  [ -z "$remove_receipt" ] ||
+    fleet_trust_authority_receipt_verify_and_consume "$remove_receipt" \
+      fleet-remove "$remove_target" || exit $?
   fleet_enroll_cascade "$remove_roster" "$remove_target" "$remove_head"
   fleet_enroll_retire "$remove_roster" "$remove_target" "$remove_head"
   fleet_enroll_bump "$remove_roster"
@@ -1239,6 +1283,16 @@ fleet_checkpoint_command() (
   fleet_vcs_store_ready "$ckpt_store" || exit $?
   ckpt_host=$(fleet_host_name)
   ckpt_head=$(fleet_vcs_heads_local "$ckpt_store" | head -1)
+  # `@` may be jj's empty working-copy child on an older line while `main`
+  # carries an unpushed local head. Stage the checkpoint on the selected
+  # bookmark head before fleet_enroll_commit describes @; otherwise the
+  # bookmark move is a backwards/sideways edit and the checkpoint never
+  # becomes the tagged commit that fleet-reroot can archive.
+  jj -R "$ckpt_store" new "$ckpt_head" >/dev/null || {
+    printf 'roundhouse: could not stage the checkpoint on local main %s\n' \
+      "$ckpt_head" >&2
+    exit 65
+  }
   ckpt_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-checkpoint.XXXXXX")
   trap 'rm -rf "$ckpt_tmp"' EXIT HUP INT TERM
   fleet_trust_roster_at_head "$ckpt_store" "$ckpt_head" "$ckpt_tmp/roster"
@@ -1274,7 +1328,7 @@ fleet_checkpoint_command() (
 )
 
 fleet_reroot_command() (
-  # `roundhouse fleet-reroot` — deliberate and instruction-driven, because it
+  # `roundhouse fleet-reroot [--authority-receipt REF]` — deliberate and instruction-driven, because it
   # rewrites what every clone starts from.
   #
   # THE ARCHIVE REF IS MANDATORY. A re-root is byte-for-byte indistinguishable
@@ -1286,16 +1340,47 @@ fleet_reroot_command() (
   fleet_run_env
   require_jq
   require_yq
+  reroot_receipt=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --authority-receipt)
+        shift
+        [ -n "${1:-}" ] || {
+          printf 'roundhouse: --authority-receipt needs a reference\n' >&2
+          exit 64
+        }
+        [ -z "$reroot_receipt" ] || {
+          printf 'roundhouse: duplicate --authority-receipt\n' >&2
+          exit 64
+        }
+        reroot_receipt=$1
+        ;;
+      *)
+        printf 'roundhouse: unknown fleet-reroot option: %s\n' "$1" >&2
+        exit 64
+        ;;
+    esac
+    shift
+  done
   fleet_enroll_require_enrolled || exit $?
   reroot_store=$(fleet_store_path)
   fleet_vcs_store_ready "$reroot_store" || exit $?
-  reroot_head=$(fleet_vcs_heads_local "$reroot_store" | head -1)
-  reroot_ckpt=$(jj -R "$reroot_store" log -r "$reroot_head" --no-graph \
-    -T 'if(tags, "yes", "no")' 2>/dev/null)
-  [ "$reroot_ckpt" = yes ] || {
+  # The working copy and local main are allowed to move after a checkpoint.
+  # The immutable tagged commit is the recovery input; selecting it through
+  # `heads_local` makes reroot depend on the current WC/bookmark shape and is
+  # exactly what breaks §7.11.2 on a diverged store.
+  reroot_tag=$(git -C "$reroot_store" for-each-ref --count=1 \
+    --sort=-refname --format='%(refname)' 'refs/tags/rh-checkpoint-*' \
+    2>/dev/null)
+  reroot_head=$(git -C "$reroot_store" rev-parse --verify \
+    "$reroot_tag^{commit}" 2>/dev/null) || reroot_head=
+  [ -n "$reroot_head" ] || {
     printf 'roundhouse: re-root starts from a tagged checkpoint; run `roundhouse fleet-checkpoint` first (§7.11.2 step 1)\n' >&2
     exit 65
   }
+  [ -z "$reroot_receipt" ] ||
+    fleet_trust_authority_receipt_verify_and_consume "$reroot_receipt" \
+      fleet-reroot || exit $?
   reroot_ref=$(fleet_trust_archive_ref "$(date -u +%Y%m%d)")
   git -C "$reroot_store" update-ref "$reroot_ref" "$reroot_head" || exit 65
   git -C "$reroot_store" push origin "$reroot_ref:$reroot_ref" >/dev/null 2>&1 || {
