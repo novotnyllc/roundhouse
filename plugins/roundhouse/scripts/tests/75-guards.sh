@@ -136,6 +136,15 @@ if [ -n "$fleet_fixture_yq" ]; then
       grep -n 'update-ref' | head -1 | cut -d: -f1)
     [ "$guard_reroot_verify_line" -lt "$guard_reroot_mutation_line" ] ||
       fail "fleet-reroot can update the archive ref before receipt validation"
+    printf '%s\n' "$guard_reroot_body" | grep -q \
+      'reroot_main_head_count=' ||
+      fail "fleet-reroot does not count every conflicted main head before selecting one"
+    printf '%s\n' "$guard_reroot_body" | grep -q \
+      'grep -c . || true' ||
+      fail "fleet-reroot does not inspect every conflicted main head before selecting one"
+    printf '%s\n' "$guard_reroot_body" | grep -q \
+      'local main is conflicted; resolve it before re-rooting' ||
+      fail "fleet-reroot does not refuse a conflicted main bookmark"
 
     # …and it is the predicate the deleting verb actually calls. Asserted on
     # the SOURCE, because the destructive path cannot be exercised safely.

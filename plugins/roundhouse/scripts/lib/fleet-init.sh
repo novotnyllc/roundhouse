@@ -1388,8 +1388,17 @@ fleet_reroot_command() (
   }
   # The archive verifier proves the reviewed-ref -> checkpoint chain. Do not
   # hide a newer reviewed main commit behind an older root; checkpoint that
-  # line again. A sibling-diverged main is deliberately allowed below.
-  reroot_main_head=$(fleet_vcs_heads_local "$reroot_store" | head -1)
+  # line again. A sibling-diverged main is deliberately allowed below. A
+  # conflicted bookmark has multiple possible lines, so it is not a safe
+  # reroot input at all; never inspect only one of those heads.
+  reroot_main_heads=$(fleet_vcs_heads_local "$reroot_store")
+  reroot_main_head_count=$(printf '%s\n' "$reroot_main_heads" |
+    grep -c . || true)
+  [ "$reroot_main_head_count" -le 1 ] || {
+    printf 'roundhouse: local main is conflicted; resolve it before re-rooting\n' >&2
+    exit 65
+  }
+  reroot_main_head=$(printf '%s\n' "$reroot_main_heads" | head -1)
   if [ -n "$reroot_main_head" ] &&
     [ -n "$(jj -R "$reroot_store" log \
       -r "$reroot_head:: & ::$reroot_main_head ~ $reroot_head" \
