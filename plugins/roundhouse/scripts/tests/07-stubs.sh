@@ -211,9 +211,23 @@ if [ "\${1:-}" = update ] && [ "\$#" -eq 1 ]; then
   [ -z "\${RUNTIME_UPDATE_MARKER:-}" ] || printf '%s\n' claude >"\$RUNTIME_UPDATE_MARKER"
   exit 0
 fi
+if [ "\${1:-}" = plugin ] && [ "\${2:-}" = marketplace ] &&
+  [ "\${3:-}" = list ] && [ "\${4:-}" = --json ]; then
+  [ -z "\${CLAUDE_PLUGIN_MARKETPLACE_FILE:-}" ] ||
+    cat "\$CLAUDE_PLUGIN_MARKETPLACE_FILE"
+  [ -n "\${CLAUDE_PLUGIN_MARKETPLACE_FILE:-}" ] || printf '%s\n' '[]'
+  exit 0
+fi
+if [ "\${1:-}" = plugin ] && [ "\${2:-}" = marketplace ] &&
+  [ "\${3:-}" = update ]; then
+  [ -z "\${CLAUDE_MARKETPLACE_UPDATE_MARKER:-}" ] ||
+    printf '%s\n' "\$4" >>"\$CLAUDE_MARKETPLACE_UPDATE_MARKER"
+  exit 0
+fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] &&
   { [ "\${3:-}" = --json ] ||
     { [ "\${3:-}" = --available ] && [ "\${4:-}" = --json ]; }; }; then
+  [ "\${3:-}" != --available ] || [ "\${CLAUDE_PLUGIN_LIST_FAIL:-0}" != 1 ] || exit 75
   [ "\${3:-}" != --available ] || {
     [ -z "\${CLAUDE_PLUGIN_CATALOG_FILE:-}" ] || {
       cat "\$CLAUDE_PLUGIN_CATALOG_FILE"
@@ -416,8 +430,10 @@ remote_command=false
 connect=false
 interval=false
 count=false
+stdin_null=false
 while [ $# -gt 0 ]; do
   case $1 in
+    -n) stdin_null=true; shift ;;
     -o)
       case $2 in
         BatchMode=yes) batch=true ;;
@@ -436,6 +452,7 @@ done
   [ "$connect" = true ] && [ "$interval" = true ] && [ "$count" = true ] || exit 64
 [ -z "${SSH_COMMAND_LOG:-}" ] || printf '%s\n' "$original" >>"$SSH_COMMAND_LOG"
 [ $# -gt 0 ] || exit 64
+[ "$stdin_null" = true ] && exec </dev/null
 if [ "$1" = sh ]; then
   [ "${2:-}" = -s ] && [ "${3:-}" = -- ] || exit 64
   case ${4:-} in

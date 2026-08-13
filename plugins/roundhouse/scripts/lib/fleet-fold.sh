@@ -42,6 +42,20 @@ wsl_sibling
 EOF
 }
 
+fleet_definitions_file_path() {
+  # A definitions directory is one level deep: the loader's glob is
+  # intentionally `definitions/*.yaml`, not a recursive walk. Keep every
+  # path-admission seam on that same direct-child rule; shell case `*` also
+  # matches `/`, so the suffix check is load-bearing.
+  case $1 in
+    definitions/*.yaml) fleet_definitions_rel=${1#definitions/} ;;
+    *) return 1 ;;
+  esac
+  case $fleet_definitions_rel in
+    ''|.*|*/*) return 1 ;;
+  esac
+}
+
 fleet_fold_program='. as $layer ireduce ({};
   (. *d ($layer | with_entries(select(.value != null))
     | (.[] | select(tag == "!!map")) |= with_entries(select(.value != null))))
@@ -97,6 +111,8 @@ fleet_tier_files() (
   [ ! -f "$tier_root.yaml" ] || printf '%s\n' "$tier_root.yaml"
   for tier_file in "$tier_root"/*.yaml; do
     [ -f "$tier_file" ] || continue
+    [ "$2" != definitions ] ||
+      fleet_definitions_file_path "definitions/${tier_file##*/}" || continue
     printf '%s\n' "$tier_file"
   done
 )
@@ -249,6 +265,7 @@ fleet_known_store_dirs() {
   # unknown category does: it may carry desired state nothing folded.
   cat <<'EOF'
 fleet
+definitions
 os
 groups
 hosts
@@ -468,31 +485,34 @@ EOF
 
 # --- §5.1 definitions: logical name -> concrete artifact ----------------------
 #
-# definitions.yaml sits at the STORE ROOT and is deliberately outside the fold.
-# The four layers answer "what does this host want"; a mapping is not a want
-# but a lookup, identical for every host that has the manager or marketplace.
-# Folding it would invite hosts to disagree about what `jj` is, which is not a
-# meaningful disagreement. (Ceiling: a genuine per-host divergence — two macOS
-# hosts wanting different taps for one tool — is the signal to split it into
-# two logical names, not to layer the definitions.)
+# The definitions tier sits at the STORE ROOT and is deliberately outside the
+# fold. It accepts `definitions.yaml` plus an ordered `definitions/*.yaml`
+# directory. The four layers answer "what does this host want"; a mapping is
+# not a want but a lookup, identical for every host that has the manager or
+# marketplace. Folding it would invite hosts to disagree about what `jj` is,
+# which is not a meaningful disagreement. (Ceiling: a genuine per-host
+# divergence — two macOS hosts wanting different taps for one tool — is the
+# signal to split it into two logical names, not to layer the definitions.)
 
 fleet_definitions_path() {
   printf '%s/definitions.yaml\n' "$1"
 }
 
-fleet_definitions_load() {
-  # A missing file reads exactly like an empty one (§4's "no opinion"). A fleet
-  # that never hits a divergence never creates it.
-  definitions_file=$(fleet_definitions_path "$1")
-  [ -f "$definitions_file" ] || {
-    printf '{}\n'
-    return
-  }
-  yq -o=json -I=0 '. // {}' "$definitions_file"
-}
+fleet_definitions_load() (
+  # A missing file or directory reads exactly like an empty one (§4's "no
+  # opinion"). `fleet_tier_files` gives definitions the same scalar-plus-
+  # sorted-directory forms as every folded layer, while the result remains
+  # outside the host fold: definitions are shared lookup data, not desired
+  # state.
+  IFS='
+'
+  set -f
+  # shellcheck disable=SC2046 # deliberate word splitting over the file list
+  fleet_fold_files $(fleet_tier_files "$1" definitions)
+)
 
 fleet_definition_entry() {
-  # One entry, or nothing. `definitions.yaml` carries ONLY the exceptions:
+  # One entry, or nothing. The definitions tier carries ONLY the exceptions:
   # absent an entry the logical name is the concrete name, resolved by that
   # category's default source. `jq` needs no definition and never will.
   printf '%s\n' "$1" | jq -c --arg c "$2" --arg n "$3" 'getpath([$c, $n]) // empty'

@@ -483,6 +483,20 @@ YAML
     [ "$(printf '%s\n' "$docjj_rows" | grep -c '^ok ')" -ge 30 ] ||
       fail "doctor printed fewer than the ~30 rows §10.7 tables"
 
+    # B-3: a checkpoint record without a jj tag is a normal finding, not an
+    # arithmetic error from a two-line `grep -c || printf 0` substitution.
+    mkdir -p "$doc/checkpoints"
+    printf 'checkpoint: untagged\n' >"$doc/checkpoints/untagged.yaml"
+    docjj_status=0
+    docjj_doctor >/dev/null || docjj_status=$?
+    [ "$docjj_status" -eq 1 ] ||
+      fail "an untagged checkpoint record did not produce a doctor finding"
+    ! printf '%s\n' "$docjj_rows" | grep -Eq 'integer( expression)? expected' ||
+      fail "doctor checkpoint arithmetic emitted an integer error: $docjj_rows"
+    printf '%s\n' "$docjj_rows" | grep -qE '^FINDING +checkpoint-tags ' ||
+      fail "an untagged checkpoint did not fire checkpoint-tags"
+    rm -rf "$doc/checkpoints"
+
     # --- and one broken store per row that can be broken cheaply ---
     # Each of these was observed to fail silently at some point, which is the
     # only reason any of them exists.

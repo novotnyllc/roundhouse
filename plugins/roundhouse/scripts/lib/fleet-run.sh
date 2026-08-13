@@ -195,6 +195,7 @@ fleet_run_layer_path() {
   case $1 in
     fleet.yaml | definitions.yaml | fleet/*.yaml | os/*.yaml | groups/*.yaml | \
       hosts/*.yaml) ;;
+    definitions/*.yaml) fleet_definitions_file_path "$1" || return 1 ;;
     *) return 1 ;;
   esac
 }
@@ -224,13 +225,13 @@ fleet_run_item_digests() {
   # fleet_run_item_digests FOLD [LAYERDIR] -> `<item> <digest>` lines, which is
   # exactly what §8.3's hold set reads.
   #
-  # LAYERDIR brings `definitions.yaml` INTO THE ITEM UNIVERSE. It is correctly
+  # LAYERDIR brings the definitions file/directory INTO THE ITEM UNIVERSE. It is correctly
   # outside the fold (§5.1 — a mapping is a lookup, not a want), and nothing
   # else enumerated it either, so `definitions.*` had no digest, no verdict, no
   # §8.3 hold entry and no §7.7 narrow-hold entry. That made rule 6's
   # deliberately-narrow hold set EMPTY for a definitions-only commit: an
   # `ephemeral` leaf — 40/day by construction — could commit nothing but
-  # `definitions.yaml`, be correctly refused by the class rule, produce zero
+  # definitions content, be correctly refused by the class rule, produce zero
   # holds, and have the run clone its skill source and install its package
   # anyway. §5.1's "the `definitions.` prefix is load-bearing" is what keeps
   # `definitions.packages.jj` and `packages.jj` from sharing one verdict key.
@@ -315,7 +316,7 @@ fleet_run_file_items() {
   # fleet_run_file_items <file-on-disk> [store-relative-path] — every item a
   # layer file contributes, `<category>.<name>`.
   #
-  # `definitions.yaml` contributes DEFINITIONS items, under the reserved prefix.
+  # A definitions file contributes DEFINITIONS items, under the reserved prefix.
   # Without it this function emitted `packages.jj` for the definitions file, so
   # a file-scoped refusal of a definitions edit held the coincidentally
   # same-named DESIRED items and never the mapping — §5.1's "the `definitions.`
@@ -330,8 +331,15 @@ fleet_run_file_items() {
   # The parse status is captured rather than piped: jq exits 0 on empty stdin,
   # so an unparsable file would otherwise read as "this file contributes no
   # items" and hold nothing.
-  case ${2:-$1} in
-    definitions.yaml | */definitions.yaml) fleet_run_ns=definitions. ;;
+  fleet_run_file_path=${2:-$1}
+  case $fleet_run_file_path in
+    definitions.yaml | definitions/*.yaml)
+      case $fleet_run_file_path in
+        definitions/*.yaml)
+          fleet_definitions_file_path "$fleet_run_file_path" || return 1
+          ;;
+      esac
+      fleet_run_ns=definitions. ;;
     *) fleet_run_ns= ;;
   esac
   fleet_run_fi_json=$(yq -o=json -I=0 '. // {}' "$1" 2>/dev/null) || return 1
@@ -340,6 +348,30 @@ fleet_run_file_items() {
     jq -r --arg ns "$fleet_run_ns" '
       to_entries[] | select(.value | type == "object") |
       .key as $c | .value | keys[] | "\($ns)\($c).\(.)"'
+}
+
+fleet_run_file_items_at_change() {
+  # fleet_run_file_items_at_change STORE COMMIT LAYERDIR PATH WORKDIR — the
+  # union of the items this changed path contributes before and after the
+  # commit. A deleted file (or a deleted key inside a surviving file) has no
+  # post-change file to inspect, so using only the reviewed export silently
+  # drops the item that must be held.
+  fleet_run_file_item_list=$5/file-items
+  fleet_run_file_parent_dir=$5/file-parent
+  rm -rf "$fleet_run_file_parent_dir"
+  : >"$fleet_run_file_item_list"
+  if [ -f "$3/$4" ]; then
+    fleet_run_file_items "$3/$4" "$4" >>"$fleet_run_file_item_list" || :
+  fi
+  for fleet_run_file_parent in $(fleet_trust_parents "$1" "$2"); do
+    rm -rf "$fleet_run_file_parent_dir"
+    fleet_run_export "$1" "$fleet_run_file_parent" \
+      "$fleet_run_file_parent_dir" 2>/dev/null || continue
+    [ -f "$fleet_run_file_parent_dir/$4" ] || continue
+    fleet_run_file_items "$fleet_run_file_parent_dir/$4" "$4" \
+      >>"$fleet_run_file_item_list" || :
+  done
+  LC_ALL=C sort -u "$fleet_run_file_item_list"
 }
 
 fleet_run_changed_items() {
@@ -498,15 +530,17 @@ fleet_run_signature_holds() {
               ;;
           esac
           fleet_run_layer_path "$fleet_run_touched" || continue
-          [ -f "$4/$fleet_run_touched" ] || continue
+          fleet_run_changed_file_items=$(fleet_run_file_items_at_change \
+            "$1" "$fleet_run_commit" "$4" "$fleet_run_touched" \
+            "$fleet_run_roster")
+          [ -n "$fleet_run_changed_file_items" ] || continue
           if [ "$fleet_run_scope" = item ]; then
             [ -n "$fleet_run_narrow" ] || {
               fleet_run_changed_items "$1" "$fleet_run_commit" "$5" \
                 "$fleet_run_roster" >"$fleet_run_roster/narrow"
               fleet_run_narrow=$fleet_run_roster/narrow
             }
-            fleet_run_file_items "$4/$fleet_run_touched" "$fleet_run_touched" |
-              LC_ALL=C sort -u |
+            printf '%s\n' "$fleet_run_changed_file_items" |
               comm -12 - "$fleet_run_narrow" |
               while IFS= read -r fleet_run_held_item; do
                 [ -n "$fleet_run_held_item" ] || continue
@@ -514,7 +548,7 @@ fleet_run_signature_holds() {
               done
             continue
           fi
-          fleet_run_file_items "$4/$fleet_run_touched" "$fleet_run_touched" |
+          printf '%s\n' "$fleet_run_changed_file_items" |
             while IFS= read -r fleet_run_held_item; do
               [ -n "$fleet_run_held_item" ] || continue
               printf '%s %s\n' "$fleet_run_held_item" "$fleet_run_bad"
@@ -777,13 +811,50 @@ fleet_config_drift() {
 }
 
 fleet_run_plugin_catalog() {
-  # `claude plugin list --available --json` is the manager's resolved
-  # marketplace view. The source SHA is the byte identity; the catalog version
-  # remains useful for the ordinary release advance but is never sufficient by
-  # itself.
-  fleet_run_catalog_json=$(claude plugin list --available --json 2>/dev/null) || return 75
-  printf '%s\n' "$fleet_run_catalog_json" |
-    jq -e -c --arg id "$1" '.available[] | select(.pluginId == $id)' 2>/dev/null
+  # The source SHA is the byte identity; the catalog version remains useful
+  # for the ordinary release advance but is never sufficient by itself.
+  # Claude 2.1.229's `--available` view omits plugins already installed on the
+  # host, so use it when it has a SHA and fall back to the installed
+  # marketplace manifest when it does not. Older managers that fail the
+  # `--available` command still reach the manifest path.
+  fleet_run_catalog_id=$1
+  fleet_run_catalog_name=${fleet_run_catalog_id%@*}
+  fleet_run_catalog_market=${fleet_run_catalog_id##*@}
+  fleet_run_catalog_json=$(claude plugin list --available --json 2>/dev/null) ||
+    fleet_run_catalog_json=
+  fleet_run_catalog_entry=$(printf '%s\n' "$fleet_run_catalog_json" |
+    jq -e -c --arg id "$fleet_run_catalog_id" '
+      (if type == "array" then .[] else (.available // [])[] end) |
+      select((.pluginId // .id) == $id and (.source.sha // "") != "")' \
+      2>/dev/null) || fleet_run_catalog_entry=
+  [ -n "$fleet_run_catalog_entry" ] && {
+    printf '%s\n' "$fleet_run_catalog_entry"
+    return 0
+  }
+
+  fleet_run_marketplaces=$(claude plugin marketplace list --json 2>/dev/null) ||
+    return 75
+  fleet_run_catalog_locations=$(printf '%s\n' "$fleet_run_marketplaces" |
+    jq -r --arg market "$fleet_run_catalog_market" '
+      (if type == "array" then .[] else (.marketplaces // [])[] end) |
+      select(.name == $market) | .installLocation // empty' 2>/dev/null) ||
+    return 75
+  while IFS= read -r fleet_run_catalog_location; do
+    [ -n "$fleet_run_catalog_location" ] || continue
+    fleet_run_catalog_manifest="$fleet_run_catalog_location/.claude-plugin/marketplace.json"
+    [ -f "$fleet_run_catalog_manifest" ] || continue
+    fleet_run_catalog_entry=$(jq -e -c \
+      --arg name "$fleet_run_catalog_name" --arg market "$fleet_run_catalog_market" \
+      '.plugins[]? | select(.name == $name) |
+       . + {pluginId: ($name + "@" + $market), marketplaceName: $market}' \
+      "$fleet_run_catalog_manifest" 2>/dev/null) || continue
+    [ -n "$fleet_run_catalog_entry" ] || continue
+    printf '%s\n' "$fleet_run_catalog_entry"
+    return 0
+  done <<EOF
+$fleet_run_catalog_locations
+EOF
+  return 75
 }
 
 fleet_run_installed_plugin() {
@@ -1439,6 +1510,11 @@ fleet_run_command() (
   # The item-scoped detections join the same hold file the signature gate
   # writes, so the apply loop below reads one surface and not two.
   grep -v '^!hold ' "$run_tmp/detections" >>"$run_tmp/sigholds" || :
+  fleet_run_definition_hold_consumers "$run_tmp/sigholds" \
+    "$run_tmp/verdicts" "$run_tmp/values" "$run_tmp" \
+    || exit 65
+  fleet_run_hold_items_into_verdicts "$run_tmp/sigholds" \
+    "$run_tmp/verdicts" "$run_tmp"
 
   # §5's rendered aliases, and the include line that makes them reachable. The
   # destination directory is this run's to create: the render is pure and
@@ -1533,6 +1609,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   while read -r run_verdict run_item run_digest <&9; do
     [ -n "${run_item:-}" ] || continue
     if [ "$run_verdict" = held ]; then
+      fleet_run_runtime_hold "$run_item" 'verdict held' "$run_tmp/sigholds" ||
+        exit 65
       fleet_journal_append "$run_store" "$run_host" \
         "$(jq -cn --arg item "$run_item" --arg at "$run_now" \
           '{item:$item,digest:"held",outcome:"held",at:$at}')" || :
@@ -1557,6 +1635,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     # never a vote cast on anyone else's behalf.
     if fleet_run_verdict_held "$run_item" "$run_digest"; then
       printf '  hold  %s — held by review at %s\n' "$run_item" "$run_digest"
+      fleet_run_runtime_hold "$run_item" 'held by review' "$run_tmp/sigholds" ||
+        exit 65
       fleet_journal_append "$run_store" "$run_host" \
         "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
           '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
@@ -1583,6 +1663,9 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         1) run_match=no ;;
         75)
           printf '  hold  %s — installed marketplace identity unavailable\n' "$run_item"
+          fleet_run_runtime_hold "$run_item" \
+            'installed marketplace identity unavailable' "$run_tmp/sigholds" ||
+            exit 65
           fleet_journal_append "$run_store" "$run_host" \
             "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
               '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
@@ -1613,6 +1696,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       fleet_canary_gate "$run_store" "$run_item" "$run_digest" "$run_wait" \
         "$run_now" $(cat "$run_tmp/canaries") || {
         printf '  wait  %s — no canary evidence at %s yet\n' "$run_item" "$run_digest"
+        fleet_run_runtime_hold "$run_item" 'canary evidence unavailable' \
+          "$run_tmp/sigholds" || exit 65
         fleet_journal_append "$run_store" "$run_host" \
           "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
             '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
@@ -1666,6 +1751,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
           "$run_item"
         ;;
       *)
+        fleet_run_runtime_hold "$run_item" "apply status $run_status" \
+          "$run_tmp/sigholds" || exit 65
         [ "$run_status" -ne 75 ] || [ "$run_category" != packages ] ||
           fleet_alert_write "$run_store" "$run_host" package-hold \
             "package-hold-$(printf '%s' "$run_item" | tr './' '--')" \
@@ -1880,6 +1967,149 @@ fleet_run_resolution_journal() {
   rm -f "$3/resolution-journal"
 }
 
+fleet_run_item_is_held() {
+  # fleet_run_item_is_held ITEM DIGEST SIGNATURE_HOLDS VERDICTS. The full
+  # cadence runs after the apply loop, so it must not consume a definition or
+  # desired plugin that this run already held. Otherwise maintenance could
+  # act on content the item gate deliberately refused.
+  [ -f "$3" ] && awk -v item="$1" '$1 == item { found = 1 } END { exit !found }' \
+    "$3" && return 0
+  [ -f "$4" ] && awk -v item="$1" \
+    '$1 == "held" && $2 == item { found = 1 } END { exit !found }' \
+    "$4" && return 0
+  [ -n "$2" ] && fleet_run_verdict_held "$1" "$2" && return 0
+  return 1
+}
+
+fleet_run_definition_hold_consumers() {
+  # fleet_run_definition_hold_consumers HOLDS VERDICTS VALUES TMP — a definitions
+  # refusal also holds the desired item that would resolve through it. The
+  # mapping is one-to-one by design: definitions.packages.foo governs
+  # packages.foo, and the same shape applies to agent-surface categories.
+  # This protects both a changed mapping and a deleted mapping, whose current
+  # tree no longer has an entry from which a resolver could detect the hold.
+  fleet_run_definition_hold_items=$4/definition-hold-items
+  awk '$1 != "" && $1 != "!hold" { print $1 }' "$1" \
+    >"$fleet_run_definition_hold_items"
+  awk '$1 == "held" { print $2 }' "$2" \
+    >>"$fleet_run_definition_hold_items"
+  fleet_run_definition_consumer_holds=$4/definition-consumer-holds
+  : >"$fleet_run_definition_consumer_holds"
+  while IFS= read -r fleet_run_definition_hold; do
+    fleet_run_definition_item=${fleet_run_definition_hold%% *}
+    case $fleet_run_definition_item in
+      definitions.*.*)
+        fleet_run_definition_rest=${fleet_run_definition_item#definitions.}
+        fleet_run_definition_category=${fleet_run_definition_rest%%.*}
+        fleet_run_definition_name=${fleet_run_definition_rest#*.}
+        [ -n "$fleet_run_definition_category" ] || continue
+        [ -n "$fleet_run_definition_name" ] || continue
+        fleet_run_definition_consumer=$fleet_run_definition_category.$fleet_run_definition_name
+        awk -v item="$fleet_run_definition_consumer" \
+          '$1 == item { found = 1 } END { exit !found }' "$3" || continue
+        printf '%s held by %s\n' "$fleet_run_definition_consumer" \
+          "$fleet_run_definition_item" >>"$fleet_run_definition_consumer_holds"
+        ;;
+    esac
+  done < <(LC_ALL=C sort -u "$fleet_run_definition_hold_items")
+  [ ! -s "$fleet_run_definition_consumer_holds" ] || {
+    LC_ALL=C sort -u "$fleet_run_definition_consumer_holds" \
+      >>"$1"
+  }
+}
+
+fleet_run_hold_items_into_verdicts() {
+  # fleet_run_hold_items_into_verdicts HOLDS VERDICTS TMP — a held item that
+  # vanished from every reviewed head still needs a verdict entry. Otherwise
+  # the removal pass and the apply loop never see the hold: an existing host
+  # can forget the item, while a new host can resolve a deleted definition by
+  # its default. Preserve existing converge/held verdicts and add only the
+  # missing held entries. A `converge` verdict for a held item is replaced, so
+  # the removal and apply loops consume the same effective decision.
+  fleet_run_hold_item_list=$3/held-items
+  awk '$1 != "" && $1 != "!hold" { print $1 }' "$1" |
+    LC_ALL=C sort -u >"$fleet_run_hold_item_list"
+  fleet_run_held_verdicts=$3/held-verdicts
+  awk '
+    FILENAME == ARGV[1] { held[$1] = 1; next }
+    {
+      if ($2 in held) {
+        print "held", $2
+        emitted[$2] = 1
+      } else {
+        print
+      }
+    }
+    END {
+      for (item in held)
+        if (!(item in emitted)) print "held", item
+    }
+  ' "$fleet_run_hold_item_list" "$2" |
+    LC_ALL=C sort >"$fleet_run_held_verdicts"
+  mv -f "$fleet_run_held_verdicts" "$2"
+}
+
+fleet_run_runtime_hold() {
+  # fleet_run_runtime_hold ITEM REASON HOLDS_FILE — carry an apply-time
+  # refusal into the same temporary hold surface the full cadence consumes.
+  # This file is run-local and never replicated; the journal remains the audit
+  # record, while this marker prevents maintenance in this same run from acting
+  # on content the apply gate just refused.
+  printf '%s %s\n' "$1" "$2" >>"$3"
+  case $1 in
+    definitions.*.*)
+      fleet_run_runtime_definition_rest=${1#definitions.}
+      fleet_run_runtime_definition_category=${fleet_run_runtime_definition_rest%%.*}
+      fleet_run_runtime_definition_name=${fleet_run_runtime_definition_rest#*.}
+      printf '%s held by %s: %s\n' \
+        "$fleet_run_runtime_definition_category.$fleet_run_runtime_definition_name" \
+        "$1" "$2" >>"$3"
+      ;;
+  esac
+}
+
+fleet_run_plugin_marketplaces() (
+  # Resolve desired plugin marketplaces from the same surface resolver the
+  # apply path uses. A marketplace may live in the definitions tier when the
+  # desired value is the documented scalar `enabled`; refreshing only inline
+  # values leaves that manifest stale forever.
+  fleet_run_market_fold=$1
+  fleet_run_market_defs=$2
+  fleet_run_market_holds=${3:-}
+  fleet_run_market_verdicts=${4:-}
+  printf '%s\n' "$fleet_run_market_fold" |
+    jq -r '(.plugins // {}) | to_entries[] |
+      [.key, (.value | if type == "object" then (.marketplace // "") else "" end)] |
+      @tsv' |
+    while IFS='	' read -r fleet_run_market_plugin fleet_run_inline_market; do
+      [ -n "$fleet_run_market_plugin" ] || continue
+      fleet_run_market_item="plugins.$fleet_run_market_plugin"
+      fleet_run_market_digest=$(fleet_item_digest "$fleet_run_market_fold" \
+        "$fleet_run_market_item" 2>/dev/null || true)
+      fleet_run_item_is_held "$fleet_run_market_item" "$fleet_run_market_digest" \
+        "$fleet_run_market_holds" "$fleet_run_market_verdicts" && continue
+      fleet_run_market=$fleet_run_inline_market
+      if [ -z "$fleet_run_market" ]; then
+        fleet_run_market_definition_item="definitions.plugins.$fleet_run_market_plugin"
+        fleet_run_market_definition=$(fleet_definition_entry "$fleet_run_market_defs" \
+          plugins "$fleet_run_market_plugin")
+        [ -n "$fleet_run_market_definition" ] || continue
+        fleet_run_market_definition_digest=$(printf '%s\n' \
+          "$fleet_run_market_definition" |
+          fleet_value_digest "$fleet_run_market_definition_item")
+        fleet_run_item_is_held "$fleet_run_market_definition_item" \
+          "$fleet_run_market_definition_digest" "$fleet_run_market_holds" \
+          "$fleet_run_market_verdicts" && continue
+        fleet_run_market=$(fleet_resolve_surface "$fleet_run_market_defs" plugins \
+          "$fleet_run_market_plugin" 2>/dev/null | jq -r '.marketplace // empty')
+      fi
+      [ -n "$fleet_run_market" ] || continue
+      fleet_upstream_id_valid "$fleet_run_market" || continue
+      printf '%s\n' "$fleet_run_market"
+    done |
+    LC_ALL=C sort -u
+)
+
 fleet_run_full_pass() (
   # fleet_run_full_pass STORE HOST FOLD DEFS LAYERDIR TMP — everything the fast
   # run does NOT do, and the reason the fast interval can be 20 minutes:
@@ -1890,13 +2120,13 @@ fleet_run_full_pass() (
   full_fold=$3
   full_defs=$4
   full_layers=$5
+  full_hold_dir=${6:-}
 
   # §10.5: one file per host per upstream. No leases, no CAS, no TTLs, no
   # takeover — jitter is the coordination primitive.
-  printf '%s\n' "$full_fold" |
-    jq -r '(.plugins // {}) | to_entries[] |
-      (.value | if type == "object" then .marketplace else null end) // empty' |
-    LC_ALL=C sort -u | while IFS= read -r full_upstream; do
+  fleet_run_plugin_marketplaces "$full_fold" "$full_defs" \
+    "${6:-}/sigholds" "${6:-}/verdicts" |
+    while IFS= read -r full_upstream; do
     [ -n "$full_upstream" ] || continue
     full_result=unavailable
     if command -v claude >/dev/null 2>&1; then
@@ -1947,6 +2177,16 @@ fleet_run_full_pass() (
   printf '%s\n' "$full_fold" | jq -r '(.packages // {}) | keys[]' |
     while IFS= read -r full_package; do
       [ -n "$full_package" ] || continue
+      if [ -n "$full_hold_dir" ] &&
+        fleet_run_item_is_held "packages.$full_package" "" \
+          "$full_hold_dir/sigholds" "$full_hold_dir/verdicts"; then
+        continue
+      fi
+      if [ -n "$full_hold_dir" ] &&
+        fleet_run_item_is_held "definitions.packages.$full_package" "" \
+          "$full_hold_dir/sigholds" "$full_hold_dir/verdicts"; then
+        continue
+      fi
       ! fleet_package_pinned "$full_defs" "$full_package" || continue
       # shellcheck disable=SC2046,SC2086 # the host's package_managers, in order
       full_resolved=$(fleet_resolve_package "$full_defs" "$full_package" \

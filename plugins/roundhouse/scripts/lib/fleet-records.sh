@@ -17,6 +17,16 @@
 # Sourced by scripts/roundhouse; carries definitions only.
 # shellcheck shell=bash
 
+fleet_upstream_id_valid() {
+  # Upstream IDs become one path component under upstreams/. Marketplace names
+  # use the same portable character set as the sealed executor manifest, but
+  # `.` and `..` remain traversal components even though dots are otherwise
+  # valid. Validate both before invoking a manager and at the record sink.
+  case ${1:-} in
+    ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+}
+
 fleet_record_write() {
   # Every record in this unit lands through here: JSON in, YAML on disk,
   # atomically, owner-only, never following a symlink. One writer, so no
@@ -390,6 +400,10 @@ fleet_upstream_write() {
   # `fleet_upstream_write STORE ID HOST RESULT`. One file per host per
   # upstream, so the last shared mutable path in the system is gone: no lease,
   # no CAS, no TTL, no discard rule, nothing to contend over.
+  fleet_upstream_id_valid "$2" || {
+    printf 'roundhouse: refusing unsafe upstream id: %s\n' "$2" >&2
+    return 1
+  }
   fleet_record_write "$1/upstreams/$2/$3.yaml" \
     "$(jq -cn --arg at "$(fleet_now)" --arg result "$4" \
       '{updated_at: $at, result: $result}')"

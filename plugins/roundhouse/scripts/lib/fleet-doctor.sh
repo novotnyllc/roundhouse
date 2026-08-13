@@ -660,7 +660,7 @@ fleet_readiness_command() (
       fleet_readiness_remote_status=0
       fleet_readiness_remote_probe=$(ssh_run "$fleet_readiness_destination" \
         'm=; for t in jj yq jq roundhouse; do command -v "$t" >/dev/null 2>&1 || m="$m $t"; done; printf "missing:%s\nhostname:%s\nuser:%s\n" "${m# }" "$(hostname)" "$(id -un)"' \
-        2>&1) || fleet_readiness_remote_status=$?
+        </dev/null 2>&1) || fleet_readiness_remote_status=$?
       fleet_readiness_remote_missing=$(printf '%s\n' "$fleet_readiness_remote_probe" |
         sed -n 's/^missing://p')
       fleet_readiness_remote_hostname=$(printf '%s\n' "$fleet_readiness_remote_probe" |
@@ -744,7 +744,7 @@ fleet_readiness_command() (
       fleet_readiness_posture_status=0
       fleet_readiness_posture_detail=$(ssh_run "$fleet_readiness_destination" \
         "roundhouse fleet-doctor 2>/dev/null | grep -E '^ok +remote-posture '" \
-        2>&1) || fleet_readiness_posture_status=$?
+        </dev/null 2>&1) || fleet_readiness_posture_status=$?
       if [ "$fleet_readiness_posture_status" -eq 0 ] &&
         [ -n "$fleet_readiness_posture_detail" ]; then
         fleet_readiness_row "$fleet_readiness_host" remote-posture ok \
@@ -1171,7 +1171,7 @@ fleet_doctor_command() (
   if [ -d "$doctor_store/checkpoints" ] &&
     [ -n "$(ls "$doctor_store/checkpoints" 2>/dev/null)" ]; then
     doctor_ckpt=$(jj -R "$doctor_store" log -r 'tags()' --no-graph \
-      -T 'commit_id ++ "\n"' 2>/dev/null | grep -c . || printf '0')
+      -T 'commit_id ++ "\n"' 2>/dev/null | grep -c . || true)
     if [ "$doctor_ckpt" -gt 0 ]; then
       fleet_doctor_row ok checkpoint-tags \
         "$doctor_ckpt tagged checkpoint(s); tags make them and all their ancestors immutable for free"

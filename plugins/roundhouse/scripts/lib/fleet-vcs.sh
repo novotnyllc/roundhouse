@@ -49,6 +49,10 @@ fleet_vcs_path_owner() {
       lineage/?* | proposals/?* | trust/?* | checkpoints/?*)
       printf '*\n'
       ;;
+    definitions/?*)
+      fleet_definitions_file_path "$1" || return 1
+      printf '*\n'
+      ;;
     joins/?*.yaml)
       printf '+\n'
       ;;

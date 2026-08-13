@@ -22,7 +22,7 @@ mkdir -p "$integrity_root"
   # non-layer paths any enrolled host may author. definitions.yaml is here on
   # purpose: the reserved `definitions.` prefix is about item identity, not
   # about who may write the file.
-  for integrity_shared in fleet.yaml definitions.yaml os/macos.yaml \
+  for integrity_shared in fleet.yaml definitions.yaml definitions/10-overrides.yaml os/macos.yaml \
     groups/development.yaml hosts/vireo.yaml hosts/wren/base.yaml \
     fleet/policy.yaml lineage/1785024000-macbook-pro.yaml \
     proposals/promote-ponytail-to-fleet.yaml; do
@@ -43,7 +43,7 @@ mkdir -p "$integrity_root"
   # position of a row 2 pattern.
   for integrity_unowned in README.md .gitignore .roundhouse-sync-store \
     applied/vireo/extra.yaml upstreams/claude-marketplace/deep/vireo.yaml \
-    hosts journal/vireo; do
+    definitions/nested/file.yaml hosts journal/vireo; do
     ! fleet_vcs_path_owner "$integrity_unowned" >/dev/null ||
       fail "§7.3 claimed an identity for an unrecognised path: $integrity_unowned"
   done
@@ -237,7 +237,7 @@ YAML
     # Rule 6, the whole security boundary: a leaf writes its own evidence and
     # nothing else, and it MAY NOT SPONSOR.
     for integrity_refused in fleet.yaml os/macos.yaml groups/development.yaml \
-      hosts/vireo.yaml definitions.yaml trust/signers.yaml \
+      hosts/vireo.yaml definitions.yaml definitions/10-overrides.yaml trust/signers.yaml \
       checkpoints/1785024000.yaml lineage/x.yaml proposals/x.yaml; do
       ! fleet_trust_class_allows ephemeral "$integrity_refused" ||
         fail "rule 6 let a leaf write $integrity_refused"
@@ -570,6 +570,29 @@ YAML
     [ "$(awk '{ print $1 }' "$rjj/leaf-holds" | LC_ALL=C sort -u | tr '\n' ' ')" = \
       'packages.b ' ] ||
       fail "the class refusal was file-scoped, not item-scoped: $(tr '\n' ';' <"$rjj/leaf-holds")"
+    integrity_as vireo
+
+    # 8a. A DELETED DEFINITIONS FRAGMENT still contributes its former items to
+    # a class refusal. The reviewed export has no file to inspect after the
+    # deletion, so the hold set must union the changed path's parent content;
+    # otherwise the mapping disappears into the default-resolution path.
+    mkdir -p "$store/definitions"
+    printf 'packages:\n  deleted-a: latest\n  deleted-b: latest\n' \
+      >"$store/definitions/10-base.yaml"
+    integrity_as vireo
+    integrity_commit 'definitions fragment before deletion' >/dev/null
+    integrity_as leaf
+    rm -f "$store/definitions/10-base.yaml"
+    integrity_defs_delete=$(integrity_commit 'leaf deletes a definitions fragment')
+    fleet_run_export "$store" "$integrity_defs_delete" "$rjj/defs-delete-layers"
+    printf '%s\n' vireo leaf >"$rjj/defs-delete-hosts"
+    fleet_run_signature_holds "$store" "$integrity_defs_delete" \
+      "$rjj/defs-delete-hosts" "$rjj/defs-delete-layers" leaf '' \
+      "$rjj/defs-delete-work-2" >"$rjj/defs-delete-holds-2" 2>/dev/null || :
+    grep -q '^definitions.packages.deleted-a ' "$rjj/defs-delete-holds-2" ||
+      fail "deleting definitions/*.yaml dropped the former first item from the hold set: $(tr '\n' ';' <"$rjj/defs-delete-holds-2")"
+    grep -q '^definitions.packages.deleted-b ' "$rjj/defs-delete-holds-2" ||
+      fail "deleting definitions/*.yaml dropped the former second item from the hold set: $(tr '\n' ';' <"$rjj/defs-delete-holds-2")"
     integrity_as vireo
 
     # 8b. THE ROSTER-BEARING PATH ESCALATES TO A STORE-WIDE HOLD — the trust

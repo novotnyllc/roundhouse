@@ -82,6 +82,94 @@ hooks:
 YAML
     defs=$(fleet_definitions_load "$defs_store")
 
+    # B-4: definitions use the same scalar-plus-sorted-directory reader as
+    # the other layers. Later files override one leaf without discarding the
+    # earlier category or its unrelated entries.
+    defs_dir_store="$defs_root/directory-store"
+    mkdir -p "$defs_dir_store/definitions"
+    cat >"$defs_dir_store/definitions.yaml" <<'YAML'
+packages:
+  jj:
+    homebrew: root-jj
+agents:
+  scalar-only:
+    source: github:claire/scalar-only
+YAML
+    cat >"$defs_dir_store/definitions/00-base.yaml" <<'YAML'
+packages:
+  jj:
+    homebrew: base-jj
+plugins:
+  railyard:
+    marketplace: claire-local
+  # This sibling exists only in the earlier file; the later file must not
+  # replace the whole packages.jj map while overriding its homebrew leaf.
+  example:
+    marketplace: claire-local
+YAML
+    cat >"$defs_dir_store/definitions/10-overrides.yaml" <<'YAML'
+packages:
+  jj:
+    homebrew: final-jj
+    winget: jj-vcs.jj
+skills:
+  grilling:
+    source: github:claire/grilling-skill
+YAML
+    defs_dir=$(fleet_definitions_load "$defs_dir_store")
+    [ "$(fleet_resolve_package "$defs_dir" jj homebrew | jq -r '.name')" = final-jj ] ||
+      fail "scalar definitions.yaml or directory precedence was wrong"
+    [ "$(fleet_resolve_package "$defs_dir" jj winget | jq -r '.name')" = jj-vcs.jj ] ||
+      fail "a later definitions file did not override/add its package leaf"
+    [ "$(fleet_resolve_surface "$defs_dir" plugins example | jq -r '.marketplace')" = claire-local ] ||
+      fail "an earlier definitions sibling leaf was discarded"
+    fleet_definition_items "$defs_dir" | grep -Fqx definitions.skills.grilling ||
+      fail "a definitions directory item was not enumerated"
+    fleet_definition_items "$defs_dir" | grep -Fqx definitions.plugins.railyard ||
+      fail "an earlier definitions directory item was discarded"
+    fleet_definition_items "$defs_dir" | grep -Fqx definitions.agents.scalar-only ||
+      fail "a scalar-only definitions item was discarded"
+    fleet_run_item_digests '{}' "$defs_dir_store" | \
+      grep -Fq 'definitions.plugins.railyard ' ||
+      fail "an earlier definitions directory item had no digest"
+    fleet_run_item_digests '{}' "$defs_dir_store" | \
+      grep -Fq 'definitions.agents.scalar-only ' ||
+      fail "a scalar definitions item had no digest"
+    fleet_run_file_items "$defs_dir_store/definitions/10-overrides.yaml" \
+      definitions/10-overrides.yaml | grep -Fqx definitions.skills.grilling ||
+      fail "a definitions directory file did not produce scoped definition items"
+    ! fleet_run_file_items "$defs_dir_store/definitions/10-overrides.yaml" \
+      definitions/nested/file.yaml >/dev/null ||
+      fail "a nested definitions path was treated as a direct child"
+    ! fleet_run_layer_path definitions/.hidden.yaml ||
+      fail "a hidden definitions file was treated as a layer"
+    ! fleet_run_file_items "$defs_dir_store/definitions/10-overrides.yaml" \
+      definitions/.hidden.yaml >/dev/null ||
+      fail "a hidden definitions file was treated as an item source"
+    ! fleet_vcs_path_owner definitions/.hidden.yaml >/dev/null ||
+      fail "a hidden definitions file was authorized for writes"
+    printf '%s\n' 'packages:' '  payload: enabled' \
+      >"$defs_dir_store/groups-definitions.yaml"
+    fleet_run_file_items "$defs_dir_store/groups-definitions.yaml" \
+      groups/definitions/packages.yaml | grep -Fqx packages.payload ||
+      fail "a group named definitions was misclassified as the definitions tier"
+    ! fleet_run_file_items "$defs_dir_store/groups-definitions.yaml" \
+      groups/definitions/packages.yaml | grep -Fq definitions. ||
+      fail "a nested group definitions path crossed the definitions namespace"
+    ! fleet_upstream_id_valid ../hosts ||
+      fail "a traversal-shaped marketplace was accepted as an upstream id"
+
+    defs_adversarial_store="$defs_root/store with * glob"
+    mkdir -p "$defs_adversarial_store/definitions"
+    cat >"$defs_adversarial_store/definitions/00-base.yaml" <<'YAML'
+packages:
+  jq:
+    homebrew: jq
+YAML
+    defs_adversarial=$(fleet_definitions_load "$defs_adversarial_store")
+    [ "$(fleet_resolve_package "$defs_adversarial" jq homebrew | jq -r '.name')" = jq ] ||
+      fail "a definitions directory path with spaces/globs was not preserved"
+
     # --- the default rule, and the two entry forms ---
     [ "$(fleet_resolve_package "$defs" gh homebrew | jq -r '.name')" = gh ] ||
       fail "a package with no entry did not fall through to the default rule"
