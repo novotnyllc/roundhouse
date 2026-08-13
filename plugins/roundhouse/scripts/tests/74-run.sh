@@ -333,12 +333,17 @@ JSON
 
     printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.2.3\",\"source\":{\"sha\":\"$run_sha_old\"}}]}" >"$run_plugin_catalog"
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_old\"}]}}" >"$run_plugin_installed"
+    # Characterization: matching bytes start enabled, so enable refuses its no-op.
+    run_plugin_enabled_file="$run_root/plugin-enabled.json"
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_plugin_identity_matches \
       "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
       fail "same-version/same-SHA ownership identity did not match"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
-      CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "same-SHA plugin apply failed"
     [ ! -s "$run_plugin_install_marker" ] ||
@@ -387,6 +392,114 @@ JSON
         '"enabled"' '' >/dev/null || fail "no-record plugin apply failed"
     grep -qx 'example@test-market' "$run_plugin_install_marker" ||
       fail "never-installed plugin (no entry in installed_plugins.json) was not installed"
+
+    # U25 regression: THE SECOND RUN IS THE ONE THAT MATTERS. `claude plugin
+    # enable` refuses a no-op — an already-enabled plugin exits non-zero — and
+    # this arm's return value was that status, so a host that had converged
+    # journalled `held` on every subsequent run, lost its plugins' `applied`
+    # records, and starved every peer gated on its canary evidence. Apply the
+    # same converged plugin twice: both passes must be `applied`.
+    printf '%s\n' '{}' >"$run_plugin_enabled_file"
+    : >"$run_plugin_install_marker"
+    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.3.0\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.3.0\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
+    for run_converged_pass in first second; do
+      run_status=0
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+        CLAUDE_CONFIG_DIR="$HOME/.claude" \
+        CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+        CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+          '{"state":"enabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
+        run_status=$?
+      [ "$run_status" -eq 0 ] ||
+        fail "the $run_converged_pass apply of an enabled plugin exited $run_status, not 0"
+    done
+    [ "$(jq -r '.["example@test-market"]' "$run_plugin_enabled_file")" = true ] ||
+      fail "the apply reported success without the plugin ending up enabled"
+    [ ! -s "$run_plugin_install_marker" ] ||
+      fail "a converged plugin was reinstalled by the state pass"
+    # The disable direction is the same verb with the same refusal, so it gets
+    # the same two passes rather than an assumption of symmetry.
+    for run_converged_pass in first second; do
+      run_status=0
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+        CLAUDE_CONFIG_DIR="$HOME/.claude" \
+        CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+        CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+          '{"state":"disabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
+        run_status=$?
+      [ "$run_status" -eq 0 ] ||
+        fail "the $run_converged_pass apply of a disabled plugin exited $run_status, not 0"
+    done
+    [ "$(jq -r '.["example@test-market"]' "$run_plugin_enabled_file")" = false ] ||
+      fail "the disable apply reported success without the plugin ending up disabled"
+    # A zero-config name is reported back by the manager as its qualified id;
+    # exercise both directions so the fixed manager row cannot mask stale state.
+    run_plugin_unqualified_defs='{"plugins":{"claude-example":{}}}'
+    CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_unqualified_defs" plugins.claude-example \
+        '"enabled"' '' >/dev/null || fail "unqualified plugin apply failed"
+    CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_unqualified_defs" plugins.claude-example \
+        '"disabled"' '' >/dev/null || fail "unqualified plugin disable failed"
+    # AND THE SWALLOW IS NOT THE FIX: a manager that cannot report the state it
+    # was asked to reach must still hold. An unwritable ledger leaves the stub's
+    # `plugin list --json` with no row for the id, and no row is not `disabled`.
+    run_status=0
+    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_root/no-such-dir/enabled.json" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_unqualified_defs" plugins.claude-example \
+        '"enabled"' '' >/dev/null 2>&1 ||
+      run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "an unverifiable plugin state exited $run_status, not 75"
+
+    # The re-read accepts only the exact user-scoped manager record. A project
+    # row, an ambiguous bare id, a non-boolean state, or a failed list command
+    # cannot turn a state verb's non-zero exit into a false applied record.
+    run_plugin_list_json='[{"id":"claude-example@test-market","scope":"project","enabled":true},{"id":"claude-example@test-market","scope":"user","enabled":false}]'
+    run_plugin_list_status=0
+    claude() {
+      case "$1:$2:${3:-}" in
+        plugin:list:--json)
+          printf '%s\n' "$run_plugin_list_json"
+          return "$run_plugin_list_status"
+          ;;
+        *) command claude "$@" ;;
+      esac
+    }
+    [ "$(fleet_run_plugin_enabled claude-example@test-market)" = false ] ||
+      fail "plugin state re-read accepted a project row over the user row"
+    run_plugin_list_json='[{"id":"claude-example@one","scope":"user","enabled":true},{"id":"claude-example@two","scope":"user","enabled":false}]'
+    run_status=0
+    fleet_run_plugin_enabled claude-example >/dev/null || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "plugin state re-read gave ambiguous bare ids exit $run_status, not 75"
+    run_plugin_list_json='[{"id":"claude-example@one","scope":"user","enabled":true},{"id":"claude-example@two","scope":"user","enabled":"false"}]'
+    run_status=0
+    fleet_run_plugin_enabled claude-example >/dev/null || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "plugin state re-read ignored a malformed matching bare-id row"
+    run_plugin_list_json='[{"id":"claude-example@test-market","scope":"user","enabled":"false"}]'
+    run_status=0
+    fleet_run_plugin_enabled claude-example@test-market >/dev/null || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "plugin state re-read gave a non-boolean enabled value exit $run_status, not 75"
+    run_plugin_list_json='[{"id":"claude-example@test-market","scope":"user","enabled":true}]'
+    run_plugin_list_status=75
+    run_status=0
+    fleet_run_plugin_enabled claude-example@test-market >/dev/null || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "plugin state re-read accepted output from a failed list command"
+    unset -f claude
 
     # §5.1.3: a STANDALONE hook is arbitrary code from outside the plugin trust
     # flow. It folds, resolves, reviews and journals — and the apply path

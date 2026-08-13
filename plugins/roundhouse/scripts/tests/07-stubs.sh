@@ -234,7 +234,28 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] &&
       exit 0
     }
   }
-  printf '%s\n' "[{\"id\":\"claude-example@test-market\",\"version\":\"\$version\",\"scope\":\"user\",\"enabled\":true,\"installPath\":\"$tmp/home/.claude/plugins/cache/test-market/claude-example/\$version\",\"installedAt\":\"2026-01-03T04:05:06.000Z\",\"lastUpdated\":\"2026-01-04T05:06:07.000Z\"}]"
+  # Keep one canonical row per plugin: state mutations must be visible through
+  # the same manager list the production code re-reads.
+  enabled_file=\${CLAUDE_PLUGIN_ENABLED_FILE:-$tmp/plugin-enabled.json}
+  enabled_file_set=\${CLAUDE_PLUGIN_ENABLED_FILE+x}
+  fixed_id=claude-example@test-market
+  fixed_enabled=true
+  extra='[]'
+  if [ -f "\$enabled_file" ]; then
+    enabled_ledger=\$(jq -e -c 'if type == "object" then . else error("ledger") end' \
+      "\$enabled_file") || { printf '%s\n' '[]'; exit 0; }
+    fixed_enabled=\$(printf '%s\n' "\$enabled_ledger" | jq -r --arg id "\$fixed_id" \
+      'if has(\$id) then .[\$id] else true end')
+    extra=\$(printf '%s\n' "\$enabled_ledger" | jq -c --arg id "\$fixed_id" \
+      'to_entries | map(select(.key != \$id) |
+        {id: .key, version: "1.0.0", scope: "user", enabled: .value})')
+  elif [ -n "\$enabled_file_set" ]; then
+    printf '%s\n' '[]'
+    exit 0
+  fi
+  printf '%s\n' "[{\"id\":\"claude-example@test-market\",\"version\":\"\$version\",\"scope\":\"user\",\"enabled\":true,\"installPath\":\"$tmp/home/.claude/plugins/cache/test-market/claude-example/\$version\",\"installedAt\":\"2026-01-03T04:05:06.000Z\",\"lastUpdated\":\"2026-01-04T05:06:07.000Z\"}]" |
+    jq -c --argjson enabled "\$fixed_enabled" --argjson extra "\$extra" \
+      '.[0].enabled = \$enabled | . + \$extra'
   exit 0
 fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = install ]; then
@@ -264,6 +285,22 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = install ]; then
 fi
 if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = enable ] || [ "\${2:-}" = disable ]; }; then
   [ -n "\${CLAUDE_INSTALL_MARKER:-}" ] || exit 64
+  want=true
+  [ "\$2" = enable ] || want=false
+  enabled_file=\${CLAUDE_PLUGIN_ENABLED_FILE:-$tmp/plugin-enabled.json}
+  fixed_id=claude-example@test-market
+  ledger_id=\$3
+  [ "\$ledger_id" != "\${fixed_id%@*}" ] || ledger_id=\$fixed_id
+  [ -f "\$enabled_file" ] || printf '{}\n' >"\$enabled_file" 2>/dev/null || exit 1
+  jq -e 'type == "object"' "\$enabled_file" >/dev/null 2>&1 || exit 1
+  current=\$(jq -r --arg id "\$ledger_id" --arg fixed "\$fixed_id" '
+    if has(\$id) then .[\$id]
+    elif \$id == \$fixed then true
+    else false
+    end | tostring' "\$enabled_file") || exit 1
+  [ "\$current" != "\$want" ] || exit 1
+  jq -c --arg id "\$ledger_id" --argjson v "\$want" '.[\$id] = \$v' "\$enabled_file" \
+    >"\$enabled_file.tmp" 2>/dev/null && mv "\$enabled_file.tmp" "\$enabled_file" || exit 1
   exit 0
 fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&

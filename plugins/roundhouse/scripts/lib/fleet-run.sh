@@ -870,6 +870,31 @@ fleet_run_installed_plugin() {
   return 75
 }
 
+fleet_run_plugin_enabled() {
+  # State verbs reject no-ops; verify one strict user-scoped manager row.
+  # A bare id can resolve to more than one marketplace, which is not proof.
+  fleet_run_plugin_list=$(claude plugin list --json 2>/dev/null) || return 75
+  fleet_run_plugin_state=$(printf '%s\n' "$fleet_run_plugin_list" |
+    jq -e -r --arg id "$1" '
+      def records:
+        if type == "array" then .
+        elif type == "object" and (.installed | type == "array") then .installed
+        else error("invalid plugin list")
+        end;
+      [ records[]
+        | select(.scope == "user")
+        | (.id // .pluginId) as $record_id
+        | select(($record_id | type) == "string")
+        | select(if ($id | contains("@")) then $record_id == $id
+                 else ($record_id | split("@")[0]) == $id
+                 end) ] as $matches
+      | if ($matches | length) == 1 and ($matches[0].enabled | type == "boolean")
+        then ($matches[0].enabled | tostring)
+        else empty
+        end' 2>/dev/null) || return 75
+  printf '%s\n' "$fleet_run_plugin_state"
+}
+
 fleet_run_plugin_identity_matches() {
   # fleet_run_plugin_identity_matches DEFS NAME VALUE — compare a resolved
   # marketplace plugin with the user-scoped installed record before ownership
@@ -1046,11 +1071,16 @@ fleet_run_apply_item() {
       else
         claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
       fi
+      # State-verb status is not convergence: re-read the manager afterward.
       if [ "$(fleet_run_state_of "$5")" = enabled ]; then
-        claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1
+        fleet_run_want_enabled=true
+        claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
       else
-        claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1
+        fleet_run_want_enabled=false
+        claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
       fi
+      fleet_run_actual_enabled=$(fleet_run_plugin_enabled "$fleet_run_id") || return 75
+      [ "$fleet_run_actual_enabled" = "$fleet_run_want_enabled" ] || return 75
       ;;
     skills)
       # Presence only: neither harness carries a skill enable/disable verb
