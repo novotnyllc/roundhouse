@@ -240,6 +240,10 @@ history'
 assert_contains "$fleet_agents_text" '**A
 bookmark does not do this.**'
 assert_contains "$fleet_agents_text" '**The archive ref is part of the protocol, not hygiene.**'
+assert_contains "$fleet_agents_text" 'Delegated owner-authority receipts'
+assert_contains "$fleet_agents_text" 'fleet-reroot --authority-receipt'
+assert_contains "$fleet_agents_text" 'atomically consumes the file before'
+assert_contains "$fleet_agents_text" 'Railyard follow-up: its trusted in-process `user-turn-attestor`'
 # The residuals, named rather than hidden.
 assert_contains "$fleet_agents_text" '**Instruction-chain compromise has no technical mitigation.**'
 assert_contains "$fleet_agents_text" '**Availability is out of scope.**'
@@ -326,6 +330,10 @@ held and exits 0 without acting'
 assert_contains "$fleet_update_text" 'Exit 75 is the STALE-lock refusal'
 assert_contains "$fleet_update_text" 'whose `meta.json` is missing so its age cannot be read'
 assert_contains "$fleet_update_text" 'Unattended runs skip protected/privileged actions'
+assert_contains "$fleet_update_text" 'After every plugin `install`, `update`, or `enable` operation'
+assert_contains "$fleet_update_text" 'native Windows helper still requires
+`node` on the Windows task PATH'
+assert_contains "$fleet_update_text" '$SHELL -lc'
 
 # fleet-hosts carries the store-credential lifecycle and the restore sequence.
 fleet_hosts_skill="$script_dir/../skills/fleet-hosts/SKILL.md"

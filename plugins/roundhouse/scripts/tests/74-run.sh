@@ -139,10 +139,16 @@ YAML
     run_plugin_defs='{"plugins":{"example":{"marketplace":"test-market"}}}'
     run_sha_old=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     run_sha_new=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    export CODEX_PLUGIN_SHA=$run_sha_new
     run_plugin_catalog="$run_root/plugin-catalog.json"
     run_plugin_installed="$HOME/.claude/plugins/installed_plugins.json"
     run_plugin_install_marker="$run_root/plugin-installs"
+    run_plugin_order_log="$run_root/plugin-order.log"
     mkdir -p "$(dirname "$run_plugin_installed")"
+    : >"$run_plugin_order_log"
+    export CLAUDE_PLUGIN_ACTION_LOG="$run_plugin_order_log"
+    export CODEX_HOOK_ORDER_FILE="$run_plugin_order_log"
+    export CODEX_HOOK_SCENARIO=auto-approve
 
     # B-1 characterization first: on Claude 2.1.229 the installed plugin is
     # absent from --available, so the existing identity gate has no SHA and
@@ -177,7 +183,8 @@ JSON
       "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
       fail "a failed --available query did not fall back to the marketplace manifest"
     : >"$run_plugin_install_marker"
-    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
+    CODEX_PLUGIN_SHA="$run_sha_old" \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
       CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_plugin_marketplace_file" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
@@ -356,12 +363,53 @@ JSON
       run_identity_status=$?
     [ "$run_identity_status" -eq 1 ] ||
       fail "same-version/new-SHA ownership identity did not require reinstall"
+    # Make the following enable a real state transition so the ledger proves
+    # approval follows an actual enable, not a manager no-op.
+    printf '%s\n' '{"example@test-market":false}' >"$run_plugin_enabled_file"
+    : >"$run_plugin_order_log"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
-      CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "same-version/new-SHA plugin apply failed"
     grep -qx 'example@test-market' "$run_plugin_install_marker" ||
       fail "same-version/new-SHA plugin was not reinstalled"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'update example@test-market' ] ||
+      fail "plugin update did not enter the honest action ledger"
+    [ "$(sed -n '2p' "$run_plugin_order_log")" = approve ] ||
+      fail "hook approval did not follow the plugin update"
+    [ "$(sed -n '3p' "$run_plugin_order_log")" = \
+      'enable example@test-market' ] ||
+      fail "plugin enable did not enter the honest action ledger"
+    [ "$(sed -n '4p' "$run_plugin_order_log")" = approve ] ||
+      fail "hook approval did not follow the plugin enable"
+
+    # A native manager may persist the enabled state and then report a
+    # nonzero exit. The verified post-state must still trigger approval and
+    # let the apply path finish with an honest ledger.
+    : >"$run_plugin_order_log"
+    rm -f "$CODEX_HOOK_WRITES_FILE"
+    printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.2.3","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":false}' >"$run_plugin_enabled_file"
+    CLAUDE_ENABLE_EXIT_AFTER_STATE=1 \
+      CODEX_HOOK_SCENARIO=auto-approve \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null ||
+      fail "post-state enable approval did not survive manager refusal"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'enable example@test-market' ] ||
+      fail "post-state enable did not enter the honest action ledger"
+    [ "$(sed -n '2p' "$run_plugin_order_log")" = approve ] ||
+      fail "post-state enable did not trigger hook approval"
+    [ -s "$CODEX_HOOK_WRITES_FILE" ] ||
+      fail "post-state enable approval did not write Codex hook trust"
+
     : >"$run_plugin_install_marker"
     printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.3.0\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
@@ -371,6 +419,139 @@ JSON
         '"enabled"' '' >/dev/null || fail "version-advance plugin apply failed"
     grep -qx 'example@test-market' "$run_plugin_install_marker" ||
       fail "version-advance plugin was not reinstalled"
+
+    # The manager can report success while leaving the old record in place;
+    # the identity re-read must hold before any Codex hook trust mutation.
+    : >"$run_plugin_order_log"
+    : >"$run_plugin_install_marker"
+    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.4.0\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.3.0\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
+    run_status=0
+    CLAUDE_INSTALL_SKIP_RECORD=1 \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "a stale post-update identity did not hold (got $run_status)"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'update example@test-market' ] ||
+      fail "the stale post-update case did not enter the update ledger"
+    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
+      fail "hook approval ran before stale post-update identity was rejected"
+
+    # A converged enable is not an enable operation. In particular, a locally
+    # modified hook must not be laundered by the next scheduled pass merely
+    # because the desired state remains enabled.
+    : >"$run_plugin_order_log"
+    rm -f "$CODEX_HOOK_WRITES_FILE"
+    printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.4.0","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    CODEX_HOOK_SCENARIO=approve \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null || fail "steady-state plugin apply failed"
+    [ ! -s "$run_plugin_order_log" ] ||
+      fail "steady-state enable invoked automatic hook approval"
+    [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
+      fail "steady-state enable re-trusted a locally modified hook"
+
+    # A disabled desired state must not approve an independently enabled Codex
+    # copy just because Claude refreshed its stale installation. The later
+    # enable transition is the point at which hook trust becomes active.
+    : >"$run_plugin_order_log"
+    rm -f "$CODEX_HOOK_WRITES_FILE"
+    printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.3.0","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    CODEX_HOOK_SCENARIO=approve \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '{"state":"disabled","marketplace":"test-market"}' '' >/dev/null ||
+      fail "disabled stale plugin apply failed"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'update example@test-market' ] ||
+      fail "disabled stale plugin did not enter the update ledger"
+    ! grep -qx approve "$run_plugin_order_log" ||
+      fail "disabled desired state approved Codex hooks during refresh"
+    [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
+      fail "disabled desired state wrote Codex hook trust during refresh"
+
+    # Automatic approval must hold rather than launder an independently
+    # modified Codex hook when Claude refreshes the same qualified plugin.
+    : >"$run_plugin_order_log"
+    rm -f "$CODEX_HOOK_WRITES_FILE"
+    printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.3.0","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    run_status=0
+    CODEX_HOOK_SCENARIO=approve \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '{"state":"enabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
+      run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "automatic approval accepted a locally modified Codex hook (got $run_status)"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'update example@test-market' ] ||
+      fail "modified-hook refusal did not enter the update ledger"
+    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
+      fail "modified-hook refusal attempted a later state verb"
+    [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
+      fail "modified-hook refusal wrote Codex hook trust"
+
+    # An untrusted hook is a separate state from modified drift. Matching
+    # Codex bytes do not make a previously untrusted hook safe to stamp during
+    # scheduled convergence; it needs an explicit owner approval.
+    : >"$run_plugin_order_log"
+    rm -f "$CODEX_HOOK_WRITES_FILE"
+    printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.3.0","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    run_status=0
+    CODEX_HOOK_SCENARIO=untrusted \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '{"state":"enabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
+      run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "automatic approval accepted an untrusted Codex hook (got $run_status)"
+    [ "$(sed -n '1p' "$run_plugin_order_log")" = \
+      'update example@test-market' ] ||
+      fail "untrusted-hook refusal did not enter the update ledger"
+    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
+      fail "untrusted-hook refusal attempted a later state verb"
+    [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
+      fail "untrusted-hook refusal wrote Codex hook trust"
+
+    # A Claude-only qualified plugin must not turn the absent Codex identity
+    # into a held DSC item. The manager update still runs, but there is no
+    # Codex approval ledger entry to write.
+    : >"$run_plugin_order_log"
+    : >"$run_plugin_install_marker"
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.3.0\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
+    run_status=0
+    CODEX_HOOK_SCENARIO=not-installed \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 0 ] ||
+      fail "a Claude-only plugin was held by absent Codex ownership (got $run_status)"
+    ! grep -qx approve "$run_plugin_order_log" ||
+      fail "a Claude-only plugin attempted Codex hook approval"
 
     # U23 regression: a plugin never installed before has no record at all
     # (no installed_plugins.json, or no entry for its id) — that is an empty

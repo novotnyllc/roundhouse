@@ -873,9 +873,12 @@ fleet_run_installed_plugin() {
 fleet_run_plugin_enabled() {
   # State verbs reject no-ops; verify one strict user-scoped manager row.
   # A bare id can resolve to more than one marketplace, which is not proof.
+  # The optional second argument is only for the pre-verb transition probe:
+  # an absent row is `unknown` there, while the post-verb proof still holds.
+  fleet_run_allow_absent=${2:-false}
   fleet_run_plugin_list=$(claude plugin list --json 2>/dev/null) || return 75
   fleet_run_plugin_state=$(printf '%s\n' "$fleet_run_plugin_list" |
-    jq -e -r --arg id "$1" '
+    jq -e -r --arg id "$1" --argjson allow_absent "$fleet_run_allow_absent" '
       def records:
         if type == "array" then .
         elif type == "object" and (.installed | type == "array") then .installed
@@ -888,11 +891,60 @@ fleet_run_plugin_enabled() {
         | select(if ($id | contains("@")) then $record_id == $id
                  else ($record_id | split("@")[0]) == $id
                  end) ] as $matches
-      | if ($matches | length) == 1 and ($matches[0].enabled | type == "boolean")
+      | if ($matches | length) == 0 and $allow_absent then "unknown"
+        elif ($matches | length) == 1 and ($matches[0].enabled | type == "boolean")
         then ($matches[0].enabled | tostring)
         else empty
         end' 2>/dev/null) || return 75
   printf '%s\n' "$fleet_run_plugin_state"
+}
+
+fleet_run_approve_plugin_hooks() {
+  # The DSC plugin item is a Claude manager operation, but the hook trust state
+  # is Codex-local. Qualified marketplace IDs are the shared seam accepted by
+  # codex-plugin-hooks.mjs; an unqualified Claude-only name has no Codex
+  # identity to approve and remains on the native manager path.
+  case ${1:-} in
+    *@*) ;;
+    *) return 0 ;;
+  esac
+  fleet_run_expected_sha=${2:-}
+  [ -z "$fleet_run_expected_sha" ] ||
+    printf '%s\n' "$fleet_run_expected_sha" | grep -Eq '^[0-9a-fA-F]{40}$' ||
+    return 75
+  # Claude's marketplace namespace is not proof that Codex owns the same
+  # plugin. A Claude-only install has no Codex hook trust state to mutate;
+  # asking the helper to approve it would turn a successful Claude apply into
+  # a false hold. If Codex is present, a malformed/failed list is a real
+  # inability to prove ownership and remains held.
+  command -v codex >/dev/null 2>&1 || return 0
+  fleet_run_codex_plugins=$(codex plugin list --json 2>/dev/null) || return 75
+  fleet_run_codex_plugin_state=$(printf '%s\n' "$fleet_run_codex_plugins" | jq -e -r \
+    --arg id "$1" --arg expected_sha "$fleet_run_expected_sha" '
+    def records:
+      if type == "array" then .
+      elif type == "object" and (.installed | type == "array") then .installed
+      else error("invalid plugin list")
+      end;
+    [records[] | select((.pluginId // .id) == $id and (.installed != false))] as $matches |
+      if ($matches | length) == 0 then "absent"
+      elif $expected_sha == "" or any($matches[]; .source.sha == $expected_sha)
+      then "match"
+      else "mismatch"
+      end
+  ' 2>/dev/null) || return 75
+  case "$fleet_run_codex_plugin_state" in
+    absent) return 0 ;;
+    match) ;;
+    *) return 75 ;;
+  esac
+  fleet_run_hooks_node=$(fleet_node_path) || {
+    printf 'roundhouse: Node.js is required to approve hooks for %s\n' "$1" >&2
+    return 75
+  }
+  ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
+    "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
+    >/dev/null || return 75
 }
 
 fleet_run_plugin_identity_matches() {
@@ -1031,6 +1083,10 @@ fleet_run_apply_item() {
       fleet_run_id=$fleet_run_name
       [ -z "$fleet_run_market" ] ||
         fleet_run_id="$fleet_run_name@$fleet_run_market"
+      fleet_run_want_enabled=false
+      [ "$(fleet_run_state_of "$5")" = enabled ] && fleet_run_want_enabled=true
+      fleet_run_plugin_mutated=false
+      fleet_run_resolved_sha=
       if [ -n "$fleet_run_market" ]; then
         fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id") || return 75
         fleet_run_resolved_sha=$(printf '%s\n' "$fleet_run_catalog" |
@@ -1067,20 +1123,60 @@ fleet_run_apply_item() {
             = "$fleet_run_resolved_sha" ] &&
             [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
               = "$fleet_run_resolved_version" ] || return 75
+          if [ "$fleet_run_want_enabled" = true ]; then
+            fleet_run_approve_plugin_hooks "$fleet_run_id" \
+              "$fleet_run_resolved_sha" || return 75
+          fi
+          fleet_run_plugin_mutated=true
         fi
       else
         claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+        if [ "$fleet_run_want_enabled" = true ]; then
+          fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+        fi
+        fleet_run_plugin_mutated=true
       fi
-      # State-verb status is not convergence: re-read the manager afterward.
-      if [ "$(fleet_run_state_of "$5")" = enabled ]; then
-        fleet_run_want_enabled=true
-        claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
+      # State-verb status is not convergence: read it before attempting the
+      # verb. A no-op enable is not an enable operation, and must not turn a
+      # locally modified Codex hook into a newly trusted hook on every pass.
+      # A fresh install/update has already gone through the identity and hook
+      # gates, but some native managers do not expose the state row until the
+      # first state verb. In that case the verb result is the transition proof.
+      fleet_run_enable_attempted=false
+      fleet_run_enable_status=125
+      fleet_run_before_enabled=unknown
+      [ "$fleet_run_plugin_mutated" = true ] || {
+        fleet_run_before_enabled=$(fleet_run_plugin_enabled "$fleet_run_id" true) ||
+          return 75
+      }
+      if [ "$fleet_run_want_enabled" = true ]; then
+        if [ "$fleet_run_plugin_mutated" = true ] ||
+          [ "$fleet_run_before_enabled" != true ]; then
+          fleet_run_enable_attempted=true
+          fleet_run_enable_status=0
+          claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1 ||
+            fleet_run_enable_status=$?
+        fi
       else
         fleet_run_want_enabled=false
-        claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
+        if [ "$fleet_run_plugin_mutated" = true ] ||
+          [ "$fleet_run_before_enabled" != false ]; then
+          claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
+        fi
       fi
       fleet_run_actual_enabled=$(fleet_run_plugin_enabled "$fleet_run_id") || return 75
       [ "$fleet_run_actual_enabled" = "$fleet_run_want_enabled" ] || return 75
+      # Approval follows the verified post-state, not the manager's exit code.
+      # Some native managers write enabled state and then return nonzero; the
+      # before/after read is the authoritative transition proof. Install/update
+      # approval above covers byte changes; a steady-state enable is not a
+      # mutation and must not launder a locally modified hook.
+      if [ "$fleet_run_want_enabled" = true ] &&
+        [ "$fleet_run_enable_attempted" = true ] &&
+        [ "$fleet_run_actual_enabled" = true ]; then
+        fleet_run_approve_plugin_hooks "$fleet_run_id" \
+          "${fleet_run_resolved_sha:-}" || return 75
+      fi
       ;;
     skills)
       # Presence only: neither harness carries a skill enable/disable verb
@@ -1512,9 +1608,10 @@ fleet_run_command() (
     # sibling hold in this function exits 65 and alerts — this one silently
     # converged on. Take the same branch the drift compare below takes.
     if ! fleet_trust_materialize "$run_store" "$run_reference"; then
+      run_reference_short=${run_reference:0:12}
       fleet_alert_write "$run_store" "$run_host" materialization \
         materialization-refused \
-        "materialization refused for $run_reference: a roster generation rollback or a non-descendant head (§7.12.3); holding everything" ||
+        "materialization refused for commit[$run_reference_short] (abbreviated commit id): a roster generation rollback or a non-descendant head (§7.12.3); holding everything" ||
         :
       printf 'roundhouse: materialization refused (§7.12.3); holding everything (§7.9)\n' >&2
       exit 65

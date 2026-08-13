@@ -1028,7 +1028,8 @@ fleet_enroll_process_joins() {
 # --- §7.3a C / §7.8: removal, renewal, reparenting, reconstitution ------------
 
 fleet_remove_command() (
-  # `roundhouse fleet-remove HOST [--burn]` — one instruction, no fan-out.
+  # `roundhouse fleet-remove HOST [--burn] [--authority-receipt REF]` — one
+  # instruction, no fan-out.
   # Every host, next fetch: the removed host's FUTURE commits verify against a
   # roster-at-parent that no longer lists it and are held; its PAST commits
   # verify against rosters that did list it and stay good. That is why the fleet
@@ -1036,8 +1037,48 @@ fleet_remove_command() (
   fleet_run_env
   require_jq
   require_yq
-  remove_target=$1
-  remove_burn=${2:-}
+  remove_target=
+  remove_burn=
+  remove_receipt=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --burn)
+        [ -z "$remove_burn" ] || {
+          printf 'roundhouse: duplicate --burn\n' >&2
+          exit 64
+        }
+        remove_burn=--burn
+        ;;
+      --authority-receipt)
+        shift
+        [ -n "${1:-}" ] || {
+          printf 'roundhouse: --authority-receipt needs a reference\n' >&2
+          exit 64
+        }
+        [ -z "$remove_receipt" ] || {
+          printf 'roundhouse: duplicate --authority-receipt\n' >&2
+          exit 64
+        }
+        remove_receipt=$1
+        ;;
+      -* )
+        printf 'roundhouse: unknown fleet-remove option: %s\n' "$1" >&2
+        exit 64
+        ;;
+      *)
+        [ -z "$remove_target" ] || {
+          printf 'roundhouse: fleet-remove takes one host name\n' >&2
+          exit 64
+        }
+        remove_target=$1
+        ;;
+    esac
+    shift
+  done
+  [ -z "$remove_receipt" ] || [ "$remove_burn" = --burn ] || {
+    printf 'roundhouse: --authority-receipt is only valid with --burn\n' >&2
+    exit 64
+  }
   # THE SAME GUARD `fleet_add_command` HAS, on the verb that DELETES. Two `rm`s
   # below build their paths straight from this argument, and dispatch accepts
   # one argument including the empty string: `fleet-remove ''` resolved to
@@ -1060,6 +1101,9 @@ fleet_remove_command() (
     exit 65
   }
   remove_head=$(fleet_vcs_heads_local "$remove_store" | head -1)
+  [ -z "$remove_receipt" ] ||
+    fleet_trust_authority_receipt_verify_and_consume "$remove_receipt" \
+      fleet-remove "$remove_target" || exit $?
   fleet_enroll_cascade "$remove_roster" "$remove_target" "$remove_head"
   fleet_enroll_retire "$remove_roster" "$remove_target" "$remove_head"
   fleet_enroll_bump "$remove_roster"
@@ -1238,7 +1282,36 @@ fleet_checkpoint_command() (
   ckpt_store=$(fleet_store_path)
   fleet_vcs_store_ready "$ckpt_store" || exit $?
   ckpt_host=$(fleet_host_name)
-  ckpt_head=$(fleet_vcs_heads_local "$ckpt_store" | head -1)
+  ckpt_heads=$(fleet_vcs_heads_local "$ckpt_store") || {
+    printf 'roundhouse: could not inspect local main before checkpointing\n' >&2
+    exit 65
+  }
+  ckpt_head_count=$(printf '%s\n' "$ckpt_heads" | grep -c . || true)
+  [ "$ckpt_head_count" -eq 1 ] || {
+    [ "$ckpt_head_count" -gt 1 ] &&
+      printf 'roundhouse: local main is conflicted; resolve it before checkpointing\n' >&2 ||
+      printf 'roundhouse: local main is absent; initialize or reconcile it before checkpointing\n' >&2
+    exit 65
+  }
+  ckpt_head=$(printf '%s\n' "$ckpt_heads" | head -1)
+  ckpt_working_copy_empty=$(jj -R "$ckpt_store" log -r @ --no-graph -T 'empty' 2>/dev/null) || {
+    printf 'roundhouse: could not inspect the jj working copy before checkpointing\n' >&2
+    exit 65
+  }
+  [ "$ckpt_working_copy_empty" = true ] || {
+    printf 'roundhouse: checkpoint refuses a nonempty jj working copy; publish or reconcile it first\n' >&2
+    exit 65
+  }
+  # `@` may be jj's empty working-copy child on an older line while `main`
+  # carries an unpushed local head. Stage the checkpoint on the selected
+  # bookmark head before fleet_enroll_commit describes @; otherwise the
+  # bookmark move is a backwards/sideways edit and the checkpoint never
+  # becomes the tagged commit that fleet-reroot can archive.
+  jj -R "$ckpt_store" new "$ckpt_head" >/dev/null || {
+    printf 'roundhouse: could not stage the checkpoint on local main %s\n' \
+      "$ckpt_head" >&2
+    exit 65
+  }
   ckpt_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-checkpoint.XXXXXX")
   trap 'rm -rf "$ckpt_tmp"' EXIT HUP INT TERM
   fleet_trust_roster_at_head "$ckpt_store" "$ckpt_head" "$ckpt_tmp/roster"
@@ -1274,7 +1347,7 @@ fleet_checkpoint_command() (
 )
 
 fleet_reroot_command() (
-  # `roundhouse fleet-reroot` — deliberate and instruction-driven, because it
+  # `roundhouse fleet-reroot [--authority-receipt REF]` — deliberate and instruction-driven, because it
   # rewrites what every clone starts from.
   #
   # THE ARCHIVE REF IS MANDATORY. A re-root is byte-for-byte indistinguishable
@@ -1286,19 +1359,114 @@ fleet_reroot_command() (
   fleet_run_env
   require_jq
   require_yq
+  reroot_receipt=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --authority-receipt)
+        shift
+        [ -n "${1:-}" ] || {
+          printf 'roundhouse: --authority-receipt needs a reference\n' >&2
+          exit 64
+        }
+        [ -z "$reroot_receipt" ] || {
+          printf 'roundhouse: duplicate --authority-receipt\n' >&2
+          exit 64
+        }
+        reroot_receipt=$1
+        ;;
+      *)
+        printf 'roundhouse: unknown fleet-reroot option: %s\n' "$1" >&2
+        exit 64
+        ;;
+    esac
+    shift
+  done
   fleet_enroll_require_enrolled || exit $?
   reroot_store=$(fleet_store_path)
   fleet_vcs_store_ready "$reroot_store" || exit $?
-  reroot_head=$(fleet_vcs_heads_local "$reroot_store" | head -1)
-  reroot_ckpt=$(jj -R "$reroot_store" log -r "$reroot_head" --no-graph \
-    -T 'if(tags, "yes", "no")' 2>/dev/null)
-  [ "$reroot_ckpt" = yes ] || {
+  # Refresh the remote bookmark before choosing the archive input. A stale
+  # main@origin can hide a reviewed commit another host pushed after this
+  # checkpoint; archiving anyway would strand that host in rollback hold.
+  fleet_vcs_fetch "$reroot_store" origin || {
+    printf 'roundhouse: could not refresh origin before re-rooting; refusing to publish an archive\n' >&2
+    exit 65
+  }
+  # The working copy and local main are allowed to move after a checkpoint.
+  # The immutable tagged commit is the recovery input; selecting it through
+  # `heads_local` makes reroot depend on the current WC/bookmark shape and is
+  # exactly what breaks §7.11.2 on a diverged store.
+  reroot_tag=$(git -C "$reroot_store" for-each-ref --count=1 \
+    --sort=-refname --format='%(refname)' 'refs/tags/rh-checkpoint-*' \
+    2>/dev/null)
+  reroot_head=$(git -C "$reroot_store" rev-parse --verify \
+    "$reroot_tag^{commit}" 2>/dev/null) || reroot_head=
+  [ -n "$reroot_head" ] || {
     printf 'roundhouse: re-root starts from a tagged checkpoint; run `roundhouse fleet-checkpoint` first (§7.11.2 step 1)\n' >&2
     exit 65
   }
+  reroot_origin_heads=$(fleet_vcs_head_origin "$reroot_store")
+  reroot_origin_head_count=$(printf '%s\n' "$reroot_origin_heads" |
+    grep -c . || true)
+  [ "$reroot_origin_head_count" -eq 1 ] || {
+    printf 'roundhouse: origin main is absent or conflicted; refusing to re-root\n' >&2
+    exit 65
+  }
+  reroot_origin_head=$(printf '%s\n' "$reroot_origin_heads" | head -1)
+  [ -n "$(jj -R "$reroot_store" log \
+    -r "$reroot_origin_head & ::$reroot_head" --no-graph \
+    -T commit_id 2>/dev/null)" ] || {
+    printf 'roundhouse: origin main %s is not covered by checkpoint %s; fetch and checkpoint again before re-rooting\n' \
+      "$reroot_origin_head" "$reroot_head" >&2
+    exit 65
+  }
+  # The archive must contain every resolvable reviewed commit on this host. A
+  # sibling reviewed line cannot be proved by an archive that ends at this
+  # checkpoint, so refuse before consuming authority or mutating refs.
+  reroot_reviewed_ref=$(fleet_trust_reviewed_ref)
+  if [ -n "$reroot_reviewed_ref" ] &&
+    jj -R "$reroot_store" log -r "$reroot_reviewed_ref" --no-graph \
+      -T 'commit_id' >/dev/null 2>&1 &&
+    [ -z "$(jj -R "$reroot_store" log \
+      -r "$reroot_reviewed_ref & ::$reroot_head" --no-graph \
+      -T commit_id 2>/dev/null)" ]; then
+    printf 'roundhouse: reviewed-ref %s is not in the checkpoint archive; refusing to re-root\n' \
+      "$reroot_reviewed_ref" >&2
+    exit 65
+  fi
+  # The archive verifier proves the reviewed-ref -> checkpoint chain. Do not
+  # hide a newer reviewed main commit behind an older root; checkpoint that
+  # line again. A sibling-diverged main is deliberately allowed below. A
+  # conflicted bookmark has multiple possible lines, so it is not a safe
+  # reroot input at all; never inspect only one of those heads.
+  reroot_main_heads=$(fleet_vcs_heads_local "$reroot_store")
+  reroot_main_head_count=$(printf '%s\n' "$reroot_main_heads" |
+    grep -c . || true)
+  [ "$reroot_main_head_count" -le 1 ] || {
+    printf 'roundhouse: local main is conflicted; resolve it before re-rooting\n' >&2
+    exit 65
+  }
+  reroot_main_head=$(printf '%s\n' "$reroot_main_heads" | head -1)
+  if [ -n "$reroot_main_head" ] &&
+    [ -n "$(jj -R "$reroot_store" log \
+      -r "$reroot_head:: & ::$reroot_main_head ~ $reroot_head" \
+      --no-graph -T commit_id 2>/dev/null)" ]; then
+    printf 'roundhouse: local main advanced beyond checkpoint %s; run fleet-checkpoint again before re-rooting\n' \
+      "$reroot_head" >&2
+    exit 65
+  fi
+  [ -z "$reroot_receipt" ] ||
+    fleet_trust_authority_receipt_verify_and_consume "$reroot_receipt" \
+      fleet-reroot "$reroot_head" || exit $?
   reroot_ref=$(fleet_trust_archive_ref "$(date -u +%Y%m%d)")
   git -C "$reroot_store" update-ref "$reroot_ref" "$reroot_head" || exit 65
-  git -C "$reroot_store" push origin "$reroot_ref:$reroot_ref" >/dev/null 2>&1 || {
+  # Publish the archive and assert that the fetched origin main is still the
+  # value this preflight covered. The no-op main refspec is intentional: with
+  # --atomic, a concurrent main advance rejects the whole transaction and the
+  # archive cannot strand a host behind an unseen reviewed commit.
+  git -C "$reroot_store" push --atomic \
+    --force-with-lease="refs/heads/main:$reroot_origin_head" origin \
+    "$reroot_ref:$reroot_ref" \
+    "$reroot_origin_head:refs/heads/main" >/dev/null 2>&1 || {
     printf 'roundhouse: the archive ref did not publish; REFUSING to re-root — without it every offline host reads this as a rollback attack and holds\n' >&2
     git -C "$reroot_store" update-ref -d "$reroot_ref" 2>/dev/null || :
     exit 65

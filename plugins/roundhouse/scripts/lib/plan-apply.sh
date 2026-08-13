@@ -401,11 +401,11 @@ EOF
             printf 'roundhouse: unsafe Codex plugin update argv\n' >&2
             return 64
           }
-          command -v node >/dev/null 2>&1 || {
+          plan_node=$(fleet_node_path) || {
             printf 'roundhouse: Node.js is required for Codex plugin hook refresh\n' >&2
             return 69
           }
-          node "$script_dir/codex-plugin-hooks.mjs" update "$plugin_id" >/dev/null
+          "$plan_node" "$script_dir/codex-plugin-hooks.mjs" update "$plugin_id" >/dev/null
           return
           ;;
         claude:*)

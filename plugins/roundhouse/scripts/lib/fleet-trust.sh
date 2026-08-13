@@ -870,6 +870,166 @@ fleet_trust_archive_ref() {
   printf 'refs/roundhouse/archive/%s\n' "$1"
 }
 
+fleet_trust_authority_receipt_verify_and_consume() {
+  # fleet_trust_authority_receipt_verify_and_consume REF COMMAND [TARGET]
+  #
+  # Railyard owns the user-turn attestor and will mint this artifact in a
+  # follow-up unit. Roundhouse owns the privileged verbs, so this side checks
+  # the handoff's local shape and exact operation binding, then consumes it
+  # before the first roster/archive mutation. The digests bind the handoff;
+  # they do not let this shell claim it authenticated the originating user
+  # turn. That provenance remains Railyard's contract.
+  fleet_trust_receipt_ref=$1
+  fleet_trust_receipt_command=$2
+  fleet_trust_receipt_target=${3:-}
+  printf '%s\n' "$fleet_trust_receipt_ref" |
+    grep -Eq '^receipt_[0-9a-f]{32}$' || {
+    printf 'roundhouse: invalid authority receipt reference\n' >&2
+    return 65
+  }
+  case $fleet_trust_receipt_command in
+    fleet-reroot) [ -n "$fleet_trust_receipt_target" ] || return 65 ;;
+    fleet-remove) [ -n "$fleet_trust_receipt_target" ] || return 65 ;;
+    *) return 65 ;;
+  esac
+
+  fleet_trust_receipt_root=$(fleet_instance_path authority-receipts)
+  check_safe_owned_path "$fleet_trust_receipt_root" \
+    'authority receipt directory' directory >/dev/null 2>&1 || {
+    printf 'roundhouse: authority receipt directory is unavailable or unsafe\n' >&2
+    return 65
+  }
+  fleet_trust_receipt_mode=$(file_mode "$fleet_trust_receipt_root")
+  fleet_trust_receipt_permissions=$(printf '%s' "$fleet_trust_receipt_mode" |
+    sed 's/.*\(...\)$/\1/')
+  [ "$(printf '%s' "$fleet_trust_receipt_permissions" | cut -c 2-3)" = 00 ] || {
+    printf 'roundhouse: authority receipt directory must be owner-only\n' >&2
+    return 65
+  }
+  fleet_trust_receipt_path="$fleet_trust_receipt_root/$fleet_trust_receipt_ref.json"
+  check_owner_only_file "$fleet_trust_receipt_path" \
+    'authority receipt' >/dev/null 2>&1 || {
+    printf 'roundhouse: authority receipt is missing or unsafe\n' >&2
+    return 65
+  }
+
+  if ! jq -e --arg ref "$fleet_trust_receipt_ref" \
+    --arg command "$fleet_trust_receipt_command" \
+    --arg target "$fleet_trust_receipt_target" '
+      type == "object" and
+      ((keys_unsorted | sort) == ["action", "actionDigest", "authorityId",
+        "expiresAt", "instructionDigest", "issuedAt", "objectiveDigest",
+        "receiptId", "schema", "source"]) and
+      .schema == "roundhouse/authority-receipt/v1" and
+      .receiptId == $ref and
+      (.authorityId | type == "string" and test("^[A-Za-z0-9._-]{1,128}$")) and
+      (.source == "explicit_user_instruction") and
+      (.issuedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+      (.expiresAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+      (.actionDigest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.objectiveDigest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.instructionDigest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.action | type == "object") and
+      (if $command == "fleet-reroot" then
+        ((.action | keys_unsorted | sort) == ["checkpoint", "command"] and
+          .action.command == $command and .action.checkpoint == $target)
+       else
+        ((.action | keys_unsorted | sort) == ["burn", "command", "target"] and
+          .action.command == $command and .action.target == $target and
+          .action.burn == true)
+       end)
+    ' "$fleet_trust_receipt_path" >/dev/null; then
+    printf 'roundhouse: authority receipt does not bind this exact operation\n' >&2
+    return 65
+  fi
+  fleet_trust_receipt_issued=$(jq -r \
+    'try (.issuedAt | fromdateiso8601) catch empty' \
+    "$fleet_trust_receipt_path" 2>/dev/null) || fleet_trust_receipt_issued=
+  fleet_trust_receipt_expires=$(jq -r \
+    'try (.expiresAt | fromdateiso8601) catch empty' \
+    "$fleet_trust_receipt_path" 2>/dev/null) || fleet_trust_receipt_expires=
+  fleet_trust_receipt_now=$(date -u +%s)
+  [ -n "$fleet_trust_receipt_issued" ] &&
+    [ -n "$fleet_trust_receipt_expires" ] &&
+    [ "$fleet_trust_receipt_issued" -le $((fleet_trust_receipt_now + 60)) ] &&
+    [ "$fleet_trust_receipt_expires" -gt "$fleet_trust_receipt_now" ] &&
+    [ "$fleet_trust_receipt_expires" -gt "$fleet_trust_receipt_issued" ] || {
+    printf 'roundhouse: authority receipt is expired or not yet valid\n' >&2
+    return 65
+  }
+  fleet_trust_receipt_action_digest=$(jq -cS '.action' \
+    "$fleet_trust_receipt_path" | sha256_stream)
+  [ "$(jq -r '.actionDigest' "$fleet_trust_receipt_path")" = \
+    "sha256:$fleet_trust_receipt_action_digest" ] || {
+    printf 'roundhouse: authority receipt action digest is invalid\n' >&2
+    return 65
+  }
+
+  # A directory claim is the atomic one-use gate. The receipt is moved into it
+  # only after every check above succeeds; replay sees the existing directory
+  # and cannot replace or reuse the consumed artifact.
+  fleet_trust_receipt_consumed="$fleet_trust_receipt_root/consumed"
+  if [ -e "$fleet_trust_receipt_consumed" ] ||
+    [ -L "$fleet_trust_receipt_consumed" ]; then
+    check_safe_owned_path "$fleet_trust_receipt_consumed" \
+      'consumed authority receipt directory' directory >/dev/null 2>&1 || {
+      printf 'roundhouse: consumed authority receipt directory is unsafe\n' >&2
+      return 65
+    }
+  else
+    mkdir "$fleet_trust_receipt_consumed" || {
+      printf 'roundhouse: could not create consumed authority receipt directory\n' >&2
+      return 65
+    }
+  fi
+  chmod 700 "$fleet_trust_receipt_consumed" || {
+    printf 'roundhouse: could not secure consumed authority receipt directory\n' >&2
+    return 65
+  }
+  check_safe_owned_path "$fleet_trust_receipt_consumed" \
+    'consumed authority receipt directory' directory >/dev/null 2>&1 || {
+    printf 'roundhouse: consumed authority receipt directory is unsafe\n' >&2
+    return 65
+  }
+  fleet_trust_receipt_mode=$(file_mode "$fleet_trust_receipt_consumed")
+  fleet_trust_receipt_permissions=$(printf '%s' "$fleet_trust_receipt_mode" |
+    sed 's/.*\(...\)$/\1/')
+  [ "$(printf '%s' "$fleet_trust_receipt_permissions" | cut -c 2-3)" = 00 ] || {
+    printf 'roundhouse: consumed authority receipt directory must be owner-only\n' >&2
+    return 65
+  }
+  fleet_trust_receipt_claim="$fleet_trust_receipt_consumed/$fleet_trust_receipt_ref"
+  mkdir "$fleet_trust_receipt_claim" 2>/dev/null || {
+    printf 'roundhouse: authority receipt has already been consumed\n' >&2
+    return 65
+  }
+  chmod 700 "$fleet_trust_receipt_claim" || {
+    rmdir "$fleet_trust_receipt_claim" 2>/dev/null || :
+    printf 'roundhouse: could not secure consumed authority receipt claim\n' >&2
+    return 65
+  }
+  check_safe_owned_path "$fleet_trust_receipt_claim" \
+    'consumed authority receipt claim' directory >/dev/null 2>&1 || {
+    rmdir "$fleet_trust_receipt_claim" 2>/dev/null || :
+    printf 'roundhouse: consumed authority receipt claim is unsafe\n' >&2
+    return 65
+  }
+  fleet_trust_receipt_mode=$(file_mode "$fleet_trust_receipt_claim")
+  fleet_trust_receipt_permissions=$(printf '%s' "$fleet_trust_receipt_mode" |
+    sed 's/.*\(...\)$/\1/')
+  [ "$(printf '%s' "$fleet_trust_receipt_permissions" | cut -c 2-3)" = 00 ] || {
+    rmdir "$fleet_trust_receipt_claim" 2>/dev/null || :
+    printf 'roundhouse: consumed authority receipt claim must be owner-only\n' >&2
+    return 65
+  }
+  if ! mv "$fleet_trust_receipt_path" \
+    "$fleet_trust_receipt_claim/receipt.json"; then
+    rmdir "$fleet_trust_receipt_claim" 2>/dev/null || :
+    printf 'roundhouse: could not consume authority receipt\n' >&2
+    return 65
+  fi
+}
+
 fleet_trust_catch_up() {
   # fleet_trust_catch_up <store> <fetched-head> — §7.11.2's seven steps, for a
   # host offline across a re-root.

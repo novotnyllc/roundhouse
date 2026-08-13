@@ -49,12 +49,12 @@ Usage:
   roundhouse fleet-enroll
   roundhouse fleet-add HOST [--ephemeral] [--job JOB] [--ttl HOURS]
   roundhouse fleet-join REMOTE
-  roundhouse fleet-remove HOST [--burn]
+  roundhouse fleet-remove HOST [--burn] [--authority-receipt RECEIPT]
   roundhouse fleet-renew NAME [HOURS]
   roundhouse fleet-reparent
   roundhouse fleet-reconstitute HOST
   roundhouse fleet-checkpoint
-  roundhouse fleet-reroot
+  roundhouse fleet-reroot [--authority-receipt RECEIPT]
   roundhouse fleet-explain [HOST] ITEM
   roundhouse fleet-run [--fast|--full]
   roundhouse fleet-seed
@@ -191,12 +191,12 @@ case $command in
   fleet-enroll) [ $# -eq 0 ] || usage; fleet_enroll_command ;;
   fleet-add) [ $# -ge 1 ] || usage; fleet_add_command "$@" ;;
   fleet-join) [ $# -eq 1 ] || usage; fleet_join_command "$1" ;;
-  fleet-remove) [ $# -ge 1 ] && [ $# -le 2 ] || usage; fleet_remove_command "$@" ;;
+  fleet-remove) [ $# -ge 1 ] && [ $# -le 5 ] || usage; fleet_remove_command "$@" ;;
   fleet-renew) [ $# -ge 1 ] && [ $# -le 2 ] || usage; fleet_renew_command "$@" ;;
   fleet-reparent) [ $# -eq 0 ] || usage; fleet_reparent_command ;;
   fleet-reconstitute) [ $# -eq 1 ] || usage; fleet_reconstitute_command "$1" ;;
   fleet-checkpoint) [ $# -eq 0 ] || usage; fleet_checkpoint_command ;;
-  fleet-reroot) [ $# -eq 0 ] || usage; fleet_reroot_command ;;
+  fleet-reroot) [ $# -le 2 ] || usage; fleet_reroot_command "$@" ;;
   fleet-explain) [ $# -ge 1 ] && [ $# -le 2 ] || usage; fleet_explain_command "$@" ;;
   fleet-run) [ $# -le 1 ] || usage; fleet_run_command "$@" ;;
   fleet-seed) [ $# -eq 0 ] || usage; fleet_seed_command ;;
