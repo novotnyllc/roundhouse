@@ -361,9 +361,14 @@ JSON
       run_identity_status=$?
     [ "$run_identity_status" -eq 1 ] ||
       fail "same-version/new-SHA ownership identity did not require reinstall"
+    # Make the following enable a real state transition so the ledger proves
+    # approval follows an actual enable, not a manager no-op.
+    printf '%s\n' '{"example@test-market":false}' >"$run_plugin_enabled_file"
     : >"$run_plugin_order_log"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
-      CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "same-version/new-SHA plugin apply failed"
     grep -qx 'example@test-market' "$run_plugin_install_marker" ||
@@ -409,6 +414,24 @@ JSON
       fail "the stale post-update case did not enter the update ledger"
     [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
       fail "hook approval ran before stale post-update identity was rejected"
+
+    # A converged enable is not an enable operation. In particular, a locally
+    # modified hook must not be laundered by the next scheduled pass merely
+    # because the desired state remains enabled.
+    : >"$run_plugin_order_log"
+    rm -f "$CODEX_HOOK_WRITES_FILE"
+    printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.4.0","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    CODEX_HOOK_SCENARIO=approve \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null || fail "steady-state plugin apply failed"
+    [ ! -s "$run_plugin_order_log" ] ||
+      fail "steady-state enable invoked automatic hook approval"
+    [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
+      fail "steady-state enable re-trusted a locally modified hook"
 
     # A Claude-only qualified plugin must not turn the absent Codex identity
     # into a held DSC item. The manager update still runs, but there is no

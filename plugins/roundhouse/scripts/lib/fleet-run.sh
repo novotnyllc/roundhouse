@@ -873,9 +873,12 @@ fleet_run_installed_plugin() {
 fleet_run_plugin_enabled() {
   # State verbs reject no-ops; verify one strict user-scoped manager row.
   # A bare id can resolve to more than one marketplace, which is not proof.
+  # The optional second argument is only for the pre-verb transition probe:
+  # an absent row is `unknown` there, while the post-verb proof still holds.
+  fleet_run_allow_absent=${2:-false}
   fleet_run_plugin_list=$(claude plugin list --json 2>/dev/null) || return 75
   fleet_run_plugin_state=$(printf '%s\n' "$fleet_run_plugin_list" |
-    jq -e -r --arg id "$1" '
+    jq -e -r --arg id "$1" --argjson allow_absent "$fleet_run_allow_absent" '
       def records:
         if type == "array" then .
         elif type == "object" and (.installed | type == "array") then .installed
@@ -888,7 +891,8 @@ fleet_run_plugin_enabled() {
         | select(if ($id | contains("@")) then $record_id == $id
                  else ($record_id | split("@")[0]) == $id
                  end) ] as $matches
-      | if ($matches | length) == 1 and ($matches[0].enabled | type == "boolean")
+      | if ($matches | length) == 0 and $allow_absent then "unknown"
+        elif ($matches | length) == 1 and ($matches[0].enabled | type == "boolean")
         then ($matches[0].enabled | tostring)
         else empty
         end' 2>/dev/null) || return 75
@@ -1068,6 +1072,7 @@ fleet_run_apply_item() {
       fleet_run_id=$fleet_run_name
       [ -z "$fleet_run_market" ] ||
         fleet_run_id="$fleet_run_name@$fleet_run_market"
+      fleet_run_plugin_mutated=false
       if [ -n "$fleet_run_market" ]; then
         fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id") || return 75
         fleet_run_resolved_sha=$(printf '%s\n' "$fleet_run_catalog" |
@@ -1105,22 +1110,52 @@ fleet_run_apply_item() {
             [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
               = "$fleet_run_resolved_version" ] || return 75
           fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+          fleet_run_plugin_mutated=true
         fi
       else
         claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
         fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+        fleet_run_plugin_mutated=true
       fi
-      # State-verb status is not convergence: re-read the manager afterward.
+      # State-verb status is not convergence: read it before attempting the
+      # verb. A no-op enable is not an enable operation, and must not turn a
+      # locally modified Codex hook into a newly trusted hook on every pass.
+      # A fresh install/update has already gone through the identity and hook
+      # gates, but some native managers do not expose the state row until the
+      # first state verb. In that case the verb result is the transition proof.
+      fleet_run_enable_attempted=false
+      fleet_run_enable_status=125
+      fleet_run_before_enabled=unknown
+      [ "$fleet_run_plugin_mutated" = true ] || {
+        fleet_run_before_enabled=$(fleet_run_plugin_enabled "$fleet_run_id" true) ||
+          return 75
+      }
       if [ "$(fleet_run_state_of "$5")" = enabled ]; then
         fleet_run_want_enabled=true
-        claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
-        fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+        if [ "$fleet_run_plugin_mutated" = true ] ||
+          [ "$fleet_run_before_enabled" != true ]; then
+          fleet_run_enable_attempted=true
+          fleet_run_enable_status=0
+          claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1 ||
+            fleet_run_enable_status=$?
+        fi
       else
         fleet_run_want_enabled=false
-        claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
+        if [ "$fleet_run_plugin_mutated" = true ] ||
+          [ "$fleet_run_before_enabled" != false ]; then
+          claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
+        fi
       fi
       fleet_run_actual_enabled=$(fleet_run_plugin_enabled "$fleet_run_id") || return 75
       [ "$fleet_run_actual_enabled" = "$fleet_run_want_enabled" ] || return 75
+      # Approval follows a verified state transition. Install/update approval
+      # above covers byte changes; a steady-state enable is not a mutation and
+      # must not launder a locally modified hook.
+      if [ "$fleet_run_want_enabled" = true ] &&
+        [ "$fleet_run_enable_attempted" = true ] &&
+        [ "$fleet_run_enable_status" -eq 0 ]; then
+        fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+      fi
       ;;
     skills)
       # Presence only: neither harness carries a skill enable/disable verb
