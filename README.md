@@ -46,7 +46,6 @@ doesn't move a train the shop hasn't cleared:
 | Baselines | `fleet-update` (packages/tools) |
 | Integrations | Optional chezmoi cooperation through [`agent-utilities`](https://github.com/novotnyllc/agent-utilities) |
 | Transport | `remote-mac`, `ssh-doctor`, SSH certificate enrollment, the Codex remote-control contract, the signed `windows-sftp` lane |
-| Network gear | `unifi-network-api` |
 
 ## The family
 

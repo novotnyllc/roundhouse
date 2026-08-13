@@ -1,4 +1,0 @@
-interface:
-  display_name: "UniFi Network API"
-  short_description: "Managed UniFi API automation"
-  default_prompt: "Use $unifi-network-api to refresh/read the live UniFi Network OpenAPI spec, make managed Integration API changes, and verify controller plus gateway state."

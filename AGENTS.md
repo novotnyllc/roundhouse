@@ -2,7 +2,7 @@
 
 Roundhouse administers the operator's own machines and infrastructure:
 readiness, inventory, parity, packages, dotfiles, auth, SSH transport,
-privileged installs, and UniFi. Plugin source lives under
+privileged installs. Plugin source lives under
 `plugins/roundhouse/`; everything else is documentation.
 
 ## Always
