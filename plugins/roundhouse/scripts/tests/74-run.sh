@@ -260,6 +260,9 @@ SH
     : >"$run_runtime_verdict_file"
     fleet_run_runtime_hold definitions.plugins.example 'apply status 75' \
       "$run_runtime_hold_file"
+    grep -Fqx 'plugins.example held by definitions.plugins.example: apply status 75' \
+      "$run_runtime_hold_file" ||
+      fail "a runtime definition hold did not promote its desired consumer"
     run_runtime_market=$(fleet_run_plugin_marketplaces \
       '{"plugins":{"example":"enabled"}}' "$run_plugin_defs" \
       "$run_runtime_hold_file" "$run_runtime_verdict_file")

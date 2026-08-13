@@ -2056,6 +2056,16 @@ fleet_run_runtime_hold() {
   # record, while this marker prevents maintenance in this same run from acting
   # on content the apply gate just refused.
   printf '%s %s\n' "$1" "$2" >>"$3"
+  case $1 in
+    definitions.*.*)
+      fleet_run_runtime_definition_rest=${1#definitions.}
+      fleet_run_runtime_definition_category=${fleet_run_runtime_definition_rest%%.*}
+      fleet_run_runtime_definition_name=${fleet_run_runtime_definition_rest#*.}
+      printf '%s held by %s: %s\n' \
+        "$fleet_run_runtime_definition_category.$fleet_run_runtime_definition_name" \
+        "$1" "$2" >>"$3"
+      ;;
+  esac
 }
 
 fleet_run_plugin_marketplaces() (
