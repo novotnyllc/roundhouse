@@ -350,6 +350,30 @@ fleet_run_file_items() {
       .key as $c | .value | keys[] | "\($ns)\($c).\(.)"'
 }
 
+fleet_run_file_items_at_change() {
+  # fleet_run_file_items_at_change STORE COMMIT LAYERDIR PATH WORKDIR — the
+  # union of the items this changed path contributes before and after the
+  # commit. A deleted file (or a deleted key inside a surviving file) has no
+  # post-change file to inspect, so using only the reviewed export silently
+  # drops the item that must be held.
+  fleet_run_file_item_list=$5/file-items
+  fleet_run_file_parent_dir=$5/file-parent
+  rm -rf "$fleet_run_file_parent_dir"
+  : >"$fleet_run_file_item_list"
+  if [ -f "$3/$4" ]; then
+    fleet_run_file_items "$3/$4" "$4" >>"$fleet_run_file_item_list" || :
+  fi
+  for fleet_run_file_parent in $(fleet_trust_parents "$1" "$2"); do
+    rm -rf "$fleet_run_file_parent_dir"
+    fleet_run_export "$1" "$fleet_run_file_parent" \
+      "$fleet_run_file_parent_dir" 2>/dev/null || continue
+    [ -f "$fleet_run_file_parent_dir/$4" ] || continue
+    fleet_run_file_items "$fleet_run_file_parent_dir/$4" "$4" \
+      >>"$fleet_run_file_item_list" || :
+  done
+  LC_ALL=C sort -u "$fleet_run_file_item_list"
+}
+
 fleet_run_changed_items() {
   # fleet_run_changed_items STORE COMMIT HOST WORKDIR -> the items whose
   # VALUE this commit actually changed, by §8.3's per-parent comparison reused
@@ -506,15 +530,17 @@ fleet_run_signature_holds() {
               ;;
           esac
           fleet_run_layer_path "$fleet_run_touched" || continue
-          [ -f "$4/$fleet_run_touched" ] || continue
+          fleet_run_changed_file_items=$(fleet_run_file_items_at_change \
+            "$1" "$fleet_run_commit" "$4" "$fleet_run_touched" \
+            "$fleet_run_roster")
+          [ -n "$fleet_run_changed_file_items" ] || continue
           if [ "$fleet_run_scope" = item ]; then
             [ -n "$fleet_run_narrow" ] || {
               fleet_run_changed_items "$1" "$fleet_run_commit" "$5" \
                 "$fleet_run_roster" >"$fleet_run_roster/narrow"
               fleet_run_narrow=$fleet_run_roster/narrow
             }
-            fleet_run_file_items "$4/$fleet_run_touched" "$fleet_run_touched" |
-              LC_ALL=C sort -u |
+            printf '%s\n' "$fleet_run_changed_file_items" |
               comm -12 - "$fleet_run_narrow" |
               while IFS= read -r fleet_run_held_item; do
                 [ -n "$fleet_run_held_item" ] || continue
@@ -522,7 +548,7 @@ fleet_run_signature_holds() {
               done
             continue
           fi
-          fleet_run_file_items "$4/$fleet_run_touched" "$fleet_run_touched" |
+          printf '%s\n' "$fleet_run_changed_file_items" |
             while IFS= read -r fleet_run_held_item; do
               [ -n "$fleet_run_held_item" ] || continue
               printf '%s %s\n' "$fleet_run_held_item" "$fleet_run_bad"
@@ -1578,6 +1604,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   while read -r run_verdict run_item run_digest <&9; do
     [ -n "${run_item:-}" ] || continue
     if [ "$run_verdict" = held ]; then
+      fleet_run_runtime_hold "$run_item" 'verdict held' "$run_tmp/sigholds" ||
+        exit 65
       fleet_journal_append "$run_store" "$run_host" \
         "$(jq -cn --arg item "$run_item" --arg at "$run_now" \
           '{item:$item,digest:"held",outcome:"held",at:$at}')" || :
@@ -1602,6 +1630,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     # never a vote cast on anyone else's behalf.
     if fleet_run_verdict_held "$run_item" "$run_digest"; then
       printf '  hold  %s — held by review at %s\n' "$run_item" "$run_digest"
+      fleet_run_runtime_hold "$run_item" 'held by review' "$run_tmp/sigholds" ||
+        exit 65
       fleet_journal_append "$run_store" "$run_host" \
         "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
           '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
@@ -1628,6 +1658,9 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         1) run_match=no ;;
         75)
           printf '  hold  %s — installed marketplace identity unavailable\n' "$run_item"
+          fleet_run_runtime_hold "$run_item" \
+            'installed marketplace identity unavailable' "$run_tmp/sigholds" ||
+            exit 65
           fleet_journal_append "$run_store" "$run_host" \
             "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
               '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
@@ -1658,6 +1691,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       fleet_canary_gate "$run_store" "$run_item" "$run_digest" "$run_wait" \
         "$run_now" $(cat "$run_tmp/canaries") || {
         printf '  wait  %s — no canary evidence at %s yet\n' "$run_item" "$run_digest"
+        fleet_run_runtime_hold "$run_item" 'canary evidence unavailable' \
+          "$run_tmp/sigholds" || exit 65
         fleet_journal_append "$run_store" "$run_host" \
           "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
             '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
@@ -1711,6 +1746,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
           "$run_item"
         ;;
       *)
+        fleet_run_runtime_hold "$run_item" "apply status $run_status" \
+          "$run_tmp/sigholds" || exit 65
         [ "$run_status" -ne 75 ] || [ "$run_category" != packages ] ||
           fleet_alert_write "$run_store" "$run_host" package-hold \
             "package-hold-$(printf '%s' "$run_item" | tr './' '--')" \
@@ -1932,9 +1969,20 @@ fleet_run_item_is_held() {
   # act on content the item gate deliberately refused.
   [ -f "$3" ] && awk -v item="$1" '$1 == item { found = 1 } END { exit !found }' \
     "$3" && return 0
-  [ -f "$4" ] && grep -Fqx "held $1" "$4" && return 0
+  [ -f "$4" ] && awk -v item="$1" \
+    '$1 == "held" && $2 == item { found = 1 } END { exit !found }' \
+    "$4" && return 0
   [ -n "$2" ] && fleet_run_verdict_held "$1" "$2" && return 0
   return 1
+}
+
+fleet_run_runtime_hold() {
+  # fleet_run_runtime_hold ITEM REASON HOLDS_FILE — carry an apply-time
+  # refusal into the same temporary hold surface the full cadence consumes.
+  # This file is run-local and never replicated; the journal remains the audit
+  # record, while this marker prevents maintenance in this same run from acting
+  # on content the apply gate just refused.
+  printf '%s %s\n' "$1" "$2" >>"$3"
 }
 
 fleet_run_plugin_marketplaces() (

@@ -215,6 +215,24 @@ JSON
       "$run_held_market_dir/sigholds" "$run_held_market_dir/verdicts")
     [ -z "$run_held_market" ] ||
       fail "full cadence refreshed a marketplace from a held definition"
+    run_runtime_hold_file="$run_root/runtime-sigholds"
+    run_runtime_verdict_file="$run_root/runtime-verdicts"
+    : >"$run_runtime_hold_file"
+    : >"$run_runtime_verdict_file"
+    fleet_run_runtime_hold definitions.plugins.example 'apply status 75' \
+      "$run_runtime_hold_file"
+    run_runtime_market=$(fleet_run_plugin_marketplaces \
+      '{"plugins":{"example":"enabled"}}' "$run_plugin_defs" \
+      "$run_runtime_hold_file" "$run_runtime_verdict_file")
+    [ -z "$run_runtime_market" ] ||
+      fail "full cadence refreshed a marketplace after an apply-time hold"
+    printf '%s\n' 'held plugins.example digest-from-verdict' \
+      >"$run_runtime_verdict_file"
+    run_runtime_market=$(fleet_run_plugin_marketplaces \
+      '{"plugins":{"example":"enabled"}}' "$run_plugin_defs" '' \
+      "$run_runtime_verdict_file")
+    [ -z "$run_runtime_market" ] ||
+      fail "full cadence ignored a held verdict while refreshing a marketplace"
     run_unsafe_store="$run_root/unsafe-upstream-store"
     mkdir -p "$run_unsafe_store"
     ! fleet_upstream_write "$run_unsafe_store" ../hosts vireo failed ||

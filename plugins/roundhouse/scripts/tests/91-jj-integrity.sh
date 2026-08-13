@@ -572,6 +572,29 @@ YAML
       fail "the class refusal was file-scoped, not item-scoped: $(tr '\n' ';' <"$rjj/leaf-holds")"
     integrity_as vireo
 
+    # 8a. A DELETED DEFINITIONS FRAGMENT still contributes its former items to
+    # a class refusal. The reviewed export has no file to inspect after the
+    # deletion, so the hold set must union the changed path's parent content;
+    # otherwise the mapping disappears into the default-resolution path.
+    mkdir -p "$store/definitions"
+    printf 'packages:\n  deleted-a: latest\n  deleted-b: latest\n' \
+      >"$store/definitions/10-base.yaml"
+    integrity_as vireo
+    integrity_commit 'definitions fragment before deletion' >/dev/null
+    integrity_as leaf
+    rm -f "$store/definitions/10-base.yaml"
+    integrity_defs_delete=$(integrity_commit 'leaf deletes a definitions fragment')
+    fleet_run_export "$store" "$integrity_defs_delete" "$rjj/defs-delete-layers"
+    printf '%s\n' vireo leaf >"$rjj/defs-delete-hosts"
+    fleet_run_signature_holds "$store" "$integrity_defs_delete" \
+      "$rjj/defs-delete-hosts" "$rjj/defs-delete-layers" leaf '' \
+      "$rjj/defs-delete-work-2" >"$rjj/defs-delete-holds-2" 2>/dev/null || :
+    grep -q '^definitions.packages.deleted-a ' "$rjj/defs-delete-holds-2" ||
+      fail "deleting definitions/*.yaml dropped the former first item from the hold set: $(tr '\n' ';' <"$rjj/defs-delete-holds-2")"
+    grep -q '^definitions.packages.deleted-b ' "$rjj/defs-delete-holds-2" ||
+      fail "deleting definitions/*.yaml dropped the former second item from the hold set: $(tr '\n' ';' <"$rjj/defs-delete-holds-2")"
+    integrity_as vireo
+
     # 8b. THE ROSTER-BEARING PATH ESCALATES TO A STORE-WIDE HOLD — the trust
     #     boundary. A leaf holding a real key signs a genuinely-GOOD commit that
     #     edits trust/signers.yaml, adding a durable key. trust/ is not a layer
