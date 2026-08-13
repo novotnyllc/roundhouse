@@ -1373,6 +1373,13 @@ fleet_reroot_command() (
   fleet_enroll_require_enrolled || exit $?
   reroot_store=$(fleet_store_path)
   fleet_vcs_store_ready "$reroot_store" || exit $?
+  # Refresh the remote bookmark before choosing the archive input. A stale
+  # main@origin can hide a reviewed commit another host pushed after this
+  # checkpoint; archiving anyway would strand that host in rollback hold.
+  fleet_vcs_fetch "$reroot_store" origin || {
+    printf 'roundhouse: could not refresh origin before re-rooting; refusing to publish an archive\n' >&2
+    exit 65
+  }
   # The working copy and local main are allowed to move after a checkpoint.
   # The immutable tagged commit is the recovery input; selecting it through
   # `heads_local` makes reroot depend on the current WC/bookmark shape and is
@@ -1384,6 +1391,21 @@ fleet_reroot_command() (
     "$reroot_tag^{commit}" 2>/dev/null) || reroot_head=
   [ -n "$reroot_head" ] || {
     printf 'roundhouse: re-root starts from a tagged checkpoint; run `roundhouse fleet-checkpoint` first (§7.11.2 step 1)\n' >&2
+    exit 65
+  }
+  reroot_origin_heads=$(fleet_vcs_head_origin "$reroot_store")
+  reroot_origin_head_count=$(printf '%s\n' "$reroot_origin_heads" |
+    grep -c . || true)
+  [ "$reroot_origin_head_count" -eq 1 ] || {
+    printf 'roundhouse: origin main is absent or conflicted; refusing to re-root\n' >&2
+    exit 65
+  }
+  reroot_origin_head=$(printf '%s\n' "$reroot_origin_heads" | head -1)
+  [ -n "$(jj -R "$reroot_store" log \
+    -r "$reroot_origin_head & ::$reroot_head" --no-graph \
+    -T commit_id 2>/dev/null)" ] || {
+    printf 'roundhouse: origin main %s is not covered by checkpoint %s; fetch and checkpoint again before re-rooting\n' \
+      "$reroot_origin_head" "$reroot_head" >&2
     exit 65
   }
   # The archive must contain every resolvable reviewed commit on this host. A

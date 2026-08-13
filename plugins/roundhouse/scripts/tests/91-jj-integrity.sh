@@ -968,6 +968,39 @@ YAML
       [ "$(jj -R "$compose_store" log -r @ --no-graph -T 'empty')" = true ] ||
         fail "the composition fixture did not leave an empty jj working-copy head"
 
+      # A second host can advance origin after this host's checkpoint while
+      # the local remote-tracking bookmark is stale. Fetch must expose that
+      # advance and reroot must refuse before publishing the old checkpoint.
+      compose_remote_advance=$(
+        GIT_AUTHOR_NAME='compose remote' \
+        GIT_AUTHOR_EMAIL='compose-remote@fleet.example.invalid' \
+        GIT_COMMITTER_NAME='compose remote' \
+        GIT_COMMITTER_EMAIL='compose-remote@fleet.example.invalid' \
+        "$REAL_GIT" -C "$compose_store" commit-tree \
+          "$("$REAL_GIT" -C "$compose_store" rev-parse \
+            "$compose_checkpoint^{tree}")" -p "$compose_checkpoint" \
+          -m 'remote reviewed advance'
+      ) || fail "the stale-remote fixture could not create a remote advance"
+      "$REAL_GIT" -C "$compose_store" push -q "$compose_remote" \
+        "$compose_remote_advance:refs/heads/main" ||
+        fail "the stale-remote fixture could not advance origin"
+      compose_remote_status=0
+      compose_remote_out=$("$cli" fleet-reroot 2>&1) || compose_remote_status=$?
+      [ "$compose_remote_status" -ne 0 ] ||
+        fail "fleet-reroot archived a stale checkpoint after origin advanced"
+      case $compose_remote_out in
+        *'not covered by checkpoint'*) ;;
+        *) fail "stale-remote refusal was not explicit: $compose_remote_out" ;;
+      esac
+      ! "$REAL_GIT" -C "$compose_store" show-ref --verify --quiet \
+        "refs/roundhouse/archive/$(date -u +%Y%m%d)" ||
+        fail "stale-remote refusal mutated the archive ref"
+      "$REAL_GIT" --git-dir="$compose_remote" update-ref refs/heads/main \
+        "$compose_checkpoint" ||
+        fail "the stale-remote fixture could not restore origin"
+      fleet_vcs_fetch "$compose_store" origin ||
+        fail "the stale-remote fixture could not refresh the restored origin"
+
       # A reviewed commit on the sibling line cannot be proved by an archive
       # ending at the checkpoint. Refuse it before consuming a receipt or
       # creating the archive ref; the actual §7.11.2 orphaned-ref shape below
@@ -984,7 +1017,7 @@ YAML
       ! "$REAL_GIT" -C "$compose_store" show-ref --verify --quiet \
         "refs/roundhouse/archive/$(date -u +%Y%m%d)" ||
         fail "sibling reviewed-line refusal mutated the archive ref"
-      printf '%s\n' "$compose_checkpoint" >"$compose_root/reviewed-ref"
+      printf '%s\n' "$compose_local_main" >"$compose_root/reviewed-ref"
 
       compose_reroot_status=0
       compose_reroot_out=$("$cli" fleet-reroot 2>&1) || compose_reroot_status=$?

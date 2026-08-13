@@ -140,6 +140,12 @@ if [ -n "$fleet_fixture_yq" ]; then
       'reroot_main_head_count=' ||
       fail "fleet-reroot does not count every conflicted main head before selecting one"
     printf '%s\n' "$guard_reroot_body" | grep -q \
+      'fleet_vcs_fetch.*origin' ||
+      fail "fleet-reroot does not refresh origin before archiving"
+    printf '%s\n' "$guard_reroot_body" | grep -q \
+      'origin main .*not covered by checkpoint' ||
+      fail "fleet-reroot does not refuse a stale checkpoint"
+    printf '%s\n' "$guard_reroot_body" | grep -q \
       'grep -c . || true' ||
       fail "fleet-reroot does not inspect every conflicted main head before selecting one"
     printf '%s\n' "$guard_reroot_body" | grep -q \
