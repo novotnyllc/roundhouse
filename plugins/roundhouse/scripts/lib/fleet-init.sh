@@ -864,7 +864,6 @@ if [ ! -d \"\$remote_store/.jj\" ]; then
 fi
 \"\$rh\" fleet-init >/dev/null
 \"\$rh\" fleet-enroll >/dev/null 2>&1
-\"\$rh\" fleet-seed >/dev/null 2>&1 || :
 " 2>&1) || add_bootstrap_rc=$?
     [ "$add_bootstrap_rc" -eq 0 ] || {
       printf 'roundhouse: bootstrap of %s failed over %s; no roster line was recorded:\n%s\n' \
@@ -939,6 +938,30 @@ fi
       "$add_target" >&2
     exit 65
   }
+
+  if [ "$add_class" = durable ]; then
+    # fleet-seed writes the newcomer's working copy. It must sit on the
+    # published sponsor commit, not on fleet-enroll's pre-enrollment child,
+    # or the first fleet-run holds every seeded item as unknown.
+    add_seed_rc=0
+    add_seed=$(ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
+set -e
+remote_store=\$(fleet_store_path)
+jj -R \"\$remote_store\" git fetch --remote origin >/dev/null
+jj -R \"\$remote_store\" bookmark set main -r main@origin >/dev/null
+jj -R \"\$remote_store\" new main >/dev/null
+\"\$rh\" fleet-seed 2>&1
+" 2>&1) || add_seed_rc=$?
+    [ "$add_seed_rc" -eq 0 ] || {
+      fleet_alert_write "$add_store" "$add_host" bootstrap-seed \
+        "seed-$add_target" \
+        "$add_target enrollment is published, but its host-side seed could not fetch the enrollment head; run fleet-seed after the next verified fetch" ||
+        :
+      printf 'roundhouse: %s enrollment is published but host-side seeding failed over %s; run fleet-seed after the enrollment head is fetched:\n%s\n' \
+        "$add_target" "$add_ssh" "$add_seed" >&2
+      exit 69
+    }
+  fi
 
   if [ "$add_class" = ephemeral ]; then
     # Step 2 of D: hand it, over the runtime boundary just created, the remote

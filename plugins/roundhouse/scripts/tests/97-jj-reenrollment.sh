@@ -82,7 +82,7 @@ SH
     export ROUNDHOUSE_REENROLL_NODE_BIN="$(dirname "$real_jj"):$tmp/bin:/usr/bin:/bin"
 
     cat >"$ROUNDHOUSE_CONFIG" <<'JSON'
-{"machines":{"hub":{"platform":"macos","groups":["durable"]},"mac-studio":{"ssh_alias":"mac-studio","platform":"macos","groups":["durable"]}}}
+{"version":1,"machines":{"hub":{"platform":"macos","transport":"local","groups":["durable"]},"mac-studio":{"ssh_alias":"mac-studio","platform":"macos","transport":"ssh","groups":["durable"]}}}
 JSON
     printf 'name: hub\ndomain: fleet.example.invalid\n' \
       >"$hub_home/.config/roundhouse/identity.yaml"
@@ -120,7 +120,7 @@ YAML
     "$REAL_GIT" ls-remote --exit-code "$hub_remote" "$reenroll_archive_ref" >/dev/null ||
       fail "hub checkpoint archive ref was not published"
     cat >"$node_home/.config/roundhouse/config.json" <<'JSON'
-{"machines":{"mac-studio":{"platform":"macos","groups":["durable"]}}}
+{"version":1,"machines":{"mac-studio":{"platform":"macos","transport":"local","groups":["durable"]}}}
 JSON
     mkdir -p "$(dirname "$node_identity")"
 
@@ -188,6 +188,12 @@ JSON
     grep -Fqx "store_id: $reenroll_genesis" \
       "$node_identity" ||
       fail "re-add overwrote the host identity with a foreign store id"
+    reenroll_origin_head=$(jj -R "$node_store" log -r 'main@origin' \
+      --no-graph -T 'commit_id')
+    reenroll_seed_parent=$(jj -R "$node_store" log -r '@-' \
+      --no-graph -T 'commit_id')
+    [ "$reenroll_seed_parent" = "$reenroll_origin_head" ] ||
+      fail "re-add seeded the working copy before the published enrollment head"
 
     # The host-side sequence is now exercised on the actual cloned store:
     # join is inert but must be accepted, and the verify/run path must remain
