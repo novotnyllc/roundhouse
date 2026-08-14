@@ -380,6 +380,15 @@ YAML
       fail "a hyphenated UUID in a remote URL false-positived as a secret"
 
     # --- enrollment ergonomics: identity vs transport, and the remote CLI ---
+    guard_add=$(cli_function_body fleet_add_command)
+    printf '%s\n' "$guard_add" | grep -q 'add_remote_q=$(printf.*%q' ||
+      fail "fleet-add does not shell-quote the remote before remote bootstrap"
+    printf '%s\n' "$guard_add" | grep -q 'jj git clone --colocate \$add_remote_q' ||
+      fail "fleet-add still interpolates the raw remote into the clone command"
+    guard_url="https://example.invalid/store'o.git"
+    guard_url_q=$(printf '%q' "$guard_url")
+    [ "$(sh -c "printf '%s' $guard_url_q")" = "$guard_url" ] ||
+      fail "the remote shell quoting fixture did not round-trip an apostrophe"
     # G2. A machine's ROSTER IDENTITY and its TRANSPORT ADDRESS are two facts,
     # and `fleet-add mac-mini` used the argument as both — so a machine whose
     # ssh alias is `claires-mac-mini` did not connect until somebody hand-added

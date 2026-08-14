@@ -678,6 +678,11 @@ YAML
       *) fail "a proved commit id was not shortened and labelled on a prose surface" ;;
     esac
 
+    integrity_embedded=$(printf 'prefix%ssuffix' "$integrity_tagtarget")
+    [ "$(fleet_prose_shorten_commit_ids "$integrity_embedded" "$store")" = \
+      "$integrity_embedded" ] ||
+      fail "an embedded commit substring was shortened out of its surrounding token"
+
     # 12. THE ARCHIVE IS MANDATORY, and its ABSENCE is the rollback protection:
     #     a host whose reviewed-ref is not an ancestor of the fetched head, with
     #     no archive containing it, must HOLD rather than adopt.

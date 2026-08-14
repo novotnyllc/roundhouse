@@ -744,6 +744,9 @@ fleet_add_command() (
   add_genesis=$(fleet_store_id "$add_store")
   add_remote=$(jj -R "$add_store" git remote list 2>/dev/null |
     awk '$1 == "origin" { print $2; exit }')
+  # The bootstrap is a remote shell string. printf percent-q keeps a validated
+  # URL as one argv value even when its URL syntax contains a shell metacharacter.
+  add_remote_q=$(printf '%q' "$add_remote")
   # The ROSTER identity stays `$add_target` — the config machine name, which is
   # what every host-keyed path and every signature is checked against. Only the
   # TRANSPORT follows the machine's configured ssh alias.
@@ -849,7 +852,7 @@ else
     >\"\$remote_identity\"
 fi
 if [ ! -d \"\$remote_store/.jj\" ]; then
-  [ -n '$add_remote' ] || {
+  [ -n $add_remote_q ] || {
     printf '%s\n' 'roundhouse: no fleet store remote was supplied for bootstrap' >&2
     exit 69
   }
@@ -857,7 +860,7 @@ if [ ! -d \"\$remote_store/.jj\" ]; then
     printf '%s\n' 'roundhouse: the store path exists but is not a fleet store; move it aside and retry' >&2
     exit 65
   }
-  jj git clone --colocate '$add_remote' \"\$remote_store\" >/dev/null
+  jj git clone --colocate $add_remote_q \"\$remote_store\" >/dev/null
 fi
 \"\$rh\" fleet-init >/dev/null
 \"\$rh\" fleet-enroll >/dev/null 2>&1
