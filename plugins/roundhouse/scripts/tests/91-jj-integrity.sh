@@ -682,6 +682,10 @@ YAML
     [ "$(fleet_prose_shorten_commit_ids "$integrity_embedded" "$store")" = \
       "$integrity_embedded" ] ||
       fail "an embedded commit substring was shortened out of its surrounding token"
+    integrity_underscore=$(printf 'prefix_%s_suffix' "$integrity_tagtarget")
+    [ "$(fleet_prose_shorten_commit_ids "$integrity_underscore" "$store")" = \
+      "$integrity_underscore" ] ||
+      fail "a commit substring surrounded by underscores was shortened out of its token"
 
     # 12. THE ARCHIVE IS MANDATORY, and its ABSENCE is the rollback protection:
     #     a host whose reviewed-ref is not an ancestor of the fetched head, with

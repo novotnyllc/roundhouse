@@ -282,7 +282,7 @@ fleet_prose_shorten_commit_ids() {
   prose_store=$2
   while :; do
     prose_token=$(printf '%s' "$prose_text" |
-      grep -oE '(^|[^A-Za-z0-9])[0-9a-f]{40}([^A-Za-z0-9]|$)' |
+      grep -oE '(^|[^A-Za-z0-9_])[0-9a-f]{40}([^A-Za-z0-9_]|$)' |
       grep -oE '[0-9a-f]{40}' | head -1 || true)
     [ -n "$prose_token" ] || break
     fleet_quote_is_content_address "$prose_token" "$prose_store" || break
