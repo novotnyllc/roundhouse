@@ -389,9 +389,13 @@ YAML
 {"version":1,"machines":{
   "mac-mini":{"platform":"macos","transport":"ssh","ssh_alias":"claires-mac-mini",
     "groups":[],"package_managers":[]},
+  "test-host":{"platform":"macos","transport":"local",
+    "groups":[],"package_managers":[]},
   "hostile":{"platform":"linux","transport":"ssh","ssh_alias":"-oProxyCommand=curl|sh",
     "groups":[],"package_managers":[]}}}
 JSONC
+    cp "$tmp/config.json" "$tmp/launcher-config.json"
+    chmod 600 "$tmp/launcher-config.json"
     [ "$(ROUNDHOUSE_CONFIG="$tmp/guards-config.json" \
       fleet_ssh_destination mac-mini)" = claires-mac-mini ] ||
       fail "the ssh destination did not resolve through the machine's configured alias"
@@ -462,7 +466,8 @@ JSONC
         guard_make_launcher "$guard_version_home/.codex/plugins/cache/test/roundhouse/0.10.0/scripts/roundhouse" codex-newer
       fi
       HOME="$guard_version_home" PATH=/usr/bin:/bin \
-        bash "$(dirname -- "$cli")/launcher-install" "$guard_launcher" >/dev/null
+        ROUNDHOUSE_CONFIG="$tmp/launcher-config.json" \
+        "$cli" launcher-install "$guard_launcher" >/dev/null
       guard_selected=$(HOME="$guard_version_home" PATH=/usr/bin:/bin "$guard_launcher")
       [ "$guard_selected" = "$guard_newer-newer" ] ||
         fail "the launcher did not choose the global version maximum when $guard_newer was newer"
@@ -481,6 +486,10 @@ JSONC
       fail "the native Windows hook-approval launcher is missing"
     grep -q 'claude.exe' "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ||
       fail "the Windows hook-approval launcher does not resolve Claude's bundled Node"
+    grep -q '\$SelfTest' "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ||
+      fail "the Windows hook-approval launcher has no self-test gate"
+    grep -q 'codex-plugin-hooks.ps1' "$repository_root/.github/workflows/validate.yml" ||
+      fail "the Windows validation job does not parse and self-test the hook launcher"
     printf '%s\n' "$(cli_function_body fleet_node_path)" | grep -q 'claude.exe' ||
       fail "the POSIX hook path does not resolve a Node sibling of claude.exe"
     # It FAILS LOUD rather than falling through to a bare command name.

@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -gt 1 ]; then
-  printf 'usage: launcher-install [DESTINATION]\n' >&2
-  exit 64
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+if [ "${ROUNDHOUSE_LAUNCHER_EMIT:-0}" != 1 ]; then
+  [ "$#" -le 1 ] || {
+    printf 'usage: launcher-install [DESTINATION]\n' >&2
+    exit 64
+  }
+  exec "$script_dir/roundhouse" launcher-install "${1:-}"
 fi
+[ "$#" -eq 0 ] || {
+  printf 'roundhouse: internal launcher emission does not accept a destination\n' >&2
+  exit 64
+}
 
-destination=${1:-$HOME/.local/bin/roundhouse}
-destination_dir=${destination%/*}
-[ "$destination_dir" = "$destination" ] && destination_dir=.
-mkdir -p "$destination_dir"
-
-launcher_tmp=$(mktemp "${TMPDIR:-/tmp}/roundhouse-launcher.XXXXXX")
-trap 'rm -f "$launcher_tmp"' EXIT HUP INT TERM
-cat >"$launcher_tmp" <<'EOF'
+cat <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -61,6 +62,3 @@ done
 }
 exec "$roundhouse_best" "$@"
 EOF
-chmod 755 "$launcher_tmp"
-mv -f "$launcher_tmp" "$destination"
-trap - EXIT

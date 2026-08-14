@@ -126,6 +126,20 @@ JSON
     printf 'name: mac-studio\ndomain: fleet.example.invalid\nstore_id: %s\nprincipal: mac-studio@fleet.example.invalid\n' \
       "$reenroll_genesis" >"$node_identity"
 
+    # A preserved store id is not enough: stale name/principal fields would
+    # make the host sign under one identity while the sponsor records another.
+    printf 'name: old-mac-studio\ndomain: fleet.example.invalid\nstore_id: %s\nprincipal: old-mac-studio@fleet.example.invalid\n' \
+      "$reenroll_genesis" >"$node_identity"
+    stale_identity_status=0
+    stale_identity_out=$("$cli" fleet-add mac-studio 2>&1) ||
+      stale_identity_status=$?
+    [ "$stale_identity_status" -eq 69 ] ||
+      fail "re-add accepted a preserved identity with stale name/principal"
+    [ ! -d "$node_store/.jj" ] ||
+      fail "identity mismatch cloned the store before refusing enrollment"
+    printf 'name: mac-studio\ndomain: fleet.example.invalid\nstore_id: %s\nprincipal: mac-studio@fleet.example.invalid\n' \
+      "$reenroll_genesis" >"$node_identity"
+
     # First add proves the new bootstrap against a host with an existing
     # identity and no store. The remote probe is intentionally inconclusive;
     # fleet-add must record the posture warning rather than arm a surprise

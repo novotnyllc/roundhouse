@@ -832,8 +832,13 @@ remote_store=\$(fleet_store_path)
 remote_identity=\$(fleet_identity_path)
 mkdir -p \"\$(dirname \"\$remote_identity\")\"
 if [ -f \"\$remote_identity\" ]; then
-  grep -Fqx 'store_id: $add_genesis' \"\$remote_identity\" || {
-    printf '%s\n' 'roundhouse: existing identity.yaml names a different fleet store; back it up before re-enrolling' >&2
+  identity_store_id=\$(yq -r '.store_id // \"\"' \"\$remote_identity\" 2>/dev/null || :)
+  identity_principal=\$(yq -r '.principal // \"\"' \"\$remote_identity\" 2>/dev/null || :)
+  identity_name=\$(yq -r '.name // \"\"' \"\$remote_identity\" 2>/dev/null || :)
+  [ \"\$identity_store_id\" = '$add_genesis' ] &&
+    [ \"\$identity_principal\" = '$add_principal' ] &&
+    [ \"\$identity_name\" = '$add_target' ] || {
+    printf '%s\n' 'roundhouse: existing identity.yaml fields do not match this host/store; back it up before re-enrolling' >&2
     exit 65
   }
 else

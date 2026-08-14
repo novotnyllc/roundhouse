@@ -46,6 +46,105 @@ ensure_project_parent() {
   done
 }
 
+validate_launcher_destination() {
+  launcher_destination=$1
+  launcher_home=$(cd -- "$HOME" && pwd -P) || {
+    printf 'roundhouse: launcher home is unavailable\n' >&2
+    return 65
+  }
+  [ "$launcher_destination" = "$HOME/.local/bin/roundhouse" ] ||
+    [ "$launcher_destination" = "$launcher_home/.local/bin/roundhouse" ] || {
+    printf 'roundhouse: launcher destination must be ~/.local/bin/roundhouse\n' >&2
+    return 64
+  }
+  [ ! -L "$launcher_destination" ] || {
+    printf 'roundhouse: launcher destination is a symbolic link\n' >&2
+    return 64
+  }
+  launcher_parent=$launcher_home/.local/bin
+  launcher_component=$launcher_home
+  for launcher_part in .local bin; do
+    launcher_component=$launcher_component/$launcher_part
+    if [ -e "$launcher_component" ] || [ -L "$launcher_component" ]; then
+      [ -d "$launcher_component" ] && [ ! -L "$launcher_component" ] || {
+        printf 'roundhouse: launcher parent is not a regular directory\n' >&2
+        return 64
+      }
+      [ "$(file_owner "$launcher_component")" = "$(id -un)" ] || {
+        printf 'roundhouse: launcher parent is not owned by the current user\n' >&2
+        return 64
+      }
+    fi
+  done
+  if [ -e "$launcher_destination" ]; then
+    check_private_owned_file "$launcher_destination" "existing launcher"
+  fi
+}
+
+install_roundhouse_launcher() (
+  destination=$1
+  validate_launcher_destination "$destination"
+  launcher_home=$(cd -- "$HOME" && pwd -P)
+  ensure_project_parent "$launcher_home" .local/bin/roundhouse true
+  launcher_parent=$launcher_home/.local/bin
+  [ "$(file_owner "$launcher_parent")" = "$(id -un)" ] || {
+    printf 'roundhouse: launcher parent is not owned by the current user\n' >&2
+    return 64
+  }
+  launcher_temporary=$(mktemp "$launcher_parent/.roundhouse-launcher.XXXXXX")
+  trap 'rm -f "$launcher_temporary"' EXIT HUP INT TERM
+  ROUNDHOUSE_LAUNCHER_EMIT=1 bash "$plugin_root/scripts/launcher-install" \
+    >"$launcher_temporary"
+  chmod 755 "$launcher_temporary"
+  mv -f "$launcher_temporary" "$destination"
+  launcher_temporary=
+  trap - EXIT HUP INT TERM
+  check_safe_owned_path "$destination" "installed launcher" file
+  [ -x "$destination" ] || {
+    printf 'roundhouse: installed launcher is not executable\n' >&2
+    return 70
+  }
+)
+
+launcher_install_command() (
+  [ "$#" -le 1 ] || usage
+  check_mutation_config
+  validate_config_file
+  launcher_home=$(cd -- "$HOME" && pwd -P) || exit 65
+  destination=${1:-$launcher_home/.local/bin/roundhouse}
+  validate_launcher_destination "$destination"
+  config=$(config_path)
+  target=$(jq -r '.machines | to_entries[] |
+    select(.value.transport == "local") | .key' "$config" | head -1)
+  [ -n "$target" ] || {
+    printf 'roundhouse: launcher installation requires a local configured target\n' >&2
+    exit 64
+  }
+  launcher_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-launcher-plan.XXXXXX")
+  trap 'rm -rf "$launcher_tmp"' EXIT HUP INT TERM
+  jq -cn --arg target "$target" --arg destination "$destination" '
+    {domain:"agents",target:$target,operations:[{
+      type:"agent-update",kind:"agent_artifact",id:"roundhouse:launcher",
+      argv:["roundhouse","launcher-install",$destination]
+    }]}' >"$launcher_tmp/draft.json"
+  export ROUNDHOUSE_LAUNCHER_PATH=$destination
+  collect_command --target "$target" --section agents \
+    --output "$launcher_tmp/planning.jsonl"
+  seal_plan_command "$launcher_tmp/draft.json" "$launcher_tmp/planning.jsonl" \
+    "$launcher_tmp/plan.json"
+  collect_command --target "$target" --section agents \
+    --output "$launcher_tmp/current.jsonl"
+  verify_preconditions_command "$launcher_tmp/plan.json" "$launcher_tmp/current.jsonl" \
+    >/dev/null
+  launcher_plan_id=$(jq -r '.plan_id' "$launcher_tmp/plan.json")
+  apply_plan_command "$launcher_tmp/plan.json" "$launcher_plan_id" \
+    "$launcher_tmp/result.jsonl" >/dev/null
+  jq -s -e --arg plan "$launcher_plan_id" '
+    any(.[]; type == "object" and .kind == "operation" and
+      .id == ("apply:" + $plan) and .data.operation_status == "completed")
+  ' "$launcher_tmp/result.jsonl" >/dev/null
+)
+
 install_auth_artifact() (
   operation=$1
   config=$2
@@ -406,6 +505,15 @@ EOF
             return 69
           }
           "$plan_node" "$script_dir/codex-plugin-hooks.mjs" update "$plugin_id" >/dev/null
+          return
+          ;;
+        roundhouse:launcher)
+          { [ "$kind" = agent_artifact ] && [ $# -eq 3 ] &&
+            [ "$1" = roundhouse ] && [ "$2" = launcher-install ]; } || {
+            printf 'roundhouse: unsafe Roundhouse launcher install argv\n' >&2
+            return 64
+          }
+          install_roundhouse_launcher "$3"
           return
           ;;
         claude:*)

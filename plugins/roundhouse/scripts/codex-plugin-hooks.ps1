@@ -1,14 +1,26 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
+    [Parameter(Mandatory = $true, Position = 0, ParameterSetName = 'Action')]
     [ValidateSet('approve', 'update')]
     [string]$Action,
 
-    [Parameter(Mandatory = $true, Position = 1)]
-    [string]$PluginId
+    [Parameter(Mandatory = $true, Position = 1, ParameterSetName = 'Action')]
+    [string]$PluginId,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'SelfTest')]
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Stop'
+if ($SelfTest) {
+    $hook = Join-Path $PSScriptRoot 'codex-plugin-hooks.mjs'
+    if (-not (Test-Path -LiteralPath $hook -PathType Leaf)) {
+        throw 'Roundhouse hook approval helper is missing its Node entrypoint'
+    }
+    Write-Output 'roundhouse: codex-plugin-hooks.ps1 self-test passed'
+    exit 0
+}
+
 $node = $null
 $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
 if ($nodeCommand) {
