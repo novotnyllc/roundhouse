@@ -442,6 +442,21 @@ JSONC
       *) fail "the remote prologue does not compare cached versions globally" ;;
     esac
     printf '%s\n' "$guard_prologue" >"$tmp/guards-prologue.sh"
+    grep -q 'fleet_signing_key_path()' "$tmp/guards-prologue.sh" ||
+      fail "the remote prologue does not resolve the configured signing key"
+    grep -q 'ROUNDHOUSE_FLEET_SIGNING_KEY' "$tmp/guards-prologue.sh" ||
+      fail "the remote signing-key resolver ignores its environment override"
+    guard_prologue_bin="$tmp/guards-prologue-bin"
+    mkdir -p "$guard_prologue_bin"
+    printf '#!/bin/sh\n' >"$guard_prologue_bin/roundhouse"
+    chmod 755 "$guard_prologue_bin/roundhouse"
+    guard_custom_key="$tmp/custom-node-key"
+    guard_resolved_key=$(HOME="$tmp/guards-empty-home" \
+      ROUNDHOUSE_FLEET_SIGNING_KEY="$guard_custom_key" \
+      PATH="$guard_prologue_bin:/usr/bin:/bin" \
+      sh -c "$guard_prologue; fleet_signing_key_path")
+    [ "$guard_resolved_key" = "$guard_custom_key" ] ||
+      fail "the remote signing-key resolver ignored a custom key path"
     ! grep -q 'sort -V' "$tmp/guards-prologue.sh" ||
       fail "the remote prologue still uses sort -V"
     for guard_cache in .claude/plugins/cache .codex/plugins/cache; do
@@ -586,6 +601,10 @@ JSONC
       fail "fleet-add does not clone the hub store when the newcomer store is wiped"
     grep -q 'fleet_enroll_seed_host_facts' "$tmp/guards-add.sh" ||
       fail "fleet-add does not seed hosts/<name>.yaml on re-add"
+    grep -q 'fleet_signing_key_path' "$tmp/guards-add.sh" ||
+      fail "fleet-add does not use the environment-aware signing-key resolver"
+    ! grep -q 'HOME/.ssh/roundhouse_node_ed25519' "$tmp/guards-add.sh" ||
+      fail "fleet-add still hardcodes the default signing-key path"
     grep -q 'remote posture.*unverified' "$tmp/guards-add.sh" ||
       fail "fleet-add does not record the unverified posture path"
 

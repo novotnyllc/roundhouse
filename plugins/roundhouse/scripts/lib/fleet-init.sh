@@ -611,6 +611,13 @@ fleet_remote_cli_prologue() {
   # this fallback intentionally share that rule.
   printf 'rh=$(command -v roundhouse 2>/dev/null) || rh=\n'
   cat <<'SH'
+fleet_signing_key_path() {
+  if [ -n "${ROUNDHOUSE_FLEET_SIGNING_KEY:-}" ]; then
+    printf '%s\n' "$ROUNDHOUSE_FLEET_SIGNING_KEY"
+    return
+  fi
+  printf '%s/.ssh/roundhouse_node_ed25519\n' "$HOME"
+}
 if [ -z "$rh" ]; then
   rh_best=
   rh_best_version=
@@ -793,13 +800,17 @@ fleet_add_command() (
     # Mint only the key before the roster edit. The store bootstrap happens
     # after the sponsor has the possession proof, so a failed CLI resolution
     # cannot leave a rival genesis behind.
-    ssh_run "$add_ssh" '
-      mkdir -p "$HOME/.ssh"
-      [ -f "$HOME/.ssh/roundhouse_node_ed25519" ] ||
-        ssh-keygen -q -t ed25519 -f "$HOME/.ssh/roundhouse_node_ed25519" \
-          -N "" -C "" </dev/null
-    ' >/dev/null 2>&1 || :
-    ssh_run "$add_ssh" 'cat "$HOME/.ssh/roundhouse_node_ed25519.pub"' \
+    ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
+set -e
+remote_signing_key=\$(fleet_signing_key_path)
+mkdir -p \"\$(dirname \"\$remote_signing_key\")\"
+[ -f \"\$remote_signing_key\" ] ||
+  ssh-keygen -q -t ed25519 -f \"\$remote_signing_key\" \\
+    -N \"\" -C \"\" </dev/null
+" >/dev/null 2>&1 || :
+    ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
+remote_signing_key=\$(fleet_signing_key_path)
+cat \"\$remote_signing_key.pub\"" \
       >"$add_tmp/leaf.pub" 2>/dev/null || :
     add_pub=$add_tmp/leaf.pub
     [ -s "$add_pub" ] || {
@@ -808,7 +819,9 @@ fleet_add_command() (
       exit 69
     }
     ssh_run "$add_ssh" \
-      "printf '%s' '$add_principal' | ssh-keygen -Y sign -n $fleet_trust_enroll_namespace -f \"\$HOME/.ssh/roundhouse_node_ed25519\" 2>/dev/null" \
+      "$(fleet_remote_cli_prologue)
+remote_signing_key=\$(fleet_signing_key_path)
+printf '%s' '$add_principal' | ssh-keygen -Y sign -n $fleet_trust_enroll_namespace -f \"\$remote_signing_key\" 2>/dev/null" \
       >"$add_tmp/proof.sig" 2>/dev/null || :
   fi
 
