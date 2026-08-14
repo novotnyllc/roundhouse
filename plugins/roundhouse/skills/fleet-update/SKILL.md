@@ -99,8 +99,9 @@ If Codex does not report the installed qualified plugin at the desired source
 SHA, or reports an untrusted or locally modified hook during automatic
 approval, the helper refuses and the DSC item is held; refresh/repair the
 Codex copy or explicitly approve that hook before retrying.
-On POSIX schedulers, invoke the CLI through the user's login shell or provide a
-PATH containing the harnesses and Node.js. The runtime also checks the standard
+On POSIX schedulers, invoke `roundhouse approve-codex-plugin-hooks
+PLUGIN@MARKETPLACE` through the user's login shell or provide a PATH containing
+the harnesses and Node.js. The runtime also checks the standard
 Homebrew Node locations on macOS. On native Windows, invoke
 `scripts/codex-plugin-hooks.ps1 approve PLUGIN@MARKETPLACE`; it first uses
 `node.exe` from the task PATH and then resolves the Node runtime beside
