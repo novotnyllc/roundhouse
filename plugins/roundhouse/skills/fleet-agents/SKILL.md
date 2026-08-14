@@ -309,13 +309,25 @@ is published it has the newcomer run its own visibility probe over the same
 channel. Posture is host-local and keyed on the URL that host resolves, so the
 probe runs *there* rather than being copied from the sponsor.
 
-**`fleet-add` does not clone the store for the newcomer.** `fleet-init` leaves a
-store with no origin and §12's runbook has the newcomer clone, so on a genuinely
-fresh host the probe has nothing to measure and `fleet-add` reports the two
-commands that remain there — `jj git clone --colocate <remote>
-~/.config/roundhouse/store`, then `roundhouse fleet-verify-remote`. For a host
-that already carries the store — a re-add, or one that was cloned — the posture
-lands automatically and its next `fleet-run` publishes.
+**`fleet-add` bootstraps the durable store for the newcomer.** On a genuinely
+fresh host it validates the identity, resolves the far-side CLI, runs the
+remote `fleet-init`/`fleet-enroll` bootstrap, and clones with
+`jj git clone --colocate <remote> ~/.config/roundhouse/store`; after the
+sponsor's roster commit is published, the host fetches that exact enrollment
+ancestry, advances `main`, creates its working-copy child, and runs
+`fleet-seed`. The sponsor also seeds `hosts/<name>.yaml` from `config.json`, so
+there is no manual clone or hand-authored host-facts step.
+
+If identity validation, CLI resolution, or the initial clone/bootstrap fails,
+`fleet-add` exits before recording the roster line: fix the host-side cause and
+rerun it, backing up stale identity material rather than deleting it. If the
+roster commit is already published but the host cannot fetch the enrollment
+head or seed, `fleet-add` exits nonzero, writes a bootstrap-seed alert, and
+prints the recovery path — verify the remote, fetch the published head, then
+rerun `fleet-seed`. Do not manually clone a second store, move `main`, or
+force an abandoned reviewed ref. For a host that already carries a same-genesis
+store, a re-add reuses it only after exact identity checks and still requires
+the fetched enrollment ancestry before seeding.
 
 Enrollment is **two-sided and needs no bearer credential**: an enrolled host
 supplies authorization (its roster key makes the commit ratchet-valid) and the
