@@ -164,6 +164,20 @@ JSON
     printf 'name: mac-studio\ndomain: fleet.example.invalid\nstore_id: %s\nprincipal: mac-studio@fleet.example.invalid\n' \
       "$reenroll_genesis" >"$node_identity"
 
+    # A preserved identity must also carry the same pinned domain. Missing or
+    # stale domain data must refuse before the wiped store can be cloned.
+    printf 'name: mac-studio\nstore_id: %s\nprincipal: mac-studio@fleet.example.invalid\n' \
+      "$reenroll_genesis" >"$node_identity"
+    domain_identity_status=0
+    domain_identity_out=$("$cli" fleet-add mac-studio 2>&1) ||
+      domain_identity_status=$?
+    [ "$domain_identity_status" -eq 69 ] ||
+      fail "re-add accepted a preserved identity with no pinned domain"
+    [ ! -d "$node_store/.jj" ] ||
+      fail "domain mismatch cloned the store before refusing enrollment"
+    printf 'name: mac-studio\ndomain: fleet.example.invalid\nstore_id: %s\nprincipal: mac-studio@fleet.example.invalid\n' \
+      "$reenroll_genesis" >"$node_identity"
+
     reenroll_second=$("$cli" fleet-add mac-studio 2>&1) || {
       printf '%s\n' "$reenroll_second" >&2
       fail "re-add did not bootstrap the wiped store from the hub"
