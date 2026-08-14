@@ -456,6 +456,10 @@ JSONC
       fail "the remote prologue does not resolve the configured signing key"
     grep -q 'ROUNDHOUSE_FLEET_SIGNING_KEY' "$tmp/guards-prologue.sh" ||
       fail "the remote signing-key resolver ignores its environment override"
+    grep -q 'fleet_remote_ssh_keygen_path()' "$tmp/guards-prologue.sh" ||
+      fail "the remote enrollment path does not bind its key tool"
+    grep -q '/usr/bin/ssh-keygen' "$tmp/guards-prologue.sh" ||
+      fail "the remote enrollment path still relies on PATH for ssh-keygen"
     guard_prologue_bin="$tmp/guards-prologue-bin"
     mkdir -p "$guard_prologue_bin"
     printf '#!/bin/sh\n' >"$guard_prologue_bin/roundhouse"

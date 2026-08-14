@@ -618,6 +618,13 @@ fleet_signing_key_path() {
   fi
   printf '%s/.ssh/roundhouse_node_ed25519\n' "$HOME"
 }
+fleet_remote_ssh_keygen_path() {
+  [ -x /usr/bin/ssh-keygen ] || {
+    printf '%s\n' 'roundhouse: absolute system ssh-keygen is unavailable on the newcomer' >&2
+    return 69
+  }
+  printf '%s\n' /usr/bin/ssh-keygen
+}
 if [ -z "$rh" ]; then
   rh_best=
   rh_best_version=
@@ -803,9 +810,10 @@ fleet_add_command() (
     ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
 set -e
 remote_signing_key=\$(fleet_signing_key_path)
+remote_ssh_keygen=\$(fleet_remote_ssh_keygen_path)
 mkdir -p \"\$(dirname \"\$remote_signing_key\")\"
 [ -f \"\$remote_signing_key\" ] ||
-  ssh-keygen -q -t ed25519 -f \"\$remote_signing_key\" \\
+  \"\$remote_ssh_keygen\" -q -t ed25519 -f \"\$remote_signing_key\" \\
     -N \"\" -C \"\" </dev/null
 " >/dev/null 2>&1 || :
     ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
@@ -821,7 +829,8 @@ cat \"\$remote_signing_key.pub\"" \
     ssh_run "$add_ssh" \
       "$(fleet_remote_cli_prologue)
 remote_signing_key=\$(fleet_signing_key_path)
-printf '%s' '$add_principal' | ssh-keygen -Y sign -n $fleet_trust_enroll_namespace -f \"\$remote_signing_key\" 2>/dev/null" \
+remote_ssh_keygen=\$(fleet_remote_ssh_keygen_path)
+printf '%s' '$add_principal' | \"\$remote_ssh_keygen\" -Y sign -n $fleet_trust_enroll_namespace -f \"\$remote_signing_key\" 2>/dev/null" \
       >"$add_tmp/proof.sig" 2>/dev/null || :
   fi
 
