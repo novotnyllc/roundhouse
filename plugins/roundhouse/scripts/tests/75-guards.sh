@@ -422,18 +422,15 @@ JSONC
     esac
     # THE SPONSOR'S OWN VERSION IS TRIED FIRST, by exact path: falling straight
     # to "whichever cached copy sorts last" drives bytes this host did not
-    # choose, and lexically last is not even newest (0.9.0 sorts after 0.10.0),
-    # so it could be an arbitrarily old build whose gates this one has added.
-    guard_version=$(jq -r '.version' \
-      "$(dirname -- "$cli")/../.codex-plugin/plugin.json")
+    # The remote fallback must compare both harness caches numerically; cache
+    # traversal order is not an executor policy.
     case $guard_prologue in
-      *"/roundhouse/$guard_version/scripts/roundhouse"*) ;;
-      *) fail "the remote prologue does not ask for the sponsor's own version first: $guard_version" ;;
+      *'rh_version_gt'*) ;;
+      *) fail "the remote prologue does not compare cached versions globally" ;;
     esac
     printf '%s\n' "$guard_prologue" >"$tmp/guards-prologue.sh"
-    assert_ordered "$tmp/guards-prologue.sh" \
-      "/roundhouse/$guard_version/scripts/roundhouse" \
-      '/roundhouse/*/scripts/roundhouse'
+    ! grep -q 'sort -V' "$tmp/guards-prologue.sh" ||
+      fail "the remote prologue still uses sort -V"
     for guard_cache in .claude/plugins/cache .codex/plugins/cache; do
       case $guard_prologue in
         *"$guard_cache"*) ;;
@@ -445,6 +442,47 @@ JSONC
       fail "the remote prologue uses a bashism; it runs under the peer's /bin/sh"
     printf '%s\n' "$guard_prologue" | sh -n ||
       fail "the remote prologue is not valid POSIX sh"
+
+    # G1.5. The launcher and the remote fallback must compare versions, not
+    # let the last globbed harness win. Exercise both cache ownerships.
+    guard_make_launcher() {
+      mkdir -p "$(dirname -- "$1")"
+      printf '#!/bin/sh\nprintf "%s\\n" "%s"\n' "$2" "$2" >"$1"
+      chmod 755 "$1"
+    }
+    for guard_newer in claude codex; do
+      guard_version_home="$tmp/guards-version-$guard_newer"
+      guard_launcher="$guard_version_home/.local/bin/roundhouse"
+      mkdir -p "$guard_version_home"
+      if [ "$guard_newer" = claude ]; then
+        guard_make_launcher "$guard_version_home/.claude/plugins/cache/test/roundhouse/0.10.0/scripts/roundhouse" claude-newer
+        guard_make_launcher "$guard_version_home/.codex/plugins/cache/test/roundhouse/0.9.0/scripts/roundhouse" codex-older
+      else
+        guard_make_launcher "$guard_version_home/.claude/plugins/cache/test/roundhouse/0.9.0/scripts/roundhouse" claude-older
+        guard_make_launcher "$guard_version_home/.codex/plugins/cache/test/roundhouse/0.10.0/scripts/roundhouse" codex-newer
+      fi
+      HOME="$guard_version_home" PATH=/usr/bin:/bin \
+        bash "$(dirname -- "$cli")/launcher-install" "$guard_launcher" >/dev/null
+      guard_selected=$(HOME="$guard_version_home" PATH=/usr/bin:/bin "$guard_launcher")
+      [ "$guard_selected" = "$guard_newer-newer" ] ||
+        fail "the launcher did not choose the global version maximum when $guard_newer was newer"
+      guard_exec="$guard_version_home/prologue.sh"
+      printf '%s\n' "$guard_prologue" >"$guard_exec"
+      printf '%s\n' 'printf "%s\\n" "$rh"' >>"$guard_exec"
+      guard_selected=$(HOME="$guard_version_home" PATH=/usr/bin:/bin sh "$guard_exec")
+      case "$guard_selected" in
+        */roundhouse/0.10.0/scripts/roundhouse) ;;
+        *) fail "the remote prologue did not choose the global version maximum when $guard_newer was newer" ;;
+      esac
+    done
+    ! printf '%s\n' "$guard_prologue" | grep -q 'sort -V' ||
+      fail "the remote prologue still uses PATH-lexical version selection"
+    [ -f "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ] ||
+      fail "the native Windows hook-approval launcher is missing"
+    grep -q 'claude.exe' "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ||
+      fail "the Windows hook-approval launcher does not resolve Claude's bundled Node"
+    printf '%s\n' "$(cli_function_body fleet_node_path)" | grep -q 'claude.exe' ||
+      fail "the POSIX hook path does not resolve a Node sibling of claude.exe"
     # It FAILS LOUD rather than falling through to a bare command name.
     case $guard_prologue in
       *'exit 69'*) ;;
@@ -506,6 +544,12 @@ JSONC
       fail "fleet-add does not resolve its transport separately from the roster identity"
     ! grep -q 'ssh_run "\$add_target"' "$tmp/guards-add.sh" ||
       fail "fleet-add still uses the roster name as an ssh destination"
+    grep -q 'jj git clone --colocate' "$tmp/guards-add.sh" ||
+      fail "fleet-add does not clone the hub store when the newcomer store is wiped"
+    grep -q 'fleet_enroll_seed_host_facts' "$tmp/guards-add.sh" ||
+      fail "fleet-add does not seed hosts/<name>.yaml on re-add"
+    grep -q 'remote posture.*unverified' "$tmp/guards-add.sh" ||
+      fail "fleet-add does not record the unverified posture path"
 
     # --- §7.3a the host-name allowlist, the sink joins/<h>.yaml reaches ---
     # A joins/ file is written by a NON-MEMBER, and its `.address` (and file
@@ -537,6 +581,20 @@ JSONC
     # success. Asserted at the source, the way the private-remote gate's banned
     # git calls are below: a guard that regresses is a guard that reads clean.
     guard_pub=$(cli_function_body fleet_vcs_publish)
+    guard_ref_pub=$(cli_function_body fleet_vcs_publish_refs)
+    printf '%s\n' "$guard_ref_pub" | grep -q 'fleet_sweep_gate' ||
+      fail "checkpoint ref publication bypasses the redaction gate"
+    printf '%s\n' "$guard_ref_pub" | grep -q -- '--atomic' ||
+      fail "checkpoint refs are not published atomically"
+    guard_alert=$(cli_function_body fleet_alert_write)
+    printf '%s\n' "$guard_alert" | grep -q 'fleet_prose_shorten_commit_ids' ||
+      fail "alert writers do not shorten proved commit ids on prose surfaces"
+    guard_finding=$(cli_function_body fleet_finding_write)
+    printf '%s\n' "$guard_finding" | grep -q 'fleet_prose_shorten_commit_ids' ||
+      fail "finding writers do not shorten proved commit ids on prose surfaces"
+    guard_remove=$(cli_function_body fleet_remove_command)
+    ! printf '%s\n' "$guard_remove" | grep -Fq 'retired at $remove_head;' ||
+      fail "fleet-remove still embeds a bare commit id in its alert prose"
     # The push captures its rejection so it can tell a CONCURRENT REMOTE MOVE
     # (recover: fetch, reconcile, re-publish once) from a GENUINE failure (fail
     # closed, propagate the rc). A failed push must never be dressed as success.

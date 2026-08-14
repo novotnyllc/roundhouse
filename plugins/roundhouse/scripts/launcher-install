@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -gt 1 ]; then
+  printf 'usage: launcher-install [DESTINATION]\n' >&2
+  exit 64
+fi
+
+destination=${1:-$HOME/.local/bin/roundhouse}
+destination_dir=${destination%/*}
+[ "$destination_dir" = "$destination" ] && destination_dir=.
+mkdir -p "$destination_dir"
+
+launcher_tmp=$(mktemp "${TMPDIR:-/tmp}/roundhouse-launcher.XXXXXX")
+trap 'rm -f "$launcher_tmp"' EXIT HUP INT TERM
+cat >"$launcher_tmp" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+roundhouse_version_valid() {
+  case "$1" in
+    ''|*[!0-9.]*|.*|*.|*..*) return 1 ;;
+  esac
+}
+
+roundhouse_version_gt() {
+  awk -v a="$1" -v b="$2" '
+    BEGIN {
+      an = split(a, av, /[.]/)
+      bn = split(b, bv, /[.]/)
+      n = an > bn ? an : bn
+      for (i = 1; i <= n; i++) {
+        x = (i <= an ? av[i] : 0) + 0
+        y = (i <= bn ? bv[i] : 0) + 0
+        if (x > y) exit 0
+        if (x < y) exit 1
+      }
+      exit 1
+    }
+  '
+}
+
+roundhouse_best=
+for roundhouse_candidate in \
+  "$HOME"/.claude/plugins/cache/*/roundhouse/*/scripts/roundhouse \
+  "$HOME"/.codex/plugins/cache/*/roundhouse/*/scripts/roundhouse
+do
+  [ -x "$roundhouse_candidate" ] || continue
+  roundhouse_version=${roundhouse_candidate%/scripts/roundhouse}
+  roundhouse_version=${roundhouse_version##*/}
+  roundhouse_version_valid "$roundhouse_version" || continue
+  if [ -z "$roundhouse_best" ] || roundhouse_version_gt "$roundhouse_version" "$roundhouse_best_version"; then
+    roundhouse_best=$roundhouse_candidate
+    roundhouse_best_version=$roundhouse_version
+  fi
+done
+
+[ -n "$roundhouse_best" ] || {
+  printf 'roundhouse: no installed launcher target found\n' >&2
+  exit 127
+}
+exec "$roundhouse_best" "$@"
+EOF
+chmod 755 "$launcher_tmp"
+mv -f "$launcher_tmp" "$destination"
+trap - EXIT

@@ -85,9 +85,9 @@ already current.
 
 After every plugin `install`, `update`, or `enable` operation performed by the
 DSC apply path, immediately run
-`scripts/codex-plugin-hooks.mjs approve PLUGIN@MARKETPLACE` and verify its
-result before journaling the item as applied when Codex owns that qualified
-plugin and the desired state is enabled. The apply path checks Codex's
+the hook approval helper and verify its result before journaling the item as
+applied when Codex owns that qualified plugin and the desired state is enabled.
+The apply path checks Codex's
 installed-plugin list first; a Claude-only plugin has no Codex hook state and
 skips the helper rather than becoming a false hold. A disabled desired state
 does not approve an independently enabled Codex copy. A desired `enabled`
@@ -101,9 +101,12 @@ approval, the helper refuses and the DSC item is held; refresh/repair the
 Codex copy or explicitly approve that hook before retrying.
 On POSIX schedulers, invoke the CLI through the user's login shell or provide a
 PATH containing the harnesses and Node.js. The runtime also checks the standard
-Homebrew Node locations on macOS. The native Windows helper still requires
-`node` on the Windows task PATH; that is a current gap, not a reason to claim
-Windows auto-approval is complete.
+Homebrew Node locations on macOS. On native Windows, invoke
+`scripts/codex-plugin-hooks.ps1 approve PLUGIN@MARKETPLACE`; it first uses
+`node.exe` from the task PATH and then resolves the Node runtime beside
+`claude.exe` or in Claude Code's standard install directories. If neither
+exists it exits 69 with the WSL interop recovery, rather than silently
+claiming approval.
 
 The entry drives **two cadences from one owned slot**:
 
@@ -199,3 +202,7 @@ The shared Codex/Claude lifecycle vocabulary is
 Human enrollment, upgrade, activation, and revocation stop at the local
 password/UAC boundary; on macOS that is owner-local interactive elevation, not
 an SSH fallback.
+After a Roundhouse plugin install or update on POSIX, run
+`roundhouse launcher-install ~/.local/bin/roundhouse` so the maintained
+launcher is refreshed from the installed plugin and selects the highest
+version across both harness caches.

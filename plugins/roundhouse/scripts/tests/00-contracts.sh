@@ -331,8 +331,7 @@ assert_contains "$fleet_update_text" 'Exit 75 is the STALE-lock refusal'
 assert_contains "$fleet_update_text" 'whose `meta.json` is missing so its age cannot be read'
 assert_contains "$fleet_update_text" 'Unattended runs skip protected/privileged actions'
 assert_contains "$fleet_update_text" 'After every plugin `install`, `update`, or `enable` operation'
-assert_contains "$fleet_update_text" 'native Windows helper still requires
-`node` on the Windows task PATH'
+assert_contains "$fleet_update_text" 'scripts/codex-plugin-hooks.ps1 approve PLUGIN@MARKETPLACE'
 assert_contains "$fleet_update_text" '$SHELL -lc'
 
 # fleet-hosts carries the store-credential lifecycle and the restore sequence.

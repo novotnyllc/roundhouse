@@ -73,6 +73,7 @@ Usage:
   roundhouse fleet-set-remote URL
   roundhouse fleet-readiness [HOST]...
   roundhouse fleet-doctor
+  roundhouse launcher-install [DESTINATION]
   roundhouse ensure-tools
 EOF
   exit 64
@@ -219,5 +220,6 @@ case $command in
   fleet-readiness) fleet_readiness_command "$@" ;;
   fleet-doctor) [ $# -eq 0 ] || usage; fleet_doctor_command ;;
   ensure-tools) [ $# -eq 0 ] || usage; fleet_ensure_tools_command ;;
+  launcher-install) [ $# -le 1 ] || usage; bash "$script_dir/launcher-install" "${1:-}" ;;
   *) usage ;;
 esac

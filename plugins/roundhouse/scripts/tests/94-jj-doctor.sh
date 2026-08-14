@@ -495,6 +495,8 @@ YAML
       fail "doctor checkpoint arithmetic emitted an integer error: $docjj_rows"
     printf '%s\n' "$docjj_rows" | grep -qE '^FINDING +checkpoint-tags ' ||
       fail "an untagged checkpoint did not fire checkpoint-tags"
+    printf '%s\n' "$docjj_rows" | grep -qE '^FINDING +archive-present ' ||
+      fail "a checkpoint without an archive ref did not fire archive-present"
     rm -rf "$doc/checkpoints"
 
     # --- and one broken store per row that can be broken cheaply ---

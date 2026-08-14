@@ -104,6 +104,12 @@ anything. Then, in this order:
 5. **Per-artifact reauth** — work the auth shopping list with the user;
    every credential is re-established on X by hand.
 
+If X's reviewed-ref names a fully abandoned reviewed line, re-enrollment is
+the sanctioned recovery: back up `~/.config/roundhouse/identity.yaml`,
+never delete it, re-add X from the hub, clone the hub store at its published
+checkpoint, and run `fleet-init`, `fleet-enroll`, `fleet-verify-remote`, and
+`fleet-run` in that order. Do not hand-edit or force the abandoned ref.
+
 ## Boundaries
 
 - One host per invocation; a fleet-wide sweep is `fleet-readiness` /

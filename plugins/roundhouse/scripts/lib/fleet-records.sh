@@ -277,6 +277,20 @@ fleet_removal_cap() {
 
 # --- §5 alerts and §10.4 findings ---------------------------------------------
 
+fleet_prose_shorten_commit_ids() {
+  prose_text=$1
+  prose_store=$2
+  while :; do
+    prose_token=$(printf '%s' "$prose_text" |
+      grep -oE '[0-9a-f]{40}' | head -1 || true)
+    [ -n "$prose_token" ] || break
+    fleet_quote_is_content_address "$prose_token" "$prose_store" || break
+    prose_short=${prose_token:0:12}
+    prose_text=${prose_text//$prose_token/commit[$prose_short]}
+  done
+  printf '%s\n' "$prose_text"
+}
+
 fleet_alert_write() {
   # `fleet_alert_write STORE HOST KIND SLUG DETAIL [ITEM...]`. Resolution is
   # `rm` on the file. There is no state machine.
@@ -286,6 +300,7 @@ fleet_alert_write() {
   alert_slug=$4
   alert_detail=$5
   shift 5
+  alert_detail=$(fleet_prose_shorten_commit_ids "$alert_detail" "$alert_store")
   fleet_replicated_text_ok "$alert_detail" || return 1
   fleet_record_write \
     "$alert_store/alerts/$alert_host/$(fleet_record_stamp)-$alert_slug.yaml" \
@@ -298,10 +313,12 @@ fleet_alert_write() {
 fleet_finding_write() {
   # `fleet_finding_write STORE HOST SLUG SUMMARY [QUOTE]`. Host-keyed, and the
   # quote passes the same floor as everything else that replicates.
-  fleet_replicated_text_ok "$4" || return 1
-  [ "$#" -lt 5 ] || fleet_replicated_text_ok "$5" || return 1
+  finding_summary=$(fleet_prose_shorten_commit_ids "$4" "$1")
+  finding_quote=$(fleet_prose_shorten_commit_ids "${5:-}" "$1")
+  fleet_replicated_text_ok "$finding_summary" || return 1
+  [ "$#" -lt 5 ] || fleet_replicated_text_ok "$finding_quote" || return 1
   fleet_record_write "$1/findings/$2/$(fleet_record_stamp)-$3.yaml" \
-    "$(jq -cn --arg host "$2" --arg summary "$4" --arg quote "${5:-}" \
+    "$(jq -cn --arg host "$2" --arg summary "$finding_summary" --arg quote "$finding_quote" \
       --arg at "$(fleet_now)" \
       '{host: $host, summary: $summary,
         quote: (if $quote == "" then null else $quote end), at: $at}')"

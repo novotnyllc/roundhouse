@@ -1072,7 +1072,7 @@ fleet_trust_catch_up() {
     return 0
   fi
   # 2-3. the archive, and its ABSENCE is the rollback protection.
-  jj -R "$fleet_trust_cs" git fetch --remote origin >/dev/null 2>&1 || :
+  fleet_vcs_fetch "$fleet_trust_cs" origin >/dev/null 2>&1 || :
   fleet_trust_carchive=$(git -C "$fleet_trust_cs" for-each-ref --count=1 \
     --sort=-refname --format='%(objectname)' 'refs/roundhouse/archive/*' \
     2>/dev/null)
