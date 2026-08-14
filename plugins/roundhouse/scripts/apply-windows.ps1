@@ -742,12 +742,16 @@ function Invoke-CodexPluginHooks([string]$Action, [string]$PluginId) {
     if ($PluginId -notmatch "^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$") {
         throw "Invalid Codex plugin ID"
     }
-    $Node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($null -eq $Node) { throw "Node.js is required for Codex plugin hook refresh" }
-    $Helper = Join-Path $PSScriptRoot "codex-plugin-hooks.mjs"
+    # Keep the DSC executor on the same resolver as the documented native
+    # Windows path: the task PATH may not contain Node, while Claude ships it.
+    $PowerShell = Get-Command -Name @(
+        "pwsh.exe", "pwsh", "powershell.exe", "powershell"
+    ) -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $PowerShell) { throw "PowerShell is required for Codex plugin hook refresh" }
+    $Helper = Join-Path $PSScriptRoot "codex-plugin-hooks.ps1"
     Assert-RegularFile $Helper "Codex plugin hook helper" | Out-Null
-    & $Node.Source $Helper $Action $PluginId *> $null
+    & $PowerShell.Source -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+        -File $Helper -Action $Action -PluginId $PluginId *> $null
     $Succeeded = $?
     $NativeExitCode = $LASTEXITCODE
     if (-not $Succeeded -or ($null -ne $NativeExitCode -and $NativeExitCode -ne 0)) {

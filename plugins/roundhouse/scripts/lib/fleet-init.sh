@@ -943,11 +943,18 @@ fi
     # fleet-seed writes the newcomer's working copy. It must sit on the
     # published sponsor commit, not on fleet-enroll's pre-enrollment child,
     # or the first fleet-run holds every seeded item as unknown.
+    add_commit_q=$(printf '%q' "$add_commit")
     add_seed_rc=0
     add_seed=$(ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
 set -e
 remote_store=\$(fleet_store_path)
 jj -R \"\$remote_store\" git fetch --remote origin >/dev/null
+expected_enrollment=$add_commit_q
+if ! jj -R \"\$remote_store\" log -r \"\$expected_enrollment & ::main@origin\" --no-graph -T 'commit_id ++ \"\\n\"' 2>/dev/null |
+  grep -Fqx \"\$expected_enrollment\"; then
+  printf '%s\\n' 'roundhouse: fetched origin does not contain the published enrollment head' >&2
+  exit 70
+fi
 jj -R \"\$remote_store\" bookmark set main -r main@origin >/dev/null
 jj -R \"\$remote_store\" new main >/dev/null
 \"\$rh\" fleet-seed 2>&1

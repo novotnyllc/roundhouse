@@ -107,7 +107,8 @@ Homebrew Node locations on macOS. On native Windows, invoke
 `node.exe` from the task PATH and then resolves the Node runtime beside
 `claude.exe` or in Claude Code's standard install directories. If neither
 exists it exits 69 with the WSL interop recovery, rather than silently
-claiming approval.
+claiming approval. The native DSC executor invokes this same helper, so its
+scheduled task does not require Node to be on the task PATH.
 
 The entry drives **two cadences from one owned slot**:
 

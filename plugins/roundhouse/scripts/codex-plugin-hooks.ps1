@@ -22,7 +22,8 @@ if ($SelfTest) {
 }
 
 $node = $null
-$nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+$nodeCommand = Get-Command -Name @('node.exe', 'node') -ErrorAction SilentlyContinue |
+    Select-Object -First 1
 if ($nodeCommand) {
     $node = $nodeCommand.Source
 }

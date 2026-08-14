@@ -511,6 +511,10 @@ JSONC
       fail "the native Windows hook-approval launcher is missing"
     grep -q 'claude.exe' "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ||
       fail "the Windows hook-approval launcher does not resolve Claude's bundled Node"
+    grep -q 'codex-plugin-hooks.ps1' "$(dirname -- "$cli")/apply-windows.ps1" ||
+      fail "the native Windows executor does not route hook refresh through its resolver"
+    ! grep -q 'Get-Command node' "$(dirname -- "$cli")/apply-windows.ps1" ||
+      fail "the native Windows executor still requires Node on the task PATH"
     grep -q '\$SelfTest' "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ||
       fail "the Windows hook-approval launcher has no self-test gate"
     grep -q 'codex-plugin-hooks.ps1' "$repository_root/.github/workflows/validate.yml" ||
