@@ -207,4 +207,6 @@ an SSH fallback.
 After a Roundhouse plugin install or update on POSIX, run
 `roundhouse launcher-install ~/.local/bin/roundhouse` so the maintained
 launcher is refreshed from the installed plugin and selects the highest
-version across both harness caches.
+version across both harness caches. It resolves the local target by the
+configured hostname/user; when more than one local entry matches, pass its
+machine id as the second argument instead of relying on inventory order.

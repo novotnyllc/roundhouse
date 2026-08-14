@@ -70,10 +70,7 @@ validate_launcher_destination() {
         printf 'roundhouse: launcher parent is not a regular directory\n' >&2
         return 64
       }
-      [ "$(file_owner "$launcher_component")" = "$(id -un)" ] || {
-        printf 'roundhouse: launcher parent is not owned by the current user\n' >&2
-        return 64
-      }
+      check_safe_owned_directory "$launcher_component" "launcher parent" || return
     fi
   done
   if [ -e "$launcher_destination" ]; then
@@ -97,11 +94,9 @@ install_roundhouse_launcher() (
   validate_launcher_destination "$destination"
   launcher_home=$(cd -- "$HOME" && pwd -P)
   ensure_project_parent "$launcher_home" .local/bin/roundhouse true
+  check_safe_owned_directory "$launcher_home/.local" "launcher parent" || return
   launcher_parent=$launcher_home/.local/bin
-  [ "$(file_owner "$launcher_parent")" = "$(id -un)" ] || {
-    printf 'roundhouse: launcher parent is not owned by the current user\n' >&2
-    return 64
-  }
+  check_safe_owned_directory "$launcher_parent" "launcher parent" || return
   launcher_temporary=$(mktemp "$launcher_parent/.roundhouse-launcher.XXXXXX")
   trap 'rm -f "$launcher_temporary"' EXIT HUP INT TERM
   ROUNDHOUSE_LAUNCHER_EMIT=1 bash "$plugin_root/scripts/launcher-install" \
@@ -126,19 +121,40 @@ install_roundhouse_launcher() (
 )
 
 launcher_install_command() (
-  [ "$#" -le 1 ] || usage
+  [ "$#" -le 2 ] || usage
   check_mutation_config
   validate_config_file
   launcher_home=$(cd -- "$HOME" && pwd -P) || exit 65
   destination=${1:-$launcher_home/.local/bin/roundhouse}
   validate_launcher_destination "$destination"
   config=$(config_path)
-  target=$(jq -r '.machines | to_entries[] |
-    select(.value.transport == "local") | .key' "$config" | head -1)
-  [ -n "$target" ] || {
-    printf 'roundhouse: launcher installation requires a local configured target\n' >&2
-    exit 64
-  }
+  requested_target=${2:-}
+  if [ -n "$requested_target" ]; then
+    jq -e --arg target "$requested_target" '
+      .machines[$target].transport == "local" and
+      (.machines[$target].expected_hostname | type == "string" and length > 0) and
+      (.machines[$target].expected_user | type == "string" and length > 0)
+    ' "$config" >/dev/null || {
+      printf 'roundhouse: launcher target must be one local machine with expected_hostname and expected_user\n' >&2
+      exit 64
+    }
+    target=$requested_target
+  else
+    launcher_hostname=$(hostname)
+    launcher_user=$(id -un)
+    target_candidates=$(jq -r --arg hostname "$launcher_hostname" --arg user "$launcher_user" '
+      .machines | to_entries[] |
+      select(.value.transport == "local" and
+        .value.expected_hostname == $hostname and .value.expected_user == $user) |
+      .key
+    ' "$config")
+    target_count=$(printf '%s\n' "$target_candidates" | grep -c . || true)
+    [ "$target_count" -eq 1 ] || {
+      printf 'roundhouse: launcher installation requires one local target matching hostname/user; pass TARGET explicitly\n' >&2
+      exit 64
+    }
+    target=$target_candidates
+  fi
   launcher_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-launcher-plan.XXXXXX")
   trap 'rm -rf "$launcher_tmp"' EXIT HUP INT TERM
   ROUNDHOUSE_LAUNCHER_EMIT=1 bash "$script_dir/launcher-install" \

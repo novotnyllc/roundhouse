@@ -50,7 +50,7 @@ if (-not $node) {
 }
 
 if (-not $node) {
-    Write-Error 'Roundhouse hook approval needs Node.js. Install/use the Claude-bundled node.exe or run the documented WSL interop fallback.'
+    [Console]::Error.WriteLine('Roundhouse hook approval needs Node.js. Install/use the Claude-bundled node.exe or run the documented WSL interop fallback.')
     exit 69
 }
 

@@ -54,7 +54,7 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.ps1",
-      "sha256": "41c30be264e75944c1d6e90f3db846c2c3855a9558fa1c34025aefa322a13a23"
+      "sha256": "0bafdd637deb9d2f3d2504018f2ca1b360f3f407c7818fbeed1fab88118ec277"
     },
     {
       "path": "scripts/collect-posix",
@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/plan-apply.sh",
-      "sha256": "fa0e32ac2fbca0ad62c686c7919ce732fa58f2ed035a564916ce0c767004a190"
+      "sha256": "3c3b18b1bf93a8796fc8bd8e55d600cba24aca7e15c067da1fbe59c790af2c4d"
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
@@ -190,7 +190,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "8802a389a77ffb518e8f237f865d5e302878c8af8a5b50ef3e0caba52573565e"
+      "sha256": "2293cd4948229cc5d2affcdcdabd6f9970f69302494852afd8b22a624a8e0804"
     },
     {
       "path": "scripts/roundhouse-trustd",
@@ -246,7 +246,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "3409438ba244b5c3730a4e7a45eef5e58466ce14d64f39fc13b8ebe939945bed"
+      "sha256": "edaa4475cbb18414e3084fbd96f364db416c5630a43bf9e2dd6bd96cc5e9ee90"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",

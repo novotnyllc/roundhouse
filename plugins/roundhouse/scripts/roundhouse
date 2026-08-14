@@ -73,7 +73,7 @@ Usage:
   roundhouse fleet-set-remote URL
   roundhouse fleet-readiness [HOST]...
   roundhouse fleet-doctor
-  roundhouse launcher-install [DESTINATION]
+  roundhouse launcher-install [DESTINATION] [TARGET]
   roundhouse ensure-tools
 EOF
   exit 64

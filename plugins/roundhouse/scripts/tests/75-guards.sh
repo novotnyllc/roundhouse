@@ -491,13 +491,13 @@ JSONC
       fi
       HOME="$guard_version_home" PATH=/usr/bin:/bin \
         ROUNDHOUSE_CONFIG="$tmp/launcher-config.json" \
-        "$cli" launcher-install "$guard_launcher" >/dev/null
+        "$cli" launcher-install "$guard_launcher" test-host >/dev/null
       guard_selected=$(HOME="$guard_version_home" PATH=/usr/bin:/bin "$guard_launcher")
       [ "$guard_selected" = "$guard_newer-newer" ] ||
         fail "the launcher did not choose the global version maximum when $guard_newer was newer"
       HOME="$guard_version_home" PATH=/usr/bin:/bin \
         ROUNDHOUSE_CONFIG="$tmp/launcher-config.json" \
-        "$cli" launcher-install "$guard_launcher" >/dev/null
+        "$cli" launcher-install "$guard_launcher" test-host >/dev/null
       [ -x "$guard_launcher" ] || fail "an unchanged launcher install lost executability"
       guard_bad_digest=$(printf '%064d' 0)
       ! install_roundhouse_launcher "$guard_launcher" "$guard_bad_digest" >/dev/null 2>&1 ||
@@ -511,6 +511,33 @@ JSONC
         *) fail "the remote prologue did not choose the global version maximum when $guard_newer was newer" ;;
       esac
     done
+    # A PATH launcher is a mutation: both parent directories must be private,
+    # and a config with multiple local entries must not select by JSON order.
+    for guard_parent in .local .local/bin; do
+      guard_unsafe_home="$tmp/guards-unsafe-$guard_parent"
+      mkdir -p "$guard_unsafe_home/.local/bin"
+      chmod 755 "$guard_unsafe_home/.local" "$guard_unsafe_home/.local/bin"
+      chmod 777 "$guard_unsafe_home/$guard_parent"
+      ! HOME="$guard_unsafe_home" PATH=/usr/bin:/bin \
+        ROUNDHOUSE_CONFIG="$tmp/launcher-config.json" \
+        "$cli" launcher-install "$guard_unsafe_home/.local/bin/roundhouse" test-host \
+        >/dev/null 2>&1 || fail "launcher-install accepted a writable $guard_parent"
+    done
+    guard_launcher_auto_config="$tmp/launcher-auto-config.json"
+    jq --arg hostname "$(hostname)" --arg user "$(id -un)" \
+      '.machines["test-host"].expected_hostname=$hostname |
+       .machines["test-host"].expected_user=$user |
+       .machines["test-apt"].expected_hostname="another-fixture-host" |
+       .machines["test-apt"].expected_user="another-fixture-user"' \
+      "$tmp/config.json" >"$guard_launcher_auto_config"
+    chmod 600 "$guard_launcher_auto_config"
+    guard_auto_home="$tmp/guards-auto-home"
+    mkdir -p "$guard_auto_home"
+    HOME="$guard_auto_home" PATH=/usr/bin:/bin \
+      ROUNDHOUSE_CONFIG="$guard_launcher_auto_config" \
+      "$cli" launcher-install "$guard_auto_home/.local/bin/roundhouse" >/dev/null
+    [ -x "$guard_auto_home/.local/bin/roundhouse" ] ||
+      fail "launcher-install did not resolve the unique local hostname/user target"
     guard_launcher_command=$(cli_function_body launcher_install_command)
     printf '%s\n' "$guard_launcher_command" | grep -q 'launcher_digest=' ||
       fail "launcher-install does not seal the emitted launcher digest"
@@ -528,6 +555,8 @@ JSONC
       fail "the Windows hook-approval launcher does not resolve Claude's bundled Node"
     grep -q 'codex-plugin-hooks.ps1' "$(dirname -- "$cli")/apply-windows.ps1" ||
       fail "the native Windows executor does not route hook refresh through its resolver"
+    grep -q '\[Console\]::Error.WriteLine' "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ||
+      fail "the Windows hook-approval launcher does not preserve exit 69 diagnostics"
     ! grep -q 'Get-Command node' "$(dirname -- "$cli")/apply-windows.ps1" ||
       fail "the native Windows executor still requires Node on the task PATH"
     grep -q '\$SelfTest' "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ||
