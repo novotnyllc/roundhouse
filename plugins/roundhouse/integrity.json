@@ -118,7 +118,7 @@
     },
     {
       "path": "scripts/lib/fleet-records.sh",
-      "sha256": "c79f3fe385ac526f7187416889385168e2288e527c0e2b91b356a5ce79ed50fb"
+      "sha256": "977781ff7acd3565aef48edfd671a834f6299999abe4fcceec35ebf065af7c74"
     },
     {
       "path": "scripts/lib/fleet-resolve.sh",
@@ -218,7 +218,7 @@
     },
     {
       "path": "skills/fleet-hosts/SKILL.md",
-      "sha256": "049f822176f5c4ec5afa65a4f7ab2e6608e073b6be8df6e1688d9f902c4e7ec3"
+      "sha256": "79c64a98345984142fd47d832ea61629432933ffbfa0d155e9bb5ec1853746c1"
     },
     {
       "path": "skills/fleet-inventory/SKILL.md",

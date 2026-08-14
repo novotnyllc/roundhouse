@@ -287,7 +287,24 @@ fleet_prose_shorten_commit_ids() {
     [ -n "$prose_token" ] || break
     fleet_quote_is_content_address "$prose_token" "$prose_store" || break
     prose_short=${prose_token:0:12}
-    prose_text=${prose_text//$prose_token/commit[$prose_short]}
+    prose_text=$(printf '%s\n' "$prose_text" | awk \
+      -v token="$prose_token" -v replacement="commit[$prose_short]" '
+      BEGIN { done = 0 }
+      {
+        line = $0
+        if (!done) {
+          pattern = "(^|[^A-Za-z0-9_])" token "([^A-Za-z0-9_]|$)"
+          if (match(line, pattern)) {
+            matched = substr(line, RSTART, RLENGTH)
+            leading = (substr(matched, 1, 1) == substr(token, 1, 1)) ? 0 : 1
+            token_start = RSTART + leading
+            line = substr(line, 1, token_start - 1) replacement \
+              substr(line, token_start + length(token))
+            done = 1
+          }
+        }
+        print line
+      }')
   done
   printf '%s\n' "$prose_text"
 }

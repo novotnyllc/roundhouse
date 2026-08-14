@@ -374,6 +374,16 @@ YAML
       fail "a 32-hex token stopped being flagged"
     fleet_quote_is_secret '9f2c1a4b7e0d3856af91cc42b7e5d80613a4f29cbd75e01834a6c9b2df75e013' ||
       fail "a 64-hex token stopped being flagged; only a proved commit id is exempt"
+    guard_redaction_commit=8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172
+    guard_redaction_expected="prefix commit[8e765ed0c1b2] ${guard_redaction_commit}x"
+    guard_redaction_actual=$(
+      fleet_quote_is_content_address() { [ "$1" = "$guard_redaction_commit" ]; }
+      fleet_prose_shorten_commit_ids \
+        "prefix ${guard_redaction_commit} ${guard_redaction_commit}x" \
+        "$guard_store"
+    )
+    [ "$guard_redaction_actual" = "$guard_redaction_expected" ] ||
+      fail "commit redaction rewrote an embedded duplicate token"
     # A hyphenated UUID in a path or remote URL is not a secret: `-` is out of
     # the entropy class, so it splits into its short segments.
     ! fleet_quote_is_secret 'move the store remote to /tmp/store-bf513ef6-0107-492a-ba74-f4a72b1b4fb4.git' ||

@@ -105,10 +105,13 @@ anything. Then, in this order:
    every credential is re-established on X by hand.
 
 If X's reviewed-ref names a fully abandoned reviewed line, re-enrollment is
-the sanctioned recovery: back up `~/.config/roundhouse/identity.yaml`,
-never delete it, re-add X from the hub, clone the hub store at its published
-checkpoint, and run `fleet-init`, `fleet-enroll`, `fleet-verify-remote`, and
-`fleet-run` in that order. Do not hand-edit or force the abandoned ref.
+the sanctioned recovery: back up `~/.config/roundhouse/identity.yaml`, never
+delete it, then re-add X from the hub with `fleet-add`. That flow performs the
+host bootstrap, clones the published hub store, fetches the enrollment head,
+and seeds the host; do not run a second manual clone. If the roster commit was
+already published but the fetch or seed stopped, use the printed recovery:
+run `fleet-verify-remote`, fetch the published enrollment head, rerun
+`fleet-seed`, then `fleet-run`. Do not hand-edit or force the abandoned ref.
 
 ## Boundaries
 
