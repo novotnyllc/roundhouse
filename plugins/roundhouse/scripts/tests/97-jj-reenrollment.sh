@@ -22,7 +22,8 @@ else
     node_home="$reenroll_root/mac-studio"
     hub_store="$hub_home/.config/roundhouse/store"
     hub_remote="$reenroll_root/hub.git"
-    node_store="$node_home/.config/roundhouse/store"
+    node_store="$node_home/.config/roundhouse-custom/store"
+    node_identity="$node_home/.config/roundhouse-custom/identity.yaml"
     mkdir -p "$hub_home/.config/roundhouse" "$hub_home/.ssh" \
       "$node_home/.config/roundhouse" "$node_home/.ssh"
 
@@ -39,7 +40,7 @@ done
 export HOME="$ROUNDHOUSE_REENROLL_NODE_HOME"
 export XDG_CONFIG_HOME="$HOME/.config"
 export ROUNDHOUSE_CONFIG="$HOME/.config/roundhouse/config.json"
-export ROUNDHOUSE_FLEET_STORE="$HOME/.config/roundhouse/store"
+     export ROUNDHOUSE_FLEET_STORE="$HOME/.config/roundhouse-custom/store"
 export ROUNDHOUSE_FLEET_SIGNING_KEY="$HOME/.ssh/roundhouse_node_ed25519"
 export ROUNDHOUSE_TRUST_ROOT="$HOME/.config/roundhouse"
 export PATH="$ROUNDHOUSE_REENROLL_NODE_BIN:$PATH"
@@ -121,8 +122,9 @@ YAML
     cat >"$node_home/.config/roundhouse/config.json" <<'JSON'
 {"machines":{"mac-studio":{"platform":"macos","groups":["durable"]}}}
 JSON
+    mkdir -p "$(dirname "$node_identity")"
     printf 'name: mac-studio\ndomain: fleet.example.invalid\nstore_id: %s\nprincipal: mac-studio@fleet.example.invalid\n' \
-      "$reenroll_genesis" >"$node_home/.config/roundhouse/identity.yaml"
+      "$reenroll_genesis" >"$node_identity"
 
     # First add proves the new bootstrap against a host with an existing
     # identity and no store. The remote probe is intentionally inconclusive;
@@ -145,7 +147,7 @@ JSON
     [ ! -e "$hub_store/hosts/mac-studio.yaml" ] ||
       fail "retire left the durable host layer behind"
     mv "$node_store" "$node_store.wiped"
-    [ -f "$node_home/.config/roundhouse/identity.yaml" ] ||
+    [ -f "$node_identity" ] ||
       fail "the re-enrollment fixture lost identity.yaml while wiping the store"
 
     reenroll_second=$("$cli" fleet-add mac-studio 2>&1) || {
@@ -156,7 +158,7 @@ JSON
     [ -f "$hub_store/hosts/mac-studio.yaml" ] ||
       fail "re-add did not seed hosts/mac-studio.yaml"
     grep -Fqx "store_id: $reenroll_genesis" \
-      "$node_home/.config/roundhouse/identity.yaml" ||
+      "$node_identity" ||
       fail "re-add overwrote the host identity with a foreign store id"
 
     # The host-side sequence is now exercised on the actual cloned store:

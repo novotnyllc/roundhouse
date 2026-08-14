@@ -645,6 +645,16 @@ if [ -z "$rh" ]; then
   done
   rh=$rh_best
 fi
+fleet_store_path() {
+  if [ -n "${ROUNDHOUSE_FLEET_STORE:-}" ]; then
+    printf '%s\n' "$ROUNDHOUSE_FLEET_STORE"
+    return
+  fi
+  printf '%s/roundhouse/store\n' "${XDG_CONFIG_HOME:-"$HOME/.config"}"
+}
+fleet_identity_path() {
+  printf '%s/identity.yaml\n' "$(dirname "$(fleet_store_path)")"
+}
 [ -n "$rh" ] || {
   printf 'roundhouse: no roundhouse CLI on this host — not on PATH and no valid plugin cache under ~/.claude or ~/.codex\n' >&2
   exit 69
@@ -818,26 +828,28 @@ fleet_add_command() (
     add_bootstrap_rc=0
     add_bootstrap=$(ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
 set -e
-mkdir -p \"\$HOME/.config/roundhouse\"
-if [ -f \"\$HOME/.config/roundhouse/identity.yaml\" ]; then
-  grep -Fqx 'store_id: $add_genesis' \"\$HOME/.config/roundhouse/identity.yaml\" || {
+remote_store=\$(fleet_store_path)
+remote_identity=\$(fleet_identity_path)
+mkdir -p \"\$(dirname \"\$remote_identity\")\"
+if [ -f \"\$remote_identity\" ]; then
+  grep -Fqx 'store_id: $add_genesis' \"\$remote_identity\" || {
     printf '%s\n' 'roundhouse: existing identity.yaml names a different fleet store; back it up before re-enrolling' >&2
     exit 65
   }
 else
   printf 'store_id: %s\nprincipal: %s\nname: %s\n' '$add_genesis' '$add_principal' '$add_target' \
-    >\"\$HOME/.config/roundhouse/identity.yaml\"
+    >\"\$remote_identity\"
 fi
-if [ ! -d \"\$HOME/.config/roundhouse/store/.jj\" ]; then
+if [ ! -d \"\$remote_store/.jj\" ]; then
   [ -n '$add_remote' ] || {
     printf '%s\n' 'roundhouse: no fleet store remote was supplied for bootstrap' >&2
     exit 69
   }
-  [ ! -e \"\$HOME/.config/roundhouse/store\" ] || {
+  [ ! -e \"\$remote_store\" ] || {
     printf '%s\n' 'roundhouse: the store path exists but is not a fleet store; move it aside and retry' >&2
     exit 65
   }
-  jj git clone --colocate '$add_remote' \"\$HOME/.config/roundhouse/store\" >/dev/null
+  jj git clone --colocate '$add_remote' \"\$remote_store\" >/dev/null
 fi
 \"\$rh\" fleet-init >/dev/null
 \"\$rh\" fleet-enroll >/dev/null 2>&1
