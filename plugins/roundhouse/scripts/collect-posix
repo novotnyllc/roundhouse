@@ -1875,10 +1875,12 @@ if [ -n "${ROUNDHOUSE_LAUNCHER_PATH:-}" ]; then
       '[]' '[{"code":"symlink_not_followed","severity":"warning","retryable":false,"message":"launcher path is a symlink"}]'
   elif [ -f "$launcher_path" ]; then
     launcher_digest=$(sha256_file "$launcher_path")
+    launcher_executable=false
+    [ -x "$launcher_path" ] && launcher_executable=true
     launcher_data=$(jq -cn --arg path "$launcher_path" --arg digest "$launcher_digest" \
-      --arg mtime "$(file_mtime "$launcher_path")" \
+      --arg mtime "$(file_mtime "$launcher_path")" --argjson executable "$launcher_executable" \
       '{id:"roundhouse:launcher",path:$path,artifact_kind:"launcher",
-        agent_exposure:["codex","claude"],updated_at:$mtime,
+        agent_exposure:["codex","claude"],updated_at:$mtime,executable:$executable,
         digest:{algorithm:"sha256",value:$digest,scope:"raw-bytes"}}')
     emit agent_artifact "roundhouse:launcher" present high "$launcher_data" \
       '[{"source":"filesystem","method":"launcher-file+sha256"}]'

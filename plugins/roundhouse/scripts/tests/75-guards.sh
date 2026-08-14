@@ -471,6 +471,10 @@ JSONC
       guard_selected=$(HOME="$guard_version_home" PATH=/usr/bin:/bin "$guard_launcher")
       [ "$guard_selected" = "$guard_newer-newer" ] ||
         fail "the launcher did not choose the global version maximum when $guard_newer was newer"
+      HOME="$guard_version_home" PATH=/usr/bin:/bin \
+        ROUNDHOUSE_CONFIG="$tmp/launcher-config.json" \
+        "$cli" launcher-install "$guard_launcher" >/dev/null
+      [ -x "$guard_launcher" ] || fail "an unchanged launcher install lost executability"
       guard_exec="$guard_version_home/prologue.sh"
       printf '%s\n' "$guard_prologue" >"$guard_exec"
       printf '%s\n' 'printf "%s\\n" "$rh"' >>"$guard_exec"

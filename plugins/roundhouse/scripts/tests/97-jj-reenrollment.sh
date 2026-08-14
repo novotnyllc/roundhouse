@@ -123,8 +123,32 @@ YAML
 {"machines":{"mac-studio":{"platform":"macos","groups":["durable"]}}}
 JSON
     mkdir -p "$(dirname "$node_identity")"
-    printf 'name: mac-studio\ndomain: fleet.example.invalid\nstore_id: %s\nprincipal: mac-studio@fleet.example.invalid\n' \
-      "$reenroll_genesis" >"$node_identity"
+
+    # First add proves the new bootstrap against a host with no identity and
+    # no store. The remote probe is intentionally inconclusive;
+    # fleet-add must record the posture warning rather than arm a surprise
+    # first push.
+    reenroll_first=$("$cli" fleet-add mac-studio 2>&1) || {
+      printf '%s\n' "$reenroll_first" >&2
+      fail "initial live-shaped add failed"
+    }
+    [ -d "$node_store/.jj" ] || fail "initial add did not clone the hub store"
+    [ -f "$hub_store/hosts/mac-studio.yaml" ] ||
+      fail "initial add did not seed hosts/mac-studio.yaml"
+    grep -Fqx 'domain: fleet.example.invalid' "$node_identity" ||
+      fail "fresh bootstrap did not persist the pinned fleet domain"
+    printf '%s\n' "$reenroll_first" | grep -Fq 'unverified over the SSH lane' ||
+      fail "initial add did not guide the operator after an inconclusive posture probe"
+
+    # Retire through the real verb, then wipe only the remote store. Identity
+    # survives, matching the mac-studio failure; the next add is the sanctioned
+    # re-enrollment rather than a hand-edited reviewed ref.
+    "$cli" fleet-remove mac-studio >/dev/null
+    [ ! -e "$hub_store/hosts/mac-studio.yaml" ] ||
+      fail "retire left the durable host layer behind"
+    mv "$node_store" "$node_store.wiped"
+    [ -f "$node_identity" ] ||
+      fail "the re-enrollment fixture lost identity.yaml while wiping the store"
 
     # A preserved store id is not enough: stale name/principal fields would
     # make the host sign under one identity while the sponsor records another.
@@ -139,30 +163,6 @@ JSON
       fail "identity mismatch cloned the store before refusing enrollment"
     printf 'name: mac-studio\ndomain: fleet.example.invalid\nstore_id: %s\nprincipal: mac-studio@fleet.example.invalid\n' \
       "$reenroll_genesis" >"$node_identity"
-
-    # First add proves the new bootstrap against a host with an existing
-    # identity and no store. The remote probe is intentionally inconclusive;
-    # fleet-add must record the posture warning rather than arm a surprise
-    # first push.
-    reenroll_first=$("$cli" fleet-add mac-studio 2>&1) || {
-      printf '%s\n' "$reenroll_first" >&2
-      fail "initial live-shaped add failed"
-    }
-    [ -d "$node_store/.jj" ] || fail "initial add did not clone the hub store"
-    [ -f "$hub_store/hosts/mac-studio.yaml" ] ||
-      fail "initial add did not seed hosts/mac-studio.yaml"
-    printf '%s\n' "$reenroll_first" | grep -Fq 'unverified over the SSH lane' ||
-      fail "initial add did not guide the operator after an inconclusive posture probe"
-
-    # Retire through the real verb, then wipe only the remote store. Identity
-    # survives, matching the mac-studio failure; the next add is the sanctioned
-    # re-enrollment rather than a hand-edited reviewed ref.
-    "$cli" fleet-remove mac-studio >/dev/null
-    [ ! -e "$hub_store/hosts/mac-studio.yaml" ] ||
-      fail "retire left the durable host layer behind"
-    mv "$node_store" "$node_store.wiped"
-    [ -f "$node_identity" ] ||
-      fail "the re-enrollment fixture lost identity.yaml while wiping the store"
 
     reenroll_second=$("$cli" fleet-add mac-studio 2>&1) || {
       printf '%s\n' "$reenroll_second" >&2

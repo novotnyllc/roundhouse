@@ -842,7 +842,8 @@ if [ -f \"\$remote_identity\" ]; then
     exit 65
   }
 else
-  printf 'store_id: %s\nprincipal: %s\nname: %s\n' '$add_genesis' '$add_principal' '$add_target' \
+  printf 'store_id: %s\nprincipal: %s\nname: %s\ndomain: %s\n' \
+    '$add_genesis' '$add_principal' '$add_target' '$add_domain' \
     >\"\$remote_identity\"
 fi
 if [ ! -d \"\$remote_store/.jj\" ]; then
