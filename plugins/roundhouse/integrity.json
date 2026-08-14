@@ -90,7 +90,7 @@
     },
     {
       "path": "scripts/lib/apply-commands.sh",
-      "sha256": "008414a9aa4e4595e45244f72c9cc1be4d8190a14cba691f6b09ef438415c2d0"
+      "sha256": "95b4f4264f22035895fc005bb3b21e376a36ab4699d168570b8dcfad9a6fbbeb"
     },
     {
       "path": "scripts/lib/broker-posix.sh",
@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/plan-apply.sh",
-      "sha256": "c5165f59778c826ffdbd1c059345a1ecf4bc554e3afb7ae17cbfa9f3e35d8e1b"
+      "sha256": "fa0e32ac2fbca0ad62c686c7919ce732fa58f2ed035a564916ce0c767004a190"
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
@@ -162,11 +162,11 @@
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "a5c71053b1623c0a221cc307e2901e933c2c3275e537d33c96a3fda97e32dcb5"
+      "sha256": "d1c55d0aeb0a7f200399d6fd06d253aadad1de5dd8d9d5f9f796b63579f042f6"
     },
     {
       "path": "scripts/lib/plan-verify.sh",
-      "sha256": "e8c72348d2ee6971f8681aa32981efd1719671f8f21b8f5c2c1fee657ce9a68a"
+      "sha256": "a2eb6642592cf21622cfb02166622a59cddbb61697f5720945a9c910bf0de6a5"
     },
     {
       "path": "scripts/prepare-ssh-identity",

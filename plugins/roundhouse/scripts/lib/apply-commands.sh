@@ -593,7 +593,8 @@ apply_plan_command() {
           .status == "present" and .data.path == $operation.argv[2] and
           .data.executable == true and
           .data.digest.algorithm == "sha256" and
-          (.data.digest.value | type == "string" and length > 0))
+          (.data.digest.value | type == "string" and length > 0) and
+          (.data.digest.value == $operation.expected_digest))
       elif .type == "agent-update" then
         . as $operation |
         if $operation.kind == "agent_runtime" then

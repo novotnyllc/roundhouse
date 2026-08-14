@@ -484,6 +484,9 @@ JSONC
         ROUNDHOUSE_CONFIG="$tmp/launcher-config.json" \
         "$cli" launcher-install "$guard_launcher" >/dev/null
       [ -x "$guard_launcher" ] || fail "an unchanged launcher install lost executability"
+      guard_bad_digest=$(printf '%064d' 0)
+      ! install_roundhouse_launcher "$guard_launcher" "$guard_bad_digest" >/dev/null 2>&1 ||
+        fail "launcher install accepted bytes that differ from the sealed digest"
       guard_exec="$guard_version_home/prologue.sh"
       printf '%s\n' "$guard_prologue" >"$guard_exec"
       printf '%s\n' 'printf "%s\\n" "$rh"' >>"$guard_exec"
@@ -493,6 +496,15 @@ JSONC
         *) fail "the remote prologue did not choose the global version maximum when $guard_newer was newer" ;;
       esac
     done
+    guard_launcher_command=$(cli_function_body launcher_install_command)
+    printf '%s\n' "$guard_launcher_command" | grep -q 'launcher_digest=' ||
+      fail "launcher-install does not seal the emitted launcher digest"
+    guard_launcher_apply=$(cli_function_body execute_plan_operation)
+    printf '%s\n' "$guard_launcher_apply" | grep -q 'expected_launcher_digest=' ||
+      fail "launcher apply does not read the sealed launcher digest"
+    guard_apply=$(cli_function_body apply_plan_command)
+    printf '%s\n' "$guard_apply" | grep -Fq '.data.digest.value == $operation.expected_digest' ||
+      fail "launcher postcondition does not require the sealed digest"
     ! printf '%s\n' "$guard_prologue" | grep -q 'sort -V' ||
       fail "the remote prologue still uses PATH-lexical version selection"
     [ -f "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ] ||

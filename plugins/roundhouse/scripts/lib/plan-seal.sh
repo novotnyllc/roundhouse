@@ -162,7 +162,8 @@ seal_plan_command() {
     launcher_plan_destination=$(jq -r '
       .operations[] | select(.id == "roundhouse:launcher") |
       select(.type == "agent-update" and .kind == "agent_artifact" and
-        (.argv == ["roundhouse","launcher-install",.argv[2]])) | .argv[2]
+        (.argv == ["roundhouse","launcher-install",.argv[2]]) and
+        (.expected_digest | type == "string" and test("^[0-9a-f]{64}$"))) | .argv[2]
     ' "$draft")
     [ -n "$launcher_plan_destination" ] || {
       printf 'roundhouse: invalid Roundhouse launcher plan operation\n' >&2

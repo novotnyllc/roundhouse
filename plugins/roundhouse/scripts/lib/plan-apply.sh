@@ -83,6 +83,17 @@ validate_launcher_destination() {
 
 install_roundhouse_launcher() (
   destination=$1
+  expected_digest=$2
+  case $expected_digest in
+    ''|*[!0-9a-f]*)
+      printf 'roundhouse: launcher plan has an invalid expected digest\n' >&2
+      return 64
+      ;;
+  esac
+  [ "${#expected_digest}" -eq 64 ] || {
+    printf 'roundhouse: launcher plan has an invalid expected digest\n' >&2
+    return 64
+  }
   validate_launcher_destination "$destination"
   launcher_home=$(cd -- "$HOME" && pwd -P)
   ensure_project_parent "$launcher_home" .local/bin/roundhouse true
@@ -95,6 +106,10 @@ install_roundhouse_launcher() (
   trap 'rm -f "$launcher_temporary"' EXIT HUP INT TERM
   ROUNDHOUSE_LAUNCHER_EMIT=1 bash "$plugin_root/scripts/launcher-install" \
     >"$launcher_temporary"
+  [ "$(sha256_file "$launcher_temporary")" = "$expected_digest" ] || {
+    printf 'roundhouse: emitted launcher does not match the sealed digest\n' >&2
+    return 65
+  }
   chmod 755 "$launcher_temporary"
   mv -f "$launcher_temporary" "$destination"
   launcher_temporary=
@@ -102,6 +117,10 @@ install_roundhouse_launcher() (
   check_safe_owned_path "$destination" "installed launcher" file
   [ -x "$destination" ] || {
     printf 'roundhouse: installed launcher is not executable\n' >&2
+    return 70
+  }
+  [ "$(sha256_file "$destination")" = "$expected_digest" ] || {
+    printf 'roundhouse: installed launcher does not match the sealed digest\n' >&2
     return 70
   }
 )
@@ -122,10 +141,14 @@ launcher_install_command() (
   }
   launcher_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-launcher-plan.XXXXXX")
   trap 'rm -rf "$launcher_tmp"' EXIT HUP INT TERM
-  jq -cn --arg target "$target" --arg destination "$destination" '
+  ROUNDHOUSE_LAUNCHER_EMIT=1 bash "$script_dir/launcher-install" \
+    >"$launcher_tmp/launcher"
+  launcher_digest=$(sha256_file "$launcher_tmp/launcher")
+  jq -cn --arg target "$target" --arg destination "$destination" \
+    --arg expected_digest "$launcher_digest" '
     {domain:"agents",target:$target,operations:[{
       type:"agent-update",kind:"agent_artifact",id:"roundhouse:launcher",
-      argv:["roundhouse","launcher-install",$destination]
+      argv:["roundhouse","launcher-install",$destination],expected_digest:$expected_digest
     }]}' >"$launcher_tmp/draft.json"
   export ROUNDHOUSE_LAUNCHER_PATH=$destination
   collect_command --target "$target" --section agents \
@@ -513,7 +536,8 @@ EOF
             printf 'roundhouse: unsafe Roundhouse launcher install argv\n' >&2
             return 64
           }
-          install_roundhouse_launcher "$3"
+          expected_launcher_digest=$(jq -r '.expected_digest // empty' "$operation")
+          install_roundhouse_launcher "$3" "$expected_launcher_digest"
           return
           ;;
         claude:*)
