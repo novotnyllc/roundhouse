@@ -56,14 +56,6 @@ case "$reenroll_remote_command" in
     export ROUNDHOUSE_FLEET_VISIBILITY_PROBE='printf Authentication >&2; exit 1'
     ;;
 esac
-if [ -n "${ROUNDHOUSE_REENROLL_SSH_LOG:-}" ]; then
-  set +e
-  /bin/bash -c "$reenroll_remote_command" 2>>"$ROUNDHOUSE_REENROLL_SSH_LOG"
-  reenroll_status=$?
-  set -e
-  printf 'fake-ssh-exit=%s\n' "$reenroll_status" >>"$ROUNDHOUSE_REENROLL_SSH_LOG"
-  exit "$reenroll_status"
-fi
 exec /bin/bash -c "$reenroll_remote_command"
 SH
     chmod 755 "$tmp/bin/ssh"
@@ -79,7 +71,7 @@ exec "$ROUNDHOUSE_REENROLL_CLI" "$@"
 SH
     chmod 755 "$node_bin/roundhouse"
 
-    PATH="$(dirname "$real_jj"):$(dirname "$real_yq"):$tmp/bin:$PATH"
+    PATH="$tmp/bin:$(dirname "$real_jj"):$(dirname "$real_yq"):$PATH"
     export PATH
     export HOME="$hub_home"
     export XDG_CONFIG_HOME="$hub_home/.config"
@@ -91,8 +83,6 @@ SH
     export ROUNDHOUSE_REENROLL_CLI="$cli"
     export ROUNDHOUSE_REENROLL_NODE_HOME="$node_home"
     export ROUNDHOUSE_REENROLL_NODE_BIN="$(dirname "$real_jj"):$tmp/bin:/usr/bin:/bin"
-    reenroll_ssh_log="$reenroll_root/ssh.stderr"
-    export ROUNDHOUSE_REENROLL_SSH_LOG="$reenroll_ssh_log"
 
     cat >"$ROUNDHOUSE_CONFIG" <<'JSON'
 {"version":1,"machines":{"hub":{"platform":"macos","transport":"local","groups":["durable"]},"mac-studio":{"ssh_alias":"mac-studio","platform":"macos","transport":"ssh","groups":["durable"]}}}
@@ -143,10 +133,6 @@ JSON
     # first push.
     reenroll_first=$("$cli" fleet-add mac-studio 2>&1) || {
       printf '%s\n' "$reenroll_first" >&2
-      [ ! -s "$reenroll_ssh_log" ] || {
-        printf 'real-jj: remote SSH stderr follows\n' >&2
-        sed -n '1,120p' "$reenroll_ssh_log" >&2
-      }
       fail "initial live-shaped add failed"
     }
     [ -d "$node_store/.jj" ] || fail "initial add did not clone the hub store"
