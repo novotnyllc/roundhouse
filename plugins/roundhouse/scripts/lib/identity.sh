@@ -364,6 +364,33 @@ fleet_node_path() {
       done
       ;;
   esac
+  # Native Windows Claude bundles Node beside claude.exe rather than
+  # necessarily exposing it to a scheduled task. Resolve that sibling before
+  # declaring automatic hook approval unavailable.
+  fleet_claude_bin=$(command -v claude.exe 2>/dev/null ||
+    command -v claude 2>/dev/null || true)
+  if [ -z "$fleet_claude_bin" ] && command -v cmd.exe >/dev/null 2>&1; then
+    fleet_claude_bin=$(cmd.exe /c where claude.exe 2>/dev/null |
+      tr -d '\r' | head -1 || true)
+  fi
+  case $fleet_claude_bin in
+    [A-Za-z]:\\*)
+      command -v wslpath >/dev/null 2>&1 &&
+        fleet_claude_bin=$(wslpath -u "$fleet_claude_bin" 2>/dev/null || true)
+      ;;
+  esac
+  if [ -n "$fleet_claude_bin" ]; then
+    fleet_claude_dir=$(CDPATH='' cd -- "$(dirname -- "$fleet_claude_bin")" 2>/dev/null && pwd -P) ||
+      fleet_claude_dir=
+    for fleet_node_candidate in "$fleet_claude_dir/node.exe" \
+      "$fleet_claude_dir/resources/node.exe" \
+      "$fleet_claude_dir/../node.exe" \
+      "$fleet_claude_dir/../resources/node.exe"; do
+      [ -x "$fleet_node_candidate" ] || continue
+      printf '%s\n' "$fleet_node_candidate"
+      return 0
+    done
+  fi
   return 69
 }
 

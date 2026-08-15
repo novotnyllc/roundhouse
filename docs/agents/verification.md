@@ -11,7 +11,7 @@ POSIX platform, fanned out from the `scope-matrix` job) and `windows`
 
    ```sh
    for s in roundhouse certify-ssh-node collect-posix enroll-privilege-posix \
-            enroll-ssh-posix prepare-ssh-identity privilege-broker-posix \
+            enroll-ssh-posix launcher-install prepare-ssh-identity privilege-broker-posix \
             test-roundhouse update-integrity; do
      bash -n "plugins/roundhouse/scripts/$s"
    done
@@ -24,8 +24,8 @@ POSIX platform, fanned out from the `scope-matrix` job) and `windows`
    self-check's sourced sections. Neither is executable on its own.
 
 2. **Lint** — `shellcheck --severity=warning -x -P SCRIPTDIR` (Linux job only)
-   on the four substantial scripts: `roundhouse`, `collect-posix`,
-   `test-roundhouse`, `update-integrity`. `-x` follows the `# shellcheck
+   on the five substantial scripts: `roundhouse`, `collect-posix`,
+   `launcher-install`, `test-roundhouse`, `update-integrity`. `-x` follows the `# shellcheck
    source=` directives, so `lib/` and `tests/` are analysed as part of the
    program that sources them rather than as standalone fragments.
 3. **Integrity** — `plugins/roundhouse/scripts/update-integrity` followed by

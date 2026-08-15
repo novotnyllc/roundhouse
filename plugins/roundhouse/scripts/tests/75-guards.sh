@@ -374,12 +374,31 @@ YAML
       fail "a 32-hex token stopped being flagged"
     fleet_quote_is_secret '9f2c1a4b7e0d3856af91cc42b7e5d80613a4f29cbd75e01834a6c9b2df75e013' ||
       fail "a 64-hex token stopped being flagged; only a proved commit id is exempt"
+    guard_redaction_commit=8e765ed0c1b24a97ff3d6e5a0b1c2d3e4f506172
+    guard_redaction_expected="prefix commit[8e765ed0c1b2] ${guard_redaction_commit}x"
+    guard_redaction_actual=$(
+      fleet_quote_is_content_address() { [ "$1" = "$guard_redaction_commit" ]; }
+      fleet_prose_shorten_commit_ids \
+        "prefix ${guard_redaction_commit} ${guard_redaction_commit}x" \
+        "$guard_store"
+    )
+    [ "$guard_redaction_actual" = "$guard_redaction_expected" ] ||
+      fail "commit redaction rewrote an embedded duplicate token"
     # A hyphenated UUID in a path or remote URL is not a secret: `-` is out of
     # the entropy class, so it splits into its short segments.
     ! fleet_quote_is_secret 'move the store remote to /tmp/store-bf513ef6-0107-492a-ba74-f4a72b1b4fb4.git' ||
       fail "a hyphenated UUID in a remote URL false-positived as a secret"
 
     # --- enrollment ergonomics: identity vs transport, and the remote CLI ---
+    guard_add=$(cli_function_body fleet_add_command)
+    printf '%s\n' "$guard_add" | grep -q 'add_remote_q=$(printf.*%q' ||
+      fail "fleet-add does not shell-quote the remote before remote bootstrap"
+    printf '%s\n' "$guard_add" | grep -q 'jj git clone --colocate \$add_remote_q' ||
+      fail "fleet-add still interpolates the raw remote into the clone command"
+    guard_url="https://example.invalid/store'o.git"
+    guard_url_q=$(printf '%q' "$guard_url")
+    [ "$(sh -c "printf '%s' $guard_url_q")" = "$guard_url" ] ||
+      fail "the remote shell quoting fixture did not round-trip an apostrophe"
     # G2. A machine's ROSTER IDENTITY and its TRANSPORT ADDRESS are two facts,
     # and `fleet-add mac-mini` used the argument as both — so a machine whose
     # ssh alias is `claires-mac-mini` did not connect until somebody hand-added
@@ -389,9 +408,13 @@ YAML
 {"version":1,"machines":{
   "mac-mini":{"platform":"macos","transport":"ssh","ssh_alias":"claires-mac-mini",
     "groups":[],"package_managers":[]},
+  "test-host":{"platform":"macos","transport":"local",
+    "groups":[],"package_managers":[]},
   "hostile":{"platform":"linux","transport":"ssh","ssh_alias":"-oProxyCommand=curl|sh",
     "groups":[],"package_managers":[]}}}
 JSONC
+    cp "$tmp/config.json" "$tmp/launcher-config.json"
+    chmod 600 "$tmp/launcher-config.json"
     [ "$(ROUNDHOUSE_CONFIG="$tmp/guards-config.json" \
       fleet_ssh_destination mac-mini)" = claires-mac-mini ] ||
       fail "the ssh destination did not resolve through the machine's configured alias"
@@ -422,18 +445,34 @@ JSONC
     esac
     # THE SPONSOR'S OWN VERSION IS TRIED FIRST, by exact path: falling straight
     # to "whichever cached copy sorts last" drives bytes this host did not
-    # choose, and lexically last is not even newest (0.9.0 sorts after 0.10.0),
-    # so it could be an arbitrarily old build whose gates this one has added.
-    guard_version=$(jq -r '.version' \
-      "$(dirname -- "$cli")/../.codex-plugin/plugin.json")
+    # The remote fallback must compare both harness caches numerically; cache
+    # traversal order is not an executor policy.
     case $guard_prologue in
-      *"/roundhouse/$guard_version/scripts/roundhouse"*) ;;
-      *) fail "the remote prologue does not ask for the sponsor's own version first: $guard_version" ;;
+      *'rh_version_gt'*) ;;
+      *) fail "the remote prologue does not compare cached versions globally" ;;
     esac
     printf '%s\n' "$guard_prologue" >"$tmp/guards-prologue.sh"
-    assert_ordered "$tmp/guards-prologue.sh" \
-      "/roundhouse/$guard_version/scripts/roundhouse" \
-      '/roundhouse/*/scripts/roundhouse'
+    grep -q 'fleet_signing_key_path()' "$tmp/guards-prologue.sh" ||
+      fail "the remote prologue does not resolve the configured signing key"
+    grep -q 'ROUNDHOUSE_FLEET_SIGNING_KEY' "$tmp/guards-prologue.sh" ||
+      fail "the remote signing-key resolver ignores its environment override"
+    grep -q 'fleet_remote_ssh_keygen_path()' "$tmp/guards-prologue.sh" ||
+      fail "the remote enrollment path does not bind its key tool"
+    grep -q '/usr/bin/ssh-keygen' "$tmp/guards-prologue.sh" ||
+      fail "the remote enrollment path still relies on PATH for ssh-keygen"
+    guard_prologue_bin="$tmp/guards-prologue-bin"
+    mkdir -p "$guard_prologue_bin"
+    printf '#!/bin/sh\n' >"$guard_prologue_bin/roundhouse"
+    chmod 755 "$guard_prologue_bin/roundhouse"
+    guard_custom_key="$tmp/custom-node-key"
+    guard_resolved_key=$(HOME="$tmp/guards-empty-home" \
+      ROUNDHOUSE_FLEET_SIGNING_KEY="$guard_custom_key" \
+      PATH="$guard_prologue_bin:/usr/bin:/bin" \
+      sh -c "$guard_prologue; fleet_signing_key_path")
+    [ "$guard_resolved_key" = "$guard_custom_key" ] ||
+      fail "the remote signing-key resolver ignored a custom key path"
+    ! grep -q 'sort -V' "$tmp/guards-prologue.sh" ||
+      fail "the remote prologue still uses sort -V"
     for guard_cache in .claude/plugins/cache .codex/plugins/cache; do
       case $guard_prologue in
         *"$guard_cache"*) ;;
@@ -445,6 +484,101 @@ JSONC
       fail "the remote prologue uses a bashism; it runs under the peer's /bin/sh"
     printf '%s\n' "$guard_prologue" | sh -n ||
       fail "the remote prologue is not valid POSIX sh"
+
+    # G1.5. The launcher and the remote fallback must compare versions, not
+    # let the last globbed harness win. Exercise both cache ownerships.
+    guard_make_launcher() {
+      mkdir -p "$(dirname -- "$1")"
+      printf '#!/bin/sh\nprintf "%s\\n" "%s"\n' "$2" "$2" >"$1"
+      chmod 755 "$1"
+    }
+    for guard_newer in claude codex; do
+      guard_version_home="$tmp/guards-version-$guard_newer"
+      guard_launcher="$guard_version_home/.local/bin/roundhouse"
+      mkdir -p "$guard_version_home"
+      if [ "$guard_newer" = claude ]; then
+        guard_make_launcher "$guard_version_home/.claude/plugins/cache/test/roundhouse/0.10.0/scripts/roundhouse" claude-newer
+        guard_make_launcher "$guard_version_home/.codex/plugins/cache/test/roundhouse/0.9.0/scripts/roundhouse" codex-older
+      else
+        guard_make_launcher "$guard_version_home/.claude/plugins/cache/test/roundhouse/0.9.0/scripts/roundhouse" claude-older
+        guard_make_launcher "$guard_version_home/.codex/plugins/cache/test/roundhouse/0.10.0/scripts/roundhouse" codex-newer
+      fi
+      HOME="$guard_version_home" PATH=/usr/bin:/bin \
+        ROUNDHOUSE_CONFIG="$tmp/launcher-config.json" \
+        "$cli" launcher-install "$guard_launcher" test-host >/dev/null
+      guard_selected=$(HOME="$guard_version_home" PATH=/usr/bin:/bin "$guard_launcher")
+      [ "$guard_selected" = "$guard_newer-newer" ] ||
+        fail "the launcher did not choose the global version maximum when $guard_newer was newer"
+      HOME="$guard_version_home" PATH=/usr/bin:/bin \
+        ROUNDHOUSE_CONFIG="$tmp/launcher-config.json" \
+        "$cli" launcher-install "$guard_launcher" test-host >/dev/null
+      [ -x "$guard_launcher" ] || fail "an unchanged launcher install lost executability"
+      guard_bad_digest=$(printf '%064d' 0)
+      ! install_roundhouse_launcher "$guard_launcher" "$guard_bad_digest" >/dev/null 2>&1 ||
+        fail "launcher install accepted bytes that differ from the sealed digest"
+      guard_exec="$guard_version_home/prologue.sh"
+      printf '%s\n' "$guard_prologue" >"$guard_exec"
+      printf '%s\n' 'printf "%s\\n" "$rh"' >>"$guard_exec"
+      guard_selected=$(HOME="$guard_version_home" PATH=/usr/bin:/bin sh "$guard_exec")
+      case "$guard_selected" in
+        */roundhouse/0.10.0/scripts/roundhouse) ;;
+        *) fail "the remote prologue did not choose the global version maximum when $guard_newer was newer" ;;
+      esac
+    done
+    # A PATH launcher is a mutation: both parent directories must be private,
+    # and a config with multiple local entries must not select by JSON order.
+    for guard_parent in .local .local/bin; do
+      guard_unsafe_home="$tmp/guards-unsafe-$guard_parent"
+      mkdir -p "$guard_unsafe_home/.local/bin"
+      chmod 755 "$guard_unsafe_home/.local" "$guard_unsafe_home/.local/bin"
+      chmod 777 "$guard_unsafe_home/$guard_parent"
+      ! HOME="$guard_unsafe_home" PATH=/usr/bin:/bin \
+        ROUNDHOUSE_CONFIG="$tmp/launcher-config.json" \
+        "$cli" launcher-install "$guard_unsafe_home/.local/bin/roundhouse" test-host \
+        >/dev/null 2>&1 || fail "launcher-install accepted a writable $guard_parent"
+    done
+    guard_launcher_auto_config="$tmp/launcher-auto-config.json"
+    jq --arg hostname "$(hostname)" --arg user "$(id -un)" \
+      '.machines["test-host"].expected_hostname=$hostname |
+       .machines["test-host"].expected_user=$user |
+       .machines["test-apt"].expected_hostname="another-fixture-host" |
+       .machines["test-apt"].expected_user="another-fixture-user"' \
+      "$tmp/config.json" >"$guard_launcher_auto_config"
+    chmod 600 "$guard_launcher_auto_config"
+    guard_auto_home="$tmp/guards-auto-home"
+    mkdir -p "$guard_auto_home"
+    HOME="$guard_auto_home" PATH=/usr/bin:/bin \
+      ROUNDHOUSE_CONFIG="$guard_launcher_auto_config" \
+      "$cli" launcher-install "$guard_auto_home/.local/bin/roundhouse" >/dev/null
+    [ -x "$guard_auto_home/.local/bin/roundhouse" ] ||
+      fail "launcher-install did not resolve the unique local hostname/user target"
+    guard_launcher_command=$(cli_function_body launcher_install_command)
+    printf '%s\n' "$guard_launcher_command" | grep -q 'launcher_digest=' ||
+      fail "launcher-install does not seal the emitted launcher digest"
+    guard_launcher_apply=$(cli_function_body execute_plan_operation)
+    printf '%s\n' "$guard_launcher_apply" | grep -q 'expected_launcher_digest=' ||
+      fail "launcher apply does not read the sealed launcher digest"
+    guard_apply=$(cli_function_body apply_plan_command)
+    printf '%s\n' "$guard_apply" | grep -Fq '.data.digest.value == $operation.expected_digest' ||
+      fail "launcher postcondition does not require the sealed digest"
+    ! printf '%s\n' "$guard_prologue" | grep -q 'sort -V' ||
+      fail "the remote prologue still uses PATH-lexical version selection"
+    [ -f "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ] ||
+      fail "the native Windows hook-approval launcher is missing"
+    grep -q 'claude.exe' "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ||
+      fail "the Windows hook-approval launcher does not resolve Claude's bundled Node"
+    grep -q 'codex-plugin-hooks.ps1' "$(dirname -- "$cli")/apply-windows.ps1" ||
+      fail "the native Windows executor does not route hook refresh through its resolver"
+    grep -q '\[Console\]::Error.WriteLine' "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ||
+      fail "the Windows hook-approval launcher does not preserve exit 69 diagnostics"
+    ! grep -q 'Get-Command node' "$(dirname -- "$cli")/apply-windows.ps1" ||
+      fail "the native Windows executor still requires Node on the task PATH"
+    grep -q '\$SelfTest' "$(dirname -- "$cli")/codex-plugin-hooks.ps1" ||
+      fail "the Windows hook-approval launcher has no self-test gate"
+    grep -q 'codex-plugin-hooks.ps1' "$repository_root/.github/workflows/validate.yml" ||
+      fail "the Windows validation job does not parse and self-test the hook launcher"
+    printf '%s\n' "$(cli_function_body fleet_node_path)" | grep -q 'claude.exe' ||
+      fail "the POSIX hook path does not resolve a Node sibling of claude.exe"
     # It FAILS LOUD rather than falling through to a bare command name.
     case $guard_prologue in
       *'exit 69'*) ;;
@@ -506,6 +640,16 @@ JSONC
       fail "fleet-add does not resolve its transport separately from the roster identity"
     ! grep -q 'ssh_run "\$add_target"' "$tmp/guards-add.sh" ||
       fail "fleet-add still uses the roster name as an ssh destination"
+    grep -q 'jj git clone --colocate' "$tmp/guards-add.sh" ||
+      fail "fleet-add does not clone the hub store when the newcomer store is wiped"
+    grep -q 'fleet_enroll_seed_host_facts' "$tmp/guards-add.sh" ||
+      fail "fleet-add does not seed hosts/<name>.yaml on re-add"
+    grep -q 'fleet_signing_key_path' "$tmp/guards-add.sh" ||
+      fail "fleet-add does not use the environment-aware signing-key resolver"
+    ! grep -q 'HOME/.ssh/roundhouse_node_ed25519' "$tmp/guards-add.sh" ||
+      fail "fleet-add still hardcodes the default signing-key path"
+    grep -q 'remote posture.*unverified' "$tmp/guards-add.sh" ||
+      fail "fleet-add does not record the unverified posture path"
 
     # --- §7.3a the host-name allowlist, the sink joins/<h>.yaml reaches ---
     # A joins/ file is written by a NON-MEMBER, and its `.address` (and file
@@ -537,6 +681,20 @@ JSONC
     # success. Asserted at the source, the way the private-remote gate's banned
     # git calls are below: a guard that regresses is a guard that reads clean.
     guard_pub=$(cli_function_body fleet_vcs_publish)
+    guard_ref_pub=$(cli_function_body fleet_vcs_publish_refs)
+    printf '%s\n' "$guard_ref_pub" | grep -q 'fleet_sweep_gate' ||
+      fail "checkpoint ref publication bypasses the redaction gate"
+    printf '%s\n' "$guard_ref_pub" | grep -q -- '--atomic' ||
+      fail "checkpoint refs are not published atomically"
+    guard_alert=$(cli_function_body fleet_alert_write)
+    printf '%s\n' "$guard_alert" | grep -q 'fleet_prose_shorten_commit_ids' ||
+      fail "alert writers do not shorten proved commit ids on prose surfaces"
+    guard_finding=$(cli_function_body fleet_finding_write)
+    printf '%s\n' "$guard_finding" | grep -q 'fleet_prose_shorten_commit_ids' ||
+      fail "finding writers do not shorten proved commit ids on prose surfaces"
+    guard_remove=$(cli_function_body fleet_remove_command)
+    ! printf '%s\n' "$guard_remove" | grep -Fq 'retired at $remove_head;' ||
+      fail "fleet-remove still embeds a bare commit id in its alert prose"
     # The push captures its rejection so it can tell a CONCURRENT REMOTE MOVE
     # (recover: fetch, reconcile, re-publish once) from a GENUINE failure (fail
     # closed, propagate the rc). A failed push must never be dressed as success.

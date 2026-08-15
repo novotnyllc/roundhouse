@@ -17,8 +17,10 @@ else
     u20_bin="$u20_root/bin"
     mkdir -p "$u20_bin"
     for u20_tool in "$tmp/bin"/*; do
-      [ "$(basename "$u20_tool")" = chezmoi ] ||
-        ln -s "$u20_tool" "$u20_bin/$(basename "$u20_tool")"
+      case $(basename "$u20_tool") in
+        chezmoi|jj|yq) continue ;;
+      esac
+      ln -s "$u20_tool" "$u20_bin/$(basename "$u20_tool")"
     done
     ln -s "$real_jj" "$u20_bin/jj"
     ln -s "$real_yq" "$u20_bin/yq"

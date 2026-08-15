@@ -588,14 +588,9 @@ fleet_remote_cli_prologue() {
   # A POSIX-sh prologue that resolves THIS PLUGIN'S CLI on the far side of an
   # SSH lane and leaves it in `$rh`, or exits 69 saying why not.
   #
-  # The version this host is running, so the peer can be asked for the same one
-  # by exact path. A `*` when it cannot be read keeps the glob well-formed and
-  # degrades to the ordinary fallback rather than composing a broken path.
-  fleet_remote_cli_version=$(jq -r '.version // empty' \
-    "$plugin_root/.codex-plugin/plugin.json" 2>/dev/null) || fleet_remote_cli_version=
-  case ${fleet_remote_cli_version:-} in
-    '' | *[!0-9.]*) fleet_remote_cli_version='*' ;;
-  esac
+  # PATH is preferred because the maintained launcher performs the same global
+  # version selection. With no launcher on PATH, compare every numeric version
+  # across both harness caches; glob order is never an executor policy.
   #
   # `fleet-add` used to run a bare `roundhouse …` on the newcomer, but the
   # plugin ships no `roundhouse` on anybody's PATH — skills invoke it through
@@ -611,42 +606,97 @@ fleet_remote_cli_prologue() {
   # arm the iris-windows native-membership plan adds is another entry here, not
   # a rewrite of the call sites.
   #
-  # THE SPONSOR'S OWN VERSION IS TRIED FIRST, by exact path. Falling straight
-  # to "whichever cached copy sorts last" means the sponsor drives bytes it did
-  # not choose — and lexically last is not even newest (0.9.0 sorts after
-  # 0.10.0), so it could be an arbitrarily old build whose gates this one has
-  # since added. Naming the version this host is running makes the common case
-  # deterministic and matched.
-  #
-  # ponytail: the fallback is still last-glob-wins, and it is REACHED only when
-  # the newcomer has no copy of the sponsor's version at all. The full fix the
-  # reviewer asks for — transfer or verify the exact executor, against
-  # integrity.json — is a real hardening and a bigger change than a bootstrap
-  # prologue: `scripts/roundhouse executor-status` already produces the manifest
-  # it would compare, so the follow-up has its input. Note that the channel
-  # already grants this host full code execution on the peer (§7.3a), so this
-  # is about determinism and matched gates, not about a new trust boundary.
+  # Every cached copy participates in one numeric comparison, so 0.10.0 beats
+  # 0.9.0 regardless of which harness owns it. The maintained launcher and
+  # this fallback intentionally share that rule.
   printf 'rh=$(command -v roundhouse 2>/dev/null) || rh=\n'
-  printf 'if [ -z "$rh" ]; then\n'
-  printf '  for rh_candidate in "$HOME"/.claude/plugins/cache/*/roundhouse/%s/scripts/roundhouse \\\n' \
-    "$fleet_remote_cli_version"
-  printf '    "$HOME"/.codex/plugins/cache/*/roundhouse/%s/scripts/roundhouse; do\n' \
-    "$fleet_remote_cli_version"
-  printf '    [ ! -x "$rh_candidate" ] || rh=$rh_candidate\n'
-  printf '  done\n'
-  printf 'fi\n'
   cat <<'SH'
+fleet_signing_key_path() {
+  if [ -n "${ROUNDHOUSE_FLEET_SIGNING_KEY:-}" ]; then
+    printf '%s\n' "$ROUNDHOUSE_FLEET_SIGNING_KEY"
+    return
+  fi
+  printf '%s/.ssh/roundhouse_node_ed25519\n' "$HOME"
+}
+fleet_remote_ssh_keygen_path() {
+  [ -x /usr/bin/ssh-keygen ] || {
+    printf '%s\n' 'roundhouse: absolute system ssh-keygen is unavailable on the newcomer' >&2
+    return 69
+  }
+  printf '%s\n' /usr/bin/ssh-keygen
+}
 if [ -z "$rh" ]; then
+  # Login profiles can enable Bash's failglob. The first absent harness cache
+  # must not prevent the other cache from being considered.
+  shopt -u failglob 2>/dev/null || :
+  rh_best=
+  rh_best_version=
+  rh_version_gt() {
+    awk -F. -v left="$1" -v right="$2" '
+      function part(version, part_index, pieces) {
+        return split(version, pieces, /[.]/) >= part_index ? pieces[part_index] + 0 : 0
+      }
+      BEGIN {
+        for (part_index = 1; part_index <= 4; part_index++) {
+          l = part(left, part_index)
+          r = part(right, part_index)
+          if (l > r) exit 0
+          if (l < r) exit 1
+        }
+        exit 1
+      }
+    '
+  }
   for rh_candidate in "$HOME"/.claude/plugins/cache/*/roundhouse/*/scripts/roundhouse \
     "$HOME"/.codex/plugins/cache/*/roundhouse/*/scripts/roundhouse; do
-    [ ! -x "$rh_candidate" ] || rh=$rh_candidate
+    [ -x "$rh_candidate" ] || continue
+    rh_version=${rh_candidate%/scripts/roundhouse}
+    rh_version=${rh_version##*/}
+    case $rh_version in
+      ''|.*|*.|*..*|*[!0-9.]*) continue ;;
+    esac
+    if [ -z "$rh_best" ] || rh_version_gt "$rh_version" "$rh_best_version"; then
+      rh_best=$rh_candidate
+      rh_best_version=$rh_version
+    fi
   done
+  rh=$rh_best
 fi
+fleet_store_path() {
+  if [ -n "${ROUNDHOUSE_FLEET_STORE:-}" ]; then
+    printf '%s\n' "$ROUNDHOUSE_FLEET_STORE"
+    return
+  fi
+  printf '%s/roundhouse/store\n' "${XDG_CONFIG_HOME:-"$HOME/.config"}"
+}
+fleet_identity_path() {
+  printf '%s/identity.yaml\n' "$(dirname "$(fleet_store_path)")"
+}
 [ -n "$rh" ] || {
-  printf 'roundhouse: no roundhouse CLI on this host — not on PATH and no plugin cache under ~/.claude or ~/.codex\n' >&2
+  printf 'roundhouse: no roundhouse CLI on this host — not on PATH and no valid plugin cache under ~/.claude or ~/.codex\n' >&2
   exit 69
 }
 SH
+}
+
+fleet_enroll_seed_host_facts() {
+  # Re-adds must restore the roster-coherence anchor before their commit lands.
+  # The remote fleet-seed later adds observed items; this small sponsor-side
+  # seed is the durable machine truth already present in config.json.
+  seed_store=$1
+  seed_host=$2
+  seed_file="$seed_store/hosts/$seed_host.yaml"
+  seed_facts=$(jq -c --arg host "$seed_host" '
+    (.machines[$host] // {}) |
+    {} + (if has("platform") then {platform: .platform} else {} end)
+       + (if has("groups") then {groups: .groups} else {} end)
+  ' "$(config_path)" 2>/dev/null) || seed_facts='{}'
+  [ -n "$seed_facts" ] || seed_facts='{}'
+  mkdir -p "$(dirname "$seed_file")"
+  seed_existing=$(fleet_record_read "$seed_file" '{}')
+  fleet_record_write "$seed_file" \
+    "$(printf '%s\n' "$seed_existing" |
+      jq -c --argjson facts "$seed_facts" '$facts * .')"
 }
 
 fleet_add_command() (
@@ -711,6 +761,9 @@ fleet_add_command() (
   add_genesis=$(fleet_store_id "$add_store")
   add_remote=$(jj -R "$add_store" git remote list 2>/dev/null |
     awk '$1 == "origin" { print $2; exit }')
+  # The bootstrap is a remote shell string. printf percent-q keeps a validated
+  # URL as one argv value even when its URL syntax contains a shell metacharacter.
+  add_remote_q=$(printf '%q' "$add_remote")
   # The ROSTER identity stays `$add_target` — the config machine name, which is
   # what every host-keyed path and every signature is checked against. Only the
   # TRANSPORT follows the machine's configured ssh alias.
@@ -754,13 +807,21 @@ fleet_add_command() (
     # reach, so the known_hosts/tailscale lookup takes the transport
     # destination — checking the roster name would grade a channel nobody uses.
     add_channel=$(fleet_enroll_channel_auth "$add_ssh")
-    # Step 3-4: over that channel, bootstrap and read the key back. The
-    # newcomer's own agent mints; this host only reads. The CLI is RESOLVED on
-    # the far side rather than assumed on PATH — see fleet_remote_cli_prologue.
+    # Mint only the key before the roster edit. The store bootstrap happens
+    # after the sponsor has the possession proof, so a failed CLI resolution
+    # cannot leave a rival genesis behind.
     ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
-\"\$rh\" fleet-init >/dev/null && \"\$rh\" fleet-enroll >/dev/null 2>&1; :" \
-      >/dev/null 2>&1 || :
-    ssh_run "$add_ssh" 'cat "$HOME/.ssh/roundhouse_node_ed25519.pub"' \
+set -e
+remote_signing_key=\$(fleet_signing_key_path)
+remote_ssh_keygen=\$(fleet_remote_ssh_keygen_path)
+mkdir -p \"\$(dirname \"\$remote_signing_key\")\"
+[ -f \"\$remote_signing_key\" ] ||
+  \"\$remote_ssh_keygen\" -q -t ed25519 -f \"\$remote_signing_key\" \\
+    -N \"\" -C \"\" </dev/null
+" >/dev/null 2>&1 || :
+    ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
+remote_signing_key=\$(fleet_signing_key_path)
+cat \"\$remote_signing_key.pub\"" \
       >"$add_tmp/leaf.pub" 2>/dev/null || :
     add_pub=$add_tmp/leaf.pub
     [ -s "$add_pub" ] || {
@@ -769,7 +830,10 @@ fleet_add_command() (
       exit 69
     }
     ssh_run "$add_ssh" \
-      "printf '%s' '$add_principal' | ssh-keygen -Y sign -n $fleet_trust_enroll_namespace -f \"\$HOME/.ssh/roundhouse_node_ed25519\" 2>/dev/null" \
+      "$(fleet_remote_cli_prologue)
+remote_signing_key=\$(fleet_signing_key_path)
+remote_ssh_keygen=\$(fleet_remote_ssh_keygen_path)
+printf '%s' '$add_principal' | \"\$remote_ssh_keygen\" -Y sign -n $fleet_trust_enroll_namespace -f \"\$remote_signing_key\" 2>/dev/null" \
       >"$add_tmp/proof.sig" 2>/dev/null || :
   fi
 
@@ -782,6 +846,58 @@ fleet_add_command() (
       "$add_target" "$fleet_trust_enroll_namespace" "$add_principal" >&2
     exit 65
   }
+
+  add_posture=
+  if [ "$add_class" = durable ]; then
+    [ -z "$add_remote" ] || fleet_validate_fetch_url "$add_remote" || {
+      printf 'roundhouse: the fleet store remote is unusable; the newcomer was not recorded\n' >&2
+      exit 64
+    }
+    add_bootstrap_rc=0
+    add_bootstrap=$(ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
+set -e
+remote_store=\$(fleet_store_path)
+remote_identity=\$(fleet_identity_path)
+mkdir -p \"\$(dirname \"\$remote_identity\")\"
+if [ -f \"\$remote_identity\" ]; then
+  identity_store_id=\$(yq -r '.store_id // \"\"' \"\$remote_identity\" 2>/dev/null || :)
+  identity_principal=\$(yq -r '.principal // \"\"' \"\$remote_identity\" 2>/dev/null || :)
+  identity_name=\$(yq -r '.name // \"\"' \"\$remote_identity\" 2>/dev/null || :)
+  identity_domain=\$(yq -r '.domain // \"\"' \"\$remote_identity\" 2>/dev/null || :)
+  [ \"\$identity_store_id\" = '$add_genesis' ] &&
+    [ \"\$identity_principal\" = '$add_principal' ] &&
+    [ \"\$identity_name\" = '$add_target' ] &&
+    [ \"\$identity_domain\" = '$add_domain' ] || {
+    printf '%s\n' 'roundhouse: existing identity.yaml fields do not match this host/store; back it up before re-enrolling' >&2
+    exit 65
+  }
+else
+  printf 'store_id: %s\nprincipal: %s\nname: %s\ndomain: %s\n' \
+    '$add_genesis' '$add_principal' '$add_target' '$add_domain' \
+    >\"\$remote_identity\"
+fi
+if [ ! -d \"\$remote_store/.jj\" ]; then
+  [ -n $add_remote_q ] || {
+    printf '%s\n' 'roundhouse: no fleet store remote was supplied for bootstrap' >&2
+    exit 69
+  }
+  [ ! -e \"\$remote_store\" ] || {
+    printf '%s\n' 'roundhouse: the store path exists but is not a fleet store; move it aside and retry' >&2
+    exit 65
+  }
+  jj git clone --colocate $add_remote_q \"\$remote_store\" >/dev/null
+fi
+\"\$rh\" fleet-init >/dev/null
+\"\$rh\" fleet-enroll >/dev/null 2>&1
+" 2>&1) || add_bootstrap_rc=$?
+    [ "$add_bootstrap_rc" -eq 0 ] || {
+      printf 'roundhouse: bootstrap of %s failed over %s; no roster line was recorded:\n%s\n' \
+        "$add_target" "$add_ssh" "$add_bootstrap" >&2
+      exit 69
+    }
+    add_posture=$(ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
+\"\$rh\" fleet-verify-remote 2>&1" 2>&1) || add_posture=
+  fi
 
   add_roster=$(fleet_enroll_roster_path "$add_store")
   fleet_enroll_roster_touch "$add_roster"
@@ -801,6 +917,11 @@ fleet_add_command() (
       --arg channel "$add_channel" --arg at "$add_now" \
       '{principal:$principal, key:$key, enrolled_by:$by,
         channel_auth:$channel, enrolled_at:$at}')"
+    fleet_enroll_seed_host_facts "$add_store" "$add_target" || {
+      printf 'roundhouse: could not seed hosts/%s.yaml for the re-add\n' \
+        "$add_target" >&2
+      exit 65
+    }
   fi
   fleet_enroll_bump "$add_roster"
 
@@ -819,6 +940,15 @@ fleet_add_command() (
       "roster-change${add_channel:+-$add_channel}" "roster-$add_target" \
       "$add_target enrolled as $add_principal over a $add_channel channel; soak $(fleet_trust_soak_hours "$add_class" "$add_channel")h before its fleet-layer writes land" ||
       :
+    case $add_posture in
+      *'first push is permitted'*) ;;
+      *)
+        fleet_alert_write "$add_store" "$add_host" remote-posture \
+          "posture-$add_target" \
+          "remote posture for $add_target is unverified over the SSH lane; run fleet-verify-remote before its first fleet-run" ||
+          :
+        ;;
+    esac
   fi
 
   add_commit=$(fleet_enroll_commit "$add_store" "$add_host" \
@@ -834,6 +964,37 @@ fleet_add_command() (
     exit 65
   }
 
+  if [ "$add_class" = durable ]; then
+    # fleet-seed writes the newcomer's working copy. It must sit on the
+    # published sponsor commit, not on fleet-enroll's pre-enrollment child,
+    # or the first fleet-run holds every seeded item as unknown.
+    add_commit_q=$(printf '%q' "$add_commit")
+    add_seed_rc=0
+    add_seed=$(ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
+set -e
+remote_store=\$(fleet_store_path)
+jj -R \"\$remote_store\" git fetch --remote origin >/dev/null
+expected_enrollment=$add_commit_q
+if ! jj -R \"\$remote_store\" log -r \"\$expected_enrollment & ::main@origin\" --no-graph -T 'commit_id ++ \"\\n\"' 2>/dev/null |
+  grep -Fqx \"\$expected_enrollment\"; then
+  printf '%s\\n' 'roundhouse: fetched origin does not contain the published enrollment head' >&2
+  exit 70
+fi
+jj -R \"\$remote_store\" bookmark set main -r main@origin >/dev/null
+jj -R \"\$remote_store\" new main >/dev/null
+\"\$rh\" fleet-seed 2>&1
+" 2>&1) || add_seed_rc=$?
+    [ "$add_seed_rc" -eq 0 ] || {
+      fleet_alert_write "$add_store" "$add_host" bootstrap-seed \
+        "seed-$add_target" \
+        "$add_target enrollment is published, but its host-side seed could not fetch the enrollment head; run fleet-seed after the next verified fetch" ||
+        :
+      printf 'roundhouse: %s enrollment is published but host-side seeding failed over %s; run fleet-seed after the enrollment head is fetched:\n%s\n' \
+        "$add_target" "$add_ssh" "$add_seed" >&2
+      exit 69
+    }
+  fi
+
   if [ "$add_class" = ephemeral ]; then
     # Step 2 of D: hand it, over the runtime boundary just created, the remote
     # URL, the store_id and the key. Data, not paste.
@@ -848,10 +1009,6 @@ fleet_add_command() (
   # Step 5-7: hand wren the remote URL and store_id over the SAME channel —
   # data, not a paste — and let it clone, check genesis == store_id and ratchet
   # to head on its own.
-  ssh_run "$add_ssh" \
-    "printf 'store_id: %s\nprincipal: %s\nname: %s\n' '$add_genesis' '$add_principal' '$add_target' > \"\$HOME/.config/roundhouse/identity.yaml\"" \
-    >/dev/null 2>&1 || :
-
   # §10.6's posture, established HERE where it can be, rather than left as one
   # manual step per host. `fleet-verify-remote` is a one-time per-host probe
   # that nothing ever self-invoked, so an added host could review and journal
@@ -863,31 +1020,10 @@ fleet_add_command() (
   # the URL that host resolves. Copying this host's verdict onto that host
   # would be asserting something nobody measured there.
   #
-  # KNOWN GAP, stated rather than papered over: `fleet-add` does not give the
-  # newcomer the store, and the bootstrap actively puts a different one in its
-  # place. `fleet-init` creates a store with no origin and `fleet-enroll`, run
-  # against history-less store, writes the newcomer its OWN self-signed genesis
-  # (§12 — that is what enrolling host 1 means). §12's runbook has a newcomer
-  # CLONE instead, and no verb in this system clones for it:
-  # `fleet-set-remote` refuses a store whose own genesis does not match the
-  # remote's, which is every fresh store, so it cannot serve as the bootstrap
-  # either.
-  #
-  # So the probe below lands the posture for a host that ALREADY carries this
-  # fleet's store — a re-add, or one an operator cloned, which is exactly the
-  # state the stranded hosts were in — and for a genuinely fresh host it names
-  # the recovery, move included.
-  #
-  # Closing this properly is a change to the bootstrap CONTRACT, not to this
-  # seam, and the shape is known: write identity.yaml (store_id, principal,
-  # name) BEFORE the bootstrap rather than after. `fleet_enroll_command` mints
-  # the key first and only then reaches its genesis branch, where a store_id it
-  # cannot match makes it refuse with "clone the fleet store first" — so the
-  # key still gets minted, no rival genesis is ever written, and the newcomer's
-  # principal agrees with the one this host is about to verify the possession
-  # proof against. It needs its own review; it is not a comment fix.
-  add_posture=$(ssh_run "$add_ssh" "$(fleet_remote_cli_prologue)
-\"\$rh\" fleet-verify-remote 2>&1" 2>&1) || add_posture=
+  # The bootstrap cloned the hub history before this roster commit, so the
+  # newcomer cannot create a rival genesis. Its identity was checked against
+  # the hub store id before cloning, and the posture below is measured on the
+  # newcomer itself rather than inferred from the sponsor.
   printf 'roundhouse: enrolled %s as %s over %s (channel_auth %s, store id %s)\n' \
     "$add_target" "$add_principal" "$add_ssh" "$add_channel" "$add_genesis"
   case $add_posture in
@@ -913,8 +1049,13 @@ fleet_add_command() (
         "$add_target" "$add_ssh" "${add_remote:-<remote>}" >&2
       ;;
     *)
-      printf 'roundhouse: %s could not verify the remote as private, so its first push will be refused (§10.6). It reported: %s\n' \
-        "$add_target" "${add_posture:-<no answer over the ssh lane>}" >&2
+      if [ -n "$add_posture" ]; then
+        add_posture_reason=probe-refused
+      else
+        add_posture_reason='<no answer over the ssh lane>'
+      fi
+      printf 'roundhouse: %s remote posture is unverified over the SSH lane; run fleet-verify-remote before its first fleet-run (%s)\n' \
+        "$add_target" "$add_posture_reason" >&2
       ;;
   esac
 )
@@ -1101,6 +1242,7 @@ fleet_remove_command() (
     exit 65
   }
   remove_head=$(fleet_vcs_heads_local "$remove_store" | head -1)
+  remove_head_short=${remove_head:0:12}
   [ -z "$remove_receipt" ] ||
     fleet_trust_authority_receipt_verify_and_consume "$remove_receipt" \
       fleet-remove "$remove_target" || exit $?
@@ -1116,10 +1258,10 @@ fleet_remove_command() (
         revoked_at_commit:$commit}')"
   fleet_alert_write "$remove_store" "$remove_host" roster-change \
     "roster-remove-$remove_target" \
-    "$remove_target retired at $remove_head; its past commits stay valid and its future ones stop verifying everywhere on the next fetch" ||
+    "$remove_target retired at commit[$remove_head_short] (retirement); its past commits stay valid and its future ones stop verifying everywhere on the next fetch" ||
     :
   printf 'roundhouse: retired %s at %s (working copy — the next run publishes it)\n' \
-    "$remove_target" "$remove_head"
+    "$remove_target" "$remove_head_short"
   case $remove_burn in
     --burn)
       # The KRL survives SOLELY as the emergency lever for "this key's history
@@ -1342,6 +1484,18 @@ fleet_checkpoint_command() (
     printf 'roundhouse: the checkpoint commit landed but could not be tagged; it is NOT immutable\n' >&2
     exit 65
   }
+  ckpt_tag_ref="refs/tags/rh-checkpoint-$ckpt_epoch"
+  ckpt_archive_ref=$(fleet_trust_archive_ref "$(date -u +%Y%m%d)")
+  git -C "$ckpt_store" update-ref "$ckpt_archive_ref" "$ckpt_commit" || {
+    printf 'roundhouse: the checkpoint tag exists locally but its archive ref could not be created\n' >&2
+    exit 65
+  }
+  jj -R "$ckpt_store" git import >/dev/null 2>&1 || {
+    printf 'roundhouse: the checkpoint archive ref could not be imported into jj\n' >&2
+    exit 65
+  }
+  fleet_vcs_publish_refs "$ckpt_store" "$ckpt_commit" \
+    "$ckpt_tag_ref" "$ckpt_archive_ref" || exit $?
   printf 'roundhouse: checkpoint %s at %s, tagged rh-checkpoint-%s\n' \
     "$ckpt_epoch" "$ckpt_commit" "$ckpt_epoch"
 )

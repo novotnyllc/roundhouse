@@ -513,6 +513,18 @@ fleet_vcs_publish() {
   jj -R "$1" new "$2" >/dev/null
 }
 
+fleet_vcs_publish_refs() {
+  # Publish checkpoint refs only after the same remote and redaction gates as
+  # ordinary history. The main commit is already on origin; these refs make
+  # its immutability and archive ancestry remotely provable.
+  fleet_first_push_gate "$1" || return $?
+  fleet_sweep_gate "$1" "$2" || return $?
+  git -C "$1" push --atomic origin "$3:$3" "$4:$4" >/dev/null 2>&1 || {
+    printf 'roundhouse: checkpoint tag/archive refs could not be published\n' >&2
+    return 65
+  }
+}
+
 fleet_vcs_hold_set() {
   # §8.3, and it is a PURE function on purpose: fleet_vcs_hold_set
   # <head-count> reading "<item> <value-digest>" lines, one per head per item.
@@ -563,7 +575,14 @@ fleet_vcs_peer_remote_add() {
   fi
 }
 
+fleet_vcs_archive_fetch() {
+  [ "$2" = origin ] || return 0
+  git -C "$1" fetch "$2" \
+    '+refs/roundhouse/archive/*:refs/roundhouse/archive/*' >/dev/null 2>&1
+}
+
 fleet_vcs_fetch() {
+  fleet_vcs_archive_fetch "$1" "$2" || return $?
   jj -R "$1" git fetch --remote "$2" >/dev/null
 }
 

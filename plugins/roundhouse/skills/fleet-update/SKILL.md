@@ -85,9 +85,9 @@ already current.
 
 After every plugin `install`, `update`, or `enable` operation performed by the
 DSC apply path, immediately run
-`scripts/codex-plugin-hooks.mjs approve PLUGIN@MARKETPLACE` and verify its
-result before journaling the item as applied when Codex owns that qualified
-plugin and the desired state is enabled. The apply path checks Codex's
+the hook approval helper and verify its result before journaling the item as
+applied when Codex owns that qualified plugin and the desired state is enabled.
+The apply path checks Codex's
 installed-plugin list first; a Claude-only plugin has no Codex hook state and
 skips the helper rather than becoming a false hold. A disabled desired state
 does not approve an independently enabled Codex copy. A desired `enabled`
@@ -99,11 +99,16 @@ If Codex does not report the installed qualified plugin at the desired source
 SHA, or reports an untrusted or locally modified hook during automatic
 approval, the helper refuses and the DSC item is held; refresh/repair the
 Codex copy or explicitly approve that hook before retrying.
-On POSIX schedulers, invoke the CLI through the user's login shell or provide a
-PATH containing the harnesses and Node.js. The runtime also checks the standard
-Homebrew Node locations on macOS. The native Windows helper still requires
-`node` on the Windows task PATH; that is a current gap, not a reason to claim
-Windows auto-approval is complete.
+On POSIX schedulers, invoke `roundhouse approve-codex-plugin-hooks
+PLUGIN@MARKETPLACE` through the user's login shell or provide a PATH containing
+the harnesses and Node.js. The runtime also checks the standard
+Homebrew Node locations on macOS. On native Windows, invoke
+`scripts/codex-plugin-hooks.ps1 approve PLUGIN@MARKETPLACE`; it first uses
+`node.exe` from the task PATH and then resolves the Node runtime beside
+`claude.exe` or in Claude Code's standard install directories. If neither
+exists it exits 69 with the WSL interop recovery, rather than silently
+claiming approval. The native DSC executor invokes this same helper, so its
+scheduled task does not require Node to be on the task PATH.
 
 The entry drives **two cadences from one owned slot**:
 
@@ -143,7 +148,9 @@ roundhouse fleet-run --full    # the heavy slot
 
 The scheduler entry must preserve that Node requirement: a POSIX entry uses
 `$SHELL -lc 'roundhouse fleet-run --fast|--full'` (or an equivalent explicit
-tool PATH), while a Windows task must declare its current Node prerequisite.
+tool PATH), while a Windows task invokes `codex-plugin-hooks.ps1`, which uses
+PATH Node first and then Claude's bundled `node.exe`, otherwise exiting 69 with
+the documented recovery guidance.
 
 The run is non-interactive by construction: every jj, git and ssh invocation
 it makes is closed to editors, pagers and credential prompts, so a scheduled
@@ -199,3 +206,9 @@ The shared Codex/Claude lifecycle vocabulary is
 Human enrollment, upgrade, activation, and revocation stop at the local
 password/UAC boundary; on macOS that is owner-local interactive elevation, not
 an SSH fallback.
+After a Roundhouse plugin install or update on POSIX, run
+`roundhouse launcher-install ~/.local/bin/roundhouse` so the maintained
+launcher is refreshed from the installed plugin and selects the highest
+version across both harness caches. It resolves the local target by the
+configured hostname/user; when more than one local entry matches, pass its
+machine id as the second argument instead of relying on inventory order.

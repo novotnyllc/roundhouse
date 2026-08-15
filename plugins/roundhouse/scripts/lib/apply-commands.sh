@@ -586,6 +586,15 @@ apply_plan_command() {
           any($records[]; .kind == "chezmoi_state" and .id == "live" and
             .status == "present" and .data.drift_count == 0)
         end
+      elif .type == "agent-update" and .id == "roundhouse:launcher" then
+        . as $operation |
+        any($records[];
+          .kind == "agent_artifact" and .id == "roundhouse:launcher" and
+          .status == "present" and .data.path == $operation.argv[2] and
+          .data.executable == true and
+          .data.digest.algorithm == "sha256" and
+          (.data.digest.value | type == "string" and length > 0) and
+          (.data.digest.value == $operation.expected_digest))
       elif .type == "agent-update" then
         . as $operation |
         if $operation.kind == "agent_runtime" then

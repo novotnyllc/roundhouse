@@ -658,6 +658,26 @@ verify_preconditions_command() {
     exit 65
   }
   config=$(config_path)
+  if jq -e 'any(.operations[]; .id == "roundhouse:launcher")' "$plan" >/dev/null; then
+    launcher_plan_destination=$(jq -r '
+      .operations[] | select(.id == "roundhouse:launcher") |
+      select(.type == "agent-update" and .kind == "agent_artifact" and
+        (.argv == ["roundhouse","launcher-install",.argv[2]]) and
+        (.expected_digest | type == "string" and test("^[0-9a-f]{64}$"))) | .argv[2]
+    ' "$plan")
+    [ -n "$launcher_plan_destination" ] || {
+      printf 'roundhouse: invalid Roundhouse launcher plan operation\n' >&2
+      exit 64
+    }
+    validate_launcher_destination "$launcher_plan_destination"
+    jq -e -s --arg destination "$launcher_plan_destination" '
+      any(.[]; .kind == "agent_artifact" and .id == "roundhouse:launcher" and
+        (.status | IN("present","absent")) and .data.path == $destination)
+    ' "$snapshot" >/dev/null || {
+      printf 'roundhouse: current snapshot is not bound to the launcher destination\n' >&2
+      exit 65
+    }
+  fi
   verify_executor_requirement "$plan" >/dev/null
   target=$(jq -r '.target' "$plan")
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")

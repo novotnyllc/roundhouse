@@ -672,6 +672,20 @@ YAML
       fail "a tagged checkpoint is not immutable"
     ! jj -R "$store" describe -r "$integrity_tagtarget" -m tamper >/dev/null 2>&1 ||
       fail "a tagged checkpoint commit was rewritten"
+    integrity_short=$(fleet_prose_shorten_commit_ids "commit $integrity_tagtarget" "$store")
+    case "$integrity_short" in
+      *"commit[${integrity_tagtarget:0:12}]"*) ;;
+      *) fail "a proved commit id was not shortened and labelled on a prose surface" ;;
+    esac
+
+    integrity_embedded=$(printf 'prefix%ssuffix' "$integrity_tagtarget")
+    [ "$(fleet_prose_shorten_commit_ids "$integrity_embedded" "$store")" = \
+      "$integrity_embedded" ] ||
+      fail "an embedded commit substring was shortened out of its surrounding token"
+    integrity_underscore=$(printf 'prefix_%s_suffix' "$integrity_tagtarget")
+    [ "$(fleet_prose_shorten_commit_ids "$integrity_underscore" "$store")" = \
+      "$integrity_underscore" ] ||
+      fail "a commit substring surrounded by underscores was shortened out of its token"
 
     # 12. THE ARCHIVE IS MANDATORY, and its ABSENCE is the rollback protection:
     #     a host whose reviewed-ref is not an ancestor of the fetched head, with
@@ -918,6 +932,13 @@ YAML
       compose_tag=$(git -C "$compose_store" tag --list 'rh-checkpoint-*' | head -1)
       [ -n "$compose_tag" ] || fail "fleet-checkpoint published no checkpoint tag"
       compose_checkpoint=$(git -C "$compose_store" rev-parse "$compose_tag^{commit}")
+      compose_archive_ref=$(fleet_trust_archive_ref "$(date -u +%Y%m%d)")
+      [ "$(git -C "$compose_store" rev-parse "$compose_archive_ref")" = "$compose_checkpoint" ] ||
+        fail "fleet-checkpoint created no matching local archive ref"
+      "$REAL_GIT" ls-remote --exit-code "$compose_remote" "refs/tags/$compose_tag" >/dev/null ||
+        fail "fleet-checkpoint did not publish its tag"
+      "$REAL_GIT" ls-remote --exit-code "$compose_remote" "$compose_archive_ref" >/dev/null ||
+        fail "fleet-checkpoint did not publish its archive ref"
       [ -n "$(jj -R "$compose_store" log \
         -r "$compose_local_main & ::$compose_checkpoint" --no-graph \
         -T commit_id 2>/dev/null)" ] ||
@@ -992,9 +1013,10 @@ YAML
         *'not covered by checkpoint'*) ;;
         *) fail "stale-remote refusal was not explicit: $compose_remote_out" ;;
       esac
-      ! "$REAL_GIT" -C "$compose_store" show-ref --verify --quiet \
-        "refs/roundhouse/archive/$(date -u +%Y%m%d)" ||
-        fail "stale-remote refusal mutated the archive ref"
+      [ "$("$REAL_GIT" -C "$compose_store" rev-parse \
+        "refs/roundhouse/archive/$(date -u +%Y%m%d)")" = \
+        "$compose_checkpoint" ] ||
+        fail "stale-remote refusal changed the checkpoint archive ref"
       "$REAL_GIT" --git-dir="$compose_remote" update-ref refs/heads/main \
         "$compose_checkpoint" ||
         fail "the stale-remote fixture could not restore origin"
@@ -1014,9 +1036,10 @@ YAML
         *'not in the checkpoint archive'*) ;;
         *) fail "sibling reviewed-line refusal was not explicit: $compose_sibling_out" ;;
       esac
-      ! "$REAL_GIT" -C "$compose_store" show-ref --verify --quiet \
-        "refs/roundhouse/archive/$(date -u +%Y%m%d)" ||
-        fail "sibling reviewed-line refusal mutated the archive ref"
+      [ "$("$REAL_GIT" -C "$compose_store" rev-parse \
+        "refs/roundhouse/archive/$(date -u +%Y%m%d)")" = \
+        "$compose_checkpoint" ] ||
+        fail "sibling reviewed-line refusal changed the checkpoint archive ref"
       printf '%s\n' "$compose_local_main" >"$compose_root/reviewed-ref"
 
       compose_reroot_status=0

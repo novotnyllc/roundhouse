@@ -158,6 +158,26 @@ seal_plan_command() {
     printf 'roundhouse: snapshot does not contain a completed %s inventory\n' "$required_section" >&2
     exit 65
   }
+  if jq -e 'any(.operations[]; .id == "roundhouse:launcher")' "$draft" >/dev/null; then
+    launcher_plan_destination=$(jq -r '
+      .operations[] | select(.id == "roundhouse:launcher") |
+      select(.type == "agent-update" and .kind == "agent_artifact" and
+        (.argv == ["roundhouse","launcher-install",.argv[2]]) and
+        (.expected_digest | type == "string" and test("^[0-9a-f]{64}$"))) | .argv[2]
+    ' "$draft")
+    [ -n "$launcher_plan_destination" ] || {
+      printf 'roundhouse: invalid Roundhouse launcher plan operation\n' >&2
+      exit 64
+    }
+    validate_launcher_destination "$launcher_plan_destination"
+    jq -e -s --arg destination "$launcher_plan_destination" '
+      any(.[]; .kind == "agent_artifact" and .id == "roundhouse:launcher" and
+        (.status | IN("present","absent")) and .data.path == $destination)
+    ' "$snapshot" >/dev/null || {
+      printf 'roundhouse: launcher plan is not bound to its observed destination\n' >&2
+      exit 65
+    }
+  fi
   if [ "$privileged" = true ] || [ "$mixed_privileged" = true ]; then
     if [ "$mixed_privileged" = true ]; then
       privilege_actions=$(jq -c '[.operations[] | select(.type == "semantic-action") |
