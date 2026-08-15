@@ -148,7 +148,9 @@ roundhouse fleet-run --full    # the heavy slot
 
 The scheduler entry must preserve that Node requirement: a POSIX entry uses
 `$SHELL -lc 'roundhouse fleet-run --fast|--full'` (or an equivalent explicit
-tool PATH), while a Windows task must declare its current Node prerequisite.
+tool PATH), while a Windows task invokes `codex-plugin-hooks.ps1`, which uses
+PATH Node first and then Claude's bundled `node.exe`, otherwise exiting 69 with
+the documented recovery guidance.
 
 The run is non-interactive by construction: every jj, git and ssh invocation
 it makes is closed to editors, pagers and credential prompts, so a scheduled

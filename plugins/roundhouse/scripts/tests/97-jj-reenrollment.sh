@@ -53,7 +53,7 @@ case "$reenroll_remote_command" in
     export ROUNDHOUSE_FLEET_VISIBILITY_PROBE='printf Authentication >&2; exit 1'
     ;;
 esac
-exec /bin/bash -lc "$reenroll_remote_command"
+exec /bin/bash -c "$reenroll_remote_command"
 SH
     chmod 755 "$tmp/bin/ssh"
 
