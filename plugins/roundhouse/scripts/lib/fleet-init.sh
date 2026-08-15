@@ -626,6 +626,9 @@ fleet_remote_ssh_keygen_path() {
   printf '%s\n' /usr/bin/ssh-keygen
 }
 if [ -z "$rh" ]; then
+  # Login profiles can enable Bash's failglob. The first absent harness cache
+  # must not prevent the other cache from being considered.
+  shopt -u failglob 2>/dev/null || :
   rh_best=
   rh_best_version=
   rh_version_gt() {
