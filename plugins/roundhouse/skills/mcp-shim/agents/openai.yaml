@@ -1,0 +1,4 @@
+interface:
+  display_name: "MCP Shim"
+  short_description: "Install a resilient MCP shim for a desktop app"
+  default_prompt: "Use $mcp-shim to set up a resilient MCP server for a desktop app like Fusion or Figma."

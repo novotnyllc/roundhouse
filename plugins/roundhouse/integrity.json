@@ -2,7 +2,7 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "bc3ebadeafd94ecb2e6b9b8365aa62f5cbdfa351b18a283a23a353402168eb55"
+      "sha256": "726ba30b676acf1dc87f4a905bc7e1a389f944a3c6a7389bc9de2a6a48687fd2"
     },
     {
       "path": ".codex-plugin/plugin.json",
@@ -169,6 +169,14 @@
       "sha256": "a2eb6642592cf21622cfb02166622a59cddbb61697f5720945a9c910bf0de6a5"
     },
     {
+      "path": "scripts/mcp-siding.mjs",
+      "sha256": "0ad476c9c74beb13de2766a2e773804b72bc98615ec0d524be3d0d11ea127b3a"
+    },
+    {
+      "path": "scripts/mcp-siding.selftest.mjs",
+      "sha256": "b2499f05e3bd9f88eedce0bfbc0f63b31d7e85847bd7491c114196a7a5a05401"
+    },
+    {
       "path": "scripts/prepare-ssh-identity",
       "sha256": "ad85b643ca264312e95217d77910e077fbd83de12bda4aaaf0306743bb9ceb0d"
     },
@@ -251,6 +259,14 @@
     {
       "path": "skills/fleet-update/agents/openai.yaml",
       "sha256": "fc323b44049fb281f0ddad12690513024f88d869674b3e0a6ff4b5272bc1f3ac"
+    },
+    {
+      "path": "skills/mcp-shim/SKILL.md",
+      "sha256": "448d58e2ef376234134dfb29cb83f0f24bd745ace2d7c1e0a25e86edb892fd08"
+    },
+    {
+      "path": "skills/mcp-shim/agents/openai.yaml",
+      "sha256": "353e56a03b9e18891d44d0bdb270739b11c00bfaf4b832feaf708a3a44a08c57"
     },
     {
       "path": "skills/remote-mac/SKILL.md",

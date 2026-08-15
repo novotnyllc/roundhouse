@@ -146,6 +146,8 @@ if want_section 73; then . "$script_dir/tests/73-ladder.sh"; fi
 if want_section 74; then . "$script_dir/tests/74-run.sh"; fi
 # shellcheck source=tests/75-guards.sh
 if want_section 75; then . "$script_dir/tests/75-guards.sh"; fi
+# shellcheck source=tests/76-mcp-siding.sh
+if want_section 76; then . "$script_dir/tests/76-mcp-siding.sh"; fi
 # shellcheck source=tests/78-fleet-parked.sh
 if want_section 78; then . "$script_dir/tests/78-fleet-parked.sh"; fi
 # shellcheck source=tests/90-jj-bootstrap.sh

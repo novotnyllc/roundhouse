@@ -28,6 +28,7 @@
     "./skills/fleet-projects",
     "./skills/fleet-readiness",
     "./skills/fleet-update",
+    "./skills/mcp-shim",
     "./skills/remote-mac",
     "./skills/ssh-doctor"
   ]
