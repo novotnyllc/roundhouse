@@ -255,14 +255,28 @@ const STALE_HTTP_STATUSES = new Set([404]);
 export function parseBody(body, contentType, expectedId) {
   if (!body || !body.trim()) return null;
   if (!(contentType && contentType.includes("text/event-stream"))) {
+    let parsed;
     try {
-      return JSON.parse(body);
+      parsed = JSON.parse(body);
     } catch (err) {
       // Reachable (a body arrived at all) - not downtime. Covers malformed
       // JSON and any non-JSON body served as if it were (e.g. an HTML
       // error page from an intermediary proxy).
       throw new MalformedResponse(`malformed response body: ${err.message}`);
     }
+    // Same exact-id correlation the SSE path already does (see
+    // parseSseEvent's caller, below) - a response carrying a different id
+    // (or none at all) than the one this request sent must not be
+    // accepted as this call's answer. Without this, a delayed or
+    // misrouted response for some other request would be consumed as a
+    // false success on the current, possibly mutating, call. Being
+    // lenient about a missing/mismatched `jsonrpc` field is fine (some
+    // backends omit or vary it) - the id is what actually correlates a
+    // response to a request, and it must match exactly.
+    if (expectedId !== undefined && (!parsed || typeof parsed !== "object" || parsed.id !== expectedId)) {
+      throw new MalformedResponse(`response id mismatch: expected ${JSON.stringify(expectedId)}`);
+    }
+    return parsed;
   }
   if (expectedId === undefined) return null;
   // SSE events are separated by a blank line; a body with no blank line at
@@ -416,7 +430,7 @@ function defaultCachePath(name) {
 // App launcher. Kept as a swappable field on the Shim (a spawn seam) so
 // tests can assert "did we try to launch" without ever spawning anything.
 
-function defaultLauncher(appPath) {
+function defaultLauncher(appPath, onFailed) {
   // ponytail: macOS `open -a` only, since every current preset (Fusion,
   // Figma) is a macOS .app bundle; add a platform branch if a non-mac
   // desktop-app target shows up.
@@ -431,9 +445,32 @@ function defaultLauncher(appPath) {
   // An EventEmitter's unhandled 'error' event terminates the process, so a
   // bad --app value used to take down the whole stdio server on the first
   // tools/call that tried to launch - exactly the failure this shim
-  // exists to prevent. Best effort: nothing to do with a launch failure
-  // here: the next call re-evaluates reachability on its own regardless.
-  child.on("error", () => {});
+  // exists to prevent (N1). That guarantee stays intact - onFailed is
+  // best effort and never allowed to throw back into this handler.
+  //
+  // Two distinct failure shapes, neither of which throws synchronously.
+  // spawn() itself failing is this 'error' event. The more common macOS
+  // shape for a bad --app path is different, though: `open -a <bad path>`
+  // spawns FINE and simply exits nonzero, which nothing here previously
+  // observed at all - downCallResult() had already set launchedAt, so the
+  // next call (and every one for the rest of the grace window) reported
+  // "still starting" for an app that was never going to start. Observe
+  // both and let the caller (onLaunchFailed) clear that debounce state.
+  child.on("error", (err) => {
+    try {
+      onFailed?.(err.message);
+    } catch {
+      // Best effort - never let a failure here propagate.
+    }
+  });
+  child.on("exit", (code, signal) => {
+    if (code === 0) return;
+    try {
+      onFailed?.(signal ? `terminated by signal ${signal}` : `exited with code ${code}`);
+    } catch {
+      // Best effort - never let a failure here propagate.
+    }
+  });
   child.unref();
 }
 
@@ -465,6 +502,22 @@ export class Shim {
     // in-flight HTTP request. Entries are added/removed by post() itself,
     // for the lifetime of exactly one request.
     this.inFlight = new Map();
+    // Monotonically increasing backend-facing JSON-RPC request id, and the
+    // client request id -> backend request id it produced, for the
+    // lifetime of one backend() call. Every real call used to hardcode id
+    // 1 - harmless when calls are strictly serialized, but cancellation
+    // (see cancel()) is deliberately dispatched OUTSIDE that serialization,
+    // so a cancel for one call could arrive after another call had already
+    // started and be forwarded against the wrong (or an ambiguously
+    // shared) id. connect()'s own initialize uses id 0 - this starts at 1
+    // so the two namespaces never collide.
+    this.nextBackendId = 1;
+    this.backendIdForClient = new Map();
+    // Set by the launcher's failure observation (see defaultLauncher/
+    // onLaunchFailed) when a launch is known to have failed - read and
+    // cleared by downCallResult() on the next call, instead of reporting a
+    // bogus "still starting" for an app that is never going to start.
+    this.launchFailure = null;
   }
 
   // `clientRequestId`, when given, registers this call's AbortController in
@@ -595,42 +648,57 @@ export class Shim {
   // not Down - see that class - and does not reset session state (the
   // session itself is still fine; only this one call was rejected).
   async backend(method, params, clientRequestId) {
-    for (const attempt of [1, 2]) {
-      try {
-        if (!this.connected) await this.connect(clientRequestId);
-        const { body } = await this.post({ jsonrpc: "2.0", id: 1, method, params }, this.sid, clientRequestId);
-        if (body?.error) throw new BackendReported(body.error.code, body.error.message ?? "backend error");
-        // This call always sends an id, so a response was expected - a 200
-        // with an empty body, or an SSE stream that reached EOF without
-        // ever emitting the matching event, both leave `body` null here.
-        // Do NOT synthesize {}: that reads as a successful call whose
-        // outcome nothing here ever actually saw - the worst failure mode
-        // in this file, since a mutating tool call would be reported as
-        // having succeeded. A post() call completed without throwing, so
-        // this is reachable, not downtime - same family as
-        // MalformedResponse (and handled identically by every caller).
-        if (!body || !("result" in body)) {
-          throw new MalformedResponse(`${method}: no response received for the request`);
+    try {
+      for (const attempt of [1, 2]) {
+        try {
+          if (!this.connected) await this.connect(clientRequestId);
+          // Cancellation is dispatched OUTSIDE the serialized queue
+          // (deliberately - see cancel()/main()), so a call started here
+          // can genuinely overlap another one in flight (or one just
+          // cancelled). A hardcoded id would let a cancel meant for one
+          // call land on another, or two outstanding requests share an
+          // id - allocate a fresh one per call and remember it so cancel()
+          // can name the right one.
+          const backendRequestId = this.nextBackendId++;
+          if (clientRequestId !== undefined) this.backendIdForClient.set(clientRequestId, backendRequestId);
+          const { body } = await this.post({ jsonrpc: "2.0", id: backendRequestId, method, params }, this.sid, clientRequestId);
+          if (body?.error) throw new BackendReported(body.error.code, body.error.message ?? "backend error");
+          // This call always sends an id, so a response was expected - a 200
+          // with an empty body, or an SSE stream that reached EOF without
+          // ever emitting the matching event, both leave `body` null here.
+          // Do NOT synthesize {}: that reads as a successful call whose
+          // outcome nothing here ever actually saw - the worst failure mode
+          // in this file, since a mutating tool call would be reported as
+          // having succeeded. A post() call completed without throwing, so
+          // this is reachable, not downtime - same family as
+          // MalformedResponse (and handled identically by every caller).
+          if (!body || !("result" in body)) {
+            throw new MalformedResponse(`${method}: no response received for the request`);
+          }
+          return body.result;
+        } catch (err) {
+          // All four mean "reachable" (or, for Cancelled, "we stopped
+          // waiting, the backend did not go away") - session/connection
+          // state is left untouched, and none of them ever gets a reconnect
+          // retry (that's only for Stale).
+          if (
+            err instanceof BackendReported ||
+            err instanceof HttpRejected ||
+            err instanceof Cancelled ||
+            err instanceof MalformedResponse
+          )
+            throw err;
+          this.connected = false;
+          this.sid = null;
+          this.protocolVersion = null;
+          if (err instanceof Stale && attempt === 1) continue;
+          throw err instanceof Down ? err : new Down(err?.message ?? String(err));
         }
-        return body.result;
-      } catch (err) {
-        // All four mean "reachable" (or, for Cancelled, "we stopped
-        // waiting, the backend did not go away") - session/connection
-        // state is left untouched, and none of them ever gets a reconnect
-        // retry (that's only for Stale).
-        if (
-          err instanceof BackendReported ||
-          err instanceof HttpRejected ||
-          err instanceof Cancelled ||
-          err instanceof MalformedResponse
-        )
-          throw err;
-        this.connected = false;
-        this.sid = null;
-        this.protocolVersion = null;
-        if (err instanceof Stale && attempt === 1) continue;
-        throw err instanceof Down ? err : new Down(err?.message ?? String(err));
       }
+    } finally {
+      // The call has settled (returned, thrown, or exhausted its retry) -
+      // this id no longer names anything cancel() should act on.
+      if (clientRequestId !== undefined) this.backendIdForClient.delete(clientRequestId);
     }
   }
 
@@ -649,13 +717,16 @@ export class Shim {
     const controller = this.inFlight.get(clientRequestId);
     if (!controller) return;
     controller.abort(new Cancelled(reason ? `cancelled by client: ${reason}` : "cancelled by client"));
-    // The backend-facing request always uses id 1 (see backend() above) -
-    // this shim never has more than one real backend call in flight at a
-    // time, so that id is unambiguous. Fire-and-forget: a notification has
-    // no id and expects no reply, and the abort above has already freed
-    // the queue regardless of whether this reaches the backend.
-    if (this.connected) {
-      this.post({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1, reason } }, this.sid).catch(() => {});
+    // Name the backend id THIS call actually used (see backend()) - not a
+    // hardcoded value, which could now name a different, still-running
+    // call. If backend() had not yet allocated one (e.g. still stuck in
+    // connect()'s handshake - see N6), there is nothing meaningful to
+    // forward; the abort above already freed the queue either way.
+    const backendRequestId = this.backendIdForClient.get(clientRequestId);
+    if (this.connected && backendRequestId !== undefined) {
+      this.post({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: backendRequestId, reason } }, this.sid).catch(
+        () => {},
+      );
     }
   }
 
@@ -728,6 +799,19 @@ export class Shim {
           "then retry - no restart needed.",
       );
     }
+    if (this.launchFailure != null) {
+      // A previous launch attempt observably failed (see
+      // onLaunchFailed/defaultLauncher) - report that, once, instead of
+      // either a bogus "still starting" for an app that will never start,
+      // or silently trying to launch again forever without saying why the
+      // last attempt didn't work.
+      const failure = this.launchFailure;
+      this.launchFailure = null;
+      return this.errorResult(
+        `${this.name} failed to start (${this.appPath}): ${failure}. Check the --app path and ` +
+          "that the app is installed, then retry.",
+      );
+    }
     const now = Date.now();
     if (this.launchedAt != null && now - this.launchedAt < this.launchGraceMs) {
       const ageSec = Math.round((now - this.launchedAt) / 1000);
@@ -738,7 +822,7 @@ export class Shim {
     }
     this.launchedAt = now;
     try {
-      this.launcher(this.appPath);
+      this.launcher(this.appPath, (reason) => this.onLaunchFailed(reason));
     } catch {
       // Best effort - report "starting" regardless; the next call will
       // re-evaluate reachability on its own.
@@ -749,6 +833,16 @@ export class Shim {
         "connection recovers on its own. If it then reports no active document, a freshly " +
         "launched app may need one opened or created.",
     );
+  }
+
+  // Called by the launcher (async, well after downCallResult() has already
+  // returned - see defaultLauncher) when a launch is known to have failed.
+  // Clears the debounce so the NEXT call re-evaluates instead of reporting
+  // "still starting" for the rest of the grace window, and remembers why
+  // so that call can say so.
+  onLaunchFailed(reason) {
+    this.launchedAt = null;
+    this.launchFailure = reason;
   }
 
   errorResult(text) {

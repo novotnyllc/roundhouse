@@ -46,7 +46,15 @@ const MCP_SIDING_PATH = fileURLToPath(new URL("./mcp-siding.mjs", import.meta.ur
 export async function selftest() {
   // -- 1. body parsing, including multi-event SSE selection by id --------
   assert.deepEqual(parseBody('data: {"a":1,"id":5}\n', "text/event-stream", 5), { a: 1, id: 5 });
-  assert.deepEqual(parseBody('{"a":2}', "application/json", 7), { a: 2 });
+  // N14: the JSON path now enforces the same exact-id correlation the SSE
+  // path already did - a response must carry the id it is being checked
+  // against.
+  assert.deepEqual(parseBody('{"a":2,"id":7}', "application/json", 7), { a: 2, id: 7 });
+  assert.throws(
+    () => parseBody('{"a":2,"id":8}', "application/json", 7),
+    /response id mismatch/,
+    "a JSON response for a different id must be rejected",
+  );
   assert.equal(parseBody("", "application/json", 1), null);
   assert.equal(parseBody("   ", "text/event-stream", 1), null);
   const multiEvent =
@@ -836,6 +844,17 @@ export async function selftest() {
   //        reproduces it on this platform. ---------------------------------
   await selftestLauncherErrorDoesNotCrash();
 
+  // -- 7j2. N13: the OTHER real macOS launch-failure shape - `open -a
+  //         <bad path>` spawns fine and simply exits nonzero, which
+  //         nothing previously observed at all. downCallResult() had
+  //         already set launchedAt, so every call for the rest of the
+  //         150s grace window reported "still starting" for an app that
+  //         was never going to start. PATH is left intact here (unlike
+  //         selftestLauncherErrorDoesNotCrash) so `open` itself resolves
+  //         and actually runs, reproducing the real nonzero-exit shape
+  //         rather than a spawn() failure. --------------------------------
+  await selftestLaunchFailureReportsAccurately();
+
   // -- 7k. N4: cancellation stops waiting without misreporting downtime,
   //        never launches, forwards notifications/cancelled to the
   //        backend, and is a harmless no-op for an unknown or
@@ -1346,6 +1365,163 @@ export async function selftest() {
     );
   }
 
+  // -- 7t. N14: the plain-JSON transport must enforce the same exact-id
+  //        correlation the SSE path already does - a response for a
+  //        different id than the one this request sent must not be
+  //        accepted as this call's answer (a delayed or misrouted
+  //        response would otherwise read as a false success on a
+  //        mutating call). The matching-id case stays unchanged. --------
+  const mismatchedIdLaunches = [];
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "mismatch-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/call") {
+          // Answer with a DIFFERENT id than the one this request sent - a
+          // delayed/misrouted response for some other request.
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id + 999, result: { wrong: true } });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const mismatchedIdShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "mismatched-id.json"),
+        timeoutMs: 2_000,
+        launchEnabled: true,
+        appPath: "/fake/MismatchedId.app",
+        launchGraceMs: 150_000,
+        launcher: (appPath) => mismatchedIdLaunches.push(appPath),
+      });
+      const mismatched = await mismatchedIdShim.handle({ jsonrpc: "2.0", id: 96, method: "tools/call", params: {} });
+      assert.equal(mismatched.result.isError, true, "a mismatched response id must not read as success");
+      assert.doesNotMatch(
+        mismatched.result.content[0].text,
+        /not reachable|is not reachable/i,
+        "a mismatched-id response is reachable, not downtime",
+      );
+      assert.equal(mismatchedIdLaunches.length, 0, "a mismatched-id response must never launch");
+    },
+  );
+
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "match-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: msg.method === "tools/call" ? { ok: true } : {} });
+      });
+    },
+    async (url) => {
+      const matchedIdShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "matched-id.json"),
+        timeoutMs: 2_000,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const matched = await matchedIdShim.handle({ jsonrpc: "2.0", id: 97, method: "tools/call", params: {} });
+      assert.deepEqual(matched.result, { ok: true }, "a matching-id JSON response must still work");
+    },
+  );
+
+  // -- 7u. N12: backend() must allocate a unique id per call, not always
+  //        "1" - cancellation is dispatched OUTSIDE the serialized queue
+  //        (deliberately, since N6), so a cancel for call A can arrive
+  //        after call B has started; a shared hardcoded id would let the
+  //        cancel land on B, or leave two outstanding requests sharing an
+  //        id. Assert via a request counter, not timing: the forwarded
+  //        cancellation must name A's own backend id, and B (started
+  //        immediately after A is cancelled, without waiting for A to
+  //        settle) must complete normally with its own result. ----------
+  let idRaceCancelForward = null;
+  const idRaceToolCallIds = [];
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "id-race-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "notifications/cancelled") {
+          idRaceCancelForward = msg.params;
+          return sendJson(res, 200, undefined);
+        }
+        if (msg.method === "tools/call") {
+          idRaceToolCallIds.push(msg.id);
+          if (idRaceToolCallIds.length === 1) {
+            // Call A - stall so there is something real for cancel() to
+            // interrupt.
+            res.writeHead(200, { "Content-Type": "application/json" });
+            return;
+          }
+          // Call B - answer normally, correlated by its OWN id.
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { callB: true } });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const idRaceShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "id-race.json"),
+        timeoutMs: 60_000, // long enough that only cancel(), not the timeout, ends call A's wait
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const callA = idRaceShim.handle({ jsonrpc: "2.0", id: 98, method: "tools/call", params: {} });
+      // Give A a moment to actually reach the stalling backend and
+      // register in inFlight before cancelling it.
+      await new Promise((r) => setTimeout(r, 200));
+      idRaceShim.cancel(98, "cancel A");
+      // Immediately start B, without awaiting A's settlement - exactly the
+      // queue-bypass race N12 describes.
+      const callB = idRaceShim.handle({ jsonrpc: "2.0", id: 99, method: "tools/call", params: {} });
+      const [resultA, resultB] = await Promise.all([callA, callB]);
+      assert.equal(resultA.result.isError, true, "call A must report as cancelled");
+      assert.deepEqual(resultB.result, { callB: true }, "call B must complete normally with its own result");
+
+      await new Promise((r) => setTimeout(r, 100)); // the forward to the backend is fire-and-forget
+      assert.equal(idRaceToolCallIds.length, 2, "both calls must have reached the backend");
+      assert.notEqual(
+        idRaceToolCallIds[0],
+        idRaceToolCallIds[1],
+        "call A and call B must use different backend request ids, not a shared hardcoded one",
+      );
+      assert.deepEqual(
+        idRaceCancelForward,
+        { requestId: idRaceToolCallIds[0], reason: "cancel A" },
+        "the forwarded cancellation must name A's own backend id, not B's and not a hardcoded 1",
+      );
+    },
+  );
+
   // -- 8. process-level: one malformed stdin line must not kill the shim
   const initReply = await runChildAndGetReply(
     MCP_SIDING_PATH,
@@ -1506,6 +1682,78 @@ async function selftestLauncherErrorDoesNotCrash() {
   if (child.exitCode == null) child.kill();
 
   assert.ok(answeredAgain, `child died or stopped answering after the launch attempt (stderr: ${err})`);
+}
+
+// N13: `open -a <bad path>` on macOS spawns fine and exits nonzero - unlike
+// selftestLauncherErrorDoesNotCrash, PATH is left intact so `open` itself
+// resolves and actually runs, reproducing that shape rather than a spawn()
+// ENOENT. Two tools/call requests through the REAL defaultLauncher (not the
+// injected seam, which never touches the real 'exit' event): the first
+// triggers the launch attempt, and once its failure has had time to land,
+// the second must report the failure by name rather than "still starting".
+async function selftestLaunchFailureReportsAccurately() {
+  const child = spawn(
+    process.execPath,
+    [
+      MCP_SIDING_PATH,
+      "--backend-url",
+      "http://127.0.0.1:1/mcp", // unreachable - forces downCallResult() to actually launch
+      "--name",
+      "test",
+      "--app",
+      "/definitely/does/not/exist/NoSuchApp.app",
+      "--launch",
+    ],
+    { stdio: ["pipe", "pipe", "pipe"] },
+  );
+  let out = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => (out += chunk));
+  let err = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => (err += chunk));
+  const exited = new Promise((resolvePromise) => child.on("exit", resolvePromise));
+
+  const waitFor = async (marker, deadlineMs) => {
+    const deadline = Date.now() + deadlineMs;
+    while (!out.includes(marker) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return out.includes(marker);
+  };
+
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 57, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+  assert.ok(await waitFor('"id":57', 5_000), `child never answered the first launch-triggering tools/call (stderr: ${err})`);
+
+  // `open -a <bad path>` exits nonzero asynchronously - give it real time
+  // to land before the second call.
+  await new Promise((r) => setTimeout(r, 1_500));
+
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 58, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+  assert.ok(await waitFor('"id":58', 5_000), `child never answered the second tools/call (stderr: ${err})`);
+
+  child.stdin.end();
+  await Promise.race([exited, new Promise((r) => setTimeout(r, 2_000))]);
+  if (child.exitCode == null) child.kill();
+
+  const lines = out
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const second = lines.find((l) => l.id === 58);
+  assert.ok(second, `no reply for the second tools/call (stderr: ${err})`);
+  assert.equal(second.result.isError, true);
+  assert.doesNotMatch(
+    second.result.content[0].text,
+    /still starting/i,
+    `a launch that exited nonzero must not be reported as "still starting" (stderr: ${err})`,
+  );
+  assert.match(
+    second.result.content[0].text,
+    /failed to start/i,
+    `the second call must name the launch failure (stderr: ${err})`,
+  );
 }
 
 // Spawns mcp-siding.mjs (at `scriptPath`) as a real child process, writes
