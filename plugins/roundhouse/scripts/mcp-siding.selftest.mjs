@@ -36,6 +36,7 @@ import {
   PROTOCOL_VERSION,
   parseArgs,
   buildShimFromArgs,
+  defaultCachePath,
 } from "./mcp-siding.mjs";
 
 // Resolved relative to *this file*, not CWD or a hardcoded repo path - so
@@ -218,6 +219,25 @@ export async function selftest() {
     /--no-launch/,
     "--no-launch=false must not forward --no-launch",
   );
+
+  // -- 1c. N16: the default cache path is keyed on name AND backend
+  //        identity, not name alone - a repoint (remove/re-add the same
+  //        --name with a different --backend-url, per SKILL.md's Update
+  //        section) must not resolve to the same file the old backend's
+  //        tool inventory lives at, or an initially-unavailable new
+  //        backend would have the OLD backend's tools advertised as its
+  //        own. -------------------------------------------------------
+  assert.notEqual(
+    defaultCachePath("fusion", "http://127.0.0.1:27182/mcp"),
+    defaultCachePath("fusion", "http://127.0.0.1:9999/mcp"),
+    "same name, different backend-url must not share a cache file",
+  );
+  assert.equal(
+    defaultCachePath("fusion", "http://127.0.0.1:27182/mcp"),
+    defaultCachePath("fusion", "http://127.0.0.1:27182/mcp"),
+    "same name and url must resolve to the same path across runs",
+  );
+  assert.match(defaultCachePath("fusion", "http://127.0.0.1:27182/mcp"), /fusion/, "the filename must still contain the name");
 
   // -- 2. initialize always answered locally, even pointed at nothing ---
   const tmpRoot = await mkdtemp(join(tmpdir(), "mcp-siding-"));
@@ -1519,6 +1539,63 @@ export async function selftest() {
         { requestId: idRaceToolCallIds[0], reason: "cancel A" },
         "the forwarded cancellation must name A's own backend id, not B's and not a hardcoded 1",
       );
+    },
+  );
+
+  // -- 7v. N15: connect() must require a successful initialize result
+  //        before sending anything else - an error envelope from a
+  //        reachable backend must not be silently absorbed into a default
+  //        protocol version and a connected session. Assert on the fake
+  //        backend's received-methods list (not just the client-visible
+  //        result) that notifications/initialized was never sent, and
+  //        that a SUBSEQUENT call re-handshakes rather than proceeding as
+  //        if already connected (a stale this.connected=true would skip
+  //        straight to the real, possibly mutating, call). --------------
+  const rejectedHandshakeLaunches = [];
+  const rejectedHandshakeMethods = [];
+  let initializeCalls = 0;
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        rejectedHandshakeMethods.push(msg.method);
+        if (msg.method === "initialize") {
+          initializeCalls += 1;
+          return sendJson(res, 200, {
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: { code: -32000, message: "handshake rejected: license expired" },
+          });
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const rejectedShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "rejected-handshake.json"),
+        timeoutMs: 2_000,
+        launchEnabled: true,
+        appPath: "/fake/RejectedHandshake.app",
+        launchGraceMs: 150_000,
+        launcher: (appPath) => rejectedHandshakeLaunches.push(appPath),
+      });
+      const first = await rejectedShim.handle({ jsonrpc: "2.0", id: 100, method: "tools/call", params: {} });
+      assert.equal(first.result.isError, true, "a rejected handshake must not read as success");
+      assert.match(first.result.content[0].text, /license expired/, "must surface the backend's own message");
+      assert.equal(rejectedHandshakeLaunches.length, 0, "a rejected handshake is reachable, not downtime - must never launch");
+      assert.equal(rejectedShim.connected, false, "a rejected handshake must not mark the session connected");
+      assert.equal(
+        rejectedHandshakeMethods.includes("notifications/initialized"),
+        false,
+        "notifications/initialized must never be sent after a rejected handshake",
+      );
+
+      // A SUBSEQUENT call must re-handshake, not proceed as if connected.
+      const second = await rejectedShim.handle({ jsonrpc: "2.0", id: 101, method: "tools/call", params: {} });
+      assert.equal(second.result.isError, true);
+      assert.equal(initializeCalls, 2, "a subsequent call must re-attempt the handshake, not skip it as if already connected");
     },
   );
 

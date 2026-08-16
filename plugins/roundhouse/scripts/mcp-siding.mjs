@@ -31,6 +31,7 @@
 
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -421,9 +422,19 @@ export function writeCache(cachePath, tools) {
   }
 }
 
-function defaultCachePath(name) {
+export function defaultCachePath(name, url) {
   const safe = String(name).replace(/[^A-Za-z0-9._-]+/g, "_") || "mcp-siding";
-  return join(homedir(), ".cache", "mcp-siding", `${safe}.json`);
+  // Keyed on name AND backend identity, not name alone. A repoint (remove
+  // then re-add the same --name with a different --backend-url, per
+  // SKILL.md's Update section) used to leave the previous backend's tool
+  // inventory sitting at the name-only path: if the new backend was
+  // initially unavailable, the shim would advertise the OLD backend's
+  // tools as belonging to the new one. A short hash of the URL is enough
+  // to make that collision impossible - keeping `safe` in the filename too
+  // is what keeps it greppable/human-identifiable, the original reason for
+  // keying on name at all.
+  const urlHash = createHash("sha256").update(String(url)).digest("hex").slice(0, 8);
+  return join(homedir(), ".cache", "mcp-siding", `${safe}-${urlHash}.json`);
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +642,18 @@ export class Shim {
       null,
       clientRequestId,
     );
+    // A backend that answered at all is reachable - a JSON-RPC error
+    // envelope rejecting the handshake is a BackendReported failure, not
+    // Down (same reasoning as backend()'s own body?.error check), and must
+    // not be silently absorbed into a default protocol version and a
+    // connected session. Without this, connect() fell back to
+    // PROTOCOL_VERSION, still sent notifications/initialized, marked the
+    // session connected, and the shim went on to run the caller's
+    // (possibly mutating) tool call against a backend that had explicitly
+    // rejected the handshake.
+    if (body?.error) {
+      throw new BackendReported(body.error.code, body.error.message ?? "backend error");
+    }
     this.sid = sid ?? null;
     // Capture what the backend actually negotiated, not just what we
     // asked for - a compliant backend may echo back a different (older)
@@ -981,7 +1004,7 @@ export function buildShimFromArgs(flags) {
   const appPath = flags.app ?? null;
   const timeoutMs = parsePositiveNumber(flags.timeout ?? 180_000, "timeout");
   const launchGraceMs = parsePositiveNumber(flags["launch-grace"] ?? 150, "launch-grace") * 1000;
-  const cachePath = flags.cache ?? defaultCachePath(name);
+  const cachePath = flags.cache ?? defaultCachePath(name, url);
   // --no-launch and --launch are two spellings of one boolean; either
   // flag's *explicit* value wins over the other's absence, "off" wins a
   // genuine conflict (e.g. both passed bare), and neither present falls

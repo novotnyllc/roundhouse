@@ -114,9 +114,6 @@ e.g. `startup_timeout_sec = 120` becoming `120.0` or an env table getting
 alphabetized — semantically equivalent either way, but worth mentioning to
 a user who maintains that file by hand.
 
-Optionally clean up the instance's cache file at
-`~/.cache/mcp-siding/<NAME>.json` after a remove.
-
 ## Local development
 
 To register and exercise an unpublished working-tree build instead of a
@@ -144,16 +141,20 @@ since the registration bakes them in as argv.
 | Flag | Purpose | Default |
 | --- | --- | --- |
 | `--backend-url` | HTTP MCP backend URL | required |
-| `--name` | Server display name (also the cache key) | required |
+| `--name` | Server display name (also part of the cache key) | required |
 | `--app` | App to launch on demand | none (launch disabled) |
-| `--cache` | Tool-list cache file path | `~/.cache/mcp-siding/<name>.json` |
+| `--cache` | Tool-list cache file path | `~/.cache/mcp-siding/<name>-<url-hash>.json` |
 | `--timeout` | Backend request timeout, ms | `180000` |
 | `--launch` / `--no-launch` | Launch-on-demand opt-in/out | on iff `--app` is set |
 | `--launch-grace` | Debounce window before relaunching, seconds | `150` |
 
-The cache is keyed by `--name`, so give every backend a distinct name —
-never register two different backends under the same name, or their cached
-tool lists collide.
+The cache is keyed by `--name` plus a short hash of `--backend-url`, so a
+repoint (remove and re-add the same `--name` with a different
+`--backend-url`, per Update below) can never collide with the old
+backend's cached tool list — each `(name, url)` pair gets its own file.
+Two different backends still should not share a `--name` for its own
+sake (the display name itself would be ambiguous to the user), but doing
+so no longer corrupts either one's cache.
 
 ## Launch-on-demand
 
@@ -181,7 +182,13 @@ re-add: both `claude mcp add` and `codex mcp add` reject an existing name.
   though the shim itself is healthy. There is no workaround inside the
   shim: seed it once by using this MCP server with the app open right
   after installing (any normal `tools/list` does this); after that the
-  cache persists across app restarts.
+  cache persists across app restarts. The same thing happens once, for an
+  existing registration, on the first run after upgrading past the cache
+  key change that mixed backend identity into the filename (see Config
+  flags above) — the old name-only file is simply orphaned, not migrated,
+  so a session that starts with the app closed sees zero tools until it
+  has been opened once at least one time post-upgrade. Self-healing, same
+  workaround as a fresh install.
 - **Resolver finds nothing.** Most likely `roundhouse` isn't installed on
   this machine, or was removed after this server was registered. The
   registered command exits immediately with a message on stderr naming
