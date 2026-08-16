@@ -72,6 +72,21 @@ export async function selftest() {
     "a response for a different id than expected must not be picked up",
   );
 
+  // -- 1b2. N28: HTTP media types are case-insensitive - "Text/Event-
+  //         Stream" is exactly as SSE as "text/event-stream", with or
+  //         without trailing parameters. Existing lowercase behavior
+  //         (asserted above) must stay unchanged. -----------------------
+  assert.deepEqual(
+    parseBody('data: {"a":3,"id":11}\n', "Text/Event-Stream", 11),
+    { a: 3, id: 11 },
+    "a mixed-case content type must still take the SSE path",
+  );
+  assert.deepEqual(
+    parseBody('data: {"a":4,"id":12}\n', "Text/Event-Stream; charset=UTF-8", 12),
+    { a: 4, id: 12 },
+    "a mixed-case content type with parameters must still take the SSE path",
+  );
+
   // -- 1c. N5: readSseUntilMatch must parse an event split across chunk
   //        boundaries - a chunk boundary is not an event boundary, and
   //        nothing before this asserted that directly. Split mid-value,
@@ -1072,6 +1087,85 @@ export async function selftest() {
     },
   );
 
+  // -- 7k2. N27: cancelling far more queued requests than the deleted
+  //         50-entry cap must not lose any of them - lifecycle tracking
+  //         (bounded by queue depth: an id is marked pending once when
+  //         enqueued and cleared once when dispatched) replaces the cap
+  //         entirely, so there is nothing to evict. Simulates main()'s
+  //         own enqueue pattern directly (mark this.pendingIds, then
+  //         queue the dispatch) rather than going through a real
+  //         subprocess (7l/7l2 already cover that end to end) - direct
+  //         access to shim.pendingIds/cancelledQueuedIds afterward is
+  //         what lets "nothing accumulates once the queue drains" be
+  //         checked at all. ------------------------------------------
+  let manyToolCallCount = 0;
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "many-cancel-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "notifications/cancelled") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/call") {
+          manyToolCallCount += 1;
+          res.writeHead(200, { "Content-Type": "application/json" }); // stall - deliberately never end()
+          return;
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const manyShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "many-cancel.json"),
+        // Short, deliberately: in working code none of these 120 ever
+        // reach post() at all, so the value does not matter there - but a
+        // reverted/capped version lets the evicted ones actually reach
+        // the stalled backend and wait out the full timeout, sequentially,
+        // one request at a time. A short timeout keeps a revert-check
+        // finishing in seconds instead of potentially over an hour.
+        timeoutMs: 300,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const COUNT = 120; // well over the deleted 50-entry cap
+      const ids = Array.from({ length: COUNT }, (_, i) => 200 + i);
+      let queue = Promise.resolve();
+      const replies = new Map();
+      for (const id of ids) {
+        const msg = { jsonrpc: "2.0", id, method: "tools/call", params: {} };
+        manyShim.pendingIds.add(id); // mirrors main()'s own enqueue-time marking
+        queue = queue.then(async () => {
+          replies.set(id, await manyShim.handle(msg));
+        });
+      }
+      // All 120 are still purely queued (no .then() callback above has
+      // had a chance to run yet - nothing here has awaited since the
+      // synchronous loop started) - cancel every one now, before any of
+      // them could possibly dispatch.
+      for (const id of ids) manyShim.cancel(id, "bulk cancel");
+      await queue;
+
+      for (const id of ids) {
+        const reply = replies.get(id);
+        assert.ok(reply, `id ${id} never got a reply`);
+        assert.equal(reply.result.isError, true, `id ${id} must be a cancelled result`);
+        assert.match(reply.result.content[0].text, /cancel/i, `id ${id} must say cancelled`);
+      }
+      assert.equal(manyToolCallCount, 0, "none of the 120 cancelled requests may reach the backend");
+      assert.equal(manyShim.pendingIds.size, 0, "nothing may remain pending once the queue drains");
+      assert.equal(manyShim.cancelledQueuedIds.size, 0, "no tombstone may remain once the queue drains");
+    },
+  );
+
   // -- 7l. N4 (process level): cancellation frees the serialized queue - a
   //        message queued behind the cancelled call must be answered
   //        promptly too, proving the notification really is dispatched
@@ -1483,6 +1577,59 @@ export async function selftest() {
         { crlf: true },
         "a CRLF-delimited response must resolve with the real result, not a false-success {}",
       );
+    },
+  );
+
+  // -- 7q2. N28 end to end: a real backend answering with a mixed-case
+  //         Content-Type must still take the incremental SSE path in
+  //         post() itself (not just parseBody in isolation, 1b2 above) -
+  //         the fallback (a plain res.text()) would wait for EOF on a
+  //         stream a compliant backend may legally keep open, and
+  //         eventually time out even though the matching event already
+  //         arrived. Held open deliberately, matching 7m's own pattern,
+  //         so a case-sensitive regression would show up as a timeout
+  //         here, not just a wrong branch taken. -------------------------
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "mixed-case-content-type-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/call") {
+          const response = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { mixedCase: true } });
+          res.writeHead(200, { "Content-Type": "Text/Event-Stream; charset=UTF-8" });
+          res.write(`data: ${response}\n\n`);
+          // Deliberately never res.end() - if the mixed-case type falls
+          // through to the plain-text branch, this would hang until the
+          // timeout below instead of resolving immediately.
+          return;
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const mixedCaseShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "mixed-case-content-type.json"),
+        timeoutMs: 60_000, // long enough that only taking the SSE path, not the timeout, can end the wait
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const startedAt = Date.now();
+      const mixedCaseReply = await mixedCaseShim.handle({ jsonrpc: "2.0", id: 94, method: "tools/call", params: {} });
+      assert.ok(
+        Date.now() - startedAt < 3_000,
+        "a mixed-case Content-Type must resolve promptly via the SSE path, not fall through and wait for EOF",
+      );
+      assert.deepEqual(mixedCaseReply.result, { mixedCase: true }, "a mixed-case Content-Type must still resolve with the real result");
     },
   );
 

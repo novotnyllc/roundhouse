@@ -350,7 +350,12 @@ const STALE_HTTP_STATUSES = new Set([404]);
 
 export function parseBody(body, contentType, expectedId) {
   if (!body || !body.trim()) return null;
-  if (!(contentType && contentType.includes("text/event-stream"))) {
+  // HTTP media types are case-insensitive ("Text/Event-Stream" is the same
+  // type as "text/event-stream") - lowercase once here so this function is
+  // correct regardless of what a caller passes, not just when post() below
+  // happens to have already normalized it.
+  const normalizedContentType = (contentType || "").toLowerCase();
+  if (!normalizedContentType.includes("text/event-stream")) {
     let parsed;
     try {
       parsed = JSON.parse(body);
@@ -635,30 +640,31 @@ export class Shim {
     // cleared by downCallResult() on the next call, instead of reporting a
     // bogus "still starting" for an app that is never going to start.
     this.launchFailure = null;
-    // Client request ids cancelled while still QUEUED - not yet in
-    // this.inFlight, because main()'s serialized queue has not reached
-    // them yet (see cancel()). Consumed (one-shot) by handle() when that
-    // id's own turn comes up, so it never contacts the backend with a
-    // call the user already cancelled. Capped with oldest-eviction rather
-    // than precise per-id lifecycle tracking (no timers, no second map to
-    // keep in sync): a cancellation whose matching request id never
-    // actually arrives (stale/duplicate/unknown) would otherwise sit here
-    // forever on a long-lived server, and the cap is generous enough that
-    // a real cancellation is always consumed long before eviction could
-    // matter.
+    // Client request ids main() has enqueued but whose own turn in the
+    // serialized queue has not yet come up - set by main() the moment an
+    // id-carrying message is enqueued, cleared by handle() the moment
+    // that same id is actually dispatched (cancelled or not - see
+    // handle()). This is what lets cancel() tell "this id is still
+    // queued" apart from "this id is unknown or already finished" -
+    // only the former is worth tombstoning below. Bounded by queue depth,
+    // not a constant: an id is added once and removed once, so nothing
+    // can accumulate past what is genuinely still queued.
+    this.pendingIds = new Set();
+    // Client request ids cancelled while still pending (see
+    // this.pendingIds) - not yet in this.inFlight, because main()'s
+    // serialized queue has not reached them yet (see cancel()). Consumed
+    // (one-shot) by handle() when that id's own turn comes up, so it
+    // never contacts the backend with a call the user already cancelled.
+    // No cap here (an earlier version had one, oldest-eviction at 50
+    // entries - deleted, not raised, because ANY fixed number is the same
+    // bug further away: cancel more requests than the cap while the queue
+    // is stalled behind one slow call, and the oldest tombstones are
+    // evicted, so THOSE cancelled tools/call operations reach the backend
+    // for real). An entry only ever exists for an id this.pendingIds
+    // already confirmed is genuinely still queued, and is removed the
+    // moment that id dispatches - bounded by queue depth, exactly like
+    // this.pendingIds, so there is nothing to leak.
     this.cancelledQueuedIds = new Set();
-  }
-
-  // Records `clientRequestId` as cancelled-while-queued and evicts the
-  // oldest entry once the bound is exceeded - see the constructor comment
-  // on this.cancelledQueuedIds for why a simple cap, not precise lifecycle
-  // tracking.
-  tombstoneQueuedCancel(clientRequestId) {
-    this.cancelledQueuedIds.add(clientRequestId);
-    const cap = 50;
-    while (this.cancelledQueuedIds.size > cap) {
-      this.cancelledQueuedIds.delete(this.cancelledQueuedIds.values().next().value);
-    }
   }
 
   // `clientRequestId`, when given, registers this call's AbortController in
@@ -690,7 +696,13 @@ export class Shim {
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
-      const contentType = res.headers.get("content-type") || "";
+      // HTTP media types are case-insensitive - a backend answering
+      // "Text/Event-Stream" is exactly as SSE as "text/event-stream".
+      // Header NAMES are already case-insensitive via Headers.get; this is
+      // specifically about the VALUE. Lowercased once here so every
+      // comparison below (and whatever this gets passed into, e.g.
+      // parseBody) sees a normalized value.
+      const contentType = (res.headers.get("content-type") || "").toLowerCase();
       if (res.ok && contentType.includes("text/event-stream")) {
         // The timeout must cover reading the body, not just the headers -
         // a backend that answers 200 and then stalls mid-stream (a legal
@@ -903,16 +915,16 @@ export class Shim {
   // controller once it actually starts). Cancelling that id used to be a
   // silent no-op: once its turn came up, handle() would dispatch it
   // normally and send the very mutating tool call the user had already
-  // cancelled. Recorded as a tombstone instead (see
-  // this.cancelledQueuedIds/tombstoneQueuedCancel) so handle() can catch
-  // it before ever contacting the backend - a harmless, unconsumed entry
-  // (bounded by the cap) if the id turns out to be genuinely unknown or
-  // already finished.
+  // cancelled. Tombstoned instead (see this.cancelledQueuedIds) so
+  // handle() can catch it before ever contacting the backend - but only
+  // when this.pendingIds confirms the id really is still queued; a
+  // genuinely unknown or already-finished id stays exactly the harmless
+  // no-op it always was, not a tombstone nothing will ever consume.
   cancel(clientRequestId, reason) {
     if (clientRequestId === undefined || clientRequestId === null) return;
     const controller = this.inFlight.get(clientRequestId);
     if (!controller) {
-      this.tombstoneQueuedCancel(clientRequestId);
+      if (this.pendingIds.has(clientRequestId)) this.cancelledQueuedIds.add(clientRequestId);
       return;
     }
     controller.abort(new Cancelled(reason ? `cancelled by client: ${reason}` : "cancelled by client"));
@@ -1074,6 +1086,21 @@ export class Shim {
     const id = msg?.id;
     const params = msg?.params ?? {};
 
+    // This id's own turn has now arrived - it is no longer "pending" (see
+    // this.pendingIds/main()), whichever branch below actually answers
+    // it. Clearing this HERE, before every branch (including initialize),
+    // is what keeps both records bounded by queue depth: an id is added
+    // exactly once when enqueued and removed exactly once when dispatched,
+    // never leaked. If it was cancelled while it was still queued, that
+    // tombstone is consumed (one-shot, via delete's own return value) the
+    // same way and takes priority over any dispatch - a cancelled request
+    // must not reach the backend, whatever method it named.
+    if (id !== undefined) {
+      this.pendingIds.delete(id);
+      if (this.cancelledQueuedIds.delete(id)) {
+        return ok(id, this.errorResult(`${this.name}: call cancelled.`));
+      }
+    }
     if (method === "initialize") {
       // Answered locally so the server always starts, backend up or not.
       return ok(id, {
@@ -1088,16 +1115,6 @@ export class Shim {
     // tools/call can launch the app, and a launch for a reply nobody will
     // ever read is a real, user-visible side effect, not a no-op.
     if (id === undefined) return null;
-    // A cancellation may have arrived for this id while it was still
-    // queued behind an earlier call - see cancel()/this.cancelledQueuedIds.
-    // Dispatching it now would send a mutating tool call the user already
-    // cancelled. Consume the tombstone (one-shot, via delete's own return
-    // value) here, before every dispatch branch below - same reasoning
-    // and same placement as the id===undefined gate just above: this must
-    // not be skippable per-method, since any of them could launch.
-    if (this.cancelledQueuedIds.delete(id)) {
-      return ok(id, this.errorResult(`${this.name}: call cancelled.`));
-    }
     if (method === "ping") return ok(id, {});
     if (method === "tools/list") return ok(id, await this.toolsList(params, id));
     if (method === "tools/call") return ok(id, await this.toolsCall(params, id));
@@ -1264,6 +1281,12 @@ function main(flags) {
       shim.cancel(msg.params?.requestId, msg.params?.reason);
       return;
     }
+    // Recorded as pending BEFORE enqueueing (synchronously, in this same
+    // handler call) so a notifications/cancelled for this id arriving
+    // before its turn comes up - dispatched immediately above, outside
+    // this queue - can find it and tombstone it. See
+    // this.pendingIds/handle() for the other half.
+    if (msg?.id !== undefined) shim.pendingIds.add(msg.id);
     queue = queue.then(async () => {
       let response;
       try {
