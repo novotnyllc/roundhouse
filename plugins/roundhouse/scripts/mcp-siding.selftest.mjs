@@ -1397,7 +1397,17 @@ export async function selftest() {
       );
       assert.equal(cancelLaunches.length, 0, "a cancelled call must never launch the app");
 
-      await new Promise((r) => setTimeout(r, 100)); // the forward to the backend is fire-and-forget
+      // This is the LIVE cancel() call site (matching main()'s own
+      // notifications/cancelled handler, which deliberately never awaits
+      // cancel()'s return - see cancel()'s own comment) - the forward is
+      // genuinely fire-and-forget here, unlike shutdown()'s use of it, so
+      // a fixed sleep is a real race, not just an assertion timed too
+      // early. Poll with a bounded wait instead, the way this file's
+      // existing waitFor pattern does.
+      const cancelForwardDeadline = Date.now() + 2_000;
+      while (cancelForwardReceived === null && Date.now() < cancelForwardDeadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
       assert.deepEqual(
         cancelForwardReceived,
         { requestId: 1, reason: "user requested" },
@@ -1720,7 +1730,16 @@ export async function selftest() {
       );
       assert.equal(err, "", `shutdown must not throw on the way out (stderr: ${err})`);
 
-      await new Promise((r) => setTimeout(r, 100)); // the forward to the backend is fire-and-forget
+      // No extra wait needed here, and none was ever safe to rely on: this
+      // used to be a fixed sleep on the theory that the forward is fire-
+      // and-forget, which was true of shutdown()'s cleanup and was the
+      // real bug (flaky ~1-in-5, not just a slow assertion) - shutdown()
+      // now genuinely awaits cancel()'s forward, bounded by its own
+      // deadline, before ever calling process.exit(). That makes this
+      // deterministic by construction: the child cannot have exited
+      // unless the fake server (this same test process) already received
+      // the notification and sent its response back - the response is
+      // what let the awaited forward resolve in the first place.
       assert.deepEqual(
         disconnectCancelledForwardReceived,
         { requestId: 1, reason: "client disconnected" },
@@ -2509,13 +2528,24 @@ export async function selftest() {
         "call B must complete normally with its own result",
       );
 
-      await new Promise((r) => setTimeout(r, 100)); // the forward to the backend is fire-and-forget
+      // idRaceToolCallIds is already deterministic here - resultB only
+      // resolved because the fake server's tools/call handler (which
+      // pushes to it) already ran. idRaceCancelForward is different:
+      // idRaceShim.cancel(98, ...) above is the LIVE cancel() call site
+      // (matching main()'s own notifications/cancelled handler, which
+      // deliberately never awaits cancel()'s return), so that forward is
+      // genuinely fire-and-forget - poll with a bounded wait instead of a
+      // fixed sleep, the way this file's existing waitFor pattern does.
       assert.equal(idRaceToolCallIds.length, 2, "both calls must have reached the backend");
       assert.notEqual(
         idRaceToolCallIds[0],
         idRaceToolCallIds[1],
         "call A and call B must use different backend request ids, not a shared hardcoded one",
       );
+      const idRaceForwardDeadline = Date.now() + 2_000;
+      while (idRaceCancelForward === null && Date.now() < idRaceForwardDeadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
       assert.deepEqual(
         idRaceCancelForward,
         { requestId: idRaceToolCallIds[0], reason: "cancel A" },

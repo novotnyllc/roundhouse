@@ -170,11 +170,11 @@
     },
     {
       "path": "scripts/mcp-siding.mjs",
-      "sha256": "350d9dda27f4024c57ff335e55f97c35131d4eb3436ee991a9d257d207aaa63c"
+      "sha256": "73fc525d3132ef5bcc737f20db34a242835205e6d561fc383d1267cc1c19bc03"
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
-      "sha256": "7d944448d8fb280324d51ddc389c5b365a6a84958de2a1617c9777d1ad7c8c46"
+      "sha256": "422b85479742fdd86509d84c7f361db517cf2befb8da65a4d761d935efd1605b"
     },
     {
       "path": "scripts/prepare-ssh-identity",

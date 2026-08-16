@@ -1027,12 +1027,20 @@ export class Shim {
   // when this.pendingIds confirms the id really is still queued; a
   // genuinely unknown or already-finished id stays exactly the harmless
   // no-op it always was, not a tombstone nothing will ever consume.
+  // Returns the forward's promise (already caught, so it never rejects) so
+  // a caller that cares whether it actually landed - shutdown() below,
+  // specifically - can await it. main()'s own live notifications/cancelled
+  // handler deliberately ignores the return value and stays fire-and-
+  // forget: waiting there would block the serialized queue behind a slow
+  // or unresponsive backend, which is exactly what dispatching cancel()
+  // outside that queue (N6) exists to avoid. Returns undefined when there
+  // is nothing to forward (already covered by the comments below).
   cancel(clientRequestId, reason) {
-    if (clientRequestId === undefined || clientRequestId === null) return;
+    if (clientRequestId === undefined || clientRequestId === null) return undefined;
     const controller = this.inFlight.get(clientRequestId);
     if (!controller) {
       if (this.pendingIds.has(clientRequestId)) this.cancelledQueuedIds.add(clientRequestId);
-      return;
+      return undefined;
     }
     controller.abort(new Cancelled(reason ? `cancelled by client: ${reason}` : "cancelled by client"));
     // Name the backend id THIS call actually used (see backend()) - not a
@@ -1042,10 +1050,12 @@ export class Shim {
     // forward; the abort above already freed the queue either way.
     const backendRequestId = this.backendIdForClient.get(clientRequestId);
     if (this.connected && backendRequestId !== undefined) {
-      this.post({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: backendRequestId, reason } }, this.sid).catch(
-        () => {},
-      );
+      return this.post(
+        { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: backendRequestId, reason } },
+        this.sid,
+      ).catch(() => {});
     }
+    return undefined;
   }
 
   // Best-effort cleanup when the transport closes (the client disconnected
@@ -1064,9 +1074,23 @@ export class Shim {
   // orphan it replaces, so every failure here is swallowed, not surfaced.
   async shutdown(deadlineMs = 2_000) {
     const cleanup = (async () => {
+      // "Best effort" means actually attempted and given its deadline, not
+      // fired and abandoned: cancel()'s notifications/cancelled forward
+      // used to be pure fire-and-forget here, so the DELETE request right
+      // below it (or, with no session, nothing at all) could resolve and
+      // let process.exit() cut the forward off before its bytes ever
+      // reached the backend - a real race, not just a slow assertion in
+      // the test that observes it. Collect and await every forward this
+      // loop produces (each already caught by cancel() itself, so none of
+      // these can reject) before moving on - still bounded by the SAME
+      // deadline as everything else here, via the outer Promise.race
+      // below, so an unresponsive backend still cannot hold shutdown open.
+      const forwards = [];
       for (const clientRequestId of [...this.inFlight.keys()]) {
-        this.cancel(clientRequestId, "client disconnected");
+        const forward = this.cancel(clientRequestId, "client disconnected");
+        if (forward) forwards.push(forward);
       }
+      if (forwards.length > 0) await Promise.all(forwards);
       if (this.connected && this.sid) {
         const headers = { "MCP-Session-Id": this.sid };
         if (this.protocolVersion) headers["MCP-Protocol-Version"] = this.protocolVersion;
