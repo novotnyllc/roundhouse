@@ -453,6 +453,123 @@ export async function selftest() {
     },
   );
 
+  // -- 7e3. N2: a non-2xx HTTP response (not the 404 stale-session case) is
+  //         the same class of bug one layer down from C5/7e2 - reachable,
+  //         so it must never launch or be phrased as unreachable, even
+  //         though there is no JSON-RPC envelope to read a message from
+  //         here (HttpRejected, not BackendReported). Checked at 500 and
+  //         401, since a launch-gate bug could plausibly be status-code-
+  //         specific. -------------------------------------------------------
+  for (const status of [500, 401]) {
+    const httpErrorLaunches = [];
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "initialize") {
+            return sendJson(
+              res,
+              200,
+              { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+              { "MCP-Session-Id": `http-${status}-session` },
+            );
+          }
+          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          if (msg.method === "tools/call") {
+            res.writeHead(status, { "Content-Type": "text/plain" });
+            res.end(`backend says no (${status})`);
+            return;
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const httpErrorShim = new Shim({
+          url,
+          name: "test",
+          cachePath: join(cacheDir, `http-${status}.json`),
+          timeoutMs: 2_000,
+          launchEnabled: true,
+          appPath: "/fake/ReachableButHttpRejecting.app",
+          launchGraceMs: 150_000,
+          launcher: (appPath) => httpErrorLaunches.push(appPath),
+        });
+        const httpRejected = await httpErrorShim.handle({
+          jsonrpc: "2.0",
+          id: 32,
+          method: "tools/call",
+          params: { name: "x", arguments: {} },
+        });
+        assert.equal(httpErrorLaunches.length, 0, `an HTTP ${status} must never launch the app`);
+        assert.equal(httpRejected.result.isError, true);
+        assert.match(httpRejected.result.content[0].text, new RegExp(String(status)), "the real HTTP status must surface");
+        assert.doesNotMatch(
+          httpRejected.result.content[0].text,
+          /not reachable|is not reachable/i,
+          `HTTP ${status} must not be misreported as the app being down`,
+        );
+      },
+    );
+  }
+
+  // -- 7e4. N3: pagination must not corrupt the offline cache. Only the
+  //         first (uncursored) page is cached - fetching page two must not
+  //         overwrite it, and once the backend is gone, the offline
+  //         tools/list must serve the coherent first page, never page
+  //         two's slice masquerading as the complete set, and must not
+  //         claim more pages are fetchable (no stale nextCursor). ---------
+  const page1Tools = [{ name: "page1_tool" }];
+  const page2Tools = [{ name: "page2_tool" }];
+  const paginationCachePath = join(cacheDir, "pagination.json");
+  let paginationShim;
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "pagination-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/list") {
+          if (msg.params?.cursor === "page2") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: page2Tools } }); // last page, no nextCursor
+          }
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: page1Tools, nextCursor: "page2" } });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      paginationShim = new Shim({
+        url,
+        name: "test",
+        cachePath: paginationCachePath,
+        timeoutMs: 2_000,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const page1 = await paginationShim.handle({ jsonrpc: "2.0", id: 40, method: "tools/list", params: {} });
+      assert.deepEqual(page1.result.tools, page1Tools);
+      assert.equal(page1.result.nextCursor, "page2");
+      const page2 = await paginationShim.handle({
+        jsonrpc: "2.0",
+        id: 41,
+        method: "tools/list",
+        params: { cursor: "page2" },
+      });
+      assert.deepEqual(page2.result.tools, page2Tools);
+      assert.deepEqual(readCache(paginationCachePath), page1Tools, "cache must hold the first page, not the last-fetched page");
+    },
+  );
+  // The backend is gone now (withServer tore it down on return).
+  const offlineListing = await paginationShim.handle({ jsonrpc: "2.0", id: 42, method: "tools/list", params: {} });
+  assert.deepEqual(offlineListing.result.tools, page1Tools, "offline tools/list must serve the coherent first page, never page two's slice");
+  assert.equal(offlineListing.result.nextCursor, undefined, "offline listing must not claim more pages are fetchable");
+
   // -- 7f. stale-session retry happens EXACTLY ONCE against a permanently
   //        rejecting backend (a request counter, not just eventual
   //        success) -------------------------------------------------------
@@ -612,6 +729,15 @@ export async function selftest() {
     },
   );
 
+  // -- 7j. N1: a real spawn() failure in the launcher must not kill the
+  //        shim - through the REAL defaultLauncher, not the injected
+  //        launcher seam every other launch test above uses (that seam is
+  //        exactly what let this hide: it never exercises spawn()'s real
+  //        async 'error' event). See selftestLauncherErrorDoesNotCrash for
+  //        why PATH, not just a missing --app target, is what actually
+  //        reproduces it on this platform. ---------------------------------
+  await selftestLauncherErrorDoesNotCrash();
+
   // -- 8. process-level: one malformed stdin line must not kill the shim
   const initReply = await runChildAndGetReply(
     MCP_SIDING_PATH,
@@ -705,6 +831,73 @@ async function withServer(handler, fn) {
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+}
+
+// N1: proves a real spawn() failure inside the launcher does not kill the
+// shim process, through the REAL defaultLauncher - deliberately not the
+// injected launcher seam every other launch test in this file uses, since
+// that seam never touches spawn()'s real async 'error' event and is
+// exactly what let this bug hide. spawn() does not throw synchronously for
+// a command it can't run; the returned ChildProcess emits 'error'
+// asynchronously, and an EventEmitter's unhandled 'error' event kills the
+// whole process - which used to take the entire stdio server down on the
+// first tools/call that tried to launch a bad --app.
+//
+// On this platform defaultLauncher always spawns `open -a <path>`
+// (process.platform is "darwin" here, unconditionally) - `open` itself
+// exists, so a merely-nonexistent --app target would still spawn `open`
+// successfully; it would just print its own "app not found" to stderr
+// (ignored) and exit nonzero - no crash either way, and not a
+// reproduction of the actual bug. Breaking PATH so `open` itself can't be
+// resolved reproduces the real failure class instead: spawn() itself
+// failing (ENOENT), asynchronously, through the unmodified defaultLauncher.
+async function selftestLauncherErrorDoesNotCrash() {
+  const child = spawn(
+    process.execPath,
+    [
+      MCP_SIDING_PATH,
+      "--backend-url",
+      "http://127.0.0.1:1/mcp", // unreachable - forces downCallResult() to actually launch
+      "--name",
+      "test",
+      "--app",
+      "/definitely/does/not/exist/NoSuchApp.app",
+      "--launch",
+    ],
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PATH: "/definitely/not/a/real/path" } },
+  );
+  let out = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => (out += chunk));
+  let err = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => (err += chunk));
+  const exited = new Promise((resolvePromise) => child.on("exit", resolvePromise));
+
+  const waitFor = async (marker, deadlineMs) => {
+    const deadline = Date.now() + deadlineMs;
+    while (!out.includes(marker) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return out.includes(marker);
+  };
+
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 50, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+  assert.ok(await waitFor('"id":50', 5_000), `child never answered the launch-triggering tools/call (stderr: ${err})`);
+
+  // The launcher's spawn('open', ...) failure, if it fires, does so
+  // asynchronously - give it a moment to land, then prove the process is
+  // still alive (not just that it answered before the error could fire).
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(child.exitCode, null, `the shim process must not die from a launch failure (stderr: ${err})`);
+
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 51, method: "initialize", params: {} })}\n`);
+  const answeredAgain = await waitFor('"id":51', 5_000);
+  child.stdin.end();
+  await Promise.race([exited, new Promise((r) => setTimeout(r, 2_000))]);
+  if (child.exitCode == null) child.kill();
+
+  assert.ok(answeredAgain, `child died or stopped answering after the launch attempt (stderr: ${err})`);
 }
 
 // Spawns mcp-siding.mjs (at `scriptPath`) as a real child process, writes

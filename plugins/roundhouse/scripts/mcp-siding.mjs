@@ -194,6 +194,21 @@ class BackendReported extends Error {
   }
 }
 
+// A non-2xx HTTP response that is NOT the stale-session case (404) - a
+// real HTTP-level failure (401, 400, 500, ...) from a backend that DID
+// answer. Same reasoning as BackendReported, one layer down: reachability
+// is the distinction, not status code. If an HTTP response arrived at all,
+// the app is running, so this must never launch or be reported as
+// "not reachable" - only genuine transport failure (post()'s fetch/timeout
+// catch, below) may. Carries the raw status and a body snippet, since
+// there is no JSON-RPC envelope to read a code/message from here.
+class HttpRejected extends Error {
+  constructor(status, bodySnippet) {
+    super(`HTTP ${status}${bodySnippet ? `: ${bodySnippet}` : ""}`);
+    this.status = status;
+  }
+}
+
 // Per MCP streamable-HTTP: "If a server receives a request with an invalid
 // or expired session ID, the server MUST respond with 404." Only 404 is
 // classified Stale (worth a reconnect-and-retry); every other non-2xx
@@ -271,6 +286,16 @@ function defaultLauncher(appPath) {
     process.platform === "darwin"
       ? spawn("open", ["-a", appPath], { detached: true, stdio: "ignore" })
       : spawn(appPath, [], { detached: true, stdio: "ignore" });
+  // spawn() does not throw synchronously for a missing/non-executable
+  // path (ENOENT/EACCES) - the returned ChildProcess emits an 'error'
+  // event instead, asynchronously, well after this function (and
+  // downCallResult's try/catch around calling it) has already returned.
+  // An EventEmitter's unhandled 'error' event terminates the process, so a
+  // bad --app value used to take down the whole stdio server on the first
+  // tools/call that tried to launch - exactly the failure this shim
+  // exists to prevent. Best effort: nothing to do with a launch failure
+  // here: the next call re-evaluates reachability on its own regardless.
+  child.on("error", () => {});
   child.unref();
 }
 
@@ -336,7 +361,7 @@ export class Shim {
     }
     if (!res.ok) {
       if (STALE_HTTP_STATUSES.has(res.status)) throw new Stale(`HTTP ${res.status}`);
-      throw new Down(`HTTP ${res.status}`);
+      throw new HttpRejected(res.status, text.slice(0, 200));
     }
     let body;
     try {
@@ -385,7 +410,10 @@ export class Shim {
         if (body?.error) throw new BackendReported(body.error.code, body.error.message ?? "backend error");
         return body?.result ?? {};
       } catch (err) {
-        if (err instanceof BackendReported) throw err;
+        // Both mean "reachable, rejected" - the session/connection is
+        // fine, only this one call failed, so state is left untouched and
+        // neither ever gets a reconnect retry (that's only for Stale).
+        if (err instanceof BackendReported || err instanceof HttpRejected) throw err;
         this.connected = false;
         this.sid = null;
         this.protocolVersion = null;
@@ -400,12 +428,17 @@ export class Shim {
   async toolsList(params) {
     try {
       const result = await this.backend("tools/list", params);
-      // Guard the cache write on a real array so no future response shape
-      // surprise (an error already handled above, or just a malformed
-      // `tools` field) can blank a previously good cache. The live result
-      // itself passes through unchanged either way - e.g. nextCursor stays
-      // intact - this only ever touches what gets written to disk.
-      if (Array.isArray(result.tools)) writeCache(this.cachePath, result.tools);
+      // Guard the cache write on a real array (no future response shape
+      // surprise can blank a previously good cache) AND an uncursored
+      // (first-page) request - a paginated backend's page-two response
+      // would otherwise overwrite the cache with only that page's slice,
+      // discarding earlier pages and presenting a partial page as the
+      // complete offline tool set. The cache only ever stores the tools
+      // array itself (never nextCursor), so the offline path below never
+      // claims more pages are fetchable either. The live result passes
+      // through unchanged regardless of caching - e.g. nextCursor stays
+      // intact for the live caller - this only ever touches disk.
+      if (!params?.cursor && Array.isArray(result.tools)) writeCache(this.cachePath, result.tools);
       return result;
     } catch {
       // Never launches - clients call tools/list every session, and
@@ -429,6 +462,12 @@ export class Shim {
         return this.errorResult(
           err.code != null ? `${err.message} (backend error ${err.code})` : err.message,
         );
+      }
+      if (err instanceof HttpRejected) {
+        // Same reasoning, one layer down: an HTTP response arrived at all
+        // (401/400/500/...), which proves the app is running. Never
+        // launch, never say "not reachable" - surface the real status.
+        return this.errorResult(`${this.name} responded with ${err.message} - not a downtime issue, no restart needed.`);
       }
       return this.downCallResult();
     }
