@@ -214,6 +214,31 @@ export async function selftest() {
   // installer always passes it explicitly, and the cache is keyed on it.
   assert.throws(() => buildShimFromArgs({ "backend-url": "http://x" }), /--backend-url and --name are required/);
   assert.throws(() => buildShimFromArgs({ name: "t" }), /--backend-url and --name are required/);
+  // N30: --backend-url must parse as an http(s) URL, validated at startup
+  // (before the stdio server even opens) rather than truthiness alone - a
+  // schemeless value like "127.0.0.1:27182/mcp" (missing only "http://",
+  // an easy thing to type or paste) would otherwise pass, let local
+  // initialize complete, and fail every subsequent fetch - misclassified
+  // as Indeterminate ("may have run") when nothing was ever sent, and
+  // suppressing launch-on-demand too.
+  assert.throws(
+    () => buildShimFromArgs({ "backend-url": "127.0.0.1:27182/mcp", name: "t" }),
+    /--backend-url must be a valid URL/,
+    "a schemeless value must be rejected",
+  );
+  assert.throws(
+    () => buildShimFromArgs({ "backend-url": "ftp://127.0.0.1:27182/mcp", name: "t" }),
+    /--backend-url must use http: or https:/,
+    "a non-HTTP scheme must be rejected",
+  );
+  assert.throws(
+    () => buildShimFromArgs({ "backend-url": "not a url at all", name: "t" }),
+    /--backend-url must be a valid URL/,
+    "unparseable junk must be rejected",
+  );
+  // Valid http and https values must keep starting normally.
+  assert.equal(buildShimFromArgs({ "backend-url": "http://127.0.0.1:27182/mcp", name: "t" }).url, "http://127.0.0.1:27182/mcp");
+  assert.equal(buildShimFromArgs({ "backend-url": "https://example.com/mcp", name: "t" }).url, "https://example.com/mcp");
   // --launch=false must actually disable launch (not fall through to
   // Boolean(appPath)), and --no-launch=false must not disable it.
   const launchFalseShim = buildShimFromArgs({ "backend-url": "http://x", name: "t", app: "/A.app", launch: false });
@@ -999,6 +1024,14 @@ export async function selftest() {
   //         assertable when this machine has no real node at the
   //         hardcoded fallback paths. -------------------------------------
   await selftestNodeResolver();
+
+  // -- 7j4. N30: an invalid --backend-url must exit non-zero before the
+  //         stdio server ever opens - not just that buildShimFromArgs
+  //         throws (asserted directly above), but that main() actually
+  //         wires that into "no readline interface, no reply to a
+  //         message sent regardless." A real subprocess is the only way
+  //         to prove that end to end. ---------------------------------
+  await selftestInvalidBackendUrlExitsBeforeStdio();
 
   // -- 7j2. N13: the OTHER real macOS launch-failure shape - `open -a
   //         <bad path>` spawns fine and simply exits nonzero, which
@@ -2217,6 +2250,36 @@ export async function selftest() {
     globalThis.fetch = originalFetch;
   }
 
+  // -- 7w5. N30: a URL-parse failure at REQUEST time (not just the
+  //         buildShimFromArgs startup check above) must classify as a
+  //         configuration error, not Indeterminate - nothing was ever
+  //         transmitted, so "the operation may have run" would be
+  //         backwards. Constructs a Shim directly with an invalid URL,
+  //         bypassing buildShimFromArgs entirely, to reach this route -
+  //         the real fetch() genuinely rejects on a malformed URL with no
+  //         mocking needed. Never launches either: restarting the app
+  //         cannot fix a broken URL. -----------------------------------
+  const badUrlLaunches = [];
+  const badUrlShim = new Shim({
+    url: "127.0.0.1:27182/mcp", // schemeless - fetch() itself rejects this
+    name: "test",
+    cachePath: join(cacheDir, "bad-url.json"),
+    timeoutMs: 2_000,
+    launchEnabled: true,
+    appPath: "/fake/BadUrl.app",
+    launchGraceMs: 150_000,
+    launcher: (appPath) => badUrlLaunches.push(appPath),
+  });
+  const badUrl = await badUrlShim.handle({ jsonrpc: "2.0", id: 110, method: "tools/call", params: {} });
+  assert.equal(badUrl.result.isError, true);
+  assert.doesNotMatch(
+    badUrl.result.content[0].text,
+    /not reachable|is not reachable|still be running|do not retry/i,
+    "a malformed backend URL must not be reported as downtime or as an indeterminate retry risk",
+  );
+  assert.match(badUrl.result.content[0].text, /backend-url/i, "must point at the --backend-url configuration");
+  assert.equal(badUrlLaunches.length, 0, "a malformed backend URL must never launch - restarting the app cannot fix it");
+
   // -- 8. process-level: one malformed stdin line must not kill the shim
   const initReply = await runChildAndGetReply(
     MCP_SIDING_PATH,
@@ -2557,6 +2620,38 @@ async function selftestNodeResolver() {
   }
 }
 
+// N30: buildShimFromArgs throwing (asserted directly, unit-level, above)
+// only proves the validation rule exists - this proves main() actually
+// wires it into "process exits non-zero, and the stdio server never
+// opens at all," by spawning the real script with an invalid
+// --backend-url, writing a real initialize message regardless, and
+// confirming it never gets a reply.
+async function selftestInvalidBackendUrlExitsBeforeStdio() {
+  const child = spawn(
+    process.execPath,
+    [MCP_SIDING_PATH, "--backend-url", "127.0.0.1:27182/mcp", "--name", "test"],
+    { stdio: ["pipe", "pipe", "pipe"] },
+  );
+  let out = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => (out += chunk));
+  let err = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => (err += chunk));
+  const exited = new Promise((resolvePromise) => child.on("exit", resolvePromise));
+
+  // Sent regardless of whether the process is even listening yet - if the
+  // stdio server had opened, this would get a reply.
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 61, method: "initialize", params: {} })}\n`);
+
+  const exitCode = await Promise.race([exited, new Promise((r) => setTimeout(() => r("timeout"), 5_000))]);
+  assert.notEqual(exitCode, "timeout", `child never exited on an invalid --backend-url (stderr: ${err})`);
+  assert.notEqual(exitCode, 0, "an invalid --backend-url must exit non-zero");
+  assert.match(err, /--backend-url must be a valid URL/, "the diagnostic must name the problem");
+  assert.equal(out, "", "no reply may have been sent - the stdio server must never have opened");
+  if (child.exitCode == null) child.kill();
+}
+
 // N13: `open -a <bad path>` on macOS spawns fine and exits nonzero - unlike
 // selftestLauncherErrorDoesNotCrash, PATH is left intact so `open` itself
 // resolves and actually runs, reproducing that shape rather than a spawn()
@@ -2771,12 +2866,20 @@ async function selftestResolver() {
   assert.equal(h.status, 0);
   assert.equal(h.stdout, devScript, "MCP_SIDING_PATH must win over CLAUDE_PLUGIN_ROOT");
 
-  // -- i. MCP_SIDING_PATH pointed at a nonexistent file falls through to the
-  //       normal branches rather than failing closed - only an *existing*
-  //       file is honored as the override. ---------------------------------
-  const i = runResolver({ HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot, MCP_SIDING_PATH: join(devDir, "nope.mjs") });
-  assert.equal(i.status, 0);
-  assert.equal(i.stdout, pluginRootScript, "a missing MCP_SIDING_PATH must fall through, not fail");
+  // -- i. N29: MCP_SIDING_PATH pointed at a nonexistent file must fail
+  //       closed, NOT fall through to the normal branches - an explicit
+  //       pin is an assertion of intent, and silently running an installed
+  //       build while the user believes they are exercising their working
+  //       tree is exactly the misleading result dev mode exists to avoid.
+  //       A valid CLAUDE_PLUGIN_ROOT fallback is deliberately present here
+  //       (pluginRootScript, from case g/h above) - a fallback that would
+  //       otherwise succeed is what makes this assertion meaningful. -----
+  const missingPath = join(devDir, "nope.mjs");
+  const i = runResolver({ HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot, MCP_SIDING_PATH: missingPath });
+  assert.notEqual(i.status, 0, "a nonexistent MCP_SIDING_PATH must fail closed, not exit 0");
+  assert.notEqual(i.stdout, pluginRootScript, "a nonexistent MCP_SIDING_PATH must not fall through to a real fallback");
+  assert.match(i.stderr, /MCP_SIDING_PATH/, "the diagnostic must name the override");
+  assert.ok(i.stderr.includes(missingPath), "the diagnostic must name the missing path itself");
 
   // -- j. unset MCP_SIDING_PATH behaves exactly as before this branch
   //       existed - already implicitly proven by every case above (none set

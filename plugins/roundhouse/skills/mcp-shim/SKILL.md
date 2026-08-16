@@ -143,6 +143,15 @@ This pins one exact path and will not follow plugin updates — the opposite
 of a normal install, and deliberately so; it is the one named exception to
 the "never register a literal path" prohibition above.
 
+The pin fails closed: if `MCP_SIDING_PATH` is set but does not name an
+existing file (renamed, deleted, an unmounted volume), the resolver exits
+non-zero with a diagnostic naming the path rather than silently falling
+back to an installed build. An explicit override is an assertion of
+intent — running a published version while the user believes they are
+exercising their working tree would be exactly the misleading result this
+mode exists to avoid. Only leaving the variable unset (or empty) falls
+through to the normal resolution chain.
+
 ## Config flags
 
 All of the following are `mcp-siding.mjs` CLI flags — the installer's job is

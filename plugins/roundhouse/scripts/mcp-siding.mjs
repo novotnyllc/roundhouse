@@ -48,11 +48,17 @@ export const PROTOCOL_VERSION = "2025-06-18";
 // breaks the moment the old version is pruned. Resolving at spawn time
 // instead means every registration keeps working across plugin updates with
 // no reinstall. Tried in order, first hit wins:
-//   0. $MCP_SIDING_PATH, if set and naming an existing file - the explicit
-//      local-development override (see the skill's "Local development"
-//      section): register a dev instance with this env var pinned to a
-//      working checkout, distinct from a normal install, which resolves
-//      through the branches below instead.
+//   0. $MCP_SIDING_PATH, if set - the explicit local-development override
+//      (see the skill's "Local development" section): register a dev
+//      instance with this env var pinned to a working checkout, distinct
+//      from a normal install, which resolves through the branches below
+//      instead. An explicit pin is an assertion of intent, not a hint: if
+//      it is set but names a file that does not exist (renamed, deleted,
+//      an unmounted volume), this fails closed rather than silently
+//      falling through to an installed build - running a published
+//      version while the user believes they are exercising their working
+//      tree is exactly the misleading result dev mode exists to avoid.
+//      Only UNSET (or empty) falls through to the branches below.
 //   1. $CLAUDE_PLUGIN_ROOT/scripts/mcp-siding.mjs - unpopulated for
 //      user-registered servers today (verified), kept first for any future
 //      plugin-declared registration where it would be.
@@ -92,7 +98,10 @@ export const PROTOCOL_VERSION = "2025-06-18";
 // /bin/sh unexpanded. Every expansion is double-quoted since $HOME (and in
 // principle CLAUDE_PLUGIN_ROOT) may contain spaces.
 export const RESOLVER_SH = `p="$MCP_SIDING_PATH"
-[ -n "$p" ] && [ -f "$p" ] || p=""
+if [ -n "$p" ] && [ ! -f "$p" ]; then
+  echo "mcp-siding: \\$MCP_SIDING_PATH is set to '$p' but that file does not exist - this is an explicit local-development override, not a hint, so it must name a real file rather than silently falling back to an installed build." >&2
+  exit 1
+fi
 if [ -z "$p" ]; then
   p="$CLAUDE_PLUGIN_ROOT/scripts/mcp-siding.mjs"
   [ -n "$CLAUDE_PLUGIN_ROOT" ] && [ -f "$p" ] || p=""
@@ -321,6 +330,19 @@ class Indeterminate extends Error {}
 // purpose: understating downtime is safe, overstating it risks a launch
 // and a retry that duplicates a mutation.
 const PROVEN_UNDELIVERED_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH", "EAI_AGAIN"]);
+
+// The configured backend URL itself is malformed, so fetch() rejected
+// before anything was ever transmitted - not even a connection attempt.
+// This should be unreachable in practice: buildShimFromArgs validates
+// --backend-url at startup, before the stdio server even opens (see N30
+// there). Guarded here anyway for any other construction path (e.g. a
+// Shim built directly with a raw URL string, bypassing that check).
+// Neither Down nor Indeterminate fits: Down's "may launch" is pointless
+// here - repeatedly launching the app cannot fix a malformed URL, unlike
+// a genuine down-app case - and Indeterminate would say "the operation
+// may have run," which is backwards when nothing was ever sent. Never
+// launches, never retried, surfaces the real configuration problem.
+class ConfigurationError extends Error {}
 
 // Per MCP streamable-HTTP: "If a server receives a request with an invalid
 // or expired session ID, the server MUST respond with 404." Only 404 is
@@ -749,6 +771,12 @@ export class Shim {
       // A parse failure (malformed JSON/SSE) means a response DID arrive -
       // reachable, not downtime - see MalformedResponse.
       if (err instanceof MalformedResponse) throw err;
+      // A malformed backend URL means fetch() rejected before anything
+      // was transmitted at all - see ConfigurationError for why this is
+      // neither Down nor Indeterminate.
+      if (err?.cause?.code === "ERR_INVALID_URL" || err?.code === "ERR_INVALID_URL") {
+        throw new ConfigurationError(`the configured backend URL is invalid: ${err.message}`);
+      }
       // Classify by whether delivery is PROVEN, not by whether WE aborted -
       // see Indeterminate/PROVEN_UNDELIVERED_CODES above for the reasoning.
       // Only two call sites ever abort this controller (the timer just
@@ -873,17 +901,20 @@ export class Shim {
           // BackendReported/HttpRejected/MalformedResponse mean "reachable";
           // Cancelled means "we stopped waiting, the backend did not go
           // away"; Indeterminate means "we don't know, and must not guess
-          // by resetting state" - none of the five is proof the session
-          // itself is bad, so session/connection state is left untouched
-          // for all of them, and none ever gets a reconnect retry (that's
-          // only for Stale). If the session really did go bad, the next
-          // call's own Stale classification (a real 404) catches it then.
+          // by resetting state"; ConfigurationError means "nothing was ever
+          // sent, and reconnecting won't help - the URL itself is broken."
+          // None of the six is proof the SESSION itself is bad, so
+          // session/connection state is left untouched for all of them,
+          // and none ever gets a reconnect retry (that's only for Stale).
+          // If the session really did go bad, the next call's own Stale
+          // classification (a real 404) catches it then.
           if (
             err instanceof BackendReported ||
             err instanceof HttpRejected ||
             err instanceof Cancelled ||
             err instanceof MalformedResponse ||
-            err instanceof Indeterminate
+            err instanceof Indeterminate ||
+            err instanceof ConfigurationError
           )
             throw err;
           this.connected = false;
@@ -1014,6 +1045,14 @@ export class Shim {
           `${this.name}: ${err.message}. Do not retry automatically, especially if it was a mutating action - ` +
             "check whether it already completed before trying again.",
         );
+      }
+      if (err instanceof ConfigurationError) {
+        // Nothing was ever transmitted - fetch() rejected on the URL
+        // itself, before any connection attempt. Never launch (a broken
+        // URL is not fixed by restarting the app) and never phrase this
+        // as a timing/retry issue - it is a registration problem the user
+        // needs to fix.
+        return this.errorResult(`${this.name}: ${err.message} - check the --backend-url this server was registered with.`);
       }
       if (err instanceof Cancelled) {
         // The client asked us to stop waiting - not downtime, never
@@ -1224,6 +1263,29 @@ export function buildShimFromArgs(flags) {
   // way would silently collide on one cache file instead of failing loudly.
   if (!url || !name) {
     throw new Error("--backend-url and --name are required");
+  }
+  // Validate at startup, before the stdio server opens - a schemeless
+  // value (127.0.0.1:27182/mcp, an easy thing to type or paste, missing
+  // only "http://") would otherwise pass this truthiness check, let local
+  // MCP initialize complete, and fail every subsequent fetch when it
+  // cannot be parsed as a URL. Two things make that worse than a plain
+  // error: post()'s catch would classify a URL-parse failure as
+  // Indeterminate (see that class) - "the operation may have run" - when
+  // in fact nothing was ever sent, precisely backwards; and it suppresses
+  // launch-on-demand the same way, leaving the user with neither a
+  // working shim nor a useful diagnostic. Same fail-closed posture as the
+  // resolvers: reject anything that does not parse as an http(s) URL here,
+  // before the server ever starts.
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    throw new Error(`--backend-url must be a valid URL - got ${JSON.stringify(url)} (expected e.g. http://127.0.0.1:27182/mcp)`);
+  }
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    throw new Error(
+      `--backend-url must use http: or https: - got ${JSON.stringify(url)} (protocol was ${parsedUrl.protocol})`,
+    );
   }
   const appPath = flags.app ?? null;
   const timeoutMs = parsePositiveNumber(flags.timeout ?? 180_000, "timeout");
