@@ -17,7 +17,7 @@
 //   node mcp-siding.mjs --selftest   (thin delegation to this file)
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, writeFile, copyFile, chmod, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, copyFile, chmod, rm, readFile } from "node:fs/promises";
 import { realpathSync, accessSync, constants as fsConstants } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -1025,6 +1025,16 @@ export async function selftest() {
   //         hardcoded fallback paths. -------------------------------------
   await selftestNodeResolver();
 
+  // -- 7j3b. N32: SKILL.md's install instructions must resolve a usable
+  //          node too, not assume bare `node` works - a self-contained
+  //          harness with no node on PATH fails the install step before
+  //          --print-shim-script can even run, exactly the case
+  //          NODE_RESOLVER_SH exists to handle at spawn time. Extracts
+  //          and runs the ACTUAL documented snippet (marked in SKILL.md,
+  //          not a reimplementation) so a drift between the doc and this
+  //          test fails loudly rather than silently. --------------------
+  await selftestInstallNodeResolverSnippet();
+
   // -- 7j4. N30: an invalid --backend-url must exit non-zero before the
   //         stdio server ever opens - not just that buildShimFromArgs
   //         throws (asserted directly above), but that main() actually
@@ -1374,6 +1384,108 @@ export async function selftest() {
       assert.equal(queuedCancelToolCallCount, 1, "B must never reach the backend - only A's tools/call should arrive");
     },
   );
+
+  // -- 7l3. N33: the client closing stdin (readline's 'close') must clean
+  //         up rather than leave the process hanging on the outstanding
+  //         fetch/timer - abort the in-flight call, best-effort forward
+  //         notifications/cancelled for it (reusing cancel()'s existing
+  //         machinery), and exit promptly. A request counter on the fake
+  //         backend proves the forward actually arrives, not just that
+  //         the process exits. -----------------------------------------
+  let disconnectCancelledForwardReceived = null;
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "disconnect-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "notifications/cancelled") {
+          disconnectCancelledForwardReceived = msg.params;
+          return sendJson(res, 200, undefined);
+        }
+        if (msg.method === "tools/call") {
+          res.writeHead(200, { "Content-Type": "application/json" }); // stall - deliberately never end()
+          return;
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const child = spawn(process.execPath, [MCP_SIDING_PATH, "--backend-url", url, "--name", "test", "--timeout", "60000"], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let err = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => (err += chunk));
+      const exited = new Promise((resolvePromise) => child.on("exit", resolvePromise));
+
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 90, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+      // Give the call a moment to actually reach the stalling backend and
+      // register in inFlight before disconnecting.
+      await new Promise((r) => setTimeout(r, 300));
+
+      const disconnectedAt = Date.now();
+      child.stdin.end();
+      const exitResult = await Promise.race([exited, new Promise((r) => setTimeout(() => r("timeout"), 5_000))]);
+      assert.notEqual(exitResult, "timeout", `process never exited after stdin closed with a call in flight (stderr: ${err})`);
+      assert.ok(
+        Date.now() - disconnectedAt < 5_000,
+        "disconnecting must exit promptly, not wait out the 60s tools/call timeout",
+      );
+      assert.equal(err, "", `shutdown must not throw on the way out (stderr: ${err})`);
+
+      await new Promise((r) => setTimeout(r, 100)); // the forward to the backend is fire-and-forget
+      assert.deepEqual(
+        disconnectCancelledForwardReceived,
+        { requestId: 1, reason: "client disconnected" },
+        "the backend must receive the forwarded notifications/cancelled for the in-flight call",
+      );
+    },
+  );
+
+  // -- 7l4. N33: a disconnect with no active call must still exit cleanly -
+  //         nothing to cancel, no session to release since none was ever
+  //         established (initialize is answered locally; nothing here
+  //         ever sends a real message at all). ----------------------------
+  const idleChild = spawn(process.execPath, [MCP_SIDING_PATH, "--backend-url", "http://127.0.0.1:1/mcp", "--name", "test"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let idleErr = "";
+  idleChild.stderr.setEncoding("utf8");
+  idleChild.stderr.on("data", (chunk) => (idleErr += chunk));
+  const idleExited = new Promise((resolvePromise) => idleChild.on("exit", resolvePromise));
+  idleChild.stdin.end(); // never sent a single message - nothing was ever in flight, no session was ever established
+  const idleExitResult = await Promise.race([idleExited, new Promise((r) => setTimeout(() => r("timeout"), 5_000))]);
+  assert.notEqual(idleExitResult, "timeout", `idle process never exited after stdin closed (stderr: ${idleErr})`);
+  assert.equal(idleErr, "", `idle disconnect must not throw (stderr: ${idleErr})`);
+
+  // -- 7l5. N33: a disconnect while the backend is already unreachable
+  //         (ECONNREFUSED, not merely stalled) must still exit promptly
+  //         and must not throw - shutdown()'s own best-effort cleanup
+  //         (the cancellation forward and the session-release DELETE)
+  //         can itself hit a dead connection, and that must be swallowed
+  //         too, not surface as an unhandled rejection on the way out.
+  //         No artificial delay before disconnecting, to maximize the
+  //         chance shutdown() races the still-settling connection attempt
+  //         rather than waiting for it to finish first. -----------------
+  const refusedChild = spawn(process.execPath, [MCP_SIDING_PATH, "--backend-url", "http://127.0.0.1:65533/mcp", "--name", "test"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let refusedErr = "";
+  refusedChild.stderr.setEncoding("utf8");
+  refusedChild.stderr.on("data", (chunk) => (refusedErr += chunk));
+  const refusedExited = new Promise((resolvePromise) => refusedChild.on("exit", resolvePromise));
+  refusedChild.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 91, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+  refusedChild.stdin.end();
+  const refusedExitResult = await Promise.race([refusedExited, new Promise((r) => setTimeout(() => r("timeout"), 5_000))]);
+  assert.notEqual(refusedExitResult, "timeout", `process against an unreachable backend never exited (stderr: ${refusedErr})`);
+  assert.equal(refusedErr, "", `disconnect against an unreachable backend must not throw (stderr: ${refusedErr})`);
 
   // -- 7m. N5: a backend that sends the matching SSE response and then
   //        holds the stream open (never closes) must resolve promptly -
@@ -2363,7 +2475,20 @@ function getFreePort() {
 // backend-behavior test below needs (unlike the 7a recovery test, which
 // specifically needs a port that starts out *not* listening).
 async function withServer(handler, fn) {
-  const server = createServer(handler);
+  const server = createServer((req, res) => {
+    // A shim's shutdown() sends a best-effort session-release DELETE with
+    // no body when the client disconnects (see N33) - real MCP backends
+    // handle a bodyless DELETE fine; these fixture handlers are shaped
+    // around POST-with-a-JSON-body and would otherwise crash trying to
+    // parse an empty DELETE body as JSON. Handled once, here, rather than
+    // in every individual fixture.
+    if (req.method === "DELETE") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    handler(req, res);
+  });
   const port = await new Promise((resolve, reject) => {
     server.on("error", reject);
     server.listen(0, "127.0.0.1", () => resolve(server.address().port));
@@ -2658,6 +2783,87 @@ async function selftestNodeResolver() {
     }
   } finally {
     await rm(stubNodeHome, { recursive: true, force: true });
+  }
+}
+
+// N32: extracts the ACTUAL bash snippet documented in SKILL.md's "Install
+// a server" section (marked with HTML comments, not a reimplementation of
+// it) and runs it for real via /bin/sh, so a future edit that lets the doc
+// drift from NODE_RESOLVER_SH's own candidate list fails this test rather
+// than surfacing only as an install that silently uses a different node
+// than the spawned server will. SKILL_DIR is set the same way the skill
+// itself instructs an agent to set it - the real directory containing
+// SKILL.md, so "$SKILL_DIR/../../scripts/mcp-siding.mjs" resolves to the
+// real mcp-siding.mjs.
+async function selftestInstallNodeResolverSnippet() {
+  const skillMdPath = join(dirname(MCP_SIDING_PATH), "..", "skills", "mcp-shim", "SKILL.md");
+  const skillMd = await readFile(skillMdPath, "utf8");
+  const match = skillMd.match(
+    /<!-- mcp-siding-selftest: node-resolver-install-snippet:start -->\n```bash\n([\s\S]*?)\n```\n<!-- mcp-siding-selftest: node-resolver-install-snippet:end -->/,
+  );
+  assert.ok(match, `SKILL.md's node-resolver install snippet marker not found at ${skillMdPath} - did the doc structure change?`);
+  const snippet = match[1]
+    .replaceAll("<URL>", "http://127.0.0.1:1/mcp")
+    .replaceAll("<NAME>", "test")
+    .replaceAll('"<APP_PATH>"', '""');
+
+  const skillDir = join(dirname(MCP_SIDING_PATH), "..", "skills", "mcp-shim");
+  const realNode = process.execPath;
+  const brokenPath = "/definitely/not/a/real/path";
+  const baseEnv = { ...process.env, SKILL_DIR: skillDir, PATH: brokenPath, MCP_SIDING_NODE: "" };
+
+  // -- node absent from PATH but present at a documented fallback (asdf's
+  //    default shim, HOME-relative and so fully controllable in a test) -
+  //    the documented install command must still produce a valid script. --
+  const fakeHome = await mkdtemp(join(tmpdir(), "mcp-siding-install-node-"));
+  try {
+    const asdfShimDir = join(fakeHome, ".asdf", "shims");
+    await mkdir(asdfShimDir, { recursive: true });
+    const asdfNodePath = join(asdfShimDir, "node");
+    await copyFile(realNode, asdfNodePath);
+    await chmod(asdfNodePath, 0o755);
+    const withFallback = spawnSync("/bin/sh", ["-c", `${snippet}\nprintf '%s' "$SCRIPT"`], {
+      env: { ...baseEnv, HOME: fakeHome },
+      encoding: "utf8",
+    });
+    assert.equal(withFallback.status, 0, `install snippet failed with a usable fallback node (stderr: ${withFallback.stderr})`);
+    assert.match(withFallback.stdout, /exec "\$node_bin"/, "the documented install command must still produce a valid registration script");
+  } finally {
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+
+  // -- no usable runtime anywhere: must fail with the same CLASS of
+  //    diagnostic as the runtime resolver (naming fetch/ReadableStream),
+  //    not a bare "command not found". Same real-system-path caveat as
+  //    the runtime resolver's own "none available" tests: only
+  //    assertable when this machine has no real node at the hardcoded
+  //    fallback paths. -----------------------------------------------
+  const hardcodedFallbacks = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"];
+  const anyHardcodedFallbackExists = hardcodedFallbacks.some((p) => {
+    try {
+      accessSync(p, fsConstants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (anyHardcodedFallbackExists) {
+    process.stderr.write(
+      "  (skipping N32 'no node anywhere' install-snippet assertion - this machine has a real node at one of the hardcoded fallback paths)\n",
+    );
+    return;
+  }
+  const emptyHome = await mkdtemp(join(tmpdir(), "mcp-siding-install-nonode-"));
+  try {
+    const noneResult = spawnSync("/bin/sh", ["-c", snippet], { env: { ...baseEnv, HOME: emptyHome }, encoding: "utf8" });
+    assert.notEqual(noneResult.status, 0, "the install snippet must fail closed when no node resolves anywhere");
+    assert.match(
+      noneResult.stderr,
+      /no node with global fetch\/ReadableStream/i,
+      "the install snippet must fail with the same class of diagnostic as the runtime resolver, not a bare 'command not found'",
+    );
+  } finally {
+    await rm(emptyHome, { recursive: true, force: true });
   }
 }
 

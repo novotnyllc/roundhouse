@@ -95,16 +95,38 @@ unavailable — a down `tools/call` then always returns the plain "not
 reachable, ask the user to open the app" message.
 
 Build the registration script once, from the currently-loaded plugin
-checkout:
+checkout. Resolve a usable `node` first, the same way `NODE_RESOLVER_SH`
+resolves one for the spawned server at runtime — bare `node` can fail
+before the script is even generated on a host with a self-contained
+harness or no `node` on PATH, exactly the case that resolver exists to
+handle. This candidate list mirrors `NODE_RESOLVER_SH` in
+`scripts/mcp-siding.mjs` — keep both in sync:
 
+<!-- mcp-siding-selftest: node-resolver-install-snippet:start -->
 ```bash
-SCRIPT=$(node "$SKILL_DIR/../../scripts/mcp-siding.mjs" --print-shim-script \
+node_bin=""
+for node_candidate in "$MCP_SIDING_NODE" "$(command -v node 2>/dev/null)" \
+  /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node \
+  "$HOME/.volta/bin/node" "$HOME/.asdf/shims/node"; do
+  [ -n "$node_candidate" ] && [ -x "$node_candidate" ] || continue
+  if "$node_candidate" -e 'if (typeof fetch !== "function" || typeof ReadableStream !== "function") process.exit(1)' >/dev/null 2>&1; then
+    node_bin=$node_candidate
+    break
+  fi
+done
+[ -n "$node_bin" ] || { echo "mcp-siding: no node with global fetch/ReadableStream (this shim needs Node 18+) found on this host - cannot build the registration script. Install a newer Node or set \$MCP_SIDING_NODE." >&2; exit 1; }
+
+SCRIPT=$("$node_bin" "$SKILL_DIR/../../scripts/mcp-siding.mjs" --print-shim-script \
   --backend-url <URL> --name <NAME> --app "<APP_PATH>")
 ```
+<!-- mcp-siding-selftest: node-resolver-install-snippet:end -->
 
 Omit `--app` for a backend with no launchable app. `--print-shim-script`
 only emits flags you pass it explicitly — `mcp-siding.mjs`'s own defaults
-handle the rest at runtime.
+handle the rest at runtime. Using the same `$node_bin` to generate the
+script and `NODE_RESOLVER_SH` to run it means install and runtime agree
+on what counts as a usable runtime — never install successfully with one
+node and then spawn under a different one.
 
 Then, per harness — state the exact command before running it, and always
 verify afterward. `"$SCRIPT"` must be passed as captured, as a single

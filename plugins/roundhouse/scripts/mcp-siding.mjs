@@ -194,6 +194,16 @@ fi`;
 // qualifies, exit non-zero with a diagnostic naming what was tried AND
 // what was rejected (and why), rather than exec'ing an empty command or
 // starting a server that is guaranteed to fail on its first real request.
+//
+// SKILL.md's "Install a server" section duplicates this exact candidate
+// list and probe (as a standalone snippet run before `--print-shim-script`
+// itself, which needs a working node just to be generated at all - the
+// same bootstrap problem this resolver exists to solve at spawn time).
+// Keep the two in sync; mcp-siding.selftest.mjs extracts and runs the
+// SKILL.md copy directly against this list's own test scenarios, so a
+// drift between them fails the test suite rather than surfacing only as
+// an install succeeding under one node and the server spawning under
+// another.
 export const NODE_RESOLVER_SH = `node_ok() {
   [ -x "$1" ] || return 1
   "$1" -e 'if (typeof fetch !== "function" || typeof ReadableStream !== "function") process.exit(1)' >/dev/null 2>&1
@@ -989,6 +999,34 @@ export class Shim {
     }
   }
 
+  // Best-effort cleanup when the transport closes (the client disconnected
+  // - see main()'s readline 'close' handler): cancels every in-flight
+  // request the same way an explicit client cancellation would, reusing
+  // cancel()'s existing abort-and-forward machinery rather than a second
+  // one, then releases the backend session (a streamable-HTTP DELETE), if
+  // one was established. Same honesty as cancel()'s own comment: this
+  // tells a COOPERATING backend to stop - a backend that ignores the
+  // forwarded notification (or this DELETE) keeps running the operation
+  // and holding the session regardless; this shim cannot force either.
+  //
+  // Bounded by `deadlineMs` and never throws: best-effort means bounded -
+  // shutdown must not block indefinitely on a backend that may already be
+  // gone, and an unhandled rejection on the way out is worse than the
+  // orphan it replaces, so every failure here is swallowed, not surfaced.
+  async shutdown(deadlineMs = 2_000) {
+    const cleanup = (async () => {
+      for (const clientRequestId of [...this.inFlight.keys()]) {
+        this.cancel(clientRequestId, "client disconnected");
+      }
+      if (this.connected && this.sid) {
+        const headers = { "MCP-Session-Id": this.sid };
+        if (this.protocolVersion) headers["MCP-Protocol-Version"] = this.protocolVersion;
+        await fetch(this.url, { method: "DELETE", headers });
+      }
+    })().catch(() => {});
+    await Promise.race([cleanup, new Promise((r) => setTimeout(r, deadlineMs))]);
+  }
+
   // -- message handlers -----------------------------------------------------
 
   async toolsList(params, clientRequestId) {
@@ -1331,6 +1369,17 @@ function main(flags) {
     process.exit(2);
   }
   const rl = createInterface({ input: process.stdin, terminal: false });
+
+  // The client closing stdin (readline's 'close') is the only signal a
+  // stdio transport gets for "the client disconnected." Without this, an
+  // active tools/call's outstanding fetch and its timer kept the process
+  // alive, the backend could keep working unaware nobody is listening
+  // anymore, and any allocated MCP session was never released. See
+  // shim.shutdown() for what cleanup does and does not achieve, and why
+  // it is bounded rather than awaited indefinitely.
+  rl.on("close", () => {
+    shim.shutdown().finally(() => process.exit(0));
+  });
 
   // Process lines strictly in order: concurrent handling could race two
   // in-flight requests over the same session id (this.sid).
