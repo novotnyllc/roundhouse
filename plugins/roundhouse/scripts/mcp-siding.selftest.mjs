@@ -27,6 +27,7 @@ import assert from "node:assert/strict";
 import {
   Shim,
   parseBody,
+  readSseUntilMatch,
   writeCache,
   readCache,
   RESOLVER_SH,
@@ -61,6 +62,33 @@ export async function selftest() {
     null,
     "a response for a different id than expected must not be picked up",
   );
+
+  // -- 1c. N5: readSseUntilMatch must parse an event split across chunk
+  //        boundaries - a chunk boundary is not an event boundary, and
+  //        nothing before this asserted that directly. Split mid-value,
+  //        not just mid-line, to prove the buffering is byte-level, not
+  //        line-level. Tested directly against a synthetic stream (no real
+  //        server involved) - end-to-end coverage of the same reader over
+  //        a real socket is 7m/7n below. -----------------------------------
+  function fakeReadableStream(chunks) {
+    let i = 0;
+    return {
+      getReader() {
+        return {
+          async read() {
+            if (i >= chunks.length) return { done: true, value: undefined };
+            return { done: false, value: new TextEncoder().encode(chunks[i++]) };
+          },
+          async cancel() {},
+        };
+      },
+    };
+  }
+  const splitMatch = await readSseUntilMatch(
+    fakeReadableStream(['data: {"jsonrpc":"2.0","id":9,"resu', 'lt":{"ok":true}}\n\n']),
+    9,
+  );
+  assert.deepEqual(splitMatch, { jsonrpc: "2.0", id: 9, result: { ok: true } }, "an event split across two chunks must parse");
 
   // -- 1b. CLI parsing (C7/C8/C9 regressions) ------------------------------
   // --no-launch=false / --launch=false must be real booleans, not truthy
@@ -886,6 +914,198 @@ export async function selftest() {
       const cancelledReply = lines.find((l) => l.id === 70);
       assert.equal(cancelledReply.result.isError, true);
       assert.match(cancelledReply.result.content[0].text, /cancel/i);
+    },
+  );
+
+  // -- 7m. N5: a backend that sends the matching SSE response and then
+  //        holds the stream open (never closes) must resolve promptly -
+  //        MCP streamable HTTP explicitly permits keeping the stream open
+  //        for later events, and reading must not wait for EOF to see it.
+  //        A long timeout proves it was the incremental match, not the
+  //        timeout, that ended the wait; the launcher spy proves an
+  //        already-succeeded call is never misreported as downtime. -------
+  const heldOpenLaunches = [];
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "held-open-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/call") {
+          const response = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { held: true } });
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.write(`data: ${response}\n\n`);
+          // Deliberately never res.end() - the exact "deliver then keep
+          // the stream open" pattern N5 exists to handle.
+          return;
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const heldOpenShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "held-open.json"),
+        timeoutMs: 60_000, // long enough that only the incremental match, not the timeout, can end the wait
+        launchEnabled: true,
+        appPath: "/fake/HeldOpen.app",
+        launchGraceMs: 150_000,
+        launcher: (appPath) => heldOpenLaunches.push(appPath),
+      });
+      const startedAt = Date.now();
+      const held = await heldOpenShim.handle({ jsonrpc: "2.0", id: 80, method: "tools/call", params: {} });
+      assert.ok(
+        Date.now() - startedAt < 3_000,
+        "a matching response must resolve promptly, not wait for the held-open stream to close",
+      );
+      assert.deepEqual(held.result, { held: true });
+      assert.equal(heldOpenLaunches.length, 0, "a successful held-open response must never launch");
+    },
+  );
+
+  // -- 7n. N5: a stream that never sends the matching id must still time
+  //        out - the incremental reader must not hang indefinitely waiting
+  //        for a match that will never arrive. Same bounded-wall-clock
+  //        shape as 7b's plain stall test. ---------------------------------
+  await withServer(
+    (req, res) => {
+      // Accept the connection, send SSE headers plus an event that will
+      // never match any request id this shim sends, then never end the
+      // body.
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ jsonrpc: "2.0", id: 999_999, result: {} })}\n\n`);
+    },
+    async (url) => {
+      const neverMatchShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "never-match.json"),
+        timeoutMs: 200,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const startedAt = Date.now();
+      const never = await neverMatchShim.handle({ jsonrpc: "2.0", id: 81, method: "tools/call", params: {} });
+      assert.ok(
+        Date.now() - startedAt < 3_000,
+        "a stream that never sends the matching id must still be bounded by the timeout",
+      );
+      assert.equal(never.result.isError, true);
+    },
+  );
+
+  // -- 7o. N6: cancelling while connect() is still awaiting the handshake
+  //        (initialize) must abort it - a hole in the N4 work, which
+  //        threaded the client request id through the later backend()
+  //        post() call but not through connect()'s own two post() calls.
+  //        Left uncancelled, the handshake would complete and the shim
+  //        would go on to run the tool call the client had already
+  //        cancelled. A request counter (not just timing) proves the tool
+  //        call itself never reaches the backend. -------------------------
+  let handshakeCancelToolCalls = 0;
+  const handshakeCancelLaunches = [];
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          res.writeHead(200, { "Content-Type": "application/json" }); // stall - deliberately never end()
+          return;
+        }
+        if (msg.method === "tools/call") {
+          handshakeCancelToolCalls += 1;
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const handshakeCancelShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "handshake-cancel.json"),
+        timeoutMs: 60_000, // long enough that only cancel(), not the timeout, can end the wait
+        launchEnabled: true,
+        appPath: "/fake/HandshakeCancel.app",
+        launchGraceMs: 150_000,
+        launcher: (appPath) => handshakeCancelLaunches.push(appPath),
+      });
+      const callPromise = handshakeCancelShim.handle({
+        jsonrpc: "2.0",
+        id: 90,
+        method: "tools/call",
+        params: { name: "x", arguments: {} },
+      });
+      // Give the call a moment to actually reach connect()'s stalling
+      // initialize post and register in inFlight before cancelling it.
+      await new Promise((r) => setTimeout(r, 200));
+      handshakeCancelShim.cancel(90, "cancelled during handshake");
+      const cancelledDuringHandshake = await callPromise;
+      assert.equal(cancelledDuringHandshake.result.isError, true);
+      assert.match(cancelledDuringHandshake.result.content[0].text, /cancel/i);
+      assert.equal(
+        handshakeCancelToolCalls,
+        0,
+        "the tool call must never reach the backend once the handshake was cancelled",
+      );
+      assert.equal(handshakeCancelLaunches.length, 0, "a cancelled handshake must never launch");
+    },
+  );
+
+  // -- 7p. N7: a 404 on the initial SESSIONLESS request (no session was
+  //        ever established) must be HttpRejected, not treated as a stale
+  //        session - only a request that actually carried a session id can
+  //        be stale. A wrong --backend-url path against an otherwise-live
+  //        app is the realistic trigger: today this retried as if stale
+  //        and then reported Down (and could launch a running app) even
+  //        though the app answered. The initialize counter proves it was
+  //        not retried. -------------------------------------------------
+  let sessionlessNotFoundInitCalls = 0;
+  const sessionlessNotFoundLaunches = [];
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          sessionlessNotFoundInitCalls += 1;
+          res.writeHead(404, { "Content-Type": "text/plain" });
+          res.end("not found");
+          return;
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const sessionlessNotFoundShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "sessionless-404.json"),
+        timeoutMs: 2_000,
+        launchEnabled: true,
+        appPath: "/fake/SessionlessNotFound.app",
+        launchGraceMs: 150_000,
+        launcher: (appPath) => sessionlessNotFoundLaunches.push(appPath),
+      });
+      const notFound = await sessionlessNotFoundShim.handle({ jsonrpc: "2.0", id: 91, method: "tools/call", params: {} });
+      assert.equal(notFound.result.isError, true);
+      assert.match(notFound.result.content[0].text, /404/, "must surface the real HTTP status");
+      assert.doesNotMatch(
+        notFound.result.content[0].text,
+        /not reachable|is not reachable/i,
+        "a sessionless 404 is a real HTTP rejection, not downtime",
+      );
+      assert.equal(
+        sessionlessNotFoundInitCalls,
+        1,
+        "a sessionless 404 must not be retried as if the session were stale",
+      );
+      assert.equal(sessionlessNotFoundLaunches.length, 0, "a sessionless 404 must never launch");
     },
   );
 

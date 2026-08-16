@@ -225,6 +225,11 @@ class Cancelled extends Error {}
 // typo'd --backend-url that happens to hit a route that also 404s) - by
 // status code alone there is no way to tell those apart - but it stops
 // every OTHER non-2xx from paying that cost, which covers the common case.
+// A 404 can only mean an expired session if the request actually carried
+// one - see post()'s `sid &&` guard on this check. A 404 on the initial
+// sessionless request (no session established yet) is a real HTTP
+// rejection (e.g. a wrong --backend-url path against an otherwise-live
+// app), not staleness, and must not be retried as if it were.
 const STALE_HTTP_STATUSES = new Set([404]);
 
 // ---------------------------------------------------------------------------
@@ -243,14 +248,80 @@ export function parseBody(body, contentType, expectedId) {
     return JSON.parse(body);
   }
   if (expectedId === undefined) return null;
-  for (const line of body.split("\n")) {
-    if (!line.startsWith("data:")) continue;
-    const payload = line.slice(5).trim();
-    if (!payload) continue;
-    const msg = JSON.parse(payload);
+  // SSE events are separated by a blank line; a body with no blank line at
+  // all (the common single-event case) is just one event and split() below
+  // returns it unsplit - parseSseEvent scans it the same way either way.
+  for (const rawEvent of body.split("\n\n")) {
+    const msg = parseSseEvent(rawEvent);
     if (msg && typeof msg === "object" && "id" in msg && msg.id === expectedId) return msg;
   }
   return null;
+}
+
+// Extracts the JSON-RPC message out of one SSE event's raw text (its
+// "data:" line), or null if the event carries no data line. Shared by
+// parseBody (a full already-buffered body, used for the plain-JSON/empty
+// cases and direct unit testing) and readSseUntilMatch (the incremental
+// reader below, used for the live SSE case).
+function parseSseEvent(rawEvent) {
+  for (const line of rawEvent.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload) continue;
+    return JSON.parse(payload);
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Incremental SSE reading. MCP streamable HTTP explicitly permits a backend
+// to deliver the JSON-RPC response matching a request's id and then keep
+// the SSE stream open for later events (further progress notifications,
+// etc). Waiting for the stream to close (the old `res.text()`) would
+// misreport an already-succeeded call as a timeout - and the shim could
+// then launch the app after the operation had already succeeded. This
+// reads `stream` (a web ReadableStream, i.e. `res.body`) chunk by chunk and
+// returns as soon as the event whose id matches `expectedId` arrives,
+// without waiting for EOF.
+//
+// Timeout/cancellation: this does no signal handling of its own - it
+// relies entirely on the same fetch() AbortController/signal that already
+// covers the rest of post(). Aborting that controller (on timeout or via
+// cancel()) errors the underlying stream, so a pending reader.read() call
+// rejects the same way res.text() used to - the surrounding try/catch in
+// post() is unchanged and still covers this.
+export async function readSseUntilMatch(stream, expectedId) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return null; // stream closed without ever producing the matching event
+      buffer += decoder.decode(value, { stream: true });
+      // Process every complete event already in the buffer and keep any
+      // trailing partial one for the next chunk - a chunk boundary is not
+      // an event boundary, one event can legally arrive split across
+      // multiple reads.
+      let sep;
+      while ((sep = buffer.indexOf("\n\n")) !== -1) {
+        const rawEvent = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        const msg = parseSseEvent(rawEvent);
+        if (msg && typeof msg === "object" && "id" in msg && msg.id === expectedId) return msg;
+      }
+    }
+  } finally {
+    // Release the stream as soon as we're done with it - whether that's
+    // because we found the match (the common case: stop before EOF, the
+    // whole point of this function) or the read loop threw/was aborted -
+    // so the underlying socket does not leak.
+    try {
+      await reader.cancel();
+    } catch {
+      // Already closed/errored - nothing to clean up.
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +428,7 @@ export class Shim {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     if (clientRequestId !== undefined) this.inFlight.set(clientRequestId, controller);
-    let res, text;
+    let res, body, errorText;
     try {
       res = await fetch(this.url, {
         method: "POST",
@@ -365,20 +436,49 @@ export class Shim {
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
-      // The timeout must cover reading the body, not just the headers - a
-      // backend that answers 200 and then stalls mid-stream (a legal SSE
-      // keepalive that never closes) previously hung here with nothing
-      // watching it, blocking every later stdin message behind it (main()
-      // serializes all requests through one queue, so one stuck request
-      // wedges the whole server).
-      text = await res.text();
+      const contentType = res.headers.get("content-type") || "";
+      if (res.ok && contentType.includes("text/event-stream")) {
+        // The timeout must cover reading the body, not just the headers -
+        // a backend that answers 200 and then stalls mid-stream (a legal
+        // SSE keepalive that never closes) previously hung here with
+        // nothing watching it, blocking every later stdin message behind
+        // it (main() serializes all requests through one queue, so one
+        // stuck request wedges the whole server). See readSseUntilMatch
+        // for why this is read incrementally rather than via res.text().
+        if (payload.id === undefined) {
+          // A notification - there is no id to correlate a response
+          // against (and none is expected: every caller discards this
+          // body regardless). Cancel immediately rather than either
+          // waiting for EOF (the exact hang this branch exists to avoid)
+          // or scanning for an id that will never arrive.
+          try {
+            await res.body?.cancel();
+          } catch {
+            // Already closed - nothing to clean up.
+          }
+          body = null;
+        } else {
+          body = await readSseUntilMatch(res.body, payload.id);
+        }
+      } else {
+        // Plain JSON, an empty notification response, and any non-2xx
+        // status (an error response is not the long-lived-stream case
+        // above, whatever its content-type claims) all read the whole
+        // body, exactly as before.
+        const text = await res.text();
+        if (!res.ok) {
+          errorText = text;
+        } else {
+          body = parseBody(text, contentType, payload.id);
+        }
+      }
     } catch (err) {
       // A cancel-triggered abort and a timeout-triggered abort throw the
-      // same shape of AbortError from fetch/res.text() - the reason
-      // cancel() set on the controller (only it ever passes one) is what
-      // tells them apart. A cancellation must surface as Cancelled, never
-      // as Down: it must not reach downCallResult() or launch the app -
-      // we stopped waiting, the backend did not go away.
+      // same shape of AbortError from fetch/res.text()/the stream reader -
+      // the reason cancel() set on the controller (only it ever passes
+      // one) is what tells them apart. A cancellation must surface as
+      // Cancelled, never as Down: it must not reach downCallResult() or
+      // launch the app - we stopped waiting, the backend did not go away.
       if (controller.signal.reason instanceof Cancelled) throw controller.signal.reason;
       throw new Down(err?.message ?? String(err));
     } finally {
@@ -386,19 +486,21 @@ export class Shim {
       if (clientRequestId !== undefined) this.inFlight.delete(clientRequestId);
     }
     if (!res.ok) {
-      if (STALE_HTTP_STATUSES.has(res.status)) throw new Stale(`HTTP ${res.status}`);
-      throw new HttpRejected(res.status, text.slice(0, 200));
-    }
-    let body;
-    try {
-      body = parseBody(text, res.headers.get("content-type") || "", payload.id);
-    } catch (err) {
-      throw new Down(`invalid response body: ${err.message}`);
+      if (sid && STALE_HTTP_STATUSES.has(res.status)) throw new Stale(`HTTP ${res.status}`);
+      throw new HttpRejected(res.status, (errorText ?? "").slice(0, 200));
     }
     return { body, sid: res.headers.get("mcp-session-id") };
   }
 
-  async connect() {
+  // `clientRequestId`, when given, is threaded through to both of the
+  // handshake's own post() calls (not just the caller's eventual real
+  // call) - a client that cancels while connect() is still awaiting either
+  // one must be able to abort it. Without this, a cancel during the
+  // handshake found no entry in this.inFlight (post() had registered under
+  // the handshake's own internal calls, never under the client's id) and
+  // was a silent no-op: the handshake ran to completion and the shim went
+  // on to run the very tool call the client had already cancelled.
+  async connect(clientRequestId) {
     const { body, sid } = await this.post(
       {
         jsonrpc: "2.0",
@@ -411,6 +513,7 @@ export class Shim {
         },
       },
       null,
+      clientRequestId,
     );
     this.sid = sid ?? null;
     // Capture what the backend actually negotiated, not just what we
@@ -418,7 +521,7 @@ export class Shim {
     // version it supports, and that is the value every later request must
     // carry, not our own requested one.
     this.protocolVersion = body?.result?.protocolVersion || PROTOCOL_VERSION;
-    await this.post({ jsonrpc: "2.0", method: "notifications/initialized" }, this.sid);
+    await this.post({ jsonrpc: "2.0", method: "notifications/initialized" }, this.sid, clientRequestId);
     this.connected = true;
     return body;
   }
@@ -431,7 +534,7 @@ export class Shim {
   async backend(method, params, clientRequestId) {
     for (const attempt of [1, 2]) {
       try {
-        if (!this.connected) await this.connect();
+        if (!this.connected) await this.connect(clientRequestId);
         const { body } = await this.post({ jsonrpc: "2.0", id: 1, method, params }, this.sid, clientRequestId);
         if (body?.error) throw new BackendReported(body.error.code, body.error.message ?? "backend error");
         return body?.result ?? {};
