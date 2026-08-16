@@ -216,6 +216,16 @@ class HttpRejected extends Error {
 // abort, which both produce the same AbortError from fetch/res.text().
 class Cancelled extends Error {}
 
+// A response body that could not be parsed as the protocol expects -
+// malformed JSON, a malformed SSE data payload, or (e.g.) an HTML error
+// page from an intermediary proxy served with a 200. Same reachable-is-
+// not-down principle as BackendReported/HttpRejected/the sessionless-404
+// fix: a response arrived, so the app is up - only a fetch/stream failure
+// or a timeout (post()'s outer catch, below) is downtime. Thrown directly
+// from the parse paths (parseBody/parseSseEvent) and rethrown as-is by
+// post()'s catch, the same way Cancelled is.
+class MalformedResponse extends Error {}
+
 // Per MCP streamable-HTTP: "If a server receives a request with an invalid
 // or expired session ID, the server MUST respond with 404." Only 404 is
 // classified Stale (worth a reconnect-and-retry); every other non-2xx
@@ -245,7 +255,14 @@ const STALE_HTTP_STATUSES = new Set([404]);
 export function parseBody(body, contentType, expectedId) {
   if (!body || !body.trim()) return null;
   if (!(contentType && contentType.includes("text/event-stream"))) {
-    return JSON.parse(body);
+    try {
+      return JSON.parse(body);
+    } catch (err) {
+      // Reachable (a body arrived at all) - not downtime. Covers malformed
+      // JSON and any non-JSON body served as if it were (e.g. an HTML
+      // error page from an intermediary proxy).
+      throw new MalformedResponse(`malformed response body: ${err.message}`);
+    }
   }
   if (expectedId === undefined) return null;
   // SSE events are separated by a blank line; a body with no blank line at
@@ -268,7 +285,11 @@ function parseSseEvent(rawEvent) {
     if (!line.startsWith("data:")) continue;
     const payload = line.slice(5).trim();
     if (!payload) continue;
-    return JSON.parse(payload);
+    try {
+      return JSON.parse(payload);
+    } catch (err) {
+      throw new MalformedResponse(`malformed SSE event: ${err.message}`);
+    }
   }
   return null;
 }
@@ -294,22 +315,50 @@ export async function readSseUntilMatch(stream, expectedId) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  // A trailing lone \r held back across reads - SSE permits \r\n, \r, or \n
+  // as the line terminator, and a \r\n pair can straddle a chunk boundary
+  // (\r ending one read, \n starting the next). Normalizing each chunk in
+  // isolation (or the whole buffer on every append) would count that split
+  // pair as two terminators instead of one - carrying the lone \r forward
+  // and folding it into the START of the next chunk keeps a straddled pair
+  // intact.
+  let carry = "";
+  // Process every complete event already in the buffer and keep any
+  // trailing partial one for the next chunk - a chunk boundary is not an
+  // event boundary, one event can legally arrive split across multiple
+  // reads. Called once per chunk, and once more at EOF (see below) to
+  // flush a carried trailing \r that turns out to have been the stream's
+  // very last byte.
+  const drainMatch = () => {
+    let sep;
+    while ((sep = buffer.indexOf("\n\n")) !== -1) {
+      const rawEvent = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      const msg = parseSseEvent(rawEvent);
+      if (msg && typeof msg === "object" && "id" in msg && msg.id === expectedId) return msg;
+    }
+    return undefined;
+  };
   try {
     for (;;) {
       const { value, done } = await reader.read();
-      if (done) return null; // stream closed without ever producing the matching event
-      buffer += decoder.decode(value, { stream: true });
-      // Process every complete event already in the buffer and keep any
-      // trailing partial one for the next chunk - a chunk boundary is not
-      // an event boundary, one event can legally arrive split across
-      // multiple reads.
-      let sep;
-      while ((sep = buffer.indexOf("\n\n")) !== -1) {
-        const rawEvent = buffer.slice(0, sep);
-        buffer = buffer.slice(sep + 2);
-        const msg = parseSseEvent(rawEvent);
-        if (msg && typeof msg === "object" && "id" in msg && msg.id === expectedId) return msg;
+      if (done) {
+        // A trailing lone \r held back from the previous chunk, with
+        // nothing after it, is still a real terminator, not a partial one -
+        // flush it in case it completes a pending delimiter before giving
+        // up as "no matching event."
+        if (carry) buffer += "\n";
+        return drainMatch() ?? null;
       }
+      let chunk = carry + decoder.decode(value, { stream: true });
+      carry = "";
+      if (chunk.endsWith("\r")) {
+        carry = "\r";
+        chunk = chunk.slice(0, -1);
+      }
+      buffer += chunk.replace(/\r\n|\r/g, "\n");
+      const found = drainMatch();
+      if (found !== undefined) return found;
     }
   } finally {
     // Release the stream as soon as we're done with it - whether that's
@@ -480,6 +529,9 @@ export class Shim {
       // Cancelled, never as Down: it must not reach downCallResult() or
       // launch the app - we stopped waiting, the backend did not go away.
       if (controller.signal.reason instanceof Cancelled) throw controller.signal.reason;
+      // A parse failure (malformed JSON/SSE) means a response DID arrive -
+      // reachable, not downtime - see MalformedResponse.
+      if (err instanceof MalformedResponse) throw err;
       throw new Down(err?.message ?? String(err));
     } finally {
       clearTimeout(timer);
@@ -539,11 +591,17 @@ export class Shim {
         if (body?.error) throw new BackendReported(body.error.code, body.error.message ?? "backend error");
         return body?.result ?? {};
       } catch (err) {
-        // All three mean "reachable" (or, for Cancelled, "we stopped
+        // All four mean "reachable" (or, for Cancelled, "we stopped
         // waiting, the backend did not go away") - session/connection
         // state is left untouched, and none of them ever gets a reconnect
         // retry (that's only for Stale).
-        if (err instanceof BackendReported || err instanceof HttpRejected || err instanceof Cancelled) throw err;
+        if (
+          err instanceof BackendReported ||
+          err instanceof HttpRejected ||
+          err instanceof Cancelled ||
+          err instanceof MalformedResponse
+        )
+          throw err;
         this.connected = false;
         this.sid = null;
         this.protocolVersion = null;
@@ -623,6 +681,13 @@ export class Shim {
         // (401/400/500/...), which proves the app is running. Never
         // launch, never say "not reachable" - surface the real status.
         return this.errorResult(`${this.name} responded with ${err.message} - not a downtime issue, no restart needed.`);
+      }
+      if (err instanceof MalformedResponse) {
+        // Same reasoning, one layer further down: a 200 arrived at all,
+        // which proves the app is running - the body just wasn't what the
+        // protocol expects (malformed JSON/SSE, an intermediary's HTML
+        // error page, ...). Never launch, never say "not reachable".
+        return this.errorResult(`${this.name} sent a response this shim could not parse (${err.message}) - not a downtime issue, no restart needed.`);
       }
       if (err instanceof Cancelled) {
         // The client asked us to stop waiting - not downtime, never

@@ -90,6 +90,36 @@ export async function selftest() {
   );
   assert.deepEqual(splitMatch, { jsonrpc: "2.0", id: 9, result: { ok: true } }, "an event split across two chunks must parse");
 
+  // -- 1d. N8: CRLF-delimited SSE events. The spec permits \r\n and lone \r
+  //        as line terminators, not just \n - a CRLF backend must not be
+  //        silently unparseable (a closing stream would otherwise return
+  //        null -> backend() returns {} -> a tools/call reports FALSE
+  //        SUCCESS for a mutation that never ran). Lone-\r events, and the
+  //        specific trap: a \r\n pair split so the \r ends one chunk and
+  //        the \n starts the next must collapse to ONE delimiter, not two -
+  //        a naive per-chunk-in-isolation normalization gets this wrong. --
+  const crlfMatch = await readSseUntilMatch(fakeReadableStream(['data: {"jsonrpc":"2.0","id":9,"result":{"crlf":true}}\r\n\r\n']), 9);
+  assert.deepEqual(crlfMatch, { jsonrpc: "2.0", id: 9, result: { crlf: true } }, "a CRLF-delimited event must parse");
+
+  const loneCrMatch = await readSseUntilMatch(fakeReadableStream(['data: {"jsonrpc":"2.0","id":9,"result":{"cr":true}}\r\r']), 9);
+  assert.deepEqual(loneCrMatch, { jsonrpc: "2.0", id: 9, result: { cr: true } }, "a lone-\\r-delimited event must parse");
+
+  // The straddle: chunk 1 ends with the \r half of the terminating pair,
+  // chunk 2 starts with its \n half. A correct fix carries the lone \r
+  // forward and folds it into chunk 2 as ONE terminator; a naive fix that
+  // normalizes each chunk in isolation would treat chunk 1's trailing \r as
+  // already a full terminator on its own, fabricating a delimiter that was
+  // never sent.
+  const straddledMatch = await readSseUntilMatch(
+    fakeReadableStream(['data: {"jsonrpc":"2.0","id":9,"result":{"straddled":true}}\r\n\r', "\n"]),
+    9,
+  );
+  assert.deepEqual(
+    straddledMatch,
+    { jsonrpc: "2.0", id: 9, result: { straddled: true } },
+    "a \\r\\n pair split across two chunks must parse as one delimiter, not two",
+  );
+
   // -- 1b. CLI parsing (C7/C8/C9 regressions) ------------------------------
   // --no-launch=false / --launch=false must be real booleans, not truthy
   // strings - the concrete bug: --no-launch=false used to disable launch
@@ -1108,6 +1138,105 @@ export async function selftest() {
       assert.equal(sessionlessNotFoundLaunches.length, 0, "a sessionless 404 must never launch");
     },
   );
+
+  // -- 7q. N8 end to end: a real CRLF-delimited SSE response over an actual
+  //        socket must resolve with the real result, not {} (the false-
+  //        success failure mode: a stream that closes without the reader
+  //        ever finding a "\n\n" delimiter returns null, backend() turns
+  //        that into {}, and a tools/call would report success for a
+  //        mutation that never ran). -------------------------------------
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "crlf-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/call") {
+          const response = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { crlf: true } });
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.end(`data: ${response}\r\n\r\n`);
+          return;
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const crlfShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "crlf.json"),
+        timeoutMs: 2_000,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const crlfReply = await crlfShim.handle({ jsonrpc: "2.0", id: 93, method: "tools/call", params: {} });
+      assert.deepEqual(
+        crlfReply.result,
+        { crlf: true },
+        "a CRLF-delimited response must resolve with the real result, not a false-success {}",
+      );
+    },
+  );
+
+  // -- 7r. N9: a reachable backend that answers HTTP 200 with a body this
+  //        shim cannot parse (an HTML error page from an intermediary, or
+  //        truncated JSON) must not be classified as downtime - a response
+  //        arrived, so the app is up. Must surface the real parse/protocol
+  //        problem, never say "not reachable", never launch. -------------
+  for (const [label, contentType, malformedBody, cacheName] of [
+    ["an HTML error page", "text/html", "<html><body>502 Bad Gateway</body></html>", "malformed-html.json"],
+    ["truncated JSON", "application/json", '{"jsonrpc":"2.0","id":1,"resu', "malformed-truncated.json"],
+  ]) {
+    const malformedLaunches = [];
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "initialize") {
+            return sendJson(
+              res,
+              200,
+              { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+              { "MCP-Session-Id": "malformed-session" },
+            );
+          }
+          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          if (msg.method === "tools/call") {
+            res.writeHead(200, { "Content-Type": contentType });
+            res.end(malformedBody);
+            return;
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const malformedShim = new Shim({
+          url,
+          name: "test",
+          cachePath: join(cacheDir, cacheName),
+          timeoutMs: 2_000,
+          launchEnabled: true,
+          appPath: "/fake/Malformed.app",
+          launchGraceMs: 150_000,
+          launcher: (appPath) => malformedLaunches.push(appPath),
+        });
+        const malformed = await malformedShim.handle({ jsonrpc: "2.0", id: 94, method: "tools/call", params: {} });
+        assert.equal(malformed.result.isError, true, `${label}: must be an error result`);
+        assert.doesNotMatch(
+          malformed.result.content[0].text,
+          /not reachable|is not reachable/i,
+          `${label}: a parse failure on a 200 response must not be reported as unreachable`,
+        );
+        assert.equal(malformedLaunches.length, 0, `${label}: must never launch`);
+      },
+    );
+  }
 
   // -- 8. process-level: one malformed stdin line must not kill the shim
   const initReply = await runChildAndGetReply(
