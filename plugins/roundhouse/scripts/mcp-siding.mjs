@@ -209,6 +209,13 @@ class HttpRejected extends Error {
   }
 }
 
+// A client-initiated cancellation (notifications/cancelled), not downtime
+// and not a backend rejection - we stopped waiting, the backend did not go
+// away. Set as post()'s AbortController's `abort(reason)` so the catch
+// block there can tell a deliberate cancel apart from a timeout-triggered
+// abort, which both produce the same AbortError from fetch/res.text().
+class Cancelled extends Error {}
+
 // Per MCP streamable-HTTP: "If a server receives a request with an invalid
 // or expired session ID, the server MUST respond with 404." Only 404 is
 // classified Stale (worth a reconnect-and-retry); every other non-2xx
@@ -322,9 +329,19 @@ export class Shim {
     // Set once initialize's response is known, cleared alongside
     // sid/connected on any reconnect - see post()/connect().
     this.protocolVersion = null;
+    // Client request id -> the AbortController post() built for it, so a
+    // notifications/cancelled naming that id can abort the matching
+    // in-flight HTTP request. Entries are added/removed by post() itself,
+    // for the lifetime of exactly one request.
+    this.inFlight = new Map();
   }
 
-  async post(payload, sid) {
+  // `clientRequestId`, when given, registers this call's AbortController in
+  // `this.inFlight` under that id for the duration of the request, so
+  // cancel() can find and abort it - see the Cancelled class and cancel()
+  // below. Omitted for internal calls (connect()'s own initialize/
+  // notifications/initialized) that the client never addresses directly.
+  async post(payload, sid, clientRequestId) {
     const headers = {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
@@ -339,6 +356,7 @@ export class Shim {
     if (this.protocolVersion) headers["MCP-Protocol-Version"] = this.protocolVersion;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    if (clientRequestId !== undefined) this.inFlight.set(clientRequestId, controller);
     let res, text;
     try {
       res = await fetch(this.url, {
@@ -355,9 +373,17 @@ export class Shim {
       // wedges the whole server).
       text = await res.text();
     } catch (err) {
+      // A cancel-triggered abort and a timeout-triggered abort throw the
+      // same shape of AbortError from fetch/res.text() - the reason
+      // cancel() set on the controller (only it ever passes one) is what
+      // tells them apart. A cancellation must surface as Cancelled, never
+      // as Down: it must not reach downCallResult() or launch the app -
+      // we stopped waiting, the backend did not go away.
+      if (controller.signal.reason instanceof Cancelled) throw controller.signal.reason;
       throw new Down(err?.message ?? String(err));
     } finally {
       clearTimeout(timer);
+      if (clientRequestId !== undefined) this.inFlight.delete(clientRequestId);
     }
     if (!res.ok) {
       if (STALE_HTTP_STATUSES.has(res.status)) throw new Stale(`HTTP ${res.status}`);
@@ -402,18 +428,19 @@ export class Shim {
   // envelope from a live, answering backend is a BackendReported failure,
   // not Down - see that class - and does not reset session state (the
   // session itself is still fine; only this one call was rejected).
-  async backend(method, params) {
+  async backend(method, params, clientRequestId) {
     for (const attempt of [1, 2]) {
       try {
         if (!this.connected) await this.connect();
-        const { body } = await this.post({ jsonrpc: "2.0", id: 1, method, params }, this.sid);
+        const { body } = await this.post({ jsonrpc: "2.0", id: 1, method, params }, this.sid, clientRequestId);
         if (body?.error) throw new BackendReported(body.error.code, body.error.message ?? "backend error");
         return body?.result ?? {};
       } catch (err) {
-        // Both mean "reachable, rejected" - the session/connection is
-        // fine, only this one call failed, so state is left untouched and
-        // neither ever gets a reconnect retry (that's only for Stale).
-        if (err instanceof BackendReported || err instanceof HttpRejected) throw err;
+        // All three mean "reachable" (or, for Cancelled, "we stopped
+        // waiting, the backend did not go away") - session/connection
+        // state is left untouched, and none of them ever gets a reconnect
+        // retry (that's only for Stale).
+        if (err instanceof BackendReported || err instanceof HttpRejected || err instanceof Cancelled) throw err;
         this.connected = false;
         this.sid = null;
         this.protocolVersion = null;
@@ -423,11 +450,36 @@ export class Shim {
     }
   }
 
+  // Aborts the in-flight HTTP request for `clientRequestId`, if any is
+  // still tracked, and forwards notifications/cancelled to the backend on
+  // a best-effort basis. Be precise about what this achieves: aborting our
+  // own request only stops US from waiting on it and frees the queue for
+  // the next message - it does NOT stop the backend from continuing to run
+  // the operation to completion. Only a backend that honors the forwarded
+  // notification actually stops the work; this shim cannot cancel a CAD
+  // operation mid-flight by itself. Unknown or already-finished ids (no
+  // tracked controller) are a harmless no-op - no reply either way, since
+  // this is a notification.
+  cancel(clientRequestId, reason) {
+    if (clientRequestId === undefined || clientRequestId === null) return;
+    const controller = this.inFlight.get(clientRequestId);
+    if (!controller) return;
+    controller.abort(new Cancelled(reason ? `cancelled by client: ${reason}` : "cancelled by client"));
+    // The backend-facing request always uses id 1 (see backend() above) -
+    // this shim never has more than one real backend call in flight at a
+    // time, so that id is unambiguous. Fire-and-forget: a notification has
+    // no id and expects no reply, and the abort above has already freed
+    // the queue regardless of whether this reaches the backend.
+    if (this.connected) {
+      this.post({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1, reason } }, this.sid).catch(() => {});
+    }
+  }
+
   // -- message handlers -----------------------------------------------------
 
-  async toolsList(params) {
+  async toolsList(params, clientRequestId) {
     try {
-      const result = await this.backend("tools/list", params);
+      const result = await this.backend("tools/list", params, clientRequestId);
       // Guard the cache write on a real array (no future response shape
       // surprise can blank a previously good cache) AND an uncursored
       // (first-page) request - a paginated backend's page-two response
@@ -451,9 +503,9 @@ export class Shim {
     }
   }
 
-  async toolsCall(params) {
+  async toolsCall(params, clientRequestId) {
     try {
-      return await this.backend("tools/call", params);
+      return await this.backend("tools/call", params, clientRequestId);
     } catch (err) {
       if (err instanceof BackendReported) {
         // Reachable, and rejected the call - an unknown tool, bad
@@ -468,6 +520,11 @@ export class Shim {
         // (401/400/500/...), which proves the app is running. Never
         // launch, never say "not reachable" - surface the real status.
         return this.errorResult(`${this.name} responded with ${err.message} - not a downtime issue, no restart needed.`);
+      }
+      if (err instanceof Cancelled) {
+        // The client asked us to stop waiting - not downtime, never
+        // launch. See cancel() for what this does and does not achieve.
+        return this.errorResult(`${this.name}: call cancelled.`);
       }
       return this.downCallResult();
     }
@@ -527,10 +584,10 @@ export class Shim {
     // ever read is a real, user-visible side effect, not a no-op.
     if (id === undefined) return null;
     if (method === "ping") return ok(id, {});
-    if (method === "tools/list") return ok(id, await this.toolsList(params));
-    if (method === "tools/call") return ok(id, await this.toolsCall(params));
+    if (method === "tools/list") return ok(id, await this.toolsList(params, id));
+    if (method === "tools/call") return ok(id, await this.toolsCall(params, id));
     try {
-      const result = await this.backend(method, params);
+      const result = await this.backend(method, params, id);
       return ok(id, result);
     } catch (err) {
       const code = err instanceof BackendReported && err.code != null ? err.code : -32000;
@@ -670,15 +727,29 @@ function main(flags) {
   rl.on("line", (raw) => {
     const line = raw.trim();
     if (!line) return;
-    queue = queue.then(async () => {
-      let msg;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        // Never die on one malformed stdin message.
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      // Never die on one malformed stdin message. Parsed synchronously
+      // here (not deferred into the queue below) precisely so a bad line
+      // can't block behind an unrelated in-flight call either.
+      queue = queue.then(() => {
         emit({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
-        return;
-      }
+      });
+      return;
+    }
+    // notifications/cancelled is dispatched immediately, outside the
+    // serialized queue below - queued behind the very call it is meant to
+    // cancel would make it useless by construction: that call would
+    // already be done, or the notification would sit unprocessed until
+    // the 180s timeout. This is the one exception to "everything goes
+    // through the queue," not a redesign of the loop.
+    if (msg?.method === "notifications/cancelled") {
+      shim.cancel(msg.params?.requestId, msg.params?.reason);
+      return;
+    }
+    queue = queue.then(async () => {
       let response;
       try {
         response = await shim.handle(msg);

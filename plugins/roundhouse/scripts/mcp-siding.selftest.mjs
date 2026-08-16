@@ -738,6 +738,157 @@ export async function selftest() {
   //        reproduces it on this platform. ---------------------------------
   await selftestLauncherErrorDoesNotCrash();
 
+  // -- 7k. N4: cancellation stops waiting without misreporting downtime,
+  //        never launches, forwards notifications/cancelled to the
+  //        backend, and is a harmless no-op for an unknown or
+  //        already-finished request id. A stalling tools/call (never
+  //        res.end()s) gives cancel() something real to interrupt - the
+  //        long timeoutMs proves it was the cancellation that ended the
+  //        wait, not the timeout racing it. ------------------------------
+  let cancelForwardReceived = null;
+  const cancelLaunches = [];
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "cancel-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "notifications/cancelled") {
+          cancelForwardReceived = msg.params;
+          return sendJson(res, 200, undefined);
+        }
+        if (msg.method === "tools/call") {
+          res.writeHead(200, { "Content-Type": "application/json" }); // stall - deliberately never end()
+          return;
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const cancelShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "cancel.json"),
+        timeoutMs: 60_000, // long enough that only cancel(), not the timeout, can end the wait
+        launchEnabled: true,
+        appPath: "/fake/CancelTest.app",
+        launchGraceMs: 150_000,
+        launcher: (appPath) => cancelLaunches.push(appPath),
+      });
+      const callPromise = cancelShim.handle({
+        jsonrpc: "2.0",
+        id: 60,
+        method: "tools/call",
+        params: { name: "x", arguments: {} },
+      });
+      // Give the call a moment to actually reach the stalling backend and
+      // register in inFlight before cancelling it.
+      await new Promise((r) => setTimeout(r, 200));
+      cancelShim.cancel(60, "user requested");
+      const cancelled = await callPromise;
+      assert.equal(cancelled.result.isError, true);
+      assert.match(cancelled.result.content[0].text, /cancel/i, "a cancelled call must say so, not claim downtime");
+      assert.doesNotMatch(
+        cancelled.result.content[0].text,
+        /not reachable|is not reachable/i,
+        "a cancellation must not be reported as unreachable",
+      );
+      assert.equal(cancelLaunches.length, 0, "a cancelled call must never launch the app");
+
+      await new Promise((r) => setTimeout(r, 100)); // the forward to the backend is fire-and-forget
+      assert.deepEqual(
+        cancelForwardReceived,
+        { requestId: 1, reason: "user requested" },
+        "the backend must receive the forwarded notifications/cancelled",
+      );
+
+      // Unknown or already-finished request id: harmless no-op, no throw.
+      assert.doesNotThrow(() => cancelShim.cancel(999_999, "never existed"));
+      assert.doesNotThrow(() => cancelShim.cancel(60, "already finished")); // id 60 is no longer in-flight
+    },
+  );
+
+  // -- 7l. N4 (process level): cancellation frees the serialized queue - a
+  //        message queued behind the cancelled call must be answered
+  //        promptly too, proving the notification really is dispatched
+  //        outside the queue and not just that the Shim class itself is
+  //        cancellable (7k proves that half). --------------------------
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "queue-cancel-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "notifications/cancelled") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/call") {
+          res.writeHead(200, { "Content-Type": "application/json" }); // stall - deliberately never end()
+          return;
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const child = spawn(
+        process.execPath,
+        [MCP_SIDING_PATH, "--backend-url", url, "--name", "test", "--timeout", "60000"],
+        { stdio: ["pipe", "pipe", "pipe"] },
+      );
+      let out = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => (out += chunk));
+      let err = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => (err += chunk));
+      const exited = new Promise((resolvePromise) => child.on("exit", resolvePromise));
+
+      const waitFor = async (marker, deadlineMs) => {
+        const deadline = Date.now() + deadlineMs;
+        while (!out.includes(marker) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        return out.includes(marker);
+      };
+
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 70, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 71, method: "ping", params: {} })}\n`);
+      // Give the tools/call a moment to actually be in flight (past
+      // connect(), registered in inFlight) before cancelling it.
+      await new Promise((r) => setTimeout(r, 300));
+      const cancelledAt = Date.now();
+      child.stdin.write(
+        `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 70, reason: "test" } })}\n`,
+      );
+
+      assert.ok(await waitFor('"id":70', 5_000), `cancelled tools/call never answered (stderr: ${err})`);
+      assert.ok(Date.now() - cancelledAt < 5_000, "cancellation must free the call promptly, not wait out the 60s timeout");
+      assert.ok(
+        await waitFor('"id":71', 5_000),
+        `the message queued behind the cancelled call never answered - queue stayed blocked (stderr: ${err})`,
+      );
+
+      child.stdin.end();
+      await Promise.race([exited, new Promise((r) => setTimeout(r, 2_000))]);
+      if (child.exitCode == null) child.kill();
+
+      const lines = out.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      const cancelledReply = lines.find((l) => l.id === 70);
+      assert.equal(cancelledReply.result.isError, true);
+      assert.match(cancelledReply.result.content[0].text, /cancel/i);
+    },
+  );
+
   // -- 8. process-level: one malformed stdin line must not kill the shim
   const initReply = await runChildAndGetReply(
     MCP_SIDING_PATH,
