@@ -242,7 +242,12 @@ export async function selftest() {
   // -- 2. initialize always answered locally, even pointed at nothing ---
   const tmpRoot = await mkdtemp(join(tmpdir(), "mcp-siding-"));
   const deadShim = new Shim({
-    url: "http://127.0.0.1:1/mcp", // nothing listens here
+    // Not :1 - Node/undici blocks that port client-side ("bad port", no
+    // error code) before ever attempting a connection, so it does not
+    // reliably produce a real ECONNREFUSED/Down classification (see N25).
+    // Section 3 below needs a real refused port for its "not reachable"
+    // assertion.
+    url: "http://127.0.0.1:65533/mcp",
     name: "test",
     cachePath: join(tmpRoot, "cache.json"),
     timeoutMs: 500,
@@ -288,7 +293,12 @@ export async function selftest() {
   //       tools/call with no id must neither reply nor launch ------------
   const launches = [];
   const launchShim = new Shim({
-    url: "http://127.0.0.1:1/mcp",
+    // A genuinely refused port, not :1 - Node/undici blocks :1 client-side
+    // ("bad port", no error code) before ever attempting a connection, so
+    // it does not reliably produce a real ECONNREFUSED/Down classification
+    // (see N25). This test is specifically about the Down-must-launch
+    // path, so it needs a port real connection-refused behavior.
+    url: "http://127.0.0.1:65533/mcp",
     name: "test-app",
     cachePath: join(cacheDir, "launch.json"),
     timeoutMs: 500,
@@ -1137,6 +1147,107 @@ export async function selftest() {
     },
   );
 
+  // -- 7l2. N26 (process level): a cancellation for a request B QUEUED
+  //         behind an active request A - not yet in this.inFlight, since
+  //         main()'s serialized queue has not reached it - used to be
+  //         silently discarded: cancel() found no controller and returned,
+  //         so once A settled, B was dispatched normally and sent the very
+  //         mutating tool call the user had already cancelled. A request
+  //         counter on the fake backend proves B never reaches it at all
+  //         (not just that its reply looks cancelled - 7l above already
+  //         covers the in-flight case; this is specifically the queued-
+  //         but-not-yet-started one). Also exercises an unknown id, which
+  //         must remain a harmless no-op despite now being tombstoned. ---
+  let queuedCancelToolCallCount = 0;
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "queued-cancel-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "notifications/cancelled") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/call") {
+          queuedCancelToolCallCount += 1;
+          res.writeHead(200, { "Content-Type": "application/json" }); // stall - deliberately never end()
+          return;
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const child = spawn(
+        process.execPath,
+        [MCP_SIDING_PATH, "--backend-url", url, "--name", "test", "--timeout", "60000"],
+        { stdio: ["pipe", "pipe", "pipe"] },
+      );
+      let out = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => (out += chunk));
+      let err = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => (err += chunk));
+      const exited = new Promise((resolvePromise) => child.on("exit", resolvePromise));
+
+      const waitFor = async (marker, deadlineMs) => {
+        const deadline = Date.now() + deadlineMs;
+        while (!out.includes(marker) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        return out.includes(marker);
+      };
+
+      // A - will stall on the backend. B - queued right behind it, still
+      // waiting for its own turn when it gets cancelled below.
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 80, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 81, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+      // Give A a moment to actually reach the stalling backend and
+      // register in this.inFlight - B, right behind it, is still purely
+      // queued at this point (main()'s queue is strictly sequential).
+      await new Promise((r) => setTimeout(r, 300));
+      // An unknown id must remain a harmless no-op even though it is now
+      // tombstoned rather than an immediate true no-op.
+      child.stdin.write(
+        `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 999_999, reason: "never existed" } })}\n`,
+      );
+      // Cancel B first (still queued, exercises the tombstone path this
+      // test is about), then A (in flight, frees the queue so B's own
+      // turn - and its tombstone check - actually gets reached promptly).
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 81, reason: "B" } })}\n`);
+      const cancelledAt = Date.now();
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 80, reason: "A" } })}\n`);
+
+      assert.ok(await waitFor('"id":80', 5_000), `A never answered (stderr: ${err})`);
+      assert.ok(await waitFor('"id":81', 5_000), `B never answered - the tombstone did not free it (stderr: ${err})`);
+      assert.ok(Date.now() - cancelledAt < 5_000, "both must be answered promptly, not wait out the 60s timeout");
+
+      child.stdin.end();
+      await Promise.race([exited, new Promise((r) => setTimeout(r, 2_000))]);
+      if (child.exitCode == null) child.kill();
+
+      const lines = out.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      const replyA = lines.find((l) => l.id === 80);
+      const replyB = lines.find((l) => l.id === 81);
+      assert.equal(replyA.result.isError, true);
+      assert.match(replyA.result.content[0].text, /cancel/i);
+      assert.equal(replyB.result.isError, true, "B must return a cancelled result");
+      assert.match(replyB.result.content[0].text, /cancel/i);
+      // The tombstone short-circuits inside handle(), before toolsCall()/
+      // backend() (and so before downCallResult(), the only place that
+      // launches) are ever reached - proven directly by the request
+      // counter below, and "never launches" follows structurally from
+      // that: a subprocess test has no injected launcher spy to check
+      // directly (see 7j/7j2/7j3 above for why the real launcher needs a
+      // real subprocess in the first place).
+      assert.equal(queuedCancelToolCallCount, 1, "B must never reach the backend - only A's tools/call should arrive");
+    },
+  );
+
   // -- 7m. N5: a backend that sends the matching SSE response and then
   //        holds the stream open (never closes) must resolve promptly -
   //        MCP streamable HTTP explicitly permits keeping the stream open
@@ -1858,7 +1969,11 @@ export async function selftest() {
   //         case that must NOT become Indeterminate. -------------------
   const refusedLaunches = [];
   const refusedShim = new Shim({
-    url: "http://127.0.0.1:1/mcp", // port 1 - nothing ever listens here, connection refused immediately
+    // Not :1 - Node/undici blocks that port client-side ("bad port", no
+    // error code) before ever attempting a connection, so it does not
+    // reliably produce a real ECONNREFUSED. A genuinely refused high port
+    // does; see PROVEN_UNDELIVERED_CODES.
+    url: "http://127.0.0.1:65533/mcp",
     name: "test",
     cachePath: join(cacheDir, "refused.json"),
     timeoutMs: 2_000,
@@ -1870,6 +1985,90 @@ export async function selftest() {
   const refused = await refusedShim.handle({ jsonrpc: "2.0", id: 104, method: "tools/call", params: {} });
   assert.equal(refused.result.isError, true);
   assert.equal(refusedLaunches.length, 1, "a connection-level failure (ECONNREFUSED) must still be classified Down and still launch");
+
+  // -- 7w3. N25: a connection that fails AFTER the request was transmitted
+  //         (a reset, EPIPE, or socket hang-up - Node/undici surfaces this
+  //         as cause.code UND_ERR_SOCKET) is exactly as Indeterminate as a
+  //         timeout - the app may have crashed or restarted mid-operation,
+  //         not proof the request was undelivered. fetch() rejects here
+  //         without post()'s own controller ever aborting it, which is
+  //         exactly the gap N20/N22's abort-only discriminator left open.
+  //         Destroy the socket mid-request to reproduce this for real. ---
+  const midRequestResetLaunches = [];
+  const resetServer = createServer((req) => {
+    req.socket.destroy();
+  });
+  await new Promise((resolvePromise) => resetServer.listen(0, "127.0.0.1", resolvePromise));
+  try {
+    const { port: resetPort } = resetServer.address();
+    const midRequestResetShim = new Shim({
+      url: `http://127.0.0.1:${resetPort}/mcp`,
+      name: "test",
+      cachePath: join(cacheDir, "mid-request-reset.json"),
+      timeoutMs: 2_000,
+      launchEnabled: true,
+      appPath: "/fake/MidRequestReset.app",
+      launchGraceMs: 150_000,
+      launcher: (appPath) => midRequestResetLaunches.push(appPath),
+    });
+    const reset = await midRequestResetShim.handle({ jsonrpc: "2.0", id: 108, method: "tools/call", params: {} });
+    assert.equal(reset.result.isError, true);
+    assert.doesNotMatch(
+      reset.result.content[0].text,
+      /not reachable|is not reachable/i,
+      "a mid-request reset must not be reported as unreachable",
+    );
+    assert.match(
+      reset.result.content[0].text,
+      /still be running|do not retry/i,
+      "a mid-request reset must warn that the operation may still be running",
+    );
+    assert.equal(midRequestResetLaunches.length, 0, "a mid-request reset must never launch");
+  } finally {
+    resetServer.close();
+  }
+
+  // -- 7w4. N25: an unrecognized (or synthetic) error code must default to
+  //         Indeterminate, not Down - the safe direction is to under-claim
+  //         downtime, never to over-claim it. Temporarily replaces global
+  //         fetch with one that rejects with a synthetic, deliberately-
+  //         unrecognized error code, to test the classifier directly
+  //         without depending on a specific real-world failure mode to
+  //         reproduce it (unlike 7w3's real socket reset above). --------
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => {
+      const err = new TypeError("fetch failed");
+      err.cause = Object.assign(new Error("synthetic failure"), { code: "ESYNTHETIC_UNKNOWN" });
+      throw err;
+    };
+    const unknownCodeLaunches = [];
+    const unknownCodeShim = new Shim({
+      url: "http://127.0.0.1:65533/mcp", // never actually contacted - fetch is replaced above
+      name: "test",
+      cachePath: join(cacheDir, "unknown-code.json"),
+      timeoutMs: 2_000,
+      launchEnabled: true,
+      appPath: "/fake/UnknownCode.app",
+      launchGraceMs: 150_000,
+      launcher: (appPath) => unknownCodeLaunches.push(appPath),
+    });
+    const unknownCode = await unknownCodeShim.handle({ jsonrpc: "2.0", id: 109, method: "tools/call", params: {} });
+    assert.equal(unknownCode.result.isError, true);
+    assert.doesNotMatch(
+      unknownCode.result.content[0].text,
+      /not reachable|is not reachable/i,
+      "an unrecognized error code must not be reported as unreachable",
+    );
+    assert.match(
+      unknownCode.result.content[0].text,
+      /still be running|do not retry/i,
+      "an unrecognized error code must warn about retrying, matching Indeterminate",
+    );
+    assert.equal(unknownCodeLaunches.length, 0, "an unrecognized error code must never launch");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 
   // -- 8. process-level: one malformed stdin line must not kill the shim
   const initReply = await runChildAndGetReply(
@@ -1990,7 +2189,11 @@ async function selftestLauncherErrorDoesNotCrash() {
     [
       MCP_SIDING_PATH,
       "--backend-url",
-      "http://127.0.0.1:1/mcp", // unreachable - forces downCallResult() to actually launch
+      // Not :1 - Node/undici blocks that port client-side ("bad port", no
+      // error code) before ever attempting a connection, so it does not
+      // reliably classify Down/launch-eligible (see N25). This test needs
+      // a real refused port to force downCallResult() to actually launch.
+      "http://127.0.0.1:65533/mcp",
       "--name",
       "test",
       "--app",
@@ -2220,7 +2423,8 @@ async function selftestLaunchFailureReportsAccurately() {
     [
       MCP_SIDING_PATH,
       "--backend-url",
-      "http://127.0.0.1:1/mcp", // unreachable - forces downCallResult() to actually launch
+      // Not :1 - see selftestLauncherErrorDoesNotCrash's comment on why.
+      "http://127.0.0.1:65533/mcp",
       "--name",
       "test",
       "--app",

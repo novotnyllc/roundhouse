@@ -291,23 +291,36 @@ class Cancelled extends Error {}
 // post()'s catch, the same way Cancelled is.
 class MalformedResponse extends Error {}
 
-// A timeout fired (post()'s own timer aborted the request - Cancelled is
-// already ruled out before this class is ever thrown, see post()'s catch).
-// The rule this encodes: a timeout never proves the backend did not
-// receive the request - it only proves we stopped waiting. That is true
-// whether headers ever arrived or not - a backend that withholds headers
-// until an operation completes times out with nothing established, and is
-// exactly as indeterminate as one that stalls mid-body after a 200. Only a
-// genuine connection-level failure (the fetch itself rejected without us
-// ever aborting it - ECONNREFUSED, ENOTFOUND, EHOSTUNREACH, ...) proves
-// nothing was delivered and the app is genuinely unreachable; that stays
-// Down. Aborting our own fetch does not stop the backend from continuing
-// whatever it started, so retrying (and worse, downCallResult() launching
-// an already-running app) can duplicate a mutation - for CAD, running the
-// operation twice. Never launches, never phrased as unreachable - the
-// message says the operation may have started and may still be running,
-// so a retry could repeat it.
+// The rule this encodes: classify by whether the request is PROVEN
+// UNDELIVERED, not by whether we aborted it. A timeout (post()'s own timer
+// fired - Cancelled is already ruled out before this class is ever thrown,
+// see post()'s catch) never proves the backend did not receive the
+// request, whether or not headers ever arrived. Neither does a connection
+// that failed AFTER the request was already transmitted - a reset, EPIPE,
+// or socket hang-up (Node/undici surface this as cause.code
+// UND_ERR_SOCKET/ECONNRESET/EPIPE) means the app may have crashed or
+// restarted mid-operation, not that it never saw the request. Only a
+// failure proven to precede delivery - connection refused, host
+// unreachable, DNS failure (cause.code ECONNREFUSED/EHOSTUNREACH/
+// ENOTFOUND/EAI_AGAIN) - proves nothing was delivered; see
+// PROVEN_UNDELIVERED_CODES below, which post()'s catch checks explicitly,
+// defaulting every other (including unrecognized) code to Indeterminate -
+// the safe direction is to under-claim downtime, never to over-claim it.
+// Aborting our own fetch, or the connection failing out from under us,
+// does not stop the backend from continuing whatever it started, so
+// retrying (and worse, downCallResult() launching an already-running app)
+// can duplicate a mutation - for CAD, running the operation twice. Never
+// launches, never phrased as unreachable - the message says the operation
+// may have started and may still be running, so a retry could repeat it.
 class Indeterminate extends Error {}
+
+// Error codes that PROVE a request was never delivered - the connection
+// itself never succeeded, so nothing reached the backend. Anything else
+// (a reset/EPIPE/hang-up after the request went out, or a code this list
+// does not recognize) defaults to Indeterminate in post()'s catch, on
+// purpose: understating downtime is safe, overstating it risks a launch
+// and a retry that duplicates a mutation.
+const PROVEN_UNDELIVERED_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH", "EAI_AGAIN"]);
 
 // Per MCP streamable-HTTP: "If a server receives a request with an invalid
 // or expired session ID, the server MUST respond with 404." Only 404 is
@@ -622,6 +635,30 @@ export class Shim {
     // cleared by downCallResult() on the next call, instead of reporting a
     // bogus "still starting" for an app that is never going to start.
     this.launchFailure = null;
+    // Client request ids cancelled while still QUEUED - not yet in
+    // this.inFlight, because main()'s serialized queue has not reached
+    // them yet (see cancel()). Consumed (one-shot) by handle() when that
+    // id's own turn comes up, so it never contacts the backend with a
+    // call the user already cancelled. Capped with oldest-eviction rather
+    // than precise per-id lifecycle tracking (no timers, no second map to
+    // keep in sync): a cancellation whose matching request id never
+    // actually arrives (stale/duplicate/unknown) would otherwise sit here
+    // forever on a long-lived server, and the cap is generous enough that
+    // a real cancellation is always consumed long before eviction could
+    // matter.
+    this.cancelledQueuedIds = new Set();
+  }
+
+  // Records `clientRequestId` as cancelled-while-queued and evicts the
+  // oldest entry once the bound is exceeded - see the constructor comment
+  // on this.cancelledQueuedIds for why a simple cap, not precise lifecycle
+  // tracking.
+  tombstoneQueuedCancel(clientRequestId) {
+    this.cancelledQueuedIds.add(clientRequestId);
+    const cap = 50;
+    while (this.cancelledQueuedIds.size > cap) {
+      this.cancelledQueuedIds.delete(this.cancelledQueuedIds.values().next().value);
+    }
   }
 
   // `clientRequestId`, when given, registers this call's AbortController in
@@ -700,20 +737,24 @@ export class Shim {
       // A parse failure (malformed JSON/SSE) means a response DID arrive -
       // reachable, not downtime - see MalformedResponse.
       if (err instanceof MalformedResponse) throw err;
-      // Classify by CAUSE, not by how far the response got. Only two call
-      // sites ever abort this controller (the timer just below, and
-      // cancel(), already ruled out above), so `aborted` here - with
-      // Cancelled excluded - can only mean the timer fired: a timeout,
-      // which proves nothing about whether the backend received the
-      // request. Anything else is a genuine connection-level failure (the
-      // fetch itself rejected without us ever aborting it) - nothing was
-      // delivered, so the app really is unreachable.
-      if (controller.signal.aborted) {
-        throw new Indeterminate(
-          `no response within ${this.timeoutMs}ms - the backend may have received the request and could still be processing it`,
-        );
+      // Classify by whether delivery is PROVEN, not by whether WE aborted -
+      // see Indeterminate/PROVEN_UNDELIVERED_CODES above for the reasoning.
+      // Only two call sites ever abort this controller (the timer just
+      // below, and cancel(), already ruled out above), so `aborted` here -
+      // with Cancelled excluded - can only mean the timer fired: a timeout,
+      // never proof of non-delivery. Otherwise, only an error code proven
+      // to precede delivery is Down; every other code (a reset/EPIPE/hang-
+      // up after transmission, or one this list does not recognize) is
+      // Indeterminate too, on purpose - understating downtime is the safe
+      // direction, overstating it is not.
+      if (!controller.signal.aborted && PROVEN_UNDELIVERED_CODES.has(err?.cause?.code ?? err?.code)) {
+        throw new Down(err?.message ?? String(err));
       }
-      throw new Down(err?.message ?? String(err));
+      throw new Indeterminate(
+        controller.signal.aborted
+          ? `no response within ${this.timeoutMs}ms - the backend may have received the request and could still be processing it`
+          : `the connection failed after the request may already have been sent (${err?.message ?? String(err)}) - the backend may have received it and could still be processing it`,
+      );
     } finally {
       clearTimeout(timer);
       if (clientRequestId !== undefined) this.inFlight.delete(clientRequestId);
@@ -854,13 +895,26 @@ export class Shim {
   // the next message - it does NOT stop the backend from continuing to run
   // the operation to completion. Only a backend that honors the forwarded
   // notification actually stops the work; this shim cannot cancel a CAD
-  // operation mid-flight by itself. Unknown or already-finished ids (no
-  // tracked controller) are a harmless no-op - no reply either way, since
-  // this is a notification.
+  // operation mid-flight by itself.
+  //
+  // A request that is not in this.inFlight is not necessarily unknown or
+  // already finished - it may simply be QUEUED behind an earlier call,
+  // not yet reached by main()'s serialized queue (post() only registers a
+  // controller once it actually starts). Cancelling that id used to be a
+  // silent no-op: once its turn came up, handle() would dispatch it
+  // normally and send the very mutating tool call the user had already
+  // cancelled. Recorded as a tombstone instead (see
+  // this.cancelledQueuedIds/tombstoneQueuedCancel) so handle() can catch
+  // it before ever contacting the backend - a harmless, unconsumed entry
+  // (bounded by the cap) if the id turns out to be genuinely unknown or
+  // already finished.
   cancel(clientRequestId, reason) {
     if (clientRequestId === undefined || clientRequestId === null) return;
     const controller = this.inFlight.get(clientRequestId);
-    if (!controller) return;
+    if (!controller) {
+      this.tombstoneQueuedCancel(clientRequestId);
+      return;
+    }
     controller.abort(new Cancelled(reason ? `cancelled by client: ${reason}` : "cancelled by client"));
     // Name the backend id THIS call actually used (see backend()) - not a
     // hardcoded value, which could now name a different, still-running
@@ -1034,6 +1088,16 @@ export class Shim {
     // tools/call can launch the app, and a launch for a reply nobody will
     // ever read is a real, user-visible side effect, not a no-op.
     if (id === undefined) return null;
+    // A cancellation may have arrived for this id while it was still
+    // queued behind an earlier call - see cancel()/this.cancelledQueuedIds.
+    // Dispatching it now would send a mutating tool call the user already
+    // cancelled. Consume the tombstone (one-shot, via delete's own return
+    // value) here, before every dispatch branch below - same reasoning
+    // and same placement as the id===undefined gate just above: this must
+    // not be skippable per-method, since any of them could launch.
+    if (this.cancelledQueuedIds.delete(id)) {
+      return ok(id, this.errorResult(`${this.name}: call cancelled.`));
+    }
     if (method === "ping") return ok(id, {});
     if (method === "tools/list") return ok(id, await this.toolsList(params, id));
     if (method === "tools/call") return ok(id, await this.toolsCall(params, id));
