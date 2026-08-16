@@ -440,7 +440,9 @@ if (args[0] === "app-server" && args[1] === "--stdio") {
   process.exitCode = 64;
 }
 '@
-        $fixtureBin = Join-Path $root 'codex-action-bin'
+        # Keep a space in the shim path: the Node launcher must pass a bundled
+        # codex.cmd path intact through cmd.exe.
+        $fixtureBin = Join-Path $root 'codex action bin'
         [void][IO.Directory]::CreateDirectory($fixtureBin)
         if ($IsWindows) {
             $fakeCodex = Join-Path $fixtureBin 'codex.cmd'

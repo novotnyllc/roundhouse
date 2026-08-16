@@ -13,7 +13,10 @@ function fail(message) {
 
 function spawnCodex(codexExecutable, args, options) {
   const shell = process.platform === "win32" && /\.(?:cmd|bat)$/i.test(codexExecutable);
-  return spawn(codexExecutable, args, shell ? { ...options, shell: true } : options);
+  // cmd.exe receives a command string when shell is enabled, so preserve a
+  // bundled shim's full path rather than splitting it at a space.
+  const command = shell ? `"${codexExecutable}"` : codexExecutable;
+  return spawn(command, args, shell ? { ...options, shell: true } : options);
 }
 
 function hookKeyPath(key) {
