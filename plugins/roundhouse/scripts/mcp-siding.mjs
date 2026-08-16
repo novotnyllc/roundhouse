@@ -689,6 +689,12 @@ export class Shim {
     // cleared by downCallResult() on the next call, instead of reporting a
     // bogus "still starting" for an app that is never going to start.
     this.launchFailure = null;
+    // Staging buffer for an in-progress tools/list pagination walk - pages
+    // accumulate here and are committed to the persistent cache (see
+    // toolsList) only once the terminal page (no nextCursor) arrives. null
+    // means no walk is currently staged. See toolsList for the full commit
+    // rule and what happens if a walk is abandoned mid-sequence.
+    this.pendingToolsPage = null;
     // Client request ids main() has enqueued but whose own turn in the
     // serialized queue has not yet come up - set by main() the moment an
     // id-carrying message is enqueued, cleared by handle() the moment
@@ -1033,24 +1039,53 @@ export class Shim {
     try {
       const result = await this.backend("tools/list", params, clientRequestId);
       // Guard the cache write on a real array (no future response shape
-      // surprise can blank a previously good cache). An uncursored
-      // (first-page) request REPLACES the cache - a fresh listing starts
-      // over, which is what stops a stale page ever standing in as the
-      // complete set. A cursored (later-page) request APPENDS to it: if
-      // the client walks the full sequence the cache ends up holding the
-      // complete inventory; if it stops early the cache holds a prefix -
-      // strictly better than page one alone, and still never presents a
-      // middle page as the whole set (the earlier, page-one-only fix's
-      // own failure mode - it just moved which page got stuck as "the
-      // whole set" instead of fixing the general case). The cache only
-      // ever stores the merged tools array (never nextCursor), so the
-      // offline path below never claims more pages are fetchable either.
+      // surprise can blank a previously good cache). N19's original design
+      // committed to the persistent cache on every page, including an
+      // uncursored (first) page - which meant a *refresh* of an already-
+      // complete multi-page inventory replaced it with page one alone the
+      // instant that first page arrived, and if the backend then failed
+      // mid-walk, the previously complete cache was gone: the same loss
+      // N19 was meant to prevent, just reached through an interrupted walk
+      // instead of a partial read. So the persistent cache (this.cachePath)
+      // is now only ever touched on the TERMINAL page of a walk (a
+      // response with no nextCursor) - an interrupted walk leaves it
+      // untouched. Pages accumulate in this.pendingToolsPage in the
+      // meantime, entirely in memory:
+      //   - an uncursored (first-page) request starts a FRESH staging
+      //     buffer, discarding any previous one outright - a new walk
+      //     replaces, it does not resume, whatever a prior walk (complete,
+      //     interrupted, or abandoned) left staged.
+      //   - a cursored (later-page) request appends to the existing
+      //     staging buffer (or starts one from just this page if none was
+      //     staged - a cursor arriving without an uncursored request first
+      //     is a client-driven edge case, and the least surprising thing
+      //     to do with it is stage what actually arrived).
+      //   - only once a page arrives with no nextCursor (single-page
+      //     listings are terminal on arrival, so they still commit
+      //     immediately, exactly as before) does the FULL staged result
+      //     get written to the persistent cache, replacing it outright -
+      //     a completed walk is a fresh inventory, not an append to the
+      //     old one. The buffer is then cleared.
+      // A client that starts a walk and never finishes it (crashes,
+      // disconnects, simply stops paging) leaves this.pendingToolsPage
+      // holding a partial page set - it is never written to disk, never
+      // read by the offline fallback below (which only ever reads the
+      // persistent cache), and does not grow unbounded: it is simply
+      // overwritten whole the next time an uncursored request starts a
+      // new walk, or dropped when this Shim instance exits. Nothing
+      // leaks, and a later fresh listing never resumes stale pages.
       // The live result passes through unchanged regardless of caching -
       // e.g. nextCursor stays intact for the live caller - this only ever
-      // touches disk.
+      // touches disk on a terminal page.
       if (Array.isArray(result.tools)) {
-        const base = params?.cursor ? readCache(this.cachePath) : [];
-        writeCache(this.cachePath, mergeToolPage(base, result.tools));
+        const base = params?.cursor ? (this.pendingToolsPage ?? []) : [];
+        const staged = mergeToolPage(base, result.tools);
+        if (result.nextCursor) {
+          this.pendingToolsPage = staged;
+        } else {
+          writeCache(this.cachePath, staged);
+          this.pendingToolsPage = null;
+        }
       }
       return result;
     } catch {
@@ -1452,8 +1487,18 @@ function run() {
     return;
   }
   if (flags["print-shim-script"]) {
-    if (!flags["backend-url"] || !flags.name) {
-      process.stderr.write(usage());
+    // Route through the SAME validation the runtime uses (URL format and
+    // protocol, --timeout/--launch-grace) rather than the truthiness-only
+    // check this used to have - buildShimScript below builds the actual
+    // output text directly from flags and does not itself validate
+    // anything, so generation must fail for exactly the inputs the
+    // spawned server would reject, with the same diagnostics, before a
+    // registration is made rather than after. The built Shim is discarded
+    // - only its validation matters here.
+    try {
+      buildShimFromArgs(flags);
+    } catch (err) {
+      process.stderr.write(`${err.message}\n${usage()}`);
       process.exit(2);
     }
     process.stdout.write(buildShimScript(flags));

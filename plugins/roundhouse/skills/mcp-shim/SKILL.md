@@ -104,12 +104,26 @@ handle. This candidate list mirrors `NODE_RESOLVER_SH` in
 
 <!-- mcp-siding-selftest: node-resolver-install-snippet:start -->
 ```bash
+node_ok() {
+  [ -x "$1" ] || return 1
+  "$1" -e 'if (typeof fetch !== "function" || typeof ReadableStream !== "function") process.exit(1)' >/dev/null 2>&1
+}
+if [ -n "$MCP_SIDING_NODE" ]; then
+  if [ ! -x "$MCP_SIDING_NODE" ]; then
+    echo "mcp-siding: \$MCP_SIDING_NODE is set to '$MCP_SIDING_NODE' but that file does not exist or is not executable - this is an explicit override, not a hint, so it must name a usable node rather than silently falling back to another one." >&2
+    exit 1
+  fi
+  if ! node_ok "$MCP_SIDING_NODE"; then
+    echo "mcp-siding: \$MCP_SIDING_NODE is set to '$MCP_SIDING_NODE' but it lacks global fetch/ReadableStream (this shim needs Node 18+) - this is an explicit override, not a hint, so it must name a usable node rather than silently falling back to another one." >&2
+    exit 1
+  fi
+fi
 node_bin=""
 for node_candidate in "$MCP_SIDING_NODE" "$(command -v node 2>/dev/null)" \
   /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node \
   "$HOME/.volta/bin/node" "$HOME/.asdf/shims/node"; do
-  [ -n "$node_candidate" ] && [ -x "$node_candidate" ] || continue
-  if "$node_candidate" -e 'if (typeof fetch !== "function" || typeof ReadableStream !== "function") process.exit(1)' >/dev/null 2>&1; then
+  [ -n "$node_candidate" ] || continue
+  if node_ok "$node_candidate"; then
     node_bin=$node_candidate
     break
   fi

@@ -687,16 +687,19 @@ export async function selftest() {
     );
   }
 
-  // -- 7e4. N3/N19: pagination must not corrupt the offline cache. An
-  //         uncursored (first-page) request REPLACES the cache; a cursored
-  //         (later-page) request APPENDS to it - fetching page two must
-  //         not overwrite page one's entries, and once the client has
-  //         walked the whole sequence and the backend goes away, the
-  //         offline tools/list must serve BOTH pages' tools (not just
-  //         page one - N3's fix stopped a middle page from standing in as
-  //         the complete set, but replaced it with page one alone always
-  //         doing that instead), and must not claim more pages are
-  //         fetchable (no stale nextCursor). ------------------------------
+  // -- 7e4. N3/N19/N36: pagination must not corrupt the offline cache, and
+  //         a walk that never reaches the terminal page must not destroy a
+  //         previously complete one either. Pages accumulate in memory as
+  //         the walk proceeds; the persistent cache is only REPLACED once
+  //         a page arrives with no nextCursor (N36) - fetching page two
+  //         must not overwrite page one's entries while the walk is still
+  //         in progress, and once the client has walked the whole
+  //         sequence and the backend goes away, the offline tools/list
+  //         must serve BOTH pages' tools (not just page one - N3's fix
+  //         stopped a middle page from standing in as the complete set,
+  //         but replaced it with page one alone always doing that
+  //         instead), and must not claim more pages are fetchable (no
+  //         stale nextCursor). ------------------------------------------
   const page1Tools = [{ name: "page1_tool" }];
   const page2Tools = [{ name: "page2_tool" }];
   const paginationCachePath = join(cacheDir, "pagination.json");
@@ -839,6 +842,142 @@ export async function selftest() {
         readCache(rewalkCachePath),
         [...page1Tools, ...page2Tools],
         "re-walking the same pages must not duplicate entries",
+      );
+    },
+  );
+
+  // -- 7e5. N36: a REFRESH interrupted mid-walk must leave a previously
+  //         complete cache untouched. N19's append design committed the
+  //         uncursored (first) page to the persistent cache immediately -
+  //         so refreshing an already-complete multi-page inventory
+  //         replaced it with page one alone the instant that page arrived,
+  //         and if the backend then failed before the walk finished, the
+  //         previously complete cache was gone. Seed a complete two-page
+  //         cache directly, then run a fresh walk whose first page
+  //         succeeds (staged in memory only) and whose second page hits a
+  //         dead backend - the persisted cache must still be the OLD
+  //         complete set, not page one. --------------------------------
+  const interruptedCachePath = join(cacheDir, "pagination-interrupted.json");
+  writeCache(interruptedCachePath, [...page1Tools, ...page2Tools]);
+  const refreshPage1Tools = [{ name: "refresh_page1_tool" }];
+  let interruptedShim;
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "pagination-interrupted-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/list") {
+          // Only ever answers the uncursored (first) page - the walk's
+          // continuation request is made after this server is gone.
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: refreshPage1Tools, nextCursor: "page2" } });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      interruptedShim = new Shim({
+        url,
+        name: "test",
+        cachePath: interruptedCachePath,
+        timeoutMs: 2_000,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const refreshPage1 = await interruptedShim.handle({ jsonrpc: "2.0", id: 46, method: "tools/list", params: {} });
+      assert.deepEqual(refreshPage1.result.tools, refreshPage1Tools);
+      assert.deepEqual(
+        readCache(interruptedCachePath),
+        [...page1Tools, ...page2Tools],
+        "a not-yet-terminal page must not touch the persistent cache at all - the old complete inventory must survive untouched",
+      );
+    },
+  );
+  // The backend is gone now - the walk's continuation request fails.
+  const interruptedPage2 = await interruptedShim.handle({
+    jsonrpc: "2.0",
+    id: 47,
+    method: "tools/list",
+    params: { cursor: "page2" },
+  });
+  assert.deepEqual(
+    interruptedPage2.result.tools,
+    [...page1Tools, ...page2Tools],
+    "an interrupted walk must fall back to serving the OLD complete cache, not the new partial one",
+  );
+  assert.deepEqual(
+    readCache(interruptedCachePath),
+    [...page1Tools, ...page2Tools],
+    "the persistent cache must still hold the previously complete inventory after an interrupted refresh - it must never have been replaced with page one alone",
+  );
+
+  // -- 7e6. N36: an abandoned staged walk must not leak into, or be
+  //         resumed by, a later fresh uncursored listing. Start a walk,
+  //         fetch its first (non-terminal) page, then never continue it -
+  //         a client that reconnects, gives up, or simply calls tools/list
+  //         again without a cursor must get a clean fresh listing, not
+  //         page two of an old abandoned sequence, and not a merge of the
+  //         two. -----------------------------------------------------------
+  const abandonedCachePath = join(cacheDir, "pagination-abandoned.json");
+  const abandonedPageTools = [{ name: "abandoned_tool" }];
+  const freshRefreshTools = [{ name: "fresh_refresh_tool" }];
+  let callCount = 0;
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "pagination-abandoned-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/list") {
+          callCount += 1;
+          if (callCount === 1) {
+            // The abandoned walk's first (non-terminal) page - never continued.
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: abandonedPageTools, nextCursor: "page2" } });
+          }
+          // A later, unrelated uncursored request - single page, terminal on arrival.
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: freshRefreshTools } });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const abandonedShim = new Shim({
+        url,
+        name: "test",
+        cachePath: abandonedCachePath,
+        timeoutMs: 2_000,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const firstPage = await abandonedShim.handle({ jsonrpc: "2.0", id: 48, method: "tools/list", params: {} });
+      assert.deepEqual(firstPage.result.tools, abandonedPageTools);
+      assert.deepEqual(readCache(abandonedCachePath), [], "an abandoned walk's non-terminal page must never reach the persistent cache");
+      // Never call cursor="page2" - the walk is abandoned here. A fresh
+      // uncursored request instead (e.g. the client reconnected).
+      const freshListing = await abandonedShim.handle({ jsonrpc: "2.0", id: 49, method: "tools/list", params: {} });
+      assert.deepEqual(
+        freshListing.result.tools,
+        freshRefreshTools,
+        "a fresh uncursored request must discard the abandoned walk's staged page, not resume or merge with it",
+      );
+      assert.deepEqual(
+        readCache(abandonedCachePath),
+        freshRefreshTools,
+        "the persistent cache must hold only the fresh listing - not merged with the abandoned walk's staged page",
       );
     },
   );
@@ -1042,6 +1181,14 @@ export async function selftest() {
   //         message sent regardless." A real subprocess is the only way
   //         to prove that end to end. ---------------------------------
   await selftestInvalidBackendUrlExitsBeforeStdio();
+
+  // -- 7j4b. N35: --print-shim-script must be rejected by the SAME
+  //          validation buildShimFromArgs applies to a real launch, not
+  //          just the old truthiness-only check - a malformed
+  //          --backend-url or a bad --timeout used to generate a script
+  //          happily, so `mcp add` would register something that could
+  //          never start. Real subprocess, real flags, same diagnostic. --
+  await selftestPrintShimScriptValidatesLikeBuildShimFromArgs();
 
   // -- 7j2. N13: the OTHER real macOS launch-failure shape - `open -a
   //         <bad path>` spawns fine and simply exits nonzero, which
@@ -2832,6 +2979,54 @@ async function selftestInstallNodeResolverSnippet() {
     await rm(fakeHome, { recursive: true, force: true });
   }
 
+  // -- N34: the install snippet must apply N31's exact rule too - a
+  //    nonempty $MCP_SIDING_NODE that is unusable exits non-zero before
+  //    any registration happens, distinguishing missing/non-executable
+  //    from capability-failing; unset/usable are unchanged. --------------
+
+  // set to a usable node -> wins, unchanged (PATH broken, so this proves
+  // the override itself resolves, not a PATH fallback).
+  const usableOverride = spawnSync("/bin/sh", ["-c", `${snippet}\nprintf '%s' "$SCRIPT"`], {
+    env: { ...baseEnv, MCP_SIDING_NODE: realNode },
+    encoding: "utf8",
+  });
+  assert.equal(usableOverride.status, 0, `install snippet failed with a usable $MCP_SIDING_NODE override (stderr: ${usableOverride.stderr})`);
+  assert.match(usableOverride.stdout, /exec "\$node_bin"/, "a usable $MCP_SIDING_NODE override must still produce a valid registration script");
+
+  // set to a nonexistent path while a perfectly good node exists on PATH -
+  // must fail closed, not fall through to that usable alternative (the
+  // usable alternative is what makes this assertion meaningful, same
+  // reasoning as N29/N31's own tests).
+  const missingOverridePath = "/definitely/not/a/real/node/binary";
+  const missingOverride = spawnSync("/bin/sh", ["-c", snippet], {
+    env: { ...process.env, SKILL_DIR: skillDir, MCP_SIDING_NODE: missingOverridePath }, // real PATH left intact
+    encoding: "utf8",
+  });
+  assert.notEqual(missingOverride.status, 0, "the install snippet must fail closed on a nonexistent $MCP_SIDING_NODE, not exit 0");
+  assert.match(missingOverride.stderr, /MCP_SIDING_NODE/, "the diagnostic must name the override");
+  assert.ok(missingOverride.stderr.includes(missingOverridePath), "the diagnostic must name the missing path itself");
+
+  // set to a real executable that fails the capability probe - must fail
+  // closed naming the missing capability, not silently fall through.
+  const stubNodeHome = await mkdtemp(join(tmpdir(), "mcp-siding-install-stub-node-"));
+  try {
+    const stubNodePath = join(stubNodeHome, "too-old-node");
+    await writeFile(stubNodePath, "#!/bin/sh\nexit 1\n");
+    await chmod(stubNodePath, 0o755);
+    const capabilityFailOverride = spawnSync("/bin/sh", ["-c", snippet], {
+      env: { ...process.env, SKILL_DIR: skillDir, MCP_SIDING_NODE: stubNodePath }, // real PATH left intact
+      encoding: "utf8",
+    });
+    assert.notEqual(capabilityFailOverride.status, 0, "the install snippet must fail closed on a capability-failing $MCP_SIDING_NODE");
+    assert.match(
+      capabilityFailOverride.stderr,
+      /fetch|ReadableStream/i,
+      "the diagnostic must name the missing capability, not just 'unusable'",
+    );
+  } finally {
+    await rm(stubNodeHome, { recursive: true, force: true });
+  }
+
   // -- no usable runtime anywhere: must fail with the same CLASS of
   //    diagnostic as the runtime resolver (naming fetch/ReadableStream),
   //    not a bare "command not found". Same real-system-path caveat as
@@ -2897,6 +3092,66 @@ async function selftestInvalidBackendUrlExitsBeforeStdio() {
   assert.match(err, /--backend-url must be a valid URL/, "the diagnostic must name the problem");
   assert.equal(out, "", "no reply may have been sent - the stdio server must never have opened");
   if (child.exitCode == null) child.kill();
+}
+
+// N35: --print-shim-script used to check only that --backend-url and --name
+// were present, then hand flags straight to buildShimScript - so a
+// malformed URL or a bad --timeout/--launch-grace generated a script
+// happily, `mcp add` registered it, and only the SPAWNED server (running
+// buildShimFromArgs for real) ever rejected it, leaving a broken
+// registration behind. This proves the CLI's --print-shim-script path now
+// runs buildShimFromArgs first and fails with the exact same diagnostic a
+// real launch would, before printing anything - and that valid input is
+// unaffected.
+function selftestPrintShimScriptValidatesLikeBuildShimFromArgs() {
+  const badUrl = spawnSync(
+    process.execPath,
+    [MCP_SIDING_PATH, "--print-shim-script", "--backend-url", "not a url at all", "--name", "test"],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(badUrl.status, 0, "--print-shim-script must exit non-zero on a malformed --backend-url");
+  assert.match(
+    badUrl.stderr,
+    /--backend-url must be a valid URL/,
+    "must fail with buildShimFromArgs's own diagnostic, not a generic one",
+  );
+  assert.equal(badUrl.stdout, "", "no script may be printed for input the runtime would reject");
+
+  const badScheme = spawnSync(
+    process.execPath,
+    [MCP_SIDING_PATH, "--print-shim-script", "--backend-url", "ftp://127.0.0.1:27182/mcp", "--name", "test"],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(badScheme.status, 0, "--print-shim-script must exit non-zero on a non-http(s) --backend-url");
+  assert.match(badScheme.stderr, /must use http: or https:/, "must name the protocol problem, same as buildShimFromArgs");
+  assert.equal(badScheme.stdout, "", "no script may be printed for a rejected protocol");
+
+  const badTimeout = spawnSync(
+    process.execPath,
+    [
+      MCP_SIDING_PATH,
+      "--print-shim-script",
+      "--backend-url",
+      "http://127.0.0.1:27182/mcp",
+      "--name",
+      "test",
+      "--timeout",
+      "notanumber",
+    ],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(badTimeout.status, 0, "--print-shim-script must exit non-zero on a non-numeric --timeout");
+  assert.match(badTimeout.stderr, /timeout/i, "must name the flag that failed");
+  assert.equal(badTimeout.stdout, "", "no script may be printed for a rejected --timeout");
+
+  // Valid input must still work exactly as before.
+  const valid = spawnSync(
+    process.execPath,
+    [MCP_SIDING_PATH, "--print-shim-script", "--backend-url", "http://127.0.0.1:27182/mcp", "--name", "test"],
+    { encoding: "utf8" },
+  );
+  assert.equal(valid.status, 0, `valid --print-shim-script input must still succeed (stderr: ${valid.stderr})`);
+  assert.match(valid.stdout, /exec "\$node_bin"/, "valid input must still print a real registration script");
 }
 
 // N13: `open -a <bad path>` on macOS spawns fine and exits nonzero - unlike

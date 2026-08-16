@@ -170,11 +170,11 @@
     },
     {
       "path": "scripts/mcp-siding.mjs",
-      "sha256": "e968fd1822fa307382b5807afcbc06a9af39a5be0b4f49a29c61556a41ba8ba9"
+      "sha256": "534684ffcf5de2ff96f4aa366e17b17a079269aa714020fdd7e883e20507f560"
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
-      "sha256": "cd8e71a67810fab73dab59da50349a6c1440e9f7af78e27e8a1eb01d465eb250"
+      "sha256": "35f01698d472abff16816693989999656738a848ae826d9657c6c830b0c945ef"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -262,7 +262,7 @@
     },
     {
       "path": "skills/mcp-shim/SKILL.md",
-      "sha256": "fb08e2e5d11652f6394ad15f85f522212d27c338c145307dec5e4de47e8af824"
+      "sha256": "bea1417fb3acfffaa01a52a99d97381ab25e8b733958baefbefd33cd2a722cf5"
     },
     {
       "path": "skills/mcp-shim/agents/openai.yaml",
