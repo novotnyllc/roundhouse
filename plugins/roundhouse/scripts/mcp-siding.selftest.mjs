@@ -2505,6 +2505,47 @@ async function selftestNodeResolver() {
     `script did not start with node absent from PATH but present via $MCP_SIDING_NODE (stderr: ${overrideResult.err})`,
   );
 
+  // -- N31: $MCP_SIDING_NODE set but unusable must fail closed, not fall
+  //    through to PATH/the fixed fallbacks - same rule as N29's
+  //    $MCP_SIDING_PATH, applied here too (a registration could otherwise
+  //    quietly run under a different Node than the one being pinned for
+  //    testing). PATH is left INTACT with a perfectly good node on it -
+  //    that usable alternative is what makes the "does not fall through"
+  //    assertion meaningful, same reasoning as N29's own test. -----------
+  const n31Home = await mkdtemp(join(tmpdir(), "mcp-siding-node-override-"));
+  try {
+    const missingNodePath = join(n31Home, "nope-node");
+    const missingNodeResult = await runShimScript({ ...baseEnv, MCP_SIDING_NODE: missingNodePath });
+    assert.notEqual(missingNodeResult.code, 0, "a nonexistent MCP_SIDING_NODE must fail closed, not exit 0");
+    assert.ok(
+      !missingNodeResult.out.includes('"id":60'),
+      "a nonexistent MCP_SIDING_NODE must not fall through to the real node still on PATH",
+    );
+    assert.match(missingNodeResult.err, /MCP_SIDING_NODE/, "the diagnostic must name the override");
+    assert.ok(missingNodeResult.err.includes(missingNodePath), "the diagnostic must name the missing path itself");
+
+    // A real executable that fails the capability probe (always exits 1,
+    // so it never has global fetch/ReadableStream - same stub shape as
+    // N24's) must also fail closed, naming the missing capability rather
+    // than silently falling through to PATH's perfectly good node.
+    const capabilityFailNodePath = join(n31Home, "too-old-node");
+    await writeFile(capabilityFailNodePath, "#!/bin/sh\nexit 1\n");
+    await chmod(capabilityFailNodePath, 0o755);
+    const capabilityFailNodeResult = await runShimScript({ ...baseEnv, MCP_SIDING_NODE: capabilityFailNodePath });
+    assert.notEqual(capabilityFailNodeResult.code, 0, "an MCP_SIDING_NODE failing the capability probe must fail closed");
+    assert.ok(
+      !capabilityFailNodeResult.out.includes('"id":60'),
+      "an MCP_SIDING_NODE failing the capability probe must not fall through to the real node still on PATH",
+    );
+    assert.match(
+      capabilityFailNodeResult.err,
+      /fetch|ReadableStream/i,
+      "the diagnostic must name the missing capability, not just 'unusable'",
+    );
+  } finally {
+    await rm(n31Home, { recursive: true, force: true });
+  }
+
   // -- node absent from PATH but present at a known fallback location -
   //    asdf's default shim path, HOME-relative and so fully controllable
   //    in a test, unlike the Homebrew/system absolute paths below. -----

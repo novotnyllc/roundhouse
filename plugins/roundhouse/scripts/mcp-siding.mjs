@@ -168,7 +168,14 @@ fi`;
 //
 // Candidates tried in order, first one that PASSES THE PROBE wins:
 //   0. $MCP_SIDING_NODE - the same kind of explicit override
-//      $MCP_SIDING_PATH above is, for the same reason.
+//      $MCP_SIDING_PATH above is, for the same reason, including the same
+//      fail-closed rule: set but unusable (missing, not executable, or
+//      failing the capability probe below) exits non-zero naming the
+//      override, rather than silently continuing to PATH/the fixed
+//      fallbacks - a registration could otherwise quietly run under a
+//      different Node than the one being pinned for testing. Only UNSET
+//      (or empty) falls through to the branches below - same distinction,
+//      same reason, one rule applied to both overrides in this file.
 //   1. `command -v node` - the normal case, an already-working PATH.
 //   2. Common install locations: Homebrew's arm64 and x86_64 default
 //      prefixes, then /usr/bin, then Volta's and asdf's default shims.
@@ -191,6 +198,16 @@ export const NODE_RESOLVER_SH = `node_ok() {
   [ -x "$1" ] || return 1
   "$1" -e 'if (typeof fetch !== "function" || typeof ReadableStream !== "function") process.exit(1)' >/dev/null 2>&1
 }
+if [ -n "$MCP_SIDING_NODE" ]; then
+  if [ ! -x "$MCP_SIDING_NODE" ]; then
+    echo "mcp-siding: \\$MCP_SIDING_NODE is set to '$MCP_SIDING_NODE' but that file does not exist or is not executable - this is an explicit override, not a hint, so it must name a usable node rather than silently falling back to another one." >&2
+    exit 1
+  fi
+  if ! node_ok "$MCP_SIDING_NODE"; then
+    echo "mcp-siding: \\$MCP_SIDING_NODE is set to '$MCP_SIDING_NODE' but it lacks global fetch/ReadableStream (this shim needs Node 18+) - this is an explicit override, not a hint, so it must name a usable node rather than silently falling back to another one." >&2
+    exit 1
+  fi
+fi
 node_bin=""
 node_rejected=""
 for node_candidate in "$MCP_SIDING_NODE" "$(command -v node 2>/dev/null)" \\

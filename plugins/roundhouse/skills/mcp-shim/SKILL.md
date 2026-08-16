@@ -69,7 +69,8 @@ every backend request with `ReferenceError: fetch is not defined`, which
 reads as the backend being down. `$MCP_SIDING_NODE` pins an exact `node`
 binary the same way `$MCP_SIDING_PATH` pins the script, for the same
 reason (local development, or a machine where the resolver's search order
-picks the wrong one).
+picks the wrong one) — including the same fail-closed rule; see "Local
+development" below.
 
 ## Install a server
 
@@ -143,14 +144,19 @@ This pins one exact path and will not follow plugin updates — the opposite
 of a normal install, and deliberately so; it is the one named exception to
 the "never register a literal path" prohibition above.
 
-The pin fails closed: if `MCP_SIDING_PATH` is set but does not name an
-existing file (renamed, deleted, an unmounted volume), the resolver exits
-non-zero with a diagnostic naming the path rather than silently falling
-back to an installed build. An explicit override is an assertion of
-intent — running a published version while the user believes they are
-exercising their working tree would be exactly the misleading result this
-mode exists to avoid. Only leaving the variable unset (or empty) falls
-through to the normal resolution chain.
+One rule covers both override variables, `MCP_SIDING_PATH` and
+`MCP_SIDING_NODE`: each pin fails closed. If set but unusable —
+`MCP_SIDING_PATH` naming a file that does not exist (renamed, deleted, an
+unmounted volume), or `MCP_SIDING_NODE` naming a binary that is missing,
+not executable, or fails the `fetch`/`ReadableStream` capability probe
+above — the resolver exits non-zero with a diagnostic naming the override
+and the specific problem, rather than silently falling back to an
+installed build or a different `node`. An explicit override is an
+assertion of intent — running a published version, or a different
+runtime, while the user believes they are exercising their pinned
+working tree would be exactly the misleading result this mode exists to
+avoid. Only leaving a variable unset (or empty) falls through to that
+variable's normal resolution chain — the two never affect each other.
 
 ## Config flags
 
