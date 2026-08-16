@@ -47,7 +47,126 @@ fi
 "$integrity_cover/scripts/update-integrity"
 "$integrity_cover/scripts/roundhouse" executor-status - >/dev/null ||
   fail "integrity enumeration did not pick up a new scripts/ file"
-rm -rf "$integrity_cover"
+# N17: an INSTALLED plugin cache nested inside a git repo whose .gitignore
+# excludes .claude/ (a dotfiles repo - common, and likely across a fleet
+# given roundhouse's own chezmoi tooling) must NOT have its manifest-
+# coverage check bypassed. `rev-parse --is-inside-work-tree` alone cannot
+# tell "a real roundhouse source checkout" apart from "some unrelated
+# directory that happens to sit inside a work tree" - it would make
+# check-ignore match every scripts/* path in the cache, filtering the
+# enumerated set down to nothing and letting an unmanifested executable
+# through undetected. Only whether the plugin manifest is a TRACKED file
+# in that repo tells the two apart. This is the assertion that matters
+# most in this file: it must fail if the weak rev-parse-only gate is ever
+# restored.
+dotfiles_home="$tmp/dotfiles-home"
+mkdir -p "$dotfiles_home"
+git -C "$dotfiles_home" init -q
+printf '.claude/\n.codex/\n' >"$dotfiles_home/.gitignore"
+git -C "$dotfiles_home" add .gitignore
+git -C "$dotfiles_home" -c user.email=test@test.invalid -c user.name=test commit -q -m dotfiles
+nested_cache="$dotfiles_home/.claude/plugins/cache/novotnyllc/roundhouse/$plugin_version"
+mkdir -p "$nested_cache"
+cp -R "$script_dir/../." "$nested_cache/"
+# Same stripping the plugin_cache fixture above does: cp is byte-for-byte,
+# so it also copies whatever git-ignored local tooling artifact (this repo
+# checkout's own, e.g. .impeccable/) sits under the live source tree - not
+# release content, and not what this test is about. Ignore rules are
+# evaluated against the REAL checkout ($script_dir/..), not the fake nested
+# copy, since that is the repo whose .gitignore/.git/info/exclude actually
+# apply here.
+if git -C "$script_dir/.." rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ignore_status=0
+  ignored_fixture_paths=$(
+    (cd "$script_dir/.." && find . ! -type d -print | sed 's#^\./##' | git check-ignore --stdin) 2>/dev/null
+  ) || ignore_status=$?
+  if [ "$ignore_status" -le 1 ] && [ -n "$ignored_fixture_paths" ]; then
+    printf '%s\n' "$ignored_fixture_paths" | while IFS= read -r rel; do
+      [ -n "$rel" ] && rm -f "$nested_cache/$rel"
+    done
+  fi
+fi
+chmod -R go-w "$nested_cache"
+printf '#!/bin/sh\nexit 0\n' >"$nested_cache/scripts/evil.sh"
+chmod 700 "$nested_cache/scripts/evil.sh"
+if "$nested_cache/scripts/roundhouse" executor-status - >/dev/null 2>&1; then
+  fail "N17: an unmanifested scripts/ file in a plugin cache nested under a dotfiles repo bypassed the manifest-coverage check"
+fi
+rm -f "$nested_cache/scripts/evil.sh"
+"$nested_cache/scripts/roundhouse" executor-status - >/dev/null ||
+  fail "the same nested-under-dotfiles cache must pass once the unmanifested file is gone"
+rm -rf "$dotfiles_home"
+
+# N18: strengthens the tracked-manifest test with path identity. A repo
+# that deliberately TRACKS an installed cache's .claude-plugin/plugin.json
+# (a backup repo that commits everything, say) would still pass the
+# tracked-file test above; the plugin root must also sit at the expected
+# plugins/roundhouse path within that repo's toplevel, which a cache nested
+# under .claude/plugins/cache/... never does. Defense in depth, not a
+# boundary - someone who can already write into the cache and commit its
+# manifest can edit integrity.json directly regardless - but cheap and
+# real: this must fail if the path-identity check is ever dropped.
+backup_home="$tmp/backup-home"
+mkdir -p "$backup_home"
+git -C "$backup_home" init -q
+nested_backup_cache="$backup_home/.claude/plugins/cache/novotnyllc/roundhouse/$plugin_version"
+mkdir -p "$nested_backup_cache"
+cp -R "$script_dir/../." "$nested_backup_cache/"
+if git -C "$script_dir/.." rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ignore_status=0
+  ignored_fixture_paths=$(
+    (cd "$script_dir/.." && find . ! -type d -print | sed 's#^\./##' | git check-ignore --stdin) 2>/dev/null
+  ) || ignore_status=$?
+  if [ "$ignore_status" -le 1 ] && [ -n "$ignored_fixture_paths" ]; then
+    printf '%s\n' "$ignored_fixture_paths" | while IFS= read -r rel; do
+      [ -n "$rel" ] && rm -f "$nested_backup_cache/$rel"
+    done
+  fi
+fi
+chmod -R go-w "$nested_backup_cache"
+# The backup repo's own pre-existing ignore convention (unrelated to the
+# plugin content, narrow enough that the manifest itself still gets
+# tracked normally) happens to match the smuggled file once it is added.
+printf '.claude/plugins/cache/novotnyllc/roundhouse/%s/scripts/evil.sh\n' "$plugin_version" >"$backup_home/.gitignore"
+git -C "$backup_home" add .
+git -C "$backup_home" -c user.email=test@test.invalid -c user.name=test commit -q -m "backup everything"
+printf '#!/bin/sh\nexit 0\n' >"$nested_backup_cache/scripts/evil.sh"
+chmod 700 "$nested_backup_cache/scripts/evil.sh"
+if "$nested_backup_cache/scripts/roundhouse" executor-status - >/dev/null 2>&1; then
+  fail "N18: a cache nested under a repo that TRACKS its manifest bypassed the manifest-coverage check via an unrelated ignore rule"
+fi
+rm -rf "$backup_home"
+
+# N40: plugin_root (scripts/roundhouse's `cd -- ... && pwd`, logical) can
+# be reached through a symlinked ANCESTOR directory (a symlinked dev-repo
+# checkout, common for local dev setups) while `git rev-parse
+# --show-toplevel` always resolves through symlinks to the physical repo
+# root - a straight string-prefix comparison between the two then fails
+# for that invocation even though it is the exact same checkout as a
+# direct one: a real gitignored artifact under scripts/ (present here)
+# gets filtered out and passes invoked directly, but is NOT filtered out
+# and fails invoked through the symlinked ancestor. Symlink the REPO ROOT
+# (two levels above plugin_root), not plugin_root itself - plugin_root's
+# own leaf directory must stay a real directory (check_safe_owned_directory
+# above already, separately, rejects plugin_root itself being a symlink;
+# this is testing the path-identity comparison, not that guard). Assert
+# both invocations of the SAME checkout agree. .DS_Store matches this
+# repo's own real top-level .gitignore rule (confirmed: `git check-ignore`
+# reports it ignored) - a genuine artifact, not a contrived one.
+symlinked_repo_root="$tmp/n40-symlinked-repo-root"
+ln -s "$script_dir/../../.." "$symlinked_repo_root"
+: >"$script_dir/../scripts/.DS_Store"
+set +e
+"$cli" executor-status - >/dev/null 2>"$tmp/n40-direct.err"
+n40_direct_rc=$?
+"$symlinked_repo_root/plugins/roundhouse/scripts/roundhouse" executor-status - >/dev/null 2>"$tmp/n40-symlinked.err"
+n40_symlinked_rc=$?
+set -e
+rm -f "$script_dir/../scripts/.DS_Store" "$symlinked_repo_root"
+[ "$n40_direct_rc" -eq 0 ] ||
+  fail "N40: direct invocation of a source checkout with a gitignored scripts/ artifact must pass ($(cat "$tmp/n40-direct.err"))"
+[ "$n40_symlinked_rc" -eq 0 ] ||
+  fail "N40: an invocation through a symlinked ancestor of the SAME checkout must agree with the direct one, not misdetect it as an installed cache ($(cat "$tmp/n40-symlinked.err"))"
 
 if [ -n "$pwsh_command" ]; then
   rm -f "$CODEX_HOOK_WRITES_FILE"

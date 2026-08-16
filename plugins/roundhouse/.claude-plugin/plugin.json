@@ -1,6 +1,6 @@
 {
   "name": "roundhouse",
-  "version": "0.7.6",
+  "version": "0.8.0",
   "description": "Machine and infrastructure administration for agent fleets: readiness, inventory, harness/plugin/skill parity, package baselines, auth artifacts, SSH transport and diagnosis, privileged install lanes.",
   "author": {
     "name": "Claire Novotny LLC",
@@ -28,6 +28,7 @@
     "./skills/fleet-projects",
     "./skills/fleet-readiness",
     "./skills/fleet-update",
+    "./skills/mcp-shim",
     "./skills/remote-mac",
     "./skills/ssh-doctor"
   ]

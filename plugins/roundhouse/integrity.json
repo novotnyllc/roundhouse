@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "a7da6807c2a36accfba2954bf9fc07c4e15aa55d1520e7974168c4766fc7ee2d"
+      "sha256": "bc893c0556b6a716c281075019ed1e33fb44ff9e7f382ef62cb934681add13df"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "7e32bc93de612ec6a87a23b20f8a446a9990be259a71d30209ee8c8849da1cef"
+      "sha256": "a259254c6b03a228ccea662061a98f4b1aa7c20f19e6b3bb7d468b8e938799d8"
     },
     {
       "path": "assets/icon.png",
@@ -142,7 +142,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "a3eb1d837650fb467d84af22198fce03f25855cae44b950051f068d01629e978"
+      "sha256": "bf763e20ba4efa71152583fcff00ef8b295a0a797ad89778faf73fb588147987"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -167,6 +167,14 @@
     {
       "path": "scripts/lib/plan-verify.sh",
       "sha256": "a2eb6642592cf21622cfb02166622a59cddbb61697f5720945a9c910bf0de6a5"
+    },
+    {
+      "path": "scripts/mcp-siding.mjs",
+      "sha256": "4214bd84cc5ea323d4d0901306345df7f5b8014a1ae13b95bcc6d829dcaa9422"
+    },
+    {
+      "path": "scripts/mcp-siding.selftest.mjs",
+      "sha256": "3d64d069203074745a7721ddfb38ab5b971f0a7b1af8e542673c4c628539cbef"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -253,6 +261,14 @@
       "sha256": "fc323b44049fb281f0ddad12690513024f88d869674b3e0a6ff4b5272bc1f3ac"
     },
     {
+      "path": "skills/mcp-shim/SKILL.md",
+      "sha256": "7f80d3374bd8e64137cc8f5ad7f5d98658755b5f0dc4feb540ff96a8863991ae"
+    },
+    {
+      "path": "skills/mcp-shim/agents/openai.yaml",
+      "sha256": "353e56a03b9e18891d44d0bdb270739b11c00bfaf4b832feaf708a3a44a08c57"
+    },
+    {
       "path": "skills/remote-mac/SKILL.md",
       "sha256": "e1f46161ba9ba95f6b6e6da6eeba3b9a7b9babbb67a7cf881cf75e9c393bc88f"
     },
@@ -273,5 +289,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.7.6"
+  "version": "0.8.0"
 }

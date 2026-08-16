@@ -263,6 +263,82 @@ EOF
   (cd "$plugin_root" && find scripts ! -type d -print) |
     grep -Ev "^$integrity_excluded_scripts\$" |
     LC_ALL=C sort >"$tmp/present"
+  # A gitignored file under scripts/ (e.g. a local tool's cache) can never be
+  # release content: update-integrity's own git-ls-files enumeration never
+  # produces one either, so the manifest can never cover it and this check
+  # would fail forever on a clean dev checkout. Only applies to a real
+  # roundhouse SOURCE checkout - the real installed-plugin case (a version
+  # directory in the plugin cache) has no .git to consult and keeps the
+  # unfiltered scan, exactly as before.
+  #
+  # `rev-parse --is-inside-work-tree` alone is NOT enough to tell those two
+  # cases apart, and using it alone was a real security regression: if
+  # $HOME is itself a git repo (a dotfiles repo - common, and likely across
+  # a fleet given roundhouse's own chezmoi tooling) and its .gitignore
+  # excludes .claude/ or .codex/, an INSTALLED plugin cache under
+  # ~/.claude/plugins/cache/... sits inside that work tree too. check-ignore
+  # would then match every scripts/* path in the cache, filtering the
+  # `present` list down to nothing and letting an unlisted, unmanifested
+  # executable bypass the manifest-coverage check entirely - exactly the
+  # case this check exists to catch. Do not go back to the weaker
+  # rev-parse-only test.
+  #
+  # The discriminator: the plugin manifest is a TRACKED file in a real
+  # source checkout, and is untracked (or itself ignored) in an installed
+  # cache nested under some unrelated repo. A real git failure here (not
+  # "no matches") also keeps the unfiltered scan rather than silently
+  # narrowing what this check defends.
+  #
+  # Also require plugin_root to sit at the expected path within that
+  # repository (plugins/roundhouse under the repo toplevel) - a repo that
+  # deliberately tracks an installed cache's manifest (e.g. a backup repo
+  # that commits everything) would otherwise still pass the tracked-file
+  # test above. This is defense in depth, not a boundary: someone who can
+  # already write into the plugin cache and commit its manifest there can
+  # edit integrity.json directly and make this check moot regardless - so
+  # this stays a cheap path comparison, not anything cryptographic.
+  is_source_checkout=false
+  if command -v git >/dev/null 2>&1 &&
+    git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+    git -C "$plugin_root" ls-files --error-unmatch .claude-plugin/plugin.json >/dev/null 2>&1; then
+    toplevel=$(git -C "$plugin_root" rev-parse --show-toplevel 2>/dev/null) || toplevel=
+    # plugin_root (scripts/roundhouse's `cd -- ... && pwd`, logical - see
+    # there) can retain a symlinked path, while `git rev-parse
+    # --show-toplevel` always resolves through symlinks to the physical
+    # repo root - a straight string-prefix comparison between the two then
+    # never matches for a symlinked checkout, and a real source checkout
+    # gets misdetected as an installed cache: no gitignore filtering above
+    # (a real ignored artifact under scripts/ then fails the manifest-
+    # coverage check outright), and source provenance silently omitted
+    # below. Canonicalize BOTH sides with this codebase's existing
+    # `cd -P && pwd -P` idiom (plan-apply.sh, identity.sh,
+    # certify-ssh-node, prepare-ssh-identity already use it) rather than a
+    # second resolution mechanism. Fail closed: if either side cannot be
+    # resolved, is_source_checkout stays false - the unfiltered scan,
+    # never a filtered one built on a guess.
+    plugin_root_physical=$( (CDPATH='' cd -P -- "$plugin_root" 2>/dev/null && pwd -P) ) || plugin_root_physical=
+    toplevel_physical=
+    if [ -n "$toplevel" ]; then
+      toplevel_physical=$( (CDPATH='' cd -P -- "$toplevel" 2>/dev/null && pwd -P) ) || toplevel_physical=
+    fi
+    if [ -n "$plugin_root_physical" ] && [ -n "$toplevel_physical" ]; then
+      relative_root=${plugin_root_physical#"$toplevel_physical"/}
+      if [ "$relative_root" = "plugins/roundhouse" ]; then
+        is_source_checkout=true
+      fi
+    fi
+  fi
+  if [ "$is_source_checkout" = true ]; then
+    ignore_status=0
+    ignored=$( (cd "$plugin_root" && git check-ignore --stdin) <"$tmp/present" 2>/dev/null) ||
+      ignore_status=$?
+    # 0: at least one path is ignored. 1: git ran fine, none are ignored.
+    # Anything higher is a real git error - leave $tmp/present untouched.
+    if [ "$ignore_status" -le 1 ] && [ -n "$ignored" ]; then
+      comm -23 "$tmp/present" <(printf '%s\n' "$ignored" | LC_ALL=C sort) >"$tmp/present.filtered"
+      mv "$tmp/present.filtered" "$tmp/present"
+    fi
+  fi
   jq -r '.files[].path | select(startswith("scripts/"))' "$integrity" |
     LC_ALL=C sort >"$tmp/listed"
   uncovered=$(comm -23 "$tmp/present" "$tmp/listed")
@@ -275,8 +351,11 @@ EOF
   source_commit=
   source_tree=
   source_dirty=false
-  if command -v git >/dev/null 2>&1 &&
-    git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # Same discriminator as above, reused rather than a second rev-parse-only
+  # check - an installed cache nested under an unrelated repo (the dotfiles
+  # case above) must not report THAT repo's commit/tree/dirty state as if
+  # it were roundhouse's own provenance.
+  if [ "$is_source_checkout" = true ]; then
     source_commit=$(git -C "$plugin_root" rev-parse HEAD 2>/dev/null || true)
     source_tree=$(git -C "$plugin_root" rev-parse 'HEAD^{tree}' 2>/dev/null || true)
     [ -z "$(git -C "$plugin_root" status --porcelain --untracked-files=no -- "$plugin_root" 2>/dev/null)" ] ||
