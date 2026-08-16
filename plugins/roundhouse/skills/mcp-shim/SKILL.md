@@ -176,15 +176,65 @@ argument: do not re-quote, re-escape, or reconstruct it by hand.
 | Harness | Add | Verify | Remove |
 | --- | --- | --- | --- |
 | Claude Code | `claude mcp add <NAME> -s user -- /bin/sh -c "$SCRIPT"` | `claude mcp get <NAME>` — must report `Connected`; anything else is a failed mutation (diagnose below) | `claude mcp remove <NAME> -s user` |
-| Codex | `codex mcp add <NAME> -- /bin/sh -c "$SCRIPT"` | `codex mcp get <NAME>` — same: `Connected` only | `codex mcp remove <NAME>` |
+| Codex | `codex mcp add <NAME> -- /bin/sh -c "$SCRIPT"` | `codex mcp get <NAME>` to confirm the registration, THEN the probe below — `codex mcp get` alone is not a connectivity check | `codex mcp remove <NAME>` |
 
-`Connected` is the only acceptable result, never `Failed to connect`. The
-shim answers `initialize` locally without ever contacting the backend —
-that is the whole point (see "No copy" above) — so a closed desktop app
-still yields a `Connected` server. `Failed to connect` therefore never
-means "the backend is down"; it means the *resolver* failed before the
-shim could even start: no `roundhouse` plugin found, or no usable Node.
-Treat it as a failed mutation, not an acceptable outcome, and diagnose
+**The two harnesses need genuinely different post-checks — this is not a
+stylistic choice, and making them uniform is what broke this once
+already.** `claude mcp get` really does spawn the registration and
+attempt to connect: its `Status:` line (`✔ Connected` / `✘ Failed to
+connect`) is a live probe (verified: registering a command of `/bin/false`
+makes it print `Status: ✘ Failed to connect` with the real spawn error).
+`codex mcp get` does not — it only echoes back the stored command/args/env
+and exits 0 regardless of whether that command works at all (verified the
+same way: `/bin/false` registered under Codex still prints its config and
+exits 0, no failure indication whatsoever). Treating `codex mcp get`'s
+clean output as "connected" would accept — and this skill's own post-check
+instructions used to actively remove — every correct Codex installation as
+a false failure, since Codex's check can never fail even when the
+registration is completely broken.
+
+**Claude Code:** require `Connected` from `claude mcp get`. The shim
+answers `initialize` locally without ever contacting the backend — that
+is the whole point (see "No copy" above) — so a closed desktop app still
+yields `Connected`. `Failed to connect` therefore never means "the
+backend is down"; it means the *resolver* failed before the shim could
+even start.
+
+**Codex:** `codex mcp get` is worth doing (confirms the registration
+exists and its command is what you intended) but is not a connectivity
+test, so add a real probe alongside it — run the registered command
+directly and send it an `initialize` request:
+
+```bash
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | /bin/sh -c "$SCRIPT"
+```
+
+(carry over any `--env` values the registration used — e.g.
+`MCP_SIDING_NODE`, `MCP_SIDING_PATH` — into this command's own
+environment too, since Codex passes them the same way at real spawn
+time.) The shim answers `initialize` locally, exactly as it does for
+Claude's own probe, so this passes with the desktop app closed and fails
+exactly when the resolver cannot find the script or a usable Node — the
+failure this check exists to catch. No external timeout is needed: the
+input ends after one line, the shim treats that EOF as the client
+disconnecting, and it exits on its own promptly either way (verified: a
+working registration answers and exits in well under a second; a broken
+one — resolver diagnostic on stderr, nothing on stdout — exits
+immediately too). A valid response is a JSON-RPC result carrying
+`protocolVersion`; anything else (empty stdout, a resolver diagnostic, a
+nonzero exit) is a failed mutation, exactly like Claude's `Failed to
+connect`.
+
+Do not switch Claude to this same manual probe to make the two
+mechanisms uniform. It would be strictly worse there: `claude mcp get`'s
+`Connected` check uses Claude's own real client to actually spawn and
+connect, which is a stronger, more authoritative signal than a hand-rolled
+`initialize` round-trip could ever reconstruct. The manual probe exists
+specifically because Codex's own tooling has no equivalent — it is a
+workaround for Codex, not a generally better technique.
+
+Either harness's failure — `Failed to connect` on Claude, a failed probe
+on Codex — is a failed mutation, not an acceptable outcome. Diagnose
 before leaving it in place: confirm `roundhouse` is actually installed
 and its plugin cache contains `scripts/mcp-siding.mjs`, and that a Node
 18+ with global `fetch`/`ReadableStream` resolves (PATH, Homebrew,
@@ -196,15 +246,20 @@ cause cannot be fixed immediately, remove the registration
 behind, and say so to the user.
 
 `-s user` matches the existing `fusion` registration's scope (available in
-every project); pass a different `-s` only if asked. Before the Codex row,
-check `codex` is on PATH (`command -v codex`) — the user may be on a
-Claude-only machine; if absent, skip Codex and say so plainly rather than
-trying to install it. `codex mcp add`/`remove` rewrite the entire
-`~/.codex/config.toml` (they own the file — this is by design). On a
-hand-maintained config this can canonicalize unrelated entries elsewhere,
-e.g. `startup_timeout_sec = 120` becoming `120.0` or an env table getting
-alphabetized — semantically equivalent either way, but worth mentioning to
-a user who maintains that file by hand.
+every project); pass a different `-s` only if asked — Codex has no scope
+flag at all (verified: not in `codex mcp add --help`), every Codex
+registration is global. Before the Codex row, check `codex` is on PATH
+(`command -v codex`) — the user may be on a Claude-only machine; if
+absent, skip Codex and say so plainly rather than trying to install it.
+`codex mcp add`/`remove` rewrite the entire `~/.codex/config.toml` (they
+own the file — this is by design; verified: the file's mtime changes on
+every add/remove, and this repo's own `~/.codex/config.toml` already
+carries the canonicalized `startup_timeout_sec = 120.0` from an earlier
+such rewrite). On a hand-maintained config this can canonicalize
+unrelated entries elsewhere, e.g. `startup_timeout_sec = 120` becoming
+`120.0` or an env table getting alphabetized — semantically equivalent
+either way, but worth mentioning to a user who maintains that file by
+hand.
 
 ## Local development
 
@@ -278,7 +333,15 @@ may have no active document yet.
 Nothing to re-copy — the resolver picks up a plugin update on the very next
 spawn, automatically, for every existing registration. To change a
 registration's *flags* (URL, app path, launch settings), remove then
-re-add: both `claude mcp add` and `codex mcp add` reject an existing name.
+re-add — always, on both harnesses, but for different reasons verified
+separately: `claude mcp add` genuinely rejects an existing name (`MCP
+server <NAME> already exists`, exit 1), a safety net that catches a
+stray double-add. `codex mcp add` does **not** — a second `codex mcp add`
+for the same name exits 0 and silently overwrites the existing
+registration with whatever was just passed (verified: re-adding the same
+name with a different command replaced it in place, one entry, no
+warning). Do not rely on Codex to catch a forgotten remove; the
+remove-then-re-add sequence is what keeps this safe there, not the tool.
 
 ## Known holes
 
@@ -298,9 +361,15 @@ re-add: both `claude mcp add` and `codex mcp add` reject an existing name.
 - **Resolver finds nothing.** Most likely `roundhouse` isn't installed on
   this machine, or was removed after this server was registered. The
   registered command exits immediately with a message on stderr naming
-  every path it checked; the MCP client reports the server as failed to
-  connect. Same failure shape in both harnesses, since both spawn the
-  identical `/bin/sh -c` command.
+  every path it checked. That subprocess-level failure is identical on
+  both harnesses, since both spawn the literal identical `/bin/sh -c
+  "$SCRIPT"` command — but the two harnesses do not surface it
+  identically, and this skill's own post-checks do not treat it
+  identically either (see Install a server above): `claude mcp get`
+  reports `Failed to connect` directly, a genuine probe; `codex mcp get`
+  never attempts to connect at all and will not show this, so the manual
+  `initialize` probe in Install a server is what actually catches it on
+  Codex.
 - **Native Windows is not supported yet.** The preflight check in Install
   a server above refuses before registering anything - not because it is
   impossible, but because a POSIX-shell-only shim needs a native

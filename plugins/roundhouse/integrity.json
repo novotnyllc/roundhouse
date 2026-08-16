@@ -262,7 +262,7 @@
     },
     {
       "path": "skills/mcp-shim/SKILL.md",
-      "sha256": "de45227ffc28d363c4c7d57f7c644a309f34cd82a5785eac28290e377cf16849"
+      "sha256": "7f80d3374bd8e64137cc8f5ad7f5d98658755b5f0dc4feb540ff96a8863991ae"
     },
     {
       "path": "skills/mcp-shim/agents/openai.yaml",
