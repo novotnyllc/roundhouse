@@ -50,11 +50,11 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
-      "sha256": "3c0a249a1c48e7c985692555eee595516d72c65e37b0f9be6c186f6b810648c7"
+      "sha256": "a09e5b2adcbb061f0849a1ad9accd98e3716ec6bcc9bb120a077ae5eeac63b3b"
     },
     {
       "path": "scripts/codex-plugin-hooks.ps1",
-      "sha256": "05ddd86204912fb6f7397eb02127bc6c12fd62f94878a6d7774aaa9e9e4b170b"
+      "sha256": "85eb42dec770d476faf71508153d7e95b52e59dd0651e7040c276fe071102a8f"
     },
     {
       "path": "scripts/collect-posix",

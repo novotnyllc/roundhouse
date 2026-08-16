@@ -19,6 +19,20 @@ function spawnCodex(codexExecutable, args, options) {
   return spawn(command, args, shell ? { ...options, shell: true } : options);
 }
 
+function terminateCodexChild(child) {
+  if (process.platform !== "win32" || !child.pid) {
+    child.kill();
+    return;
+  }
+  // A bundled .cmd starts through cmd.exe. Kill its full tree so a timeout
+  // cannot leave the real Codex process mutating state after this helper fails.
+  const killer = spawn("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], {
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  killer.once("error", () => child.kill());
+}
+
 function hookKeyPath(key) {
   const escaped = key.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
   return `hooks.state."${escaped}".trusted_hash`;
@@ -40,7 +54,7 @@ class AppServer {
     createInterface({ input: this.child.stdout }).on("line", (line) => {
       if (Buffer.byteLength(line) > 1024 * 1024) {
         this.rejectAll(new Error("app-server response exceeded 1 MiB"));
-        this.child.kill();
+        terminateCodexChild(this.child);
         return;
       }
       let message;
@@ -48,7 +62,7 @@ class AppServer {
         message = JSON.parse(line);
       } catch {
         this.rejectAll(new Error("app-server returned invalid JSON"));
-        this.child.kill();
+        terminateCodexChild(this.child);
         return;
       }
       if (message.id == null || !this.pending.has(message.id)) return;
@@ -88,7 +102,7 @@ class AppServer {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`app-server ${method} timed out`));
-        this.child.kill();
+        terminateCodexChild(this.child);
       }, TIMEOUT_MS);
       this.pending.set(id, { resolve, reject, timer });
       this.send({ method, id, params });
@@ -111,7 +125,7 @@ class AppServer {
     if (this.child.exitCode != null) return;
     this.child.stdin.end();
     const exited = new Promise((resolve) => this.child.once("exit", resolve));
-    const timer = setTimeout(() => this.child.kill(), 1_000);
+    const timer = setTimeout(() => terminateCodexChild(this.child), 1_000);
     await exited;
     clearTimeout(timer);
   }
@@ -229,12 +243,12 @@ function pluginInstalled(pluginId, codexExecutable) {
     child.stdout.on("data", (chunk) => {
       out += chunk;
       if (out.length > 4 * 1024 * 1024) {
-        child.kill();
+        terminateCodexChild(child);
         reject(new Error("codex plugin list output exceeded 4 MiB"));
       }
     });
     const timer = setTimeout(() => {
-      child.kill();
+      terminateCodexChild(child);
       reject(new Error("codex plugin list timed out"));
     }, TIMEOUT_MS);
     child.on("error", reject);
@@ -259,7 +273,7 @@ function runCodexPluginAdd(pluginId, codexExecutable) {
       windowsHide: true,
     });
     const timer = setTimeout(() => {
-      child.kill();
+      terminateCodexChild(child);
       reject(new Error("codex plugin add timed out"));
     }, 120_000);
     child.on("error", reject);

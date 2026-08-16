@@ -62,6 +62,34 @@ function Get-CodexRoots {
     return @($roots)
 }
 
+function Get-KnownCodexExecutable {
+    param([AllowNull()][string]$KnownCodexRoot)
+
+    $roots = [System.Collections.Generic.List[string]]::new()
+    if ($KnownCodexRoot) {
+        Add-UniqueProbe $roots $KnownCodexRoot
+        $openAIRoot = Split-Path -Parent $KnownCodexRoot
+        if ($openAIRoot) {
+            $localAppData = Split-Path -Parent $openAIRoot
+            if ($localAppData) {
+                Add-UniqueProbe $roots (Join-Path $localAppData 'Programs\OpenAI\Codex')
+            }
+        }
+    }
+    if ($env:LOCALAPPDATA) {
+        Add-UniqueProbe $roots (Join-Path $env:LOCALAPPDATA 'Programs\OpenAI\Codex')
+    }
+    foreach ($root in $roots) {
+        foreach ($candidate in @(
+                (Join-Path $root 'codex.exe'),
+                (Join-Path $root 'bin\codex.exe')
+            )) {
+            if (Test-RegularFile $candidate) { return $candidate }
+        }
+    }
+    return $null
+}
+
 function Get-CodexNodeCandidates {
     param(
         [AllowNull()][string]$CodexPath,
@@ -207,6 +235,13 @@ function Resolve-RoundhouseNode {
             Where-Object { Test-RegularFile $_ } |
             ForEach-Object { Get-Item -LiteralPath $_ } |
             Sort-Object @{ Expression = 'LastWriteTimeUtc'; Descending = $true }, @{ Expression = 'FullName'; Descending = $false })
+        # The runtime data root belongs to the known native Codex install. Do
+        # not pair it with an unrelated PATH codex.cmd that may need PATH Node.
+        $knownCodexExecutable = Get-KnownCodexExecutable $KnownCodexRoot
+        if ($codexFiles.Count -gt 0 -and $knownCodexExecutable) {
+            Add-UniqueProbe $codexProbes "matching known codex.exe: $knownCodexExecutable"
+            $CodexPath = $knownCodexExecutable
+        }
     }
     if ($codexFiles.Count -gt 0) {
         return New-NodeResolutionResult $codexFiles[0].FullName 'CODEX-BUNDLED' $pathProbes $codexProbes $claudeProbes $CodexPath
@@ -384,6 +419,16 @@ function Invoke-SelfTest {
         Assert-Test ($knownResult.Source -eq 'CODEX-BUNDLED' -and
             $knownResult.NodePath -eq $knownNode -and
             $knownResult.CodexExecutablePath -eq $knownCodex) 'known Codex install/runtime roots did not resolve together'
+
+        # A stale PATH shim cannot launch the known bundled runtime without
+        # PATH Node, so preserve the matching native codex.exe instead.
+        $staleCodex = Join-Path $root 'stale-npm\codex.cmd'
+        New-TestFile $staleCodex
+        $staleResult = Invoke-RoundhouseNodeResolution -CodexPath $staleCodex `
+            -KnownCodexRoot (Join-Path $knownLocalAppData 'OpenAI\Codex') -NoCommandDiscovery
+        Assert-Test ($staleResult.Source -eq 'CODEX-BUNDLED' -and
+            $staleResult.NodePath -eq $knownNode -and
+            $staleResult.CodexExecutablePath -eq $knownCodex) 'known Codex runtime retained a stale PATH shim'
 
         # Claude is only a last fallback, and Codex remains preferred when both
         # bundles are present.
