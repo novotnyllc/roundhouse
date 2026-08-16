@@ -1136,8 +1136,30 @@ export class Shim {
       // launching the app on that would launch it constantly. Applies the
       // same way whether the backend was unreachable (Down) or reachable
       // but rejected the call (BackendReported): tools/list has nowhere to
-      // put an error message anyway, so serving the cache is correct
+      // put an error message anyway, so serving *something* is correct
       // either way, not a misreport.
+      //
+      // N41: a CURSORED request failing mid-walk must NOT be answered with
+      // the full persisted cache the way an uncursored one is - the client
+      // already holds an earlier page live and would append this "next
+      // page" onto it, duplicating that page's tools and mixing what it
+      // already has with whatever (possibly stale, possibly a different
+      // snapshot entirely) inventory happens to be on disk from a prior
+      // walk. There is no coherent remainder to serve instead either:
+      // this.pendingToolsPage holds only what THIS walk has staged so far,
+      // which is exactly what the client already received, not a page
+      // reconciled against the persisted cache. Returning an empty page
+      // with no nextCursor cleanly terminates the walk instead - the
+      // client keeps exactly the live page(s) it already has, stops
+      // asking for more, and never duplicates or mixes stale data. This
+      // reads as "return nothing" to a future eye, but the alternative
+      // (the full cache) is strictly worse, not better - terminating a
+      // walk early is recoverable (a fresh uncursored request next time
+      // gets a clean full listing); a client silently holding duplicate
+      // or inconsistent tool definitions is not. An uncursored request -
+      // a fresh listing, no walk in progress to protect - is unaffected
+      // and still serves the full persisted cache exactly as before.
+      if (params?.cursor) return { tools: [] };
       return { tools: readCache(this.cachePath) };
     }
   }

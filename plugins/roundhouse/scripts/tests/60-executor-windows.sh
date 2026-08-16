@@ -137,6 +137,37 @@ if "$nested_backup_cache/scripts/roundhouse" executor-status - >/dev/null 2>&1; 
 fi
 rm -rf "$backup_home"
 
+# N40: plugin_root (scripts/roundhouse's `cd -- ... && pwd`, logical) can
+# be reached through a symlinked ANCESTOR directory (a symlinked dev-repo
+# checkout, common for local dev setups) while `git rev-parse
+# --show-toplevel` always resolves through symlinks to the physical repo
+# root - a straight string-prefix comparison between the two then fails
+# for that invocation even though it is the exact same checkout as a
+# direct one: a real gitignored artifact under scripts/ (present here)
+# gets filtered out and passes invoked directly, but is NOT filtered out
+# and fails invoked through the symlinked ancestor. Symlink the REPO ROOT
+# (two levels above plugin_root), not plugin_root itself - plugin_root's
+# own leaf directory must stay a real directory (check_safe_owned_directory
+# above already, separately, rejects plugin_root itself being a symlink;
+# this is testing the path-identity comparison, not that guard). Assert
+# both invocations of the SAME checkout agree. .DS_Store matches this
+# repo's own real top-level .gitignore rule (confirmed: `git check-ignore`
+# reports it ignored) - a genuine artifact, not a contrived one.
+symlinked_repo_root="$tmp/n40-symlinked-repo-root"
+ln -s "$script_dir/../../.." "$symlinked_repo_root"
+: >"$script_dir/../scripts/.DS_Store"
+set +e
+"$cli" executor-status - >/dev/null 2>"$tmp/n40-direct.err"
+n40_direct_rc=$?
+"$symlinked_repo_root/plugins/roundhouse/scripts/roundhouse" executor-status - >/dev/null 2>"$tmp/n40-symlinked.err"
+n40_symlinked_rc=$?
+set -e
+rm -f "$script_dir/../scripts/.DS_Store" "$symlinked_repo_root"
+[ "$n40_direct_rc" -eq 0 ] ||
+  fail "N40: direct invocation of a source checkout with a gitignored scripts/ artifact must pass ($(cat "$tmp/n40-direct.err"))"
+[ "$n40_symlinked_rc" -eq 0 ] ||
+  fail "N40: an invocation through a symlinked ancestor of the SAME checkout must agree with the direct one, not misdetect it as an installed cache ($(cat "$tmp/n40-symlinked.err"))"
+
 if [ -n "$pwsh_command" ]; then
   rm -f "$CODEX_HOOK_WRITES_FILE"
   windows_hook_approval=$(CODEX_HOOK_SCENARIO=approve "$pwsh_command" -NoLogo -NoProfile \

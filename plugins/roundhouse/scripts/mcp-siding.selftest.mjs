@@ -342,15 +342,23 @@ export async function selftest() {
   assert.deepEqual(readCache(atomicCachePath), originalAtomicTools, "a successful write must produce exactly the expected content");
   assert.deepEqual(await readdir(atomicDir), ["atomic.json"], "a successful write must leave no temp file behind");
 
-  // mkdirSync(dir, {recursive:true}) is a no-op on an already-existing
-  // dir (no permission check) - so making the dir unwritable makes the
-  // actual write (creating the sibling temp file) fail with a real
-  // EACCES, an honest I/O failure rather than a stubbed fs call.
-  await chmod(atomicDir, 0o555);
+  // N39: chmod-based denial does not stop uid 0 - a root-owned container
+  // (a normal way to run this gate) would still be able to write through
+  // a read-only directory, so this needs a failure permissions cannot
+  // bypass. Pre-create a DIRECTORY at the exact path writeCache computes
+  // for its temp file (same basename + this process's own pid, since the
+  // test calls writeCache in-process) - writeFileSync onto a directory
+  // fails with EISDIR regardless of uid, root included, because it is a
+  // type mismatch at the VFS level, not a permission check.
+  const collisionTmpPath = join(atomicDir, `.atomic.json.${process.pid}.tmp`);
+  await mkdir(collisionTmpPath);
   try {
     writeCache(atomicCachePath, [{ name: "should_never_land" }]);
   } finally {
-    await chmod(atomicDir, 0o755); // restore before reading the dir / cleanup
+    // writeCache's own cleanup (unlinkSync) cannot remove a directory
+    // either - remove it here so the "no temp file left behind" check
+    // below reflects writeCache's own behavior, not this test's fixture.
+    await rm(collisionTmpPath, { recursive: true, force: true });
   }
   assert.deepEqual(
     readCache(atomicCachePath),
@@ -938,15 +946,99 @@ export async function selftest() {
     method: "tools/list",
     params: { cursor: "page2" },
   });
+  // N41: a cursored request failing mid-walk must NOT fall back to the
+  // full persisted cache (this test's own assertion until N41) - the
+  // client already holds refreshPage1Tools live and would append the
+  // full old cache onto it, duplicating page1_tool (present in both) and
+  // mixing the live refresh with a stale, unrelated snapshot. An empty
+  // terminal page cleanly ends the walk instead.
   assert.deepEqual(
     interruptedPage2.result.tools,
-    [...page1Tools, ...page2Tools],
-    "an interrupted walk must fall back to serving the OLD complete cache, not the new partial one",
+    [],
+    "an interrupted cursored request must return an empty page, not duplicate/mix in the old complete cache",
+  );
+  assert.equal(
+    interruptedPage2.result.nextCursor,
+    undefined,
+    "an interrupted cursored request's empty fallback page must not claim more pages are fetchable",
   );
   assert.deepEqual(
     readCache(interruptedCachePath),
     [...page1Tools, ...page2Tools],
     "the persistent cache must still hold the previously complete inventory after an interrupted refresh - it must never have been replaced with page one alone",
+  );
+
+  // -- 7e5b. N41: the exact scenario from the finding - walk page one
+  //          live, kill the backend, request page two. The offline
+  //          fallback for a CURSORED request used to return the entire
+  //          persisted cache as if it were "page two": a client that
+  //          appends pages together would then get page one's tools
+  //          twice (once from the live page it already has, once again
+  //          from the full-cache fallback) plus whatever else was on
+  //          disk from an unrelated prior walk. Assert directly that
+  //          appending the two responses together, the way a real client
+  //          would, produces no duplicate tool names. An UNCURSORED
+  //          offline request is unaffected - still returns the full
+  //          cached inventory, exactly as before N41. -------------------
+  const offlineCursorCachePath = join(cacheDir, "offline-cursor.json");
+  const staleUnrelatedTools = [{ name: "stale_unrelated_tool" }];
+  writeCache(offlineCursorCachePath, staleUnrelatedTools);
+  const livePage1Tools = [{ name: "live_page1_tool" }];
+  let offlineCursorShim;
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "offline-cursor-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/list") {
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: livePage1Tools, nextCursor: "page2" } });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      offlineCursorShim = new Shim({
+        url,
+        name: "test",
+        cachePath: offlineCursorCachePath,
+        timeoutMs: 2_000,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const livePage1 = await offlineCursorShim.handle({ jsonrpc: "2.0", id: 50, method: "tools/list", params: {} });
+      assert.deepEqual(livePage1.result.tools, livePage1Tools);
+    },
+  );
+  // Backend is gone - request page two, offline.
+  const offlinePage2 = await offlineCursorShim.handle({
+    jsonrpc: "2.0",
+    id: 51,
+    method: "tools/list",
+    params: { cursor: "page2" },
+  });
+  // A real client just concatenates pages as they arrive - no dedup of
+  // its own to rely on, so any repeat here would be a real duplicate.
+  const clientAccumulatedNames = [...livePage1Tools, ...offlinePage2.result.tools].map((t) => t.name);
+  assert.deepEqual(
+    clientAccumulatedNames,
+    ["live_page1_tool"],
+    "appending the offline page-two response to the live page one a client already has must not duplicate page one's tools or mix in a stale unrelated snapshot",
+  );
+  // An uncursored offline request is unaffected - a fresh listing, no
+  // walk to protect, still serves the full persisted cache as before.
+  const offlineUncursored = await offlineCursorShim.handle({ jsonrpc: "2.0", id: 52, method: "tools/list", params: {} });
+  assert.deepEqual(
+    offlineUncursored.result.tools,
+    staleUnrelatedTools,
+    "an uncursored offline request must still return the full cached inventory, unaffected by N41",
   );
 
   // -- 7e6. N36: an abandoned staged walk must not leak into, or be
@@ -1204,6 +1296,16 @@ export async function selftest() {
   //          not a reimplementation) so a drift between the doc and this
   //          test fails loudly rather than silently. --------------------
   await selftestInstallNodeResolverSnippet();
+
+  // -- 7j3c. N42: SKILL.md's install section must refuse on native Windows
+  //          before ever running `mcp add` - both documented registrations
+  //          bake in `/bin/sh -c "$SCRIPT"`, which cannot spawn there.
+  //          Extracts and runs the ACTUAL documented preflight snippet
+  //          (marked in SKILL.md, same pattern as the node-resolver
+  //          snippet above), with a stubbed `uname` on PATH rather than a
+  //          faked platform - an honest way to control the one input the
+  //          snippet actually reads, on any host this runs on. -----------
+  await selftestWindowsPreflightSnippet();
 
   // -- 7j4. N30: an invalid --backend-url must exit non-zero before the
   //         stdio server ever opens - not just that buildShimFromArgs
@@ -3278,6 +3380,70 @@ async function selftestInstallNodeResolverSnippet() {
     );
   } finally {
     await rm(emptyHome, { recursive: true, force: true });
+  }
+}
+
+// N42: SKILL.md's install section must refuse before ever running
+// `mcp add` on a native-Windows host (no POSIX shell, so the `/bin/sh -c
+// "$SCRIPT"` registration could never spawn) - extracts and runs the
+// ACTUAL documented preflight snippet (marked in SKILL.md), the same
+// extraction technique selftestInstallNodeResolverSnippet already uses,
+// so a drift between the doc and this test fails loudly rather than
+// silently. The snippet's only input is `uname -s` - a stub on PATH
+// controls that honestly (the real technique this file already uses for
+// "no node"/"too-old node"), rather than pretending to actually run on a
+// different OS.
+async function selftestWindowsPreflightSnippet() {
+  const skillMdPath = join(dirname(MCP_SIDING_PATH), "..", "skills", "mcp-shim", "SKILL.md");
+  const skillMd = await readFile(skillMdPath, "utf8");
+  const match = skillMd.match(
+    /<!-- mcp-siding-selftest: windows-preflight-snippet:start -->\n```bash\n([\s\S]*?)\n```\n<!-- mcp-siding-selftest: windows-preflight-snippet:end -->/,
+  );
+  assert.ok(match, `SKILL.md's Windows preflight snippet marker not found at ${skillMdPath} - did the doc structure change?`);
+  const snippet = match[1];
+
+  // This host's own real `uname -s` (macOS or Linux, wherever this
+  // selftest runs) must pass - the guard must never reject a genuinely
+  // supported platform.
+  const realHostResult = spawnSync("/bin/sh", ["-c", `${snippet}\necho PASSED`], { encoding: "utf8" });
+  assert.equal(realHostResult.status, 0, `the preflight snippet rejected this test host's own real platform (stderr: ${realHostResult.stderr})`);
+  assert.match(realHostResult.stdout, /PASSED/, "the preflight snippet must let a supported host continue past the guard");
+
+  const stubUnameHome = await mkdtemp(join(tmpdir(), "mcp-siding-preflight-uname-"));
+  try {
+    const stubBinDir = join(stubUnameHome, "bin");
+    await mkdir(stubBinDir, { recursive: true });
+    const stubUnamePath = join(stubBinDir, "uname");
+
+    // WSL is a real Linux kernel - `uname -s` reports Linux there, and it
+    // is the documented supported route onto Windows. Must still pass.
+    await writeFile(stubUnamePath, '#!/bin/sh\nprintf "%s\\n" Linux\n');
+    await chmod(stubUnamePath, 0o755);
+    const wslResult = spawnSync("/bin/sh", ["-c", `${snippet}\necho PASSED`], {
+      env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH}` },
+      encoding: "utf8",
+    });
+    assert.equal(wslResult.status, 0, `the preflight snippet rejected a WSL-reported (Linux) uname (stderr: ${wslResult.stderr})`);
+    assert.match(wslResult.stdout, /PASSED/, "WSL (uname -s reporting Linux) must pass the preflight guard - it is the documented supported route");
+
+    // Native Windows via Git-Bash/MSYS reports something like
+    // "MINGW64_NT-10.0-19045" - neither Darwin nor Linux. Must refuse
+    // before any registration is attempted, naming WSL as the way out.
+    await writeFile(stubUnamePath, '#!/bin/sh\nprintf "%s\\n" MINGW64_NT-10.0-19045\n');
+    await chmod(stubUnamePath, 0o755);
+    const nativeWindowsResult = spawnSync("/bin/sh", ["-c", snippet], {
+      env: { ...process.env, PATH: `${stubBinDir}:${process.env.PATH}` },
+      encoding: "utf8",
+    });
+    assert.notEqual(nativeWindowsResult.status, 0, "the preflight snippet must refuse on a native-Windows-reported uname, not exit 0");
+    assert.match(
+      nativeWindowsResult.stderr,
+      /POSIX shell/i,
+      "the diagnostic must say the shim needs a POSIX shell",
+    );
+    assert.match(nativeWindowsResult.stderr, /WSL/, "the diagnostic must name WSL as the supported route");
+  } finally {
+    await rm(stubUnameHome, { recursive: true, force: true });
   }
 }
 

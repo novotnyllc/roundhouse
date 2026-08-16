@@ -302,9 +302,30 @@ EOF
     git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
     git -C "$plugin_root" ls-files --error-unmatch .claude-plugin/plugin.json >/dev/null 2>&1; then
     toplevel=$(git -C "$plugin_root" rev-parse --show-toplevel 2>/dev/null) || toplevel=
-    relative_root=${plugin_root#"$toplevel"/}
-    if [ -n "$toplevel" ] && [ "$relative_root" = "plugins/roundhouse" ]; then
-      is_source_checkout=true
+    # plugin_root (scripts/roundhouse's `cd -- ... && pwd`, logical - see
+    # there) can retain a symlinked path, while `git rev-parse
+    # --show-toplevel` always resolves through symlinks to the physical
+    # repo root - a straight string-prefix comparison between the two then
+    # never matches for a symlinked checkout, and a real source checkout
+    # gets misdetected as an installed cache: no gitignore filtering above
+    # (a real ignored artifact under scripts/ then fails the manifest-
+    # coverage check outright), and source provenance silently omitted
+    # below. Canonicalize BOTH sides with this codebase's existing
+    # `cd -P && pwd -P` idiom (plan-apply.sh, identity.sh,
+    # certify-ssh-node, prepare-ssh-identity already use it) rather than a
+    # second resolution mechanism. Fail closed: if either side cannot be
+    # resolved, is_source_checkout stays false - the unfiltered scan,
+    # never a filtered one built on a guess.
+    plugin_root_physical=$( (CDPATH='' cd -P -- "$plugin_root" 2>/dev/null && pwd -P) ) || plugin_root_physical=
+    toplevel_physical=
+    if [ -n "$toplevel" ]; then
+      toplevel_physical=$( (CDPATH='' cd -P -- "$toplevel" 2>/dev/null && pwd -P) ) || toplevel_physical=
+    fi
+    if [ -n "$plugin_root_physical" ] && [ -n "$toplevel_physical" ]; then
+      relative_root=${plugin_root_physical#"$toplevel_physical"/}
+      if [ "$relative_root" = "plugins/roundhouse" ]; then
+        is_source_checkout=true
+      fi
     fi
   fi
   if [ "$is_source_checkout" = true ]; then

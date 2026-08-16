@@ -74,6 +74,33 @@ development" below.
 
 ## Install a server
 
+Before anything else, confirm this host can actually run the shim. Both
+documented registrations (see the harness table below) bake in
+`/bin/sh -c "$SCRIPT"`, and the install snippet itself is POSIX shell -
+native Windows (PowerShell or cmd.exe, with no POSIX layer) has neither,
+so a registration made there would be accepted by the harness CLI and
+then leave a server that can never spawn. Refuse before that mutation
+happens, not after:
+
+<!-- mcp-siding-selftest: windows-preflight-snippet:start -->
+```bash
+case $(uname -s) in
+  Darwin|Linux) ;;
+  *)
+    echo "mcp-siding: this shim needs a POSIX shell to install and run - native Windows (PowerShell/cmd.exe, no WSL) is not supported yet. Use WSL (Windows Subsystem for Linux) and run this installer from inside it instead." >&2
+    exit 1
+    ;;
+esac
+```
+<!-- mcp-siding-selftest: windows-preflight-snippet:end -->
+
+WSL passes this check - it is a real Linux kernel, so `uname -s` reports
+`Linux` there, and it is the supported route onto Windows today. A native
+PowerShell resolver and launcher (so the shim could run without WSL at
+all) is a real feature with its own testing surface - out of scope here;
+this guard exists so an unsupported host gets a clear refusal instead of
+a registration that silently cannot start.
+
 Ask the user (do not assume): what to call this MCP server (e.g. `fusion`,
 `figma`, or any name they choose — never hardcode one); which backend —
 offer the presets below or "something else"; and which harness(es) —
@@ -257,6 +284,11 @@ re-add: both `claude mcp add` and `codex mcp add` reject an existing name.
   every path it checked; the MCP client reports the server as failed to
   connect. Same failure shape in both harnesses, since both spawn the
   identical `/bin/sh -c` command.
+- **Native Windows is not supported yet.** The preflight check in Install
+  a server above refuses before registering anything - not because it is
+  impossible, but because a POSIX-shell-only shim needs a native
+  PowerShell resolver and launcher to run without WSL, which does not
+  exist yet. WSL is the supported route onto Windows today.
 
 ## Cloud
 
