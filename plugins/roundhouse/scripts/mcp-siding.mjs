@@ -345,6 +345,30 @@ function validateResultShape(method, result) {
     if (result === null || typeof result !== "object" || !Array.isArray(result.tools)) {
       throw new MalformedResponse(`${method}: result is not a valid ListToolsResult (missing a tools array)`);
     }
+  } else if (method === "initialize") {
+    // N45: presence of `result` is not shape, same as N37 one level up -
+    // {"result":null} or {"result":{}} used to complete the handshake,
+    // send notifications/initialized, mark the session connected, and
+    // forward the caller's (possibly mutating) request to a backend that
+    // never actually negotiated a session. Required here: protocolVersion
+    // (a non-empty string - connect() reads this value directly right
+    // after, see this.protocolVersion below) and capabilities (an object -
+    // its presence is part of a valid handshake per MCP even though this
+    // shim does not inspect any specific capability flag). serverInfo is
+    // also spec-required but deliberately NOT checked - nothing in this
+    // file ever reads it back from a backend's result, so requiring it
+    // would only add a way to reject an otherwise-fine response for no
+    // protective benefit, the same restraint N37 already applied.
+    if (
+      result === null ||
+      typeof result !== "object" ||
+      typeof result.protocolVersion !== "string" ||
+      result.protocolVersion === "" ||
+      result.capabilities === null ||
+      typeof result.capabilities !== "object"
+    ) {
+      throw new MalformedResponse(`${method}: result is not a valid InitializeResult (missing protocolVersion or capabilities)`);
+    }
   }
 }
 
@@ -927,6 +951,7 @@ export class Shim {
     if (!body || !("result" in body)) {
       throw new MalformedResponse("initialize: no response received for the handshake");
     }
+    validateResultShape("initialize", body.result);
     this.sid = sid ?? null;
     // Capture what the backend actually negotiated, not just what we
     // asked for - a compliant backend may echo back a different (older)
@@ -1073,6 +1098,24 @@ export class Shim {
   // gone, and an unhandled rejection on the way out is worse than the
   // orphan it replaces, so every failure here is swallowed, not surfaced.
   async shutdown(deadlineMs = 2_000) {
+    // N43: this used to only abort what was already IN FLIGHT - but
+    // aborting it is exactly what frees main()'s serialized queue to
+    // advance to the next message, so a queued tools/call (never even
+    // started yet) would reach handle(), then the backend, and complete
+    // AFTER the client has disconnected and can never see the result.
+    // Reuses the exact tombstone machinery N26/N27 already built for a
+    // live client cancelling a queued id: handle() already checks
+    // cancelledQueuedIds before ever reaching the backend (see handle()'s
+    // own comment on this.pendingIds/this.cancelledQueuedIds). Tombstone
+    // every id still queued, synchronously, before cancel() below aborts
+    // the in-flight one - the abort is what lets the queue actually reach
+    // these ids, so the tombstones must already be in place, not raced
+    // against it. Genuinely in-flight requests are untouched here; their
+    // forwards still go through cancel() and still complete within the
+    // deadline exactly as before.
+    for (const pendingId of this.pendingIds) {
+      this.cancelledQueuedIds.add(pendingId);
+    }
     const cleanup = (async () => {
       // "Best effort" means actually attempted and given its deadline, not
       // fired and abandoned: cancel()'s notifications/cancelled forward
@@ -1362,6 +1405,11 @@ function ok(id, result) {
 // CLI
 
 const BOOL_FLAGS = new Set(["selftest", "help", "launch", "no-launch", "print-resolver", "print-shim-script"]);
+// Every flag this shim (and its builders) actually reads, matching
+// usage() below exactly - kept as one list so it can never quietly drift
+// from what buildShimFromArgs/buildShimScript consume.
+const VALUE_FLAGS = new Set(["backend-url", "name", "app", "cache", "timeout", "launch-grace"]);
+const VALID_FLAGS = new Set([...BOOL_FLAGS, ...VALUE_FLAGS]);
 
 // Throws a plain Error, with a message meant to be shown to the user
 // as-is, on any argv shape it can't make sense of - the caller (run())
@@ -1373,6 +1421,20 @@ export function parseArgs(argv) {
     if (!arg.startsWith("--")) continue;
     const eq = arg.indexOf("=");
     const key = eq === -1 ? arg.slice(2) : arg.slice(2, eq);
+    // N44: an unrecognized flag used to be silently stored and then just
+    // never read by anything - a misspelling like --no-launh=true was
+    // accepted, dropped from the generated script, and (with --app
+    // present) launch-on-demand ended up ENABLED, the opposite of what
+    // was asked. This is the preflight class again (N30/N35): a
+    // configuration mistake must fail before the registration mutation,
+    // not produce one that quietly behaves differently than requested.
+    // Checked here, in parseArgs itself, so BOTH callers (main()'s real
+    // launch and --print-shim-script's generation - run()'s CLI dispatch
+    // calls this exact function once, before branching to either) reject
+    // it the same way, not just one of the two.
+    if (!VALID_FLAGS.has(key)) {
+      throw new Error(`unknown flag: --${key} (valid flags: ${[...VALID_FLAGS].sort().join(", ")})`);
+    }
     if (BOOL_FLAGS.has(key)) {
       if (eq === -1) {
         flags[key] = true;

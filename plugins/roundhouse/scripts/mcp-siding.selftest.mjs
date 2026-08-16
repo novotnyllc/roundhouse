@@ -192,6 +192,52 @@ export async function selftest() {
   assert.equal(parseArgs(["--launch=false"]).launch, false);
   assert.equal(parseArgs(["--launch=true"]).launch, true);
   assert.throws(() => parseArgs(["--launch=maybe"]), /invalid value for --launch/, "a non-boolean =value on a bool flag must be rejected");
+  // N44: an unrecognized flag must be rejected outright, not silently
+  // stored and then just never read by anything - a misspelling like
+  // --no-launh=true used to be accepted, dropped by the builders (never
+  // forwarded into the generated script, never applied to a real launch),
+  // and with --app set, launch-on-demand ended up ENABLED - the opposite
+  // of what was asked.
+  assert.throws(() => parseArgs(["--no-launh", "true"]), /unknown flag: --no-launh/, "a misspelled flag must be rejected by name, not silently accepted");
+  assert.throws(
+    () => parseArgs(["--no-launh=true"]),
+    /unknown flag: --no-launh/,
+    "the exact near-miss from the finding must be rejected, not silently flip launch behavior",
+  );
+  assert.throws(() => parseArgs(["--timeuot", "5000"]), /unknown flag: --timeuot/, "a misspelled value flag must also be rejected");
+  assert.throws(
+    () => parseArgs(["--bogus-flag"]),
+    /unknown flag: --bogus-flag.*backend-url/s,
+    "the diagnostic must name the offending flag and list the valid ones",
+  );
+  // A valid, fully-specified flag set must still parse unchanged.
+  assert.deepEqual(
+    parseArgs([
+      "--backend-url",
+      "http://x",
+      "--name",
+      "t",
+      "--app",
+      "/A.app",
+      "--cache",
+      "/c.json",
+      "--timeout",
+      "5000",
+      "--launch-grace",
+      "10",
+      "--no-launch",
+    ]),
+    {
+      "backend-url": "http://x",
+      name: "t",
+      app: "/A.app",
+      cache: "/c.json",
+      timeout: "5000",
+      "launch-grace": "10",
+      "no-launch": true,
+    },
+    "a valid flag set must parse exactly as before",
+  );
   // A missing value must never swallow the following flag token.
   assert.throws(() => parseArgs(["--timeout", "--name", "x"]), /missing value for --timeout/);
   assert.throws(() => parseArgs(["--timeout"]), /missing value for --timeout/, "a value-less flag at the end of argv must also be rejected");
@@ -1323,6 +1369,14 @@ export async function selftest() {
   //          never start. Real subprocess, real flags, same diagnostic. --
   await selftestPrintShimScriptValidatesLikeBuildShimFromArgs();
 
+  // -- 7j4c. N44: an unrecognized flag must be rejected on BOTH paths -
+  //          a real launch (before the stdio server ever opens) and
+  //          --print-shim-script (before a script is generated) - since
+  //          both route through the same parseArgs. The near-miss from
+  //          the finding itself: --no-launh=true used to be silently
+  //          stored and ignored. -------------------------------------
+  selftestUnknownFlagRejectedOnBothPaths();
+
   // -- 7j2. N13: the OTHER real macOS launch-failure shape - `open -a
   //         <bad path>` spawns fine and simply exits nonzero, which
   //         nothing previously observed at all. downCallResult() had
@@ -1744,6 +1798,76 @@ export async function selftest() {
         disconnectCancelledForwardReceived,
         { requestId: 1, reason: "client disconnected" },
         "the backend must receive the forwarded notifications/cancelled for the in-flight call",
+      );
+    },
+  );
+
+  // -- 7l3b. N43: shutdown must tombstone QUEUED calls too, not just abort
+  //          the in-flight one - aborting the in-flight request is exactly
+  //          what frees main()'s serialized queue to advance, so a queued
+  //          tools/call (never even started) used to reach the backend
+  //          and complete AFTER the client had already disconnected and
+  //          could never see the result. A request counter on the fake
+  //          backend proves neither queued call reaches it, not just that
+  //          the process exits. -------------------------------------------
+  let shutdownQueuedToolCallCount = 0;
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "shutdown-queued-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "notifications/cancelled") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/call") {
+          shutdownQueuedToolCallCount += 1;
+          res.writeHead(200, { "Content-Type": "application/json" }); // stall - deliberately never end()
+          return;
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const child = spawn(process.execPath, [MCP_SIDING_PATH, "--backend-url", url, "--name", "test", "--timeout", "60000"], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let err = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => (err += chunk));
+      const exited = new Promise((resolvePromise) => child.on("exit", resolvePromise));
+
+      // A stalls on the backend (becomes in-flight). B and C are queued
+      // right behind it - main()'s queue is strictly sequential, so
+      // neither has even started by the time EOF arrives below.
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 100, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 101, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 102, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+      // Give A a moment to actually reach the stalling backend and
+      // register in inFlight before disconnecting.
+      await new Promise((r) => setTimeout(r, 300));
+
+      const disconnectedAt = Date.now();
+      child.stdin.end();
+      const exitResult = await Promise.race([exited, new Promise((r) => setTimeout(() => r("timeout"), 5_000))]);
+      assert.notEqual(
+        exitResult,
+        "timeout",
+        `process never exited after stdin closed with queued calls behind an in-flight one (stderr: ${err})`,
+      );
+      assert.ok(
+        Date.now() - disconnectedAt < 5_000,
+        "disconnecting with queued calls behind an in-flight one must still exit promptly",
+      );
+      assert.equal(err, "", `shutdown must not throw with queued calls pending (stderr: ${err})`);
+      assert.equal(
+        shutdownQueuedToolCallCount,
+        1,
+        "only the in-flight call may ever reach the backend - both queued calls must be tombstoned before the queue reaches them",
       );
     },
   );
@@ -2670,6 +2794,67 @@ export async function selftest() {
     );
   }
 
+  // -- 7v3. N45: presence of a handshake `result` is not shape, same as
+  //         N37 one level up - {"result":null}, {"result":{}}, and a
+  //         result missing protocolVersion must all fail the handshake
+  //         the same way 7v2's resultless cases do: no
+  //         notifications/initialized (checked against the fake backend's
+  //         received-methods list), session left unconnected so a
+  //         subsequent call re-handshakes, no launch. A valid
+  //         initialization result (used everywhere else in this file) is
+  //         unaffected. ---------------------------------------------------
+  for (const [label, badInitializeResult] of [
+    ["a null result", null],
+    ["an empty object result", {}],
+    ["a result missing protocolVersion", { capabilities: {}, serverInfo: { name: "fake" } }],
+  ]) {
+    const badShapeLaunches = [];
+    const badShapeMethods = [];
+    let badShapeInitializeCalls = 0;
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          badShapeMethods.push(msg.method);
+          if (msg.method === "initialize") {
+            badShapeInitializeCalls += 1;
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: badInitializeResult });
+          }
+          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const badShapeShim = new Shim({
+          url,
+          name: "test",
+          cachePath: join(cacheDir, `bad-shape-handshake-${badShapeMethods.length}.json`),
+          timeoutMs: 2_000,
+          launchEnabled: true,
+          appPath: "/fake/BadShapeHandshake.app",
+          launchGraceMs: 150_000,
+          launcher: (appPath) => badShapeLaunches.push(appPath),
+        });
+        const first = await badShapeShim.handle({ jsonrpc: "2.0", id: 107, method: "tools/call", params: {} });
+        assert.equal(first.result.isError, true, `${label}: a malformed handshake result must not read as success`);
+        assert.equal(badShapeLaunches.length, 0, `${label}: a malformed-shape handshake must never launch`);
+        assert.equal(badShapeShim.connected, false, `${label}: must not mark the session connected`);
+        assert.equal(
+          badShapeMethods.includes("notifications/initialized"),
+          false,
+          `${label}: notifications/initialized must never be sent after a malformed-shape handshake`,
+        );
+
+        const second = await badShapeShim.handle({ jsonrpc: "2.0", id: 108, method: "tools/call", params: {} });
+        assert.equal(second.result.isError, true);
+        assert.equal(
+          badShapeInitializeCalls,
+          2,
+          `${label}: a subsequent call must re-attempt the handshake, not skip it as if already connected`,
+        );
+      },
+    );
+  }
+
   // -- 7w. N20/N22: a timeout never proves the backend did not receive the
   //        request - it only proves we stopped waiting, whether or not
   //        headers ever arrived. Both shapes below must be Indeterminate:
@@ -3507,6 +3692,43 @@ async function selftestInvalidBackendUrlExitsBeforeStdio() {
   assert.match(err, /--backend-url must be a valid URL/, "the diagnostic must name the problem");
   assert.equal(out, "", "no reply may have been sent - the stdio server must never have opened");
   if (child.exitCode == null) child.kill();
+}
+
+// N44: an unrecognized flag used to be silently stored by parseArgs and
+// then just never read by anything - a misspelling like --no-launh=true
+// was accepted, dropped from the generated script (never forwarded) and
+// never applied to a real launch, and with --app present, launch-on-
+// demand ended up ENABLED, the opposite of what was asked. Proves BOTH
+// CLI paths reject it, since run() calls parseArgs exactly once before
+// branching to either (same reasoning as N35's own comment above).
+function selftestUnknownFlagRejectedOnBothPaths() {
+  const realLaunch = spawnSync(
+    process.execPath,
+    [MCP_SIDING_PATH, "--backend-url", "http://127.0.0.1:27182/mcp", "--name", "test", "--no-launh", "true"],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(realLaunch.status, 0, "a real launch with an unknown flag must exit non-zero, before the stdio server opens");
+  assert.match(realLaunch.stderr, /unknown flag: --no-launh/, "the diagnostic must name the offending flag");
+
+  const printShimScript = spawnSync(
+    process.execPath,
+    [
+      MCP_SIDING_PATH,
+      "--print-shim-script",
+      "--backend-url",
+      "http://127.0.0.1:27182/mcp",
+      "--name",
+      "test",
+      "--app",
+      "/A.app",
+      "--no-launh",
+      "true",
+    ],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(printShimScript.status, 0, "--print-shim-script with an unknown flag must exit non-zero, not generate a script");
+  assert.match(printShimScript.stderr, /unknown flag: --no-launh/, "the diagnostic must name the offending flag here too");
+  assert.equal(printShimScript.stdout, "", "no script may be printed when a flag is unrecognized");
 }
 
 // N35: --print-shim-script used to check only that --backend-url and --name
