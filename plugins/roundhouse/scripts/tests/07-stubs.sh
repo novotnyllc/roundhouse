@@ -691,11 +691,42 @@ fi
 rm -f "$CODEX_HOOK_WRITES_FILE"
 printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"
 update_result=$(CODEX_HOOK_SCENARIO=update \
-  node "$script_dir/codex-plugin-hooks.mjs" update example@test-market)
+  node "$script_dir/codex-plugin-hooks.mjs" update example@test-market \
+    --codex-executable "$tmp/bin/codex")
 [ "$(printf '%s\n' "$update_result" | jq -r '.refreshed')" -eq 1 ] ||
   fail "Codex plugin update did not refresh exactly the retained trusted hook"
 [ "$(cat "$CODEX_STATE_FILE")" = 1.3.0 ] ||
   fail "Codex hook wrapper did not run the exact native plugin add"
+
+# Prove the Windows resolver's explicit codex.exe handoff reaches every MJS
+# launch. Keep a failing PATH decoy in place so bare `codex` cannot make this
+# pass: approve exercises app-server plus plugin-list, and update exercises
+# app-server plus plugin-add.
+explicit_codex="$tmp/explicit-codex"
+cp "$tmp/bin/codex" "$explicit_codex"
+chmod +x "$explicit_codex"
+cp "$tmp/bin/codex" "$tmp/bin/codex-path-backup"
+cat >"$tmp/bin/codex" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'PATH codex decoy was invoked' >&2
+exit 97
+SH
+chmod +x "$tmp/bin/codex"
+rm -f "$CODEX_HOOK_WRITES_FILE" "$AGENT_EXEC_MARKER"
+explicit_approve_result=$(CODEX_HOOK_SCENARIO=hookless \
+  node "$script_dir/codex-plugin-hooks.mjs" approve example@test-market \
+    --codex-executable "$explicit_codex")
+[ "$(printf '%s\n' "$explicit_approve_result" | jq -r '.approved')" -eq 0 ] ||
+  fail "explicit Codex executable did not cover plugin-list through the forwarded path"
+printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"
+explicit_update_result=$(CODEX_HOOK_SCENARIO=update \
+  node "$script_dir/codex-plugin-hooks.mjs" update example@test-market \
+    --codex-executable "$explicit_codex")
+[ "$(printf '%s\n' "$explicit_update_result" | jq -r '.refreshed')" -eq 1 ] ||
+  fail "explicit Codex executable did not cover plugin-add through the forwarded path"
+[ -e "$AGENT_EXEC_MARKER" ] || fail "explicit Codex executable did not run plugin-add"
+cp "$tmp/bin/codex-path-backup" "$tmp/bin/codex"
+
 jq -e -s '
   length == 1 and
   (.[0].edits | length) == 1 and
