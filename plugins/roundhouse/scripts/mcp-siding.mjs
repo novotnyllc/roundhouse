@@ -140,14 +140,26 @@ if [ -z "$p" ]; then
   exit 1
 fi`;
 
-// Node resolver: finds a usable `node` before the final exec. Resolving
-// mcp-siding.mjs's path (above) is not enough on its own - a GUI-launched
-// harness on macOS does not inherit a login shell's PATH, and a self-
-// contained Claude/Codex install does not guarantee a `node` on PATH at
-// all, so the registration would resolve the script and then fail to
-// start anything. Tried in order, first hit wins:
-//   0. $MCP_SIDING_NODE, if set and executable - the same kind of explicit
-//      override $MCP_SIDING_PATH above is, for the same reason.
+// Node resolver: finds a node that can actually RUN this shim before the
+// final exec, not merely a node that exists. Resolving mcp-siding.mjs's
+// path (above) is not enough on its own - a GUI-launched harness on macOS
+// does not inherit a login shell's PATH, and a self-contained Claude/Codex
+// install does not guarantee a `node` on PATH at all, so the registration
+// would resolve the script and then fail to start anything. And existence
+// alone is not enough either: an old Node (16, say) starts the server fine
+// and then throws ReferenceError: fetch is not defined on the first
+// backend request - which this shim classifies as Down, producing silent
+// empty tool listings and launches of an already-running app. So every
+// candidate is probed for what this shim actually needs - a cheap `-e`
+// check for global fetch and ReadableStream, one exec per candidate, run
+// at every server start - rather than accepted on existence or compared
+// by version number (a proxy for the capability, not the capability
+// itself; version numbers also drift out of date the moment a
+// runtime backports or removes a feature).
+//
+// Candidates tried in order, first one that PASSES THE PROBE wins:
+//   0. $MCP_SIDING_NODE - the same kind of explicit override
+//      $MCP_SIDING_PATH above is, for the same reason.
 //   1. `command -v node` - the normal case, an already-working PATH.
 //   2. Common install locations: Homebrew's arm64 and x86_64 default
 //      prefixes, then /usr/bin, then Volta's and asdf's default shims.
@@ -163,24 +175,31 @@ fi`;
 // with false confidence that it was checked.
 // Same POSIX-sh-only constraint as RESOLVER_SH above, for the same reason
 // (minimal cloud images), and the same fail-closed shape: if nothing
-// resolves, exit non-zero with a diagnostic naming what was tried, rather
-// than exec'ing an empty command and leaving the client hanging.
-export const NODE_RESOLVER_SH = `node_bin="$MCP_SIDING_NODE"
-[ -n "$node_bin" ] && [ -x "$node_bin" ] || node_bin=""
+// qualifies, exit non-zero with a diagnostic naming what was tried AND
+// what was rejected (and why), rather than exec'ing an empty command or
+// starting a server that is guaranteed to fail on its first real request.
+export const NODE_RESOLVER_SH = `node_ok() {
+  [ -x "$1" ] || return 1
+  "$1" -e 'if (typeof fetch !== "function" || typeof ReadableStream !== "function") process.exit(1)' >/dev/null 2>&1
+}
+node_bin=""
+node_rejected=""
+for node_candidate in "$MCP_SIDING_NODE" "$(command -v node 2>/dev/null)" \\
+  /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node \\
+  "$HOME/.volta/bin/node" "$HOME/.asdf/shims/node"; do
+  [ -n "$node_candidate" ] || continue
+  if node_ok "$node_candidate"; then
+    node_bin=$node_candidate
+    break
+  fi
+  [ -x "$node_candidate" ] && node_rejected="$node_rejected $node_candidate"
+done
 if [ -z "$node_bin" ]; then
-  node_bin=$(command -v node 2>/dev/null) || node_bin=""
-fi
-if [ -z "$node_bin" ]; then
-  for node_candidate in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node \\
-    "$HOME/.volta/bin/node" "$HOME/.asdf/shims/node"; do
-    if [ -x "$node_candidate" ]; then
-      node_bin=$node_candidate
-      break
-    fi
-  done
-fi
-if [ -z "$node_bin" ]; then
-  echo "mcp-siding: could not find a usable node (checked \\$MCP_SIDING_NODE, PATH, /opt/homebrew/bin, /usr/local/bin, /usr/bin, Volta, asdf). Install Node or set \\$MCP_SIDING_NODE." >&2
+  node_diag="mcp-siding: no node with global fetch/ReadableStream (this shim needs Node 18+) found (checked \\$MCP_SIDING_NODE, PATH, /opt/homebrew/bin, /usr/local/bin, /usr/bin, Volta, asdf)."
+  if [ -n "$node_rejected" ]; then
+    node_diag="$node_diag Rejected as too old:$node_rejected."
+  fi
+  echo "$node_diag Install a newer Node or set \\$MCP_SIDING_NODE." >&2
   exit 1
 fi`;
 
@@ -272,19 +291,23 @@ class Cancelled extends Error {}
 // post()'s catch, the same way Cancelled is.
 class MalformedResponse extends Error {}
 
-// A response was established (status 200, headers received, body reading
-// began) and then reading it was interrupted - almost always the timeout
-// firing, since a Cancelled abort is already ruled out before this class
-// is ever thrown (see post()'s catch). Same reachable-is-not-down
-// principle as the classes above: a 200 proved the backend is up and, for
-// a tool call, that it likely already started the operation. This matters
-// more than plain Down, though: aborting our own fetch does not stop the
-// backend from continuing whatever it started, so retrying (and worse,
-// downCallResult() launching an already-running app) can duplicate a
-// mutation - for CAD, running the operation twice. Never launches, never
-// phrased as unreachable - the message says the operation may still be
-// running and a retry could repeat it.
-class TimedOutAfterResponse extends Error {}
+// A timeout fired (post()'s own timer aborted the request - Cancelled is
+// already ruled out before this class is ever thrown, see post()'s catch).
+// The rule this encodes: a timeout never proves the backend did not
+// receive the request - it only proves we stopped waiting. That is true
+// whether headers ever arrived or not - a backend that withholds headers
+// until an operation completes times out with nothing established, and is
+// exactly as indeterminate as one that stalls mid-body after a 200. Only a
+// genuine connection-level failure (the fetch itself rejected without us
+// ever aborting it - ECONNREFUSED, ENOTFOUND, EHOSTUNREACH, ...) proves
+// nothing was delivered and the app is genuinely unreachable; that stays
+// Down. Aborting our own fetch does not stop the backend from continuing
+// whatever it started, so retrying (and worse, downCallResult() launching
+// an already-running app) can duplicate a mutation - for CAD, running the
+// operation twice. Never launches, never phrased as unreachable - the
+// message says the operation may have started and may still be running,
+// so a retry could repeat it.
+class Indeterminate extends Error {}
 
 // Per MCP streamable-HTTP: "If a server receives a request with an invalid
 // or expired session ID, the server MUST respond with 404." Only 404 is
@@ -623,13 +646,6 @@ export class Shim {
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     if (clientRequestId !== undefined) this.inFlight.set(clientRequestId, controller);
     let res, body, errorText;
-    // Set once a response is established (status 200, headers received,
-    // body reading begun) - the discriminator post()'s catch uses to tell
-    // "the backend never answered" (Down) apart from "the backend
-    // answered, and something interrupted us while it was doing whatever
-    // came next" (TimedOutAfterResponse). See that class for why the
-    // distinction matters.
-    let responseEstablished = false;
     try {
       res = await fetch(this.url, {
         method: "POST",
@@ -638,7 +654,6 @@ export class Shim {
         signal: controller.signal,
       });
       const contentType = res.headers.get("content-type") || "";
-      if (res.ok) responseEstablished = true;
       if (res.ok && contentType.includes("text/event-stream")) {
         // The timeout must cover reading the body, not just the headers -
         // a backend that answers 200 and then stalls mid-stream (a legal
@@ -685,13 +700,18 @@ export class Shim {
       // A parse failure (malformed JSON/SSE) means a response DID arrive -
       // reachable, not downtime - see MalformedResponse.
       if (err instanceof MalformedResponse) throw err;
-      // Once a response was established, any interruption reading it
-      // (almost always the timeout, given Cancelled is already ruled out
-      // above) proves the backend was up and possibly already running the
-      // operation - keep that out of the pre-response Down path, which
-      // downCallResult() treats as safe to retry/launch against.
-      if (responseEstablished) {
-        throw new TimedOutAfterResponse(`no further response within ${this.timeoutMs}ms of the backend accepting the request`);
+      // Classify by CAUSE, not by how far the response got. Only two call
+      // sites ever abort this controller (the timer just below, and
+      // cancel(), already ruled out above), so `aborted` here - with
+      // Cancelled excluded - can only mean the timer fired: a timeout,
+      // which proves nothing about whether the backend received the
+      // request. Anything else is a genuine connection-level failure (the
+      // fetch itself rejected without us ever aborting it) - nothing was
+      // delivered, so the app really is unreachable.
+      if (controller.signal.aborted) {
+        throw new Indeterminate(
+          `no response within ${this.timeoutMs}ms - the backend may have received the request and could still be processing it`,
+        );
       }
       throw new Down(err?.message ?? String(err));
     } finally {
@@ -740,6 +760,17 @@ export class Shim {
     if (body?.error) {
       throw new BackendReported(body.error.code, body.error.message ?? "backend error");
     }
+    // Same class as N10's fix in backend() (this request always carries an
+    // id, so a response was expected): require a real RESULT, not merely
+    // the absence of an error. A 200 with an empty body, or an envelope
+    // with neither result nor error, is a protocol failure, not a
+    // completed handshake - it must not be silently absorbed into a
+    // default protocol version, notifications/initialized, and a
+    // connected session that then runs the caller's (possibly mutating)
+    // tool call as if initialize had actually succeeded.
+    if (!body || !("result" in body)) {
+      throw new MalformedResponse("initialize: no response received for the handshake");
+    }
     this.sid = sid ?? null;
     // Capture what the backend actually negotiated, not just what we
     // asked for - a compliant backend may echo back a different (older)
@@ -786,16 +817,20 @@ export class Shim {
           }
           return body.result;
         } catch (err) {
-          // All five mean "reachable" (or, for Cancelled, "we stopped
-          // waiting, the backend did not go away") - session/connection
-          // state is left untouched, and none of them ever gets a reconnect
-          // retry (that's only for Stale).
+          // BackendReported/HttpRejected/MalformedResponse mean "reachable";
+          // Cancelled means "we stopped waiting, the backend did not go
+          // away"; Indeterminate means "we don't know, and must not guess
+          // by resetting state" - none of the five is proof the session
+          // itself is bad, so session/connection state is left untouched
+          // for all of them, and none ever gets a reconnect retry (that's
+          // only for Stale). If the session really did go bad, the next
+          // call's own Stale classification (a real 404) catches it then.
           if (
             err instanceof BackendReported ||
             err instanceof HttpRejected ||
             err instanceof Cancelled ||
             err instanceof MalformedResponse ||
-            err instanceof TimedOutAfterResponse
+            err instanceof Indeterminate
           )
             throw err;
           this.connected = false;
@@ -902,18 +937,16 @@ export class Shim {
         // error page, ...). Never launch, never say "not reachable".
         return this.errorResult(`${this.name} sent a response this shim could not parse (${err.message}) - not a downtime issue, no restart needed.`);
       }
-      if (err instanceof TimedOutAfterResponse) {
-        // A 200 arrived - the app is up, and for a tool call it likely
-        // already started the operation. Never launch, never say "not
-        // reachable" (this is not the pre-response timeout case, which
-        // still falls through to Down/downCallResult below): warn plainly
-        // that it may still be running, since aborting our own request did
-        // not stop it, and a blind retry (or a launch) could duplicate a
-        // mutation.
+      if (err instanceof Indeterminate) {
+        // A timeout never proves the backend did not receive the request -
+        // it only proves we stopped waiting, whether or not headers ever
+        // arrived. Never launch, never say "not reachable": warn plainly
+        // that the operation may have started and may still be running,
+        // since aborting our own request did not stop it, and a blind
+        // retry (or a launch) could duplicate a mutation.
         return this.errorResult(
-          `${this.name} accepted the request but ${err.message} - the operation may still be running on the ` +
-            "backend. Do not retry automatically, especially if it was a mutating action - check whether it " +
-            "already completed before trying again.",
+          `${this.name}: ${err.message}. Do not retry automatically, especially if it was a mutating action - ` +
+            "check whether it already completed before trying again.",
         );
       }
       if (err instanceof Cancelled) {

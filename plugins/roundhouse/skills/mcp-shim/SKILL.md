@@ -55,10 +55,21 @@ anywhere else — and never copy the script.** Every registration instead
 embeds `mcp-siding.mjs --print-shim-script`'s output: a small POSIX
 `/bin/sh` resolver that finds the script fresh at every server start
 (see the `RESOLVER_SH` comment in the script for exactly how and why —
-`--print-resolver` prints just that part), followed by the exec line for
-this instance's flags. A plugin update lands a new version directory; the
-very next spawn picks it up automatically, for every existing registration,
-with nothing to reinstall or re-copy.
+`--print-resolver` prints just that part), followed by a second resolver
+(`NODE_RESOLVER_SH`) that finds a `node` capable of running it, then the
+exec line for this instance's flags. A plugin update lands a new version
+directory; the very next spawn picks it up automatically, for every
+existing registration, with nothing to reinstall or re-copy.
+
+The shim needs a runtime with global `fetch` and `ReadableStream` —
+**Node 18 or newer**. `NODE_RESOLVER_SH` probes each candidate `node` for
+those two globals directly rather than trusting a version number or mere
+existence on PATH: an older Node starts the server fine and then fails
+every backend request with `ReferenceError: fetch is not defined`, which
+reads as the backend being down. `$MCP_SIDING_NODE` pins an exact `node`
+binary the same way `$MCP_SIDING_PATH` pins the script, for the same
+reason (local development, or a machine where the resolver's search order
+picks the wrong one).
 
 ## Install a server
 

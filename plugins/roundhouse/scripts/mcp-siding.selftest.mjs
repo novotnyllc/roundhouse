@@ -1710,16 +1710,77 @@ export async function selftest() {
     },
   );
 
-  // -- 7w. N20: once a response is established (200 + SSE headers, body
-  //        reading begun), a timeout reading the rest of it is NOT
-  //        downtime - the backend answered, so it is demonstrably up and,
-  //        for a tool call, may already be running the operation. Must
-  //        never launch, never say "not reachable", and must warn the
-  //        operation may still be running (retrying could duplicate a
-  //        mutation - aborting our own fetch does not stop the backend).
-  //        Contrasted with a backend that never responds AT ALL, which
-  //        must still be Down and must still launch - the pre-response
-  //        case is unchanged. -------------------------------------------
+  // -- 7v2. N23: connect() must require a real RESULT, not merely the
+  //         absence of an error - a 200 with an empty body, or an envelope
+  //         carrying neither result nor error, is a protocol failure, not
+  //         a completed handshake. Same assertions as 7v: no launch, no
+  //         notifications/initialized (checked against the fake backend's
+  //         received-methods list), session left unconnected so a
+  //         subsequent call re-handshakes rather than proceeding as if
+  //         initialize had actually succeeded. -------------------------
+  for (const [label, respondToInitialize] of [
+    ["an empty 200 body", (res) => sendJson(res, 200, undefined)],
+    ["an envelope with neither result nor error", (res, msg) => sendJson(res, 200, { jsonrpc: "2.0", id: msg.id })],
+  ]) {
+    const noResultLaunches = [];
+    const noResultMethods = [];
+    let noResultInitializeCalls = 0;
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          noResultMethods.push(msg.method);
+          if (msg.method === "initialize") {
+            noResultInitializeCalls += 1;
+            return respondToInitialize(res, msg);
+          }
+          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const noResultShim = new Shim({
+          url,
+          name: "test",
+          cachePath: join(cacheDir, `no-result-handshake-${noResultMethods.length}.json`),
+          timeoutMs: 2_000,
+          launchEnabled: true,
+          appPath: "/fake/NoResultHandshake.app",
+          launchGraceMs: 150_000,
+          launcher: (appPath) => noResultLaunches.push(appPath),
+        });
+        const first = await noResultShim.handle({ jsonrpc: "2.0", id: 105, method: "tools/call", params: {} });
+        assert.equal(first.result.isError, true, `${label}: a missing handshake result must not read as success`);
+        assert.equal(noResultLaunches.length, 0, `${label}: a reachable-but-resultless handshake must never launch`);
+        assert.equal(noResultShim.connected, false, `${label}: must not mark the session connected`);
+        assert.equal(
+          noResultMethods.includes("notifications/initialized"),
+          false,
+          `${label}: notifications/initialized must never be sent after a resultless handshake`,
+        );
+
+        const second = await noResultShim.handle({ jsonrpc: "2.0", id: 106, method: "tools/call", params: {} });
+        assert.equal(second.result.isError, true);
+        assert.equal(
+          noResultInitializeCalls,
+          2,
+          `${label}: a subsequent call must re-attempt the handshake, not skip it as if already connected`,
+        );
+      },
+    );
+  }
+
+  // -- 7w. N20/N22: a timeout never proves the backend did not receive the
+  //        request - it only proves we stopped waiting, whether or not
+  //        headers ever arrived. Both shapes below must be Indeterminate:
+  //        never launch, never say "not reachable", warn the operation may
+  //        still be running (retrying could duplicate a mutation -
+  //        aborting our own fetch does not stop the backend). N20's own
+  //        discriminator (res.ok - headers received) left the "backend
+  //        withholds headers until the operation completes" shape
+  //        misclassified as Down; N22 closes that by classifying on
+  //        WHETHER WE TIMED OUT, not on how far the response got. Only a
+  //        genuine connection-level failure (below, 7w2) is real downtime.
+  //        -------------------------------------------------------------
   const establishedTimeoutLaunches = [];
   await withServer(
     (req, res) => {
@@ -1744,39 +1805,71 @@ export async function selftest() {
       assert.doesNotMatch(
         timedOut.result.content[0].text,
         /not reachable|is not reachable/i,
-        "a timeout after the response was established must not be reported as unreachable",
+        "a timeout after headers arrived must not be reported as unreachable",
       );
       assert.match(
         timedOut.result.content[0].text,
         /still be running|do not retry/i,
         "must warn that the operation may still be running and must not be retried blindly",
       );
-      assert.equal(establishedTimeoutLaunches.length, 0, "a timeout after the response was established must never launch");
+      assert.equal(establishedTimeoutLaunches.length, 0, "a timeout after headers arrived must never launch");
     },
   );
 
-  const neverRespondsLaunches = [];
+  const noHeadersTimeoutLaunches = [];
   await withServer(
     () => {
-      // Never respond at all - not even headers. Nothing proves
-      // reachability, so this must still be classified Down.
+      // Accept the connection but withhold everything - not even headers -
+      // until the timeout fires. A backend that only answers once an
+      // operation completes looks exactly like this. N20's res.ok
+      // discriminator misclassified this as Down; it must be Indeterminate
+      // for the same reason the established-then-stalls case above is.
     },
     async (url) => {
-      const neverRespondsShim = new Shim({
+      const noHeadersTimeoutShim = new Shim({
         url,
         name: "test",
-        cachePath: join(cacheDir, "never-responds.json"),
+        cachePath: join(cacheDir, "no-headers-timeout.json"),
         timeoutMs: 200,
         launchEnabled: true,
-        appPath: "/fake/NeverResponds.app",
+        appPath: "/fake/NoHeadersTimeout.app",
         launchGraceMs: 150_000,
-        launcher: (appPath) => neverRespondsLaunches.push(appPath),
+        launcher: (appPath) => noHeadersTimeoutLaunches.push(appPath),
       });
-      const down = await neverRespondsShim.handle({ jsonrpc: "2.0", id: 103, method: "tools/call", params: {} });
-      assert.equal(down.result.isError, true);
-      assert.equal(neverRespondsLaunches.length, 1, "a backend that never responds at all must still be classified Down and still launch");
+      const timedOut = await noHeadersTimeoutShim.handle({ jsonrpc: "2.0", id: 103, method: "tools/call", params: {} });
+      assert.equal(timedOut.result.isError, true);
+      assert.doesNotMatch(
+        timedOut.result.content[0].text,
+        /not reachable|is not reachable/i,
+        "a timeout before any headers arrived must not be reported as unreachable",
+      );
+      assert.match(
+        timedOut.result.content[0].text,
+        /still be running|do not retry/i,
+        "must warn that the operation may still be running even though no headers ever arrived",
+      );
+      assert.equal(noHeadersTimeoutLaunches.length, 0, "a timeout before any headers arrived must never launch");
     },
   );
+
+  // -- 7w2. N22: a genuine connection-level failure (nothing listening at
+  //         all - ECONNREFUSED) is real downtime and must keep working
+  //         exactly as before: Down, and still launches. This is the one
+  //         case that must NOT become Indeterminate. -------------------
+  const refusedLaunches = [];
+  const refusedShim = new Shim({
+    url: "http://127.0.0.1:1/mcp", // port 1 - nothing ever listens here, connection refused immediately
+    name: "test",
+    cachePath: join(cacheDir, "refused.json"),
+    timeoutMs: 2_000,
+    launchEnabled: true,
+    appPath: "/fake/Refused.app",
+    launchGraceMs: 150_000,
+    launcher: (appPath) => refusedLaunches.push(appPath),
+  });
+  const refused = await refusedShim.handle({ jsonrpc: "2.0", id: 104, method: "tools/call", params: {} });
+  assert.equal(refused.result.isError, true);
+  assert.equal(refusedLaunches.length, 1, "a connection-level failure (ECONNREFUSED) must still be classified Down and still launch");
 
   // -- 8. process-level: one malformed stdin line must not kill the shim
   const initReply = await runChildAndGetReply(
@@ -2045,10 +2138,72 @@ async function selftestNodeResolver() {
       const noneResult = await runShimScript({ ...baseEnv, PATH: brokenPath, HOME: emptyHome, MCP_SIDING_NODE: "" }, 3_000);
       assert.ok(!noneResult.timedOut, "a subprocess with no node resolvable anywhere must exit, not hang");
       assert.notEqual(noneResult.code, 0, "must exit non-zero when no node resolves anywhere");
-      assert.match(noneResult.err, /could not find a usable node/i, "must name what was tried in the diagnostic");
+      assert.match(noneResult.err, /no node with global fetch/i, "must name what was tried in the diagnostic");
     } finally {
       await rm(emptyHome, { recursive: true, force: true });
     }
+  }
+
+  // -- N24: existence is not enough - a node old enough to lack global
+  //    fetch/ReadableStream must be REJECTED, not accepted just because it
+  //    exists and is executable (Node 16 starts the server fine and then
+  //    throws ReferenceError: fetch is not defined on the first real
+  //    request, which reads as Down - silent empty tool listings and a
+  //    launch of an already-running app). A stub `node` that always exits
+  //    nonzero (simulating the probe failing on an old runtime, whatever
+  //    it was actually asked to do) stands in for "found but too old". ---
+  const stubNodeHome = await mkdtemp(join(tmpdir(), "mcp-siding-stub-node-"));
+  try {
+    const stubNodeDir = join(stubNodeHome, "stub-bin");
+    await mkdir(stubNodeDir, { recursive: true });
+    const stubNodePath = join(stubNodeDir, "node");
+    await writeFile(stubNodePath, "#!/bin/sh\nexit 1\n");
+    await chmod(stubNodePath, 0o755);
+
+    // -- the stub on PATH, a real node reachable at the asdf fallback: the
+    //    stub must be rejected and the next candidate tried, not accepted
+    //    just because command -v found something named "node". ----------
+    const realFallbackDir = join(stubNodeHome, ".asdf", "shims");
+    await mkdir(realFallbackDir, { recursive: true });
+    const realFallbackPath = join(realFallbackDir, "node");
+    await copyFile(realNode, realFallbackPath);
+    await chmod(realFallbackPath, 0o755);
+    const rejectThenFallback = await runShimScript({
+      ...baseEnv,
+      PATH: stubNodeDir,
+      HOME: stubNodeHome,
+      MCP_SIDING_NODE: "",
+    });
+    assert.ok(!rejectThenFallback.timedOut, `reject-then-fallback script hung (stderr: ${rejectThenFallback.err})`);
+    assert.ok(
+      rejectThenFallback.out.includes('"id":60'),
+      `script did not fall through to a real node after rejecting the stub (stderr: ${rejectThenFallback.err})`,
+    );
+
+    // -- only the stub anywhere: must exit non-zero naming the
+    //    requirement, not silently start a server doomed to fail on its
+    //    first real request. A bare HOME (no asdf fallback populated) so
+    //    the only candidate PATH or the fixed locations can find is the
+    //    stub. Same real-system-path caveat as the "none available" case
+    //    above. -----------------------------------------------------
+    if (anyHardcodedFallbackExists) {
+      process.stderr.write(
+        "  (skipping N24 'only a too-old node' assertion - this machine has a real node at one of the hardcoded fallback paths)\n",
+      );
+    } else {
+      const bareHome = await mkdtemp(join(tmpdir(), "mcp-siding-stub-bare-"));
+      try {
+        const bareResult = await runShimScript({ ...baseEnv, PATH: stubNodeDir, HOME: bareHome, MCP_SIDING_NODE: "" }, 3_000);
+        assert.ok(!bareResult.timedOut, "a subprocess with only a too-old node anywhere must exit, not hang");
+        assert.notEqual(bareResult.code, 0, "must exit non-zero when only a too-old node is found");
+        assert.match(bareResult.err, /fetch|ReadableStream/i, "the diagnostic must name the requirement that was rejected");
+        assert.match(bareResult.err, /rejected/i, "the diagnostic must name what was rejected");
+      } finally {
+        await rm(bareHome, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    await rm(stubNodeHome, { recursive: true, force: true });
   }
 }
 
