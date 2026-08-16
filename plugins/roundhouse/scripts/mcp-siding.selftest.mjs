@@ -120,6 +120,46 @@ export async function selftest() {
     "a \\r\\n pair split across two chunks must parse as one delimiter, not two",
   );
 
+  // -- 1e. N11: SSE joins consecutive "data:" fields within one event with
+  //        newlines to form a single payload - a compliant backend may
+  //        legally split a large JSON body across several data: fields.
+  //        Parsing only the first field truncates that payload and throws
+  //        MalformedResponse on a perfectly valid response. ---------------
+  const multiFieldEvent = 'data: {"jsonrpc":"2.0",\ndata: "id":9,\ndata: "result":{"multi":true}}\n\n';
+  assert.deepEqual(
+    parseBody(multiFieldEvent, "text/event-stream", 9),
+    { jsonrpc: "2.0", id: 9, result: { multi: true } },
+    "JSON split across three data: fields must parse as one payload",
+  );
+
+  // A single leading space after the colon is stripped ("data: x" and
+  // "data:x" both yield "x") - the rest of the field is untouched.
+  assert.deepEqual(
+    parseBody('data: {"jsonrpc":"2.0","id":9,"result":{}}\n\n', "text/event-stream", 9),
+    { jsonrpc: "2.0", id: 9, result: {} },
+    "data: with a leading space must parse",
+  );
+  assert.deepEqual(
+    parseBody('data:{"jsonrpc":"2.0","id":9,"result":{}}\n\n', "text/event-stream", 9),
+    { jsonrpc: "2.0", id: 9, result: {} },
+    "data: with no leading space must parse",
+  );
+
+  // A single-field event is unchanged (no regression from the join logic).
+  assert.deepEqual(
+    parseBody('data: {"jsonrpc":"2.0","id":9,"result":{"single":true}}\n\n', "text/event-stream", 9),
+    { jsonrpc: "2.0", id: 9, result: { single: true } },
+    "a single-field event must still parse",
+  );
+
+  // A genuinely malformed multi-field payload must still raise
+  // MalformedResponse rather than silently passing.
+  assert.throws(
+    () => parseBody('data: {"jsonrpc":"2.0",\ndata: not valid json here\n\n', "text/event-stream", 9),
+    /malformed SSE event/,
+    "a malformed multi-field payload must still be rejected",
+  );
+
   // -- 1b. CLI parsing (C7/C8/C9 regressions) ------------------------------
   // --no-launch=false / --launch=false must be real booleans, not truthy
   // strings - the concrete bug: --no-launch=false used to disable launch
@@ -1234,6 +1274,74 @@ export async function selftest() {
           `${label}: a parse failure on a 200 response must not be reported as unreachable`,
         );
         assert.equal(malformedLaunches.length, 0, `${label}: must never launch`);
+      },
+    );
+  }
+
+  // -- 7s. N10: a request that expects a response (it always carries an id)
+  //        but never gets a correlated result/error envelope must not be
+  //        synthesized into a silent {} success - that reports a mutating
+  //        tool call as having succeeded when its outcome was never
+  //        received, the worst failure class in this file. Covers both
+  //        ways it happens: a 200 with a genuinely empty body, and an SSE
+  //        stream that reaches EOF without ever emitting the matching
+  //        event. notifications/initialized returning an empty 200 stays
+  //        fine throughout - every withServer test here (including this
+  //        one) depends on exactly that already working. -----------------
+  for (const [label, respond, cacheName] of [
+    [
+      "a 200 with an empty body",
+      (res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end();
+      },
+      "no-envelope-empty200.json",
+    ],
+    [
+      "an SSE stream that closes with no matching id",
+      (res) => {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.end(`data: ${JSON.stringify({ jsonrpc: "2.0", id: 999_999, result: {} })}\n\n`);
+      },
+      "no-envelope-sse-eof.json",
+    ],
+  ]) {
+    const noEnvelopeLaunches = [];
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "initialize") {
+            return sendJson(
+              res,
+              200,
+              { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+              { "MCP-Session-Id": "no-envelope-session" },
+            );
+          }
+          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          if (msg.method === "tools/call") return respond(res);
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const noEnvelopeShim = new Shim({
+          url,
+          name: "test",
+          cachePath: join(cacheDir, cacheName),
+          timeoutMs: 2_000,
+          launchEnabled: true,
+          appPath: "/fake/NoEnvelope.app",
+          launchGraceMs: 150_000,
+          launcher: (appPath) => noEnvelopeLaunches.push(appPath),
+        });
+        const noEnvelope = await noEnvelopeShim.handle({ jsonrpc: "2.0", id: 95, method: "tools/call", params: {} });
+        assert.equal(noEnvelope.result.isError, true, `${label}: a missing response must not read as success`);
+        assert.match(
+          noEnvelope.result.content[0].text,
+          /no response|not received/i,
+          `${label}: must name the missing response`,
+        );
+        assert.equal(noEnvelopeLaunches.length, 0, `${label}: must never launch`);
       },
     );
   }

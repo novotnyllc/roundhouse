@@ -275,23 +275,34 @@ export function parseBody(body, contentType, expectedId) {
   return null;
 }
 
-// Extracts the JSON-RPC message out of one SSE event's raw text (its
-// "data:" line), or null if the event carries no data line. Shared by
-// parseBody (a full already-buffered body, used for the plain-JSON/empty
-// cases and direct unit testing) and readSseUntilMatch (the incremental
-// reader below, used for the live SSE case).
+// Extracts the JSON-RPC message out of one SSE event's raw text, or null
+// if the event carries no "data:" field. Shared by parseBody (a full
+// already-buffered body, used for the plain-JSON/empty cases and direct
+// unit testing) and readSseUntilMatch (the incremental reader below, used
+// for the live SSE case).
+//
+// Per the SSE spec, an event's data can be split across multiple "data:"
+// fields - each contributes one line, joined with "\n" to form the full
+// payload (this is how a large JSON body legally gets sent). Parsing only
+// the first field would truncate/corrupt any such payload and throw
+// MalformedResponse on a perfectly valid response. Also per spec, a single
+// leading space right after the colon is stripped ("data: x" and "data:x"
+// both yield "x") - anything past that first space is part of the value.
 function parseSseEvent(rawEvent) {
+  const fields = [];
   for (const line of rawEvent.split("\n")) {
     if (!line.startsWith("data:")) continue;
-    const payload = line.slice(5).trim();
-    if (!payload) continue;
-    try {
-      return JSON.parse(payload);
-    } catch (err) {
-      throw new MalformedResponse(`malformed SSE event: ${err.message}`);
-    }
+    const rest = line.slice(5);
+    fields.push(rest.startsWith(" ") ? rest.slice(1) : rest);
   }
-  return null;
+  if (fields.length === 0) return null;
+  const payload = fields.join("\n");
+  if (!payload.trim()) return null;
+  try {
+    return JSON.parse(payload);
+  } catch (err) {
+    throw new MalformedResponse(`malformed SSE event: ${err.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -589,7 +600,19 @@ export class Shim {
         if (!this.connected) await this.connect(clientRequestId);
         const { body } = await this.post({ jsonrpc: "2.0", id: 1, method, params }, this.sid, clientRequestId);
         if (body?.error) throw new BackendReported(body.error.code, body.error.message ?? "backend error");
-        return body?.result ?? {};
+        // This call always sends an id, so a response was expected - a 200
+        // with an empty body, or an SSE stream that reached EOF without
+        // ever emitting the matching event, both leave `body` null here.
+        // Do NOT synthesize {}: that reads as a successful call whose
+        // outcome nothing here ever actually saw - the worst failure mode
+        // in this file, since a mutating tool call would be reported as
+        // having succeeded. A post() call completed without throwing, so
+        // this is reachable, not downtime - same family as
+        // MalformedResponse (and handled identically by every caller).
+        if (!body || !("result" in body)) {
+          throw new MalformedResponse(`${method}: no response received for the request`);
+        }
+        return body.result;
       } catch (err) {
         // All four mean "reachable" (or, for Cancelled, "we stopped
         // waiting, the backend did not go away") - session/connection
