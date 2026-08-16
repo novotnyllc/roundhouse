@@ -18,7 +18,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, writeFile, copyFile, chmod, rm, readFile, readdir } from "node:fs/promises";
-import { realpathSync, accessSync, constants as fsConstants } from "node:fs";
+import { realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -1327,10 +1327,15 @@ export async function selftest() {
   //         doctored PATH, running buildShimScript()'s FULL output through
   //         a real /bin/sh -c (the same way a registration actually
   //         invokes it), is the only honest way to check this - the same
-  //         technique that made the N1 launcher test above real. See
-  //         selftestNodeResolver for why "none available anywhere" is only
-  //         assertable when this machine has no real node at the
-  //         hardcoded fallback paths. -------------------------------------
+  //         technique that made the N1 launcher test above real. "none
+  //         available anywhere" and "only a too-old node anywhere" are
+  //         constructed (the three hardcoded absolute fallback paths are
+  //         rewritten into a temp dir, see rewriteHardcodedNodeFallbacks)
+  //         rather than conditionally skipped when this host happens to
+  //         have a real node at one of those paths - a skipped-by-
+  //         construction assertion is how the EPIPE-on-fail-closed-exit
+  //         regression this file's runShimScript guard now handles went
+  //         unnoticed through 20 passes on a machine where it never ran. -
   await selftestNodeResolver();
 
   // -- 7j3b. N32: SKILL.md's install instructions must resolve a usable
@@ -3254,16 +3259,50 @@ async function selftestLauncherErrorDoesNotCrash() {
   assert.ok(answeredAgain, `child died or stopped answering after the launch attempt (stderr: ${err})`);
 }
 
+// The three hardcoded absolute node fallback paths NODE_RESOLVER_SH (and
+// SKILL.md's install snippet, which mirrors it) checks are real system
+// paths - not overridable via PATH/HOME - so "nothing resolves anywhere"
+// and "only a hardcoded fallback resolves" used to be only conditionally
+// testable, skipped on any machine that happens to have (or lack) a real
+// node at e.g. /opt/homebrew/bin/node. That meant the assertion never ran
+// at all on a dev machine with Homebrew's node installed - only in CI,
+// where a genuine crash (the EPIPE this whole fix responds to) went
+// unnoticed through 20 local passes. Rewriting these three literal paths
+// to point inside a test-controlled directory makes both cases
+// constructible on ANY machine instead of conditional on it - confirmed
+// faithful by a positive-control case (selftestNodeResolver, below) that
+// places a real node at one of the rewritten paths and checks it still
+// resolves, rather than assumed.
+function rewriteHardcodedNodeFallbacks(scriptText, dir) {
+  return scriptText
+    .replaceAll("/opt/homebrew/bin/node", join(dir, "opt-homebrew-node"))
+    .replaceAll("/usr/local/bin/node", join(dir, "usr-local-node"))
+    .replaceAll("/usr/bin/node", join(dir, "usr-bin-node"));
+}
+
 // N21: runs buildShimScript()'s FULL output (RESOLVER_SH + NODE_RESOLVER_SH
 // + the exec line) through a real `/bin/sh -c`, exactly the way a
 // registration actually invokes it - resolving mcp-siding.mjs itself is not
 // enough on its own if there is then no `node` to run it with. $MCP_SIDING_PATH
 // pins the script resolution deterministically (RESOLVER_SH is not what
 // these tests are about); each case doctors PATH/HOME/$MCP_SIDING_NODE to
-// control node resolution specifically.
-async function runShimScript(env, timeoutMs = 5_000) {
-  const script = buildShimScript({ "backend-url": "http://127.0.0.1:1/mcp", name: "test" });
+// control node resolution specifically. `fallbackDir`, when given, rewrites
+// the three hardcoded absolute fallbacks (see rewriteHardcodedNodeFallbacks)
+// so a case can control what they resolve to as well.
+async function runShimScript(env, timeoutMs = 5_000, fallbackDir) {
+  let script = buildShimScript({ "backend-url": "http://127.0.0.1:1/mcp", name: "test" });
+  if (fallbackDir) script = rewriteHardcodedNodeFallbacks(script, fallbackDir);
   const child = spawn("/bin/sh", ["-c", script], { stdio: ["pipe", "pipe", "pipe"], env });
+  // Every fail-closed resolver path this helper exists to test (unusable
+  // MCP_SIDING_NODE/MCP_SIDING_PATH, no node anywhere, ...) exits BEFORE
+  // ever reading stdin - the write below then hits a closed pipe. That is
+  // expected data for this helper ("the child exited before we could
+  // write"), not a crash: an unhandled 'error' event on a stream kills
+  // the whole process (same class as N1, in this harness instead of
+  // production - see the CI incident this comment is responding to).
+  // Caught here, once, for every caller of this helper, rather than
+  // guarding the write call site by call site.
+  child.stdin.on("error", () => {});
   let out = "";
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => (out += chunk));
@@ -3282,8 +3321,19 @@ async function runShimScript(env, timeoutMs = 5_000) {
   // serves stdin until closed/killed), so success is "the marker showed
   // up," not "the process exited" - only the failure path (no node
   // resolved anywhere) exits quickly on its own, and success there means
-  // reaching that exit before the timeout, not a marker.
-  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 60, method: "initialize", params: {} })}\n`);
+  // reaching that exit before the timeout, not a marker. The write itself
+  // is also wrapped: a pipe that is already gone by the time write() is
+  // called can throw synchronously instead of emitting 'error' async,
+  // depending on exactly how far the child got - either way, a child that
+  // already exited (checked below via `exited`/`exitCode`) is the real
+  // signal this function returns, not whether the write nominally
+  // succeeded.
+  try {
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 60, method: "initialize", params: {} })}\n`);
+  } catch {
+    // Same as the 'error' handler above - a fail-closed child exiting
+    // before this write lands is expected, not a bug.
+  }
   const deadline = Date.now() + timeoutMs;
   while (!out.includes('"id":60') && !exited && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 25));
@@ -3374,36 +3424,51 @@ async function selftestNodeResolver() {
     await rm(fakeHome, { recursive: true, force: true });
   }
 
-  // -- none available anywhere: exits non-zero with a diagnostic rather
-  //    than hanging. Only assertable when this machine genuinely has no
-  //    node at any of the hardcoded absolute fallback paths - those are
-  //    real system paths, not overridable via env, so on a machine that
-  //    happens to have e.g. Homebrew's /opt/homebrew/bin/node, resolving
-  //    it there is CORRECT behavior, not something this test can turn
-  //    into a failure case without touching real system state.
-  const hardcodedFallbacks = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"];
-  const anyHardcodedFallbackExists = hardcodedFallbacks.some((p) => {
-    try {
-      accessSync(p, fsConstants.X_OK);
-      return true;
-    } catch {
-      return false;
-    }
-  });
-  if (anyHardcodedFallbackExists) {
-    process.stderr.write(
-      "  (skipping N21 'no node anywhere' assertion - this machine has a real node at one of the hardcoded fallback paths)\n",
+  // -- positive control for the fallback rewrite itself: place a real,
+  //    usable node at the REWRITTEN "/opt/homebrew/bin/node" slot (PATH
+  //    broken, HOME empty so nothing else could resolve it) and confirm
+  //    it is still found - proves rewriteHardcodedNodeFallbacks produces
+  //    a script that behaves like the real one for these paths, before
+  //    trusting it for the negative cases right below. -------------------
+  const fallbackRewriteHome = await mkdtemp(join(tmpdir(), "mcp-siding-fallback-rewrite-"));
+  try {
+    const rewrittenDir = join(fallbackRewriteHome, "fallbacks");
+    await mkdir(rewrittenDir, { recursive: true });
+    await copyFile(realNode, join(rewrittenDir, "opt-homebrew-node"));
+    await chmod(join(rewrittenDir, "opt-homebrew-node"), 0o755);
+    const positiveControl = await runShimScript(
+      { ...baseEnv, PATH: brokenPath, HOME: fallbackRewriteHome, MCP_SIDING_NODE: "" },
+      5_000,
+      rewrittenDir,
     );
-  } else {
-    const emptyHome = await mkdtemp(join(tmpdir(), "mcp-siding-nonode-"));
-    try {
-      const noneResult = await runShimScript({ ...baseEnv, PATH: brokenPath, HOME: emptyHome, MCP_SIDING_NODE: "" }, 3_000);
-      assert.ok(!noneResult.timedOut, "a subprocess with no node resolvable anywhere must exit, not hang");
-      assert.notEqual(noneResult.code, 0, "must exit non-zero when no node resolves anywhere");
-      assert.match(noneResult.err, /no node with global fetch/i, "must name what was tried in the diagnostic");
-    } finally {
-      await rm(emptyHome, { recursive: true, force: true });
-    }
+    assert.ok(!positiveControl.timedOut, `fallback-rewrite positive control hung (stderr: ${positiveControl.err})`);
+    assert.ok(
+      positiveControl.out.includes('"id":60'),
+      `a real node at the rewritten /opt/homebrew/bin/node slot must still resolve (stderr: ${positiveControl.err})`,
+    );
+  } finally {
+    await rm(fallbackRewriteHome, { recursive: true, force: true });
+  }
+
+  // -- none available anywhere: exits non-zero with a diagnostic rather
+  //    than hanging. Constructed on any machine via the fallback rewrite
+  //    above (a fresh, guaranteed-empty temp dir), not conditional on
+  //    whether this host happens to have a real node at
+  //    /opt/homebrew/bin/node or the other hardcoded absolute paths. ----
+  const emptyHome = await mkdtemp(join(tmpdir(), "mcp-siding-nonode-"));
+  try {
+    const emptyFallbackDir = join(emptyHome, "empty-fallbacks");
+    await mkdir(emptyFallbackDir, { recursive: true });
+    const noneResult = await runShimScript(
+      { ...baseEnv, PATH: brokenPath, HOME: emptyHome, MCP_SIDING_NODE: "" },
+      3_000,
+      emptyFallbackDir,
+    );
+    assert.ok(!noneResult.timedOut, "a subprocess with no node resolvable anywhere must exit, not hang");
+    assert.notEqual(noneResult.code, 0, "must exit non-zero when no node resolves anywhere");
+    assert.match(noneResult.err, /no node with global fetch/i, "must name what was tried in the diagnostic");
+  } finally {
+    await rm(emptyHome, { recursive: true, force: true });
   }
 
   // -- N24: existence is not enough - a node old enough to lack global
@@ -3444,25 +3509,27 @@ async function selftestNodeResolver() {
 
     // -- only the stub anywhere: must exit non-zero naming the
     //    requirement, not silently start a server doomed to fail on its
-    //    first real request. A bare HOME (no asdf fallback populated) so
-    //    the only candidate PATH or the fixed locations can find is the
-    //    stub. Same real-system-path caveat as the "none available" case
-    //    above. -----------------------------------------------------
-    if (anyHardcodedFallbackExists) {
-      process.stderr.write(
-        "  (skipping N24 'only a too-old node' assertion - this machine has a real node at one of the hardcoded fallback paths)\n",
+    //    first real request. A bare HOME (no asdf fallback populated) and
+    //    the hardcoded absolute fallbacks rewritten to an empty temp dir
+    //    (same technique as "none available anywhere" above) so the only
+    //    candidate PATH or the fixed locations can find is the stub -
+    //    constructed on any machine, not conditional on this host lacking
+    //    a real node at one of those paths. -----------------------------
+    const bareHome = await mkdtemp(join(tmpdir(), "mcp-siding-stub-bare-"));
+    try {
+      const bareFallbackDir = join(bareHome, "empty-fallbacks");
+      await mkdir(bareFallbackDir, { recursive: true });
+      const bareResult = await runShimScript(
+        { ...baseEnv, PATH: stubNodeDir, HOME: bareHome, MCP_SIDING_NODE: "" },
+        3_000,
+        bareFallbackDir,
       );
-    } else {
-      const bareHome = await mkdtemp(join(tmpdir(), "mcp-siding-stub-bare-"));
-      try {
-        const bareResult = await runShimScript({ ...baseEnv, PATH: stubNodeDir, HOME: bareHome, MCP_SIDING_NODE: "" }, 3_000);
-        assert.ok(!bareResult.timedOut, "a subprocess with only a too-old node anywhere must exit, not hang");
-        assert.notEqual(bareResult.code, 0, "must exit non-zero when only a too-old node is found");
-        assert.match(bareResult.err, /fetch|ReadableStream/i, "the diagnostic must name the requirement that was rejected");
-        assert.match(bareResult.err, /rejected/i, "the diagnostic must name what was rejected");
-      } finally {
-        await rm(bareHome, { recursive: true, force: true });
-      }
+      assert.ok(!bareResult.timedOut, "a subprocess with only a too-old node anywhere must exit, not hang");
+      assert.notEqual(bareResult.code, 0, "must exit non-zero when only a too-old node is found");
+      assert.match(bareResult.err, /fetch|ReadableStream/i, "the diagnostic must name the requirement that was rejected");
+      assert.match(bareResult.err, /rejected/i, "the diagnostic must name what was rejected");
+    } finally {
+      await rm(bareHome, { recursive: true, force: true });
     }
   } finally {
     await rm(stubNodeHome, { recursive: true, force: true });
@@ -3565,28 +3632,43 @@ async function selftestInstallNodeResolverSnippet() {
 
   // -- no usable runtime anywhere: must fail with the same CLASS of
   //    diagnostic as the runtime resolver (naming fetch/ReadableStream),
-  //    not a bare "command not found". Same real-system-path caveat as
-  //    the runtime resolver's own "none available" tests: only
-  //    assertable when this machine has no real node at the hardcoded
-  //    fallback paths. -----------------------------------------------
-  const hardcodedFallbacks = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"];
-  const anyHardcodedFallbackExists = hardcodedFallbacks.some((p) => {
-    try {
-      accessSync(p, fsConstants.X_OK);
-      return true;
-    } catch {
-      return false;
-    }
-  });
-  if (anyHardcodedFallbackExists) {
-    process.stderr.write(
-      "  (skipping N32 'no node anywhere' install-snippet assertion - this machine has a real node at one of the hardcoded fallback paths)\n",
+  //    not a bare "command not found". Constructed via the same fallback
+  //    rewrite runShimScript uses (rewriteHardcodedNodeFallbacks) applied
+  //    to this snippet's own text, so it runs on any machine rather than
+  //    being conditional on this host lacking a real node at one of the
+  //    hardcoded absolute paths. A positive control first (a real node
+  //    placed at the rewritten /opt/homebrew/bin/node slot must still
+  //    resolve) proves the rewrite is faithful before trusting it for the
+  //    negative case right after. -------------------------------------
+  const fallbackRewriteHome = await mkdtemp(join(tmpdir(), "mcp-siding-install-fallback-rewrite-"));
+  try {
+    const rewrittenDir = join(fallbackRewriteHome, "fallbacks");
+    await mkdir(rewrittenDir, { recursive: true });
+    await copyFile(realNode, join(rewrittenDir, "opt-homebrew-node"));
+    await chmod(join(rewrittenDir, "opt-homebrew-node"), 0o755);
+    const rewrittenSnippet = rewriteHardcodedNodeFallbacks(snippet, rewrittenDir);
+    const positiveControl = spawnSync("/bin/sh", ["-c", `${rewrittenSnippet}\nprintf '%s' "$SCRIPT"`], {
+      env: { ...baseEnv, HOME: fallbackRewriteHome },
+      encoding: "utf8",
+    });
+    assert.equal(
+      positiveControl.status,
+      0,
+      `a real node at the rewritten /opt/homebrew/bin/node slot must still resolve (stderr: ${positiveControl.stderr})`,
     );
-    return;
+    assert.match(positiveControl.stdout, /exec "\$node_bin"/, "the fallback-rewritten install snippet must still produce a valid script");
+  } finally {
+    await rm(fallbackRewriteHome, { recursive: true, force: true });
   }
+
   const emptyHome = await mkdtemp(join(tmpdir(), "mcp-siding-install-nonode-"));
   try {
-    const noneResult = spawnSync("/bin/sh", ["-c", snippet], { env: { ...baseEnv, HOME: emptyHome }, encoding: "utf8" });
+    const emptyFallbackDir = join(emptyHome, "empty-fallbacks");
+    await mkdir(emptyFallbackDir, { recursive: true });
+    const noneResult = spawnSync("/bin/sh", ["-c", rewriteHardcodedNodeFallbacks(snippet, emptyFallbackDir)], {
+      env: { ...baseEnv, HOME: emptyHome },
+      encoding: "utf8",
+    });
     assert.notEqual(noneResult.status, 0, "the install snippet must fail closed when no node resolves anywhere");
     assert.match(
       noneResult.stderr,
@@ -3683,8 +3765,21 @@ async function selftestInvalidBackendUrlExitsBeforeStdio() {
   const exited = new Promise((resolvePromise) => child.on("exit", resolvePromise));
 
   // Sent regardless of whether the process is even listening yet - if the
-  // stdio server had opened, this would get a reply.
-  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 61, method: "initialize", params: {} })}\n`);
+  // stdio server had opened, this would get a reply. This IS the fail-
+  // closed case an invalid --backend-url is supposed to trigger - main()
+  // exits via parseArgs/buildShimFromArgs before ever opening readline -
+  // so the write below can legitimately hit an already-closed pipe. An
+  // unhandled 'error' there would kill the whole selftest process (see
+  // runShimScript's identical guard, added for the same reason); the
+  // actual assertions below already check that the child exited non-zero
+  // with the right diagnostic and never replied, which is the real signal
+  // regardless of whether this write nominally landed.
+  child.stdin.on("error", () => {});
+  try {
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 61, method: "initialize", params: {} })}\n`);
+  } catch {
+    // Same as the 'error' handler above.
+  }
 
   const exitCode = await Promise.race([exited, new Promise((r) => setTimeout(() => r("timeout"), 5_000))]);
   assert.notEqual(exitCode, "timeout", `child never exited on an invalid --backend-url (stderr: ${err})`);
