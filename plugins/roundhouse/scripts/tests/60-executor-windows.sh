@@ -97,6 +97,46 @@ rm -f "$nested_cache/scripts/evil.sh"
   fail "the same nested-under-dotfiles cache must pass once the unmanifested file is gone"
 rm -rf "$dotfiles_home"
 
+# N18: strengthens the tracked-manifest test with path identity. A repo
+# that deliberately TRACKS an installed cache's .claude-plugin/plugin.json
+# (a backup repo that commits everything, say) would still pass the
+# tracked-file test above; the plugin root must also sit at the expected
+# plugins/roundhouse path within that repo's toplevel, which a cache nested
+# under .claude/plugins/cache/... never does. Defense in depth, not a
+# boundary - someone who can already write into the cache and commit its
+# manifest can edit integrity.json directly regardless - but cheap and
+# real: this must fail if the path-identity check is ever dropped.
+backup_home="$tmp/backup-home"
+mkdir -p "$backup_home"
+git -C "$backup_home" init -q
+nested_backup_cache="$backup_home/.claude/plugins/cache/novotnyllc/roundhouse/$plugin_version"
+mkdir -p "$nested_backup_cache"
+cp -R "$script_dir/../." "$nested_backup_cache/"
+if git -C "$script_dir/.." rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ignore_status=0
+  ignored_fixture_paths=$(
+    (cd "$script_dir/.." && find . ! -type d -print | sed 's#^\./##' | git check-ignore --stdin) 2>/dev/null
+  ) || ignore_status=$?
+  if [ "$ignore_status" -le 1 ] && [ -n "$ignored_fixture_paths" ]; then
+    printf '%s\n' "$ignored_fixture_paths" | while IFS= read -r rel; do
+      [ -n "$rel" ] && rm -f "$nested_backup_cache/$rel"
+    done
+  fi
+fi
+chmod -R go-w "$nested_backup_cache"
+# The backup repo's own pre-existing ignore convention (unrelated to the
+# plugin content, narrow enough that the manifest itself still gets
+# tracked normally) happens to match the smuggled file once it is added.
+printf '.claude/plugins/cache/novotnyllc/roundhouse/%s/scripts/evil.sh\n' "$plugin_version" >"$backup_home/.gitignore"
+git -C "$backup_home" add .
+git -C "$backup_home" -c user.email=test@test.invalid -c user.name=test commit -q -m "backup everything"
+printf '#!/bin/sh\nexit 0\n' >"$nested_backup_cache/scripts/evil.sh"
+chmod 700 "$nested_backup_cache/scripts/evil.sh"
+if "$nested_backup_cache/scripts/roundhouse" executor-status - >/dev/null 2>&1; then
+  fail "N18: a cache nested under a repo that TRACKS its manifest bypassed the manifest-coverage check via an unrelated ignore rule"
+fi
+rm -rf "$backup_home"
+
 if [ -n "$pwsh_command" ]; then
   rm -f "$CODEX_HOOK_WRITES_FILE"
   windows_hook_approval=$(CODEX_HOOK_SCENARIO=approve "$pwsh_command" -NoLogo -NoProfile \

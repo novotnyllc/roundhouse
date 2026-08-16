@@ -288,11 +288,24 @@ EOF
   # cache nested under some unrelated repo. A real git failure here (not
   # "no matches") also keeps the unfiltered scan rather than silently
   # narrowing what this check defends.
+  #
+  # Also require plugin_root to sit at the expected path within that
+  # repository (plugins/roundhouse under the repo toplevel) - a repo that
+  # deliberately tracks an installed cache's manifest (e.g. a backup repo
+  # that commits everything) would otherwise still pass the tracked-file
+  # test above. This is defense in depth, not a boundary: someone who can
+  # already write into the plugin cache and commit its manifest there can
+  # edit integrity.json directly and make this check moot regardless - so
+  # this stays a cheap path comparison, not anything cryptographic.
   is_source_checkout=false
   if command -v git >/dev/null 2>&1 &&
     git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
     git -C "$plugin_root" ls-files --error-unmatch .claude-plugin/plugin.json >/dev/null 2>&1; then
-    is_source_checkout=true
+    toplevel=$(git -C "$plugin_root" rev-parse --show-toplevel 2>/dev/null) || toplevel=
+    relative_root=${plugin_root#"$toplevel"/}
+    if [ -n "$toplevel" ] && [ "$relative_root" = "plugins/roundhouse" ]; then
+      is_source_checkout=true
+    fi
   fi
   if [ "$is_source_checkout" = true ]; then
     ignore_status=0

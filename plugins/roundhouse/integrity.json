@@ -142,7 +142,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "10f8a66e3a390e5f96282b2b3361473e363ff2b4552ceeeb275e8186f99ed3c6"
+      "sha256": "53b9dce3bf54dbf2800ada8d37167c2e5ee08b1d3535acf82e615b91fe37fca3"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -170,11 +170,11 @@
     },
     {
       "path": "scripts/mcp-siding.mjs",
-      "sha256": "8e6a53d53ec259367bc8087098f495b59d862d3f98df6416f42ff5041b4778fa"
+      "sha256": "2e5868e0d92ddb169edc9fca763def0dfa6433798efd7b5543fcf84cdde3f99d"
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
-      "sha256": "77f72fd8d1f00266398a7f920a62d6a592f5ff63957819620898518c04410622"
+      "sha256": "c75a0160dfdedae34e0512414b915314cbd05b863e3b08b5a06b31494e291ef7"
     },
     {
       "path": "scripts/prepare-ssh-identity",

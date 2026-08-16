@@ -422,6 +422,17 @@ export function writeCache(cachePath, tools) {
   }
 }
 
+// Appends `page` onto `base`, de-duplicating by tool name and keeping the
+// newest definition - a client re-walking the same page sequence (e.g.
+// after a reconnect) must not leave duplicate entries, and if a tool's
+// definition legitimately changed between walks the newer one should win,
+// not sit alongside a stale copy.
+function mergeToolPage(base, page) {
+  const byName = new Map(base.map((tool) => [tool?.name, tool]));
+  for (const tool of page) byName.set(tool?.name, tool);
+  return [...byName.values()];
+}
+
 export function defaultCachePath(name, url) {
   const safe = String(name).replace(/[^A-Za-z0-9._-]+/g, "_") || "mcp-siding";
   // Keyed on name AND backend identity, not name alone. A repoint (remove
@@ -759,16 +770,25 @@ export class Shim {
     try {
       const result = await this.backend("tools/list", params, clientRequestId);
       // Guard the cache write on a real array (no future response shape
-      // surprise can blank a previously good cache) AND an uncursored
-      // (first-page) request - a paginated backend's page-two response
-      // would otherwise overwrite the cache with only that page's slice,
-      // discarding earlier pages and presenting a partial page as the
-      // complete offline tool set. The cache only ever stores the tools
-      // array itself (never nextCursor), so the offline path below never
-      // claims more pages are fetchable either. The live result passes
-      // through unchanged regardless of caching - e.g. nextCursor stays
-      // intact for the live caller - this only ever touches disk.
-      if (!params?.cursor && Array.isArray(result.tools)) writeCache(this.cachePath, result.tools);
+      // surprise can blank a previously good cache). An uncursored
+      // (first-page) request REPLACES the cache - a fresh listing starts
+      // over, which is what stops a stale page ever standing in as the
+      // complete set. A cursored (later-page) request APPENDS to it: if
+      // the client walks the full sequence the cache ends up holding the
+      // complete inventory; if it stops early the cache holds a prefix -
+      // strictly better than page one alone, and still never presents a
+      // middle page as the whole set (the earlier, page-one-only fix's
+      // own failure mode - it just moved which page got stuck as "the
+      // whole set" instead of fixing the general case). The cache only
+      // ever stores the merged tools array (never nextCursor), so the
+      // offline path below never claims more pages are fetchable either.
+      // The live result passes through unchanged regardless of caching -
+      // e.g. nextCursor stays intact for the live caller - this only ever
+      // touches disk.
+      if (Array.isArray(result.tools)) {
+        const base = params?.cursor ? readCache(this.cachePath) : [];
+        writeCache(this.cachePath, mergeToolPage(base, result.tools));
+      }
       return result;
     } catch {
       // Never launches - clients call tools/list every session, and

@@ -637,12 +637,16 @@ export async function selftest() {
     );
   }
 
-  // -- 7e4. N3: pagination must not corrupt the offline cache. Only the
-  //         first (uncursored) page is cached - fetching page two must not
-  //         overwrite it, and once the backend is gone, the offline
-  //         tools/list must serve the coherent first page, never page
-  //         two's slice masquerading as the complete set, and must not
-  //         claim more pages are fetchable (no stale nextCursor). ---------
+  // -- 7e4. N3/N19: pagination must not corrupt the offline cache. An
+  //         uncursored (first-page) request REPLACES the cache; a cursored
+  //         (later-page) request APPENDS to it - fetching page two must
+  //         not overwrite page one's entries, and once the client has
+  //         walked the whole sequence and the backend goes away, the
+  //         offline tools/list must serve BOTH pages' tools (not just
+  //         page one - N3's fix stopped a middle page from standing in as
+  //         the complete set, but replaced it with page one alone always
+  //         doing that instead), and must not claim more pages are
+  //         fetchable (no stale nextCursor). ------------------------------
   const page1Tools = [{ name: "page1_tool" }];
   const page2Tools = [{ name: "page2_tool" }];
   const paginationCachePath = join(cacheDir, "pagination.json");
@@ -688,13 +692,106 @@ export async function selftest() {
         params: { cursor: "page2" },
       });
       assert.deepEqual(page2.result.tools, page2Tools);
-      assert.deepEqual(readCache(paginationCachePath), page1Tools, "cache must hold the first page, not the last-fetched page");
+      assert.deepEqual(
+        readCache(paginationCachePath),
+        [...page1Tools, ...page2Tools],
+        "cache must hold both pages after the full sequence has been walked",
+      );
     },
   );
   // The backend is gone now (withServer tore it down on return).
   const offlineListing = await paginationShim.handle({ jsonrpc: "2.0", id: 42, method: "tools/list", params: {} });
-  assert.deepEqual(offlineListing.result.tools, page1Tools, "offline tools/list must serve the coherent first page, never page two's slice");
+  assert.deepEqual(
+    offlineListing.result.tools,
+    [...page1Tools, ...page2Tools],
+    "offline tools/list must serve BOTH pages' tools, not just the first",
+  );
   assert.equal(offlineListing.result.nextCursor, undefined, "offline listing must not claim more pages are fetchable");
+
+  // An uncursored request after that must RESET the cache, not append to
+  // the old (now stale) set - a fresh listing starts over.
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "pagination-reset-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/list") {
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: page1Tools } }); // single page, no nextCursor
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const freshShim = new Shim({
+        url,
+        name: "test",
+        cachePath: paginationCachePath, // same file, still holding both pages from the walk above
+        timeoutMs: 2_000,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      await freshShim.handle({ jsonrpc: "2.0", id: 43, method: "tools/list", params: {} });
+      assert.deepEqual(
+        readCache(paginationCachePath),
+        page1Tools,
+        "an uncursored request must reset the cache to the fresh listing, not append to the stale old one",
+      );
+    },
+  );
+
+  // A re-walk of the same two pages must not duplicate entries.
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "pagination-rewalk-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/list") {
+          if (msg.params?.cursor === "page2") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: page2Tools } });
+          }
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: page1Tools, nextCursor: "page2" } });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const rewalkCachePath = join(cacheDir, "pagination-rewalk.json");
+      const rewalkShim = new Shim({
+        url,
+        name: "test",
+        cachePath: rewalkCachePath,
+        timeoutMs: 2_000,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      // Walk the sequence twice.
+      for (let i = 0; i < 2; i += 1) {
+        await rewalkShim.handle({ jsonrpc: "2.0", id: 44, method: "tools/list", params: {} });
+        await rewalkShim.handle({ jsonrpc: "2.0", id: 45, method: "tools/list", params: { cursor: "page2" } });
+      }
+      assert.deepEqual(
+        readCache(rewalkCachePath),
+        [...page1Tools, ...page2Tools],
+        "re-walking the same pages must not duplicate entries",
+      );
+    },
+  );
 
   // -- 7f. stale-session retry happens EXACTLY ONCE against a permanently
   //        rejecting backend (a request counter, not just eventual
