@@ -175,8 +175,25 @@ argument: do not re-quote, re-escape, or reconstruct it by hand.
 
 | Harness | Add | Verify | Remove |
 | --- | --- | --- | --- |
-| Claude Code | `claude mcp add <NAME> -s user -- /bin/sh -c "$SCRIPT"` | `claude mcp get <NAME>` — confirm `Connected` or `Failed to connect` (it should be *this* shim listed and inert, not a raw `mcp-remote` failure) | `claude mcp remove <NAME> -s user` |
-| Codex | `codex mcp add <NAME> -- /bin/sh -c "$SCRIPT"` | `codex mcp get <NAME>` | `codex mcp remove <NAME>` |
+| Claude Code | `claude mcp add <NAME> -s user -- /bin/sh -c "$SCRIPT"` | `claude mcp get <NAME>` — must report `Connected`; anything else is a failed mutation (diagnose below) | `claude mcp remove <NAME> -s user` |
+| Codex | `codex mcp add <NAME> -- /bin/sh -c "$SCRIPT"` | `codex mcp get <NAME>` — same: `Connected` only | `codex mcp remove <NAME>` |
+
+`Connected` is the only acceptable result, never `Failed to connect`. The
+shim answers `initialize` locally without ever contacting the backend —
+that is the whole point (see "No copy" above) — so a closed desktop app
+still yields a `Connected` server. `Failed to connect` therefore never
+means "the backend is down"; it means the *resolver* failed before the
+shim could even start: no `roundhouse` plugin found, or no usable Node.
+Treat it as a failed mutation, not an acceptable outcome, and diagnose
+before leaving it in place: confirm `roundhouse` is actually installed
+and its plugin cache contains `scripts/mcp-siding.mjs`, and that a Node
+18+ with global `fetch`/`ReadableStream` resolves (PATH, Homebrew,
+Volta, asdf, or `$MCP_SIDING_NODE`) — running `/bin/sh -c "$SCRIPT"`
+directly surfaces the resolvers' own stderr naming exactly what was
+checked (see "Resolver finds nothing" under Known holes below). If the
+cause cannot be fixed immediately, remove the registration
+(`<harness> mcp remove <NAME> ...`) rather than leaving a dead one
+behind, and say so to the user.
 
 `-s user` matches the existing `fusion` registration's scope (available in
 every project); pass a different `-s` only if asked. Before the Codex row,

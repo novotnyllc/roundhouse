@@ -282,9 +282,31 @@ export async function selftest() {
     /--backend-url must be a valid URL/,
     "unparseable junk must be rejected",
   );
+  // N47: a syntactically valid http(s) URL naming a fetch-forbidden port
+  // (e.g. 1) used to pass every check here and only fail at request time,
+  // where undici's client-side block carries no recognized error code -
+  // post()'s catch fell through to Indeterminate ("the operation may have
+  // run") when nothing was ever transmitted. Rejected here instead, same
+  // family as the schemeless/non-HTTP cases above.
+  assert.throws(
+    () => buildShimFromArgs({ "backend-url": "http://127.0.0.1:1/mcp", name: "t" }),
+    /--backend-url uses port 1\b.*fetch\(\) refuses to connect/,
+    "a fetch-forbidden port must be rejected, naming the port",
+  );
+  assert.throws(
+    () => buildShimFromArgs({ "backend-url": "http://127.0.0.1:6667/mcp", name: "t" }),
+    /--backend-url uses port 6667\b/,
+    "any port on the fetch-forbidden list must be rejected, not just port 1",
+  );
   // Valid http and https values must keep starting normally.
   assert.equal(buildShimFromArgs({ "backend-url": "http://127.0.0.1:27182/mcp", name: "t" }).url, "http://127.0.0.1:27182/mcp");
   assert.equal(buildShimFromArgs({ "backend-url": "https://example.com/mcp", name: "t" }).url, "https://example.com/mcp");
+  // A normal, non-forbidden port must be unaffected by the new check.
+  assert.equal(
+    buildShimFromArgs({ "backend-url": "http://127.0.0.1:65533/mcp", name: "t" }).url,
+    "http://127.0.0.1:65533/mcp",
+    "an ordinary high port must not be rejected",
+  );
   // --launch=false must actually disable launch (not fall through to
   // Boolean(appPath)), and --no-launch=false must not disable it.
   const launchFalseShim = buildShimFromArgs({ "backend-url": "http://x", name: "t", app: "/A.app", launch: false });
@@ -1382,6 +1404,12 @@ export async function selftest() {
   //          stored and ignored. -------------------------------------
   selftestUnknownFlagRejectedOnBothPaths();
 
+  // -- 7j4d. N47: a fetch-forbidden --backend-url port must be rejected
+  //          at a real launch too, not just --print-shim-script (covered
+  //          just above) - same parseArgs/buildShimFromArgs choke point,
+  //          same reasoning as every other pair of these tests. -------
+  selftestForbiddenPortRejectedAtLaunch();
+
   // -- 7j2. N13: the OTHER real macOS launch-failure shape - `open -a
   //         <bad path>` spawns fine and simply exits nonzero, which
   //         nothing previously observed at all. downCallResult() had
@@ -1549,8 +1577,13 @@ export async function selftest() {
       for (const id of ids) {
         const reply = replies.get(id);
         assert.ok(reply, `id ${id} never got a reply`);
-        assert.equal(reply.result.isError, true, `id ${id} must be a cancelled result`);
-        assert.match(reply.result.content[0].text, /cancel/i, `id ${id} must say cancelled`);
+        // N48: a cancelled QUEUED request answers as a JSON-RPC error, not
+        // a CallToolResult - valid for any method uniformly, since tools/
+        // list (or any other method) could just as easily be the one
+        // sitting in this queue, not only tools/call.
+        assert.equal(reply.result, undefined, `id ${id} must not carry a result`);
+        assert.ok(reply.error, `id ${id} must be a JSON-RPC error response`);
+        assert.match(reply.error.message, /cancel/i, `id ${id} must say cancelled`);
       }
       assert.equal(manyToolCallCount, 0, "none of the 120 cancelled requests may reach the backend");
       assert.equal(manyShim.pendingIds.size, 0, "nothing may remain pending once the queue drains");
@@ -1719,10 +1752,16 @@ export async function selftest() {
       const lines = out.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
       const replyA = lines.find((l) => l.id === 80);
       const replyB = lines.find((l) => l.id === 81);
+      // A was cancelled IN-FLIGHT (toolsCall's own Cancelled handling, not
+      // the tombstone path) - still a CallToolResult, unaffected by N48.
       assert.equal(replyA.result.isError, true);
       assert.match(replyA.result.content[0].text, /cancel/i);
-      assert.equal(replyB.result.isError, true, "B must return a cancelled result");
-      assert.match(replyB.result.content[0].text, /cancel/i);
+      // B was cancelled while still QUEUED - the tombstone path (N48):
+      // a JSON-RPC error, valid for any method uniformly, not a
+      // CallToolResult that would be an invalid shape for e.g. tools/list.
+      assert.equal(replyB.result, undefined, "B must not carry a result");
+      assert.ok(replyB.error, "B must be a JSON-RPC error response");
+      assert.match(replyB.error.message, /cancel/i, "B must say cancelled");
       // The tombstone short-circuits inside handle(), before toolsCall()/
       // backend() (and so before downCallResult(), the only place that
       // launches) are ever reached - proven directly by the request
@@ -1731,6 +1770,95 @@ export async function selftest() {
       // directly (see 7j/7j2/7j3 above for why the real launcher needs a
       // real subprocess in the first place).
       assert.equal(queuedCancelToolCallCount, 1, "B must never reach the backend - only A's tools/call should arrive");
+    },
+  );
+
+  // -- 7l2b. N48: a cancelled QUEUED request must answer with a shape
+  //          valid for whatever method was actually cancelled - the
+  //          tombstone path used to always return a CallToolResult
+  //          ({content, isError}), which is a valid shape for tools/call
+  //          (asserted above) but an INVALID ListToolsResult (missing a
+  //          `tools` array) for tools/list or anything else. B here is a
+  //          tools/list, queued behind a stalled A (tools/call), cancelled
+  //          while still queued - the shape is asserted against what
+  //          tools/list actually requires: a JSON-RPC error response,
+  //          which is valid for any method uniformly (no per-method
+  //          shape to keep in sync). -------------------------------------
+  let queuedCancelToolsListCount = 0;
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "queued-cancel-list-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "notifications/cancelled") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/call") {
+          res.writeHead(200, { "Content-Type": "application/json" }); // stall - deliberately never end()
+          return;
+        }
+        if (msg.method === "tools/list") {
+          queuedCancelToolsListCount += 1;
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: [] } });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const child = spawn(
+        process.execPath,
+        [MCP_SIDING_PATH, "--backend-url", url, "--name", "test", "--timeout", "60000"],
+        { stdio: ["pipe", "pipe", "pipe"] },
+      );
+      let out = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => (out += chunk));
+      let err = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => (err += chunk));
+      const exited = new Promise((resolvePromise) => child.on("exit", resolvePromise));
+
+      const waitFor = async (marker, deadlineMs) => {
+        const deadline = Date.now() + deadlineMs;
+        while (!out.includes(marker) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        return out.includes(marker);
+      };
+
+      // A - will stall on the backend. B - a tools/list, queued right
+      // behind it, still waiting for its own turn when cancelled below.
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 82, method: "tools/call", params: { name: "x", arguments: {} } })}\n`);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 83, method: "tools/list", params: {} })}\n`);
+      await new Promise((r) => setTimeout(r, 300));
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 83, reason: "B" } })}\n`);
+      const cancelledAt = Date.now();
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 82, reason: "A" } })}\n`);
+
+      assert.ok(await waitFor('"id":82', 5_000), `A never answered (stderr: ${err})`);
+      assert.ok(await waitFor('"id":83', 5_000), `B (tools/list) never answered - the tombstone did not free it (stderr: ${err})`);
+      assert.ok(Date.now() - cancelledAt < 5_000, "both must be answered promptly, not wait out the 60s timeout");
+
+      child.stdin.end();
+      await Promise.race([exited, new Promise((r) => setTimeout(r, 2_000))]);
+      if (child.exitCode == null) child.kill();
+
+      const lines = out.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      const replyB = lines.find((l) => l.id === 83);
+      assert.ok(replyB, "no reply for the cancelled queued tools/list");
+      assert.equal(
+        replyB.result,
+        undefined,
+        "a cancelled queued tools/list must not carry a result at all - a CallToolResult shape would be an invalid ListToolsResult",
+      );
+      assert.ok(replyB.error, "a cancelled queued tools/list must be a JSON-RPC error response, valid for any method");
+      assert.match(replyB.error.message, /cancel/i, "the diagnostic must say cancelled");
+      assert.equal(queuedCancelToolsListCount, 0, "the cancelled tools/list must never reach the backend");
     },
   );
 
@@ -1881,7 +2009,7 @@ export async function selftest() {
   //         nothing to cancel, no session to release since none was ever
   //         established (initialize is answered locally; nothing here
   //         ever sends a real message at all). ----------------------------
-  const idleChild = spawn(process.execPath, [MCP_SIDING_PATH, "--backend-url", "http://127.0.0.1:1/mcp", "--name", "test"], {
+  const idleChild = spawn(process.execPath, [MCP_SIDING_PATH, "--backend-url", "http://127.0.0.1:65533/mcp", "--name", "test"], {
     stdio: ["pipe", "pipe", "pipe"],
   });
   let idleErr = "";
@@ -3080,6 +3208,36 @@ export async function selftest() {
   assert.match(badUrl.result.content[0].text, /backend-url/i, "must point at the --backend-url configuration");
   assert.equal(badUrlLaunches.length, 0, "a malformed backend URL must never launch - restarting the app cannot fix it");
 
+  // -- 7z. N47: a fetch-forbidden port reaching the REQUEST path (a Shim
+  //       built directly, bypassing buildShimFromArgs's own validation
+  //       at construction time - the same bypass shape badUrlShim above
+  //       exercises for a schemeless URL) must classify as
+  //       ConfigurationError, not Indeterminate. Before this fix, undici's
+  //       client-side block for this exact port carries no recognized
+  //       error code, so post() fell through to "the operation may have
+  //       run" when nothing was ever transmitted - independent protection
+  //       from the startup-time rejection tested elsewhere. --------------
+  const badPortLaunches = [];
+  const badPortShim = new Shim({
+    url: "http://127.0.0.1:1/mcp", // fetch-forbidden - never reaches the network at all
+    name: "test",
+    cachePath: join(cacheDir, "bad-port.json"),
+    timeoutMs: 2_000,
+    launchEnabled: true,
+    appPath: "/fake/BadPort.app",
+    launchGraceMs: 150_000,
+    launcher: (appPath) => badPortLaunches.push(appPath),
+  });
+  const badPort = await badPortShim.handle({ jsonrpc: "2.0", id: 111, method: "tools/call", params: {} });
+  assert.equal(badPort.result.isError, true);
+  assert.doesNotMatch(
+    badPort.result.content[0].text,
+    /not reachable|is not reachable|still be running|do not retry|still starting/i,
+    "a fetch-forbidden port must not be reported as downtime, a launch-in-progress, or an indeterminate retry risk",
+  );
+  assert.match(badPort.result.content[0].text, /backend-url/i, "must point at the --backend-url configuration, same as the ConfigurationError class");
+  assert.equal(badPortLaunches.length, 0, "a fetch-forbidden port must never launch - restarting the app cannot fix it");
+
   // -- 8. process-level: one malformed stdin line must not kill the shim
   const initReply = await runChildAndGetReply(
     MCP_SIDING_PATH,
@@ -3308,7 +3466,14 @@ async function stageNodeWrapper(destPath) {
 // the three hardcoded absolute fallbacks (see rewriteHardcodedNodeFallbacks)
 // so a case can control what they resolve to as well.
 async function runShimScript(env, timeoutMs = 5_000, fallbackDir) {
-  let script = buildShimScript({ "backend-url": "http://127.0.0.1:1/mcp", name: "test" });
+  // Not port 1 (N47: a fetch-forbidden port is now rejected by
+  // buildShimFromArgs at startup, before the stdio server even opens -
+  // exactly the validation this file is elsewhere proving exists, so
+  // using one here would make every resolver case in this function fail
+  // before ever reaching what it is actually testing). This helper only
+  // ever answers a locally-handled `initialize`, never touches the
+  // backend, so any syntactically valid, non-forbidden port is fine.
+  let script = buildShimScript({ "backend-url": "http://127.0.0.1:65533/mcp", name: "test" });
   if (fallbackDir) script = rewriteHardcodedNodeFallbacks(script, fallbackDir);
   const child = spawn("/bin/sh", ["-c", script], { stdio: ["pipe", "pipe", "pipe"], env });
   // Every fail-closed resolver path this helper exists to test (unusable
@@ -3568,7 +3733,8 @@ async function selftestInstallNodeResolverSnippet() {
   );
   assert.ok(match, `SKILL.md's node-resolver install snippet marker not found at ${skillMdPath} - did the doc structure change?`);
   const snippet = match[1]
-    .replaceAll("<URL>", "http://127.0.0.1:1/mcp")
+    // Not port 1 - see runShimScript's identical comment (N47).
+    .replaceAll("<URL>", "http://127.0.0.1:65533/mcp")
     .replaceAll("<NAME>", "test")
     .replaceAll('"<APP_PATH>"', '""');
 
@@ -3839,6 +4005,23 @@ function selftestUnknownFlagRejectedOnBothPaths() {
   assert.equal(printShimScript.stdout, "", "no script may be printed when a flag is unrecognized");
 }
 
+// N47: a fetch-forbidden port (127.0.0.1:1, say) is a syntactically valid
+// http(s) URL, so it used to pass every startup check, open the stdio
+// server, and only fail on the first real request - where undici's
+// client-side block carries no recognized error code and post()'s catch
+// fell through to Indeterminate ("the operation may have run"), when
+// nothing was ever transmitted. Must be rejected before the stdio server
+// ever opens, same as any other invalid --backend-url (N30).
+function selftestForbiddenPortRejectedAtLaunch() {
+  const result = spawnSync(
+    process.execPath,
+    [MCP_SIDING_PATH, "--backend-url", "http://127.0.0.1:1/mcp", "--name", "test"],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(result.status, 0, "a real launch on a fetch-forbidden port must exit non-zero, before the stdio server opens");
+  assert.match(result.stderr, /port 1\b/, "the diagnostic must name the offending port");
+}
+
 // N35: --print-shim-script used to check only that --backend-url and --name
 // were present, then hand flags straight to buildShimScript - so a
 // malformed URL or a bad --timeout/--launch-grace generated a script
@@ -3888,6 +4071,19 @@ function selftestPrintShimScriptValidatesLikeBuildShimFromArgs() {
   assert.notEqual(badTimeout.status, 0, "--print-shim-script must exit non-zero on a non-numeric --timeout");
   assert.match(badTimeout.stderr, /timeout/i, "must name the flag that failed");
   assert.equal(badTimeout.stdout, "", "no script may be printed for a rejected --timeout");
+
+  // N47: a fetch-forbidden port must be rejected here too, not just at a
+  // real launch - same reasoning as every other validation case in this
+  // function (this is the whole point of N35's fix: generation and
+  // launch must reject exactly the same inputs).
+  const badPort = spawnSync(
+    process.execPath,
+    [MCP_SIDING_PATH, "--print-shim-script", "--backend-url", "http://127.0.0.1:1/mcp", "--name", "test"],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(badPort.status, 0, "--print-shim-script must exit non-zero on a fetch-forbidden --backend-url port");
+  assert.match(badPort.stderr, /port 1\b/, "must name the offending port");
+  assert.equal(badPort.stdout, "", "no script may be printed for a forbidden port");
 
   // Valid input must still work exactly as before.
   const valid = spawnSync(
@@ -3978,9 +4174,12 @@ async function selftestLaunchFailureReportsAccurately() {
 // malformed-stdin and space-in-path self-tests, which differ only in what
 // they write to stdin and where the script itself lives.
 async function runChildAndGetReply(scriptPath, stdinLines, matchId) {
+  // Not port 1 - see runShimScript's identical comment (N47). Both
+  // callers only ever send initialize (locally answered) and/or a
+  // malformed line, never a tools/call, so the backend is never dialed.
   const child = spawn(
     process.execPath,
-    [scriptPath, "--backend-url", "http://127.0.0.1:1/mcp", "--name", "test", "--no-launch"],
+    [scriptPath, "--backend-url", "http://127.0.0.1:65533/mcp", "--name", "test", "--no-launch"],
     { stdio: ["pipe", "pipe", "pipe"] },
   );
   let out = "";

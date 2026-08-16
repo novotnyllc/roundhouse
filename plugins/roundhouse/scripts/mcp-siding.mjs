@@ -403,6 +403,25 @@ class Indeterminate extends Error {}
 // and a retry that duplicates a mutation.
 const PROVEN_UNDELIVERED_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH", "EAI_AGAIN"]);
 
+// N47: the fixed, published "bad port" list fetch() (via undici/the Fetch
+// spec's port-blocking list) refuses client-side, for any of these ports,
+// before attempting a connection at all - reserved for other protocols
+// (echo, ftp-data, telnet, smtp, ...), not something a real MCP backend
+// would ever legitimately use. Embedded here (matches the WHATWG Fetch
+// spec's list, verified live against this runtime) rather than probed,
+// since it never changes at runtime and probing would mean actually
+// trying to connect. buildShimFromArgs rejects a --backend-url naming one
+// of these at validation time (before any registration or connection
+// attempt); post()'s catch, independently, classifies a "bad port"
+// rejection reaching the request path some other way as a
+// ConfigurationError rather than Indeterminate - see both call sites.
+const FETCH_FORBIDDEN_PORTS = new Set([
+  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102, 103, 104, 109, 110,
+  111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532,
+  540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000,
+  6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+]);
+
 // The configured backend URL itself is malformed, so fetch() rejected
 // before anything was ever transmitted - not even a connection attempt.
 // This should be unreachable in practice: buildShimFromArgs validates
@@ -875,6 +894,18 @@ export class Shim {
       // neither Down nor Indeterminate.
       if (err?.cause?.code === "ERR_INVALID_URL" || err?.code === "ERR_INVALID_URL") {
         throw new ConfigurationError(`the configured backend URL is invalid: ${err.message}`);
+      }
+      // N47: a fetch-forbidden port (see FETCH_FORBIDDEN_PORTS) - undici
+      // blocks these client-side before attempting any connection, and
+      // carries no recognized error code (bare "bad port" on err.cause,
+      // no .code at all), so this used to fall through to Indeterminate:
+      // "the operation may have run," when nothing was ever transmitted.
+      // buildShimFromArgs rejects this at validation time already; this
+      // is independent protection in case a forbidden port ever reaches
+      // this path some other way (a Shim built directly, bypassing that
+      // check - same reasoning as ConfigurationError's own guard above).
+      if (err?.cause?.message === "bad port") {
+        throw new ConfigurationError(`the configured backend URL uses a port fetch() refuses to connect to: ${this.url}`);
       }
       // Classify by whether delivery is PROVEN, not by whether WE aborted -
       // see Indeterminate/PROVEN_UNDELIVERED_CODES above for the reasoning.
@@ -1367,7 +1398,17 @@ export class Shim {
     if (id !== undefined) {
       this.pendingIds.delete(id);
       if (this.cancelledQueuedIds.delete(id)) {
-        return ok(id, this.errorResult(`${this.name}: call cancelled.`));
+        // N48: this used to be ok(id, this.errorResult(...)) - a
+        // CallToolResult ({content, isError}) - regardless of which
+        // method was actually cancelled. That is a valid response shape
+        // for tools/call, but a cancelled tools/list (or any other
+        // method) got a body with no `tools` array: an invalid
+        // ListToolsResult, a protocol failure at the client. A JSON-RPC
+        // ERROR response is valid for any method's cancellation
+        // uniformly - no per-method shape to get right or keep in sync
+        // with validateResultShape - so it is the answer here regardless
+        // of what was cancelled.
+        return { jsonrpc: "2.0", id, error: { code: -32000, message: `${this.name}: call cancelled.` } };
       }
     }
     if (method === "initialize") {
@@ -1534,6 +1575,18 @@ export function buildShimFromArgs(flags) {
   if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
     throw new Error(
       `--backend-url must use http: or https: - got ${JSON.stringify(url)} (protocol was ${parsedUrl.protocol})`,
+    );
+  }
+  // N47: a syntactically valid http(s) URL naming a fetch-forbidden port
+  // (127.0.0.1:1, say) used to pass every check here, generate a working
+  // registration, and only fail at request time - where undici's client-
+  // side block carries no recognized error code, so post()'s catch fell
+  // through to Indeterminate: "the operation may have run," when nothing
+  // was ever transmitted, not even a connection attempt. Reject it here
+  // instead, before any registration is built.
+  if (parsedUrl.port && FETCH_FORBIDDEN_PORTS.has(Number(parsedUrl.port))) {
+    throw new Error(
+      `--backend-url uses port ${parsedUrl.port}, which fetch() refuses to connect to (reserved for another protocol, blocked client-side before any connection attempt) - got ${JSON.stringify(url)}`,
     );
   }
   const appPath = flags.app ?? null;
