@@ -812,6 +812,30 @@ jq -e -s '
 plugin_cache="$tmp/home/.codex/plugins/cache/novotnyllc/roundhouse/$plugin_version"
 mkdir -p "$plugin_cache"
 cp -R "$script_dir/../." "$plugin_cache/"
+# This fixture simulates an already-installed plugin, so it must contain
+# only release content - the same standard update-integrity/executor-status
+# hold a real install to. The cp above is byte-for-byte, so it also copies
+# whatever git-ignored local tooling artifact (an editor cache, a hook's
+# scratch file, whatever comes next) happens to sit under the live source
+# tree, which no real release would ever contain. Strip those here,
+# generically via git's own ignore rules rather than naming today's
+# offender - only when the source is a git checkout (no gitignore to
+# consult otherwise), and only on a clean git run, so a git failure leaves
+# the copy untouched rather than silently pruning on a guess. This does not
+# touch what the fixture's own integrity check enumerates below - that stays
+# unfiltered, on purpose: it verifies real installs, which have no git.
+if command -v git >/dev/null 2>&1 &&
+  git -C "$script_dir/.." rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ignore_status=0
+  ignored_fixture_paths=$(
+    (cd "$script_dir/.." && find . ! -type d -print | sed 's#^\./##' | git check-ignore --stdin) 2>/dev/null
+  ) || ignore_status=$?
+  if [ "$ignore_status" -le 1 ] && [ -n "$ignored_fixture_paths" ]; then
+    printf '%s\n' "$ignored_fixture_paths" | while IFS= read -r rel; do
+      [ -n "$rel" ] && rm -f "$plugin_cache/$rel"
+    done
+  fi
+fi
 chmod -R go-w "$plugin_cache"
 case ${ROUNDHOUSE_TEST_SCOPE:-} in
   u1-characterization|u1-contracts|u4-contracts|u5-contracts|macos-privilege-contracts)

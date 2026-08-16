@@ -33,6 +33,8 @@ import {
   buildShimScript,
   shQuote,
   PROTOCOL_VERSION,
+  parseArgs,
+  buildShimFromArgs,
 } from "./mcp-siding.mjs";
 
 // Resolved relative to *this file*, not CWD or a hardcoded repo path - so
@@ -58,6 +60,57 @@ export async function selftest() {
     parseBody(multiEvent, "text/event-stream", 999),
     null,
     "a response for a different id than expected must not be picked up",
+  );
+
+  // -- 1b. CLI parsing (C7/C8/C9 regressions) ------------------------------
+  // --no-launch=false / --launch=false must be real booleans, not truthy
+  // strings - the concrete bug: --no-launch=false used to disable launch
+  // (the string "false" is truthy), the exact opposite of what it reads as.
+  assert.equal(parseArgs(["--no-launch=false"])["no-launch"], false);
+  assert.equal(parseArgs(["--launch=false"]).launch, false);
+  assert.equal(parseArgs(["--launch=true"]).launch, true);
+  assert.throws(() => parseArgs(["--launch=maybe"]), /invalid value for --launch/, "a non-boolean =value on a bool flag must be rejected");
+  // A missing value must never swallow the following flag token.
+  assert.throws(() => parseArgs(["--timeout", "--name", "x"]), /missing value for --timeout/);
+  assert.throws(() => parseArgs(["--timeout"]), /missing value for --timeout/, "a value-less flag at the end of argv must also be rejected");
+  // Numeric flags reject non-finite/non-positive input instead of a silent
+  // NaN (a 0ms timeout, a broken debounce).
+  assert.throws(
+    () => buildShimFromArgs({ "backend-url": "http://x", name: "t", timeout: "notanumber" }),
+    /invalid value for --timeout/,
+  );
+  assert.throws(
+    () => buildShimFromArgs({ "backend-url": "http://x", name: "t", timeout: "0" }),
+    /invalid value for --timeout/,
+    "zero is not a valid timeout",
+  );
+  assert.throws(
+    () => buildShimFromArgs({ "backend-url": "http://x", name: "t", "launch-grace": "-5" }),
+    /invalid value for --launch-grace/,
+  );
+  // --name has no silent default - required, matching usage(); the
+  // installer always passes it explicitly, and the cache is keyed on it.
+  assert.throws(() => buildShimFromArgs({ "backend-url": "http://x" }), /--backend-url and --name are required/);
+  assert.throws(() => buildShimFromArgs({ name: "t" }), /--backend-url and --name are required/);
+  // --launch=false must actually disable launch (not fall through to
+  // Boolean(appPath)), and --no-launch=false must not disable it.
+  const launchFalseShim = buildShimFromArgs({ "backend-url": "http://x", name: "t", app: "/A.app", launch: false });
+  assert.equal(launchFalseShim.launchEnabled, false);
+  const noLaunchFalseShim = buildShimFromArgs({ "backend-url": "http://x", name: "t", app: "/A.app", "no-launch": false });
+  assert.equal(noLaunchFalseShim.launchEnabled, true);
+  // buildShimScript must forward the same resolved intent into the
+  // generated registration script, not just buildShimFromArgs's in-process
+  // Shim - an explicit --launch=false with no corresponding --no-launch in
+  // the generated argv would silently re-enable launch at the next spawn.
+  assert.match(
+    buildShimScript({ "backend-url": "http://x", name: "t", app: "/A.app", launch: false }),
+    /--no-launch/,
+    "--launch=false must forward as --no-launch in the generated script",
+  );
+  assert.doesNotMatch(
+    buildShimScript({ "backend-url": "http://x", name: "t", app: "/A.app", "no-launch": false }),
+    /--no-launch/,
+    "--no-launch=false must not forward --no-launch",
   );
 
   // -- 2. initialize always answered locally, even pointed at nothing ---
@@ -349,6 +402,57 @@ export async function selftest() {
     },
   );
 
+  // -- 7e2. C5 regression: a tools/call JSON-RPC error envelope from a
+  //         reachable backend must NOT be treated as downtime - no launch,
+  //         no "app is unreachable" message, the real backend message (and
+  //         code) surfaces instead. Companion to the transport-failure
+  //         launch case already covered in section 6 above (backend
+  //         completely unreachable -> launches) and the tools/list
+  //         cache-preservation case just above (error envelope -> cache
+  //         survives) - together these are the three cases C5 asked for. --
+  const toolsCallErrorLaunches = [];
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "tools-call-error-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/call") {
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "unknown tool: bogus_tool" } });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const toolsCallErrorShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "tools-call-error.json"),
+        timeoutMs: 2_000,
+        launchEnabled: true,
+        appPath: "/fake/ReachableButRejecting.app",
+        launchGraceMs: 150_000,
+        launcher: (appPath) => toolsCallErrorLaunches.push(appPath),
+      });
+      const rejected = await toolsCallErrorShim.handle({
+        jsonrpc: "2.0",
+        id: 30,
+        method: "tools/call",
+        params: { name: "bogus_tool", arguments: {} },
+      });
+      assert.equal(toolsCallErrorLaunches.length, 0, "a live backend rejection must never launch the app");
+      assert.equal(rejected.result.isError, true);
+      assert.match(rejected.result.content[0].text, /unknown tool: bogus_tool/, "the real backend message must surface");
+      assert.doesNotMatch(rejected.result.content[0].text, /not reachable|is not reachable/i, "must not be misreported as the app being down");
+    },
+  );
+
   // -- 7f. stale-session retry happens EXACTLY ONCE against a permanently
   //        rejecting backend (a request counter, not just eventual
   //        success) -------------------------------------------------------
@@ -458,6 +562,53 @@ export async function selftest() {
       await l2Shim.handle({ jsonrpc: "2.0", id: 29, method: "tools/list", params: {} });
       assert.equal(l2ConnectCount, 1, "a session-less backend must only be handshaked once, not on every call");
       assert.equal(l2ListCount, 3, "all three logical calls must still reach the backend");
+    },
+  );
+
+  // -- 7i. C6: MCP-Protocol-Version is sent on every post-initialize
+  //        request, carrying the version the BACKEND negotiated (not just
+  //        echoing our own outgoing PROTOCOL_VERSION) - a streamable-HTTP
+  //        backend enforcing the 2025-06-18 transport contract rejects any
+  //        post-initialization request missing it (HTTP 400), which would
+  //        otherwise present as the app simply being down. Absent on the
+  //        initialize request itself, since that is what negotiates it. --
+  const negotiatedProtocolVersion = "2024-11-05"; // deliberately not this file's own PROTOCOL_VERSION
+  const protocolHeaderSeen = { onInitialize: "missing", onNotify: null, onToolsList: null };
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        const gotHeader = req.headers["mcp-protocol-version"] ?? null;
+        if (msg.method === "initialize") {
+          protocolHeaderSeen.onInitialize = gotHeader;
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: negotiatedProtocolVersion, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "protocol-version-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") {
+          protocolHeaderSeen.onNotify = gotHeader;
+          return sendJson(res, 200, undefined);
+        }
+        protocolHeaderSeen.onToolsList = gotHeader;
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: [] } });
+      });
+    },
+    async (url) => {
+      const protocolShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "protocol-version.json"),
+        timeoutMs: 2_000,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      await protocolShim.handle({ jsonrpc: "2.0", id: 31, method: "tools/list", params: {} });
+      assert.equal(protocolHeaderSeen.onInitialize, null, "the initialize request itself must not carry a version yet");
+      assert.equal(protocolHeaderSeen.onNotify, negotiatedProtocolVersion, "notifications/initialized must carry the negotiated version");
+      assert.equal(protocolHeaderSeen.onToolsList, negotiatedProtocolVersion, "every later request must carry the negotiated version");
     },
   );
 
@@ -600,7 +751,7 @@ async function runChildAndGetReply(scriptPath, stdinLines, matchId) {
 function runResolver(env) {
   const script = `${RESOLVER_SH}\nprintf '%s' "$p"\n`;
   const res = spawnSync("/bin/sh", ["-c", script], {
-    env: { ...process.env, CLAUDE_PLUGIN_ROOT: "", ...env },
+    env: { ...process.env, CLAUDE_PLUGIN_ROOT: "", MCP_SIDING_PATH: "", ...env },
     encoding: "utf8",
   });
   return { status: res.status, stdout: res.stdout, stderr: res.stderr };
@@ -621,42 +772,62 @@ async function selftestResolver() {
   assert.equal(empty.stdout, "");
   assert.match(empty.stderr, /could not find mcp-siding\.mjs/);
 
-  // -- b. lowest priority: Codex versioned-shape fallback ------------------
-  const codexVersioned = await touch(
-    join(home, ".codex", "plugins", "cache", "novotnyllc", "roundhouse", "9.9.9", "scripts", "mcp-siding.mjs"),
+  // -- b. a single Codex versioned cache entry resolves (either harness
+  //       works alone; marketplace segment is wildcarded, not hardcoded
+  //       "novotnyllc"). -----------------------------------------------
+  const codexLow = await touch(
+    join(home, ".codex", "plugins", "cache", "some-marketplace", "roundhouse", "0.7.4", "scripts", "mcp-siding.mjs"),
   );
   const b = runResolver({ HOME: home });
   assert.equal(b.status, 0);
-  assert.equal(b.stdout, codexVersioned);
+  assert.equal(b.stdout, codexLow);
 
-  // -- c. Codex unversioned shape outranks the versioned fallback ---------
-  const codexFlat = await touch(
-    join(home, ".codex", "plugins", "cache", "novotnyllc", "roundhouse", "scripts", "mcp-siding.mjs"),
+  // -- c. cross-harness selection: a HIGHER Claude version beats a lower
+  //       Codex one. Both caches are scanned in one pass, not "check all
+  //       of Claude's cache before considering Codex" - the bug that made
+  //       a Codex-updated roundhouse lose to a stale Claude copy. --------
+  const claudeHigh = await touch(
+    join(home, ".claude", "plugins", "cache", "novotnyllc", "roundhouse", "0.8.0", "scripts", "mcp-siding.mjs"),
   );
   const c = runResolver({ HOME: home });
   assert.equal(c.status, 0);
-  assert.equal(c.stdout, codexFlat);
+  assert.equal(c.stdout, claudeHigh, "the higher Claude version must beat the lower Codex one");
 
-  // -- d. Claude versioned cache outranks both Codex shapes, and among
-  //       multiple Claude versions the highest (sort -V, not lexical) wins.
-  //       Two ordering traps a lexical sort gets backwards: 0.7.10 must
-  //       beat 0.7.4 (lexically "1" < "4"), and 0.10.0 must beat 0.7.4
-  //       (lexically "0.1" < "0.7") - the second is the realistic case a
-  //       live roundhouse install eventually hits as it crosses a minor
-  //       version boundary. --------------------------------------------
-  for (const version of ["0.7.2", "0.7.10", "0.7.4", "0.10.0"]) {
+  // -- d. and the reverse: a Codex version higher than every Claude one
+  //       wins too - proving this is a true global max, not harness order. -
+  const codexHigh = await touch(
+    join(home, ".codex", "plugins", "cache", "some-marketplace", "roundhouse", "0.9.0", "scripts", "mcp-siding.mjs"),
+  );
+  const d = runResolver({ HOME: home });
+  assert.equal(d.status, 0);
+  assert.equal(d.stdout, codexHigh, "a higher Codex version must beat every Claude version present");
+
+  // -- e. a version directory that exists but lacks the script itself is
+  //       skipped, not treated as a (broken) match. ------------------------
+  await mkdir(join(home, ".claude", "plugins", "cache", "novotnyllc", "roundhouse", "9.9.9"), { recursive: true });
+  const e = runResolver({ HOME: home });
+  assert.equal(e.status, 0);
+  assert.equal(e.stdout, codexHigh, "a version directory with no mcp-siding.mjs must be skipped, not win");
+
+  // -- f. among many versions across both caches, the highest wins via the
+  //       awk numeric comparison, not a lexical one. Two ordering traps a
+  //       lexical sort gets backwards: 0.7.10 must beat 0.7.4 (lexically
+  //       "1" < "4"), and 0.10.0 must beat 0.9.0 (lexically "0.1" < "0.9") -
+  //       the second is the realistic case a live install eventually hits
+  //       crossing a minor version boundary. -----------------------------
+  for (const version of ["0.7.2", "0.7.10"]) {
     await touch(
       join(home, ".claude", "plugins", "cache", "novotnyllc", "roundhouse", version, "scripts", "mcp-siding.mjs"),
     );
   }
-  const d = runResolver({ HOME: home });
-  assert.equal(d.status, 0);
-  assert.equal(
-    d.stdout,
+  const claudeHighest = await touch(
     join(home, ".claude", "plugins", "cache", "novotnyllc", "roundhouse", "0.10.0", "scripts", "mcp-siding.mjs"),
   );
+  const f = runResolver({ HOME: home });
+  assert.equal(f.status, 0);
+  assert.equal(f.stdout, claudeHighest, "0.10.0 must beat every 0.7.x and 0.9.0 present, numerically not lexically");
 
-  // -- e. CLAUDE_PLUGIN_ROOT outranks everything when it points at a real
+  // -- g. CLAUDE_PLUGIN_ROOT outranks everything when it points at a real
   //       file, and is skipped (falling through to the cache) when it
   //       doesn't -----------------------------------------------------------
   const pluginRoot = await mkdtemp(join(tmpdir(), "mcp-siding-pluginroot-"));
@@ -664,9 +835,32 @@ async function selftestResolver() {
   assert.equal(missing.status, 0);
   assert.notEqual(missing.stdout, join(pluginRoot, "scripts", "mcp-siding.mjs"), "must skip a CLAUDE_PLUGIN_ROOT with no script file");
   const pluginRootScript = await touch(join(pluginRoot, "scripts", "mcp-siding.mjs"));
-  const e = runResolver({ HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot });
-  assert.equal(e.status, 0);
-  assert.equal(e.stdout, pluginRootScript);
+  const g = runResolver({ HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot });
+  assert.equal(g.status, 0);
+  assert.equal(g.stdout, pluginRootScript);
+
+  // -- h. MCP_SIDING_PATH (explicit local-development override) outranks
+  //       everything, including a CLAUDE_PLUGIN_ROOT that also points at a
+  //       real file - it is branch 0, checked before branch 1. -------------
+  const devDir = await mkdtemp(join(tmpdir(), "mcp-siding-dev-"));
+  const devScript = await touch(join(devDir, "mcp-siding.mjs"));
+  const h = runResolver({ HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot, MCP_SIDING_PATH: devScript });
+  assert.equal(h.status, 0);
+  assert.equal(h.stdout, devScript, "MCP_SIDING_PATH must win over CLAUDE_PLUGIN_ROOT");
+
+  // -- i. MCP_SIDING_PATH pointed at a nonexistent file falls through to the
+  //       normal branches rather than failing closed - only an *existing*
+  //       file is honored as the override. ---------------------------------
+  const i = runResolver({ HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot, MCP_SIDING_PATH: join(devDir, "nope.mjs") });
+  assert.equal(i.status, 0);
+  assert.equal(i.stdout, pluginRootScript, "a missing MCP_SIDING_PATH must fall through, not fail");
+
+  // -- j. unset MCP_SIDING_PATH behaves exactly as before this branch
+  //       existed - already implicitly proven by every case above (none set
+  //       it), asserted directly here too for a case that names it. --------
+  const j = runResolver({ HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot });
+  assert.equal(j.status, 0);
+  assert.equal(j.stdout, pluginRootScript, "unset MCP_SIDING_PATH must not change branch 1 onward");
 }
 
 // ---------------------------------------------------------------------------

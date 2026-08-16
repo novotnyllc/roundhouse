@@ -24,6 +24,30 @@ and `codex mcp` — never a custom config-file editor. No TOML/JSON parsing or
 serialization lives in this skill or its scripts; that stays the harness
 CLI's job, which owns the format and gets the escaping right.
 
+## Authorization model
+
+An explicit request naming the target — "set up MCP for Fusion," "register
+figma as an MCP server," "remove the fusion-dev registration" — IS the
+mutation authorization for that one registration: resolve the target
+(name/backend/harness), state the exact command, run it, and verify
+afterward, without a second confirmation round-trip. A request to just
+inspect or explain current registrations (`claude mcp list`, `claude mcp
+get NAME`, or the Codex equivalents) stays read-only and never on its own
+authorizes an add or remove.
+
+This mutates one named MCP server registration through the harness's own
+first-party CLI (`claude mcp add`/`remove`, `codex mcp add`/`remove`), not
+the fleet-wide package/agent/auth/chezmoi/project domains the `roundhouse`
+CLI's `seal-plan`/`verify-preconditions`/`apply-plan` pipeline governs —
+there is no sealed-plan action type for "register an MCP server" today,
+and adding one is out of this skill's scope. The same discipline still
+applies in miniature, matching what that pipeline enforces for the domains
+it does cover: identity verification is the harness/PATH check
+(`command -v codex`) before ever touching Codex; preflight is stating the
+exact command before running it; the post-change check is
+`claude mcp get`/`codex mcp get` afterward, every time, not only when
+asked.
+
 ## No copy — resolve the script path at spawn time
 
 **Never register a literal path to `mcp-siding.mjs` — plugin tree or
@@ -93,6 +117,24 @@ a user who maintains that file by hand.
 Optionally clean up the instance's cache file at
 `~/.cache/mcp-siding/<NAME>.json` after a remove.
 
+## Local development
+
+To register and exercise an unpublished working-tree build instead of a
+published plugin version, pin it explicitly with `MCP_SIDING_PATH` — the
+resolver's first branch, checked before `$CLAUDE_PLUGIN_ROOT` and everything
+below it. Build `$SCRIPT` the same way as a normal install (above), suffix
+the name (e.g. `fusion-dev`) so a local build never silently clobbers a
+working published registration, and add the env var to the registration:
+
+```bash
+claude mcp add fusion-dev -s user -e MCP_SIDING_PATH=/absolute/path/to/checkout/scripts/mcp-siding.mjs -- /bin/sh -c "$SCRIPT"
+codex mcp add fusion-dev --env MCP_SIDING_PATH=/absolute/path/to/checkout/scripts/mcp-siding.mjs -- /bin/sh -c "$SCRIPT"
+```
+
+This pins one exact path and will not follow plugin updates — the opposite
+of a normal install, and deliberately so; it is the one named exception to
+the "never register a literal path" prohibition above.
+
 ## Config flags
 
 All of the following are `mcp-siding.mjs` CLI flags — the installer's job is
@@ -102,7 +144,7 @@ since the registration bakes them in as argv.
 | Flag | Purpose | Default |
 | --- | --- | --- |
 | `--backend-url` | HTTP MCP backend URL | required |
-| `--name` | Server display name (also the default cache key) | `mcp-siding` |
+| `--name` | Server display name (also the cache key) | required |
 | `--app` | App to launch on demand | none (launch disabled) |
 | `--cache` | Tool-list cache file path | `~/.cache/mcp-siding/<name>.json` |
 | `--timeout` | Backend request timeout, ms | `180000` |

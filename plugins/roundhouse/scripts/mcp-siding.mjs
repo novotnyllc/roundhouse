@@ -47,32 +47,95 @@ export const PROTOCOL_VERSION = "2025-06-18";
 // breaks the moment the old version is pruned. Resolving at spawn time
 // instead means every registration keeps working across plugin updates with
 // no reinstall. Tried in order, first hit wins:
+//   0. $MCP_SIDING_PATH, if set and naming an existing file - the explicit
+//      local-development override (see the skill's "Local development"
+//      section): register a dev instance with this env var pinned to a
+//      working checkout, distinct from a normal install, which resolves
+//      through the branches below instead.
 //   1. $CLAUDE_PLUGIN_ROOT/scripts/mcp-siding.mjs - unpopulated for
 //      user-registered servers today (verified), kept first for any future
 //      plugin-declared registration where it would be.
-//   2. newest versioned Claude plugin cache (sort -V, last wins).
-//   3. Codex plugin cache, unversioned shape.
-//   4. Codex plugin cache, versioned shape (Codex's cache is not version-
-//      nested today - verified - but this covers it if that ever changes).
-// POSIX sh only (no bashisms) so it runs on minimal cloud images. Only bare
-// $VAR forms are used, never ${VAR} - Claude Code expands ${VAR} tokens in
-// registered server args (verified: ${HOME} resolves, an unset ${VAR} warns
-// and passes through literally), and this snippet must reach /bin/sh
-// unexpanded. Every expansion is double-quoted since $HOME (and in
+//   2. every versioned plugin cache directory across BOTH harnesses -
+//      ~/.claude/plugins/cache/*/roundhouse/*/scripts/mcp-siding.mjs and
+//      the ~/.codex equivalent - compared in ONE pass, globally newest
+//      wins regardless of which harness owns it. (Earlier versions of this
+//      resolver checked the whole Claude cache before considering Codex at
+//      all, so a Codex-updated roundhouse lost to a stale Claude copy -
+//      fixed by scanning both roots in the same loop, exactly like
+//      fleet_remote_cli_prologue below.) Verified live on this machine:
+//      Codex's plugin cache IS version-nested
+//      (~/.codex/plugins/cache/<marketplace>/roundhouse/<version>/...),
+//      matching Claude's shape - an earlier version of this comment
+//      claimed otherwise from a stale observation.
+// POSIX sh only (no bashisms) so it runs on minimal cloud images - and no
+// `sort -V`: it isn't POSIX, this repo's own guard section
+// (scripts/tests/75-guards.sh) fails the build on it, and its presence in
+// an earlier draft only passed locally because this machine's `sort`
+// happens to support it. Numeric version comparison instead uses the exact
+// awk-based approach `fleet_remote_cli_prologue` in
+// scripts/lib/fleet-init.sh already established for this identical
+// problem (resolving this plugin's own CLI across both harness caches) -
+// modeled on it directly, not reinvented, and kept in sync by hand since
+// one is a POSIX heredoc and the other a JS template literal with no
+// shared runtime. That prologue extracts a candidate's version with
+// `${var%pattern}`; this resolver globs for the version *directory* first
+// and reads it with `basename` instead of parameter expansion, because
+// this string is a JS template literal AND gets embedded in a
+// `claude mcp add`/`codex mcp add` argument - `${...}` here would either
+// be JS-interpolated at build time or risk Claude Code's own `${VAR}`
+// expansion of registered server args (see below); `$(basename ...)` has
+// no braces and is exactly as POSIX. Only bare $VAR forms are used
+// elsewhere too, never ${VAR} - Claude Code expands ${VAR} tokens in
+// registered server args (verified: ${HOME} resolves, an unset ${VAR}
+// warns and passes through literally), and this snippet must reach
+// /bin/sh unexpanded. Every expansion is double-quoted since $HOME (and in
 // principle CLAUDE_PLUGIN_ROOT) may contain spaces.
-export const RESOLVER_SH = `p="$CLAUDE_PLUGIN_ROOT/scripts/mcp-siding.mjs"
-if [ -z "$CLAUDE_PLUGIN_ROOT" ] || [ ! -f "$p" ]; then
-  p=$(ls -d "$HOME"/.claude/plugins/cache/novotnyllc/roundhouse/*/scripts/mcp-siding.mjs 2>/dev/null | sort -V | tail -1)
+export const RESOLVER_SH = `p="$MCP_SIDING_PATH"
+[ -n "$p" ] && [ -f "$p" ] || p=""
+if [ -z "$p" ]; then
+  p="$CLAUDE_PLUGIN_ROOT/scripts/mcp-siding.mjs"
+  [ -n "$CLAUDE_PLUGIN_ROOT" ] && [ -f "$p" ] || p=""
 fi
 if [ -z "$p" ]; then
-  c="$HOME/.codex/plugins/cache/novotnyllc/roundhouse/scripts/mcp-siding.mjs"
-  [ -f "$c" ] && p="$c"
+  # Login profiles can enable Bash's failglob; the first absent harness
+  # cache must not stop the other cache from being considered. Same
+  # defensive line as fleet_remote_cli_prologue, same reason.
+  shopt -u failglob 2>/dev/null || :
+  p_best=
+  p_best_version=
+  mcp_siding_version_gt() {
+    awk -F. -v left="$1" -v right="$2" '
+      function part(version, part_index, pieces) {
+        return split(version, pieces, /[.]/) >= part_index ? pieces[part_index] + 0 : 0
+      }
+      BEGIN {
+        for (part_index = 1; part_index <= 4; part_index++) {
+          l = part(left, part_index)
+          r = part(right, part_index)
+          if (l > r) exit 0
+          if (l < r) exit 1
+        }
+        exit 1
+      }
+    '
+  }
+  for p_version_dir in "$HOME"/.claude/plugins/cache/*/roundhouse/* \\
+    "$HOME"/.codex/plugins/cache/*/roundhouse/*; do
+    p_candidate="$p_version_dir/scripts/mcp-siding.mjs"
+    [ -f "$p_candidate" ] || continue
+    p_version=$(basename "$p_version_dir")
+    case $p_version in
+      ''|.*|*.|*..*|*[!0-9.]*) continue ;;
+    esac
+    if [ -z "$p_best" ] || mcp_siding_version_gt "$p_version" "$p_best_version"; then
+      p_best=$p_candidate
+      p_best_version=$p_version
+    fi
+  done
+  p=$p_best
 fi
 if [ -z "$p" ]; then
-  p=$(ls -d "$HOME"/.codex/plugins/cache/novotnyllc/roundhouse/*/scripts/mcp-siding.mjs 2>/dev/null | sort -V | tail -1)
-fi
-if [ -z "$p" ]; then
-  echo "mcp-siding: could not find mcp-siding.mjs (checked \\$CLAUDE_PLUGIN_ROOT, ~/.claude/plugins/cache/novotnyllc/roundhouse/*/scripts, ~/.codex/plugins/cache/novotnyllc/roundhouse[/*]/scripts). Is the roundhouse plugin installed?" >&2
+  echo "mcp-siding: could not find mcp-siding.mjs (checked \\$MCP_SIDING_PATH, \\$CLAUDE_PLUGIN_ROOT, ~/.claude/plugins/cache/*/roundhouse/*/scripts, ~/.codex/plugins/cache/*/roundhouse/*/scripts). Is the roundhouse plugin installed?" >&2
   exit 1
 fi`;
 
@@ -94,8 +157,16 @@ export function buildShimScript(flags) {
   if (flags.cache) args.push("--cache", shQuote(flags.cache));
   if (flags.timeout) args.push("--timeout", shQuote(flags.timeout));
   if (flags["launch-grace"]) args.push("--launch-grace", shQuote(flags["launch-grace"]));
-  if (flags["no-launch"]) args.push("--no-launch");
-  else if (flags.launch) args.push("--launch");
+  // Same tri-state resolution as buildShimFromArgs: either flag's explicit
+  // value wins over the other's absence, "off" wins a genuine conflict.
+  // Collapsed to the canonical bare form in the generated script - an
+  // explicit --launch=false must still forward as --no-launch here, or the
+  // spawned shim would fall back to "on iff --app is set" and silently
+  // launch anyway.
+  const launchOff = flags["no-launch"] === true || flags.launch === false;
+  const launchOn = flags.launch === true || flags["no-launch"] === false;
+  if (launchOff) args.push("--no-launch");
+  else if (launchOn) args.push("--launch");
   return `${RESOLVER_SH}\nexec node "$p" ${args.join(" ")}\n`;
 }
 
@@ -106,6 +177,22 @@ export function buildShimScript(flags) {
 
 class Down extends Error {}
 class Stale extends Error {}
+
+// A JSON-RPC error envelope from a backend that IS reachable and DID
+// answer - an unknown tool, bad arguments, an internal tool error, ...
+// Distinct from Down: a live rejection is not downtime. Regression fixed
+// here - an earlier version threw Down for this case too (to stop it
+// silently laundering into an empty success, the actual bug it fixed),
+// which overcorrected into misreporting a live error as the app being
+// unreachable, discarding the real message and letting toolsCall relaunch
+// an already-running app. Carries the backend's own code/message through
+// unchanged.
+class BackendReported extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
 
 // Per MCP streamable-HTTP: "If a server receives a request with an invalid
 // or expired session ID, the server MUST respond with 404." Only 404 is
@@ -207,6 +294,9 @@ export class Shim {
     // every single call.
     this.connected = false;
     this.launchedAt = null;
+    // Set once initialize's response is known, cleared alongside
+    // sid/connected on any reconnect - see post()/connect().
+    this.protocolVersion = null;
   }
 
   async post(payload, sid) {
@@ -215,6 +305,13 @@ export class Shim {
       Accept: "application/json, text/event-stream",
     };
     if (sid) headers["MCP-Session-Id"] = sid;
+    // Required on every request after initialize by the 2025-06-18
+    // streamable-HTTP transport - a backend enforcing that contract
+    // rejects (HTTP 400) any post-initialization request missing it, which
+    // this shim would otherwise misreport as the app simply being down.
+    // Absent (undefined) before the first successful initialize, which is
+    // correct: the version is what that exchange negotiates.
+    if (this.protocolVersion) headers["MCP-Protocol-Version"] = this.protocolVersion;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     let res, text;
@@ -265,6 +362,11 @@ export class Shim {
       null,
     );
     this.sid = sid ?? null;
+    // Capture what the backend actually negotiated, not just what we
+    // asked for - a compliant backend may echo back a different (older)
+    // version it supports, and that is the value every later request must
+    // carry, not our own requested one.
+    this.protocolVersion = body?.result?.protocolVersion || PROTOCOL_VERSION;
     await this.post({ jsonrpc: "2.0", method: "notifications/initialized" }, this.sid);
     this.connected = true;
     return body;
@@ -272,20 +374,21 @@ export class Shim {
 
   // Calls the backend, reconnecting once if the session went stale (the
   // backend restarted while this shim kept running). A JSON-RPC error
-  // envelope from a live, answering backend is treated the same as
-  // unreachable (Down) - the caller-visible failure path already belongs
-  // to toolsCall/downCallResult, and nothing here may quietly hand back {}
-  // or [] and let a caller mistake that for a real empty success.
+  // envelope from a live, answering backend is a BackendReported failure,
+  // not Down - see that class - and does not reset session state (the
+  // session itself is still fine; only this one call was rejected).
   async backend(method, params) {
     for (const attempt of [1, 2]) {
       try {
         if (!this.connected) await this.connect();
         const { body } = await this.post({ jsonrpc: "2.0", id: 1, method, params }, this.sid);
-        if (body?.error) throw new Down(body.error.message ?? "backend error");
+        if (body?.error) throw new BackendReported(body.error.code, body.error.message ?? "backend error");
         return body?.result ?? {};
       } catch (err) {
+        if (err instanceof BackendReported) throw err;
         this.connected = false;
         this.sid = null;
+        this.protocolVersion = null;
         if (err instanceof Stale && attempt === 1) continue;
         throw err instanceof Down ? err : new Down(err?.message ?? String(err));
       }
@@ -306,7 +409,11 @@ export class Shim {
       return result;
     } catch {
       // Never launches - clients call tools/list every session, and
-      // launching the app on that would launch it constantly.
+      // launching the app on that would launch it constantly. Applies the
+      // same way whether the backend was unreachable (Down) or reachable
+      // but rejected the call (BackendReported): tools/list has nowhere to
+      // put an error message anyway, so serving the cache is correct
+      // either way, not a misreport.
       return { tools: readCache(this.cachePath) };
     }
   }
@@ -314,7 +421,15 @@ export class Shim {
   async toolsCall(params) {
     try {
       return await this.backend("tools/call", params);
-    } catch {
+    } catch (err) {
+      if (err instanceof BackendReported) {
+        // Reachable, and rejected the call - an unknown tool, bad
+        // arguments, an internal tool error. Not downtime: never launch,
+        // never claim the app is unreachable, surface the real message.
+        return this.errorResult(
+          err.code != null ? `${err.message} (backend error ${err.code})` : err.message,
+        );
+      }
       return this.downCallResult();
     }
   }
@@ -379,7 +494,8 @@ export class Shim {
       const result = await this.backend(method, params);
       return ok(id, result);
     } catch (err) {
-      return { jsonrpc: "2.0", id, error: { code: -32000, message: err.message } };
+      const code = err instanceof BackendReported && err.code != null ? err.code : -32000;
+      return { jsonrpc: "2.0", id, error: { code, message: err.message } };
     }
   }
 }
@@ -393,25 +509,56 @@ function ok(id, result) {
 
 const BOOL_FLAGS = new Set(["selftest", "help", "launch", "no-launch", "print-resolver", "print-shim-script"]);
 
-function parseArgs(argv) {
+// Throws a plain Error, with a message meant to be shown to the user
+// as-is, on any argv shape it can't make sense of - the caller (run())
+// turns that into usage()+exit(2) rather than a stack trace.
+export function parseArgs(argv) {
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (!arg.startsWith("--")) continue;
     const eq = arg.indexOf("=");
-    if (eq !== -1) {
-      flags[arg.slice(2, eq)] = arg.slice(eq + 1);
-      continue;
-    }
-    const key = arg.slice(2);
+    const key = eq === -1 ? arg.slice(2) : arg.slice(2, eq);
     if (BOOL_FLAGS.has(key)) {
-      flags[key] = true;
+      if (eq === -1) {
+        flags[key] = true;
+        continue;
+      }
+      // --flag=value forms are still meaningful for a boolean flag (most
+      // concretely --no-launch=false / --launch=false) - interpreted as a
+      // string, "false" is truthy, so --no-launch=false previously
+      // disabled launch, the opposite of what it reads as.
+      const raw = arg.slice(eq + 1).toLowerCase();
+      if (raw === "true" || raw === "1") flags[key] = true;
+      else if (raw === "false" || raw === "0") flags[key] = false;
+      else throw new Error(`invalid value for --${key}: ${arg.slice(eq + 1)} (expected true or false)`);
       continue;
     }
-    flags[key] = argv[i + 1];
+    if (eq !== -1) {
+      flags[key] = arg.slice(eq + 1);
+      continue;
+    }
+    const value = argv[i + 1];
+    // Never treat the next flag as this one's value - a missing --timeout
+    // value used to silently swallow the following --whatever token.
+    if (value === undefined || value.startsWith("--")) {
+      throw new Error(`missing value for --${key}`);
+    }
+    flags[key] = value;
     i++;
   }
   return flags;
+}
+
+// Rejects non-finite or non-positive input with a clear message rather
+// than letting a bad/missing numeric flag silently become NaN - which
+// downstream is a 0ms timeout or a broken debounce, not an error.
+function parsePositiveNumber(value, flagName) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`invalid value for --${flagName}: ${value} (expected a positive number)`);
+  }
+  return n;
 }
 
 function usage() {
@@ -436,25 +583,46 @@ Options:
 `;
 }
 
-function buildShimFromArgs(flags) {
+// Pure and testable: throws a plain Error (message meant to be shown
+// as-is) on anything invalid, never calls process.exit itself. main() is
+// the only caller and is the CLI boundary that turns a thrown error into
+// usage()+exit(2).
+export function buildShimFromArgs(flags) {
   const url = flags["backend-url"];
-  const name = flags.name ?? "mcp-siding";
-  if (!url) {
-    process.stderr.write(usage());
-    process.exit(2);
+  const name = flags.name;
+  // Both required, matching usage() - the installer always passes --name
+  // explicitly anyway (the cache is keyed on it), so a silent "mcp-siding"
+  // default here just meant two unrelated instances misconfigured the same
+  // way would silently collide on one cache file instead of failing loudly.
+  if (!url || !name) {
+    throw new Error("--backend-url and --name are required");
   }
   const appPath = flags.app ?? null;
-  const timeoutMs = Number(flags.timeout ?? 180_000);
-  const launchGraceMs = Number(flags["launch-grace"] ?? 150) * 1000;
+  const timeoutMs = parsePositiveNumber(flags.timeout ?? 180_000, "timeout");
+  const launchGraceMs = parsePositiveNumber(flags["launch-grace"] ?? 150, "launch-grace") * 1000;
   const cachePath = flags.cache ?? defaultCachePath(name);
-  const launchEnabled = flags["no-launch"] ? false : flags.launch ? true : Boolean(appPath);
+  // --no-launch and --launch are two spellings of one boolean; either
+  // flag's *explicit* value wins over the other's absence, "off" wins a
+  // genuine conflict (e.g. both passed bare), and neither present falls
+  // back to the old default of "on iff an app is configured". Explicit
+  // false now means false (a plain truthy-string bug before parseArgs
+  // started producing real booleans for --flag=value on a bool flag).
+  const launchOff = flags["no-launch"] === true || flags.launch === false;
+  const launchOn = flags.launch === true || flags["no-launch"] === false;
+  const launchEnabled = launchOff ? false : launchOn ? true : Boolean(appPath);
   return new Shim({ url, name, cachePath, timeoutMs, launchEnabled, appPath, launchGraceMs });
 }
 
 function main(flags) {
   // Built before stdin opens: an invalid flag combination exits(2) here,
   // rather than opening a stdio server that would just sit there silent.
-  const shim = buildShimFromArgs(flags);
+  let shim;
+  try {
+    shim = buildShimFromArgs(flags);
+  } catch (err) {
+    process.stderr.write(`${err.message}\n${usage()}`);
+    process.exit(2);
+  }
   const rl = createInterface({ input: process.stdin, terminal: false });
 
   // Process lines strictly in order: concurrent handling could race two
@@ -492,7 +660,13 @@ function emit(response) {
 }
 
 function run() {
-  const flags = parseArgs(process.argv.slice(2));
+  let flags;
+  try {
+    flags = parseArgs(process.argv.slice(2));
+  } catch (err) {
+    process.stderr.write(`${err.message}\n${usage()}`);
+    process.exit(2);
+  }
   if (flags.help) {
     process.stdout.write(usage());
     return;

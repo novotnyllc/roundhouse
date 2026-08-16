@@ -263,6 +263,27 @@ EOF
   (cd "$plugin_root" && find scripts ! -type d -print) |
     grep -Ev "^$integrity_excluded_scripts\$" |
     LC_ALL=C sort >"$tmp/present"
+  # A gitignored file under scripts/ (e.g. a local tool's cache) can never be
+  # release content: update-integrity's own git-ls-files enumeration never
+  # produces one either, so the manifest can never cover it and this check
+  # would fail forever on a clean dev checkout. Only applies inside a git
+  # work tree - the real installed-plugin case (a version directory in the
+  # plugin cache) has no .git to consult and keeps the unfiltered scan,
+  # exactly as before. A real git failure here (not "no matches") also keeps
+  # the unfiltered scan rather than silently narrowing what this check
+  # defends.
+  if command -v git >/dev/null 2>&1 &&
+    git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    ignore_status=0
+    ignored=$( (cd "$plugin_root" && git check-ignore --stdin) <"$tmp/present" 2>/dev/null) ||
+      ignore_status=$?
+    # 0: at least one path is ignored. 1: git ran fine, none are ignored.
+    # Anything higher is a real git error - leave $tmp/present untouched.
+    if [ "$ignore_status" -le 1 ] && [ -n "$ignored" ]; then
+      comm -23 "$tmp/present" <(printf '%s\n' "$ignored" | LC_ALL=C sort) >"$tmp/present.filtered"
+      mv "$tmp/present.filtered" "$tmp/present"
+    fi
+  fi
   jq -r '.files[].path | select(startswith("scripts/"))' "$integrity" |
     LC_ALL=C sort >"$tmp/listed"
   uncovered=$(comm -23 "$tmp/present" "$tmp/listed")

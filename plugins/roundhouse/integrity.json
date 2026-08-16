@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "726ba30b676acf1dc87f4a905bc7e1a389f944a3c6a7389bc9de2a6a48687fd2"
+      "sha256": "bc893c0556b6a716c281075019ed1e33fb44ff9e7f382ef62cb934681add13df"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "253b7cfe36cd49c32dd7fd3022aa30dc653625d7b4d8e21a6d1ab96134e3b583"
+      "sha256": "a259254c6b03a228ccea662061a98f4b1aa7c20f19e6b3bb7d468b8e938799d8"
     },
     {
       "path": "assets/icon.png",
@@ -142,7 +142,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "a3eb1d837650fb467d84af22198fce03f25855cae44b950051f068d01629e978"
+      "sha256": "b64062ddc7854ded077ad75a64955928d3360f3c9603e94b0e53fab239a22062"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -170,11 +170,11 @@
     },
     {
       "path": "scripts/mcp-siding.mjs",
-      "sha256": "0ad476c9c74beb13de2766a2e773804b72bc98615ec0d524be3d0d11ea127b3a"
+      "sha256": "03a3a310d9e51d573a8f6a7751fbf4d9a24b4d7bdf26685d64743b5c7d4910d5"
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
-      "sha256": "b2499f05e3bd9f88eedce0bfbc0f63b31d7e85847bd7491c114196a7a5a05401"
+      "sha256": "cd65b4a63bdd1fea36e34c71786499fc03b194d2e15d69ea04159e7b024ff047"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -262,7 +262,7 @@
     },
     {
       "path": "skills/mcp-shim/SKILL.md",
-      "sha256": "448d58e2ef376234134dfb29cb83f0f24bd745ace2d7c1e0a25e86edb892fd08"
+      "sha256": "8056321f87e42fcdaec83a4c145072f4286e62553d0e258d127af979b567008a"
     },
     {
       "path": "skills/mcp-shim/agents/openai.yaml",
@@ -289,5 +289,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.7.5"
+  "version": "0.8.0"
 }
