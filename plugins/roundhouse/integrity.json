@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "bc3ebadeafd94ecb2e6b9b8365aa62f5cbdfa351b18a283a23a353402168eb55"
+      "sha256": "a7da6807c2a36accfba2954bf9fc07c4e15aa55d1520e7974168c4766fc7ee2d"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "253b7cfe36cd49c32dd7fd3022aa30dc653625d7b4d8e21a6d1ab96134e3b583"
+      "sha256": "7e32bc93de612ec6a87a23b20f8a446a9990be259a71d30209ee8c8849da1cef"
     },
     {
       "path": "assets/icon.png",
@@ -42,7 +42,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "69da9f1fe1a2f1405315dc07ab003243d519fa59830c52597594034417720bd6"
+      "sha256": "e4f36d2f8df05909a6aa7022223f8c9fd1a9a349c9ef4562372d2bec43946335"
     },
     {
       "path": "scripts/certify-ssh-node",
@@ -50,11 +50,11 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
-      "sha256": "0649eb8c36c8568b327155bb6a76b26b7e8b9cbc4e1952e1cc3ca44f0910c32c"
+      "sha256": "bad2feed3ed10124617c9406a810a7e6755d69c434deac3362392e3af6d20782"
     },
     {
       "path": "scripts/codex-plugin-hooks.ps1",
-      "sha256": "0bafdd637deb9d2f3d2504018f2ca1b360f3f407c7818fbeed1fab88118ec277"
+      "sha256": "197a98385da9e93cc3064adf1e40116d75df30f24ba7f4ab071c501dbe6dae28"
     },
     {
       "path": "scripts/collect-posix",
@@ -246,7 +246,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "9a8edd66232cc950c226b53a955c9ebe0e34f3193308f000cb3f1b26c9b80039"
+      "sha256": "171d10db767f3c96578e739d9a1e3b3d7b0282d33636637c7d4a0da34898f4b0"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",
@@ -273,5 +273,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.7.5"
+  "version": "0.7.6"
 }

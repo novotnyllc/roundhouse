@@ -103,12 +103,16 @@ On POSIX schedulers, invoke `roundhouse approve-codex-plugin-hooks
 PLUGIN@MARKETPLACE` through the user's login shell or provide a PATH containing
 the harnesses and Node.js. The runtime also checks the standard
 Homebrew Node locations on macOS. On native Windows, invoke
-`scripts/codex-plugin-hooks.ps1 approve PLUGIN@MARKETPLACE`; it first uses
-`node.exe` from the task PATH and then resolves the Node runtime beside
-`claude.exe` or in Claude Code's standard install directories. If neither
-exists it exits 69 with the WSL interop recovery, rather than silently
-claiming approval. The native DSC executor invokes this same helper, so its
-scheduled task does not require Node to be on the task PATH.
+`scripts/codex-plugin-hooks.ps1 approve PLUGIN@MARKETPLACE`; it resolves Node
+in this order: `node.exe` from the task PATH, the Codex-bundled runtime beside
+the `codex.exe` actually in use (including its versioned siblings, newest
+mtime first), then a last-resort Claude-bundled probe derived from
+`claude.exe`. The helper runs only where Codex exists, so the Codex-bundled
+probe makes Node effectively guaranteed and Windows never depends on Claude.
+If all three probes fail it exits 69 with guidance naming the probes and the
+WSL interop recovery, rather than silently claiming approval. The native DSC
+executor invokes this same helper, so its scheduled task does not require Node
+to be on the task PATH.
 
 The entry drives **two cadences from one owned slot**:
 
@@ -149,8 +153,9 @@ roundhouse fleet-run --full    # the heavy slot
 The scheduler entry must preserve that Node requirement: a POSIX entry uses
 `$SHELL -lc 'roundhouse fleet-run --fast|--full'` (or an equivalent explicit
 tool PATH), while a Windows task invokes `codex-plugin-hooks.ps1`, which uses
-PATH Node first and then Claude's bundled `node.exe`, otherwise exiting 69 with
-the documented recovery guidance.
+PATH Node first, then the Codex-bundled runtime (effectively guaranteed because
+the helper runs only where Codex exists), then Claude's bundled `node.exe` as a
+last fallback, otherwise exiting 69 with the documented recovery guidance.
 
 The run is non-interactive by construction: every jj, git and ssh invocation
 it makes is closed to editors, pagers and credential prompts, so a scheduled

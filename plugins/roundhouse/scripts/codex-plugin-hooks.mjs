@@ -5,9 +5,15 @@ import { createInterface } from "node:readline";
 
 const TIMEOUT_MS = 15_000;
 const PLUGIN_ID = /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/;
+const CODEX_EXECUTABLE_FLAG = "--codex-executable";
 
 function fail(message) {
   throw new Error(`codex-plugin-hooks: ${message}`);
+}
+
+function spawnCodex(codexExecutable, args, options) {
+  const shell = process.platform === "win32" && /\.(?:cmd|bat)$/i.test(codexExecutable);
+  return spawn(codexExecutable, args, shell ? { ...options, shell: true } : options);
 }
 
 function hookKeyPath(key) {
@@ -16,11 +22,11 @@ function hookKeyPath(key) {
 }
 
 class AppServer {
-  constructor() {
+  constructor(codexExecutable) {
     this.nextId = 1;
     this.pending = new Map();
     this.stderr = "";
-    this.child = spawn("codex", ["app-server", "--stdio"], {
+    this.child = spawnCodex(codexExecutable, ["app-server", "--stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -146,8 +152,8 @@ function matchingPluginHooks(hooks, pluginId) {
   return matching.filter((hook) => hook.isManaged !== true);
 }
 
-async function withAppServer(action) {
-  const server = new AppServer();
+async function withAppServer(action, codexExecutable) {
+  const server = new AppServer(codexExecutable);
   try {
     await server.initialize();
     return await action(server);
@@ -156,14 +162,14 @@ async function withAppServer(action) {
   }
 }
 
-async function listHooks(pluginId, cwd) {
+async function listHooks(pluginId, cwd, codexExecutable) {
   return withAppServer(async (server) => {
     const hooks = validateHooks(await server.request("hooks/list", { cwds: [cwd] }), cwd, pluginId);
     return matchingPluginHooks(hooks, pluginId);
-  });
+  }, codexExecutable);
 }
 
-async function writeTrust(pluginId, cwd, wanted) {
+async function writeTrust(pluginId, cwd, wanted, codexExecutable) {
   if (!wanted.length) return;
   await withAppServer(async (server) => {
     const hooks = validateHooks(await server.request("hooks/list", { cwds: [cwd] }), cwd, pluginId);
@@ -182,11 +188,11 @@ async function writeTrust(pluginId, cwd, wanted) {
         reloadUserConfig: true,
       });
     }
-  });
+  }, codexExecutable);
 }
 
-async function verifyTrust(pluginId, cwd, wanted, rejectNewTrusted, requireAllPresent) {
-  const hooks = await listHooks(pluginId, cwd);
+async function verifyTrust(pluginId, cwd, wanted, rejectNewTrusted, requireAllPresent, codexExecutable) {
+  const hooks = await listHooks(pluginId, cwd, codexExecutable);
   const byKey = new Map(hooks.map((hook) => [hook.key, hook]));
   for (const key of wanted) {
     const hook = byKey.get(key);
@@ -209,9 +215,9 @@ async function verifyTrust(pluginId, cwd, wanted, rejectNewTrusted, requireAllPr
   return hooks;
 }
 
-function pluginInstalled(pluginId) {
+function pluginInstalled(pluginId, codexExecutable) {
   return new Promise((resolve, reject) => {
-    const child = spawn("codex", ["plugin", "list", "--json"], {
+    const child = spawnCodex(codexExecutable, ["plugin", "list", "--json"], {
       stdio: ["ignore", "pipe", "inherit"],
       windowsHide: true,
     });
@@ -243,9 +249,9 @@ function pluginInstalled(pluginId) {
   });
 }
 
-function runCodexPluginAdd(pluginId) {
+function runCodexPluginAdd(pluginId, codexExecutable) {
   return new Promise((resolve, reject) => {
-    const child = spawn("codex", ["plugin", "add", pluginId, "--json"], {
+    const child = spawnCodex(codexExecutable, ["plugin", "add", pluginId, "--json"], {
       stdio: ["ignore", "ignore", "inherit"],
       windowsHide: true,
     });
@@ -264,12 +270,18 @@ function runCodexPluginAdd(pluginId) {
 
 async function main() {
   const [command, pluginId, ...rest] = process.argv.slice(2);
-  if (!PLUGIN_ID.test(pluginId ?? "") || rest.length) {
+  let codexExecutable = "codex";
+  if (rest.length === 2 && rest[0] === CODEX_EXECUTABLE_FLAG && rest[1]) {
+    codexExecutable = rest[1];
+  } else if (rest.length) {
+    fail("usage: codex-plugin-hooks.mjs approve|update PLUGIN@MARKETPLACE");
+  }
+  if (!PLUGIN_ID.test(pluginId ?? "")) {
     fail("usage: codex-plugin-hooks.mjs approve|update PLUGIN@MARKETPLACE");
   }
   const cwd = process.cwd();
   if (command === "approve") {
-    const hooks = await listHooks(pluginId, cwd);
+    const hooks = await listHooks(pluginId, cwd, codexExecutable);
     if (
       process.env.ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL === "1" &&
       hooks.some((hook) => ["modified", "untrusted"].includes(hook.trustStatus))
@@ -284,18 +296,18 @@ async function main() {
       // looks identical to "plugin not installed at all" (observed live:
       // a codex plugin remove/add cycle dropped a sibling plugin's
       // registration), so verify registration before calling it benign.
-      if (!(await pluginInstalled(pluginId))) fail(`plugin not installed: ${pluginId}`);
+      if (!(await pluginInstalled(pluginId, codexExecutable))) fail(`plugin not installed: ${pluginId}`);
       process.stdout.write(`${JSON.stringify({ pluginId, approved: 0 })}\n`);
       return;
     }
     const keys = hooks.map((hook) => hook.key);
-    await writeTrust(pluginId, cwd, keys);
-    await verifyTrust(pluginId, cwd, keys, false, true);
+    await writeTrust(pluginId, cwd, keys, codexExecutable);
+    await verifyTrust(pluginId, cwd, keys, false, true, codexExecutable);
     process.stdout.write(`${JSON.stringify({ pluginId, approved: keys.length })}\n`);
     return;
   }
   if (command === "update") {
-    const before = await listHooks(pluginId, cwd);
+    const before = await listHooks(pluginId, cwd, codexExecutable);
     // Only hooks this host had already trusted get re-trusted at their new
     // hashes. "modified" is the tampered-drift state — the content no longer
     // matches the trusted hash — and writeTrust stamps whatever hash is on disk
@@ -306,9 +318,9 @@ async function main() {
     const keys = before
       .filter((hook) => hook.trustStatus === "trusted")
       .map((hook) => hook.key);
-    await runCodexPluginAdd(pluginId);
-    await writeTrust(pluginId, cwd, keys);
-    const after = await verifyTrust(pluginId, cwd, keys, true, false);
+    await runCodexPluginAdd(pluginId, codexExecutable);
+    await writeTrust(pluginId, cwd, keys, codexExecutable);
+    const after = await verifyTrust(pluginId, cwd, keys, true, false, codexExecutable);
     process.stdout.write(
       `${JSON.stringify({ pluginId, refreshed: keys.filter((key) => after.some((hook) => hook.key === key)).length })}\n`,
     );
