@@ -737,25 +737,47 @@ function Invoke-Exact([string[]]$Argv) {
     return $(if ($null -eq $NativeExitCode) { 0 } else { [int]$NativeExitCode })
 }
 
-function Invoke-CodexPluginHooks([string]$Action, [string]$PluginId) {
+function Invoke-CodexPluginHooks {
+    param(
+        [string]$Action,
+        [string]$PluginId,
+        [AllowNull()][string]$HelperPath = $null
+    )
+
     if ($Action -notin @("approve", "update")) { throw "Invalid Codex hook action" }
     if ($PluginId -notmatch "^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$") {
         throw "Invalid Codex plugin ID"
     }
     # Keep the DSC executor on the same resolver as the documented native
-    # Windows path: the task PATH may not contain Node, while Claude ships it.
+    # Windows path: Codex owns the primary bundled Node, with Claude last.
     $PowerShell = Get-Command -Name @(
         "pwsh.exe", "pwsh", "powershell.exe", "powershell"
     ) -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $PowerShell) { throw "PowerShell is required for Codex plugin hook refresh" }
-    $Helper = Join-Path $PSScriptRoot "codex-plugin-hooks.ps1"
+    $Helper = if ($HelperPath) { $HelperPath } else { Join-Path $PSScriptRoot "codex-plugin-hooks.ps1" }
     Assert-RegularFile $Helper "Codex plugin hook helper" | Out-Null
-    & $PowerShell.Source -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-        -File $Helper -Action $Action -PluginId $PluginId *> $null
-    $Succeeded = $?
-    $NativeExitCode = $LASTEXITCODE
+    $DiagnosticPath = [IO.Path]::GetTempFileName()
+    $Diagnostic = ""
+    try {
+        & $PowerShell.Source -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+            -File $Helper -Action $Action -PluginId $PluginId 1>$null 2>$DiagnosticPath
+        $Succeeded = $?
+        $NativeExitCode = $LASTEXITCODE
+        if ([IO.File]::Exists($DiagnosticPath)) {
+            $Diagnostic = [IO.File]::ReadAllText($DiagnosticPath)
+        }
+    } finally {
+        Remove-Item -LiteralPath $DiagnosticPath -Force -ErrorAction SilentlyContinue
+    }
     if (-not $Succeeded -or ($null -ne $NativeExitCode -and $NativeExitCode -ne 0)) {
-        $Failure = [InvalidOperationException]::new("Codex plugin hook operation failed")
+        if (-not [string]::IsNullOrWhiteSpace($Diagnostic)) {
+            [Console]::Error.Write($Diagnostic.TrimEnd() + [Environment]::NewLine)
+        }
+        $FailureMessage = "Codex plugin hook operation failed"
+        if (-not [string]::IsNullOrWhiteSpace($Diagnostic)) {
+            $FailureMessage += ": " + $Diagnostic.Trim()
+        }
+        $Failure = [InvalidOperationException]::new($FailureMessage)
         $Failure.Data["ExitCode"] = $(if ($null -eq $NativeExitCode) { 1 } else { [int]$NativeExitCode })
         throw $Failure
     }
@@ -1039,6 +1061,22 @@ if ($SelfTest) {
             $ApprovalRejected = $true
         }
         if (-not $ApprovalRejected) { throw "Codex hook approval action self-test failed" }
+        $FailureHelper = Join-Path $SelfTestRoot "codex-plugin-hooks-failure.ps1"
+        [IO.File]::WriteAllText($FailureHelper, (@(
+            'param([string]$Action, [string]$PluginId)'
+            '[Console]::Error.WriteLine("Roundhouse hook approval needs Node.js. PATH node: fixture; CODEX-BUNDLED node: fixture; Claude-bundled node: fixture; Recovery: WSL interop")'
+            'exit 69'
+        ) -join [Environment]::NewLine), $OutputEncoding)
+        $FailurePropagated = $false
+        try {
+            [void](Invoke-CodexPluginHooks "approve" "example@test-market" $FailureHelper)
+        } catch {
+            $FailurePropagated = $null -ne $_.Exception.Data -and
+                $_.Exception.Data.Contains("ExitCode") -and
+                [int]$_.Exception.Data["ExitCode"] -eq 69 -and
+                $_.Exception.Message.Contains("PATH node:")
+        }
+        if (-not $FailurePropagated) { throw "Codex hook resolver failure did not preserve exit 69 diagnostics" }
         $ChezmoiPullArgv = @(Get-ExactArgv ([pscustomobject]@{
             type = "chezmoi-pull"; kind = "file"; id = "chezmoi:source"
         }) $null $null)
@@ -1523,7 +1561,16 @@ if ($PSCmdlet.ParameterSetName -eq "ApproveHooks") {
     }
     Assert-ExecutorShape $RequiredExecutor
     Assert-Executor $RequiredExecutor (Get-InstalledExecutor)
-    [void](Invoke-CodexPluginHooks "approve" $ApproveCodexPluginHooks)
+    try {
+        [void](Invoke-CodexPluginHooks "approve" $ApproveCodexPluginHooks)
+    } catch {
+        $ExitCode = 1
+        if ($null -ne $_.Exception.Data -and $_.Exception.Data.Contains("ExitCode")) {
+            $ExitCode = [int]$_.Exception.Data["ExitCode"]
+        }
+        [Console]::Error.WriteLine((Get-SafeFailureMessage $_))
+        exit $ExitCode
+    }
     [ordered]@{ pluginId = $ApproveCodexPluginHooks; approved = $true } |
         ConvertTo-Json -Compress
     exit 0

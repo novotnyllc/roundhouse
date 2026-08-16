@@ -32,7 +32,11 @@ Changes under `plugins/` ship to installed fleets. They couple to a release:
    steady-state enabled no-op must not invoke the manager verb or re-approve
    locally modified hooks. Claude-only plugins have no Codex hook state and are
    explicitly skipped after the ownership check. Keep the Node/login-shell
-   requirement and native-Windows Node gap documented in `fleet-update`.
+   requirement and native-Windows resolver order documented in `fleet-update`:
+   PATH Node first, then the Codex-bundled runtime (effectively guaranteed
+   because the helper runs only where Codex exists), Claude-bundled Node only
+   as a last fallback, and exit 69 with all three probe classes plus WSL
+   recovery when none is available.
 
 Never treat an installed plugin cache as the source repository.
 
