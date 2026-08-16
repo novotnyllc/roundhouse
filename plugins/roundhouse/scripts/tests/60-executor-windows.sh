@@ -47,7 +47,55 @@ fi
 "$integrity_cover/scripts/update-integrity"
 "$integrity_cover/scripts/roundhouse" executor-status - >/dev/null ||
   fail "integrity enumeration did not pick up a new scripts/ file"
-rm -rf "$integrity_cover"
+# N17: an INSTALLED plugin cache nested inside a git repo whose .gitignore
+# excludes .claude/ (a dotfiles repo - common, and likely across a fleet
+# given roundhouse's own chezmoi tooling) must NOT have its manifest-
+# coverage check bypassed. `rev-parse --is-inside-work-tree` alone cannot
+# tell "a real roundhouse source checkout" apart from "some unrelated
+# directory that happens to sit inside a work tree" - it would make
+# check-ignore match every scripts/* path in the cache, filtering the
+# enumerated set down to nothing and letting an unmanifested executable
+# through undetected. Only whether the plugin manifest is a TRACKED file
+# in that repo tells the two apart. This is the assertion that matters
+# most in this file: it must fail if the weak rev-parse-only gate is ever
+# restored.
+dotfiles_home="$tmp/dotfiles-home"
+mkdir -p "$dotfiles_home"
+git -C "$dotfiles_home" init -q
+printf '.claude/\n.codex/\n' >"$dotfiles_home/.gitignore"
+git -C "$dotfiles_home" add .gitignore
+git -C "$dotfiles_home" -c user.email=test@test.invalid -c user.name=test commit -q -m dotfiles
+nested_cache="$dotfiles_home/.claude/plugins/cache/novotnyllc/roundhouse/$plugin_version"
+mkdir -p "$nested_cache"
+cp -R "$script_dir/../." "$nested_cache/"
+# Same stripping the plugin_cache fixture above does: cp is byte-for-byte,
+# so it also copies whatever git-ignored local tooling artifact (this repo
+# checkout's own, e.g. .impeccable/) sits under the live source tree - not
+# release content, and not what this test is about. Ignore rules are
+# evaluated against the REAL checkout ($script_dir/..), not the fake nested
+# copy, since that is the repo whose .gitignore/.git/info/exclude actually
+# apply here.
+if git -C "$script_dir/.." rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ignore_status=0
+  ignored_fixture_paths=$(
+    (cd "$script_dir/.." && find . ! -type d -print | sed 's#^\./##' | git check-ignore --stdin) 2>/dev/null
+  ) || ignore_status=$?
+  if [ "$ignore_status" -le 1 ] && [ -n "$ignored_fixture_paths" ]; then
+    printf '%s\n' "$ignored_fixture_paths" | while IFS= read -r rel; do
+      [ -n "$rel" ] && rm -f "$nested_cache/$rel"
+    done
+  fi
+fi
+chmod -R go-w "$nested_cache"
+printf '#!/bin/sh\nexit 0\n' >"$nested_cache/scripts/evil.sh"
+chmod 700 "$nested_cache/scripts/evil.sh"
+if "$nested_cache/scripts/roundhouse" executor-status - >/dev/null 2>&1; then
+  fail "N17: an unmanifested scripts/ file in a plugin cache nested under a dotfiles repo bypassed the manifest-coverage check"
+fi
+rm -f "$nested_cache/scripts/evil.sh"
+"$nested_cache/scripts/roundhouse" executor-status - >/dev/null ||
+  fail "the same nested-under-dotfiles cache must pass once the unmanifested file is gone"
+rm -rf "$dotfiles_home"
 
 if [ -n "$pwsh_command" ]; then
   rm -f "$CODEX_HOOK_WRITES_FILE"

@@ -266,14 +266,35 @@ EOF
   # A gitignored file under scripts/ (e.g. a local tool's cache) can never be
   # release content: update-integrity's own git-ls-files enumeration never
   # produces one either, so the manifest can never cover it and this check
-  # would fail forever on a clean dev checkout. Only applies inside a git
-  # work tree - the real installed-plugin case (a version directory in the
-  # plugin cache) has no .git to consult and keeps the unfiltered scan,
-  # exactly as before. A real git failure here (not "no matches") also keeps
-  # the unfiltered scan rather than silently narrowing what this check
-  # defends.
+  # would fail forever on a clean dev checkout. Only applies to a real
+  # roundhouse SOURCE checkout - the real installed-plugin case (a version
+  # directory in the plugin cache) has no .git to consult and keeps the
+  # unfiltered scan, exactly as before.
+  #
+  # `rev-parse --is-inside-work-tree` alone is NOT enough to tell those two
+  # cases apart, and using it alone was a real security regression: if
+  # $HOME is itself a git repo (a dotfiles repo - common, and likely across
+  # a fleet given roundhouse's own chezmoi tooling) and its .gitignore
+  # excludes .claude/ or .codex/, an INSTALLED plugin cache under
+  # ~/.claude/plugins/cache/... sits inside that work tree too. check-ignore
+  # would then match every scripts/* path in the cache, filtering the
+  # `present` list down to nothing and letting an unlisted, unmanifested
+  # executable bypass the manifest-coverage check entirely - exactly the
+  # case this check exists to catch. Do not go back to the weaker
+  # rev-parse-only test.
+  #
+  # The discriminator: the plugin manifest is a TRACKED file in a real
+  # source checkout, and is untracked (or itself ignored) in an installed
+  # cache nested under some unrelated repo. A real git failure here (not
+  # "no matches") also keeps the unfiltered scan rather than silently
+  # narrowing what this check defends.
+  is_source_checkout=false
   if command -v git >/dev/null 2>&1 &&
-    git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+    git -C "$plugin_root" ls-files --error-unmatch .claude-plugin/plugin.json >/dev/null 2>&1; then
+    is_source_checkout=true
+  fi
+  if [ "$is_source_checkout" = true ]; then
     ignore_status=0
     ignored=$( (cd "$plugin_root" && git check-ignore --stdin) <"$tmp/present" 2>/dev/null) ||
       ignore_status=$?
@@ -296,8 +317,11 @@ EOF
   source_commit=
   source_tree=
   source_dirty=false
-  if command -v git >/dev/null 2>&1 &&
-    git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # Same discriminator as above, reused rather than a second rev-parse-only
+  # check - an installed cache nested under an unrelated repo (the dotfiles
+  # case above) must not report THAT repo's commit/tree/dirty state as if
+  # it were roundhouse's own provenance.
+  if [ "$is_source_checkout" = true ]; then
     source_commit=$(git -C "$plugin_root" rev-parse HEAD 2>/dev/null || true)
     source_tree=$(git -C "$plugin_root" rev-parse 'HEAD^{tree}' 2>/dev/null || true)
     [ -z "$(git -C "$plugin_root" status --porcelain --untracked-files=no -- "$plugin_root" 2>/dev/null)" ] ||
