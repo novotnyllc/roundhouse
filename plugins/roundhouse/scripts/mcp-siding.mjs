@@ -140,6 +140,50 @@ if [ -z "$p" ]; then
   exit 1
 fi`;
 
+// Node resolver: finds a usable `node` before the final exec. Resolving
+// mcp-siding.mjs's path (above) is not enough on its own - a GUI-launched
+// harness on macOS does not inherit a login shell's PATH, and a self-
+// contained Claude/Codex install does not guarantee a `node` on PATH at
+// all, so the registration would resolve the script and then fail to
+// start anything. Tried in order, first hit wins:
+//   0. $MCP_SIDING_NODE, if set and executable - the same kind of explicit
+//      override $MCP_SIDING_PATH above is, for the same reason.
+//   1. `command -v node` - the normal case, an already-working PATH.
+//   2. Common install locations: Homebrew's arm64 and x86_64 default
+//      prefixes, then /usr/bin, then Volta's and asdf's default shims.
+//      nvm is deliberately skipped - its active version lives behind an
+//      alias file, not a fixed path, so a cheap existence check cannot
+//      resolve it the way it can for Volta/asdf.
+// A harness-bundled node is deliberately NOT probed here, unlike
+// codex-plugin-hooks.ps1's Windows resolver (which locates Codex's and
+// Claude Desktop's own bundled node.exe): that Windows logic was built
+// from verified, empirical install-layout knowledge. No equivalent
+// macOS/Linux bundle path is currently known, and guessing one would be
+// worse than not trying it - a wrong path fails exactly like no path, but
+// with false confidence that it was checked.
+// Same POSIX-sh-only constraint as RESOLVER_SH above, for the same reason
+// (minimal cloud images), and the same fail-closed shape: if nothing
+// resolves, exit non-zero with a diagnostic naming what was tried, rather
+// than exec'ing an empty command and leaving the client hanging.
+export const NODE_RESOLVER_SH = `node_bin="$MCP_SIDING_NODE"
+[ -n "$node_bin" ] && [ -x "$node_bin" ] || node_bin=""
+if [ -z "$node_bin" ]; then
+  node_bin=$(command -v node 2>/dev/null) || node_bin=""
+fi
+if [ -z "$node_bin" ]; then
+  for node_candidate in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node \\
+    "$HOME/.volta/bin/node" "$HOME/.asdf/shims/node"; do
+    if [ -x "$node_candidate" ]; then
+      node_bin=$node_candidate
+      break
+    fi
+  done
+fi
+if [ -z "$node_bin" ]; then
+  echo "mcp-siding: could not find a usable node (checked \\$MCP_SIDING_NODE, PATH, /opt/homebrew/bin, /usr/local/bin, /usr/bin, Volta, asdf). Install Node or set \\$MCP_SIDING_NODE." >&2
+  exit 1
+fi`;
+
 // Single-quotes a value for safe literal embedding in the sh script this
 // module emits - nothing inside single quotes is special except one, so
 // this is correct for arbitrary paths/URLs (including the space in
@@ -148,10 +192,11 @@ export function shQuote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
 }
 
-// Builds the full sh -c script body (resolver + the final exec line) for a
-// registration: `RESOLVER_SH` followed by `exec node "$p" <flags>`, flags
-// taken only from what the caller explicitly set (mcp-siding.mjs's own
-// defaults handle the rest at runtime, so nothing is baked in redundantly).
+// Builds the full sh -c script body (resolvers + the final exec line) for
+// a registration: `RESOLVER_SH`, then `NODE_RESOLVER_SH`, then
+// `exec "$node_bin" "$p" <flags>`, flags taken only from what the caller
+// explicitly set (mcp-siding.mjs's own defaults handle the rest at
+// runtime, so nothing is baked in redundantly).
 export function buildShimScript(flags) {
   const args = ["--backend-url", shQuote(flags["backend-url"]), "--name", shQuote(flags.name)];
   if (flags.app) args.push("--app", shQuote(flags.app));
@@ -168,7 +213,7 @@ export function buildShimScript(flags) {
   const launchOn = flags.launch === true || flags["no-launch"] === false;
   if (launchOff) args.push("--no-launch");
   else if (launchOn) args.push("--launch");
-  return `${RESOLVER_SH}\nexec node "$p" ${args.join(" ")}\n`;
+  return `${RESOLVER_SH}\n${NODE_RESOLVER_SH}\nexec "$node_bin" "$p" ${args.join(" ")}\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +271,20 @@ class Cancelled extends Error {}
 // from the parse paths (parseBody/parseSseEvent) and rethrown as-is by
 // post()'s catch, the same way Cancelled is.
 class MalformedResponse extends Error {}
+
+// A response was established (status 200, headers received, body reading
+// began) and then reading it was interrupted - almost always the timeout
+// firing, since a Cancelled abort is already ruled out before this class
+// is ever thrown (see post()'s catch). Same reachable-is-not-down
+// principle as the classes above: a 200 proved the backend is up and, for
+// a tool call, that it likely already started the operation. This matters
+// more than plain Down, though: aborting our own fetch does not stop the
+// backend from continuing whatever it started, so retrying (and worse,
+// downCallResult() launching an already-running app) can duplicate a
+// mutation - for CAD, running the operation twice. Never launches, never
+// phrased as unreachable - the message says the operation may still be
+// running and a retry could repeat it.
+class TimedOutAfterResponse extends Error {}
 
 // Per MCP streamable-HTTP: "If a server receives a request with an invalid
 // or expired session ID, the server MUST respond with 404." Only 404 is
@@ -564,6 +623,13 @@ export class Shim {
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     if (clientRequestId !== undefined) this.inFlight.set(clientRequestId, controller);
     let res, body, errorText;
+    // Set once a response is established (status 200, headers received,
+    // body reading begun) - the discriminator post()'s catch uses to tell
+    // "the backend never answered" (Down) apart from "the backend
+    // answered, and something interrupted us while it was doing whatever
+    // came next" (TimedOutAfterResponse). See that class for why the
+    // distinction matters.
+    let responseEstablished = false;
     try {
       res = await fetch(this.url, {
         method: "POST",
@@ -572,6 +638,7 @@ export class Shim {
         signal: controller.signal,
       });
       const contentType = res.headers.get("content-type") || "";
+      if (res.ok) responseEstablished = true;
       if (res.ok && contentType.includes("text/event-stream")) {
         // The timeout must cover reading the body, not just the headers -
         // a backend that answers 200 and then stalls mid-stream (a legal
@@ -618,6 +685,14 @@ export class Shim {
       // A parse failure (malformed JSON/SSE) means a response DID arrive -
       // reachable, not downtime - see MalformedResponse.
       if (err instanceof MalformedResponse) throw err;
+      // Once a response was established, any interruption reading it
+      // (almost always the timeout, given Cancelled is already ruled out
+      // above) proves the backend was up and possibly already running the
+      // operation - keep that out of the pre-response Down path, which
+      // downCallResult() treats as safe to retry/launch against.
+      if (responseEstablished) {
+        throw new TimedOutAfterResponse(`no further response within ${this.timeoutMs}ms of the backend accepting the request`);
+      }
       throw new Down(err?.message ?? String(err));
     } finally {
       clearTimeout(timer);
@@ -711,7 +786,7 @@ export class Shim {
           }
           return body.result;
         } catch (err) {
-          // All four mean "reachable" (or, for Cancelled, "we stopped
+          // All five mean "reachable" (or, for Cancelled, "we stopped
           // waiting, the backend did not go away") - session/connection
           // state is left untouched, and none of them ever gets a reconnect
           // retry (that's only for Stale).
@@ -719,7 +794,8 @@ export class Shim {
             err instanceof BackendReported ||
             err instanceof HttpRejected ||
             err instanceof Cancelled ||
-            err instanceof MalformedResponse
+            err instanceof MalformedResponse ||
+            err instanceof TimedOutAfterResponse
           )
             throw err;
           this.connected = false;
@@ -825,6 +901,20 @@ export class Shim {
         // protocol expects (malformed JSON/SSE, an intermediary's HTML
         // error page, ...). Never launch, never say "not reachable".
         return this.errorResult(`${this.name} sent a response this shim could not parse (${err.message}) - not a downtime issue, no restart needed.`);
+      }
+      if (err instanceof TimedOutAfterResponse) {
+        // A 200 arrived - the app is up, and for a tool call it likely
+        // already started the operation. Never launch, never say "not
+        // reachable" (this is not the pre-response timeout case, which
+        // still falls through to Down/downCallResult below): warn plainly
+        // that it may still be running, since aborting our own request did
+        // not stop it, and a blind retry (or a launch) could duplicate a
+        // mutation.
+        return this.errorResult(
+          `${this.name} accepted the request but ${err.message} - the operation may still be running on the ` +
+            "backend. Do not retry automatically, especially if it was a mutating action - check whether it " +
+            "already completed before trying again.",
+        );
       }
       if (err instanceof Cancelled) {
         // The client asked us to stop waiting - not downtime, never

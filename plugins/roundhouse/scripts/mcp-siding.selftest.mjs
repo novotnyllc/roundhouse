@@ -17,8 +17,8 @@
 //   node mcp-siding.mjs --selftest   (thin delegation to this file)
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, writeFile, copyFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { mkdtemp, mkdir, writeFile, copyFile, chmod, rm } from "node:fs/promises";
+import { realpathSync, accessSync, constants as fsConstants } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -961,6 +961,20 @@ export async function selftest() {
   //        reproduces it on this platform. ---------------------------------
   await selftestLauncherErrorDoesNotCrash();
 
+  // -- 7j3. N21: the generated registration script must resolve a usable
+  //         `node` before exec'ing, not assume one is on PATH - a GUI-
+  //         launched harness on macOS does not inherit a login shell's
+  //         PATH, and a self-contained Claude/Codex install does not
+  //         guarantee node on PATH at all. A subprocess test with a
+  //         doctored PATH, running buildShimScript()'s FULL output through
+  //         a real /bin/sh -c (the same way a registration actually
+  //         invokes it), is the only honest way to check this - the same
+  //         technique that made the N1 launcher test above real. See
+  //         selftestNodeResolver for why "none available anywhere" is only
+  //         assertable when this machine has no real node at the
+  //         hardcoded fallback paths. -------------------------------------
+  await selftestNodeResolver();
+
   // -- 7j2. N13: the OTHER real macOS launch-failure shape - `open -a
   //         <bad path>` spawns fine and simply exits nonzero, which
   //         nothing previously observed at all. downCallResult() had
@@ -1696,6 +1710,74 @@ export async function selftest() {
     },
   );
 
+  // -- 7w. N20: once a response is established (200 + SSE headers, body
+  //        reading begun), a timeout reading the rest of it is NOT
+  //        downtime - the backend answered, so it is demonstrably up and,
+  //        for a tool call, may already be running the operation. Must
+  //        never launch, never say "not reachable", and must warn the
+  //        operation may still be running (retrying could duplicate a
+  //        mutation - aborting our own fetch does not stop the backend).
+  //        Contrasted with a backend that never responds AT ALL, which
+  //        must still be Down and must still launch - the pre-response
+  //        case is unchanged. -------------------------------------------
+  const establishedTimeoutLaunches = [];
+  await withServer(
+    (req, res) => {
+      // Establish the response - 200, SSE headers, one byte of body - then
+      // stall forever without ever sending the matching event or closing.
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(": keepalive\n\n");
+    },
+    async (url) => {
+      const establishedTimeoutShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "established-timeout.json"),
+        timeoutMs: 200,
+        launchEnabled: true,
+        appPath: "/fake/EstablishedTimeout.app",
+        launchGraceMs: 150_000,
+        launcher: (appPath) => establishedTimeoutLaunches.push(appPath),
+      });
+      const timedOut = await establishedTimeoutShim.handle({ jsonrpc: "2.0", id: 102, method: "tools/call", params: {} });
+      assert.equal(timedOut.result.isError, true);
+      assert.doesNotMatch(
+        timedOut.result.content[0].text,
+        /not reachable|is not reachable/i,
+        "a timeout after the response was established must not be reported as unreachable",
+      );
+      assert.match(
+        timedOut.result.content[0].text,
+        /still be running|do not retry/i,
+        "must warn that the operation may still be running and must not be retried blindly",
+      );
+      assert.equal(establishedTimeoutLaunches.length, 0, "a timeout after the response was established must never launch");
+    },
+  );
+
+  const neverRespondsLaunches = [];
+  await withServer(
+    () => {
+      // Never respond at all - not even headers. Nothing proves
+      // reachability, so this must still be classified Down.
+    },
+    async (url) => {
+      const neverRespondsShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "never-responds.json"),
+        timeoutMs: 200,
+        launchEnabled: true,
+        appPath: "/fake/NeverResponds.app",
+        launchGraceMs: 150_000,
+        launcher: (appPath) => neverRespondsLaunches.push(appPath),
+      });
+      const down = await neverRespondsShim.handle({ jsonrpc: "2.0", id: 103, method: "tools/call", params: {} });
+      assert.equal(down.result.isError, true);
+      assert.equal(neverRespondsLaunches.length, 1, "a backend that never responds at all must still be classified Down and still launch");
+    },
+  );
+
   // -- 8. process-level: one malformed stdin line must not kill the shim
   const initReply = await runChildAndGetReply(
     MCP_SIDING_PATH,
@@ -1856,6 +1938,118 @@ async function selftestLauncherErrorDoesNotCrash() {
   if (child.exitCode == null) child.kill();
 
   assert.ok(answeredAgain, `child died or stopped answering after the launch attempt (stderr: ${err})`);
+}
+
+// N21: runs buildShimScript()'s FULL output (RESOLVER_SH + NODE_RESOLVER_SH
+// + the exec line) through a real `/bin/sh -c`, exactly the way a
+// registration actually invokes it - resolving mcp-siding.mjs itself is not
+// enough on its own if there is then no `node` to run it with. $MCP_SIDING_PATH
+// pins the script resolution deterministically (RESOLVER_SH is not what
+// these tests are about); each case doctors PATH/HOME/$MCP_SIDING_NODE to
+// control node resolution specifically.
+async function runShimScript(env, timeoutMs = 5_000) {
+  const script = buildShimScript({ "backend-url": "http://127.0.0.1:1/mcp", name: "test" });
+  const child = spawn("/bin/sh", ["-c", script], { stdio: ["pipe", "pipe", "pipe"], env });
+  let out = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => (out += chunk));
+  let err = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => (err += chunk));
+  let exitCode;
+  let exited = false;
+  child.on("exit", (code) => {
+    exited = true;
+    exitCode = code;
+  });
+  // initialize is answered locally by the shim regardless of backend
+  // reachability - a reply proves the process actually started, without
+  // needing a real backend. A working shim never exits on its own (it
+  // serves stdin until closed/killed), so success is "the marker showed
+  // up," not "the process exited" - only the failure path (no node
+  // resolved anywhere) exits quickly on its own, and success there means
+  // reaching that exit before the timeout, not a marker.
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 60, method: "initialize", params: {} })}\n`);
+  const deadline = Date.now() + timeoutMs;
+  while (!out.includes('"id":60') && !exited && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  const timedOut = !out.includes('"id":60') && !exited;
+  if (!exited) child.kill();
+  return { code: exited ? exitCode : null, out, err, timedOut };
+}
+
+async function selftestNodeResolver() {
+  const realNode = process.execPath;
+  const brokenPath = "/definitely/not/a/real/path";
+  const baseEnv = { ...process.env, MCP_SIDING_PATH };
+
+  // -- normal case unchanged: PATH intact, node resolves via `command -v
+  //    node` exactly as it always did. --------------------------------
+  const normal = await runShimScript(baseEnv);
+  assert.ok(!normal.timedOut, `normal-case script hung (stderr: ${normal.err})`);
+  assert.ok(normal.out.includes('"id":60'), `normal-case script never answered initialize (stderr: ${normal.err})`);
+
+  // -- node absent from PATH but present via $MCP_SIDING_NODE, the
+  //    explicit override - the same kind of pin $MCP_SIDING_PATH is. ----
+  const overrideResult = await runShimScript({ ...baseEnv, PATH: brokenPath, MCP_SIDING_NODE: realNode });
+  assert.ok(!overrideResult.timedOut, `MCP_SIDING_NODE override script hung (stderr: ${overrideResult.err})`);
+  assert.ok(
+    overrideResult.out.includes('"id":60'),
+    `script did not start with node absent from PATH but present via $MCP_SIDING_NODE (stderr: ${overrideResult.err})`,
+  );
+
+  // -- node absent from PATH but present at a known fallback location -
+  //    asdf's default shim path, HOME-relative and so fully controllable
+  //    in a test, unlike the Homebrew/system absolute paths below. -----
+  const fakeHome = await mkdtemp(join(tmpdir(), "mcp-siding-node-"));
+  const asdfShimDir = join(fakeHome, ".asdf", "shims");
+  await mkdir(asdfShimDir, { recursive: true });
+  const asdfNodePath = join(asdfShimDir, "node");
+  await copyFile(realNode, asdfNodePath);
+  await chmod(asdfNodePath, 0o755);
+  try {
+    const fallbackResult = await runShimScript({ ...baseEnv, PATH: brokenPath, HOME: fakeHome, MCP_SIDING_NODE: "" });
+    assert.ok(!fallbackResult.timedOut, `asdf-fallback script hung (stderr: ${fallbackResult.err})`);
+    assert.ok(
+      fallbackResult.out.includes('"id":60'),
+      `script did not start with node absent from PATH but present at the asdf fallback (stderr: ${fallbackResult.err})`,
+    );
+  } finally {
+    await rm(fakeHome, { recursive: true, force: true });
+  }
+
+  // -- none available anywhere: exits non-zero with a diagnostic rather
+  //    than hanging. Only assertable when this machine genuinely has no
+  //    node at any of the hardcoded absolute fallback paths - those are
+  //    real system paths, not overridable via env, so on a machine that
+  //    happens to have e.g. Homebrew's /opt/homebrew/bin/node, resolving
+  //    it there is CORRECT behavior, not something this test can turn
+  //    into a failure case without touching real system state.
+  const hardcodedFallbacks = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"];
+  const anyHardcodedFallbackExists = hardcodedFallbacks.some((p) => {
+    try {
+      accessSync(p, fsConstants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (anyHardcodedFallbackExists) {
+    process.stderr.write(
+      "  (skipping N21 'no node anywhere' assertion - this machine has a real node at one of the hardcoded fallback paths)\n",
+    );
+  } else {
+    const emptyHome = await mkdtemp(join(tmpdir(), "mcp-siding-nonode-"));
+    try {
+      const noneResult = await runShimScript({ ...baseEnv, PATH: brokenPath, HOME: emptyHome, MCP_SIDING_NODE: "" }, 3_000);
+      assert.ok(!noneResult.timedOut, "a subprocess with no node resolvable anywhere must exit, not hang");
+      assert.notEqual(noneResult.code, 0, "must exit non-zero when no node resolves anywhere");
+      assert.match(noneResult.err, /could not find a usable node/i, "must name what was tried in the diagnostic");
+    } finally {
+      await rm(emptyHome, { recursive: true, force: true });
+    }
+  }
 }
 
 // N13: `open -a <bad path>` on macOS spawns fine and exits nonzero - unlike
