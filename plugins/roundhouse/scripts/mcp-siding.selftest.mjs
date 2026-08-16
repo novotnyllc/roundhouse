@@ -17,7 +17,7 @@
 //   node mcp-siding.mjs --selftest   (thin delegation to this file)
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, writeFile, copyFile, chmod, rm, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, copyFile, chmod, rm, readFile, readdir } from "node:fs/promises";
 import { realpathSync, accessSync, constants as fsConstants } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -327,6 +327,37 @@ export async function selftest() {
   });
   const listed = await cachedShim.handle({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} });
   assert.deepEqual(listed.result.tools, seededTools);
+
+  // -- 5b. N38: cache writes must be atomic - write to a sibling temp
+  //        file, then rename into place, so an interrupted or failing
+  //        write can never leave an empty/partial file behind. A
+  //        successful write still produces exactly the expected content;
+  //        a failed write (a real unwritable target directory, not a
+  //        stubbed fs call) must leave the PREVIOUS cache completely
+  //        intact and readable, and must not leak a temp file either way. -
+  const atomicDir = await mkdtemp(join(tmpdir(), "mcp-siding-atomic-"));
+  const atomicCachePath = join(atomicDir, "atomic.json");
+  const originalAtomicTools = [{ name: "original_tool" }];
+  writeCache(atomicCachePath, originalAtomicTools);
+  assert.deepEqual(readCache(atomicCachePath), originalAtomicTools, "a successful write must produce exactly the expected content");
+  assert.deepEqual(await readdir(atomicDir), ["atomic.json"], "a successful write must leave no temp file behind");
+
+  // mkdirSync(dir, {recursive:true}) is a no-op on an already-existing
+  // dir (no permission check) - so making the dir unwritable makes the
+  // actual write (creating the sibling temp file) fail with a real
+  // EACCES, an honest I/O failure rather than a stubbed fs call.
+  await chmod(atomicDir, 0o555);
+  try {
+    writeCache(atomicCachePath, [{ name: "should_never_land" }]);
+  } finally {
+    await chmod(atomicDir, 0o755); // restore before reading the dir / cleanup
+  }
+  assert.deepEqual(
+    readCache(atomicCachePath),
+    originalAtomicTools,
+    "a failed write must leave the previous cache completely intact and readable, not empty or partial",
+  );
+  assert.deepEqual(await readdir(atomicDir), ["atomic.json"], "a failed write must not leak a temp file behind");
 
   // -- 6. launch-on-demand: tools/list never launches, tools/call does,
   //       repeated calls during the grace window are debounced, and a
@@ -1655,7 +1686,15 @@ export async function selftest() {
         }
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
-          const response = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { held: true } });
+          // A valid CallToolResult shape (N37 now requires one) - this
+          // test is about held-open transport timing, not shape, so the
+          // fixture just needs to pass shape validation to stay focused
+          // on what it actually exercises.
+          const response = JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { content: [{ type: "text", text: "held" }] },
+          });
           res.writeHead(200, { "Content-Type": "text/event-stream" });
           res.write(`data: ${response}\n\n`);
           // Deliberately never res.end() - the exact "deliver then keep
@@ -1682,7 +1721,7 @@ export async function selftest() {
         Date.now() - startedAt < 3_000,
         "a matching response must resolve promptly, not wait for the held-open stream to close",
       );
-      assert.deepEqual(held.result, { held: true });
+      assert.deepEqual(held.result, { content: [{ type: "text", text: "held" }] });
       assert.equal(heldOpenLaunches.length, 0, "a successful held-open response must never launch");
     },
   );
@@ -1845,7 +1884,13 @@ export async function selftest() {
         }
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
-          const response = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { crlf: true } });
+          // A valid CallToolResult shape (N37 now requires one) - this
+          // test is about CRLF parsing, not shape.
+          const response = JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { content: [{ type: "text", text: "crlf" }] },
+          });
           res.writeHead(200, { "Content-Type": "text/event-stream" });
           res.end(`data: ${response}\r\n\r\n`);
           return;
@@ -1866,7 +1911,7 @@ export async function selftest() {
       const crlfReply = await crlfShim.handle({ jsonrpc: "2.0", id: 93, method: "tools/call", params: {} });
       assert.deepEqual(
         crlfReply.result,
-        { crlf: true },
+        { content: [{ type: "text", text: "crlf" }] },
         "a CRLF-delimited response must resolve with the real result, not a false-success {}",
       );
     },
@@ -1894,7 +1939,13 @@ export async function selftest() {
         }
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
-          const response = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { mixedCase: true } });
+          // A valid CallToolResult shape (N37 now requires one) - this
+          // test is about Content-Type case-sensitivity, not shape.
+          const response = JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { content: [{ type: "text", text: "mixedCase" }] },
+          });
           res.writeHead(200, { "Content-Type": "Text/Event-Stream; charset=UTF-8" });
           res.write(`data: ${response}\n\n`);
           // Deliberately never res.end() - if the mixed-case type falls
@@ -1921,7 +1972,11 @@ export async function selftest() {
         Date.now() - startedAt < 3_000,
         "a mixed-case Content-Type must resolve promptly via the SSE path, not fall through and wait for EOF",
       );
-      assert.deepEqual(mixedCaseReply.result, { mixedCase: true }, "a mixed-case Content-Type must still resolve with the real result");
+      assert.deepEqual(
+        mixedCaseReply.result,
+        { content: [{ type: "text", text: "mixedCase" }] },
+        "a mixed-case Content-Type must still resolve with the real result",
+      );
     },
   );
 
@@ -1977,6 +2032,158 @@ export async function selftest() {
       },
     );
   }
+
+  // -- 7r2. N37: presence of `result` is not the same as it having the
+  //         right shape. {"result":null}, a tools/call result missing
+  //         `content`, and a `content` that is not an array must all be
+  //         rejected the same way 7r's unparseable bodies are - reachable,
+  //         not downtime, never launched, never read as success, and (for
+  //         a mutating tools/call) the model must be told the operation
+  //         may already have run. A valid result passes through unchanged. -
+  for (const [label, malformedResult, cacheName] of [
+    ["a null result", null, "shape-null.json"],
+    ["a result missing content", { notContent: [] }, "shape-no-content.json"],
+    ["a content that is not an array", { content: "not an array" }, "shape-content-not-array.json"],
+  ]) {
+    const shapeLaunches = [];
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "initialize") {
+            return sendJson(
+              res,
+              200,
+              { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+              { "MCP-Session-Id": "shape-session" },
+            );
+          }
+          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          if (msg.method === "tools/call") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: malformedResult });
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shapeShim = new Shim({
+          url,
+          name: "test",
+          cachePath: join(cacheDir, cacheName),
+          timeoutMs: 2_000,
+          launchEnabled: true,
+          appPath: "/fake/Shape.app",
+          launchGraceMs: 150_000,
+          launcher: (appPath) => shapeLaunches.push(appPath),
+        });
+        const shapeReply = await shapeShim.handle({ jsonrpc: "2.0", id: 95, method: "tools/call", params: {} });
+        assert.equal(shapeReply.result.isError, true, `${label}: must be an error result, never a false success`);
+        assert.doesNotMatch(
+          shapeReply.result.content[0].text,
+          /not reachable|is not reachable/i,
+          `${label}: a malformed shape from a reachable backend must not be reported as unreachable`,
+        );
+        assert.match(
+          shapeReply.result.content[0].text,
+          /may have (already )?(started|run|completed)|do not retry automatically/i,
+          `${label}: the model must be told the operation may have already run, same as the Indeterminate class`,
+        );
+        assert.equal(shapeLaunches.length, 0, `${label}: must never launch`);
+      },
+    );
+  }
+
+  // A valid tools/call result (content array present) must pass through
+  // completely unchanged - this is not a schema validator, only the one
+  // shape MCP requires.
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "shape-valid-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/call") {
+          return sendJson(res, 200, {
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: { content: [{ type: "text", text: "fine" }], isError: false },
+          });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const validShapeShim = new Shim({
+        url,
+        name: "test",
+        cachePath: join(cacheDir, "shape-valid.json"),
+        timeoutMs: 2_000,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const validShapeReply = await validShapeShim.handle({ jsonrpc: "2.0", id: 96, method: "tools/call", params: {} });
+      assert.deepEqual(
+        validShapeReply.result,
+        { content: [{ type: "text", text: "fine" }], isError: false },
+        "a valid CallToolResult must pass through completely unchanged",
+      );
+    },
+  );
+
+  // A tools/list with a non-array `tools` must be rejected the same way -
+  // this used to be only a caching guard (silently skip writing a bad
+  // shape to disk), which let the malformed shape through to the live
+  // caller anyway. Falls back to whatever cache already exists, exactly
+  // like every other tools/list error (see toolsList's own catch).
+  await withServer(
+    (req, res) => {
+      readJsonBody(req).then((msg) => {
+        if (msg.method === "initialize") {
+          return sendJson(
+            res,
+            200,
+            { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+            { "MCP-Session-Id": "shape-list-session" },
+          );
+        }
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+        if (msg.method === "tools/list") {
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: "not an array" } });
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+      });
+    },
+    async (url) => {
+      const shapeListCachePath = join(cacheDir, "shape-list.json");
+      writeCache(shapeListCachePath, [{ name: "preexisting_tool" }]);
+      const shapeListShim = new Shim({
+        url,
+        name: "test",
+        cachePath: shapeListCachePath,
+        timeoutMs: 2_000,
+        launchEnabled: false,
+        appPath: null,
+        launchGraceMs: 150_000,
+      });
+      const shapeListReply = await shapeListShim.handle({ jsonrpc: "2.0", id: 97, method: "tools/list", params: {} });
+      assert.deepEqual(
+        shapeListReply.result.tools,
+        [{ name: "preexisting_tool" }],
+        "a non-array tools/list result must be rejected and fall back to the existing cache, not forwarded live",
+      );
+      assert.deepEqual(
+        readCache(shapeListCachePath),
+        [{ name: "preexisting_tool" }],
+        "the persistent cache must be untouched by a rejected shape",
+      );
+    },
+  );
 
   // -- 7s. N10: a request that expects a response (it always carries an id)
   //        but never gets a correlated result/error envelope must not be
@@ -2107,7 +2314,13 @@ export async function selftest() {
           );
         }
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
-        sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: msg.method === "tools/call" ? { ok: true } : {} });
+        sendJson(res, 200, {
+          jsonrpc: "2.0",
+          id: msg.id,
+          // A valid CallToolResult shape (N37 now requires one) for
+          // tools/call - this test is about id correlation, not shape.
+          result: msg.method === "tools/call" ? { content: [{ type: "text", text: "ok" }] } : {},
+        });
       });
     },
     async (url) => {
@@ -2121,7 +2334,7 @@ export async function selftest() {
         launchGraceMs: 150_000,
       });
       const matched = await matchedIdShim.handle({ jsonrpc: "2.0", id: 97, method: "tools/call", params: {} });
-      assert.deepEqual(matched.result, { ok: true }, "a matching-id JSON response must still work");
+      assert.deepEqual(matched.result, { content: [{ type: "text", text: "ok" }] }, "a matching-id JSON response must still work");
     },
   );
 
@@ -2160,8 +2373,10 @@ export async function selftest() {
             res.writeHead(200, { "Content-Type": "application/json" });
             return;
           }
-          // Call B - answer normally, correlated by its OWN id.
-          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { callB: true } });
+          // Call B - answer normally, correlated by its OWN id. Valid
+          // CallToolResult shape (N37 now requires one) - this test is
+          // about id allocation, not shape.
+          return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "callB" }] } });
         }
         sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
       });
@@ -2186,7 +2401,11 @@ export async function selftest() {
       const callB = idRaceShim.handle({ jsonrpc: "2.0", id: 99, method: "tools/call", params: {} });
       const [resultA, resultB] = await Promise.all([callA, callB]);
       assert.equal(resultA.result.isError, true, "call A must report as cancelled");
-      assert.deepEqual(resultB.result, { callB: true }, "call B must complete normally with its own result");
+      assert.deepEqual(
+        resultB.result,
+        { content: [{ type: "text", text: "callB" }] },
+        "call B must complete normally with its own result",
+      );
 
       await new Promise((r) => setTimeout(r, 100)); // the forward to the backend is fire-and-forget
       assert.equal(idRaceToolCallIds.length, 2, "both calls must have reached the backend");

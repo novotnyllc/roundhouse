@@ -32,8 +32,8 @@
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -327,6 +327,27 @@ class Cancelled extends Error {}
 // post()'s catch, the same way Cancelled is.
 class MalformedResponse extends Error {}
 
+// Presence of `result` (checked by backend(), just above where this is
+// called) is not the same as it having the right shape - {"result": null}
+// or a tools/call result with no `content` array both pass that check and
+// would otherwise be forwarded as a successful call, after the operation
+// may already have run. Deliberately narrow: only the one thing each
+// method's result type requires per MCP, not a schema validator - this is
+// not the place to reject a shape a real backend legitimately sends.
+// Methods with no shape requirement here (initialize, ...) pass through
+// unchecked.
+function validateResultShape(method, result) {
+  if (method === "tools/call") {
+    if (result === null || typeof result !== "object" || !Array.isArray(result.content)) {
+      throw new MalformedResponse(`${method}: result is not a valid CallToolResult (missing a content array)`);
+    }
+  } else if (method === "tools/list") {
+    if (result === null || typeof result !== "object" || !Array.isArray(result.tools)) {
+      throw new MalformedResponse(`${method}: result is not a valid ListToolsResult (missing a tools array)`);
+    }
+  }
+}
+
 // The rule this encodes: classify by whether the request is PROVEN
 // UNDELIVERED, not by whether we aborted it. A timeout (post()'s own timer
 // fired - Cancelled is already ruled out before this class is ever thrown,
@@ -563,11 +584,32 @@ export function readCache(cachePath) {
 }
 
 export function writeCache(cachePath, tools) {
+  // Atomic: write to a sibling temp file, then rename it into place, rather
+  // than writeFileSync straight to cachePath - writeFileSync truncates the
+  // target before writing, so an ENOSPC, an I/O error, or an interruption
+  // mid-write used to leave an empty or partial file, silently swallowed by
+  // the catch below, destroying a complete cached inventory the offline
+  // tools/list path depends on. A rename within the same directory is
+  // atomic on the same filesystem - a reader only ever sees the old
+  // complete file or the new complete one, never a partial write.
+  const dir = dirname(cachePath);
+  const tmpPath = join(dir, `.${basename(cachePath)}.${process.pid}.tmp`);
   try {
-    mkdirSync(dirname(cachePath), { recursive: true });
-    writeFileSync(cachePath, JSON.stringify(tools));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(tmpPath, JSON.stringify(tools));
+    renameSync(tmpPath, cachePath);
   } catch {
-    // Best effort - a read-only cache dir degrades to "no cache", not a crash.
+    // Best effort, same outcome as before: a read-only cache dir (or any
+    // other write failure) degrades to "cache unchanged", not a crash -
+    // but now that "unchanged" is real, since nothing at cachePath itself
+    // was ever touched until the rename, which only happens after a
+    // complete write. Clean up the temp file so a failed write doesn't
+    // also leak one; ignored if it was never created.
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Nothing to clean up, or cleanup itself failed - best effort only.
+    }
   }
 }
 
@@ -929,6 +971,7 @@ export class Shim {
           if (!body || !("result" in body)) {
             throw new MalformedResponse(`${method}: no response received for the request`);
           }
+          validateResultShape(method, body.result);
           return body.result;
         } catch (err) {
           // BackendReported/HttpRejected/MalformedResponse mean "reachable";
@@ -1121,8 +1164,16 @@ export class Shim {
         // Same reasoning, one layer further down: a 200 arrived at all,
         // which proves the app is running - the body just wasn't what the
         // protocol expects (malformed JSON/SSE, an intermediary's HTML
-        // error page, ...). Never launch, never say "not reachable".
-        return this.errorResult(`${this.name} sent a response this shim could not parse (${err.message}) - not a downtime issue, no restart needed.`);
+        // error page, a result present but the wrong shape for this method
+        // per validateResultShape, ...). Never launch, never say "not
+        // reachable" - and never claim success either: a malformed
+        // response tells us nothing about whether the work happened, the
+        // same uncertainty Indeterminate carries, so a mutating call gets
+        // the same retry caution.
+        return this.errorResult(
+          `${this.name} sent a response this shim could not parse (${err.message}) - not a downtime issue, no restart needed. ` +
+            "Do not retry automatically, especially if it was a mutating action - check whether it already completed before trying again.",
+        );
       }
       if (err instanceof Indeterminate) {
         // A timeout never proves the backend did not receive the request -
