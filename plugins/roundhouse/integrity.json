@@ -174,7 +174,7 @@
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
-      "sha256": "f924d0966eee52df547daf1d1138361f2048ef387b2850c4d15b505809bc5b3b"
+      "sha256": "5195c65a297a944a4e21f6b6d2ac6020dd8f510e3c78b46bfca3f68f76697510"
     },
     {
       "path": "scripts/prepare-ssh-identity",

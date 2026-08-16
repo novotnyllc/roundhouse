@@ -3280,6 +3280,24 @@ function rewriteHardcodedNodeFallbacks(scriptText, dir) {
     .replaceAll("/usr/bin/node", join(dir, "usr-bin-node"));
 }
 
+// Never COPY the real node binary to a synthetic path to stage "a real
+// node" somewhere the resolver will find it - a relocated signed binary
+// can fail its own signature check on macOS (Abort trap: 6, observed in
+// CI), and a Node build can also lose its dylib resolution when moved
+// outside its original install layout. Neither is what any test here is
+// actually about, and it happens to work or not per-machine depending on
+// exactly how that machine's Node was signed/linked - precisely the kind
+// of environment difference the fallback-rewrite work this responds to
+// exists to stop hiding. A tiny POSIX wrapper that `exec`s the real,
+// never-relocated binary by its absolute path satisfies the resolver's
+// `-x` check and its capability probe (the probe's `-e` flags forward
+// straight through to the genuine runtime via "$@") with no signing or
+// linking assumptions at all.
+async function stageNodeWrapper(destPath) {
+  await writeFile(destPath, `#!/bin/sh\nexec "${process.execPath}" "$@"\n`);
+  await chmod(destPath, 0o755);
+}
+
 // N21: runs buildShimScript()'s FULL output (RESOLVER_SH + NODE_RESOLVER_SH
 // + the exec line) through a real `/bin/sh -c`, exactly the way a
 // registration actually invokes it - resolving mcp-siding.mjs itself is not
@@ -3411,8 +3429,7 @@ async function selftestNodeResolver() {
   const asdfShimDir = join(fakeHome, ".asdf", "shims");
   await mkdir(asdfShimDir, { recursive: true });
   const asdfNodePath = join(asdfShimDir, "node");
-  await copyFile(realNode, asdfNodePath);
-  await chmod(asdfNodePath, 0o755);
+  await stageNodeWrapper(asdfNodePath);
   try {
     const fallbackResult = await runShimScript({ ...baseEnv, PATH: brokenPath, HOME: fakeHome, MCP_SIDING_NODE: "" });
     assert.ok(!fallbackResult.timedOut, `asdf-fallback script hung (stderr: ${fallbackResult.err})`);
@@ -3434,8 +3451,7 @@ async function selftestNodeResolver() {
   try {
     const rewrittenDir = join(fallbackRewriteHome, "fallbacks");
     await mkdir(rewrittenDir, { recursive: true });
-    await copyFile(realNode, join(rewrittenDir, "opt-homebrew-node"));
-    await chmod(join(rewrittenDir, "opt-homebrew-node"), 0o755);
+    await stageNodeWrapper(join(rewrittenDir, "opt-homebrew-node"));
     const positiveControl = await runShimScript(
       { ...baseEnv, PATH: brokenPath, HOME: fallbackRewriteHome, MCP_SIDING_NODE: "" },
       5_000,
@@ -3493,8 +3509,7 @@ async function selftestNodeResolver() {
     const realFallbackDir = join(stubNodeHome, ".asdf", "shims");
     await mkdir(realFallbackDir, { recursive: true });
     const realFallbackPath = join(realFallbackDir, "node");
-    await copyFile(realNode, realFallbackPath);
-    await chmod(realFallbackPath, 0o755);
+    await stageNodeWrapper(realFallbackPath);
     const rejectThenFallback = await runShimScript({
       ...baseEnv,
       PATH: stubNodeDir,
@@ -3570,8 +3585,7 @@ async function selftestInstallNodeResolverSnippet() {
     const asdfShimDir = join(fakeHome, ".asdf", "shims");
     await mkdir(asdfShimDir, { recursive: true });
     const asdfNodePath = join(asdfShimDir, "node");
-    await copyFile(realNode, asdfNodePath);
-    await chmod(asdfNodePath, 0o755);
+    await stageNodeWrapper(asdfNodePath);
     const withFallback = spawnSync("/bin/sh", ["-c", `${snippet}\nprintf '%s' "$SCRIPT"`], {
       env: { ...baseEnv, HOME: fakeHome },
       encoding: "utf8",
@@ -3644,8 +3658,7 @@ async function selftestInstallNodeResolverSnippet() {
   try {
     const rewrittenDir = join(fallbackRewriteHome, "fallbacks");
     await mkdir(rewrittenDir, { recursive: true });
-    await copyFile(realNode, join(rewrittenDir, "opt-homebrew-node"));
-    await chmod(join(rewrittenDir, "opt-homebrew-node"), 0o755);
+    await stageNodeWrapper(join(rewrittenDir, "opt-homebrew-node"));
     const rewrittenSnippet = rewriteHardcodedNodeFallbacks(snippet, rewrittenDir);
     const positiveControl = spawnSync("/bin/sh", ["-c", `${rewrittenSnippet}\nprintf '%s' "$SCRIPT"`], {
       env: { ...baseEnv, HOME: fallbackRewriteHome },
