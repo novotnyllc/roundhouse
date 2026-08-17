@@ -247,17 +247,27 @@ export function shQuote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
 }
 
-// Builds the full sh -c script body (resolvers + the final exec line) for
-// a registration: `RESOLVER_SH`, then `NODE_RESOLVER_SH`, then
-// `exec "$node_bin" "$p" <flags>`, flags taken only from what the caller
-// explicitly set (mcp-siding.mjs's own defaults handle the rest at
-// runtime, so nothing is baked in redundantly).
-export function buildShimScript(flags) {
-  const args = ["--backend-url", shQuote(flags["backend-url"]), "--name", shQuote(flags.name)];
-  if (flags.app) args.push("--app", shQuote(flags.app));
-  if (flags.cache) args.push("--cache", shQuote(flags.cache));
-  if (flags.timeout) args.push("--timeout", shQuote(flags.timeout));
-  if (flags["launch-grace"]) args.push("--launch-grace", shQuote(flags["launch-grace"]));
+// Single-quotes a value for literal embedding in the PowerShell script this
+// module emits for a native-Windows registration. PowerShell single-quoted
+// strings are fully literal - a doubled '' is the only escape, and neither
+// $ nor \ nor " means anything inside them - so this is correct for
+// arbitrary paths and URLs, exactly like shQuote is for sh.
+export function psQuote(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+// The shim's own argv for one registration, unquoted: only what the caller
+// explicitly set (mcp-siding.mjs's defaults handle the rest at runtime, so
+// nothing is baked in redundantly). Shared by both script builders so the
+// POSIX and PowerShell registrations can never disagree about which flags
+// a given set of install options produces - only about how they are
+// quoted.
+function shimFlagArgs(flags) {
+  const args = ["--backend-url", flags["backend-url"], "--name", flags.name];
+  if (flags.app) args.push("--app", flags.app);
+  if (flags.cache) args.push("--cache", flags.cache);
+  if (flags.timeout) args.push("--timeout", flags.timeout);
+  if (flags["launch-grace"]) args.push("--launch-grace", flags["launch-grace"]);
   // Same tri-state resolution as buildShimFromArgs: either flag's explicit
   // value wins over the other's absence, "off" wins a genuine conflict.
   // Collapsed to the canonical bare form in the generated script - an
@@ -268,7 +278,53 @@ export function buildShimScript(flags) {
   const launchOn = flags.launch === true || flags["no-launch"] === false;
   if (launchOff) args.push("--no-launch");
   else if (launchOn) args.push("--launch");
-  return `${RESOLVER_SH}\n${NODE_RESOLVER_SH}\nexec "$node_bin" "$p" ${args.join(" ")}\n`;
+  return args.map(String);
+}
+
+// Builds the full sh -c script body (resolvers + the final exec line) for
+// a registration: `RESOLVER_SH`, then `NODE_RESOLVER_SH`, then
+// `exec "$node_bin" "$p" <flags>`.
+export function buildShimScript(flags) {
+  return `${RESOLVER_SH}\n${NODE_RESOLVER_SH}\nexec "$node_bin" "$p" ${shimFlagArgs(flags).map(shQuote).join(" ")}\n`;
+}
+
+// The marked region of the sibling mcp-siding-windows.ps1 - the PowerShell
+// twin of RESOLVER_SH + NODE_RESOLVER_SH, plus the launcher that hands
+// this process's stdio to node. Extracted rather than duplicated here: that
+// file is the single source, it carries its own -SelfTest (run by the
+// Windows CI job and by this script's own self-test), and a registration
+// built from it therefore runs exactly the text those tests exercise.
+export function extractWindowsResolver(ps1Text) {
+  const match = ps1Text.match(
+    /^# <!-- mcp-siding: windows-resolver:start -->\n([\s\S]*?)\n# <!-- mcp-siding: windows-resolver:end -->$/m,
+  );
+  if (!match) {
+    throw new Error("mcp-siding-windows.ps1: the windows-resolver marker region was not found - did that file's structure change?");
+  }
+  return match[1];
+}
+
+// Resolved as a sibling of THIS module, not from CWD or a fixed path, for
+// the same reason the self-test resolves its own subject that way: the
+// pair has to keep working from any copy of the scripts/ directory.
+function readWindowsResolver() {
+  const ps1Path = fileURLToPath(new URL("./mcp-siding-windows.ps1", import.meta.url));
+  let text;
+  try {
+    text = readFileSync(ps1Path, "utf8");
+  } catch (err) {
+    throw new Error(`--platform windows needs the sibling mcp-siding-windows.ps1 (${ps1Path}): ${err.message}`);
+  }
+  return extractWindowsResolver(text);
+}
+
+// The native-Windows registration body: the PowerShell resolver region,
+// then one Invoke-McpSidingShim call carrying this instance's flags. Same
+// contract as buildShimScript - self-contained text that resolves the
+// script and a usable node at every spawn, so a plugin update is picked up
+// with nothing to reinstall.
+export function buildShimScriptPowerShell(flags, resolverPs1) {
+  return `${resolverPs1}\nInvoke-McpSidingShim -ShimArgs @(${shimFlagArgs(flags).map(psQuote).join(", ")})\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +589,23 @@ function parseSseEvent(rawEvent) {
   }
 }
 
+// Is this parsed value a JSON-RPC message at all - i.e. something that is
+// meaningful to hand to an MCP client? Deliberately structural, not a
+// schema check: an object carrying jsonrpc "2.0" and either a method (a
+// notification, or a server->client request) or a correlated result/error.
+// Anything else that happens to sit in an SSE `data:` field - a bare
+// number, an array, a keepalive object, a JSON fragment some intermediary
+// injected - is not a message and must never be written to the client's
+// stdio stream, where it would be a protocol violation the client has no
+// way to recover from. Used by readSseUntilMatch before forwarding; the
+// awaited response itself never reaches it (that returns first).
+function isJsonRpcMessage(msg) {
+  if (msg === null || typeof msg !== "object" || Array.isArray(msg)) return false;
+  if (msg.jsonrpc !== "2.0") return false;
+  if (typeof msg.method === "string") return true;
+  return "id" in msg && ("result" in msg || "error" in msg);
+}
+
 // ---------------------------------------------------------------------------
 // Incremental SSE reading. MCP streamable HTTP explicitly permits a backend
 // to deliver the JSON-RPC response matching a request's id and then keep
@@ -544,13 +617,34 @@ function parseSseEvent(rawEvent) {
 // returns as soon as the event whose id matches `expectedId` arrives,
 // without waiting for EOF.
 //
+// `onMessage`, when given, receives every JSON-RPC message on the stream
+// that is NOT the awaited response - a notifications/progress for a
+// long-running call, a server->client request, or a (misrouted, delayed)
+// response correlated to some other id. That is what lets the shim relay a
+// multi-minute operation's progress to the stdio client instead of looking
+// stalled (issue #15). Three properties this relies on, all of them
+// structural rather than defensive:
+//   - The match check runs FIRST, so the awaited response is returned, never
+//     forwarded: a notification can never be mistaken for it, and the
+//     response can never be double-delivered.
+//   - Events are drained in arrival order and this returns at the match, so
+//     everything forwarded was genuinely emitted BEFORE the response, and
+//     nothing after the match is even parsed - the shim cannot write a
+//     stray message once it has moved on.
+//   - Only a real JSON-RPC message is passed on (see isJsonRpcMessage);
+//     anything else in a `data:` field is dropped, not relayed. A payload
+//     that does not parse as JSON at all still throws MalformedResponse
+//     exactly as before - unchanged, and never forwarded either.
+// The callback is called synchronously from the read loop; the caller (see
+// Shim.forwardNotification) is responsible for never throwing back into it.
+//
 // Timeout/cancellation: this does no signal handling of its own - it
 // relies entirely on the same fetch() AbortController/signal that already
 // covers the rest of post(). Aborting that controller (on timeout or via
 // cancel()) errors the underlying stream, so a pending reader.read() call
 // rejects the same way res.text() used to - the surrounding try/catch in
 // post() is unchanged and still covers this.
-export async function readSseUntilMatch(stream, expectedId) {
+export async function readSseUntilMatch(stream, expectedId, onMessage) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -575,6 +669,7 @@ export async function readSseUntilMatch(stream, expectedId) {
       buffer = buffer.slice(sep + 2);
       const msg = parseSseEvent(rawEvent);
       if (msg && typeof msg === "object" && "id" in msg && msg.id === expectedId) return msg;
+      if (onMessage && isJsonRpcMessage(msg)) onMessage(msg);
     }
     return undefined;
   };
@@ -743,6 +838,13 @@ export class Shim {
     this.appPath = opts.appPath;
     this.launchGraceMs = opts.launchGraceMs;
     this.launcher = opts.launcher ?? defaultLauncher;
+    // Where a forwarded server notification goes (issue #15). null - the
+    // default - means "do not forward", which is what every unit-level
+    // construction of a Shim wants: nothing should reach a real stdout
+    // unless main() deliberately wired it there. main() sets this to emit
+    // (the same one-object-per-line writer every response already goes
+    // through) so framing is identical for both. See forwardNotification.
+    this.onNotification = opts.onNotification ?? null;
     this.sid = null;
     // Separate from `sid`: session management is optional in MCP
     // streamable HTTP, so a backend that never issues a session id would
@@ -864,7 +966,7 @@ export class Shim {
           }
           body = null;
         } else {
-          body = await readSseUntilMatch(res.body, payload.id);
+          body = await readSseUntilMatch(res.body, payload.id, (msg) => this.forwardNotification(msg));
         }
       } else {
         // Plain JSON, an empty notification response, and any non-2xx
@@ -1174,6 +1276,34 @@ export class Shim {
     await Promise.race([cleanup, new Promise((r) => setTimeout(r, deadlineMs))]);
   }
 
+  // Relays one server-originated JSON-RPC message (already validated as a
+  // message, and already known not to be the awaited response - see
+  // readSseUntilMatch) to the stdio client. Issue #15: without this, a
+  // backend emitting notifications/progress during a multi-minute Fusion
+  // operation gives the client nothing and the call looks stalled.
+  //
+  // Three things this deliberately does NOT do. It does not go through
+  // main()'s serialized queue: that queue orders REQUEST HANDLING, and a
+  // server notification is not a request - routing it through the queue
+  // would deadlock it behind the very call whose progress it reports.
+  // Framing is safe without the queue because both this and every response
+  // go through the same emit(), which writes one complete
+  // JSON-object-plus-newline per call, and a Writable serializes whole
+  // writes in call order - so a forward can never land inside a response's
+  // line. It does not touch session, correlation, or cancellation state:
+  // nothing here can change which response a caller accepts. And it never
+  // throws back into the read loop - a failed write (a closed stdout, a
+  // client that already went away) must not turn into a failed tool call.
+  forwardNotification(msg) {
+    if (!this.onNotification) return;
+    try {
+      this.onNotification(msg);
+    } catch {
+      // Best effort - a broken stdout is the client's disconnect, which
+      // readline's 'close' already handles; it is not this call's failure.
+    }
+  }
+
   // -- message handlers -----------------------------------------------------
 
   async toolsList(params, clientRequestId) {
@@ -1449,8 +1579,12 @@ const BOOL_FLAGS = new Set(["selftest", "help", "launch", "no-launch", "print-re
 // Every flag this shim (and its builders) actually reads, matching
 // usage() below exactly - kept as one list so it can never quietly drift
 // from what buildShimFromArgs/buildShimScript consume.
-const VALUE_FLAGS = new Set(["backend-url", "name", "app", "cache", "timeout", "launch-grace"]);
+const VALUE_FLAGS = new Set(["backend-url", "name", "app", "cache", "timeout", "launch-grace", "platform"]);
 const VALID_FLAGS = new Set([...BOOL_FLAGS, ...VALUE_FLAGS]);
+// Which registration flavour --print-resolver/--print-shim-script emit.
+// "posix" is the default and everything this shim did before native
+// Windows support existed; "windows" emits the PowerShell twin instead.
+const SHIM_PLATFORMS = new Set(["posix", "windows"]);
 
 // Throws a plain Error, with a message meant to be shown to the user
 // as-is, on any argv shape it can't make sense of - the caller (run())
@@ -1504,6 +1638,13 @@ export function parseArgs(argv) {
     flags[key] = value;
     i++;
   }
+  // Same class as N44's unknown-flag rejection: a --platform value this
+  // script does not understand must fail here, before a registration is
+  // generated, rather than silently producing the POSIX flavour on a host
+  // that asked for the other one.
+  if (flags.platform !== undefined && !SHIM_PLATFORMS.has(flags.platform)) {
+    throw new Error(`invalid value for --platform: ${flags.platform} (expected ${[...SHIM_PLATFORMS].sort().join(" or ")})`);
+  }
   return flags;
 }
 
@@ -1531,11 +1672,13 @@ Options:
   --timeout MS               Backend request timeout in ms (default: 180000)
   --launch / --no-launch      Launch-on-demand opt-in/out (default: on iff --app is set)
   --launch-grace SECONDS      Debounce window before relaunching (default: 150)
+  --platform posix|windows     Registration flavour --print-resolver/--print-shim-script
+                                 emit: POSIX sh (default) or native-Windows PowerShell
   --selftest                   Run the built-in self-check (delegates to the sibling
                                  mcp-siding.selftest.mjs) and exit
-  --print-resolver              Print the POSIX sh backend-path resolver and exit
-  --print-shim-script            Print the full sh -c registration script (resolver +
-                                   exec line) for --backend-url/--name/--app/etc and exit
+  --print-resolver              Print the backend-path resolver and exit
+  --print-shim-script            Print the full registration script (resolver +
+                                   launch line) for --backend-url/--name/--app/etc and exit
   --help                        Show this message
 `;
 }
@@ -1615,6 +1758,12 @@ function main(flags) {
     process.stderr.write(`${err.message}\n${usage()}`);
     process.exit(2);
   }
+  // Issue #15: server notifications arriving mid-call go to the client
+  // through the SAME writer every response uses, so both share one framing
+  // guarantee rather than two. Wired here, at the transport boundary, not
+  // in buildShimFromArgs - a Shim built for a unit test has no stdio client
+  // and must never write to a real stdout.
+  shim.onNotification = emit;
   const rl = createInterface({ input: process.stdin, terminal: false });
 
   // The client closing stdin (readline's 'close') is the only signal a
@@ -1695,7 +1844,7 @@ function run() {
     return;
   }
   if (flags["print-resolver"]) {
-    process.stdout.write(`${RESOLVER_SH}\n`);
+    process.stdout.write(flags.platform === "windows" ? `${readWindowsResolver()}\n` : `${RESOLVER_SH}\n`);
     return;
   }
   if (flags["print-shim-script"]) {
@@ -1713,7 +1862,7 @@ function run() {
       process.stderr.write(`${err.message}\n${usage()}`);
       process.exit(2);
     }
-    process.stdout.write(buildShimScript(flags));
+    process.stdout.write(flags.platform === "windows" ? buildShimScriptPowerShell(flags, readWindowsResolver()) : buildShimScript(flags));
     return;
   }
   if (flags.selftest) {
