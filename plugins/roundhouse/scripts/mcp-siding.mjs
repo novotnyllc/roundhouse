@@ -39,6 +39,29 @@ import { fileURLToPath } from "node:url";
 
 export const PROTOCOL_VERSION = "2025-06-18";
 
+// Versions this shim will serve to a CLIENT. It is deliberately dual-era: the
+// backend (a desktop app's MCP server) is legacy and will be for a long time,
+// while the harness on the other side may modernize at any point. Per the
+// 2026-07-28 compatibility matrix a legacy-only server FAILS a modern client,
+// and a legacy-only client FAILS a modern server — so being dual-era is what
+// keeps the shim working while either side moves. Newest first: a client
+// choosing from this list should land on the newest we both support.
+export const SUPPORTED_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
+
+// JSON-RPC error code for UnsupportedProtocolVersionError (spec 2026-07-28).
+export const UNSUPPORTED_PROTOCOL_VERSION = -32022;
+
+export const PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
+
+// The version a request declares, if it speaks the modern per-request style.
+// Absent means legacy: the caller negotiated (or will negotiate) by handshake.
+export function requestedProtocolVersion(params) {
+  const meta = params?._meta;
+  if (meta === null || typeof meta !== "object") return undefined;
+  const v = meta[PROTOCOL_VERSION_META_KEY];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Resolver: the shell snippet a registration embeds via `/bin/sh -c` so the
 // registration itself never hardcodes a path to this script. Plugin install
@@ -1533,7 +1556,10 @@ export class Shim {
       // cache OUR stale copy as if it were fresh. ttlMs:0 is the spec's way to
       // say "immediately stale, re-ask when you can" - the honest label for a
       // last-known-good list served from disk.
-      return { tools: cached, ttlMs: 0 };
+      // resultType marks this a COMPLETE result (2026-07-28) — it is a real
+      // answer, just a stale one — while ttlMs:0 stops the client caching our
+      // stale copy as fresh. Harmless to a legacy client, which ignores both.
+      return { tools: cached, resultType: "complete", ttlMs: 0 };
     }
   }
 
@@ -1710,6 +1736,42 @@ export class Shim {
     // tools/call can launch the app, and a launch for a reply nobody will
     // ever read is a real, user-visible side effect, not a no-op.
     if (id === undefined) return null;
+    // A modern client declares its version on EVERY request. Reject one we do
+    // not serve with the error the spec defines, listing what we do serve, so
+    // the client can retry on a mutually supported version instead of guessing.
+    // A request with no such declaration is legacy and passes through here
+    // untouched.
+    const wanted = requestedProtocolVersion(params);
+    if (wanted !== undefined && !SUPPORTED_PROTOCOL_VERSIONS.includes(wanted)) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: UNSUPPORTED_PROTOCOL_VERSION,
+          message: "Unsupported protocol version",
+          data: { supported: SUPPORTED_PROTOCOL_VERSIONS, requested: wanted },
+        },
+      };
+    }
+    // Servers MUST implement server/discover (2026-07-28). It is also the stdio
+    // backward-compatibility probe: a dual-era client sends it first and falls
+    // back to `initialize` on any non-modern error. Answering it locally, like
+    // initialize, keeps the shim describable while the backend is closed.
+    if (method === "server/discover") {
+      return ok(id, {
+        resultType: "complete",
+        supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
+        capabilities: { tools: { listChanged: true } },
+        _meta: {
+          "io.modelcontextprotocol/serverInfo": { name: this.name, version: "1.0.0" },
+        },
+        // Zero: this shim's own tool list genuinely changes (cached list while
+        // the app is closed, live list once it opens), so a client must never
+        // hold this answer as fresh.
+        ttlMs: 0,
+        cacheScope: "public",
+      });
+    }
     if (method === "ping") return ok(id, {});
     if (method === "tools/list") return ok(id, await this.toolsList(params, id));
     if (method === "tools/call") return ok(id, await this.toolsCall(params, id));

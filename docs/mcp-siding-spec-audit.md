@@ -38,7 +38,7 @@ it while being able to serve a modern client.
 
 Ordered by when they bite, not by size.
 
-### 1. MRTR interim results are rejected as malformed — breaks first
+### 1. MRTR interim results rejected as malformed — DONE (0.9.1)
 
 `validateResultShape` requires `Array.isArray(result.content)` for `tools/call`
 and `Array.isArray(result.tools)` for `tools/list`. Under `2026-07-28` a
@@ -50,7 +50,7 @@ This is the only gap that breaks purely from the *backend* modernizing, with no
 change on the client side, so it is first. The fix is narrow: treat a result
 carrying `resultType: "input_required"` as valid and pass it through untouched.
 
-### 2. No `server/discover` — spec says servers MUST implement it
+### 2. `server/discover` — DONE (0.9.3)
 
 It is also the stdio backward-compatibility probe: a dual-era client sends
 `server/discover` first and falls back to `initialize` on any non-modern error.
@@ -62,7 +62,7 @@ legible to a modern client.
 Response needs `supportedVersions`, `capabilities`, `_meta` serverInfo, and the
 caching hints (`ttlMs`, `cacheScope`).
 
-### 3. No per-request `_meta` protocol version, no `UnsupportedProtocolVersionError`
+### 3. Per-request `_meta` version + `UnsupportedProtocolVersionError` — DONE (0.9.3)
 
 A modern client's requests carry `_meta.io.modelcontextprotocol/protocolVersion`
 and expect either service or a `-32022` error listing supported versions. The
@@ -70,7 +70,7 @@ shim ignores `_meta` entirely, so a modern client is served under legacy
 semantics by accident — the matrix's "may even process an era-ambiguous method
 under legacy semantics" case.
 
-### 4. No `resultType` on synthesized results
+### 4. `resultType` on synthesized results — DONE (0.9.3)
 
 The shim manufactures results in two places — the offline `tools/list` cache
 fallback and the `isError` result for an unreachable backend. Modern results
@@ -98,6 +98,18 @@ which fits the shim's existing per-session connection state.
   backing-off poll — the spec requires jitter and backoff of any implementation
   that chooses to poll.
 - **`MCP-Protocol-Version` header** is sent on requests once negotiated.
+
+## Status
+
+Gaps 1–4 are done: the shim now answers `server/discover`, honours a
+per-request `_meta` protocol version (rejecting an unserved one with `-32022`
+and the list it does serve), and marks synthesized results `resultType:
+"complete"`. It advertises `2026-07-28`, `2025-11-25` and `2025-06-18`, so it
+is dual-era on the CLIENT face while still speaking legacy `initialize` to the
+backend.
+
+Gap 5 (dual-era on the BACKEND face) remains, and deliberately: nothing needs
+it until a desktop app modernizes, and none has.
 
 ## Suggested sequencing
 

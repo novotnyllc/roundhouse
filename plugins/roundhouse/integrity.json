@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "c67ddea9d2ee078957da09f9f609cd62c4df24a72b42bdbe606a4a2c597e27c5"
+      "sha256": "c0f7c1062fef42ccaa7c0385ef02a8262f0a602e109104b42c0cba4359c655ab"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "f48183c5c7c21ce679e09381527e9c5cc9dc2a02b46eae37a1b14c9a1b23e017"
+      "sha256": "7add200a0c85f3e90ae68e7abf81a38e64b1f728cddd9944a8b5664a2cefa559"
     },
     {
       "path": "assets/icon.png",
@@ -174,11 +174,11 @@
     },
     {
       "path": "scripts/mcp-siding.mjs",
-      "sha256": "05922a7a8ce5a55b08ebc84a210d55c87c9c4424094075c5b727285d18da422a"
+      "sha256": "1ceb9059fe89cd49c79ff49dad8224010c659496a0dd004cb504be22f733ceee"
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
-      "sha256": "d29ca0916a7408a833e0d39cc6554aceee83f3bc4dbb146dfaf592db328d1ce2"
+      "sha256": "c8aac8111e6b2282d90f88ed1704c82c90a4030a9ca57a6a3112eba77e428e53"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -293,5 +293,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.1"
+  "version": "0.9.3"
 }
