@@ -18,3 +18,24 @@
 *.gz   binary
 *.woff  binary
 *.woff2 binary
+
+# integrity.json is GENERATED, so merging it textually is meaningless: two
+# branches that each touched a hashed file produce different hashes for the
+# same files, and git reports a conflict with no correct textual resolution.
+# Stacked PRs made this constant - every branch touches it, so every merge to
+# main conflicts every other branch by construction.
+#
+# `merge=ours` keeps our side rather than conflicting. That is NOT the
+# correctness guarantee: `scripts/preflight` regenerates the manifest and fails
+# if it differs from what is staged, so a stale or wrong manifest cannot reach
+# a push regardless of what the merge picked. The attribute removes the noise;
+# the gate keeps the truth.
+#
+# Requires the stock one-liner below, which `scripts/preflight` sets for you:
+#     git config merge.ours.driver true
+# Without it git falls back to a normal conflict - noisier, never wrong.
+#
+# Deliberately NOT applied to the plugin manifests: a version conflict is a
+# semantic decision about which release this is, and silently keeping one side
+# would hide an intended bump.
+plugins/roundhouse/integrity.json merge=ours

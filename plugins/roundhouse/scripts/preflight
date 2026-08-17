@@ -21,6 +21,16 @@ cd "$(dirname "$0")/../../.." || exit 1
 fail=0
 note() { printf '%s\n' "$*" >&2; }
 
+# --- 0. the merge attribute integrity.json relies on -----------------------
+# .gitattributes marks the generated manifest `merge=ours`, which needs this
+# stock driver defined locally (git ships no default for it). Set here rather
+# than in a hook: preflight is an explicit developer action, so it is the honest
+# place to configure repo-local git behaviour. Without it, merges simply
+# conflict as before - noisier, never wrong.
+if [ "$(git config --get merge.ours.driver || true)" != "true" ]; then
+  git config merge.ours.driver true && note "ok   configured merge.ours.driver (integrity.json stops conflicting)"
+fi
+
 # --- 1. integrity manifest is regenerated and committed --------------------
 # Capture the generator's OWN exit status first. It can refuse before touching
 # integrity.json at all (e.g. exit 65 when only one plugin manifest is bumped),

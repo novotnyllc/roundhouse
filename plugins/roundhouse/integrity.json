@@ -182,7 +182,7 @@
     },
     {
       "path": "scripts/preflight",
-      "sha256": "8e6cb4d191fbb1b78775045336997cbb5bcb3cec0a6f092dc912681e2c058bf4"
+      "sha256": "0717adf3a10fe028350fca1c111a4383b032d316caae83dd8d8e9b8d89046b32"
     },
     {
       "path": "scripts/prepare-ssh-identity",
