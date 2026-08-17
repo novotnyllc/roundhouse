@@ -392,7 +392,15 @@ class MalformedResponse extends Error {}
 // not the place to reject a shape a real backend legitimately sends.
 // Methods with no shape requirement here (initialize, ...) pass through
 // unchecked.
-function validateResultShape(method, result) {
+export function validateResultShape(method, result) {
+  // MCP 2026-07-28 multi-round-trip requests: an INTERIM result carries
+  // `resultType: "input_required"` and neither a `content` nor a `tools` array,
+  // because the operation has not produced one yet - it is asking for input.
+  // The per-method checks below would call that malformed and turn a legitimate
+  // response into an error the moment a backend adopts the newer revision. Only
+  // a `complete` result (or an older backend that says nothing, which is the
+  // same thing) is subject to shape rules.
+  if (result !== null && typeof result === "object" && result.resultType !== undefined && result.resultType !== "complete") return;
   if (method === "tools/call") {
     if (result === null || typeof result !== "object" || !Array.isArray(result.content)) {
       throw new MalformedResponse(`${method}: result is not a valid CallToolResult (missing a content array)`);
