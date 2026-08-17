@@ -129,7 +129,7 @@ function Get-ClaudeNodeCandidates {
     if ($ClaudePath) {
         $claudeDirectory = Split-Path -Parent $ClaudePath
         # Derive from the actual claude.exe layout first. Native inspection of
-        # iris-windows found claude.exe at %USERPROFILE%\.local\bin with no
+        # a Windows host found claude.exe at %USERPROFILE%\.local\bin with no
         # node.exe below that directory; the default roots below therefore
         # remain documented best-effort probes only.
         Add-UniqueProbe $candidates (Join-Path $claudeDirectory 'node.exe')

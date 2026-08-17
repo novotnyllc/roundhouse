@@ -171,7 +171,7 @@ function Test-McpSidingNodeCapability {
 # deliberately included here even though the POSIX resolver deliberately
 # omits its equivalents: on Windows those layouts are known empirically
 # (codex-plugin-hooks.ps1 in this same directory resolves them for the hook
-# lane, verified against the iris-windows host), whereas no macOS/Linux
+# lane, verified against a native Windows host), whereas no macOS/Linux
 # bundle path is - and guessing one is worse than not trying it.
 function Get-McpSidingNodeCandidates {
     param([AllowNull()][string]$Override)

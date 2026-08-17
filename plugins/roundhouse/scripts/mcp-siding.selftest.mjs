@@ -239,6 +239,33 @@ export async function selftest() {
     "a message with a non-matching id must be forwarded, not silently discarded",
   );
 
+  // A server-to-CLIENT request (method AND id) must NOT be forwarded. The
+  // shim has no path to carry its reply back: the client's response has no
+  // method, so handle() would read it as a fresh backend request, and it
+  // would serialize behind the still-running call that produced it - the
+  // backend waits forever for a correlated reply. Notifications and
+  // responses still go through; only requests are dropped.
+  const mixedForwarded = [];
+  const mixedMatch = await readSseUntilMatch(
+    fakeReadableStream([
+      'data: {"jsonrpc":"2.0","id":41,"method":"sampling/createMessage","params":{}}\n\n',
+      'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"p":1}}\n\n',
+      'data: {"jsonrpc":"2.0","id":42,"result":{"other":true}}\n\n',
+      'data: {"jsonrpc":"2.0","id":43,"result":{"mine":true}}\n\n',
+    ]),
+    43,
+    (msg) => mixedForwarded.push(msg),
+  );
+  assert.deepEqual(mixedMatch, { jsonrpc: "2.0", id: 43, result: { mine: true } });
+  assert.deepEqual(
+    mixedForwarded,
+    [
+      { jsonrpc: "2.0", method: "notifications/progress", params: { p: 1 } },
+      { jsonrpc: "2.0", id: 42, result: { other: true } },
+    ],
+    "server-to-client requests must be dropped; notifications and other-id responses must still forward",
+  );
+
   // Anything in a data: field that is not a JSON-RPC message - a bare
   // number, an array, an object with no jsonrpc, a jsonrpc envelope with
   // neither method nor result/error - is dropped, never written to the

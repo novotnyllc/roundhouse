@@ -669,7 +669,31 @@ export async function readSseUntilMatch(stream, expectedId, onMessage) {
       buffer = buffer.slice(sep + 2);
       const msg = parseSseEvent(rawEvent);
       if (msg && typeof msg === "object" && "id" in msg && msg.id === expectedId) return msg;
-      if (onMessage && isJsonRpcMessage(msg)) onMessage(msg);
+      // NOTIFICATIONS ONLY - a message with an id is a server-to-client
+      // REQUEST (sampling/createMessage, elicitation/create), and we have no
+      // path to carry its reply back: the client's response has no method, so
+      // handle() would read it as a fresh backend request, and the reply would
+      // serialize behind the still-running call that produced it. The backend
+      // would wait for a correlated reply that never arrives. Dropping it is
+      // safe rather than merely convenient: connect() declares
+      // `capabilities: {}` to the backend, so a spec-compliant server has been
+      // told this client supports no sampling or elicitation and must not ask.
+      // Forward everything EXCEPT a server-to-client request (method + id):
+      // sampling/createMessage, elicitation/create. We have no path to carry
+      // such a request's reply back - the client's response has no method, so
+      // handle() would read it as a fresh backend request, and it would
+      // serialize behind the still-running call that produced it. The backend
+      // would wait for a correlated reply that never arrives. Dropping it is
+      // safe rather than merely convenient: connect() declares
+      // `capabilities: {}` to the backend, so a spec-compliant server has been
+      // told this client supports no sampling or elicitation and must not ask.
+      //
+      // Note this is NOT "id-less messages only": a RESPONSE carrying an id
+      // that does not match this call's is another concurrent call's reply
+      // arriving on this stream, and dropping those breaks multiplexing.
+      // Request = method AND id. That distinction is the whole rule.
+      const isServerRequest = typeof msg?.method === "string" && msg?.id !== undefined;
+      if (onMessage && isJsonRpcMessage(msg) && !isServerRequest) onMessage(msg);
     }
     return undefined;
   };

@@ -107,7 +107,11 @@ Ask the user (do not assume): what to call this MCP server (e.g. `fusion`,
 offer the presets below or "something else"; and which harness(es) —
 Claude Code, Codex, or both.
 
-| Preset | `--backend-url` | `--app` |
+The `--app` column is **macOS-only**. Backend URLs are the same everywhere;
+app paths are not. For native Windows see "Windows app paths" under the
+PowerShell route below — do not carry these values over.
+
+| Preset | `--backend-url` | `--app` (macOS) |
 | --- | --- | --- |
 | Autodesk Fusion | `http://127.0.0.1:27182/mcp` | `$HOME/Applications/Autodesk Fusion.app` |
 | Figma | `http://127.0.0.1:3845/mcp` | `/Applications/Figma.app` |
@@ -279,7 +283,28 @@ backslash paths, and it has to survive the harness CLI's own argument
 handling. `-EncodedCommand` takes one base64 token, so there is nothing
 left to quote or re-escape at any layer. Ask the same three questions as
 the POSIX route (name, backend, harness(es)) and use the same preset
-table.
+table **for `--backend-url` only**.
+
+### Windows app paths
+
+`defaultLauncher()` executes `--app` directly on Windows, so a macOS `.app`
+bundle path fails with ENOENT and launch-on-demand is silently dead. Never
+carry the macOS `--app` values over. Resolve the real executable, and
+**preflight it** — if it does not resolve, omit `--app` entirely rather than
+registering a target known to be invalid. Launch-on-demand is optional; a
+wrong path is worse than none, because it fails only later, on first use.
+
+```powershell
+# Fusion's launcher lives under a per-build webdeploy directory, so it must be
+# discovered rather than hardcoded; take the newest if several are present.
+$fusion = Get-ChildItem -Path "$env:LOCALAPPDATA\Autodesk\webdeploy\production" `
+  -Filter 'FusionLauncher.exe' -Recurse -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+$figma = "$env:LOCALAPPDATA\Figma\Figma.exe"   # verify before use
+
+# Pass --app ONLY if it actually exists on this host.
+$appArgs = if ($appPath -and (Test-Path -LiteralPath $appPath)) { @('--app', $appPath) } else { @() }
+```
 
 Run this in PowerShell, with `$SkillDir` set to the absolute directory
 containing this `SKILL.md`:
@@ -295,7 +320,16 @@ $nodeBin = Resolve-McpSidingNode -Override $env:MCP_SIDING_NODE `
 
 $script = & $nodeBin (Join-Path (Join-Path $SkillDir '..\..\scripts') 'mcp-siding.mjs') `
   --print-shim-script --platform windows `
-  --backend-url <URL> --name <NAME> --app "<APP_PATH>" | Out-String
+  --backend-url <URL> --name <NAME>  | Out-String
+# A rejected URL or missing value exits nonzero with empty stdout, and Windows
+# PowerShell 5.1 does NOT turn a native process's nonzero exit into a
+# terminating error here. Without this gate the script encodes an empty string
+# and runs the mutating `mcp add` below anyway, registering a server whose
+# command does nothing. Check both: the exit code, and that anything was
+# actually produced.
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($script)) {
+  throw "mcp-siding.mjs failed to generate a shim script (exit $LASTEXITCODE). Nothing was registered."
+}
 $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
 ```
 
