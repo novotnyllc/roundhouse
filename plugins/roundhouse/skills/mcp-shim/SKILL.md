@@ -320,7 +320,7 @@ $nodeBin = Resolve-McpSidingNode -Override $env:MCP_SIDING_NODE `
 
 $script = & $nodeBin (Join-Path (Join-Path $SkillDir '..\..\scripts') 'mcp-siding.mjs') `
   --print-shim-script --platform windows `
-  --backend-url <URL> --name <NAME>  | Out-String
+  --backend-url <URL> --name <NAME> @appArgs | Out-String
 # A rejected URL or missing value exits nonzero with empty stdout, and Windows
 # PowerShell 5.1 does NOT turn a native process's nonzero exit into a
 # terminating error here. Without this gate the script encodes an empty string
