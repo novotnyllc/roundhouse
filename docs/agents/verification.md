@@ -11,7 +11,7 @@ POSIX platform, fanned out from the `scope-matrix` job) and `windows`
 
    ```sh
    for s in roundhouse certify-ssh-node collect-posix enroll-privilege-posix \
-            enroll-ssh-posix launcher-install prepare-ssh-identity privilege-broker-posix \
+            enroll-ssh-posix launcher-install preflight prepare-ssh-identity privilege-broker-posix \
             test-roundhouse update-integrity; do
      bash -n "plugins/roundhouse/scripts/$s"
    done

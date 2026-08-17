@@ -22,8 +22,17 @@ fail=0
 note() { printf '%s\n' "$*" >&2; }
 
 # --- 1. integrity manifest is regenerated and committed --------------------
-plugins/roundhouse/scripts/update-integrity >/dev/null 2>&1
-if ! git diff --quiet -- plugins/roundhouse/integrity.json; then
+# Capture the generator's OWN exit status first. It can refuse before touching
+# integrity.json at all (e.g. exit 65 when only one plugin manifest is bumped),
+# and a clean `git diff` afterwards would then read as "current" and let the
+# mandated gate fail open on the very inconsistency it exists to catch.
+integrity_out=$(plugins/roundhouse/scripts/update-integrity 2>&1)
+integrity_rc=$?
+if [ "$integrity_rc" -ne 0 ]; then
+  note "FAIL update-integrity exited $integrity_rc"
+  [ -n "$integrity_out" ] && note "$integrity_out"
+  fail=1
+elif ! git diff --quiet -- plugins/roundhouse/integrity.json; then
   note "FAIL integrity.json is stale — update-integrity changed it. Stage the result."
   fail=1
 else
@@ -58,16 +67,32 @@ for (const file of files) {
   // rather than resetting per block - otherwise every multi-step procedure
   // reports false failures and the gate gets ignored, which is worse than not
   // having it.
+  // IN EXECUTION ORDER. Collecting every assignment up front would accept a
+  // variable read in an early snippet and assigned only in a later one - which
+  // is precisely the use-before-assignment defect this exists to catch, since a
+  // reader pasting the documented sequence hits the unset variable. Walk
+  // statements in order and let a name become known only once it is assigned.
   const assigned = new Set();
   for (const block of blocks) {
-    for (const m of block.matchAll(/\$([A-Za-z_][A-Za-z0-9_]*)\s*=/g)) assigned.add(m[1]);
-  }
-  for (const block of blocks) {
-    for (const m of block.matchAll(/\$(?!env:)([A-Za-z_][A-Za-z0-9_]*)/g)) {
-      const name = m[1];
-      if (assigned.has(name) || KNOWN.has(name)) continue;
-      console.error(`FAIL ${file}: PowerShell snippet reads $${name} but nothing assigns it`);
-      bad = 1;
+    for (const raw of block.split("\n")) {
+      // Strip comments before scanning. Prose in a comment legitimately NAMES a
+      // variable to explain it ("without this, $appPath is unset"), and reading
+      // that as code reports a use-before-assignment that does not exist.
+      const line = raw.replace(/#.*$/, "");
+      for (const m of line.matchAll(/\$(?!env:)([A-Za-z_][A-Za-z0-9_]*)/g)) {
+        const name = m[1];
+        if (assigned.has(name) || KNOWN.has(name)) continue;
+        // An assignment on THIS line defines the name from here on; reading it
+        // on its own right-hand side is still a use-before-assignment.
+        const assignsHere = new RegExp(`\\$${name}\\s*=`).test(line);
+        const readBeforeAssign = assignsHere
+          ? line.indexOf(`$${name}`) < line.search(new RegExp(`\\$${name}\\s*=`))
+          : true;
+        if (assignsHere && !readBeforeAssign) continue;
+        console.error(`FAIL ${file}: PowerShell snippet reads $${name} before anything assigns it`);
+        bad = 1;
+      }
+      for (const m of line.matchAll(/\$([A-Za-z_][A-Za-z0-9_]*)\s*=/g)) assigned.add(m[1]);
     }
   }
 }
@@ -77,12 +102,29 @@ NODE
 [ -n "$snippet_check" ] && note "$snippet_check"
 [ "$fail" -eq 0 ] && note "ok   shipped snippets assign what they read"
 
-# --- 3. the shim self-test -------------------------------------------------
-if node plugins/roundhouse/scripts/mcp-siding.selftest.mjs >/dev/null 2>&1; then
-  note "ok   mcp-siding selftest"
+# --- 3. the mandated fixture suite -----------------------------------------
+# AGENTS.md names test-roundhouse, and it must PRINT "PASS" — substituting the
+# narrower shim selftest here would let a failure in any other fixture through
+# while this still reported PASSED, which is worse than having no gate because
+# it reads as coverage. PREFLIGHT_FAST=1 runs only the shim selftest for a tight
+# inner loop; it is deliberately NOT the default.
+if [ "${PREFLIGHT_FAST:-0}" = "1" ]; then
+  if node plugins/roundhouse/scripts/mcp-siding.selftest.mjs >/dev/null 2>&1; then
+    note "ok   mcp-siding selftest (PREFLIGHT_FAST — full suite SKIPPED)"
+  else
+    note "FAIL mcp-siding selftest"
+    fail=1
+  fi
 else
-  note "FAIL mcp-siding selftest"
-  fail=1
+  suite_out=$(plugins/roundhouse/scripts/test-roundhouse 2>&1)
+  suite_rc=$?
+  if [ "$suite_rc" -eq 0 ] && printf '%s' "$suite_out" | grep -q '^PASS'; then
+    note "ok   test-roundhouse"
+  else
+    note "FAIL test-roundhouse (exit $suite_rc)"
+    printf '%s\n' "$suite_out" | tail -15 >&2
+    fail=1
+  fi
 fi
 
 if [ "$fail" -ne 0 ]; then
