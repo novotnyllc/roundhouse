@@ -5186,6 +5186,14 @@ async function selftestBackendEraDetection() {
         assert.equal(shim.backendEra, "modern");
         assert.equal(sawInitialize, false, "a modern backend needs NO handshake — sending one is the bug");
         assert.equal(sawMetaVersion, "2026-07-28", "every request to a modern backend must declare its version");
+        // Including the bare notification, which bypasses backend(). A modern
+        // backend that ignores an undeclared cancellation keeps running a
+        // possibly-mutating operation.
+        assert.deepEqual(
+          shim.withProtocolMeta({ requestId: 1, reason: "x" })._meta,
+          { "io.modelcontextprotocol/protocolVersion": "2026-07-28" },
+          "notifications/cancelled must carry the protocol version too",
+        );
       },
     );
 
@@ -5270,6 +5278,42 @@ async function selftestBackendEraDetection() {
         },
       );
     }
+
+    // An AUTH challenge is not an era verdict. A desktop app waiting on login
+    // answers 401/403 and is reachable moments later; caching legacy there is
+    // permanent, and a modern-only backend could never be reached again.
+    for (const status of [401, 403, 407]) {
+      await withServer(
+        (req, res) => {
+          readJsonBody(req).then((msg) => {
+            if (msg.method === "server/discover") return sendJson(res, status, { error: "auth required" });
+            sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+          });
+        },
+        async (url) => {
+          const shim = mk(url);
+          await shim.probeBackendEra().catch(() => {});
+          assert.equal(shim.backendEra, null, `HTTP ${status} is an auth challenge, not a protocol statement`);
+        },
+      );
+    }
+
+    // A transport failure must fail ONCE. Returning "undecided" let connect()
+    // immediately issue a second request, so an endpoint that accepts
+    // connections and never answers burned the whole timeout twice.
+    let hangCount = 0;
+    await withServer(
+      (req) => { hangCount++; readJsonBody(req).then(() => { /* never responds */ }); },
+      async (url) => {
+        const shim = new Shim({
+          url, name: "test", cachePath: join(dir, "hang.json"),
+          timeoutMs: 300, launchEnabled: false, appPath: null, launchGraceMs: 150_000,
+        });
+        await shim.handle({ jsonrpc: "2.0", id: 9, method: "tools/call", params: {} });
+        assert.equal(hangCount, 1, "a hung endpoint must be hit once, not probed then re-attempted");
+        assert.equal(shim.backendEra, null, "and the era stays uncached for the next call");
+      },
+    );
 
     // --- downtime is NOT an era verdict ---------------------------------
     const down = mk("http://127.0.0.1:65533/mcp");

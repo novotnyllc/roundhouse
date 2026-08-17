@@ -1250,6 +1250,18 @@ export class Shim {
   // Deliberately fail-safe toward legacy: every desktop backend today speaks
   // the handshake, so an ambiguous answer must not strand us in modern mode
   // against a server that cannot serve it.
+  // Adds the per-request protocol version when, and only when, the backend has
+  // been PROVEN modern. A legacy backend negotiated once by handshake and must
+  // not receive _meta it never asked for. One definition, so every outbound
+  // path - requests and bare notifications alike - decorates identically.
+  withProtocolMeta(params) {
+    if (this.backendEra !== "modern") return params;
+    return {
+      ...(params ?? {}),
+      _meta: { ...(params?._meta ?? {}), [PROTOCOL_VERSION_META_KEY]: this.protocolVersion ?? MODERN_PROTOCOL_VERSION },
+    };
+  }
+
   async probeBackendEra(clientRequestId) {
     if (this.backendEra !== null) return this.backendEra;
     try {
@@ -1313,16 +1325,25 @@ export class Shim {
       // blip must leave the era undecided so the next attempt can probe again.
       if (err instanceof HttpRejected) {
         const s = err.status;
-        if (s >= 400 && s < 500 && s !== 408 && s !== 429) {
+        // 401/403/407 are authentication or authorization challenges, not a
+        // statement about which protocol the server speaks - a desktop app
+        // waiting on login answers this way and becomes reachable moments
+        // later. Caching legacy here is permanent: discovery is skipped
+        // forever after, and a modern-only backend can never be reached again
+        // without restarting the shim.
+        if (s >= 400 && s < 500 && ![401, 403, 407, 408, 429].includes(s)) {
           this.backendEra = "legacy";
           return this.backendEra;
         }
         return null;
       }
       // Anything else - unreachable, timeout, malformed - is genuinely
-      // inconclusive. Leave it undecided so a later attempt probes again
-      // rather than caching an era from what was only downtime.
-      return null;
+      // inconclusive about the ERA, but it is conclusive about REACHABILITY
+      // right now. Returning null let connect() immediately issue a second
+      // request, so an endpoint that accepts connections and never answers
+      // burned the full timeout twice before reporting anything. Leave the era
+      // uncached for the next call and re-throw, so this attempt fails once.
+      throw err;
     }
     this.backendEra = "legacy";
     return this.backendEra;
@@ -1408,9 +1429,7 @@ export class Shim {
           // A modern backend expects the version on EVERY request; a legacy
           // one negotiated it once and must not receive _meta it never asked
           // for, so this is added only for a backend proven modern.
-          const outbound = this.backendEra === "modern"
-            ? { ...(params ?? {}), _meta: { ...(params?._meta ?? {}), [PROTOCOL_VERSION_META_KEY]: this.protocolVersion ?? MODERN_PROTOCOL_VERSION } }
-            : params;
+          const outbound = this.withProtocolMeta(params);
           const { body } = await this.post({ jsonrpc: "2.0", id: backendRequestId, method, params: outbound }, this.sid, clientRequestId);
           if (body?.error) throw new BackendReported(body.error.code, body.error.message ?? "backend error");
           // This call always sends an id, so a response was expected - a 200
@@ -1505,7 +1524,11 @@ export class Shim {
     const backendRequestId = this.backendIdForClient.get(clientRequestId);
     if (this.connected && backendRequestId !== undefined) {
       return this.post(
-        { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: backendRequestId, reason } },
+        // cancel() bypasses backend(), so it must add the modern metadata
+        // itself. Without it a modern backend can reject or ignore the
+        // cancellation and keep running a possibly-mutating operation - the
+        // one message where being ignored is worst.
+        { jsonrpc: "2.0", method: "notifications/cancelled", params: this.withProtocolMeta({ requestId: backendRequestId, reason }) },
         this.sid,
       ).catch(() => {});
     }
