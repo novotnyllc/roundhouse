@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "c67ddea9d2ee078957da09f9f609cd62c4df24a72b42bdbe606a4a2c597e27c5"
+      "sha256": "8b4a4254352dfc9941ab859a2b657ba04510a3fd75cd610371a7378eb603779d"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "f48183c5c7c21ce679e09381527e9c5cc9dc2a02b46eae37a1b14c9a1b23e017"
+      "sha256": "47981835bed3ce6085cae245670867beaede429e1dab41ce55397fea59c751a3"
     },
     {
       "path": "assets/icon.png",
@@ -170,7 +170,7 @@
     },
     {
       "path": "scripts/mcp-siding-windows.ps1",
-      "sha256": "8f33ba40adc814879320565d9df2b440b4a70abd7b964fc6ab468b9325065dc1"
+      "sha256": "1ef2574ce5b41b730a37c868a1c2d01d5799acad3e82701e41791ff9b3c64f70"
     },
     {
       "path": "scripts/mcp-siding.mjs",
@@ -293,5 +293,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.1"
+  "version": "0.9.4"
 }

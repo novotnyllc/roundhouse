@@ -156,7 +156,14 @@ function Test-McpSidingNodeCapability {
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        & $Path -e 'if (typeof fetch !== "function" || typeof ReadableStream !== "function") process.exit(1)' *> $null
+        # NO quotes inside this expression, deliberately. PowerShell strips the
+        # inner double quotes when handing an argument to a NATIVE executable,
+        # so the obvious `typeof fetch !== "function"` form reached node as
+        # `typeof fetch !== function` - a SyntaxError, exit 1, and therefore
+        # EVERY candidate rejected as incapable. The shim could never start on
+        # Windows, and the failure looked exactly like "no usable node found".
+        # globalThis lookups need no string literals and cannot be mangled.
+        & $Path -e 'if (!globalThis.fetch || !globalThis.ReadableStream) process.exit(1)' *> $null
     } catch {
         return $false
     } finally {
