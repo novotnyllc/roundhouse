@@ -1524,6 +1524,7 @@ export async function selftest() {
   //          show. -------------------------------------------------------
   await selftestNotificationForwardingEndToEnd();
   await selftestToolListReconcileNotifiesClient();
+  await selftestInterimResultsArePassedThrough();
   await selftestReconcileNeverCommitsTruncatedWalk();
 
   // -- 7j3e. #16: native Windows. The PowerShell resolver/launcher lives in
@@ -4897,4 +4898,38 @@ async function selftestToolListReconcileNotifiesClient() {
     await new Promise((r) => server.close(r));
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+// MCP 2026-07-28 multi-round-trip requests: an INTERIM result carries
+// `resultType: "input_required"` and no content/tools array, because the
+// operation is asking for input rather than returning one. The shape checks
+// would previously call that malformed and convert a legitimate response into
+// an error the moment a backend adopted the newer revision.
+async function selftestInterimResultsArePassedThrough() {
+  const { validateResultShape } = await import("./mcp-siding.mjs");
+
+  // Interim results of either method pass untouched, missing arrays and all.
+  for (const method of ["tools/call", "tools/list"]) {
+    validateResultShape(method, { resultType: "input_required", requestState: "abc" });
+  }
+
+  // A COMPLETE result is still held to its shape - the relaxation must not
+  // become a hole a genuinely malformed response can walk through.
+  assert.throws(
+    () => validateResultShape("tools/call", { resultType: "complete" }),
+    /CallToolResult/,
+    "a complete tools/call result still requires a content array",
+  );
+  assert.throws(
+    () => validateResultShape("tools/list", { resultType: "complete" }),
+    /ListToolsResult/,
+    "a complete tools/list result still requires a tools array",
+  );
+  // And a legacy backend, which says nothing about resultType, is unaffected.
+  assert.throws(
+    () => validateResultShape("tools/call", {}),
+    /CallToolResult/,
+    "a result with no resultType is treated as complete, exactly as before",
+  );
+  validateResultShape("tools/call", { content: [] });
 }
