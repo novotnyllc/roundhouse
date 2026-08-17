@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "bc893c0556b6a716c281075019ed1e33fb44ff9e7f382ef62cb934681add13df"
+      "sha256": "2d9a7de2849bd53a2cd813ec5cc730bed21ccfe2f7f4474ce58226b6141381bc"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "a259254c6b03a228ccea662061a98f4b1aa7c20f19e6b3bb7d468b8e938799d8"
+      "sha256": "d8fc0300650bc9f5a7aeb4c599108a3e829e303f619f763e9b5ce7a8cbc0899c"
     },
     {
       "path": "assets/icon.png",
@@ -54,7 +54,7 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.ps1",
-      "sha256": "85eb42dec770d476faf71508153d7e95b52e59dd0651e7040c276fe071102a8f"
+      "sha256": "550013322f9f23a98c4185c28e11fe445437b04fe6fa3b469a317d34b3450827"
     },
     {
       "path": "scripts/collect-posix",
@@ -169,12 +169,16 @@
       "sha256": "a2eb6642592cf21622cfb02166622a59cddbb61697f5720945a9c910bf0de6a5"
     },
     {
+      "path": "scripts/mcp-siding-windows.ps1",
+      "sha256": "8f33ba40adc814879320565d9df2b440b4a70abd7b964fc6ab468b9325065dc1"
+    },
+    {
       "path": "scripts/mcp-siding.mjs",
-      "sha256": "4214bd84cc5ea323d4d0901306345df7f5b8014a1ae13b95bcc6d829dcaa9422"
+      "sha256": "411f7cbed788c4b6c7c46bd710a63ee96446f3265fd6cbfbbff492579582d22a"
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
-      "sha256": "3d64d069203074745a7721ddfb38ab5b971f0a7b1af8e542673c4c628539cbef"
+      "sha256": "313f74a1ab1b97c361d3e8b9cf95b088660e9a4e2fe27f1b9e407f5f413c4a20"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -262,7 +266,7 @@
     },
     {
       "path": "skills/mcp-shim/SKILL.md",
-      "sha256": "7f80d3374bd8e64137cc8f5ad7f5d98658755b5f0dc4feb540ff96a8863991ae"
+      "sha256": "6475c4fb7119233cfa89128743001a7c3e80bf166094f63ad5de60e279765c0e"
     },
     {
       "path": "skills/mcp-shim/agents/openai.yaml",
@@ -289,5 +293,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.8.0"
+  "version": "0.9.0"
 }

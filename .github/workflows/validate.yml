@@ -202,6 +202,7 @@ jobs:
             "plugins/roundhouse/scripts/codex-plugin-hooks.ps1",
             "plugins/roundhouse/scripts/enroll-privilege-windows.ps1",
             "plugins/roundhouse/scripts/enroll-windows-sftp.ps1",
+            "plugins/roundhouse/scripts/mcp-siding-windows.ps1",
             "plugins/roundhouse/scripts/privilege-broker-windows.ps1",
             "plugins/roundhouse/scripts/profile-worker-windows.ps1",
             "plugins/roundhouse/scripts/register-profile-task-windows.ps1",

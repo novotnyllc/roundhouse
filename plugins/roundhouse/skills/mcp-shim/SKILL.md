@@ -74,20 +74,23 @@ development" below.
 
 ## Install a server
 
-Before anything else, confirm this host can actually run the shim. Both
-documented registrations (see the harness table below) bake in
-`/bin/sh -c "$SCRIPT"`, and the install snippet itself is POSIX shell -
-native Windows (PowerShell or cmd.exe, with no POSIX layer) has neither,
-so a registration made there would be accepted by the harness CLI and
-then leave a server that can never spawn. Refuse before that mutation
-happens, not after:
+Pick the install route by host first. macOS, Linux and WSL take the POSIX
+route below; native Windows (PowerShell or cmd.exe, no POSIX layer) takes
+"Install on native Windows" further down. Both are supported and both
+resolve the script at spawn time; they differ only in the shell the
+registration is written in.
+
+The POSIX route's registrations bake in `/bin/sh -c "$SCRIPT"` and its
+install snippet is POSIX shell, so running it on native Windows would be
+accepted by the harness CLI and then leave a server that can never spawn.
+Guard before that mutation happens, not after:
 
 <!-- mcp-siding-selftest: windows-preflight-snippet:start -->
 ```bash
 case $(uname -s) in
   Darwin|Linux) ;;
   *)
-    echo "mcp-siding: this shim needs a POSIX shell to install and run - native Windows (PowerShell/cmd.exe, no WSL) is not supported yet. Use WSL (Windows Subsystem for Linux) and run this installer from inside it instead." >&2
+    echo "mcp-siding: this installer needs a POSIX shell, and native Windows (PowerShell/cmd.exe) has none. Use the PowerShell install route instead (see 'Install on native Windows' in this skill), or run this installer from inside WSL." >&2
     exit 1
     ;;
 esac
@@ -95,18 +98,20 @@ esac
 <!-- mcp-siding-selftest: windows-preflight-snippet:end -->
 
 WSL passes this check - it is a real Linux kernel, so `uname -s` reports
-`Linux` there, and it is the supported route onto Windows today. A native
-PowerShell resolver and launcher (so the shim could run without WSL at
-all) is a real feature with its own testing surface - out of scope here;
-this guard exists so an unsupported host gets a clear refusal instead of
-a registration that silently cannot start.
+`Linux` there, and it stays a fully supported route onto Windows: a WSL
+registration is an ordinary POSIX one. The guard is not a refusal of
+Windows, it is a refusal of the *wrong installer* for the host.
 
 Ask the user (do not assume): what to call this MCP server (e.g. `fusion`,
 `figma`, or any name they choose — never hardcode one); which backend —
 offer the presets below or "something else"; and which harness(es) —
 Claude Code, Codex, or both.
 
-| Preset | `--backend-url` | `--app` |
+The `--app` column is **macOS-only**. Backend URLs are the same everywhere;
+app paths are not. For native Windows see "Windows app paths" under the
+PowerShell route below — do not carry these values over.
+
+| Preset | `--backend-url` | `--app` (macOS) |
 | --- | --- | --- |
 | Autodesk Fusion | `http://127.0.0.1:27182/mcp` | `$HOME/Applications/Autodesk Fusion.app` |
 | Figma | `http://127.0.0.1:3845/mcp` | `/Applications/Figma.app` |
@@ -261,6 +266,121 @@ unrelated entries elsewhere, e.g. `startup_timeout_sec = 120` becoming
 either way, but worth mentioning to a user who maintains that file by
 hand.
 
+## Install on native Windows
+
+Same contract as the POSIX route — nothing is copied, nothing is
+hardcoded, the script and a usable `node` are resolved fresh at every
+spawn — expressed in PowerShell instead of `sh`. The logic lives in
+`scripts/mcp-siding-windows.ps1`; `--platform windows` emits it as the
+registration body. Use this route when `uname` is unavailable or reports
+something other than `Darwin`/`Linux`. WSL is not this route: inside WSL,
+use the POSIX one above.
+
+Registration goes through `powershell.exe` (always present on Windows;
+`pwsh` is not) with **`-EncodedCommand`**, never `-Command "<script>"`.
+That is deliberate: the body is multi-line and contains quotes, `$`, and
+backslash paths, and it has to survive the harness CLI's own argument
+handling. `-EncodedCommand` takes one base64 token, so there is nothing
+left to quote or re-escape at any layer. Ask the same three questions as
+the POSIX route (name, backend, harness(es)) and use the same preset
+table **for `--backend-url` only**.
+
+### Windows app paths
+
+`defaultLauncher()` executes `--app` directly on Windows, so a macOS `.app`
+bundle path fails with ENOENT and launch-on-demand is silently dead. Never
+carry the macOS `--app` values over. Resolve the real executable, and
+**preflight it** — if it does not resolve, omit `--app` entirely rather than
+registering a target known to be invalid. Launch-on-demand is optional; a
+wrong path is worse than none, because it fails only later, on first use.
+
+```powershell
+# Fusion's launcher lives under a per-build webdeploy directory, so it must be
+# discovered rather than hardcoded; take the newest if several are present.
+$fusion = Get-ChildItem -Path "$env:LOCALAPPDATA\Autodesk\webdeploy\production" `
+  -Filter 'FusionLauncher.exe' -Recurse -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+$figma = "$env:LOCALAPPDATA\Figma\Figma.exe"   # verify before use
+
+# Assign the preset the user actually chose. Without this, $appPath is unset,
+# the test below is vacuously false, and --app is omitted even though discovery
+# succeeded — launch-on-demand silently stays disabled.
+$appPath = $fusion        # or $figma, or the path the user supplied
+
+# Pass --app ONLY if it actually exists on this host.
+$appArgs = if ($appPath -and (Test-Path -LiteralPath $appPath)) { @('--app', $appPath) } else { @() }
+if (-not $appArgs) { Write-Warning "No usable app path; registering without launch-on-demand." }
+```
+
+Run this in PowerShell, with `$SkillDir` set to the absolute directory
+containing this `SKILL.md`:
+
+```powershell
+# Dot-sourcing defines the resolver functions and runs nothing, so the
+# install reuses the SAME node-candidate list and capability probe the
+# registered server will use at spawn time - install and runtime can never
+# disagree about what counts as a usable runtime.
+. (Join-Path (Join-Path $SkillDir '..\..\scripts') 'mcp-siding-windows.ps1')
+$nodeBin = Resolve-McpSidingNode -Override $env:MCP_SIDING_NODE `
+  -Candidates (Get-McpSidingNodeCandidates $env:MCP_SIDING_NODE)
+
+$script = & $nodeBin (Join-Path (Join-Path $SkillDir '..\..\scripts') 'mcp-siding.mjs') `
+  --print-shim-script --platform windows `
+  --backend-url <URL> --name <NAME> @appArgs | Out-String
+# A rejected URL or missing value exits nonzero with empty stdout, and Windows
+# PowerShell 5.1 does NOT turn a native process's nonzero exit into a
+# terminating error here. Without this gate the script encodes an empty string
+# and runs the mutating `mcp add` below anyway, registering a server whose
+# command does nothing. Check both: the exit code, and that anything was
+# actually produced.
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($script)) {
+  throw "mcp-siding.mjs failed to generate a shim script (exit $LASTEXITCODE). Nothing was registered."
+}
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+```
+
+`Resolve-McpSidingNode` throws with a diagnostic naming every path it
+tried (and every `node` it rejected as too old) rather than returning
+nothing — if it throws, stop and report that; do not register.
+
+| Harness | Add | Verify | Remove |
+| --- | --- | --- | --- |
+| Claude Code | `claude mcp add <NAME> -s user -- powershell -NoProfile -NonInteractive -EncodedCommand $encoded` | `claude mcp get <NAME>` — must report `Connected` | `claude mcp remove <NAME> -s user` |
+| Codex | `codex mcp add <NAME> -- powershell -NoProfile -NonInteractive -EncodedCommand $encoded` | `codex mcp get <NAME>`, THEN the probe below | `codex mcp remove <NAME>` |
+
+The Claude/Codex asymmetry is exactly as described in the POSIX section —
+`claude mcp get` really connects, `codex mcp get` only echoes stored
+config — so Codex still needs a real probe. The Windows spelling of it:
+
+```powershell
+'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' |
+  powershell -NoProfile -NonInteractive -EncodedCommand $encoded
+```
+
+A valid response is a JSON-RPC result carrying `protocolVersion`; anything
+else (empty stdout, a resolver diagnostic on stderr, a nonzero exit) is a
+failed mutation.
+
+To read back what a registration actually runs — the registered command is
+one opaque base64 token, which is the point, but it makes diagnosis
+opaque too:
+
+```powershell
+[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
+```
+
+Two Windows-specific notes worth carrying:
+
+- The version-directory scan compares versions **numerically**, so
+  `0.10.0` outranks `0.7.4`. Both harness caches
+  (`%USERPROFILE%\.claude\plugins\cache` and the `.codex` equivalent) are
+  scanned in one pass, so a Codex-updated roundhouse wins over a stale
+  Claude copy and vice versa.
+- `MCP_SIDING_PATH` and `MCP_SIDING_NODE` fail closed here identically to
+  the POSIX resolvers — set but unusable is an error naming the override,
+  never a silent fallback. See "Local development" below; pass them with
+  `-e NAME=VALUE` (Claude) or `--env NAME=VALUE` (Codex) exactly as there.
+
 ## Local development
 
 To register and exercise an unpublished working-tree build instead of a
@@ -370,11 +490,19 @@ remove-then-re-add sequence is what keeps this safe there, not the tool.
   never attempts to connect at all and will not show this, so the manual
   `initialize` probe in Install a server is what actually catches it on
   Codex.
-- **Native Windows is not supported yet.** The preflight check in Install
-  a server above refuses before registering anything - not because it is
-  impossible, but because a POSIX-shell-only shim needs a native
-  PowerShell resolver and launcher to run without WSL, which does not
-  exist yet. WSL is the supported route onto Windows today.
+- **Native Windows is unverified on a real Windows host.** The PowerShell
+  route above is implemented and tested — `scripts/mcp-siding-windows.ps1
+  -SelfTest` covers numeric version ordering across both harness caches,
+  the fail-closed overrides, the `fetch`/`ReadableStream` capability
+  probe, Windows argument quoting, and a parse of the exact registration
+  `--print-shim-script --platform windows` generates — but that self-test
+  runs under PowerShell, not under a real `claude mcp add` on a real
+  Windows machine. What remains unproven is the end-to-end registration:
+  the harness CLI accepting the `-EncodedCommand` argument, and
+  `powershell.exe` (5.1) handing stdio to `node` unchanged. WSL remains
+  the route with production mileage. If the native route misbehaves, the
+  first thing to check is the decoded registration (see Install on native
+  Windows) and the resolver's own stderr.
 
 ## Cloud
 
@@ -389,6 +517,14 @@ above) names exactly which paths it checked there.
 node "$SKILL_DIR/../../scripts/mcp-siding.mjs" --selftest
 ```
 
-Exercises the shim end to end — parsing, timeouts, caching, recovery, the
-resolver, and more — against fake backends and temp directories only, never
-the real caches. Exits non-zero on any failure.
+Exercises the shim end to end — parsing, timeouts, caching, recovery,
+notification forwarding, the resolver, and more — against fake backends
+and temp directories only, never the real caches. Exits non-zero on any
+failure.
+
+The PowerShell resolver has its own, which needs a PowerShell host (so it
+runs on Windows, or anywhere `pwsh` is installed) and a `node` on PATH:
+
+```powershell
+pwsh -NoProfile -NonInteractive -File "$SkillDir\..\..\scripts\mcp-siding-windows.ps1" -SelfTest
+```

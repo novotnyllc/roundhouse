@@ -32,11 +32,15 @@ import {
   readCache,
   RESOLVER_SH,
   buildShimScript,
+  buildShimScriptPowerShell,
+  extractWindowsResolver,
   shQuote,
+  psQuote,
   PROTOCOL_VERSION,
   parseArgs,
   buildShimFromArgs,
   defaultCachePath,
+  toolsDigest,
 } from "./mcp-siding.mjs";
 
 // Resolved relative to *this file*, not CWD or a hardcoded repo path - so
@@ -182,6 +186,136 @@ export async function selftest() {
     () => parseBody('data: {"jsonrpc":"2.0",\ndata: not valid json here\n\n', "text/event-stream", 9),
     /malformed SSE event/,
     "a malformed multi-field payload must still be rejected",
+  );
+
+  // -- 1f. #15: readSseUntilMatch must FORWARD every server-originated
+  //        JSON-RPC message that is not the awaited response, in arrival
+  //        order, while still returning the correlated response. Without
+  //        it, a backend emitting notifications/progress during a
+  //        multi-minute operation gives the client nothing and the call
+  //        looks stalled. The three properties that make forwarding safe
+  //        are asserted here directly, at the reader, since that is where
+  //        the ordering and the classification actually happen. ----------
+  const forwarded = [];
+  const progressThenResponse = await readSseUntilMatch(
+    fakeReadableStream([
+      'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1,"total":3}}\n\n',
+      'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":2,"total":3}}\n\n',
+      'data: {"jsonrpc":"2.0","id":9,"result":{"done":true}}\n\n',
+    ]),
+    9,
+    (msg) => forwarded.push(msg),
+  );
+  assert.deepEqual(
+    progressThenResponse,
+    { jsonrpc: "2.0", id: 9, result: { done: true } },
+    "forwarding must not disturb which message is accepted as the response",
+  );
+  assert.deepEqual(
+    forwarded,
+    [
+      { jsonrpc: "2.0", method: "notifications/progress", params: { progress: 1, total: 3 } },
+      { jsonrpc: "2.0", method: "notifications/progress", params: { progress: 2, total: 3 } },
+    ],
+    "every progress notification preceding the response must be forwarded, in arrival order",
+  );
+
+  // A message carrying a DIFFERENT id is a message, not this call's
+  // answer: it must be forwarded and the reader must keep waiting, never
+  // accept it as the response (the failure that would report some other
+  // request's outcome as this one's).
+  const otherIdForwarded = [];
+  const otherIdMatch = await readSseUntilMatch(
+    fakeReadableStream([
+      'data: {"jsonrpc":"2.0","id":8,"result":{"other":true}}\n\n',
+      'data: {"jsonrpc":"2.0","id":9,"result":{"mine":true}}\n\n',
+    ]),
+    9,
+    (msg) => otherIdForwarded.push(msg),
+  );
+  assert.deepEqual(otherIdMatch, { jsonrpc: "2.0", id: 9, result: { mine: true } }, "a non-matching id must never be taken as the response");
+  // Deliberately NOT forwarded. forwardNotification() writes to the client's
+  // stdout, but these ids come from this.nextBackendId - the shim's own counter
+  // - not from the client. Relaying id 8 puts a foreign id into the client's
+  // namespace, where it can prematurely satisfy an unrelated pending client
+  // request numbered 8 and turn the real reply into a duplicate. Nothing else
+  // needs it either: readSseUntilMatch is per-request and returns only the
+  // matching id, so a foreign response on this stream is orphaned by
+  // construction. This assertion previously required the opposite and was
+  // encoding the bug.
+  assert.deepEqual(
+    otherIdForwarded,
+    [],
+    "a response carrying a non-matching backend id must never reach the client",
+  );
+
+  // A server-to-CLIENT request (method AND id) must NOT be forwarded. The
+  // shim has no path to carry its reply back: the client's response has no
+  // method, so handle() would read it as a fresh backend request, and it
+  // would serialize behind the still-running call that produced it - the
+  // backend waits forever for a correlated reply. Notifications and
+  // responses still go through; only requests are dropped.
+  const mixedForwarded = [];
+  const mixedMatch = await readSseUntilMatch(
+    fakeReadableStream([
+      'data: {"jsonrpc":"2.0","id":41,"method":"sampling/createMessage","params":{}}\n\n',
+      'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"p":1}}\n\n',
+      'data: {"jsonrpc":"2.0","id":42,"result":{"other":true}}\n\n',
+      'data: {"jsonrpc":"2.0","id":43,"result":{"mine":true}}\n\n',
+    ]),
+    43,
+    (msg) => mixedForwarded.push(msg),
+  );
+  assert.deepEqual(mixedMatch, { jsonrpc: "2.0", id: 43, result: { mine: true } });
+  assert.deepEqual(
+    mixedForwarded,
+    [{ jsonrpc: "2.0", method: "notifications/progress", params: { p: 1 } }],
+    "only id-less notifications reach the client: server-to-client requests have no reply path, and other-id responses carry backend ids that would collide with the client's own",
+  );
+
+  // Anything in a data: field that is not a JSON-RPC message - a bare
+  // number, an array, an object with no jsonrpc, a jsonrpc envelope with
+  // neither method nor result/error - is dropped, never written to the
+  // client's stdio stream where it would be an unrecoverable protocol
+  // violation. The response after them must still arrive.
+  const droppedForwarded = [];
+  const afterJunk = await readSseUntilMatch(
+    fakeReadableStream([
+      "data: 42\n\n",
+      'data: ["not","a","message"]\n\n',
+      'data: {"progress":1}\n\n',
+      'data: {"jsonrpc":"2.0"}\n\n',
+      'data: {"jsonrpc":"1.0","method":"notifications/progress"}\n\n',
+      'data: {"jsonrpc":"2.0","id":9,"result":{"survived":true}}\n\n',
+    ]),
+    9,
+    (msg) => droppedForwarded.push(msg),
+  );
+  assert.deepEqual(afterJunk, { jsonrpc: "2.0", id: 9, result: { survived: true } }, "non-message events must not stop the real response arriving");
+  assert.deepEqual(droppedForwarded, [], "only a real JSON-RPC message may be forwarded - everything else is dropped");
+
+  // A payload that does not parse as JSON at all keeps its existing
+  // behavior exactly: MalformedResponse, not a forward, not a silent drop.
+  const throwForwarded = [];
+  await assert.rejects(
+    () => readSseUntilMatch(fakeReadableStream(['data: {"jsonrpc":"2.0",not json\n\n']), 9, (msg) => throwForwarded.push(msg)),
+    /malformed SSE event/,
+    "an unparseable event must still raise MalformedResponse",
+  );
+  assert.deepEqual(throwForwarded, [], "an unparseable event must never be forwarded");
+
+  // Omitting the callback entirely (every caller before #15) must behave
+  // exactly as it always did.
+  assert.deepEqual(
+    await readSseUntilMatch(
+      fakeReadableStream([
+        'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n\n',
+        'data: {"jsonrpc":"2.0","id":9,"result":{"nocb":true}}\n\n',
+      ]),
+      9,
+    ),
+    { jsonrpc: "2.0", id: 9, result: { nocb: true } },
+    "the reader must still work with no forwarding callback",
   );
 
   // -- 1b. CLI parsing (C7/C8/C9 regressions) ------------------------------
@@ -1379,6 +1513,32 @@ export async function selftest() {
   //          faked platform - an honest way to control the one input the
   //          snippet actually reads, on any host this runs on. -----------
   await selftestWindowsPreflightSnippet();
+
+  // -- 7j3d. #15: the unit assertions in 1f prove the READER forwards; this
+  //          proves the whole transport does - a real child process, a real
+  //          socket, real stdout framing. That is the half that cannot be
+  //          checked in-process: forwarding writes to stdout from inside
+  //          the SSE read loop while a request is in flight, so the risk is
+  //          a message landing inside a response's line or out of order
+  //          relative to it, neither of which an injected callback can
+  //          show. -------------------------------------------------------
+  await selftestNotificationForwardingEndToEnd();
+  await selftestToolListReconcileNotifiesClient();
+  await selftestReconcileNeverCommitsTruncatedWalk();
+
+  // -- 7j3e. #16: native Windows. The PowerShell resolver/launcher lives in
+  //          the sibling mcp-siding-windows.ps1 and carries its own
+  //          -SelfTest (numeric version ordering, fail-closed overrides,
+  //          the capability probe, argument quoting, and a parse of the
+  //          registration this script generates) - run by the Windows CI
+  //          job on a real Windows host, where a PowerShell parser is not
+  //          optional. What belongs HERE is everything provable without
+  //          PowerShell: that generation emits the right text, quotes it
+  //          correctly, fails closed on a bad --platform, and has not
+  //          drifted from either the .ps1 or the skill. Deliberately not
+  //          gated on `pwsh` being installed - a conditional assertion is
+  //          how a hole hides. -----------------------------------------
+  await selftestWindowsRegistration();
 
   // -- 7j4. N30: an invalid --backend-url must exit non-zero before the
   //         stdio server ever opens - not just that buildShimFromArgs
@@ -3279,7 +3439,8 @@ export async function selftest() {
 
   process.stdout.write(
     `selftest ok (${listed.result.tools.length} cached tool(s), recovery + stale-session-once + timeout + ` +
-      "SSE-multi-event + error-cache-preservation + session-less + resolver + space-path + injection verified)\n",
+      "SSE-multi-event + notification-forwarding + error-cache-preservation + session-less + resolver + " +
+      "windows-registration + space-path + injection verified)\n",
   );
 }
 
@@ -3917,9 +4078,245 @@ async function selftestWindowsPreflightSnippet() {
       /POSIX shell/i,
       "the diagnostic must say the shim needs a POSIX shell",
     );
-    assert.match(nativeWindowsResult.stderr, /WSL/, "the diagnostic must name WSL as the supported route");
+    assert.match(nativeWindowsResult.stderr, /WSL/, "the diagnostic must name WSL as a supported route");
+    // #16: native Windows is supported now, by a different installer - the
+    // guard must send the caller THERE, not tell them it cannot be done.
+    // Without this the message could quietly rot back into a refusal while
+    // a working PowerShell route sits unused two sections below it.
+    assert.match(
+      nativeWindowsResult.stderr,
+      /PowerShell install route/,
+      "the diagnostic must point at the native-Windows PowerShell route, not refuse Windows outright",
+    );
   } finally {
     await rm(stubUnameHome, { recursive: true, force: true });
+  }
+}
+
+// #16: the PowerShell registration path, checked for everything that does
+// not need a PowerShell interpreter to check. The behavioural half - does
+// the resolver pick the newest version, does an override fail closed, does
+// the probe reject an old runtime, does the generated text parse - lives in
+// mcp-siding-windows.ps1's own -SelfTest, where PowerShell is guaranteed.
+// The halves are complementary on purpose: neither one is a weaker copy of
+// the other, and this one runs on every host.
+async function selftestWindowsRegistration() {
+  const ps1Path = join(dirname(MCP_SIDING_PATH), "mcp-siding-windows.ps1");
+  const ps1Text = await readFile(ps1Path, "utf8");
+  const region = extractWindowsResolver(ps1Text);
+
+  // The region must be self-sufficient: a registration is exactly this
+  // text plus one Invoke-McpSidingShim call, so every function that call
+  // reaches has to be defined inside it.
+  for (const required of [
+    "Invoke-McpSidingShim",
+    "Resolve-McpSidingScript",
+    "Resolve-McpSidingNode",
+    "Get-McpSidingCacheRoots",
+    "Get-McpSidingNodeCandidates",
+    "Test-McpSidingNodeCapability",
+    "Compare-McpSidingVersion",
+    "ConvertTo-McpSidingArgumentString",
+    "Test-McpSidingFile",
+  ]) {
+    assert.match(region, new RegExp(`^function ${required} \\{$`, "m"), `the marked region must define ${required} - a registration carries nothing else`);
+  }
+  // ...and must NOT drag the self-test along: that text ships inside every
+  // registration on every Windows host, so a leak here is real weight and
+  // a real surface, not a tidiness point.
+  assert.doesNotMatch(region, /Invoke-McpSidingSelfTest|Assert-McpSidingTest/, "the self-test must stay outside the marked region");
+  // Both harness caches, scanned in the same pass - the exact regression
+  // the POSIX resolver's comment records (a Codex-updated roundhouse
+  // losing to a stale Claude copy).
+  assert.match(region, /'\.claude'/, "the resolver must scan the Claude plugin cache");
+  assert.match(region, /'\.codex'/, "the resolver must scan the Codex plugin cache");
+
+  // -- generation: the registration body is the region plus one call -----
+  const hostileName = `it's a "weird" name`;
+  const generated = buildShimScriptPowerShell(
+    {
+      "backend-url": "http://127.0.0.1:27182/mcp",
+      name: hostileName,
+      app: "C:\\Program Files\\Autodesk Fusion.app",
+      timeout: "5000",
+      "no-launch": true,
+    },
+    region,
+  );
+  assert.ok(generated.startsWith(region), "the generated registration must start with the resolver region verbatim");
+  const invokeLine = generated.trim().split("\n").at(-1);
+  assert.equal(
+    invokeLine,
+    "Invoke-McpSidingShim -ShimArgs @('--backend-url', 'http://127.0.0.1:27182/mcp', '--name', 'it''s a \"weird\" name', " +
+      "'--app', 'C:\\Program Files\\Autodesk Fusion.app', '--timeout', '5000', '--no-launch')",
+    "every flag must be forwarded, PowerShell-quoted, with the single-quote doubling that makes a hostile value literal",
+  );
+
+  // psQuote's whole contract in one place: ' doubles, and nothing else is
+  // special inside a PowerShell single-quoted string (notably $ and \,
+  // which is why an interpolating "..." would be wrong here).
+  assert.equal(psQuote("plain"), "'plain'");
+  assert.equal(psQuote("it's"), "'it''s'");
+  assert.equal(psQuote('$env:PATH; rm -rf /'), "'$env:PATH; rm -rf /'");
+  assert.equal(psQuote("C:\\x\\"), "'C:\\x\\'");
+
+  // -- both builders must agree on WHICH flags a registration carries ----
+  // Only the quoting may differ; a flag appearing in one flavour and not
+  // the other would be a silently different server on one platform.
+  const sameFlags = { "backend-url": "http://127.0.0.1:3845/mcp", name: "figma", app: "/Applications/Figma.app", launch: false };
+  const flagNames = (line) => [...line.matchAll(/'(--[a-z-]+)'/g)].map((match) => match[1]);
+  const posixFlags = flagNames(buildShimScript(sameFlags).trim().split("\n").at(-1));
+  assert.deepEqual(posixFlags, ["--backend-url", "--name", "--app", "--no-launch"], "the POSIX registration's flag set is the reference");
+  assert.deepEqual(
+    flagNames(buildShimScriptPowerShell(sameFlags, region).trim().split("\n").at(-1)),
+    posixFlags,
+    "the POSIX and PowerShell registrations must carry the same flags, in the same order",
+  );
+
+  // -- a missing/renamed marker region must fail loudly, not emit a
+  //    registration whose resolver is silently absent ---------------------
+  assert.throws(
+    () => extractWindowsResolver("# nothing marked here\n"),
+    /windows-resolver marker region was not found/,
+    "generation must fail closed when the .ps1's markers are gone",
+  );
+
+  // -- --platform is validated at parse time, both spellings, so a typo
+  //    cannot quietly produce the POSIX flavour on a Windows host --------
+  assert.throws(() => parseArgs(["--platform", "win"]), /invalid value for --platform: win/, "an unknown --platform must be rejected");
+  assert.throws(() => parseArgs(["--platform=Windows"]), /invalid value for --platform: Windows/, "--platform is case-sensitive and must reject a near-miss");
+  assert.equal(parseArgs(["--platform", "windows"]).platform, "windows");
+  assert.equal(parseArgs(["--platform=posix"]).platform, "posix");
+
+  // -- the real CLI must actually emit PowerShell for --platform windows,
+  //    not just the builder in-process ------------------------------------
+  const printed = spawnSync(
+    process.execPath,
+    [MCP_SIDING_PATH, "--print-shim-script", "--platform", "windows", "--backend-url", "http://127.0.0.1:27182/mcp", "--name", "fusion"],
+    { encoding: "utf8" },
+  );
+  assert.equal(printed.status, 0, `--print-shim-script --platform windows failed: ${printed.stderr}`);
+  assert.ok(printed.stdout.includes("function Invoke-McpSidingShim {"), "the CLI must emit the PowerShell resolver for --platform windows");
+  assert.ok(printed.stdout.trim().endsWith("Invoke-McpSidingShim -ShimArgs @('--backend-url', 'http://127.0.0.1:27182/mcp', '--name', 'fusion')"));
+  const printedPosix = spawnSync(
+    process.execPath,
+    [MCP_SIDING_PATH, "--print-shim-script", "--backend-url", "http://127.0.0.1:27182/mcp", "--name", "fusion"],
+    { encoding: "utf8" },
+  );
+  assert.equal(printedPosix.status, 0, `the default (POSIX) registration must still generate: ${printedPosix.stderr}`);
+  assert.ok(printedPosix.stdout.includes('exec "$node_bin" "$p"'), "omitting --platform must still emit the POSIX registration unchanged");
+
+  // -- SKILL.md must actually document this route, and document it as
+  //    supported - a resolver nothing tells the installer to use is not
+  //    Windows support. -----------------------------------------------
+  const skillMd = await readFile(join(dirname(MCP_SIDING_PATH), "..", "skills", "mcp-shim", "SKILL.md"), "utf8");
+  assert.ok(skillMd.includes("--platform windows"), "SKILL.md must tell the installer to generate the Windows registration");
+  assert.ok(skillMd.includes("-EncodedCommand"), "SKILL.md must register the PowerShell body as an encoded command, not as hand-quoted text");
+  assert.ok(skillMd.includes("mcp-siding-windows.ps1"), "SKILL.md must name the file the Windows logic lives in, for diagnosis");
+}
+
+// #15: end-to-end proof that a server notification emitted mid-call
+// reaches the stdio client, in order, without corrupting framing. Runs the
+// REAL script as a child process against a real HTTP backend, so the whole
+// path is exercised: SSE read loop -> forwardNotification -> emit ->
+// stdout, concurrently with an in-flight tools/call whose response goes
+// through that same stdout. An in-process Shim with an injected callback
+// (1f) cannot show this - it never writes a byte to a real stream.
+//
+// The backend also emits one event that is NOT a JSON-RPC message, mixed in
+// with the real ones: a relayed non-message would be an unrecoverable
+// protocol violation at the client, so "dropped, and the response still
+// arrives" is asserted here too, over a real socket rather than a fake
+// stream.
+async function selftestNotificationForwardingEndToEnd() {
+  const progress = { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "t1", progress: 1, total: 2 } };
+  const logNote = { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "halfway" } };
+  const cacheDir = await mkdtemp(join(tmpdir(), "mcp-siding-notify-"));
+  try {
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "initialize") {
+            return sendJson(
+              res,
+              200,
+              {
+                jsonrpc: "2.0",
+                id: msg.id,
+                result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } },
+              },
+              { "MCP-Session-Id": "notify-session" },
+            );
+          }
+          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          if (msg.method === "tools/call") {
+            res.writeHead(200, { "Content-Type": "text/event-stream" });
+            res.write(`data: ${JSON.stringify(progress)}\n\n`);
+            res.write(`data: ${JSON.stringify(logNote)}\n\n`);
+            res.write(`data: ${JSON.stringify({ keepalive: true })}\n\n`);
+            res.write(
+              `data: ${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "done" }] } })}\n\n`,
+            );
+            res.end();
+            return;
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const child = spawn(
+          process.execPath,
+          [MCP_SIDING_PATH, "--backend-url", url, "--name", "test", "--cache", join(cacheDir, "tools.json"), "--no-launch"],
+          { stdio: ["pipe", "pipe", "pipe"] },
+        );
+        let out = "";
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk) => (out += chunk));
+        let err = "";
+        child.stderr.setEncoding("utf8");
+        child.stderr.on("data", (chunk) => (err += chunk));
+        const exited = new Promise((resolve) => child.on("exit", resolve));
+
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })}\n`);
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "slow" } })}\n`);
+
+        const deadline = Date.now() + 10_000;
+        while (!out.includes('"id":2') && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        child.stdin.end();
+        await Promise.race([exited, new Promise((r) => setTimeout(r, 2_000))]);
+        if (child.exitCode == null) child.kill();
+
+        assert.ok(out.includes('"id":2'), `child never answered the tools/call (stderr: ${err})`);
+        // Every line must be a complete JSON object on its own - the
+        // framing guarantee. A forward written into the middle of a
+        // response's line would fail right here, before any ordering
+        // assertion gets a chance to look reasonable.
+        const lines = out.split("\n").filter((line) => line !== "");
+        const messages = lines.map((line, index) => {
+          try {
+            return JSON.parse(line);
+          } catch (parseError) {
+            throw new assert.AssertionError({
+              message: `stdout line ${index} is not one complete JSON object (${parseError.message}): ${JSON.stringify(line)}`,
+            });
+          }
+        });
+        assert.deepEqual(
+          messages,
+          [
+            { jsonrpc: "2.0", id: 1, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: { listChanged: true } }, serverInfo: { name: "test", version: "1.0.0" } } },
+            progress,
+            logNote,
+            { jsonrpc: "2.0", id: 2, result: { content: [{ type: "text", text: "done" }] } },
+          ],
+          `the client must see both notifications, verbatim, BEFORE the response they belong to, and nothing else (stderr: ${err})`,
+        );
+      },
+    );
+  } finally {
+    await rm(cacheDir, { recursive: true, force: true });
   }
 }
 
@@ -4349,4 +4746,155 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(resolve(p
       process.stderr.write(`selftest FAILED: ${err.stack ?? err}\n`);
       process.exit(1);
     });
+}
+
+// The defect this covers: the shim used to advertise tools.listChanged:false,
+// which entitles a client to call tools/list exactly ONCE and keep the answer
+// for the whole session. A client that first asked while the app was closed
+// was served the cached fallback - empty on a first run - and there was no
+// channel left to ever correct it. It would believe this server exposes no
+// tools until the client itself restarted. The backend reports
+// listChanged:false while genuinely serving dynamic tools, so it will never
+// volunteer the change either; the shim has to notice and say so.
+async function selftestReconcileNeverCommitsTruncatedWalk() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-truncated-"));
+  const cachePath = join(dir, "tools.json");
+  const port = await getFreePort();
+  const good = [{ name: "a" }, { name: "b" }];
+  await writeFile(cachePath, JSON.stringify(good), "utf8");
+  const notifications = [];
+  const shim = new Shim({
+    url: `http://127.0.0.1:${port}/mcp`,
+    name: "test",
+    cachePath,
+    timeoutMs: 500,
+    launchEnabled: false,
+    appPath: null,
+    launchGraceMs: 150_000,
+  });
+  shim.onNotification = (msg) => notifications.push(msg);
+  shim.lastServedToolsDigest = toolsDigest(good);
+
+  // A backend whose cursor never terminates - either genuinely more pages than
+  // the cap, or a looping cursor.
+  const server = createServer((req, res) => {
+    readJsonBody(req).then((msg) => {
+      if (msg.method === "initialize") {
+        return sendJson(res, 200,
+          { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+          { "MCP-Session-Id": "s1" });
+      }
+      if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+      if (msg.method === "tools/list") {
+        return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "partial" }], nextCursor: "always-more" } });
+      }
+      sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+    });
+  });
+  await new Promise((r) => server.listen(port, "127.0.0.1", r));
+  try {
+    assert.equal(await shim.reconcileTools(), null, "a walk that never terminates must report incomplete");
+    assert.equal(notifications.length, 0, "must never claim tools vanished from a truncated walk");
+    assert.deepEqual(
+      JSON.parse(await readFile(cachePath, "utf8")),
+      good,
+      "a truncated walk must not overwrite a complete cached inventory",
+    );
+  } finally {
+    await new Promise((r) => server.close(r));
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function selftestToolListReconcileNotifiesClient() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-reconcile-"));
+  const cachePath = join(dir, "tools.json");
+  const port = await getFreePort();
+  const notifications = [];
+  const shim = new Shim({
+    url: `http://127.0.0.1:${port}/mcp`,
+    name: "test",
+    cachePath,
+    timeoutMs: 500,
+    launchEnabled: false,
+    appPath: null,
+    launchGraceMs: 150_000,
+  });
+  shim.onNotification = (msg) => notifications.push(msg);
+
+  // The shim must promise the client a list that can change, whatever the
+  // backend says about its own.
+  const init = await shim.handle({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  assert.equal(init.result.capabilities.tools.listChanged, true, "shim must advertise listChanged:true");
+
+  // Backend down, cache never written: the exact first-run shape.
+  const offline = await shim.handle({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+  assert.deepEqual(offline.result.tools, [], "app closed, no cache -> empty list");
+  assert.equal(offline.result.ttlMs, 0, "a served-from-disk list must be labelled immediately stale");
+
+  // Reconciling against a still-closed app must stay silent and report the
+  // unreachable backend so the caller backs off.
+  assert.equal(await shim.reconcileTools(), null, "unreachable backend -> null (back off)");
+  assert.equal(notifications.length, 0, "must not notify about a backend it never reached");
+
+  let tools = [{ name: "fusion_mcp_execute", description: "live" }];
+  const server = createServer((req, res) => {
+    readJsonBody(req).then((msg) => {
+      if (msg.method === "initialize") {
+        return sendJson(res, 200,
+          { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: { listChanged: false } }, serverInfo: { name: "fake" } } },
+          { "MCP-Session-Id": "s1" });
+      }
+      if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+      if (msg.method === "tools/list") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools } });
+      sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+    });
+  });
+  await new Promise((r) => server.listen(port, "127.0.0.1", r));
+  try {
+    // The app opened. The client is idle and still holds the empty list.
+    assert.equal(await shim.reconcileTools(), true, "list moved -> notify");
+    assert.equal(notifications.length, 1, "exactly one notification");
+    assert.equal(notifications[0].method, "notifications/tools/list_changed");
+
+    // The client re-lists on that signal and now sees the live inventory.
+    const live = await shim.handle({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} });
+    assert.deepEqual(live.result.tools, tools, "re-list must serve live tools, not the cache");
+    assert.equal(live.result.ttlMs, undefined, "a live pass-through must not be labelled stale");
+
+    // Negative control: an unchanged inventory must not wake the client again.
+    assert.equal(await shim.reconcileTools(), false, "unchanged list -> no notification");
+    assert.equal(notifications.length, 1, "still exactly one notification");
+
+    // Reordering alone is not a change.
+    tools = [{ name: "fusion_mcp_execute", description: "live" }, { name: "b" }].reverse();
+    await shim.handle({ jsonrpc: "2.0", id: 4, method: "tools/list", params: {} });
+    tools = [...tools].reverse();
+    assert.equal(await shim.reconcileTools(), false, "same tools in a different order is not a change");
+    assert.equal(notifications.length, 1, "reordering must not notify");
+
+    // A genuine dynamic-tool change mid-session does reach the client.
+    tools = [{ name: "fusion_mcp_execute", description: "live" }];
+    assert.equal(await shim.reconcileTools(), true, "a real inventory change -> notify");
+    assert.equal(notifications.length, 2, "second notification for the real change");
+
+    // Metadata-only change: the digest must cover the WHOLE tool object, not
+    // a hand-picked subset. A client holding a stale outputSchema/annotations
+    // is holding a stale definition just as surely as a renamed tool.
+    tools = [{ name: "fusion_mcp_execute", description: "live", outputSchema: { type: "object" } }];
+    assert.equal(await shim.reconcileTools(), true, "an outputSchema change must notify");
+    assert.equal(notifications.length, 3, "metadata-only change notifies");
+
+    tools = [{ name: "fusion_mcp_execute", description: "live", annotations: { readOnlyHint: true } }];
+    assert.equal(await shim.reconcileTools(), true, "an annotations change must notify");
+    assert.equal(notifications.length, 4, "annotations change notifies");
+
+    // Key ORDER within a tool object is not a change.
+    tools = [{ annotations: { readOnlyHint: true }, description: "live", name: "fusion_mcp_execute" }];
+    assert.equal(await shim.reconcileTools(), false, "reordered object keys are not a change");
+    assert.equal(notifications.length, 4, "key reordering must not notify");
+  } finally {
+    await new Promise((r) => server.close(r));
+    await rm(dir, { recursive: true, force: true });
+  }
 }
