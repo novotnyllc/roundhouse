@@ -1489,6 +1489,7 @@ export async function selftest() {
   //          relative to it, neither of which an injected callback can
   //          show. -------------------------------------------------------
   await selftestNotificationForwardingEndToEnd();
+  await selftestToolListReconcileNotifiesClient();
 
   // -- 7j3e. #16: native Windows. The PowerShell resolver/launcher lives in
   //          the sibling mcp-siding-windows.ps1 and carries its own
@@ -4270,7 +4271,7 @@ async function selftestNotificationForwardingEndToEnd() {
         assert.deepEqual(
           messages,
           [
-            { jsonrpc: "2.0", id: 1, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: { listChanged: false } }, serverInfo: { name: "test", version: "1.0.0" } } },
+            { jsonrpc: "2.0", id: 1, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: { listChanged: true } }, serverInfo: { name: "test", version: "1.0.0" } } },
             progress,
             logNote,
             { jsonrpc: "2.0", id: 2, result: { content: [{ type: "text", text: "done" }] } },
@@ -4710,4 +4711,89 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(resolve(p
       process.stderr.write(`selftest FAILED: ${err.stack ?? err}\n`);
       process.exit(1);
     });
+}
+
+// The defect this covers: the shim used to advertise tools.listChanged:false,
+// which entitles a client to call tools/list exactly ONCE and keep the answer
+// for the whole session. A client that first asked while the app was closed
+// was served the cached fallback - empty on a first run - and there was no
+// channel left to ever correct it. It would believe this server exposes no
+// tools until the client itself restarted. The backend reports
+// listChanged:false while genuinely serving dynamic tools, so it will never
+// volunteer the change either; the shim has to notice and say so.
+async function selftestToolListReconcileNotifiesClient() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-reconcile-"));
+  const cachePath = join(dir, "tools.json");
+  const port = await getFreePort();
+  const notifications = [];
+  const shim = new Shim({
+    url: `http://127.0.0.1:${port}/mcp`,
+    name: "test",
+    cachePath,
+    timeoutMs: 500,
+    launchEnabled: false,
+    appPath: null,
+    launchGraceMs: 150_000,
+  });
+  shim.onNotification = (msg) => notifications.push(msg);
+
+  // The shim must promise the client a list that can change, whatever the
+  // backend says about its own.
+  const init = await shim.handle({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  assert.equal(init.result.capabilities.tools.listChanged, true, "shim must advertise listChanged:true");
+
+  // Backend down, cache never written: the exact first-run shape.
+  const offline = await shim.handle({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+  assert.deepEqual(offline.result.tools, [], "app closed, no cache -> empty list");
+  assert.equal(offline.result.ttlMs, 0, "a served-from-disk list must be labelled immediately stale");
+
+  // Reconciling against a still-closed app must stay silent and report the
+  // unreachable backend so the caller backs off.
+  assert.equal(await shim.reconcileTools(), null, "unreachable backend -> null (back off)");
+  assert.equal(notifications.length, 0, "must not notify about a backend it never reached");
+
+  let tools = [{ name: "fusion_mcp_execute", description: "live" }];
+  const server = createServer((req, res) => {
+    readJsonBody(req).then((msg) => {
+      if (msg.method === "initialize") {
+        return sendJson(res, 200,
+          { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: { listChanged: false } }, serverInfo: { name: "fake" } } },
+          { "MCP-Session-Id": "s1" });
+      }
+      if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+      if (msg.method === "tools/list") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools } });
+      sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+    });
+  });
+  await new Promise((r) => server.listen(port, "127.0.0.1", r));
+  try {
+    // The app opened. The client is idle and still holds the empty list.
+    assert.equal(await shim.reconcileTools(), true, "list moved -> notify");
+    assert.equal(notifications.length, 1, "exactly one notification");
+    assert.equal(notifications[0].method, "notifications/tools/list_changed");
+
+    // The client re-lists on that signal and now sees the live inventory.
+    const live = await shim.handle({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} });
+    assert.deepEqual(live.result.tools, tools, "re-list must serve live tools, not the cache");
+    assert.equal(live.result.ttlMs, undefined, "a live pass-through must not be labelled stale");
+
+    // Negative control: an unchanged inventory must not wake the client again.
+    assert.equal(await shim.reconcileTools(), false, "unchanged list -> no notification");
+    assert.equal(notifications.length, 1, "still exactly one notification");
+
+    // Reordering alone is not a change.
+    tools = [{ name: "fusion_mcp_execute", description: "live" }, { name: "b" }].reverse();
+    await shim.handle({ jsonrpc: "2.0", id: 4, method: "tools/list", params: {} });
+    tools = [...tools].reverse();
+    assert.equal(await shim.reconcileTools(), false, "same tools in a different order is not a change");
+    assert.equal(notifications.length, 1, "reordering must not notify");
+
+    // A genuine dynamic-tool change mid-session does reach the client.
+    tools = [{ name: "fusion_mcp_execute", description: "live" }];
+    assert.equal(await shim.reconcileTools(), true, "a real inventory change -> notify");
+    assert.equal(notifications.length, 2, "second notification for the real change");
+  } finally {
+    await new Promise((r) => server.close(r));
+    await rm(dir, { recursive: true, force: true });
+  }
 }

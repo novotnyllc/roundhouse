@@ -756,6 +756,34 @@ export function writeCache(cachePath, tools) {
 // after a reconnect) must not leave duplicate entries, and if a tool's
 // definition legitimately changed between walks the newer one should win,
 // not sit alongside a stale copy.
+// A reconcile walk is bounded so a backend that keeps handing back cursors
+// cannot spin it forever.
+const MAX_RECONCILE_PAGES = 50;
+
+// Spec (2026-07-28, server/utilities/caching): a client "SHOULD NOT treat TTL
+// as a polling interval that triggers automatic background refetches...
+// Implementations that do choose to poll MUST apply jitter and backoff." We do
+// choose to poll, because the backend reports listChanged:false yet serves
+// dynamic tools - it will never tell us the inventory moved. So: jittered
+// base interval, exponential backoff while the backend is down (the common
+// case - the app is usually closed), reset to base on first success.
+const RECONCILE_BASE_MS = 30_000;
+const RECONCILE_MAX_MS = 10 * 60_000;
+const RECONCILE_JITTER = 0.25;
+
+function jittered(ms) {
+  return Math.round(ms * (1 + (Math.random() * 2 - 1) * RECONCILE_JITTER));
+}
+
+// Order-insensitive: a backend is free to return the same inventory in a
+// different order, and that is not a change worth waking the client for.
+export function toolsDigest(tools) {
+  const norm = tools
+    .map((t) => JSON.stringify([t?.name ?? null, t?.description ?? null, t?.inputSchema ?? null]))
+    .sort();
+  return createHash("sha256").update(norm.join(" ")).digest("hex");
+}
+
 function mergeToolPage(base, page) {
   const byName = new Map(base.map((tool) => [tool?.name, tool]));
   for (const tool of page) byName.set(tool?.name, tool);
@@ -907,6 +935,53 @@ export class Shim {
     // moment that id dispatches - bounded by queue depth, exactly like
     // this.pendingIds, so there is nothing to leak.
     this.cancelledQueuedIds = new Set();
+    // Digest of the tool list the CLIENT currently holds, so reconcileTools()
+    // can tell "the inventory moved" from "nothing to say." null means the
+    // client has never been served a list.
+    this.lastServedToolsDigest = null;
+    this.reconciling = false;
+  }
+
+  // The client only re-lists when told to, so a list that changes while it is
+  // idle never reaches it: a backend serving DYNAMIC tools changes its
+  // inventory mid-session, and the shim additionally moves between the
+  // last-known cached list (backend down) and the live one (backend up).
+  // tools/list never launches the app - only toolsCall does - so polling a
+  // closed backend is a cheap failed connect with no side effect.
+  //
+  // Returns true if the client was notified, false if the list was reached and
+  // matched (or there was nothing to compare against), and null if the backend
+  // could not be reached at all - the caller uses null to back off.
+  async reconcileTools() {
+    // A client-driven paged walk owns this.pendingToolsPage; never race it.
+    if (this.reconciling || this.pendingToolsPage !== null) return false;
+    this.reconciling = true;
+    try {
+      let tools = [];
+      let cursor;
+      for (let page = 0; page < MAX_RECONCILE_PAGES; page++) {
+        const result = await this.backend("tools/list", cursor ? { cursor } : undefined);
+        if (!Array.isArray(result?.tools)) return null;
+        tools = mergeToolPage(tools, result.tools);
+        if (!result.nextCursor) break;
+        cursor = result.nextCursor;
+      }
+      writeCache(this.cachePath, tools);
+      const digest = toolsDigest(tools);
+      // Only a list the client already holds can go stale. If it has never
+      // listed, it gets this one live the first time it asks - waking it for a
+      // list it never had would be noise.
+      const changed = this.lastServedToolsDigest !== null && digest !== this.lastServedToolsDigest;
+      this.lastServedToolsDigest = digest;
+      if (changed) this.onNotification?.({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+      return changed;
+    } catch {
+      // Backend down or refusing: the client keeps what it holds and the cache
+      // stays the last known good list. Nothing changed that we know of.
+      return null;
+    } finally {
+      this.reconciling = false;
+    }
   }
 
   // `clientRequestId`, when given, registers this call's AbortController in
@@ -1356,6 +1431,9 @@ export class Shim {
         } else {
           writeCache(this.cachePath, staged);
           this.pendingToolsPage = null;
+          // This is what the client now holds; reconcileTools() compares
+          // against it to decide whether anything is worth notifying about.
+          this.lastServedToolsDigest = toolsDigest(staged);
         }
       }
       return result;
@@ -1388,7 +1466,15 @@ export class Shim {
       // a fresh listing, no walk in progress to protect - is unaffected
       // and still serves the full persisted cache exactly as before.
       if (params?.cursor) return { tools: [] };
-      return { tools: readCache(this.cachePath) };
+      const cached = readCache(this.cachePath);
+      this.lastServedToolsDigest = toolsDigest(cached);
+      // Serving a stale copy because the backend is down is explicitly
+      // permitted ("Clients MAY serve stale responses if errors occur during
+      // re-fetching... server downtime"), but the client should not go on to
+      // cache OUR stale copy as if it were fresh. ttlMs:0 is the spec's way to
+      // say "immediately stale, re-ask when you can" - the honest label for a
+      // last-known-good list served from disk.
+      return { tools: cached, ttlMs: 0 };
     }
   }
 
@@ -1545,7 +1631,17 @@ export class Shim {
       // Answered locally so the server always starts, backend up or not.
       return ok(id, {
         protocolVersion: PROTOCOL_VERSION,
-        capabilities: { tools: { listChanged: false } },
+        // NOT a mirror of the backend's own flag, deliberately. The backend
+        // reports listChanged:false while actually serving dynamic tools, and
+        // regardless of that, the SHIM's list genuinely changes: it moves
+        // between the last-known cached list (backend down) and the live one
+        // (backend up). A client told `false` is entitled to call tools/list
+        // once and keep the answer for the whole session - which is exactly
+        // how a client that first asked while the app was closed ends up
+        // believing this server exposes no tools at all, with no way for us
+        // to correct it. We advertise the capability we actually need and
+        // drive it from reconcileTools().
+        capabilities: { tools: { listChanged: true } },
         serverInfo: { name: this.name, version: "1.0.0" },
       });
     }
@@ -1764,6 +1860,23 @@ function main(flags) {
   // in buildShimFromArgs - a Shim built for a unit test has no stdio client
   // and must never write to a real stdout.
   shim.onNotification = emit;
+  // Detects an inventory that moved while the client sat idle - the app being
+  // opened after we served the cached fallback, or its dynamic tools changing
+  // mid-session. Self-rescheduling rather than setInterval so the delay can
+  // back off while the app is closed (the usual state) instead of retrying at
+  // full rate forever. unref() so this timer never keeps the process alive.
+  let reconcileDelay = RECONCILE_BASE_MS;
+  const scheduleReconcile = () => {
+    const timer = setTimeout(async () => {
+      const changed = await shim.reconcileTools();
+      reconcileDelay = changed === null
+        ? Math.min(reconcileDelay * 2, RECONCILE_MAX_MS)
+        : RECONCILE_BASE_MS;
+      scheduleReconcile();
+    }, jittered(reconcileDelay));
+    timer.unref?.();
+  };
+  scheduleReconcile();
   const rl = createInterface({ input: process.stdin, terminal: false });
 
   // The client closing stdin (readline's 'close') is the only signal a
