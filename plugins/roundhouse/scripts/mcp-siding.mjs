@@ -415,6 +415,25 @@ class MalformedResponse extends Error {}
 // not the place to reject a shape a real backend legitimately sends.
 // Methods with no shape requirement here (initialize, ...) pass through
 // unchecked.
+// A client that DECLARED a modern protocol version relies on resultType to
+// tell a complete answer from an interim one, and the backend is legacy and
+// supplies none - so without this the normal app-up tools/list and tools/call
+// paths hand a modern client legacy-shaped results for nearly every real call.
+//
+// Applied only when the request declared a modern version. A legacy client
+// neither expects the field nor benefits from it, and adding it there would
+// change bytes on the wire for callers that never asked to move.
+//
+// Absent means complete: an interim result always states its own resultType
+// (input_required), so anything silent is a finished answer. Never overwrite
+// one the backend did set.
+function withResultType(result, declaredVersion) {
+  if (declaredVersion === undefined || declaredVersion < "2026-07-28") return result;
+  if (result === null || typeof result !== "object" || Array.isArray(result)) return result;
+  if (result.resultType !== undefined) return result;
+  return { ...result, resultType: "complete" };
+}
+
 export function validateResultShape(method, result) {
   // MCP 2026-07-28 multi-round-trip requests: an INTERIM result carries
   // `resultType: "input_required"` and neither a `content` nor a `tools` array,
@@ -1773,8 +1792,8 @@ export class Shim {
       });
     }
     if (method === "ping") return ok(id, {});
-    if (method === "tools/list") return ok(id, await this.toolsList(params, id));
-    if (method === "tools/call") return ok(id, await this.toolsCall(params, id));
+    if (method === "tools/list") return ok(id, withResultType(await this.toolsList(params, id), wanted));
+    if (method === "tools/call") return ok(id, withResultType(await this.toolsCall(params, id), wanted));
     try {
       const result = await this.backend(method, params, id);
       return ok(id, result);

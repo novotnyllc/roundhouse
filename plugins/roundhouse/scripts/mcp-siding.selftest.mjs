@@ -4985,6 +4985,20 @@ async function selftestDualEraServerFace() {
     const offline = await shim.handle({ jsonrpc: "2.0", id: 5, method: "tools/list", params: {} });
     assert.equal(offline.result.resultType, "complete");
     assert.equal(offline.result.ttlMs, 0);
+
+    // A client that DECLARED a modern version gets the discriminator on the
+    // ordinary paths too, not only on the two results we synthesize - the
+    // backend is legacy and supplies none, so without this a modern client
+    // would get legacy-shaped results for nearly every real call.
+    const modernCall = await shim.handle({
+      jsonrpc: "2.0", id: 6, method: "tools/call",
+      params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } },
+    });
+    assert.equal(modernCall.result.resultType, "complete", "a modern client's tools/call result must be discriminated");
+
+    // ...and a LEGACY client's bytes are unchanged: it never asked to move.
+    const legacyCall = await shim.handle({ jsonrpc: "2.0", id: 7, method: "tools/call", params: {} });
+    assert.equal(legacyCall.result.resultType, undefined, "a legacy client's result must not gain fields it never asked for");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
