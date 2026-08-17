@@ -4957,6 +4957,10 @@ async function selftestDualEraServerFace() {
     assert.equal(disc.result.resultType, "complete");
     assert.ok(disc.result.supportedVersions.includes("2026-07-28"), "must offer the current revision");
     assert.ok(disc.result.supportedVersions.includes("2025-06-18"), "must still offer the legacy revision");
+    // Advertise ONLY what is actually negotiated: initialize answers with the
+    // pinned legacy version and never reads the client's request, so listing an
+    // intermediate revision would strand a client that selected it.
+    assert.deepEqual(disc.result.supportedVersions, ["2026-07-28", "2025-06-18"], "no version may be advertised that initialize cannot negotiate");
     assert.equal(disc.result.capabilities.tools.listChanged, true);
     assert.equal(disc.result.ttlMs, 0, "our tool list genuinely changes; discover must not be cached as fresh");
 
@@ -4965,7 +4969,7 @@ async function selftestDualEraServerFace() {
       jsonrpc: "2.0", id: 2, method: "ping",
       params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } },
     });
-    assert.deepEqual(okVer.result, {}, "a supported declared version is served normally");
+    assert.equal(okVer.result.resultType, "complete", "a modern client's ping must be discriminated too");
 
     // One we do not serve gets the defined error, listing what we do serve, so
     // the client can retry rather than guess.
@@ -4979,7 +4983,7 @@ async function selftestDualEraServerFace() {
 
     // A LEGACY request declares no version and must be unaffected.
     const legacy = await shim.handle({ jsonrpc: "2.0", id: 4, method: "ping", params: {} });
-    assert.deepEqual(legacy.result, {}, "a request with no declared version stays legacy and is served");
+    assert.deepEqual(legacy.result, {}, "a request with no declared version stays legacy and is served, byte-identical");
 
     // The offline fallback is a complete-but-stale result.
     const offline = await shim.handle({ jsonrpc: "2.0", id: 5, method: "tools/list", params: {} });

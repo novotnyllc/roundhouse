@@ -46,7 +46,14 @@ export const PROTOCOL_VERSION = "2025-06-18";
 // and a legacy-only client FAILS a modern server — so being dual-era is what
 // keeps the shim working while either side moves. Newest first: a client
 // choosing from this list should land on the newest we both support.
-export const SUPPORTED_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
+// ONLY versions this shim genuinely serves. 2025-11-25 was advertised here and
+// was a lie: the initialize branch never reads the client's requested version
+// and always answers with the pinned 2025-06-18, so a client that selected
+// 2025-11-25 from discovery would then fail legacy negotiation. Advertise what
+// is actually negotiated - a shorter honest list beats a longer aspirational
+// one, because a client cannot tell the difference until it has already
+// committed.
+export const SUPPORTED_PROTOCOL_VERSIONS = ["2026-07-28", "2025-06-18"];
 
 // JSON-RPC error code for UnsupportedProtocolVersionError (spec 2026-07-28).
 export const UNSUPPORTED_PROTOCOL_VERSION = -32022;
@@ -1791,7 +1798,10 @@ export class Shim {
         cacheScope: "public",
       });
     }
-    if (method === "ping") return ok(id, {});
+    // ping is a liveness check a modern client may reject if it cannot tell a
+    // complete result from an interim one, so it needs the discriminator just
+    // as the tool branches do.
+    if (method === "ping") return ok(id, withResultType({}, wanted));
     if (method === "tools/list") return ok(id, withResultType(await this.toolsList(params, id), wanted));
     if (method === "tools/call") return ok(id, withResultType(await this.toolsCall(params, id), wanted));
     try {
