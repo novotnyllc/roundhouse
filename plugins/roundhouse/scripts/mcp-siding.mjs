@@ -1301,11 +1301,23 @@ export class Shim {
         this.protocolVersion = shared[0] ?? MODERN_PROTOCOL_VERSION;
         return this.backendEra;
       }
-      // A 4xx with no recognisable modern body is a LEGACY server, per the
-      // Streamable HTTP fallback rule - that is a verdict, not an unknown.
+      // A CLIENT-error rejection with no recognisable modern body is a legacy
+      // server, per the Streamable HTTP fallback rule - the server understood
+      // us and refused, which is the evidence that rule is built on.
+      //
+      // Deliberately NOT every HttpRejected. A 5xx means the server FAILED, not
+      // that it rejected our era, and 408/429 are explicitly transient. Caching
+      // any of those as "legacy" would be permanent: every later connection
+      // skips discovery and sends an initialize a modern-only backend cannot
+      // answer, with no recovery short of restarting the shim. A transient
+      // blip must leave the era undecided so the next attempt can probe again.
       if (err instanceof HttpRejected) {
-        this.backendEra = "legacy";
-        return this.backendEra;
+        const s = err.status;
+        if (s >= 400 && s < 500 && s !== 408 && s !== 429) {
+          this.backendEra = "legacy";
+          return this.backendEra;
+        }
+        return null;
       }
       // Anything else - unreachable, timeout, malformed - is genuinely
       // inconclusive. Leave it undecided so a later attempt probes again

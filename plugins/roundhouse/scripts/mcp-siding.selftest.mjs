@@ -5251,6 +5251,26 @@ async function selftestBackendEraDetection() {
       },
     );
 
+    // A 5xx or an explicitly transient 4xx must NOT decide an era. Caching
+    // either as legacy is permanent: every later connection skips discovery and
+    // sends an initialize a modern-only backend cannot answer, with no recovery
+    // short of restarting the shim.
+    for (const status of [500, 503, 408, 429]) {
+      await withServer(
+        (req, res) => {
+          readJsonBody(req).then((msg) => {
+            if (msg.method === "server/discover") return sendJson(res, status, { transient: true });
+            sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+          });
+        },
+        async (url) => {
+          const shim = mk(url);
+          await shim.probeBackendEra();
+          assert.equal(shim.backendEra, null, `HTTP ${status} is transient and must leave the era undecided`);
+        },
+      );
+    }
+
     // --- downtime is NOT an era verdict ---------------------------------
     const down = mk("http://127.0.0.1:65533/mcp");
     await down.handle({ jsonrpc: "2.0", id: 3, method: "tools/call", params: {} });
