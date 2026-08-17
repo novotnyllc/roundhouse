@@ -302,8 +302,14 @@ $fusion = Get-ChildItem -Path "$env:LOCALAPPDATA\Autodesk\webdeploy\production" 
   Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 $figma = "$env:LOCALAPPDATA\Figma\Figma.exe"   # verify before use
 
+# Assign the preset the user actually chose. Without this, $appPath is unset,
+# the test below is vacuously false, and --app is omitted even though discovery
+# succeeded — launch-on-demand silently stays disabled.
+$appPath = $fusion        # or $figma, or the path the user supplied
+
 # Pass --app ONLY if it actually exists on this host.
 $appArgs = if ($appPath -and (Test-Path -LiteralPath $appPath)) { @('--app', $appPath) } else { @() }
+if (-not $appArgs) { Write-Warning "No usable app path; registering without launch-on-demand." }
 ```
 
 Run this in PowerShell, with `$SkillDir` set to the absolute directory

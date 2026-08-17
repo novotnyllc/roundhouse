@@ -678,22 +678,27 @@ export async function readSseUntilMatch(stream, expectedId, onMessage) {
       // safe rather than merely convenient: connect() declares
       // `capabilities: {}` to the backend, so a spec-compliant server has been
       // told this client supports no sampling or elicitation and must not ask.
-      // Forward everything EXCEPT a server-to-client request (method + id):
-      // sampling/createMessage, elicitation/create. We have no path to carry
-      // such a request's reply back - the client's response has no method, so
-      // handle() would read it as a fresh backend request, and it would
-      // serialize behind the still-running call that produced it. The backend
-      // would wait for a correlated reply that never arrives. Dropping it is
-      // safe rather than merely convenient: connect() declares
-      // `capabilities: {}` to the backend, so a spec-compliant server has been
-      // told this client supports no sampling or elicitation and must not ask.
+      // NOTIFICATIONS ONLY - nothing carrying an id may reach the client.
       //
-      // Note this is NOT "id-less messages only": a RESPONSE carrying an id
-      // that does not match this call's is another concurrent call's reply
-      // arriving on this stream, and dropping those breaks multiplexing.
-      // Request = method AND id. That distinction is the whole rule.
-      const isServerRequest = typeof msg?.method === "string" && msg?.id !== undefined;
-      if (onMessage && isJsonRpcMessage(msg) && !isServerRequest) onMessage(msg);
+      // Two distinct hazards, one rule. A message with a method AND an id is a
+      // server-to-client REQUEST (sampling/createMessage, elicitation/create)
+      // and we have no path to carry its reply back: the client's response has
+      // no method, so handle() would read it as a fresh backend request, and it
+      // would serialize behind the still-running call that produced it. Safe to
+      // drop - connect() declares `capabilities: {}`, so a compliant server has
+      // been told this client does no sampling or elicitation.
+      //
+      // A RESPONSE whose id does not match this call must be dropped too, and
+      // this is the subtler one: forwardNotification() writes to the client's
+      // stdout, but these ids come from this.nextBackendId - the shim's OWN
+      // counter for backend requests - not from the client. Relaying one puts a
+      // foreign id into the client's id namespace, where it can prematurely
+      // satisfy an unrelated pending client request that happens to share the
+      // number and make the real reply arrive as a duplicate. There is no
+      // caller it could legitimately reach either: readSseUntilMatch is
+      // per-request and returns only the matching id, so a foreign response on
+      // this stream is orphaned by construction.
+      if (onMessage && isJsonRpcMessage(msg) && msg?.id === undefined) onMessage(msg);
     }
     return undefined;
   };

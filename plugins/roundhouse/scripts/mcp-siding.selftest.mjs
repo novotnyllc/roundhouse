@@ -234,10 +234,19 @@ export async function selftest() {
     (msg) => otherIdForwarded.push(msg),
   );
   assert.deepEqual(otherIdMatch, { jsonrpc: "2.0", id: 9, result: { mine: true } }, "a non-matching id must never be taken as the response");
+  // Deliberately NOT forwarded. forwardNotification() writes to the client's
+  // stdout, but these ids come from this.nextBackendId - the shim's own counter
+  // - not from the client. Relaying id 8 puts a foreign id into the client's
+  // namespace, where it can prematurely satisfy an unrelated pending client
+  // request numbered 8 and turn the real reply into a duplicate. Nothing else
+  // needs it either: readSseUntilMatch is per-request and returns only the
+  // matching id, so a foreign response on this stream is orphaned by
+  // construction. This assertion previously required the opposite and was
+  // encoding the bug.
   assert.deepEqual(
     otherIdForwarded,
-    [{ jsonrpc: "2.0", id: 8, result: { other: true } }],
-    "a message with a non-matching id must be forwarded, not silently discarded",
+    [],
+    "a response carrying a non-matching backend id must never reach the client",
   );
 
   // A server-to-CLIENT request (method AND id) must NOT be forwarded. The
@@ -260,11 +269,8 @@ export async function selftest() {
   assert.deepEqual(mixedMatch, { jsonrpc: "2.0", id: 43, result: { mine: true } });
   assert.deepEqual(
     mixedForwarded,
-    [
-      { jsonrpc: "2.0", method: "notifications/progress", params: { p: 1 } },
-      { jsonrpc: "2.0", id: 42, result: { other: true } },
-    ],
-    "server-to-client requests must be dropped; notifications and other-id responses must still forward",
+    [{ jsonrpc: "2.0", method: "notifications/progress", params: { p: 1 } }],
+    "only id-less notifications reach the client: server-to-client requests have no reply path, and other-id responses carry backend ids that would collide with the client's own",
   );
 
   // Anything in a data: field that is not a JSON-RPC message - a bare
