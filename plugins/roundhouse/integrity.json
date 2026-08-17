@@ -170,7 +170,7 @@
     },
     {
       "path": "scripts/mcp-siding-windows.ps1",
-      "sha256": "8f33ba40adc814879320565d9df2b440b4a70abd7b964fc6ab468b9325065dc1"
+      "sha256": "1ef2574ce5b41b730a37c868a1c2d01d5799acad3e82701e41791ff9b3c64f70"
     },
     {
       "path": "scripts/mcp-siding.mjs",
