@@ -40,6 +40,7 @@ import {
   parseArgs,
   buildShimFromArgs,
   defaultCachePath,
+  toolsDigest,
 } from "./mcp-siding.mjs";
 
 // Resolved relative to *this file*, not CWD or a hardcoded repo path - so
@@ -1517,6 +1518,7 @@ export async function selftest() {
   //          show. -------------------------------------------------------
   await selftestNotificationForwardingEndToEnd();
   await selftestToolListReconcileNotifiesClient();
+  await selftestReconcileNeverCommitsTruncatedWalk();
 
   // -- 7j3e. #16: native Windows. The PowerShell resolver/launcher lives in
   //          the sibling mcp-siding-windows.ps1 and carries its own
@@ -4748,6 +4750,56 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(resolve(p
 // tools until the client itself restarted. The backend reports
 // listChanged:false while genuinely serving dynamic tools, so it will never
 // volunteer the change either; the shim has to notice and say so.
+async function selftestReconcileNeverCommitsTruncatedWalk() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-truncated-"));
+  const cachePath = join(dir, "tools.json");
+  const port = await getFreePort();
+  const good = [{ name: "a" }, { name: "b" }];
+  await writeFile(cachePath, JSON.stringify(good), "utf8");
+  const notifications = [];
+  const shim = new Shim({
+    url: `http://127.0.0.1:${port}/mcp`,
+    name: "test",
+    cachePath,
+    timeoutMs: 500,
+    launchEnabled: false,
+    appPath: null,
+    launchGraceMs: 150_000,
+  });
+  shim.onNotification = (msg) => notifications.push(msg);
+  shim.lastServedToolsDigest = toolsDigest(good);
+
+  // A backend whose cursor never terminates - either genuinely more pages than
+  // the cap, or a looping cursor.
+  const server = createServer((req, res) => {
+    readJsonBody(req).then((msg) => {
+      if (msg.method === "initialize") {
+        return sendJson(res, 200,
+          { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } },
+          { "MCP-Session-Id": "s1" });
+      }
+      if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+      if (msg.method === "tools/list") {
+        return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "partial" }], nextCursor: "always-more" } });
+      }
+      sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+    });
+  });
+  await new Promise((r) => server.listen(port, "127.0.0.1", r));
+  try {
+    assert.equal(await shim.reconcileTools(), null, "a walk that never terminates must report incomplete");
+    assert.equal(notifications.length, 0, "must never claim tools vanished from a truncated walk");
+    assert.deepEqual(
+      JSON.parse(await readFile(cachePath, "utf8")),
+      good,
+      "a truncated walk must not overwrite a complete cached inventory",
+    );
+  } finally {
+    await new Promise((r) => server.close(r));
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function selftestToolListReconcileNotifiesClient() {
   const dir = await mkdtemp(join(tmpdir(), "siding-reconcile-"));
   const cachePath = join(dir, "tools.json");
@@ -4819,6 +4871,22 @@ async function selftestToolListReconcileNotifiesClient() {
     tools = [{ name: "fusion_mcp_execute", description: "live" }];
     assert.equal(await shim.reconcileTools(), true, "a real inventory change -> notify");
     assert.equal(notifications.length, 2, "second notification for the real change");
+
+    // Metadata-only change: the digest must cover the WHOLE tool object, not
+    // a hand-picked subset. A client holding a stale outputSchema/annotations
+    // is holding a stale definition just as surely as a renamed tool.
+    tools = [{ name: "fusion_mcp_execute", description: "live", outputSchema: { type: "object" } }];
+    assert.equal(await shim.reconcileTools(), true, "an outputSchema change must notify");
+    assert.equal(notifications.length, 3, "metadata-only change notifies");
+
+    tools = [{ name: "fusion_mcp_execute", description: "live", annotations: { readOnlyHint: true } }];
+    assert.equal(await shim.reconcileTools(), true, "an annotations change must notify");
+    assert.equal(notifications.length, 4, "annotations change notifies");
+
+    // Key ORDER within a tool object is not a change.
+    tools = [{ annotations: { readOnlyHint: true }, description: "live", name: "fusion_mcp_execute" }];
+    assert.equal(await shim.reconcileTools(), false, "reordered object keys are not a change");
+    assert.equal(notifications.length, 4, "key reordering must not notify");
   } finally {
     await new Promise((r) => server.close(r));
     await rm(dir, { recursive: true, force: true });

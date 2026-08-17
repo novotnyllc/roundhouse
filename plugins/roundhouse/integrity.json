@@ -54,7 +54,7 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.ps1",
-      "sha256": "85eb42dec770d476faf71508153d7e95b52e59dd0651e7040c276fe071102a8f"
+      "sha256": "550013322f9f23a98c4185c28e11fe445437b04fe6fa3b469a317d34b3450827"
     },
     {
       "path": "scripts/collect-posix",
@@ -170,15 +170,15 @@
     },
     {
       "path": "scripts/mcp-siding-windows.ps1",
-      "sha256": "dabbe1af919e49bc792e6f9cfc09fc745fae2882f4cad391719fcbcdbbfbb74d"
+      "sha256": "8f33ba40adc814879320565d9df2b440b4a70abd7b964fc6ab468b9325065dc1"
     },
     {
       "path": "scripts/mcp-siding.mjs",
-      "sha256": "4069e27ae3b5b0ff38e6861f19c2b94b2d697539e7daba963d1c8ad4a68e67d4"
+      "sha256": "654e81c692f42cb36b85680c5d3fed0bbe4f9e976307a9b97369e970cddafcf7"
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
-      "sha256": "9b156732fccac8e0c7f236f218cc92e7f15b04034f6c7762814d50b00f5803b0"
+      "sha256": "5bd3d6ab3ab5b29f0ad4898a3af28a9ec0306cb1b5f68c72f86cb7fbf131399d"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -266,7 +266,7 @@
     },
     {
       "path": "skills/mcp-shim/SKILL.md",
-      "sha256": "3f077ee946f19f90e4890fb775780de9505365468524323c9a6bf10212a9759c"
+      "sha256": "b87bf0a6bc04dabb9ea04d82077cef2e1416f500ed62ba5b822563c4a24b9c76"
     },
     {
       "path": "skills/mcp-shim/agents/openai.yaml",

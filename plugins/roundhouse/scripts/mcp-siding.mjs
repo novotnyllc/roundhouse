@@ -799,13 +799,26 @@ function jittered(ms) {
   return Math.round(ms * (1 + (Math.random() * 2 - 1) * RECONCILE_JITTER));
 }
 
-// Order-insensitive: a backend is free to return the same inventory in a
-// different order, and that is not a change worth waking the client for.
+// Key order inside an object is not meaningful, so it must not change the
+// digest.
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+// Hashes the COMPLETE tool object, not a hand-picked subset. A backend that
+// changes only outputSchema, annotations, title, icons or _meta has still
+// changed the definition the client is holding, and naming fields explicitly
+// means every field the spec adds later is silently exempt from change
+// detection. List ORDER stays insignificant - a backend may return the same
+// inventory in any order, which is not worth waking the client for - hence
+// sorting the per-tool strings rather than hashing the array as given.
 export function toolsDigest(tools) {
-  const norm = tools
-    .map((t) => JSON.stringify([t?.name ?? null, t?.description ?? null, t?.inputSchema ?? null]))
-    .sort();
-  return createHash("sha256").update(norm.join(" ")).digest("hex");
+  const norm = tools.map(stableStringify).sort();
+  return createHash("sha256").update(norm.join("\u0000")).digest("hex");
 }
 
 function mergeToolPage(base, page) {
@@ -983,13 +996,22 @@ export class Shim {
     try {
       let tools = [];
       let cursor;
+      let complete = false;
       for (let page = 0; page < MAX_RECONCILE_PAGES; page++) {
         const result = await this.backend("tools/list", cursor ? { cursor } : undefined);
         if (!Array.isArray(result?.tools)) return null;
         tools = mergeToolPage(tools, result.tools);
-        if (!result.nextCursor) break;
+        if (!result.nextCursor) { complete = true; break; }
         cursor = result.nextCursor;
       }
+      // Hitting the cap with a cursor still outstanding means we never saw a
+      // terminal page - either the backend genuinely has more than
+      // MAX_RECONCILE_PAGES, or its cursor loops. Either way this is a PARTIAL
+      // inventory. Committing it would overwrite a complete cached list with a
+      // truncated one and, worse, notify the client that tools disappeared
+      // when they did not. A reconcile that could not finish has learned
+      // nothing; treat it exactly like an unreachable backend and back off.
+      if (!complete) return null;
       writeCache(this.cachePath, tools);
       const digest = toolsDigest(tools);
       // Only a list the client already holds can go stale. If it has never
@@ -1884,23 +1906,6 @@ function main(flags) {
   // in buildShimFromArgs - a Shim built for a unit test has no stdio client
   // and must never write to a real stdout.
   shim.onNotification = emit;
-  // Detects an inventory that moved while the client sat idle - the app being
-  // opened after we served the cached fallback, or its dynamic tools changing
-  // mid-session. Self-rescheduling rather than setInterval so the delay can
-  // back off while the app is closed (the usual state) instead of retrying at
-  // full rate forever. unref() so this timer never keeps the process alive.
-  let reconcileDelay = RECONCILE_BASE_MS;
-  const scheduleReconcile = () => {
-    const timer = setTimeout(async () => {
-      const changed = await shim.reconcileTools();
-      reconcileDelay = changed === null
-        ? Math.min(reconcileDelay * 2, RECONCILE_MAX_MS)
-        : RECONCILE_BASE_MS;
-      scheduleReconcile();
-    }, jittered(reconcileDelay));
-    timer.unref?.();
-  };
-  scheduleReconcile();
   const rl = createInterface({ input: process.stdin, terminal: false });
 
   // The client closing stdin (readline's 'close') is the only signal a
@@ -1917,6 +1922,34 @@ function main(flags) {
   // Process lines strictly in order: concurrent handling could race two
   // in-flight requests over the same session id (this.sid).
   let queue = Promise.resolve();
+
+  // Detects an inventory that moved while the client sat idle - the app being
+  // opened after we served the cached fallback, or its dynamic tools changing
+  // mid-session. Self-rescheduling rather than setInterval so the delay can
+  // back off while the app is closed (the usual state) instead of retrying at
+  // full rate forever. unref() so this timer never keeps the process alive.
+  //
+  // Runs THROUGH the same serialized queue every client request uses. Calling
+  // reconcileTools() directly off the timer raced a client request that was
+  // also connecting: both observe `connected === false`, both send their own
+  // initialize, and the second overwrites this.sid - so the first then sends
+  // its real request against a session whose notifications/initialized never
+  // completed, and it is rejected or silently falls back to cached tools. The
+  // queue exists precisely to prevent that; background work is not exempt.
+  let reconcileDelay = RECONCILE_BASE_MS;
+  const scheduleReconcile = () => {
+    const timer = setTimeout(() => {
+      queue = queue.then(async () => {
+        const changed = await shim.reconcileTools();
+        reconcileDelay = changed === null
+          ? Math.min(reconcileDelay * 2, RECONCILE_MAX_MS)
+          : RECONCILE_BASE_MS;
+        scheduleReconcile();
+      });
+    }, jittered(reconcileDelay));
+    timer.unref?.();
+  };
+  scheduleReconcile();
   rl.on("line", (raw) => {
     const line = raw.trim();
     if (!line) return;
