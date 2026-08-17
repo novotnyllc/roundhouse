@@ -387,8 +387,14 @@ class BackendReported extends Error {
 // there is no JSON-RPC envelope to read a code/message from here.
 class HttpRejected extends Error {
   constructor(status, bodySnippet) {
-    super(`HTTP ${status}${bodySnippet ? `: ${bodySnippet}` : ""}`);
+    super(`HTTP ${status}${bodySnippet ? `: ${String(bodySnippet).slice(0, 200)}` : ""}`);
     this.status = status;
+    // The spec's documented modern-detection case is an
+    // UnsupportedProtocolVersionError delivered inside an HTTP 400, so the era
+    // probe has to be able to READ the body of a rejection. Parsed here, once,
+    // rather than making every caller re-parse a snippet.
+    this.body = null;
+    try { this.body = JSON.parse(bodySnippet); } catch { /* not JSON: no body to offer */ }
   }
 }
 
@@ -1218,7 +1224,10 @@ export class Shim {
     }
     if (!res.ok) {
       if (sid && STALE_HTTP_STATUSES.has(res.status)) throw new Stale(`HTTP ${res.status}`);
-      throw new HttpRejected(res.status, (errorText ?? "").slice(0, 200));
+      // Pass the WHOLE body, not a 200-char snippet: HttpRejected parses it so
+      // the era probe can recognise a modern error delivered in a 4xx, and a
+      // truncated body never parses. The message still shows only a snippet.
+      throw new HttpRejected(res.status, errorText ?? "");
     }
     return { body, sid: res.headers.get("mcp-session-id") };
   }
@@ -1275,10 +1284,32 @@ export class Shim {
         this.protocolVersion = shared[0] ?? MODERN_PROTOCOL_VERSION;
         return this.backendEra;
       }
-    } catch {
-      // Unreachable or refused: not evidence of an era. Leave it undecided so a
-      // later attempt can probe again rather than caching "legacy" from what
-      // was only downtime.
+    } catch (err) {
+      // A CANCELLATION is not an era verdict and must not be swallowed. The
+      // client asked us to stop; returning null here let connect() carry on,
+      // start a fresh initialize, and ultimately run the caller's (possibly
+      // mutating) tool call against the backend after it had been cancelled.
+      if (err instanceof Cancelled) throw err;
+      // The spec's documented modern-detection case: an
+      // UnsupportedProtocolVersionError delivered inside an HTTP 4xx. Without
+      // reading that body a modern-only backend looks like a legacy one, we
+      // send initialize, and it fails for a reason nothing explains.
+      if (err instanceof HttpRejected && err.body?.error?.code === UNSUPPORTED_PROTOCOL_VERSION) {
+        this.backendEra = "modern";
+        const supported = err.body.error.data?.supported;
+        const shared = Array.isArray(supported) ? supported.filter((v) => SUPPORTED_PROTOCOL_VERSIONS.includes(v)) : [];
+        this.protocolVersion = shared[0] ?? MODERN_PROTOCOL_VERSION;
+        return this.backendEra;
+      }
+      // A 4xx with no recognisable modern body is a LEGACY server, per the
+      // Streamable HTTP fallback rule - that is a verdict, not an unknown.
+      if (err instanceof HttpRejected) {
+        this.backendEra = "legacy";
+        return this.backendEra;
+      }
+      // Anything else - unreachable, timeout, malformed - is genuinely
+      // inconclusive. Leave it undecided so a later attempt probes again
+      // rather than caching an era from what was only downtime.
       return null;
     }
     this.backendEra = "legacy";

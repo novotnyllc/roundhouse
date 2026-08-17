@@ -5215,6 +5215,42 @@ async function selftestBackendEraDetection() {
       },
     );
 
+    // --- a modern backend that answers discover with an HTTP 4xx --------
+    // The spec's documented detection case. Reading that body is the whole
+    // point: without it a modern-only backend looks legacy, we send
+    // initialize, and it fails for a reason nothing explains.
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") {
+            return sendJson(res, 400, { jsonrpc: "2.0", id: msg.id, error: { code: -32022, message: "Unsupported protocol version", data: { supported: ["2026-07-28"], requested: "2026-07-28" } } });
+          }
+          if (msg.method === "tools/call") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { content: [], isError: false } });
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = mk(url);
+        await shim.probeBackendEra();
+        assert.equal(shim.backendEra, "modern", "a modern error inside a 4xx must identify a MODERN server");
+      },
+    );
+
+    // A 4xx with nothing modern in it IS a verdict: legacy.
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") return sendJson(res, 400, { oops: "no idea what that is" });
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = mk(url);
+        await shim.probeBackendEra();
+        assert.equal(shim.backendEra, "legacy", "an unrecognisable 4xx means legacy, per the fallback rule");
+      },
+    );
+
     // --- downtime is NOT an era verdict ---------------------------------
     const down = mk("http://127.0.0.1:65533/mcp");
     await down.handle({ jsonrpc: "2.0", id: 3, method: "tools/call", params: {} });
