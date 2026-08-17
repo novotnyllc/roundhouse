@@ -48,6 +48,9 @@ export const PROTOCOL_VERSION = "2025-06-18";
 // choosing from this list should land on the newest we both support.
 export const SUPPORTED_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
 
+// The newest revision we speak; what the backend-era probe asks for.
+export const MODERN_PROTOCOL_VERSION = "2026-07-28";
+
 // JSON-RPC error code for UnsupportedProtocolVersionError (spec 2026-07-28).
 export const UNSUPPORTED_PROTOCOL_VERSION = -32022;
 
@@ -975,6 +978,12 @@ export class Shim {
     // Set once initialize's response is known, cleared alongside
     // sid/connected on any reconnect - see post()/connect().
     this.protocolVersion = null;
+    // The BACKEND's era: "modern" (per-request _meta, 2026-07-28+), "legacy"
+    // (initialize handshake), or null for not-yet-probed. The spec says era is
+    // a property of the server, not of a request, and SHOULD be cached for the
+    // lifetime of the origin — so this is decided once and reused, not
+    // re-probed on every reconnect.
+    this.backendEra = null;
     // Client request id -> the AbortController post() built for it, so a
     // notifications/cancelled naming that id can abort the matching
     // in-flight HTTP request. Entries are added/removed by post() itself,
@@ -1222,7 +1231,69 @@ export class Shim {
   // the handshake's own internal calls, never under the client's id) and
   // was a silent no-op: the handshake ran to completion and the shim went
   // on to run the very tool call the client had already cancelled.
+  // Is the backend modern? Probes server/discover once and caches the verdict.
+  // Per the Streamable HTTP backward-compatibility rules: attempt a modern
+  // request, and treat a RECOGNIZED modern reply (a DiscoverResult, or an
+  // UnsupportedProtocolVersionError) as proof of a modern server. Anything
+  // else — an unknown-method error, a 4xx with no modern body, a transport
+  // failure — means legacy, and we fall back to `initialize`.
+  //
+  // Deliberately fail-safe toward legacy: every desktop backend today speaks
+  // the handshake, so an ambiguous answer must not strand us in modern mode
+  // against a server that cannot serve it.
+  async probeBackendEra(clientRequestId) {
+    if (this.backendEra !== null) return this.backendEra;
+    try {
+      const { body } = await this.post(
+        {
+          jsonrpc: "2.0",
+          id: 0,
+          method: "server/discover",
+          params: {
+            _meta: {
+              [PROTOCOL_VERSION_META_KEY]: MODERN_PROTOCOL_VERSION,
+              "io.modelcontextprotocol/clientInfo": { name: "mcp-siding", version: "1" },
+              "io.modelcontextprotocol/clientCapabilities": {},
+            },
+          },
+        },
+        null,
+        clientRequestId,
+      );
+      if (Array.isArray(body?.result?.supportedVersions)) {
+        const shared = body.result.supportedVersions.filter((v) => SUPPORTED_PROTOCOL_VERSIONS.includes(v));
+        // A modern server we share no version with is still MODERN — falling
+        // back to initialize would just fail differently and hide why.
+        this.backendEra = "modern";
+        this.protocolVersion = shared[0] ?? MODERN_PROTOCOL_VERSION;
+        return this.backendEra;
+      }
+      if (body?.error?.code === UNSUPPORTED_PROTOCOL_VERSION) {
+        this.backendEra = "modern";
+        const supported = body.error.data?.supported;
+        const shared = Array.isArray(supported) ? supported.filter((v) => SUPPORTED_PROTOCOL_VERSIONS.includes(v)) : [];
+        this.protocolVersion = shared[0] ?? MODERN_PROTOCOL_VERSION;
+        return this.backendEra;
+      }
+    } catch {
+      // Unreachable or refused: not evidence of an era. Leave it undecided so a
+      // later attempt can probe again rather than caching "legacy" from what
+      // was only downtime.
+      return null;
+    }
+    this.backendEra = "legacy";
+    return this.backendEra;
+  }
+
   async connect(clientRequestId) {
+    // A modern backend needs no handshake at all: version, identity and
+    // capabilities all travel per-request. Marking the session connected is
+    // the whole of "connecting" there.
+    if ((await this.probeBackendEra(clientRequestId)) === "modern") {
+      this.sid = null;
+      this.connected = true;
+      return;
+    }
     const { body, sid } = await this.post(
       {
         jsonrpc: "2.0",
@@ -1291,7 +1362,13 @@ export class Shim {
           // can name the right one.
           const backendRequestId = this.nextBackendId++;
           if (clientRequestId !== undefined) this.backendIdForClient.set(clientRequestId, backendRequestId);
-          const { body } = await this.post({ jsonrpc: "2.0", id: backendRequestId, method, params }, this.sid, clientRequestId);
+          // A modern backend expects the version on EVERY request; a legacy
+          // one negotiated it once and must not receive _meta it never asked
+          // for, so this is added only for a backend proven modern.
+          const outbound = this.backendEra === "modern"
+            ? { ...(params ?? {}), _meta: { ...(params?._meta ?? {}), [PROTOCOL_VERSION_META_KEY]: this.protocolVersion ?? MODERN_PROTOCOL_VERSION } }
+            : params;
+          const { body } = await this.post({ jsonrpc: "2.0", id: backendRequestId, method, params: outbound }, this.sid, clientRequestId);
           if (body?.error) throw new BackendReported(body.error.code, body.error.message ?? "backend error");
           // This call always sends an id, so a response was expected - a 200
           // with an empty body, or an SSE stream that reached EOF without
