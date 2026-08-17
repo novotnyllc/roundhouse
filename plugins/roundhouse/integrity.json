@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "1832a2ab941a4ec7199b2ae38265cc3297cae8a5a1f6cf753d1cba0da8291795"
+      "sha256": "2ea89caac3595a1c95777a354f2bc33919c549d438744af40e36727c8962d3b9"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "eccce085a50d94cddbba445c6fa8b5ac672e29c3740293328c469a6cc0aef69c"
+      "sha256": "774108dd381d6d73492b5f169f3622db2a26fe15f22c4782917f898586502af0"
     },
     {
       "path": "assets/icon.png",
@@ -182,7 +182,7 @@
     },
     {
       "path": "scripts/preflight",
-      "sha256": "0717adf3a10fe028350fca1c111a4383b032d316caae83dd8d8e9b8d89046b32"
+      "sha256": "4e4a05a1d1f749a87ce66cd520910dc2c13296776724e7034d2d2c2f4cfb1fbf"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -297,5 +297,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.6"
+  "version": "0.9.8"
 }

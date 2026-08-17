@@ -94,11 +94,13 @@ for (const file of files) {
         if (assigned.has(name) || KNOWN.has(name)) continue;
         // An assignment on THIS line defines the name from here on; reading it
         // on its own right-hand side is still a use-before-assignment.
-        const assignsHere = new RegExp(`\\$${name}\\s*=`).test(line);
-        const readBeforeAssign = assignsHere
-          ? line.indexOf(`$${name}`) < line.search(new RegExp(`\\$${name}\\s*=`))
-          : true;
-        if (assignsHere && !readBeforeAssign) continue;
+        // Compare THIS match's position against the assignment, not the first
+        // occurrence of the name: in `$x = $x + 1` both indexOf and search
+        // resolve to the same left-hand `$x`, so the right-hand read - the
+        // actual use-before-assignment - was excused. m.index is this
+        // occurrence; only the one AT the assignment is the definition.
+        const assignAt = line.search(new RegExp(`\\$${name}\\s*=`));
+        if (assignAt !== -1 && m.index === assignAt) continue;
         console.error(`FAIL ${file}: PowerShell snippet reads $${name} before anything assigns it`);
         bad = 1;
       }
@@ -126,7 +128,12 @@ if [ "${PREFLIGHT_FAST:-0}" = "1" ]; then
     fail=1
   fi
 else
-  suite_out=$(plugins/roundhouse/scripts/test-roundhouse 2>&1)
+  # Unset the scope selectors. test-roundhouse honours ROUNDHOUSE_TEST_SCOPE /
+  # _ONLY / _TIER and will exit early with a scoped PASS, which this gate would
+  # then accept as a full run - a release gate that reports PASSED for a partial
+  # suite is worse than no gate, because it reads as coverage.
+  suite_out=$(env -u ROUNDHOUSE_TEST_SCOPE -u ROUNDHOUSE_TEST_ONLY -u ROUNDHOUSE_TEST_TIER \
+    plugins/roundhouse/scripts/test-roundhouse 2>&1)
   suite_rc=$?
   if [ "$suite_rc" -eq 0 ] && printf '%s' "$suite_out" | grep -q '^PASS'; then
     note "ok   test-roundhouse"
