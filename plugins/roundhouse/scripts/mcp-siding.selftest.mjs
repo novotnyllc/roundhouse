@@ -1526,6 +1526,7 @@ export async function selftest() {
   await selftestToolListReconcileNotifiesClient();
   await selftestInterimResultsArePassedThrough();
   await selftestDualEraServerFace();
+  await selftestModernToolsListCarriesCachingHints();
   await selftestReconcileNeverCommitsTruncatedWalk();
 
   // -- 7j3e. #16: native Windows. The PowerShell resolver/launcher lives in
@@ -4939,6 +4940,49 @@ async function selftestInterimResultsArePassedThrough() {
 // and talking to a legacy backend. Per the 2026-07-28 compatibility matrix a
 // legacy-only server FAILS a modern client outright, so this is what keeps the
 // shim working when the harness moves and the desktop app has not.
+// Caching hints on the APP-UP path specifically. The offline fallback sets them
+// inline, so asserting against a down backend proves nothing about the
+// normalization - the first version of this test did exactly that and passed
+// with the normalization deleted.
+async function selftestModernToolsListCarriesCachingHints() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-hints-"));
+  try {
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+          if (msg.method === "initialize") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } }, { "MCP-Session-Id": "s1" });
+          }
+          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          // A legacy backend: a plain inventory carrying no caching hints.
+          if (msg.method === "tools/list") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "live_tool" }] } });
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = new Shim({
+          url, name: "test", cachePath: join(dir, "t.json"),
+          timeoutMs: 1_000, launchEnabled: false, appPath: null, launchGraceMs: 150_000,
+        });
+        const r = await shim.handle({
+          jsonrpc: "2.0", id: 1, method: "tools/list",
+          params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } },
+        });
+        assert.deepEqual(r.result.tools, [{ name: "live_tool" }], "must be the LIVE list, proving the app-up path ran");
+        assert.equal(r.result.resultType, "complete");
+        assert.equal(r.result.ttlMs, 0, "our list changes underneath the client; it must never be held as fresh");
+        assert.equal(r.result.cacheScope, "private", "a desktop app's tools are that machine's session");
+
+        const legacy = await shim.handle({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+        assert.deepEqual(legacy.result, { tools: [{ name: "live_tool" }] }, "a legacy client gets no fields it never asked for");
+      },
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 async function selftestDualEraServerFace() {
   const dir = await mkdtemp(join(tmpdir(), "siding-dualera-"));
   const shim = new Shim({
