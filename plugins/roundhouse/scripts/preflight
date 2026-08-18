@@ -30,6 +30,12 @@ note() { printf '%s\n' "$*" >&2; }
 if [ "$(git config --get merge.ours.driver || true)" != "true" ]; then
   git config merge.ours.driver true && note "ok   configured merge.ours.driver (integrity.json stops conflicting)"
 fi
+# Version-only manifest conflicts resolve to the HIGHER version. %O/%A/%B are
+# git's ancestor/ours/theirs paths.
+if [ -z "$(git config --get merge.pluginversion.driver || true)" ]; then
+  git config merge.pluginversion.driver 'plugins/roundhouse/scripts/git-merge-plugin-version %O %A %B' &&
+    note "ok   configured merge.pluginversion.driver (manifest bumps stop conflicting)"
+fi
 
 # --- 1. integrity manifest is regenerated and committed --------------------
 # Capture the generator's OWN exit status first. It can refuse before touching

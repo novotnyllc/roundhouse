@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "2ea89caac3595a1c95777a354f2bc33919c549d438744af40e36727c8962d3b9"
+      "sha256": "039fa633bb45faa6cfce99815f6388c3cff8d656e1ebcda70390d8b1517193e7"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "774108dd381d6d73492b5f169f3622db2a26fe15f22c4782917f898586502af0"
+      "sha256": "fd550360d96f821493b0863d8ec630b841a8e083d173b89a3cf873287d59e0fa"
     },
     {
       "path": "assets/icon.png",
@@ -79,6 +79,10 @@
     {
       "path": "scripts/enroll-windows-sftp.ps1",
       "sha256": "d7f07d713340a1481fffc615b6518e847fc9ddbc525f766aae5fa9016597da31"
+    },
+    {
+      "path": "scripts/git-merge-plugin-version",
+      "sha256": "716deeb76fc2dbab27b9da34777e36f9edb3ddb53e26195c86879f4ac47718e6"
     },
     {
       "path": "scripts/homebrew-bridge.rb",
@@ -182,7 +186,7 @@
     },
     {
       "path": "scripts/preflight",
-      "sha256": "4e4a05a1d1f749a87ce66cd520910dc2c13296776724e7034d2d2c2f4cfb1fbf"
+      "sha256": "866af1413fa46bd79ad3c1d77201946f87a1d9ad6a973251b63ce9b7fde675d6"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -297,5 +301,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.8"
+  "version": "0.9.10"
 }

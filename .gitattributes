@@ -39,3 +39,15 @@
 # semantic decision about which release this is, and silently keeping one side
 # would hide an intended bump.
 plugins/roundhouse/integrity.json merge=ours
+
+# Plugin versions only ever increment, so a version-only conflict has exactly
+# one right answer and resolving it by hand on every stacked merge is churn.
+# `merge=ours` is NOT sufficient here: it keeps the CURRENT branch's version
+# even when main has moved ahead, silently regressing the release number — the
+# failure that made every branch in a 4-deep stack need a hand bump.
+#
+# The driver resolves ONLY when the two sides are identical apart from the
+# version, and takes the HIGHER one. Any other difference is a real content
+# conflict and is left for a human. Configured by scripts/preflight.
+plugins/roundhouse/.claude-plugin/plugin.json merge=pluginversion
+plugins/roundhouse/.codex-plugin/plugin.json merge=pluginversion
