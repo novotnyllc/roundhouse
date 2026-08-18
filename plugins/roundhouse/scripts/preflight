@@ -86,7 +86,7 @@ const walk = (d) => {
 if (fs.existsSync("plugins/roundhouse/skills")) walk("plugins/roundhouse/skills");
 
 // Shell builtins and documented caller-supplied values.
-const KNOWN = new Set(["SkillDir", "_", "LASTEXITCODE", "PSScriptRoot", "args", "true", "false", "null", "env"]);
+const KNOWN = new Set(["skilldir", "_", "lastexitcode", "psscriptroot", "args", "true", "false", "null", "env"]);
 
 for (const file of files) {
   const text = fs.readFileSync(file, "utf8");
@@ -107,7 +107,9 @@ for (const file of files) {
   // unassigned braced variable passed the checker entirely. `$env:X` is
   // excluded - it is supplied by the environment, not the snippet.
   const VAR = /\$(?!env:)\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g;
-  const ASSIGN = (n) => new RegExp(`\\$\\{?${n}\\}?\\s*=`);
+  // Case-insensitive too: the assignment that defines $AppPath must be found
+  // when looking up the normalized name.
+  const ASSIGN = (n) => new RegExp(`\\$\\{?${n}\\}?\\s*=`, "i");
   for (const block of blocks) {
     for (const raw of block.split("\n")) {
       const line = raw.replace(/#.*$/, "");
@@ -118,14 +120,18 @@ for (const file of files) {
       for (const stmt of line.split(";")) {
         const defined = [];
         for (const m of stmt.matchAll(VAR)) {
-          const name = m[1];
+          // PowerShell variable names are CASE-INSENSITIVE: `$AppPath = ...`
+          // followed by `Test-Path $appPath` is one variable, and a
+          // case-sensitive Set reported the second as a use-before-assignment
+          // and failed a perfectly valid shipped snippet.
+          const name = m[1].toLowerCase();
           if (KNOWN.has(name)) continue;
           const at = stmt.search(ASSIGN(name));
           // The occurrence AT the assignment is the definition; anything else
           // - including this statement's own right-hand side - is a read.
           if (at !== -1 && m.index === at) { defined.push(name); continue; }
           if (assigned.has(name)) continue;
-          console.error(`FAIL ${file}: PowerShell snippet reads $${name} before anything assigns it`);
+          console.error(`FAIL ${file}: PowerShell snippet reads $${m[1]} before anything assigns it`);
           bad = 1;
         }
         for (const name of defined) assigned.add(name);

@@ -22,18 +22,34 @@ vb=$(jq -r '.version // empty' "$theirs" 2>/dev/null) || exit 1
 
 # Highest wins. sort -V understands dotted versions; picking max rather than
 # "theirs" is what makes this safe in both merge directions.
-winner=$(printf '%s\n%s\n' "$va" "$vb" | sort -V 2>/dev/null | tail -1) || winner=
-# FAIL CLOSED. There is no errexit here, so without this check a `sort` that
-# lacks -V leaves $winner empty, both manifests normalize to version "" and
-# compare equal, and the driver writes `"version": ""` and exits 0 — silently
-# corrupting both manifests while reporting a clean resolve. A merge driver
-# that cannot determine the answer must refuse, not guess.
-case $winner in
-  "" ) exit 1 ;;
-  *[!0-9.]* ) exit 1 ;;
-esac
-# And it must actually be one of the two inputs, never something sort invented.
-[ "$winner" = "$va" ] || [ "$winner" = "$vb" ] || exit 1
+# The repository's established comparator, not `sort -V`. sort's -V is a GNU
+# extension absent from BSD/macOS sort, where the pipeline would fail and the
+# fail-closed check would then refuse every conflict — safe, but the feature
+# would simply never work on the primary development platform. This is the same
+# awk comparison RESOLVER_SH uses in mcp-siding.mjs, for the same reason.
+version_gt() {
+  awk -F. -v left="$1" -v right="$2" '
+    function part(version, part_index, pieces) {
+      return split(version, pieces, /[.]/) >= part_index ? pieces[part_index] + 0 : 0
+    }
+    BEGIN {
+      for (part_index = 1; part_index <= 4; part_index++) {
+        l = part(left, part_index)
+        r = part(right, part_index)
+        if (l > r) exit 0
+        if (l < r) exit 1
+      }
+      exit 1
+    }
+  '
+}
+
+# Both must look like versions before they are compared; anything else is not a
+# version-only conflict and belongs to a human.
+case $va in ""|*[!0-9.]*) exit 1 ;; esac
+case $vb in ""|*[!0-9.]*) exit 1 ;; esac
+
+if version_gt "$va" "$vb"; then winner=$va; else winner=$vb; fi
 
 # Are the sides otherwise identical? Normalize BOTH to the winning version and
 # compare the whole document. If anything else differs, this is not a version

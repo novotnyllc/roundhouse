@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "fde9cf7cf1b3604daad669167b2291287195a050275d5769b499c4659a2314ca"
+      "sha256": "ee18ffb96b62eedbecd21390b01f98367cd3436f55d7665ac2d4ed2e5a338b25"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "c763d352898d81efebda5585f7e44778f78a026c62802b07dc042028d3476881"
+      "sha256": "068701a87d97513cfc62f9969a6aab9a2a6e51931e6b31a1c28e20cbad2234be"
     },
     {
       "path": "assets/icon.png",
@@ -82,7 +82,7 @@
     },
     {
       "path": "scripts/git-merge-plugin-version",
-      "sha256": "3072c21b7b13d46fd57042a132069e91f4be99af67f4233f7d40227c45b13583"
+      "sha256": "e98cd3f12b96a7f3cc5b84bc9eda5315e69bbcce7c5f857fbb3c37f585a6b4ec"
     },
     {
       "path": "scripts/homebrew-bridge.rb",
@@ -186,7 +186,7 @@
     },
     {
       "path": "scripts/preflight",
-      "sha256": "83f2ffc0968a26f1908e1dcdcd30658b258d7b6a3488ac7ae6b00d431eb2149c"
+      "sha256": "9ad36860c6912ee5a9f4df7044fd3a5fa1851b1f68e05010c07e87201479c543"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -301,5 +301,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.12"
+  "version": "0.9.13"
 }
