@@ -4060,12 +4060,16 @@ async function selftestInstallNodeResolverSnippet() {
     await mkdir(asdfShimDir, { recursive: true });
     const asdfNodePath = join(asdfShimDir, "node");
     await stageNodeWrapper(asdfNodePath);
-    const withFallback = spawnSync("/bin/sh", ["-c", `${snippet}\nprintf '%s' "$SCRIPT"`], {
+    // The snippet now INSTALLS a launcher rather than capturing a script into
+    // $SCRIPT, so the contract it must satisfy is "a runnable launcher exists
+    // at $LAUNCHER" - print the installed file, not a variable.
+    const withFallback = spawnSync("/bin/sh", ["-c", `${snippet}\n/bin/cat "$LAUNCHER"`], {
       env: { ...baseEnv, HOME: fakeHome },
       encoding: "utf8",
     });
     assert.equal(withFallback.status, 0, `install snippet failed with a usable fallback node (stderr: ${withFallback.stderr})`);
-    assert.match(withFallback.stdout, /exec "\$node_bin"/, "the documented install command must still produce a valid registration script");
+    assert.match(withFallback.stdout, /exec "\$node_bin" "\$p" "\$@"/, "the documented install command must install a launcher that forwards its arguments");
+    assert.match(withFallback.stdout, /^#!\/bin\/sh/, "the installed launcher must carry a POSIX sh shebang");
   } finally {
     await rm(fakeHome, { recursive: true, force: true });
   }
@@ -4077,12 +4081,12 @@ async function selftestInstallNodeResolverSnippet() {
 
   // set to a usable node -> wins, unchanged (PATH broken, so this proves
   // the override itself resolves, not a PATH fallback).
-  const usableOverride = spawnSync("/bin/sh", ["-c", `${snippet}\nprintf '%s' "$SCRIPT"`], {
+  const usableOverride = spawnSync("/bin/sh", ["-c", `${snippet}\n/bin/cat "$LAUNCHER"`], {
     env: { ...baseEnv, MCP_SIDING_NODE: realNode },
     encoding: "utf8",
   });
   assert.equal(usableOverride.status, 0, `install snippet failed with a usable $MCP_SIDING_NODE override (stderr: ${usableOverride.stderr})`);
-  assert.match(usableOverride.stdout, /exec "\$node_bin"/, "a usable $MCP_SIDING_NODE override must still produce a valid registration script");
+  assert.match(usableOverride.stdout, /exec "\$node_bin" "\$p" "\$@"/, "a usable $MCP_SIDING_NODE override must still install a working launcher");
 
   // set to a nonexistent path while a perfectly good node exists on PATH -
   // must fail closed, not fall through to that usable alternative (the
@@ -4134,7 +4138,7 @@ async function selftestInstallNodeResolverSnippet() {
     await mkdir(rewrittenDir, { recursive: true });
     await stageNodeWrapper(join(rewrittenDir, "opt-homebrew-node"));
     const rewrittenSnippet = rewriteHardcodedNodeFallbacks(snippet, rewrittenDir);
-    const positiveControl = spawnSync("/bin/sh", ["-c", `${rewrittenSnippet}\nprintf '%s' "$SCRIPT"`], {
+    const positiveControl = spawnSync("/bin/sh", ["-c", `${rewrittenSnippet}\n/bin/cat "$LAUNCHER"`], {
       env: { ...baseEnv, HOME: fallbackRewriteHome },
       encoding: "utf8",
     });
