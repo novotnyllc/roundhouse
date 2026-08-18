@@ -1,6 +1,6 @@
 {
   "name": "roundhouse",
-  "version": "0.9.9",
+  "version": "0.9.14",
   "description": "Machine and infrastructure administration for agent fleets: readiness, inventory, harness/plugin/skill parity, package baselines, auth artifacts, SSH transport and diagnosis, privileged install lanes.",
   "author": {
     "name": "Claire Novotny LLC",

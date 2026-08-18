@@ -5298,6 +5298,43 @@ async function selftestBackendEraDetection() {
       );
     }
 
+    // A GENERIC JSON-RPC error over HTTP 200 is not an era verdict. Only
+    // method-not-found identifies a legacy server; -32603 says the request
+    // failed, and caching legacy on it strands a modern backend that had one
+    // bad moment.
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Internal error" } });
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = mk(url);
+        await shim.probeBackendEra().catch(() => {});
+        assert.equal(shim.backendEra, null, "-32603 is a failed request, not a protocol statement");
+      },
+    );
+
+    // ...while method-not-found IS exactly what a legacy server says.
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = mk(url);
+        await shim.probeBackendEra().catch(() => {});
+        assert.equal(shim.backendEra, "legacy", "method-not-found settles the verdict");
+      },
+    );
+
     // A transport failure must fail ONCE. Returning "undecided" let connect()
     // immediately issue a second request, so an endpoint that accepts
     // connections and never answers burned the whole timeout twice.

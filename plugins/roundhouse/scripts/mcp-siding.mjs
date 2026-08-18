@@ -54,6 +54,16 @@ export const MODERN_PROTOCOL_VERSION = "2026-07-28";
 // JSON-RPC error code for UnsupportedProtocolVersionError (spec 2026-07-28).
 export const UNSUPPORTED_PROTOCOL_VERSION = -32022;
 
+// JSON-RPC "method not found". The ONLY error that identifies a legacy server:
+// it means the method is unknown, which is exactly a legacy server's answer to
+// server/discover. Every other error says the request failed, which is not a
+// statement about the protocol.
+export const METHOD_NOT_FOUND = -32601;
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 export const PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
 
 // The version a request declares, if it speaks the modern per-request style.
@@ -1264,8 +1274,11 @@ export class Shim {
 
   async probeBackendEra(clientRequestId) {
     if (this.backendEra !== null) return this.backendEra;
+    // Declared out here: the verdict below the try needs to inspect the reply,
+    // and a `const` inside the block is not in scope there.
+    let body;
     try {
-      const { body } = await this.post(
+      ({ body } = await this.post(
         {
           jsonrpc: "2.0",
           id: 0,
@@ -1280,7 +1293,7 @@ export class Shim {
         },
         null,
         clientRequestId,
-      );
+      ));
       if (Array.isArray(body?.result?.supportedVersions)) {
         const shared = body.result.supportedVersions.filter((v) => SUPPORTED_PROTOCOL_VERSIONS.includes(v));
         // A modern server we share no version with is still MODERN — falling
@@ -1345,8 +1358,20 @@ export class Shim {
       // uncached for the next call and re-throw, so this attempt fails once.
       throw err;
     }
-    this.backendEra = "legacy";
-    return this.backendEra;
+    // Reached only when the backend ANSWERED over HTTP 200 without a
+    // DiscoverResult. Only an error that actually identifies a legacy server
+    // may settle the verdict: method-not-found (-32601) means "I do not know
+    // server/discover", which is precisely what a legacy server says. A
+    // generic server error (-32603 and friends) says the request FAILED, not
+    // that the method is unknown — a modern backend having a bad moment would
+    // otherwise be cached as legacy permanently, and every later connection
+    // would skip discovery and send initialize it cannot answer.
+    const code = body?.error?.code;
+    if (code === METHOD_NOT_FOUND || !isObject(body?.error)) {
+      this.backendEra = "legacy";
+      return this.backendEra;
+    }
+    return null;
   }
 
   async connect(clientRequestId) {
