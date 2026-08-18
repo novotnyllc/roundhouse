@@ -22,7 +22,18 @@ vb=$(jq -r '.version // empty' "$theirs" 2>/dev/null) || exit 1
 
 # Highest wins. sort -V understands dotted versions; picking max rather than
 # "theirs" is what makes this safe in both merge directions.
-winner=$(printf '%s\n%s\n' "$va" "$vb" | sort -V | tail -1)
+winner=$(printf '%s\n%s\n' "$va" "$vb" | sort -V 2>/dev/null | tail -1) || winner=
+# FAIL CLOSED. There is no errexit here, so without this check a `sort` that
+# lacks -V leaves $winner empty, both manifests normalize to version "" and
+# compare equal, and the driver writes `"version": ""` and exits 0 — silently
+# corrupting both manifests while reporting a clean resolve. A merge driver
+# that cannot determine the answer must refuse, not guess.
+case $winner in
+  "" ) exit 1 ;;
+  *[!0-9.]* ) exit 1 ;;
+esac
+# And it must actually be one of the two inputs, never something sort invented.
+[ "$winner" = "$va" ] || [ "$winner" = "$vb" ] || exit 1
 
 # Are the sides otherwise identical? Normalize BOTH to the winning version and
 # compare the whole document. If anything else differs, this is not a version

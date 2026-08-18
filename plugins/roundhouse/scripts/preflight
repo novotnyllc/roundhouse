@@ -21,20 +21,24 @@ cd "$(dirname "$0")/../../.." || exit 1
 fail=0
 note() { printf '%s\n' "$*" >&2; }
 
-# --- 0. the merge attribute integrity.json relies on -----------------------
-# .gitattributes marks the generated manifest `merge=ours`, which needs this
-# stock driver defined locally (git ships no default for it). Set here rather
-# than in a hook: preflight is an explicit developer action, so it is the honest
-# place to configure repo-local git behaviour. Without it, merges simply
-# conflict as before - noisier, never wrong.
-if [ "$(git config --get merge.ours.driver || true)" != "true" ]; then
-  git config merge.ours.driver true && note "ok   configured merge.ours.driver (integrity.json stops conflicting)"
-fi
-# Version-only manifest conflicts resolve to the HIGHER version. %O/%A/%B are
-# git's ancestor/ours/theirs paths.
-if [ -z "$(git config --get merge.pluginversion.driver || true)" ]; then
-  git config merge.pluginversion.driver 'plugins/roundhouse/scripts/git-merge-plugin-version %O %A %B' &&
-    note "ok   configured merge.pluginversion.driver (manifest bumps stop conflicting)"
+# --- 0. merge drivers the .gitattributes entries rely on -------------------
+# REPORTS, never configures. Writing .git/config is a repository mutation, and
+# mutations here belong in an explicit sealed setup operation with target
+# resolution and post-change checks - not as a side effect of an audit command
+# somebody ran to check their work. Preflight's job is to tell you the truth
+# about the checkout, so an unconfigured driver is a finding, not a chore to
+# silently perform.
+missing_drivers=()
+[ "$(git config --get merge.ours.driver || true)" = "true" ] ||
+  missing_drivers+=("git config merge.ours.driver true")
+[ -n "$(git config --get merge.pluginversion.driver || true)" ] ||
+  missing_drivers+=("git config merge.pluginversion.driver 'plugins/roundhouse/scripts/git-merge-plugin-version %O %A %B'")
+if [ ${#missing_drivers[@]} -gt 0 ]; then
+  note "WARN merge drivers not configured; .gitattributes entries are inert and"
+  note "     conflicts will look ordinary. Run:"
+  for cmd in "${missing_drivers[@]}"; do note "       $cmd"; done
+else
+  note "ok   merge drivers configured"
 fi
 
 # --- 1. integrity manifest is regenerated and committed --------------------
@@ -89,28 +93,34 @@ for (const file of files) {
   // reader pasting the documented sequence hits the unset variable. Walk
   // statements in order and let a name become known only once it is assigned.
   const assigned = new Set();
+  // Matches BOTH `$name` and PowerShell's braced `${name}`; `${appPath}` is a
+  // perfectly valid reference and was invisible to the old pattern, so an
+  // unassigned braced variable passed the checker entirely. `$env:X` is
+  // excluded - it is supplied by the environment, not the snippet.
+  const VAR = /\$(?!env:)\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g;
+  const ASSIGN = (n) => new RegExp(`\\$\\{?${n}\\}?\\s*=`);
   for (const block of blocks) {
     for (const raw of block.split("\n")) {
-      // Strip comments before scanning. Prose in a comment legitimately NAMES a
-      // variable to explain it ("without this, $appPath is unset"), and reading
-      // that as code reports a use-before-assignment that does not exist.
       const line = raw.replace(/#.*$/, "");
-      for (const m of line.matchAll(/\$(?!env:)([A-Za-z_][A-Za-z0-9_]*)/g)) {
-        const name = m[1];
-        if (assigned.has(name) || KNOWN.has(name)) continue;
-        // An assignment on THIS line defines the name from here on; reading it
-        // on its own right-hand side is still a use-before-assignment.
-        // Compare THIS match's position against the assignment, not the first
-        // occurrence of the name: in `$x = $x + 1` both indexOf and search
-        // resolve to the same left-hand `$x`, so the right-hand read - the
-        // actual use-before-assignment - was excused. m.index is this
-        // occurrence; only the one AT the assignment is the definition.
-        const assignAt = line.search(new RegExp(`\\$${name}\\s*=`));
-        if (assignAt !== -1 && m.index === assignAt) continue;
-        console.error(`FAIL ${file}: PowerShell snippet reads $${name} before anything assigns it`);
-        bad = 1;
+      // Per STATEMENT, not per line: `$x = 1; Write-Output $x` is valid, and
+      // recording assignments only after the whole line made the second read
+      // look like a use-before-assignment. Splitting on `;` advances the state
+      // at the boundary where PowerShell actually would.
+      for (const stmt of line.split(";")) {
+        const defined = [];
+        for (const m of stmt.matchAll(VAR)) {
+          const name = m[1];
+          if (KNOWN.has(name)) continue;
+          const at = stmt.search(ASSIGN(name));
+          // The occurrence AT the assignment is the definition; anything else
+          // - including this statement's own right-hand side - is a read.
+          if (at !== -1 && m.index === at) { defined.push(name); continue; }
+          if (assigned.has(name)) continue;
+          console.error(`FAIL ${file}: PowerShell snippet reads $${name} before anything assigns it`);
+          bad = 1;
+        }
+        for (const name of defined) assigned.add(name);
       }
-      for (const m of line.matchAll(/\$([A-Za-z_][A-Za-z0-9_]*)\s*=/g)) assigned.add(m[1]);
     }
   }
 }
