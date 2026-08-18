@@ -111,7 +111,29 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install OpenSSH server for scope validation
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+        # Bounded and skippable. apt-get here is an UNBOUNDED external
+        # dependency sitting in the critical path of every Linux job: when a
+        # mirror stalls it has held jobs past eight minutes doing nothing, which
+        # no amount of test scoping can fix. The runner image usually ships
+        # sshd already, so the common case now touches the network not at all.
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -eu
+          if command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ]; then
+            printf 'sshd already present; skipping apt\n'
+            exit 0
+          fi
+          for attempt in 1 2; do
+            if sudo apt-get update && \
+               sudo apt-get install -y --no-install-recommends openssh-server; then
+              exit 0
+            fi
+            printf 'apt attempt %s failed; retrying\n' "$attempt" >&2
+            sleep 5
+          done
+          printf 'could not install openssh-server\n' >&2
+          exit 1
       - name: Validate ${{ matrix.helper }}
         shell: bash
         run: |
@@ -216,7 +238,29 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install OpenSSH server for scope validation
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+        # Bounded and skippable. apt-get here is an UNBOUNDED external
+        # dependency sitting in the critical path of every Linux job: when a
+        # mirror stalls it has held jobs past eight minutes doing nothing, which
+        # no amount of test scoping can fix. The runner image usually ships
+        # sshd already, so the common case now touches the network not at all.
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -eu
+          if command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ]; then
+            printf 'sshd already present; skipping apt\n'
+            exit 0
+          fi
+          for attempt in 1 2; do
+            if sudo apt-get update && \
+               sudo apt-get install -y --no-install-recommends openssh-server; then
+              exit 0
+            fi
+            printf 'apt attempt %s failed; retrying\n' "$attempt" >&2
+            sleep 5
+          done
+          printf 'could not install openssh-server\n' >&2
+          exit 1
       - name: Install jj and yq for the real-jj sections
         shell: bash
         run: |
@@ -268,7 +312,29 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install OpenSSH server for scope validation
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+        # Bounded and skippable. apt-get here is an UNBOUNDED external
+        # dependency sitting in the critical path of every Linux job: when a
+        # mirror stalls it has held jobs past eight minutes doing nothing, which
+        # no amount of test scoping can fix. The runner image usually ships
+        # sshd already, so the common case now touches the network not at all.
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -eu
+          if command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ]; then
+            printf 'sshd already present; skipping apt\n'
+            exit 0
+          fi
+          for attempt in 1 2; do
+            if sudo apt-get update && \
+               sudo apt-get install -y --no-install-recommends openssh-server; then
+              exit 0
+            fi
+            printf 'apt attempt %s failed; retrying\n' "$attempt" >&2
+            sleep 5
+          done
+          printf 'could not install openssh-server\n' >&2
+          exit 1
       - name: Run scoped fixture suite
         shell: bash
         env:
