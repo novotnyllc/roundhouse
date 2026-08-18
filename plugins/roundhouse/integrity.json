@@ -82,7 +82,7 @@
     },
     {
       "path": "scripts/git-merge-plugin-version",
-      "sha256": "fbf4c4a4c54d0c70cdf1de16373506aece28e36d27f5315d620912ea18a3eb32"
+      "sha256": "3cc1954ce2a3d687cdc9fa88ed51e992bcb7ba9990a433ac4f7a8edb6fd43ba1"
     },
     {
       "path": "scripts/homebrew-bridge.rb",

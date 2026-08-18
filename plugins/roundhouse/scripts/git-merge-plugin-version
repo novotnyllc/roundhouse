@@ -12,7 +12,10 @@
 # for a human, exit 1 and all. A driver that "helpfully" resolved a description
 # or role-list conflict by picking a side would hide a decision.
 set -uo pipefail
-ancestor=$1 ours=$2 theirs=$3
+# %O (the ancestor) is deliberately unbound: the max-version rule needs only the
+# two sides. Naming it would be an unused variable, and shellcheck is right to
+# say so.
+ours=$2 theirs=$3
 
 command -v jq >/dev/null 2>&1 || exit 1
 
