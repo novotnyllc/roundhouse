@@ -20,8 +20,6 @@ va=$(jq -r '.version // empty' "$ours" 2>/dev/null) || exit 1
 vb=$(jq -r '.version // empty' "$theirs" 2>/dev/null) || exit 1
 [ -n "$va" ] && [ -n "$vb" ] || exit 1
 
-# Highest wins. sort -V understands dotted versions; picking max rather than
-# "theirs" is what makes this safe in both merge directions.
 # The repository's established comparator, not `sort -V`. sort's -V is a GNU
 # extension absent from BSD/macOS sort, where the pipeline would fail and the
 # fail-closed check would then refuse every conflict — safe, but the feature
