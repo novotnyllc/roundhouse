@@ -97,13 +97,6 @@ jobs:
           fi
           plugins/roundhouse/scripts/update-integrity
           git diff --exit-code -- plugins/roundhouse/integrity.json
-      - name: Validate public identity and transport helpers
-        shell: bash
-        run: |
-          set -eu
-          plugins/roundhouse/scripts/enroll-ssh-posix self-test
-          plugins/roundhouse/scripts/prepare-ssh-identity self-test
-          plugins/roundhouse/scripts/certify-ssh-node self-test
       - name: Validate fleet skill frontmatter
         shell: bash
         run: |
@@ -144,6 +137,29 @@ jobs:
   # ran nowhere until a human typed the variable. The list is derived from
   # the sections themselves — adding a scope enrolls it in CI, and no list
   # here can silently rot behind the tree.
+  # Split out of `posix`, where the three ran SEQUENTIALLY and cost 13.8 min of
+  # a 30.8 min job on macOS. They are fork-bound shell fixtures (thousands of
+  # small stat/tr/cut execs), so there is nothing to cache and nothing blocked
+  # on I/O: running them concurrently is the whole optimization. One job per
+  # helper also names which helper failed instead of one opaque step.
+  helpers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        helper: [enroll-ssh-posix, prepare-ssh-identity, certify-ssh-node]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install OpenSSH server for scope validation
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+      - name: Validate ${{ matrix.helper }}
+        shell: bash
+        run: |
+          set -eu
+          plugins/roundhouse/scripts/${{ matrix.helper }} self-test
+
   scope-matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -259,7 +275,10 @@ jobs:
   # into one context. Require `ci-ok` in protection instead of the volatile
   # per-cell contexts — adding or renaming a scope never desyncs the rule.
   ci-ok:
-    needs: [actionlint, posix, scope-matrix, scoped, windows]
+    # helpers included deliberately: splitting them out of posix would have
+    # silently removed them from the required set otherwise, turning a speedup
+    # into a coverage loss.
+    needs: [actionlint, posix, helpers, scope-matrix, scoped, windows]
     if: always()
     runs-on: ubuntu-latest
     steps:
