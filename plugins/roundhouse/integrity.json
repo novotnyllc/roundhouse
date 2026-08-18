@@ -186,7 +186,7 @@
     },
     {
       "path": "scripts/preflight",
-      "sha256": "9ad36860c6912ee5a9f4df7044fd3a5fa1851b1f68e05010c07e87201479c543"
+      "sha256": "cb03a33eb7c2215076d3d58c4adbd348227db39ea45cafed197d3e3e8babdc26"
     },
     {
       "path": "scripts/prepare-ssh-identity",
