@@ -178,11 +178,11 @@
     },
     {
       "path": "scripts/mcp-siding.mjs",
-      "sha256": "05922a7a8ce5a55b08ebc84a210d55c87c9c4424094075c5b727285d18da422a"
+      "sha256": "f19755520edad1188e07066d6205b838c393faa7c034b89efad66eacf08a3ec3"
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
-      "sha256": "d29ca0916a7408a833e0d39cc6554aceee83f3bc4dbb146dfaf592db328d1ce2"
+      "sha256": "b77d3bbcc9087b144bc2593bd1d44a1d4ea3fff91a993c72eb1d7bbc14aa36b9"
     },
     {
       "path": "scripts/preflight",
