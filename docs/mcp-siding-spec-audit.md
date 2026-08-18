@@ -77,7 +77,7 @@ fallback and the `isError` result for an unreachable backend. Modern results
 carry `resultType: "complete"`. Absent, a modern client cannot distinguish a
 complete result from an interim one.
 
-### 5. Backend-side era detection
+### 5. Backend-side era detection — DONE (0.9.5)
 
 The shim should probe `server/discover` before falling back to `initialize`, per
 the Streamable HTTP backward-compatibility rules (attempt a modern request,
@@ -108,8 +108,16 @@ and the list it does serve), and marks synthesized results `resultType:
 is dual-era on the CLIENT face while still speaking legacy `initialize` to the
 backend.
 
-Gap 5 (dual-era on the BACKEND face) remains, and deliberately: nothing needs
-it until a desktop app modernizes, and none has.
+Gap 5 is done too: `probeBackendEra()` sends `server/discover` before the
+handshake and caches the verdict for the origin's lifetime. A modern backend
+skips `initialize` entirely and receives `_meta` on every request; a legacy one
+is byte-identical to before; an unreachable one stays UNDECIDED rather than
+being cached as legacy, because downtime is not evidence of an era.
+
+**Verified against a mock only.** No desktop backend speaks 2026-07-28 yet, so
+the modern branch has never met a real server. What the test pins is the branch
+logic, not field behaviour — worth saying plainly rather than letting a green
+run imply more.
 
 ## Suggested sequencing
 

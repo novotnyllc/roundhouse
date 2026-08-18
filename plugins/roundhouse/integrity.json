@@ -5,6 +5,22 @@
       "sha256": "6ef89c68e6027e9a7127cfa5418bb17ca1e049119b6d11e80ff7c75efa631ecc"
     },
     {
+      "path": ".claude-plugin/plugin.json",
+      "sha256": "6ef89c68e6027e9a7127cfa5418bb17ca1e049119b6d11e80ff7c75efa631ecc"
+    },
+    {
+      "path": ".claude-plugin/plugin.json",
+      "sha256": "6ef89c68e6027e9a7127cfa5418bb17ca1e049119b6d11e80ff7c75efa631ecc"
+    },
+    {
+      "path": ".codex-plugin/plugin.json",
+      "sha256": "cd03dba3ac8d0f001f33837ebe9363123fc02028b9f8db59d78561d12d3b31a9"
+    },
+    {
+      "path": ".codex-plugin/plugin.json",
+      "sha256": "cd03dba3ac8d0f001f33837ebe9363123fc02028b9f8db59d78561d12d3b31a9"
+    },
+    {
       "path": ".codex-plugin/plugin.json",
       "sha256": "cd03dba3ac8d0f001f33837ebe9363123fc02028b9f8db59d78561d12d3b31a9"
     },
@@ -174,11 +190,11 @@
     },
     {
       "path": "scripts/mcp-siding.mjs",
-      "sha256": "f19755520edad1188e07066d6205b838c393faa7c034b89efad66eacf08a3ec3"
+      "sha256": "406ceb0021d3fdf56854c9418dd436190741749ef874dac68ca005f4fb0c43fa"
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
-      "sha256": "b77d3bbcc9087b144bc2593bd1d44a1d4ea3fff91a993c72eb1d7bbc14aa36b9"
+      "sha256": "6015cb39332b0055109def775089de0436e84d45d9e8cd00f1911d9799fec5a0"
     },
     {
       "path": "scripts/prepare-ssh-identity",
