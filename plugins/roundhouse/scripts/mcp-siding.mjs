@@ -1287,7 +1287,21 @@ export class Shim {
   // not receive _meta it never asked for. One definition, so every outbound
   // path - requests and bare notifications alike - decorates identically.
   withProtocolMeta(params) {
-    if (this.backendEra !== "modern") return params;
+    if (this.backendEra !== "modern") {
+      // A legacy backend must not RECEIVE the per-request version marker
+      // either - not even when the CLIENT supplied it. Passing it through
+      // declares modern semantics to a server that never negotiated them,
+      // which defeats the translation in exactly the case it exists for: a
+      // modern harness in front of a legacy desktop app. Strip only this key;
+      // unrelated _meta belongs to the caller and travels untouched, and an
+      // _meta that held nothing else is dropped so legacy bytes are unchanged.
+      if (!isObject(params?._meta) || params._meta[PROTOCOL_VERSION_META_KEY] === undefined) return params;
+      const { [PROTOCOL_VERSION_META_KEY]: _stripped, ...restMeta } = params._meta;
+      const out = { ...params };
+      if (Object.keys(restMeta).length > 0) out._meta = restMeta;
+      else delete out._meta;
+      return out;
+    }
     return {
       ...(params ?? {}),
       _meta: { ...(params?._meta ?? {}), [PROTOCOL_VERSION_META_KEY]: this.protocolVersion ?? MODERN_PROTOCOL_VERSION },
@@ -1388,8 +1402,14 @@ export class Shim {
     // that the method is unknown — a modern backend having a bad moment would
     // otherwise be cached as legacy permanently, and every later connection
     // would skip discovery and send initialize it cannot answer.
+    // A 200 with no error object at all is NOT evidence either: a modern
+    // backend transiently answering `{}` or `{"result":{}}` would otherwise be
+    // cached as legacy forever, and every later connection would skip
+    // discovery and send an initialize it cannot answer. Absence of an error
+    // is absence of evidence, so an unrecognized success stays undecided and
+    // the next call probes again.
     const code = body?.error?.code;
-    if (code === METHOD_NOT_FOUND || !isObject(body?.error)) {
+    if (code === METHOD_NOT_FOUND) {
       this.backendEra = "legacy";
       return this.backendEra;
     }

@@ -1584,6 +1584,8 @@ export async function selftest() {
   await selftestDualEraServerFace();
   await selftestModernToolsListCarriesCachingHints();
   await selftestBackendEraDetection();
+  await selftestLegacyBackendGetsNoModernMarker();
+  await selftestMalformedDiscoveryStaysUndecided();
   await selftestReconcileNeverCommitsTruncatedWalk();
 
   // -- 7j3e. #16: native Windows. The PowerShell resolver/launcher lives in
@@ -5192,6 +5194,111 @@ async function selftestDualEraServerFace() {
     // ...and a LEGACY client's bytes are unchanged: it never asked to move.
     const legacyCall = await shim.handle({ jsonrpc: "2.0", id: 7, method: "tools/call", params: {} });
     assert.equal(legacyCall.result.resultType, undefined, "a legacy client's result must not gain fields it never asked for");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function selftestLegacyBackendGetsNoModernMarker() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-strip-"));
+  try {
+    // A LEGACY backend fronted by a MODERN client: the client puts the version
+    // marker in _meta itself, and the shim must not relay it.
+    let seenMeta = "unset";
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "unknown" } });
+          }
+          if (msg.method === "initialize") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {} } });
+          }
+          if (msg.method === "tools/call") {
+            seenMeta = msg.params?._meta ?? null;
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { content: [], isError: false } });
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = new Shim({ url, name: "test", cachePath: join(dir, "t.json"), timeoutMs: 1_000, launchEnabled: false, appPath: null, launchGraceMs: 150_000 });
+        await shim.handle({
+          jsonrpc: "2.0", id: 1, method: "tools/call",
+          params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "acme/trace": "keep-me" } },
+        });
+        assert.equal(shim.backendEra, "legacy");
+        assert.equal(seenMeta?.["io.modelcontextprotocol/protocolVersion"], undefined,
+          "a legacy backend must not receive the modern version marker");
+        assert.equal(seenMeta?.["acme/trace"], "keep-me",
+          "unrelated _meta belongs to the caller and must survive");
+      },
+    );
+
+    // And when the marker was the ONLY _meta key, _meta goes away entirely so
+    // the legacy request is byte-identical to one that never carried it.
+    let sawMetaKey = "unset";
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "unknown" } });
+          }
+          if (msg.method === "initialize") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {} } });
+          }
+          if (msg.method === "tools/call") {
+            sawMetaKey = Object.prototype.hasOwnProperty.call(msg.params ?? {}, "_meta");
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { content: [], isError: false } });
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = new Shim({ url, name: "test", cachePath: join(dir, "t2.json"), timeoutMs: 1_000, launchEnabled: false, appPath: null, launchGraceMs: 150_000 });
+        await shim.handle({
+          jsonrpc: "2.0", id: 1, method: "tools/call",
+          params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } },
+        });
+        assert.equal(sawMetaKey, false, "an _meta holding only the marker must be dropped, not sent empty");
+      },
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function selftestMalformedDiscoveryStaysUndecided() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-undecided-"));
+  try {
+    // A modern backend having a bad moment: HTTP 200, no error, no usable
+    // DiscoverResult. That is not evidence of a legacy server, so the era must
+    // stay unset and the NEXT call must probe again rather than be stranded.
+    for (const body of [{}, { result: {} }]) {
+      let discoveries = 0;
+      await withServer(
+        (req, res) => {
+          readJsonBody(req).then((msg) => {
+            if (msg.method === "server/discover") {
+              discoveries += 1;
+              if (discoveries === 1) return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, ...body });
+              return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", supportedVersions: ["2026-07-28"], capabilities: { tools: {} } } });
+            }
+            sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { content: [], isError: false } });
+          });
+        },
+        async (url) => {
+          const shim = new Shim({ url, name: "test", cachePath: join(dir, `u-${discoveries}-${Object.keys(body).join()}.json`), timeoutMs: 1_000, launchEnabled: false, appPath: null, launchGraceMs: 150_000 });
+          await shim.handle({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {} });
+          assert.notEqual(shim.backendEra, "legacy",
+            `a malformed 200 (${JSON.stringify(body)}) must not settle the era as legacy`);
+          // The recovered backend is reachable as modern on a later probe.
+          await shim.handle({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {} });
+          assert.equal(shim.backendEra, "modern",
+            "once discovery answers properly the backend must be usable as modern");
+        },
+      );
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
