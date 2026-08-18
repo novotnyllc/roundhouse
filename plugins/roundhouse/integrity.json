@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "60b21441587825dba54d4768c2d78a58a85f41f2ad439a1134336edb914812dc"
+      "sha256": "6ef89c68e6027e9a7127cfa5418bb17ca1e049119b6d11e80ff7c75efa631ecc"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "8a4f9948fa1075589a4c3e31e5d61e999b2d11b27b980bc30c734ed973425d0e"
+      "sha256": "cd03dba3ac8d0f001f33837ebe9363123fc02028b9f8db59d78561d12d3b31a9"
     },
     {
       "path": "assets/icon.png",
@@ -209,6 +209,10 @@
       "sha256": "8ebd81f288ec2b4dad8efb4e90f7be2650eaa25c1ab58a2e58b0a5e214e26b34"
     },
     {
+      "path": "scripts/select-sections",
+      "sha256": "d1bc5b080ec2fd9f0c10d82e5d12d36130daf4e13e4b55b4bbbd2503b37446a3"
+    },
+    {
       "path": "scripts/windows-native-canary-runner.ps1",
       "sha256": "a681f02986330eb1315094600ed226dc37af4a7a10532daf6e26756af9d0976b"
     },
@@ -293,5 +297,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.14"
+  "version": "0.9.18"
 }

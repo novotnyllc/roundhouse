@@ -16,6 +16,11 @@ jobs:
       - name: Lint GitHub Actions workflows
         uses: docker://rhysd/actionlint@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 # v1.7.7
 
+  # The full serial suite still runs — on pushes to main, as the backstop that
+  # catches anything the change-scoped selection got wrong. PRs run the selected
+  # sections in parallel instead (see `select` / `sections` below). Keeping this
+  # on main means a mis-scoped rule costs one late red build rather than silent
+  # loss of coverage.
   posix:
     strategy:
       matrix:
@@ -23,49 +28,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Install OpenSSH server for scope validation
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
-      # The five real-jj sections (90-94) are the only place the store's
-      # repository half is exercised at all; without jj they print a NOTICE and
-      # the signature gate, the reconcile runbook, the resolution ladder and
-      # rollback go UNVERIFIED on every run. BOTH tools go in: the gate is
-      # `jj AND yq`, ubuntu-latest ships yq and macos-latest does not, so
-      # installing only jj would leave macOS skipping exactly as before.
-      #
-      # From the upstream releases rather than a distro package — Ubuntu
-      # carries no jj at all and brew on the Linux runner builds it — and
-      # PINNED, so neither project's next release can silently change what CI
-      # proved. `/usr/local/bin` is one of the paths the suite probes after it
-      # sanitizes PATH. Adds seconds; the suite stays one job.
-      - name: Install jj and yq for the real-jj sections
-        shell: bash
-        run: |
-          set -eu
-          jj_version=0.44.0
-          yq_version=4.44.3
-          case "$RUNNER_OS-$(uname -m)" in
-            Linux-x86_64) jj_asset=x86_64-unknown-linux-musl; yq_asset=linux_amd64 ;;
-            Linux-aarch64) jj_asset=aarch64-unknown-linux-musl; yq_asset=linux_arm64 ;;
-            macOS-arm64) jj_asset=aarch64-apple-darwin; yq_asset=darwin_arm64 ;;
-            macOS-x86_64) jj_asset=x86_64-apple-darwin; yq_asset=darwin_amd64 ;;
-            *) echo "no pinned build for $RUNNER_OS-$(uname -m)" >&2; exit 1 ;;
-          esac
-          jj_tmp=$(mktemp -d)
-          curl -fsSL --retry 3 \
-            "https://github.com/jj-vcs/jj/releases/download/v$jj_version/jj-v$jj_version-$jj_asset.tar.gz" |
-            tar -xz -C "$jj_tmp"
-          sudo install -m 0755 "$jj_tmp/jj" /usr/local/bin/jj
-          rm -rf "$jj_tmp"
-          # Always install the pinned yq — never fall back to the runner's
-          # pre-installed one. Number-form handling differs across yq versions
-          # (some preserve 12.0, 4.44.3 normalizes it to 12), and the fold
-          # digest's item identity depends on it, so the version must be pinned.
-          curl -fsSL --retry 3 -o /tmp/yq \
-            "https://github.com/mikefarah/yq/releases/download/v$yq_version/yq_$yq_asset"
-          sudo install -m 0755 /tmp/yq /usr/local/bin/yq
-          jj --version
-          yq --version
       - name: Validate Bash and integrity
         shell: bash
         run: |
@@ -97,13 +59,6 @@ jobs:
           fi
           plugins/roundhouse/scripts/update-integrity
           git diff --exit-code -- plugins/roundhouse/integrity.json
-      - name: Validate public identity and transport helpers
-        shell: bash
-        run: |
-          set -eu
-          plugins/roundhouse/scripts/enroll-ssh-posix self-test
-          plugins/roundhouse/scripts/prepare-ssh-identity self-test
-          plugins/roundhouse/scripts/certify-ssh-node self-test
       - name: Validate fleet skill frontmatter
         shell: bash
         run: |
@@ -129,57 +84,257 @@ jobs:
               if set(fields) != {"name", "description"} or fields["name"] != path.parent.name:
                   raise SystemExit(f"invalid skill identity: {path}")
           PY
-      - name: Run fixture suite
-        shell: bash
-        env:
-          # jj is installed above, so a skipped real-jj block is a broken
-          # install rather than an unequipped host: fail instead of noticing.
-          ROUNDHOUSE_REQUIRE_REAL_JJ: 'true'
-        run: |
-          chmod -R go-w plugins/roundhouse
-          plugins/roundhouse/scripts/test-roundhouse
-
   # The scoped suites are early-exit shortcuts *inside* the same self-check:
   # a default invocation defines their bodies and never calls them, so they
   # ran nowhere until a human typed the variable. The list is derived from
   # the sections themselves — adding a scope enrolls it in CI, and no list
   # here can silently rot behind the tree.
-  scope-matrix:
-    runs-on: ubuntu-latest
-    outputs:
-      scopes: ${{ steps.derive.outputs.scopes }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - id: derive
-        shell: bash
-        run: |
-          set -eu
-          scopes=$(grep -ho 'ROUNDHOUSE_TEST_SCOPE:-}" != [a-z0-9-]*' \
-            plugins/roundhouse/scripts/tests/*.sh |
-            awk '{ print $NF }' | LC_ALL=C sort -u |
-            jq -Rsc 'split("\n") | map(select(. != ""))')
-          [ "$scopes" != '[]' ] || {
-            printf 'no ROUNDHOUSE_TEST_SCOPE suites found\n' >&2
-            exit 1
-          }
-          printf 'scopes=%s\n' "$scopes" >>"$GITHUB_OUTPUT"
-
-  # One runner per scope per platform. Each scope re-runs the sections ahead
-  # of it, so these are siblings of the `posix` fixture step rather than extra
-  # work bolted onto it: wall time stays one suite, not the sum of eight.
-  scoped:
-    needs: scope-matrix
+  # Split out of `posix`, where the three ran SEQUENTIALLY and cost 13.8 min of
+  # a 30.8 min job on macOS. They are fork-bound shell fixtures (thousands of
+  # small stat/tr/cut execs), so there is nothing to cache and nothing blocked
+  # on I/O: running them concurrently is the whole optimization. One job per
+  # helper also names which helper failed instead of one opaque step.
+  # Depends on `select` - about six seconds - so that a change implicating no
+  # helper skips these entirely. That is a real dependency, not a concurrent
+  # one: the matrix cannot be built before the list exists. Worth it, because
+  # the enroll-ssh-posix leg alone runs ~10 min on macOS.
+  helpers:
+    needs: select
+    if: needs.select.outputs.helpers != '[]'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        scope: ${{ fromJSON(needs.scope-matrix.outputs.scopes) }}
+        helper: ${{ fromJSON(needs.select.outputs.helpers) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install OpenSSH server for scope validation
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+        # Bounded and skippable. apt-get here is an UNBOUNDED external
+        # dependency sitting in the critical path of every Linux job: when a
+        # mirror stalls it has held jobs past eight minutes doing nothing, which
+        # no amount of test scoping can fix. The runner image usually ships
+        # sshd already, so the common case now touches the network not at all.
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -eu
+          if command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ]; then
+            printf 'sshd already present; skipping apt\n'
+            exit 0
+          fi
+          for attempt in 1 2; do
+            if sudo apt-get update && \
+               sudo apt-get install -y --no-install-recommends openssh-server; then
+              exit 0
+            fi
+            printf 'apt attempt %s failed; retrying\n' "$attempt" >&2
+            sleep 5
+          done
+          printf 'could not install openssh-server\n' >&2
+          exit 1
+      - name: Validate ${{ matrix.helper }}
+        shell: bash
+        run: |
+          set -eu
+          plugins/roundhouse/scripts/${{ matrix.helper }} self-test
+
+  # Which test sections does THIS change actually require? Measured motivation:
+  # the preamble (00/05/07) is ~3s and most sections are single-digit seconds,
+  # while the serial suite was 16.8 min on macOS — so the cost is a few heavy
+  # sections that most changes do not touch.
+  #
+  # select-sections is fail-safe: an unmapped path, or no input at all, selects
+  # everything. Adding a rule makes CI faster; forgetting one only makes it
+  # slower, never blinder.
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      sections: ${{ steps.pick.outputs.sections }}
+      scopes: ${{ steps.pick.outputs.scopes }}
+      helpers: ${{ steps.pick.outputs.helpers }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          every() {
+            for f in plugins/roundhouse/scripts/tests/*.sh; do
+              n=$(basename "$f" | cut -d- -f1)
+              case "$n" in 00|05|07) continue ;; esac
+              printf '%s\n' "$n"
+            done | sort -u
+          }
+
+          if [ '${{ github.event_name }}' = pull_request ]; then
+            base='${{ github.event.pull_request.base.sha }}'
+            head='${{ github.event.pull_request.head.sha }}'
+            changed=$(git diff --name-only "$base" "$head")
+            printf 'changed paths:\n%s\n' "$changed"
+            picked=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections)
+          else
+            picked=all
+          fi
+
+          if [ "$picked" = all ]; then
+            picked=$(printf '00\n05\n07\n'; every)
+          fi
+          printf 'selected: %s\n' "$(printf '%s' "$picked" | tr '\n' ' ')"
+
+          json=$(printf '%s\n' "$picked" | grep -v '^$' | sort -u |
+            awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+          echo "sections=$json" >> "$GITHUB_OUTPUT"
+
+          # Scopes are SEPARATE coverage, not a grouping of sections: the
+          # *_contracts functions are only invoked from a scope guard, so an
+          # unscoped run never executes them. They are also where the
+          # 17-minute job lived, which is exactly why they must be selected by
+          # change rather than run every time.
+          if [ '${{ github.event_name }}' = pull_request ]; then
+            scopes=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections --scopes)
+          else
+            scopes=all
+          fi
+          if [ "$scopes" = all ]; then
+            scopes=$(grep -ho 'ROUNDHOUSE_TEST_SCOPE:-}" != [a-z0-9-]*' \
+              plugins/roundhouse/scripts/tests/*.sh | sed 's/.*!= //' | sort -u)
+          fi
+          printf 'scopes: %s\n' "$(printf '%s' "$scopes" | tr '\n' ' ')"
+          # No implicated scope is a legitimate answer (docs-only changes), and
+          # grep exits 1 on no match, which under `set -o pipefail` would abort
+          # the job instead of emitting an empty matrix for `scoped` to skip.
+          sjson=$(printf '%s\n' "$scopes" | { grep -v '^$' || true; } | sort -u |
+            awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+          echo "scopes=$sjson" >> "$GITHUB_OUTPUT"
+
+          # Which helper self-tests does this change implicate? These are the
+          # most expensive jobs in the matrix, so running all six legs for a
+          # change that touches none of them is the biggest avoidable cost here.
+          if [ '${{ github.event_name }}' = pull_request ]; then
+            helpers=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections --helpers)
+          else
+            helpers=$(printf '%s\n' '' | plugins/roundhouse/scripts/select-sections --helpers)
+          fi
+          printf 'helpers: %s\n' "$(printf '%s' "$helpers" | tr '\n' ' ')"
+          hjson=$(printf '%s\n' "$helpers" | { grep -v '^$' || true; } | sort -u |
+            awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+          echo "helpers=$hjson" >> "$GITHUB_OUTPUT"
+
+  # One job per section, on every event. Wall time is the ~3s preamble plus the
+  # slowest SELECTED section, never the sum of all of them.
+  sections:
+    needs: select
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        section: ${{ fromJSON(needs.select.outputs.sections) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install OpenSSH server for scope validation
+        if: runner.os == 'Linux'
+        # Bounded and skippable. apt-get here is an UNBOUNDED external
+        # dependency sitting in the critical path of every Linux job: when a
+        # mirror stalls it has held jobs past eight minutes doing nothing, which
+        # no amount of test scoping can fix. The runner image usually ships
+        # sshd already, so the common case now touches the network not at all.
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -eu
+          if command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ]; then
+            printf 'sshd already present; skipping apt\n'
+            exit 0
+          fi
+          for attempt in 1 2; do
+            if sudo apt-get update && \
+               sudo apt-get install -y --no-install-recommends openssh-server; then
+              exit 0
+            fi
+            printf 'apt attempt %s failed; retrying\n' "$attempt" >&2
+            sleep 5
+          done
+          printf 'could not install openssh-server\n' >&2
+          exit 1
+      - name: Install jj and yq for the real-jj sections
+        shell: bash
+        run: |
+          set -eu
+          jj_version=0.44.0
+          yq_version=4.44.3
+          case "$RUNNER_OS-$(uname -m)" in
+            Linux-x86_64) jj_asset=x86_64-unknown-linux-musl; yq_asset=linux_amd64 ;;
+            Linux-aarch64) jj_asset=aarch64-unknown-linux-musl; yq_asset=linux_arm64 ;;
+            macOS-arm64) jj_asset=aarch64-apple-darwin; yq_asset=darwin_arm64 ;;
+            macOS-x86_64) jj_asset=x86_64-apple-darwin; yq_asset=darwin_amd64 ;;
+            *) echo "no pinned build for $RUNNER_OS-$(uname -m)" >&2; exit 1 ;;
+          esac
+          jj_tmp=$(mktemp -d)
+          curl -fsSL --retry 3 \
+            "https://github.com/jj-vcs/jj/releases/download/v$jj_version/jj-v$jj_version-$jj_asset.tar.gz" |
+            tar -xz -C "$jj_tmp"
+          sudo install -m 0755 "$jj_tmp/jj" /usr/local/bin/jj
+          rm -rf "$jj_tmp"
+          # Always install the pinned yq — never fall back to the runner's
+          # pre-installed one. Number-form handling differs across yq versions
+          # (some preserve 12.0, 4.44.3 normalizes it to 12), and the fold
+          # digest's item identity depends on it, so the version must be pinned.
+          curl -fsSL --retry 3 -o /tmp/yq \
+            "https://github.com/mikefarah/yq/releases/download/v$yq_version/yq_$yq_asset"
+          sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+          jj --version
+          yq --version
+      - name: Section ${{ matrix.section }}
+        shell: bash
+        env:
+          ROUNDHOUSE_TEST_ONLY: ${{ matrix.section }}
+          # Travels with the suite. Without it a real-jj section prints a NOTICE
+          # and PASSES, so moving the suite here without this flag would have
+          # silently stopped verifying the store's repository half.
+          ROUNDHOUSE_REQUIRE_REAL_JJ: 'true'
+        run: plugins/roundhouse/scripts/test-roundhouse
+
+  scoped:
+    needs: select
+    if: needs.select.outputs.scopes != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        scope: ${{ fromJSON(needs.select.outputs.scopes) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install OpenSSH server for scope validation
+        if: runner.os == 'Linux'
+        # Bounded and skippable. apt-get here is an UNBOUNDED external
+        # dependency sitting in the critical path of every Linux job: when a
+        # mirror stalls it has held jobs past eight minutes doing nothing, which
+        # no amount of test scoping can fix. The runner image usually ships
+        # sshd already, so the common case now touches the network not at all.
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -eu
+          if command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ]; then
+            printf 'sshd already present; skipping apt\n'
+            exit 0
+          fi
+          for attempt in 1 2; do
+            if sudo apt-get update && \
+               sudo apt-get install -y --no-install-recommends openssh-server; then
+              exit 0
+            fi
+            printf 'apt attempt %s failed; retrying\n' "$attempt" >&2
+            sleep 5
+          done
+          printf 'could not install openssh-server\n' >&2
+          exit 1
       - name: Run scoped fixture suite
         shell: bash
         env:
@@ -259,17 +414,46 @@ jobs:
   # into one context. Require `ci-ok` in protection instead of the volatile
   # per-cell contexts — adding or renaming a scope never desyncs the rule.
   ci-ok:
-    needs: [actionlint, posix, scope-matrix, scoped, windows]
+    needs: [actionlint, posix, helpers, select, sections, scoped, windows]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs succeeded
         shell: bash
+        env:
+          # Named individually rather than join(needs.*.result): a positional
+          # list cannot say WHICH job skipped, and "some job skipped" is not a
+          # verdict. Only two jobs may legitimately skip.
+          ACTIONLINT: ${{ needs.actionlint.result }}
+          POSIX: ${{ needs.posix.result }}
+          SELECT: ${{ needs.select.result }}
+          SECTIONS: ${{ needs.sections.result }}
+          WINDOWS: ${{ needs.windows.result }}
+          SCOPED: ${{ needs.scoped.result }}
+          HELPERS: ${{ needs.helpers.result }}
         run: |
-          set -eu
-          results='${{ join(needs.*.result, ',') }}'
-          printf 'needed results: %s\n' "$results"
-          case ",$results," in
-            *,failure,*|*,cancelled,*|*,skipped,*)
-              printf 'a required job did not succeed\n' >&2; exit 1 ;;
-          esac
+          set -euo pipefail
+          printf 'actionlint=%s posix=%s select=%s sections=%s windows=%s scoped=%s helpers=%s\n' \
+            "$ACTIONLINT" "$POSIX" "$SELECT" "$SECTIONS" "$WINDOWS" "$SCOPED" "$HELPERS"
+
+          # These run on every event and must SUCCEED. A skip here means the
+          # gate stopped gating, which is worse than a red build because it is
+          # quiet - so a skip is a failure for them, not a pass.
+          for pair in "actionlint:$ACTIONLINT" "posix:$POSIX" "select:$SELECT" \
+                      "sections:$SECTIONS" "windows:$WINDOWS"; do
+            case ${pair#*:} in
+              success) ;;
+              *) printf '%s must run and succeed (got %s)\n' "${pair%%:*}" "${pair#*:}" >&2; exit 1 ;;
+            esac
+          done
+
+          # These two are change-scoped and skip when nothing implicates them:
+          # no contract scope, no helper self-test. Success or skipped only -
+          # never failure or cancellation.
+          for pair in "scoped:$SCOPED" "helpers:$HELPERS"; do
+            case ${pair#*:} in
+              success|skipped) ;;
+              *) printf '%s did not succeed (got %s)\n' "${pair%%:*}" "${pair#*:}" >&2; exit 1 ;;
+            esac
+          done
+          printf 'all required jobs succeeded\n'

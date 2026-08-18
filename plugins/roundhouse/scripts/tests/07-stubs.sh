@@ -888,3 +888,77 @@ printf '%s\n' '{"portable":"session"}' >"$OP_SECRET_FILE"
   printf 'PASS: chezmoi pull fixture\n'
   exit 0
 }
+
+# --- fixtures shared across sections -------------------------------------
+# Each of these used to be a side effect of whichever section happened to run
+# first: the yq probe in 70, oversized_setting in 65, snapshot.jsonl in 65.
+# That held only for a whole-suite run. Selecting a consumer on its own left
+# the variable unbound (67, 71, 72, 74, 75) or the file absent (68), so the
+# per-section CI matrix failed on state the suite had been getting by luck.
+# They live here, in the harness that always runs, so a section is selectable
+# alone without inheriting anything.
+
+# The suite sanitizes PATH to $tmp/bin:/usr/bin:/bin and yq is not a system
+# binary on any of the fleet's platforms, so probe the standard install
+# locations the way the real-jj block does. yq is a hard prerequisite of the
+# design (5.1); a host without it gets a loud skip rather than a mystery
+# failure, and CI runners carry it.
+fleet_fixture_tool() {
+  fixture_found=$(command -v "$1" 2>/dev/null || true)
+  if [ -z "$fixture_found" ]; then
+    for fixture_candidate in "/opt/homebrew/bin/$1" "/usr/local/bin/$1" \
+      "$HOME/.local/bin/$1" "$HOME/.cargo/bin/$1"; do
+      [ ! -x "$fixture_candidate" ] || {
+        fixture_found=$fixture_candidate
+        break
+      }
+    done
+  fi
+  printf '%s\n' "$fixture_found"
+}
+fleet_fixture_yq=$(fleet_fixture_tool yq)
+fleet_fixture_path=$PATH
+[ -z "$fleet_fixture_yq" ] || fleet_fixture_path="$(dirname "$fleet_fixture_yq"):$PATH"
+
+# Longer than the 8192-byte setting ceiling 65 and 67 both probe.
+oversized_setting=$(awk 'BEGIN { for (i = 0; i < 8193; i++) printf "x" }')
+
+# The collected snapshot 65 asserts over and 67/68 read. Guarded, because it
+# is the one costly fixture here and most sections never touch it.
+# A SCOPE run (u2-contracts and friends) exits from its own block long before
+# these sections would be reached, and want_section answers true for everything
+# when ROUNDHOUSE_TEST_ONLY is unset - so without the scope check every scoped
+# job paid ~9s building two snapshots nothing would read.
+if [ -z "${ROUNDHOUSE_TEST_SCOPE:-}" ] &&
+  { want_section 65 || want_section 67 || want_section 68; }; then
+  "$cli" collect --target test-host --section all --output "$tmp/snapshot.jsonl"
+  # A second capture a second later: identical inventory, different timestamps
+  # and run IDs. 65 compares the pair to prove that difference is not reported
+  # as drift, and 68 needs a recapture distinct from the planning snapshot.
+  sleep 1
+  "$cli" collect --target test-host --section all --output "$tmp/snapshot-2.jsonl"
+
+  # Codex readiness metadata: 65 enriches snapshots with it and probes the
+  # rejection paths, 68 correlates an apply operation through it. 0600 because
+  # the CLI refuses anything looser or symlinked.
+  cat >"$tmp/codex-readiness.json" <<JSON
+{
+  "host_id": "test-host",
+  "project": "example",
+  "status": "available",
+  "codex_host": "test-codex-host",
+  "native_path": "$tmp/home/dev/example",
+  "expected_source": "github.com:owner/example.git",
+  "codex_project_id": "project-opaque-id",
+  "task_id": "task-opaque-id",
+  "correlation_id": "correlation-opaque-id"
+}
+JSON
+  chmod 600 "$tmp/codex-readiness.json"
+
+  # A config variant that ignores the native auth artifact: 65 validates it,
+  # 68 runs its plan lifecycle under it.
+  jq '.auth_artifacts["native-test-auth"].strategy = "ignore"' \
+    "$tmp/config.json" >"$tmp/ignore-native-auth.json"
+  chmod 600 "$tmp/ignore-native-auth.json"
+fi
