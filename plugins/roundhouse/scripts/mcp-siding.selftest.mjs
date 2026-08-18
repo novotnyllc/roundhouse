@@ -718,6 +718,10 @@ export async function selftest() {
             { "MCP-Session-Id": "sse-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/list") {
           const notification = JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress", params: {} });
@@ -764,6 +768,10 @@ export async function selftest() {
             { "MCP-Session-Id": "error-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/list") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "not ready" } });
         sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
@@ -799,6 +807,10 @@ export async function selftest() {
             { "MCP-Session-Id": "non-array-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/list") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: "not-an-array" } });
         sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
@@ -839,6 +851,10 @@ export async function selftest() {
             { "MCP-Session-Id": "tools-call-error-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
           return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "unknown tool: bogus_tool" } });
@@ -890,7 +906,11 @@ export async function selftest() {
               { "MCP-Session-Id": `http-${status}-session` },
             );
           }
-          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
           if (msg.method === "tools/call") {
             res.writeHead(status, { "Content-Type": "text/plain" });
             res.end(`backend says no (${status})`);
@@ -956,6 +976,10 @@ export async function selftest() {
             { "MCP-Session-Id": "pagination-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/list") {
           if (msg.params?.cursor === "page2") {
@@ -1015,6 +1039,10 @@ export async function selftest() {
             { "MCP-Session-Id": "pagination-reset-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/list") {
           return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: page1Tools } }); // single page, no nextCursor
@@ -1053,6 +1081,10 @@ export async function selftest() {
             { "MCP-Session-Id": "pagination-rewalk-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/list") {
           if (msg.params?.cursor === "page2") {
@@ -1113,6 +1145,10 @@ export async function selftest() {
             { "MCP-Session-Id": "pagination-interrupted-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/list") {
           // Only ever answers the uncursored (first) page - the walk's
@@ -1198,6 +1234,10 @@ export async function selftest() {
             { "MCP-Session-Id": "offline-cursor-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/list") {
           return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: livePage1Tools, nextCursor: "page2" } });
@@ -1265,6 +1305,10 @@ export async function selftest() {
             { "MCP-Session-Id": "pagination-abandoned-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/list") {
           callCount += 1;
@@ -1322,6 +1366,10 @@ export async function selftest() {
             { "MCP-Session-Id": "always-stale" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         staleRealCount++;
         sendJson(res, 404, { error: "unknown session" });
@@ -1359,6 +1407,10 @@ export async function selftest() {
             { "MCP-Session-Id": "s500" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         realCount500++;
         sendJson(res, 500, { error: "server error" });
@@ -1396,6 +1448,10 @@ export async function selftest() {
             result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } },
           }); // deliberately no MCP-Session-Id header
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         l2ListCount++;
         sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: [] } });
@@ -1527,6 +1583,9 @@ export async function selftest() {
   await selftestInterimResultsArePassedThrough();
   await selftestDualEraServerFace();
   await selftestModernToolsListCarriesCachingHints();
+  await selftestBackendEraDetection();
+  await selftestLegacyBackendGetsNoModernMarker();
+  await selftestMalformedDiscoveryStaysUndecided();
   await selftestReconcileNeverCommitsTruncatedWalk();
 
   // -- 7j3e. #16: native Windows. The PowerShell resolver/launcher lives in
@@ -1604,6 +1663,10 @@ export async function selftest() {
             { "MCP-Session-Id": "cancel-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "notifications/cancelled") {
           cancelForwardReceived = msg.params;
@@ -1693,6 +1756,10 @@ export async function selftest() {
             { "MCP-Session-Id": "many-cancel-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "notifications/cancelled") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
@@ -1770,6 +1837,10 @@ export async function selftest() {
             { "MCP-Session-Id": "queue-cancel-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "notifications/cancelled") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
@@ -1852,6 +1923,10 @@ export async function selftest() {
             { "MCP-Session-Id": "queued-cancel-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "notifications/cancelled") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
@@ -1959,6 +2034,10 @@ export async function selftest() {
             { "MCP-Session-Id": "queued-cancel-list-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "notifications/cancelled") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
@@ -2044,6 +2123,10 @@ export async function selftest() {
             { "MCP-Session-Id": "disconnect-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "notifications/cancelled") {
           disconnectCancelledForwardReceived = msg.params;
@@ -2118,6 +2201,10 @@ export async function selftest() {
             { "MCP-Session-Id": "shutdown-queued-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "notifications/cancelled") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
@@ -2225,6 +2312,10 @@ export async function selftest() {
             { "MCP-Session-Id": "held-open-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
           // A valid CallToolResult shape (N37 now requires one) - this
@@ -2423,6 +2514,10 @@ export async function selftest() {
             { "MCP-Session-Id": "crlf-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
           // A valid CallToolResult shape (N37 now requires one) - this
@@ -2478,6 +2573,10 @@ export async function selftest() {
             { "MCP-Session-Id": "mixed-case-content-type-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
           // A valid CallToolResult shape (N37 now requires one) - this
@@ -2542,7 +2641,11 @@ export async function selftest() {
               { "MCP-Session-Id": "malformed-session" },
             );
           }
-          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
           if (msg.method === "tools/call") {
             res.writeHead(200, { "Content-Type": contentType });
             res.end(malformedBody);
@@ -2598,7 +2701,11 @@ export async function selftest() {
               { "MCP-Session-Id": "shape-session" },
             );
           }
-          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
           if (msg.method === "tools/call") {
             return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: malformedResult });
           }
@@ -2647,6 +2754,10 @@ export async function selftest() {
             { "MCP-Session-Id": "shape-valid-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
           return sendJson(res, 200, {
@@ -2693,6 +2804,10 @@ export async function selftest() {
             { "MCP-Session-Id": "shape-list-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/list") {
           return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: "not an array" } });
@@ -2766,7 +2881,11 @@ export async function selftest() {
               { "MCP-Session-Id": "no-envelope-session" },
             );
           }
-          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
           if (msg.method === "tools/call") return respond(res);
           sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
         });
@@ -2812,6 +2931,10 @@ export async function selftest() {
             { "MCP-Session-Id": "mismatch-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "tools/call") {
           // Answer with a DIFFERENT id than the one this request sent - a
@@ -2854,6 +2977,10 @@ export async function selftest() {
             { "MCP-Session-Id": "match-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         sendJson(res, 200, {
           jsonrpc: "2.0",
@@ -2901,6 +3028,10 @@ export async function selftest() {
             { "MCP-Session-Id": "id-race-session" },
           );
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         if (msg.method === "notifications/cancelled") {
           idRaceCancelForward = msg.params;
@@ -2998,6 +3129,10 @@ export async function selftest() {
             error: { code: -32000, message: "handshake rejected: license expired" },
           });
         }
+        // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
         if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
         sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
       });
@@ -3054,7 +3189,11 @@ export async function selftest() {
             noResultInitializeCalls += 1;
             return respondToInitialize(res, msg);
           }
-          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
           sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
         });
       },
@@ -3115,7 +3254,11 @@ export async function selftest() {
             badShapeInitializeCalls += 1;
             return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: badInitializeResult });
           }
-          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
           sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
         });
       },
@@ -4251,7 +4394,11 @@ async function selftestNotificationForwardingEndToEnd() {
               { "MCP-Session-Id": "notify-session" },
             );
           }
-          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          // server/discover is handshake-class, like initialize: it is the era
+        // probe, not a real call. A LEGACY backend answers method-not-found,
+        // which is exactly what these fixtures represent.
+        if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+        if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
           if (msg.method === "tools/call") {
             res.writeHead(200, { "Content-Type": "text/event-stream" });
             res.write(`data: ${JSON.stringify(progress)}\n\n`);
@@ -5048,6 +5195,316 @@ async function selftestDualEraServerFace() {
     const legacyCall = await shim.handle({ jsonrpc: "2.0", id: 7, method: "tools/call", params: {} });
     assert.equal(legacyCall.result.resultType, undefined, "a legacy client's result must not gain fields it never asked for");
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function selftestLegacyBackendGetsNoModernMarker() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-strip-"));
+  try {
+    // A LEGACY backend fronted by a MODERN client: the client puts the version
+    // marker in _meta itself, and the shim must not relay it.
+    let seenMeta = "unset";
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "unknown" } });
+          }
+          if (msg.method === "initialize") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {} } });
+          }
+          if (msg.method === "tools/call") {
+            seenMeta = msg.params?._meta ?? null;
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { content: [], isError: false } });
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = new Shim({ url, name: "test", cachePath: join(dir, "t.json"), timeoutMs: 1_000, launchEnabled: false, appPath: null, launchGraceMs: 150_000 });
+        await shim.handle({
+          jsonrpc: "2.0", id: 1, method: "tools/call",
+          params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "acme/trace": "keep-me" } },
+        });
+        assert.equal(shim.backendEra, "legacy");
+        assert.equal(seenMeta?.["io.modelcontextprotocol/protocolVersion"], undefined,
+          "a legacy backend must not receive the modern version marker");
+        assert.equal(seenMeta?.["acme/trace"], "keep-me",
+          "unrelated _meta belongs to the caller and must survive");
+      },
+    );
+
+    // And when the marker was the ONLY _meta key, _meta goes away entirely so
+    // the legacy request is byte-identical to one that never carried it.
+    let sawMetaKey = "unset";
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "unknown" } });
+          }
+          if (msg.method === "initialize") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {} } });
+          }
+          if (msg.method === "tools/call") {
+            sawMetaKey = Object.prototype.hasOwnProperty.call(msg.params ?? {}, "_meta");
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { content: [], isError: false } });
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = new Shim({ url, name: "test", cachePath: join(dir, "t2.json"), timeoutMs: 1_000, launchEnabled: false, appPath: null, launchGraceMs: 150_000 });
+        await shim.handle({
+          jsonrpc: "2.0", id: 1, method: "tools/call",
+          params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } },
+        });
+        assert.equal(sawMetaKey, false, "an _meta holding only the marker must be dropped, not sent empty");
+      },
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function selftestMalformedDiscoveryStaysUndecided() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-undecided-"));
+  try {
+    // A modern backend having a bad moment: HTTP 200, no error, no usable
+    // DiscoverResult. That is not evidence of a legacy server, so the era must
+    // stay unset and the NEXT call must probe again rather than be stranded.
+    for (const body of [{}, { result: {} }]) {
+      let discoveries = 0;
+      await withServer(
+        (req, res) => {
+          readJsonBody(req).then((msg) => {
+            if (msg.method === "server/discover") {
+              discoveries += 1;
+              if (discoveries === 1) return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, ...body });
+              return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", supportedVersions: ["2026-07-28"], capabilities: { tools: {} } } });
+            }
+            sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { content: [], isError: false } });
+          });
+        },
+        async (url) => {
+          const shim = new Shim({ url, name: "test", cachePath: join(dir, `u-${discoveries}-${Object.keys(body).join()}.json`), timeoutMs: 1_000, launchEnabled: false, appPath: null, launchGraceMs: 150_000 });
+          await shim.handle({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {} });
+          assert.notEqual(shim.backendEra, "legacy",
+            `a malformed 200 (${JSON.stringify(body)}) must not settle the era as legacy`);
+          // The recovered backend is reachable as modern on a later probe.
+          await shim.handle({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {} });
+          assert.equal(shim.backendEra, "modern",
+            "once discovery answers properly the backend must be usable as modern");
+        },
+      );
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function selftestBackendEraDetection() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-era-"));
+  const mk = (url) => new Shim({
+    url, name: "test", cachePath: join(dir, "t.json"),
+    timeoutMs: 1_000, launchEnabled: false, appPath: null, launchGraceMs: 150_000,
+  });
+  try {
+    // --- a MODERN backend -----------------------------------------------
+    let sawInitialize = false;
+    let sawMetaVersion = null;
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "initialize") { sawInitialize = true; return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} }); }
+          if (msg.method === "server/discover") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { resultType: "complete", supportedVersions: ["2026-07-28"], capabilities: { tools: {} } } });
+          }
+          if (msg.method === "tools/call") {
+            sawMetaVersion = msg.params?._meta?.["io.modelcontextprotocol/protocolVersion"] ?? null;
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { content: [], isError: false } });
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = mk(url);
+        const r = await shim.handle({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {} });
+        assert.equal(r.result.isError, false, "a modern backend must serve a real call");
+        assert.equal(shim.backendEra, "modern");
+        assert.equal(sawInitialize, false, "a modern backend needs NO handshake — sending one is the bug");
+        assert.equal(sawMetaVersion, "2026-07-28", "every request to a modern backend must declare its version");
+        // Including the bare notification, which bypasses backend(). A modern
+        // backend that ignores an undeclared cancellation keeps running a
+        // possibly-mutating operation.
+        assert.deepEqual(
+          shim.withProtocolMeta({ requestId: 1, reason: "x" })._meta,
+          { "io.modelcontextprotocol/protocolVersion": "2026-07-28" },
+          "notifications/cancelled must carry the protocol version too",
+        );
+      },
+    );
+
+    // --- a LEGACY backend is untouched ----------------------------------
+    let legacyGotMeta = "unset";
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+          if (msg.method === "initialize") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } }, { "MCP-Session-Id": "s1" });
+          }
+          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          if (msg.method === "tools/call") {
+            legacyGotMeta = msg.params?._meta?.["io.modelcontextprotocol/protocolVersion"] ?? null;
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { content: [], isError: false } });
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = mk(url);
+        const r = await shim.handle({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {} });
+        assert.equal(r.result.isError, false);
+        assert.equal(shim.backendEra, "legacy");
+        assert.equal(legacyGotMeta, null, "a legacy backend must not receive _meta it never negotiated");
+      },
+    );
+
+    // --- a modern backend that answers discover with an HTTP 4xx --------
+    // The spec's documented detection case. Reading that body is the whole
+    // point: without it a modern-only backend looks legacy, we send
+    // initialize, and it fails for a reason nothing explains.
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") {
+            return sendJson(res, 400, { jsonrpc: "2.0", id: msg.id, error: { code: -32022, message: "Unsupported protocol version", data: { supported: ["2026-07-28"], requested: "2026-07-28" } } });
+          }
+          if (msg.method === "tools/call") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { content: [], isError: false } });
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = mk(url);
+        await shim.probeBackendEra();
+        assert.equal(shim.backendEra, "modern", "a modern error inside a 4xx must identify a MODERN server");
+      },
+    );
+
+    // A 4xx with nothing modern in it IS a verdict: legacy.
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") return sendJson(res, 400, { oops: "no idea what that is" });
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = mk(url);
+        await shim.probeBackendEra();
+        assert.equal(shim.backendEra, "legacy", "an unrecognisable 4xx means legacy, per the fallback rule");
+      },
+    );
+
+    // A 5xx or an explicitly transient 4xx must NOT decide an era. Caching
+    // either as legacy is permanent: every later connection skips discovery and
+    // sends an initialize a modern-only backend cannot answer, with no recovery
+    // short of restarting the shim.
+    for (const status of [500, 503, 408, 429]) {
+      await withServer(
+        (req, res) => {
+          readJsonBody(req).then((msg) => {
+            if (msg.method === "server/discover") return sendJson(res, status, { transient: true });
+            sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+          });
+        },
+        async (url) => {
+          const shim = mk(url);
+          await shim.probeBackendEra();
+          assert.equal(shim.backendEra, null, `HTTP ${status} is transient and must leave the era undecided`);
+        },
+      );
+    }
+
+    // An AUTH challenge is not an era verdict. A desktop app waiting on login
+    // answers 401/403 and is reachable moments later; caching legacy there is
+    // permanent, and a modern-only backend could never be reached again.
+    for (const status of [401, 403, 407]) {
+      await withServer(
+        (req, res) => {
+          readJsonBody(req).then((msg) => {
+            if (msg.method === "server/discover") return sendJson(res, status, { error: "auth required" });
+            sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+          });
+        },
+        async (url) => {
+          const shim = mk(url);
+          await shim.probeBackendEra().catch(() => {});
+          assert.equal(shim.backendEra, null, `HTTP ${status} is an auth challenge, not a protocol statement`);
+        },
+      );
+    }
+
+    // A GENERIC JSON-RPC error over HTTP 200 is not an era verdict. Only
+    // method-not-found identifies a legacy server; -32603 says the request
+    // failed, and caching legacy on it strands a modern backend that had one
+    // bad moment.
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Internal error" } });
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = mk(url);
+        await shim.probeBackendEra().catch(() => {});
+        assert.equal(shim.backendEra, null, "-32603 is a failed request, not a protocol statement");
+      },
+    );
+
+    // ...while method-not-found IS exactly what a legacy server says.
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+          }
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = mk(url);
+        await shim.probeBackendEra().catch(() => {});
+        assert.equal(shim.backendEra, "legacy", "method-not-found settles the verdict");
+      },
+    );
+
+    // A transport failure must fail ONCE. Returning "undecided" let connect()
+    // immediately issue a second request, so an endpoint that accepts
+    // connections and never answers burned the whole timeout twice.
+    let hangCount = 0;
+    await withServer(
+      (req) => { hangCount++; readJsonBody(req).then(() => { /* never responds */ }); },
+      async (url) => {
+        const shim = new Shim({
+          url, name: "test", cachePath: join(dir, "hang.json"),
+          timeoutMs: 300, launchEnabled: false, appPath: null, launchGraceMs: 150_000,
+        });
+        await shim.handle({ jsonrpc: "2.0", id: 9, method: "tools/call", params: {} });
+        assert.equal(hangCount, 1, "a hung endpoint must be hit once, not probed then re-attempted");
+        assert.equal(shim.backendEra, null, "and the era stays uncached for the next call");
+      },
+    );
+
+    // --- downtime is NOT an era verdict ---------------------------------
+    const down = mk("http://127.0.0.1:65533/mcp");
+    await down.handle({ jsonrpc: "2.0", id: 3, method: "tools/call", params: {} });
+    assert.equal(down.backendEra, null, "an unreachable backend must stay undecided, not be cached as legacy");  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 }

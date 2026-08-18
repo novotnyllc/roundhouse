@@ -47,16 +47,29 @@ export const PROTOCOL_VERSION = "2025-06-18";
 // keeps the shim working while either side moves. Newest first: a client
 // choosing from this list should land on the newest we both support.
 // ONLY versions this shim genuinely serves. 2025-11-25 was advertised here and
-// was a lie: the initialize branch never reads the client's requested version
-// and always answers with the pinned 2025-06-18, so a client that selected
-// 2025-11-25 from discovery would then fail legacy negotiation. Advertise what
-// is actually negotiated - a shorter honest list beats a longer aspirational
-// one, because a client cannot tell the difference until it has already
-// committed.
+// was a lie: the legacy initialize branch never reads the client's requested
+// version and always answers the pinned 2025-06-18, so a client that selected
+// 2025-11-25 from discovery would then fail negotiation. The backend-era work
+// did not change that - initialize still answers PROTOCOL_VERSION - so the
+// honest list stays short. A client cannot tell the difference until it has
+// already committed.
 export const SUPPORTED_PROTOCOL_VERSIONS = ["2026-07-28", "2025-06-18"];
+
+// The newest revision we speak; what the backend-era probe asks for.
+export const MODERN_PROTOCOL_VERSION = "2026-07-28";
 
 // JSON-RPC error code for UnsupportedProtocolVersionError (spec 2026-07-28).
 export const UNSUPPORTED_PROTOCOL_VERSION = -32022;
+
+// JSON-RPC "method not found". The ONLY error that identifies a legacy server:
+// it means the method is unknown, which is exactly a legacy server's answer to
+// server/discover. Every other error says the request failed, which is not a
+// statement about the protocol.
+export const METHOD_NOT_FOUND = -32601;
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
 
 export const PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
 
@@ -391,8 +404,14 @@ class BackendReported extends Error {
 // there is no JSON-RPC envelope to read a code/message from here.
 class HttpRejected extends Error {
   constructor(status, bodySnippet) {
-    super(`HTTP ${status}${bodySnippet ? `: ${bodySnippet}` : ""}`);
+    super(`HTTP ${status}${bodySnippet ? `: ${String(bodySnippet).slice(0, 200)}` : ""}`);
     this.status = status;
+    // The spec's documented modern-detection case is an
+    // UnsupportedProtocolVersionError delivered inside an HTTP 400, so the era
+    // probe has to be able to READ the body of a rejection. Parsed here, once,
+    // rather than making every caller re-parse a snippet.
+    this.body = null;
+    try { this.body = JSON.parse(bodySnippet); } catch { /* not JSON: no body to offer */ }
   }
 }
 
@@ -997,6 +1016,12 @@ export class Shim {
     // Set once initialize's response is known, cleared alongside
     // sid/connected on any reconnect - see post()/connect().
     this.protocolVersion = null;
+    // The BACKEND's era: "modern" (per-request _meta, 2026-07-28+), "legacy"
+    // (initialize handshake), or null for not-yet-probed. The spec says era is
+    // a property of the server, not of a request, and SHOULD be cached for the
+    // lifetime of the origin — so this is decided once and reused, not
+    // re-probed on every reconnect.
+    this.backendEra = null;
     // Client request id -> the AbortController post() built for it, so a
     // notifications/cancelled naming that id can abort the matching
     // in-flight HTTP request. Entries are added/removed by post() itself,
@@ -1231,7 +1256,10 @@ export class Shim {
     }
     if (!res.ok) {
       if (sid && STALE_HTTP_STATUSES.has(res.status)) throw new Stale(`HTTP ${res.status}`);
-      throw new HttpRejected(res.status, (errorText ?? "").slice(0, 200));
+      // Pass the WHOLE body, not a 200-char snippet: HttpRejected parses it so
+      // the era probe can recognise a modern error delivered in a 4xx, and a
+      // truncated body never parses. The message still shows only a snippet.
+      throw new HttpRejected(res.status, errorText ?? "");
     }
     return { body, sid: res.headers.get("mcp-session-id") };
   }
@@ -1244,7 +1272,159 @@ export class Shim {
   // the handshake's own internal calls, never under the client's id) and
   // was a silent no-op: the handshake ran to completion and the shim went
   // on to run the very tool call the client had already cancelled.
+  // Is the backend modern? Probes server/discover once and caches the verdict.
+  // Per the Streamable HTTP backward-compatibility rules: attempt a modern
+  // request, and treat a RECOGNIZED modern reply (a DiscoverResult, or an
+  // UnsupportedProtocolVersionError) as proof of a modern server. Anything
+  // else — an unknown-method error, a 4xx with no modern body, a transport
+  // failure — means legacy, and we fall back to `initialize`.
+  //
+  // Deliberately fail-safe toward legacy: every desktop backend today speaks
+  // the handshake, so an ambiguous answer must not strand us in modern mode
+  // against a server that cannot serve it.
+  // Adds the per-request protocol version when, and only when, the backend has
+  // been PROVEN modern. A legacy backend negotiated once by handshake and must
+  // not receive _meta it never asked for. One definition, so every outbound
+  // path - requests and bare notifications alike - decorates identically.
+  withProtocolMeta(params) {
+    if (this.backendEra !== "modern") {
+      // A legacy backend must not RECEIVE the per-request version marker
+      // either - not even when the CLIENT supplied it. Passing it through
+      // declares modern semantics to a server that never negotiated them,
+      // which defeats the translation in exactly the case it exists for: a
+      // modern harness in front of a legacy desktop app. Strip only this key;
+      // unrelated _meta belongs to the caller and travels untouched, and an
+      // _meta that held nothing else is dropped so legacy bytes are unchanged.
+      if (!isObject(params?._meta) || params._meta[PROTOCOL_VERSION_META_KEY] === undefined) return params;
+      const { [PROTOCOL_VERSION_META_KEY]: _stripped, ...restMeta } = params._meta;
+      const out = { ...params };
+      if (Object.keys(restMeta).length > 0) out._meta = restMeta;
+      else delete out._meta;
+      return out;
+    }
+    return {
+      ...(params ?? {}),
+      _meta: { ...(params?._meta ?? {}), [PROTOCOL_VERSION_META_KEY]: this.protocolVersion ?? MODERN_PROTOCOL_VERSION },
+    };
+  }
+
+  async probeBackendEra(clientRequestId) {
+    if (this.backendEra !== null) return this.backendEra;
+    // Declared out here: the verdict below the try needs to inspect the reply,
+    // and a `const` inside the block is not in scope there.
+    let body;
+    try {
+      ({ body } = await this.post(
+        {
+          jsonrpc: "2.0",
+          id: 0,
+          method: "server/discover",
+          params: {
+            _meta: {
+              [PROTOCOL_VERSION_META_KEY]: MODERN_PROTOCOL_VERSION,
+              "io.modelcontextprotocol/clientInfo": { name: "mcp-siding", version: "1" },
+              "io.modelcontextprotocol/clientCapabilities": {},
+            },
+          },
+        },
+        null,
+        clientRequestId,
+      ));
+      if (Array.isArray(body?.result?.supportedVersions)) {
+        const shared = body.result.supportedVersions.filter((v) => SUPPORTED_PROTOCOL_VERSIONS.includes(v));
+        // A modern server we share no version with is still MODERN — falling
+        // back to initialize would just fail differently and hide why.
+        this.backendEra = "modern";
+        this.protocolVersion = shared[0] ?? MODERN_PROTOCOL_VERSION;
+        return this.backendEra;
+      }
+      if (body?.error?.code === UNSUPPORTED_PROTOCOL_VERSION) {
+        this.backendEra = "modern";
+        const supported = body.error.data?.supported;
+        const shared = Array.isArray(supported) ? supported.filter((v) => SUPPORTED_PROTOCOL_VERSIONS.includes(v)) : [];
+        this.protocolVersion = shared[0] ?? MODERN_PROTOCOL_VERSION;
+        return this.backendEra;
+      }
+    } catch (err) {
+      // A CANCELLATION is not an era verdict and must not be swallowed. The
+      // client asked us to stop; returning null here let connect() carry on,
+      // start a fresh initialize, and ultimately run the caller's (possibly
+      // mutating) tool call against the backend after it had been cancelled.
+      if (err instanceof Cancelled) throw err;
+      // The spec's documented modern-detection case: an
+      // UnsupportedProtocolVersionError delivered inside an HTTP 4xx. Without
+      // reading that body a modern-only backend looks like a legacy one, we
+      // send initialize, and it fails for a reason nothing explains.
+      if (err instanceof HttpRejected && err.body?.error?.code === UNSUPPORTED_PROTOCOL_VERSION) {
+        this.backendEra = "modern";
+        const supported = err.body.error.data?.supported;
+        const shared = Array.isArray(supported) ? supported.filter((v) => SUPPORTED_PROTOCOL_VERSIONS.includes(v)) : [];
+        this.protocolVersion = shared[0] ?? MODERN_PROTOCOL_VERSION;
+        return this.backendEra;
+      }
+      // A CLIENT-error rejection with no recognisable modern body is a legacy
+      // server, per the Streamable HTTP fallback rule - the server understood
+      // us and refused, which is the evidence that rule is built on.
+      //
+      // Deliberately NOT every HttpRejected. A 5xx means the server FAILED, not
+      // that it rejected our era, and 408/429 are explicitly transient. Caching
+      // any of those as "legacy" would be permanent: every later connection
+      // skips discovery and sends an initialize a modern-only backend cannot
+      // answer, with no recovery short of restarting the shim. A transient
+      // blip must leave the era undecided so the next attempt can probe again.
+      if (err instanceof HttpRejected) {
+        const s = err.status;
+        // 401/403/407 are authentication or authorization challenges, not a
+        // statement about which protocol the server speaks - a desktop app
+        // waiting on login answers this way and becomes reachable moments
+        // later. Caching legacy here is permanent: discovery is skipped
+        // forever after, and a modern-only backend can never be reached again
+        // without restarting the shim.
+        if (s >= 400 && s < 500 && ![401, 403, 407, 408, 429].includes(s)) {
+          this.backendEra = "legacy";
+          return this.backendEra;
+        }
+        return null;
+      }
+      // Anything else - unreachable, timeout, malformed - is genuinely
+      // inconclusive about the ERA, but it is conclusive about REACHABILITY
+      // right now. Returning null let connect() immediately issue a second
+      // request, so an endpoint that accepts connections and never answers
+      // burned the full timeout twice before reporting anything. Leave the era
+      // uncached for the next call and re-throw, so this attempt fails once.
+      throw err;
+    }
+    // Reached only when the backend ANSWERED over HTTP 200 without a
+    // DiscoverResult. Only an error that actually identifies a legacy server
+    // may settle the verdict: method-not-found (-32601) means "I do not know
+    // server/discover", which is precisely what a legacy server says. A
+    // generic server error (-32603 and friends) says the request FAILED, not
+    // that the method is unknown — a modern backend having a bad moment would
+    // otherwise be cached as legacy permanently, and every later connection
+    // would skip discovery and send initialize it cannot answer.
+    // A 200 with no error object at all is NOT evidence either: a modern
+    // backend transiently answering `{}` or `{"result":{}}` would otherwise be
+    // cached as legacy forever, and every later connection would skip
+    // discovery and send an initialize it cannot answer. Absence of an error
+    // is absence of evidence, so an unrecognized success stays undecided and
+    // the next call probes again.
+    const code = body?.error?.code;
+    if (code === METHOD_NOT_FOUND) {
+      this.backendEra = "legacy";
+      return this.backendEra;
+    }
+    return null;
+  }
+
   async connect(clientRequestId) {
+    // A modern backend needs no handshake at all: version, identity and
+    // capabilities all travel per-request. Marking the session connected is
+    // the whole of "connecting" there.
+    if ((await this.probeBackendEra(clientRequestId)) === "modern") {
+      this.sid = null;
+      this.connected = true;
+      return;
+    }
     const { body, sid } = await this.post(
       {
         jsonrpc: "2.0",
@@ -1313,7 +1493,11 @@ export class Shim {
           // can name the right one.
           const backendRequestId = this.nextBackendId++;
           if (clientRequestId !== undefined) this.backendIdForClient.set(clientRequestId, backendRequestId);
-          const { body } = await this.post({ jsonrpc: "2.0", id: backendRequestId, method, params }, this.sid, clientRequestId);
+          // A modern backend expects the version on EVERY request; a legacy
+          // one negotiated it once and must not receive _meta it never asked
+          // for, so this is added only for a backend proven modern.
+          const outbound = this.withProtocolMeta(params);
+          const { body } = await this.post({ jsonrpc: "2.0", id: backendRequestId, method, params: outbound }, this.sid, clientRequestId);
           if (body?.error) throw new BackendReported(body.error.code, body.error.message ?? "backend error");
           // This call always sends an id, so a response was expected - a 200
           // with an empty body, or an SSE stream that reached EOF without
@@ -1407,7 +1591,11 @@ export class Shim {
     const backendRequestId = this.backendIdForClient.get(clientRequestId);
     if (this.connected && backendRequestId !== undefined) {
       return this.post(
-        { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: backendRequestId, reason } },
+        // cancel() bypasses backend(), so it must add the modern metadata
+        // itself. Without it a modern backend can reject or ignore the
+        // cancellation and keep running a possibly-mutating operation - the
+        // one message where being ignored is worst.
+        { jsonrpc: "2.0", method: "notifications/cancelled", params: this.withProtocolMeta({ requestId: backendRequestId, reason }) },
         this.sid,
       ).catch(() => {});
     }

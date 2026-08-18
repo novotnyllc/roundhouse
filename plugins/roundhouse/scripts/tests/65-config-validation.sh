@@ -70,9 +70,6 @@ if ROUNDHOUSE_CONFIG="$tmp/invalid-pathless-encrypted-auth.json" \
   "$cli" validate-config >/dev/null 2>&1; then
   fail "pathless encrypted auth install was accepted"
 fi
-jq '.auth_artifacts["native-test-auth"].strategy = "ignore"' \
-  "$tmp/config.json" >"$tmp/ignore-native-auth.json"
-chmod 600 "$tmp/ignore-native-auth.json"
 ROUNDHOUSE_CONFIG="$tmp/ignore-native-auth.json" "$cli" validate-config
 jq '.agent_artifacts += [{id:"missing-host-path",paths:{"test-windows":"~/.missing"},kind:"config",format:"json",settings:{fallbackModel:null,model:"fixture-model"},agents:["claude"],groups:["development"]}]' \
   "$tmp/config.json" >"$tmp/missing-agent-path.json"
@@ -87,7 +84,6 @@ set -e
   fail "missing per-host artifact path was not explicit"
 [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "missing-host-path" and .status == "unavailable" and .data.path == null and .errors[0].code == "artifact_path_missing")) | length' "$tmp/missing-agent-path.jsonl")" -eq 2 ] ||
   fail "missing per-host artifact path dropped configured settings or treated them as observed absent"
-"$cli" collect --target test-host --section all --output "$tmp/snapshot.jsonl"
 [ "$(test_file_mode "$tmp/snapshot.jsonl")" = 600 ] ||
   fail "snapshot mode is not 600"
 "$cli" validate "$tmp/snapshot.jsonl"
@@ -330,7 +326,6 @@ mv "$tmp/claude-settings-file-before-fifo-posix.json" "$tmp/home/.claude/setting
 if grep -q 'fifo-settings-secret-posix' "$tmp/fifo-settings-posix.jsonl"; then
   fail "POSIX settings inventory read a FIFO artifact"
 fi
-oversized_setting=$(awk 'BEGIN { for (i = 0; i < 8193; i++) printf "x" }')
 cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-bounded-posix.json"
 jq -cn --arg value "$oversized_setting" '{model:$value,availableModels:[range(0;3000)|"xx"]}' \
   >"$tmp/home/.claude/settings.json"
@@ -346,20 +341,6 @@ mv "$tmp/claude-settings-bounded-posix.json" "$tmp/home/.claude/settings.json"
   fail "oversized scalar or array POSIX setting was not suppressed"
 assert_contains "$json" '"origin":"ssh://github.com/owner/example.git"'
 
-cat >"$tmp/codex-readiness.json" <<JSON
-{
-  "host_id": "test-host",
-  "project": "example",
-  "status": "available",
-  "codex_host": "test-codex-host",
-  "native_path": "$tmp/home/dev/example",
-  "expected_source": "github.com:owner/example.git",
-  "codex_project_id": "project-opaque-id",
-  "task_id": "task-opaque-id",
-  "correlation_id": "correlation-opaque-id"
-}
-JSON
-chmod 600 "$tmp/codex-readiness.json"
 "$cli" record-codex-readiness "$tmp/snapshot.jsonl" "$tmp/codex-readiness.json" "$tmp/enriched.jsonl"
 "$cli" validate "$tmp/enriched.jsonl"
 [ "$(jq -r 'select(.kind == "project" and .id == "example") | .data.codex_saved_project_status' "$tmp/enriched.jsonl")" = available ] ||
@@ -385,8 +366,6 @@ fi
 "$cli" compare "$tmp/snapshot.jsonl" "$tmp/snapshot.jsonl" >"$tmp/compare.json"
 [ "$(jq 'length' "$tmp/compare.json")" -eq 0 ] || fail "identical snapshot comparison reported drift"
 
-sleep 1
-"$cli" collect --target test-host --section all --output "$tmp/snapshot-2.jsonl"
 "$cli" compare "$tmp/snapshot.jsonl" "$tmp/snapshot-2.jsonl" >"$tmp/compare-2.json"
 [ "$(jq 'length' "$tmp/compare-2.json")" -eq 0 ] || fail "timestamps and run IDs reported as inventory drift"
 

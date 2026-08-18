@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Which test sections must run for a given set of changed paths?
+#
+# Reads changed paths on stdin (one per line). With no argument, prints the
+# SECTION numbers to run. With `--scopes`, prints the ROUNDHOUSE_TEST_SCOPE
+# names to run. Either may print the single token `all`.
+#
+# Scopes are not a grouping of sections — they are separate coverage. The
+# *_contracts functions are DEFINED in sections 10/12/14 but only INVOKED from
+# a scope guard, so an unscoped run never executes them however many sections
+# it runs. That is also where the 17-minute job was: the contracts themselves,
+# not the sections around them.
+#
+# Unmapped paths are split by whether they are even INPUTS to the suite:
+#
+#   * inside the tested surface (the roundhouse plugin's scripts, skills and
+#     manifests) -> run EVERYTHING. A new file there plausibly changes what the
+#     suite validates, and guessing its blast radius is how a gate quietly
+#     stops gating.
+#   * anywhere else -> run nothing extra. Adding an unrelated file, a new
+#     top-level directory, another plugin, or a note cannot affect a suite that
+#     does not read them, and forcing a full run for those is pure tax.
+#
+# The asymmetry is deliberate: forgetting a rule for a real input costs time,
+# never coverage, while treating every unknown path as harmless would trade
+# coverage for speed silently.
+set -uo pipefail
+
+# Section numbers that are ALWAYS run: the shared preamble every other section
+# is sourced on top of, so nothing can be validated without them. Measured at
+# roughly three seconds, which is why this is cheap to keep unconditional.
+ALWAYS="00 05 07"
+
+# path prefix -> sections. First match wins, longest prefixes first.
+# Anything touching the harness, the shared libs, the CLI, or CI config is
+# deliberately `all`: those are inputs to every section, so a targeted subset
+# would be guessing about blast radius.
+rules() {
+  cat <<'MAP'
+plugins/roundhouse/scripts/tests/	all
+plugins/roundhouse/scripts/test-roundhouse	all
+plugins/roundhouse/scripts/lib/	all
+plugins/roundhouse/scripts/roundhouse	all
+plugins/roundhouse/scripts/select-sections	all
+plugins/roundhouse/integrity.json	all
+.github/	all
+AGENTS.md	all
+plugins/roundhouse/scripts/mcp-siding.mjs	76
+plugins/roundhouse/scripts/mcp-siding.selftest.mjs	76
+plugins/roundhouse/scripts/mcp-siding-windows.ps1	76 67
+plugins/roundhouse/skills/mcp-shim/	76
+plugins/roundhouse/scripts/collect-posix	10 12 14
+plugins/roundhouse/scripts/enroll-ssh-posix	12 14
+plugins/roundhouse/scripts/prepare-ssh-identity	12 14
+plugins/roundhouse/scripts/certify-ssh-node	12 14
+plugins/roundhouse/scripts/enroll-privilege-posix	50
+plugins/roundhouse/scripts/privilege-broker-posix	50
+plugins/roundhouse/scripts/launcher-install	40
+plugins/roundhouse/scripts/update-integrity	00 60
+plugins/roundhouse/scripts/preflight	00
+plugins/roundhouse/scripts/git-merge-plugin-version	00
+docs/	none
+README.md	none
+UPSTREAM.md	none
+MAP
+}
+
+# scope -> the path prefixes that can affect it. Same fail-safe split as
+# sections: unmapped inside the tested surface means run every scope.
+scopes_for() {
+  case $1 in
+    plugins/roundhouse/scripts/collect-posix*|\
+    plugins/roundhouse/scripts/enroll-ssh-posix*|\
+    plugins/roundhouse/scripts/prepare-ssh-identity*|\
+    plugins/roundhouse/scripts/certify-ssh-node*) printf 'u2-contracts\n' ;;
+    plugins/roundhouse/scripts/enroll-privilege-posix*|\
+    plugins/roundhouse/scripts/privilege-broker-posix*) printf 'macos-privilege-contracts\nu2-contracts\n' ;;
+    plugins/roundhouse/scripts/launcher-install*) printf 'u4-contracts\nu5-contracts\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# helper -> the paths that can affect its self-test. Each helper ships its own
+# `self-test`, and those are the most expensive jobs in the matrix - the
+# enroll-ssh-posix one alone is ~10 min on macOS - so running all six legs for a
+# docs change is the single biggest avoidable cost in CI. Same fail-safe split
+# as sections and scopes: unmapped inside the tested surface runs every helper.
+helpers_for() {
+  case $1 in
+    plugins/roundhouse/scripts/enroll-ssh-posix*) printf 'enroll-ssh-posix\n' ;;
+    plugins/roundhouse/scripts/prepare-ssh-identity*) printf 'prepare-ssh-identity\n' ;;
+    plugins/roundhouse/scripts/certify-ssh-node*) printf 'certify-ssh-node\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+ALL_HELPERS='enroll-ssh-posix
+prepare-ssh-identity
+certify-ssh-node'
+
+# Sections are SOURCED cumulatively, and a few used to build on an earlier
+# one's fixtures: 67 read $oversized_setting and snapshot.jsonl from 65, 68 read
+# snapshot-2.jsonl from 65, and 71/72/74/75 read $fleet_fixture_yq from 70. That
+# made a per-section matrix unschedulable without pairing entries together.
+# Those fixtures now live in the always-run 07 harness, so every section stands
+# alone and the matrix can schedule them in any combination. Verified by running
+# each one with ROUNDHOUSE_TEST_ONLY and a clean HOME, which `set -eu` makes a
+# meaningful result rather than a lucky one.
+
+want_scopes=false
+want_helpers=false
+case ${1:-} in
+  --scopes) want_scopes=true ;;
+  --helpers) want_helpers=true ;;
+esac
+
+selected=""
+scope_selected=""
+helper_selected=""
+saw_any=false
+while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  saw_any=true
+  match=""
+  while IFS=$'\t' read -r prefix sections; do
+    [ -n "$prefix" ] || continue
+    case $path in
+      "$prefix"*) match=$sections; break ;;
+    esac
+  done < <(rules)
+
+  if [ -z "$match" ]; then
+    case $path in
+      # Unmapped but INSIDE the tested surface: cannot reason about it, so run
+      # everything rather than guess.
+      plugins/roundhouse/scripts/*|plugins/roundhouse/skills/*|\
+      plugins/roundhouse/.claude-plugin/*|plugins/roundhouse/.codex-plugin/*)
+        if [ "$want_helpers" = true ]; then printf '%s\n' "$ALL_HELPERS"; else printf 'all\n'; fi
+        exit 0 ;;
+      # Outside it: not an input to this suite. Nothing to run.
+      *) continue ;;
+    esac
+  fi
+  [ "$match" = none ] && continue
+  if [ "$match" = all ]; then
+    if [ "$want_helpers" = true ]; then printf '%s\n' "$ALL_HELPERS"; else printf 'all\n'; fi
+    exit 0
+  fi
+  selected="$selected $match"
+  if scope_hit=$(scopes_for "$path"); then
+    scope_selected="$scope_selected $scope_hit"
+  fi
+  if helper_hit=$(helpers_for "$path"); then
+    helper_selected="$helper_selected $helper_hit"
+  fi
+done
+
+# No input at all is not "nothing changed" — it is "I was told nothing", which
+# is the same unknown as an unmapped path.
+if [ "$saw_any" != true ]; then
+  if [ "$want_helpers" = true ]; then printf '%s\n' "$ALL_HELPERS"; else printf 'all\n'; fi
+  exit 0
+fi
+
+if [ "$want_helpers" = true ]; then
+  # Like scopes: no helper implicated means no helper self-test needs running.
+  for n in $helper_selected; do printf '%s\n' "$n"; done | sort -u
+elif [ "$want_scopes" = true ]; then
+  # No scope implicated means no scope needs running - unlike sections, there
+  # is no mandatory preamble scope.
+  for n in $scope_selected; do printf '%s\n' "$n"; done | sort -u
+else
+  # Piped, not $(...) in a for-loop: command substitution word-splits, which
+  # would tear the "65 67" entry back into two independent jobs and reinstate
+  # the exact failure the pairing exists to prevent.
+  printf '%s\n' $ALWAYS $selected | sort -u
+fi
