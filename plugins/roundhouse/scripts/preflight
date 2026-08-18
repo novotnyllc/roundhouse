@@ -31,8 +31,13 @@ note() { printf '%s\n' "$*" >&2; }
 missing_drivers=()
 [ "$(git config --get merge.ours.driver || true)" = "true" ] ||
   missing_drivers+=("git config merge.ours.driver true")
-[ -n "$(git config --get merge.pluginversion.driver || true)" ] ||
-  missing_drivers+=("git config merge.pluginversion.driver 'plugins/roundhouse/scripts/git-merge-plugin-version %O %A %B'")
+# EXACT value, not merely present. `merge.pluginversion.driver true` satisfies
+# a nonempty test and then resolves every version-only conflict by exiting 0
+# without touching %A — silently keeping the branch's LOWER version, which is
+# the precise regression this driver exists to prevent.
+expected_pluginversion="plugins/roundhouse/scripts/git-merge-plugin-version %O %A %B"
+[ "$(git config --get merge.pluginversion.driver || true)" = "$expected_pluginversion" ] ||
+  missing_drivers+=("git config merge.pluginversion.driver '$expected_pluginversion'")
 if [ ${#missing_drivers[@]} -gt 0 ]; then
   note "WARN merge drivers not configured; .gitattributes entries are inert and"
   note "     conflicts will look ordinary. Run:"
@@ -52,8 +57,12 @@ if [ "$integrity_rc" -ne 0 ]; then
   note "FAIL update-integrity exited $integrity_rc"
   [ -n "$integrity_out" ] && note "$integrity_out"
   fail=1
-elif ! git diff --quiet -- plugins/roundhouse/integrity.json; then
-  note "FAIL integrity.json is stale — update-integrity changed it. Stage the result."
+elif ! git diff --quiet HEAD -- plugins/roundhouse/integrity.json; then
+  # Against HEAD, not the index. Worktree-vs-index passes the moment you `git
+  # add` the regenerated file, even though every COMMIT being pushed still
+  # carries the stale manifest — so preflight would green-light a push whose
+  # integrity metadata is wrong. HEAD is the thing being pushed.
+  note "FAIL integrity.json differs from HEAD — regenerate and COMMIT it, not just stage it."
   fail=1
 else
   note "ok   integrity.json current"
