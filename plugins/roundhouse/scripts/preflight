@@ -111,13 +111,20 @@ for (const file of files) {
   // when looking up the normalized name.
   const ASSIGN = (n) => new RegExp(`\\$\\{?${n}\\}?\\s*=`, "i");
   for (const block of blocks) {
-    // Fold backtick continuations into ONE logical line first. PowerShell is
-    // still evaluating an assignment's right-hand side across the break, so
-    // splitting on physical lines marked `$x` assigned before `-Filter $x` on
-    // the next line was read - accepting exactly the use-before-assignment the
-    // gate exists to catch. Joined, the read sits in the same statement as its
-    // own assignment and is correctly reported.
-    const logical = block.replace(/`[ \t]*\r?\n/g, " ");
+    // Fold line continuations into ONE logical line first. PowerShell is still
+    // evaluating the right-hand side of an assignment across the break, so
+    // splitting on physical lines marked $x assigned before the continuation
+    // line read it - accepting exactly the use-before-assignment this gate
+    // exists to catch. Joined, the read sits in the same statement as the
+    // assignment and is correctly reported.
+    //
+    // Note the deliberate absence of literal backticks and apostrophes in this
+    // whole node program: it sits inside a $( ) command substitution, and bash
+    // 3.2 on macOS still counts quotes and backticks there even inside a quoted
+    // heredoc. One unpaired character makes the file an unterminated
+    // substitution that bash -n rejects - invisible on a bash 5 dev machine,
+    // and a hard failure on macOS CI. \x60 is the continuation marker.
+    const logical = block.replace(/\x60[ \t]*\r?\n/g, " ");
     for (const raw of logical.split("\n")) {
       const line = raw.replace(/#.*$/, "");
       // Per STATEMENT, not per line: `$x = 1; Write-Output $x` is valid, and
