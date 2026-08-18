@@ -39,6 +39,36 @@ import { fileURLToPath } from "node:url";
 
 export const PROTOCOL_VERSION = "2025-06-18";
 
+// Versions this shim will serve to a CLIENT. It is deliberately dual-era: the
+// backend (a desktop app's MCP server) is legacy and will be for a long time,
+// while the harness on the other side may modernize at any point. Per the
+// 2026-07-28 compatibility matrix a legacy-only server FAILS a modern client,
+// and a legacy-only client FAILS a modern server — so being dual-era is what
+// keeps the shim working while either side moves. Newest first: a client
+// choosing from this list should land on the newest we both support.
+// ONLY versions this shim genuinely serves. 2025-11-25 was advertised here and
+// was a lie: the initialize branch never reads the client's requested version
+// and always answers with the pinned 2025-06-18, so a client that selected
+// 2025-11-25 from discovery would then fail legacy negotiation. Advertise what
+// is actually negotiated - a shorter honest list beats a longer aspirational
+// one, because a client cannot tell the difference until it has already
+// committed.
+export const SUPPORTED_PROTOCOL_VERSIONS = ["2026-07-28", "2025-06-18"];
+
+// JSON-RPC error code for UnsupportedProtocolVersionError (spec 2026-07-28).
+export const UNSUPPORTED_PROTOCOL_VERSION = -32022;
+
+export const PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
+
+// The version a request declares, if it speaks the modern per-request style.
+// Absent means legacy: the caller negotiated (or will negotiate) by handshake.
+export function requestedProtocolVersion(params) {
+  const meta = params?._meta;
+  if (meta === null || typeof meta !== "object") return undefined;
+  const v = meta[PROTOCOL_VERSION_META_KEY];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Resolver: the shell snippet a registration embeds via `/bin/sh -c` so the
 // registration itself never hardcodes a path to this script. Plugin install
@@ -392,6 +422,40 @@ class MalformedResponse extends Error {}
 // not the place to reject a shape a real backend legitimately sends.
 // Methods with no shape requirement here (initialize, ...) pass through
 // unchecked.
+// A client that DECLARED a modern protocol version relies on resultType to
+// tell a complete answer from an interim one, and the backend is legacy and
+// supplies none - so without this the normal app-up tools/list and tools/call
+// paths hand a modern client legacy-shaped results for nearly every real call.
+//
+// Applied only when the request declared a modern version. A legacy client
+// neither expects the field nor benefits from it, and adding it there would
+// change bytes on the wire for callers that never asked to move.
+//
+// Absent means complete: an interim result always states its own resultType
+// (input_required), so anything silent is a finished answer. Never overwrite
+// one the backend did set.
+function withResultType(result, declaredVersion, method) {
+  if (declaredVersion === undefined || declaredVersion < "2026-07-28") return result;
+  if (result === null || typeof result !== "object" || Array.isArray(result)) return result;
+  const out = result.resultType === undefined ? { ...result, resultType: "complete" } : { ...result };
+  // A COMPLETE tools/list MUST carry caching hints (2026-07-28,
+  // server/utilities/caching). Without them a strict modern client rejects the
+  // inventory immediately after adopting the version we advertised - the worst
+  // possible moment, since it has already committed. The legacy backend sends
+  // none, so we supply them.
+  //
+  // ttlMs 0 is the honest value, not a placeholder: this shim's list genuinely
+  // changes underneath a client (cached inventory while the app is closed, live
+  // once it opens), so nothing may hold it as fresh. cacheScope private because
+  // a desktop app's tools are that machine's session, and sharing them across
+  // authorization contexts is not ours to authorize.
+  if (out.resultType === "complete" && method === "tools/list") {
+    if (out.ttlMs === undefined) out.ttlMs = 0;
+    if (out.cacheScope === undefined) out.cacheScope = "private";
+  }
+  return out;
+}
+
 export function validateResultShape(method, result) {
   // MCP 2026-07-28 multi-round-trip requests: an INTERIM result carries
   // `resultType: "input_required"` and neither a `content` nor a `tools` array,
@@ -1533,7 +1597,10 @@ export class Shim {
       // cache OUR stale copy as if it were fresh. ttlMs:0 is the spec's way to
       // say "immediately stale, re-ask when you can" - the honest label for a
       // last-known-good list served from disk.
-      return { tools: cached, ttlMs: 0 };
+      // resultType marks this a COMPLETE result (2026-07-28) — it is a real
+      // answer, just a stale one — while ttlMs:0 stops the client caching our
+      // stale copy as fresh. Harmless to a legacy client, which ignores both.
+      return { tools: cached, resultType: "complete", ttlMs: 0, cacheScope: "private" };
     }
   }
 
@@ -1710,9 +1777,48 @@ export class Shim {
     // tools/call can launch the app, and a launch for a reply nobody will
     // ever read is a real, user-visible side effect, not a no-op.
     if (id === undefined) return null;
-    if (method === "ping") return ok(id, {});
-    if (method === "tools/list") return ok(id, await this.toolsList(params, id));
-    if (method === "tools/call") return ok(id, await this.toolsCall(params, id));
+    // A modern client declares its version on EVERY request. Reject one we do
+    // not serve with the error the spec defines, listing what we do serve, so
+    // the client can retry on a mutually supported version instead of guessing.
+    // A request with no such declaration is legacy and passes through here
+    // untouched.
+    const wanted = requestedProtocolVersion(params);
+    if (wanted !== undefined && !SUPPORTED_PROTOCOL_VERSIONS.includes(wanted)) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: UNSUPPORTED_PROTOCOL_VERSION,
+          message: "Unsupported protocol version",
+          data: { supported: SUPPORTED_PROTOCOL_VERSIONS, requested: wanted },
+        },
+      };
+    }
+    // Servers MUST implement server/discover (2026-07-28). It is also the stdio
+    // backward-compatibility probe: a dual-era client sends it first and falls
+    // back to `initialize` on any non-modern error. Answering it locally, like
+    // initialize, keeps the shim describable while the backend is closed.
+    if (method === "server/discover") {
+      return ok(id, {
+        resultType: "complete",
+        supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
+        capabilities: { tools: { listChanged: true } },
+        _meta: {
+          "io.modelcontextprotocol/serverInfo": { name: this.name, version: "1.0.0" },
+        },
+        // Zero: this shim's own tool list genuinely changes (cached list while
+        // the app is closed, live list once it opens), so a client must never
+        // hold this answer as fresh.
+        ttlMs: 0,
+        cacheScope: "public",
+      });
+    }
+    // ping is a liveness check a modern client may reject if it cannot tell a
+    // complete result from an interim one, so it needs the discriminator just
+    // as the tool branches do.
+    if (method === "ping") return ok(id, withResultType({}, wanted, method));
+    if (method === "tools/list") return ok(id, withResultType(await this.toolsList(params, id), wanted, method));
+    if (method === "tools/call") return ok(id, withResultType(await this.toolsCall(params, id), wanted, method));
     try {
       const result = await this.backend(method, params, id);
       return ok(id, result);

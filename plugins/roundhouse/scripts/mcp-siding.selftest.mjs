@@ -1525,6 +1525,8 @@ export async function selftest() {
   await selftestNotificationForwardingEndToEnd();
   await selftestToolListReconcileNotifiesClient();
   await selftestInterimResultsArePassedThrough();
+  await selftestDualEraServerFace();
+  await selftestModernToolsListCarriesCachingHints();
   await selftestReconcileNeverCommitsTruncatedWalk();
 
   // -- 7j3e. #16: native Windows. The PowerShell resolver/launcher lives in
@@ -4932,4 +4934,120 @@ async function selftestInterimResultsArePassedThrough() {
     "a result with no resultType is treated as complete, exactly as before",
   );
   validateResultShape("tools/call", { content: [] });
+}
+
+// The shim must be legible to a MODERN client while still serving a legacy one
+// and talking to a legacy backend. Per the 2026-07-28 compatibility matrix a
+// legacy-only server FAILS a modern client outright, so this is what keeps the
+// shim working when the harness moves and the desktop app has not.
+// Caching hints on the APP-UP path specifically. The offline fallback sets them
+// inline, so asserting against a down backend proves nothing about the
+// normalization - the first version of this test did exactly that and passed
+// with the normalization deleted.
+async function selftestModernToolsListCarriesCachingHints() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-hints-"));
+  try {
+    await withServer(
+      (req, res) => {
+        readJsonBody(req).then((msg) => {
+          if (msg.method === "server/discover") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } });
+          if (msg.method === "initialize") {
+            return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, serverInfo: { name: "fake" } } }, { "MCP-Session-Id": "s1" });
+          }
+          if (msg.method === "notifications/initialized") return sendJson(res, 200, undefined);
+          // A legacy backend: a plain inventory carrying no caching hints.
+          if (msg.method === "tools/list") return sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "live_tool" }] } });
+          sendJson(res, 200, { jsonrpc: "2.0", id: msg.id, result: {} });
+        });
+      },
+      async (url) => {
+        const shim = new Shim({
+          url, name: "test", cachePath: join(dir, "t.json"),
+          timeoutMs: 1_000, launchEnabled: false, appPath: null, launchGraceMs: 150_000,
+        });
+        const r = await shim.handle({
+          jsonrpc: "2.0", id: 1, method: "tools/list",
+          params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } },
+        });
+        assert.deepEqual(r.result.tools, [{ name: "live_tool" }], "must be the LIVE list, proving the app-up path ran");
+        assert.equal(r.result.resultType, "complete");
+        assert.equal(r.result.ttlMs, 0, "our list changes underneath the client; it must never be held as fresh");
+        assert.equal(r.result.cacheScope, "private", "a desktop app's tools are that machine's session");
+
+        const legacy = await shim.handle({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+        assert.deepEqual(legacy.result, { tools: [{ name: "live_tool" }] }, "a legacy client gets no fields it never asked for");
+      },
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function selftestDualEraServerFace() {
+  const dir = await mkdtemp(join(tmpdir(), "siding-dualera-"));
+  const shim = new Shim({
+    url: "http://127.0.0.1:65533/mcp",
+    name: "test",
+    cachePath: join(dir, "tools.json"),
+    timeoutMs: 500,
+    launchEnabled: false,
+    appPath: null,
+    launchGraceMs: 150_000,
+  });
+  try {
+    // server/discover is a MUST, and is the stdio era probe. Answered locally,
+    // so it works with the app closed.
+    const disc = await shim.handle({ jsonrpc: "2.0", id: 1, method: "server/discover", params: {} });
+    assert.equal(disc.result.resultType, "complete");
+    assert.ok(disc.result.supportedVersions.includes("2026-07-28"), "must offer the current revision");
+    assert.ok(disc.result.supportedVersions.includes("2025-06-18"), "must still offer the legacy revision");
+    // Advertise ONLY what is actually negotiated: initialize answers with the
+    // pinned legacy version and never reads the client's request, so listing an
+    // intermediate revision would strand a client that selected it.
+    assert.deepEqual(disc.result.supportedVersions, ["2026-07-28", "2025-06-18"], "no version may be advertised that initialize cannot negotiate");
+    assert.equal(disc.result.capabilities.tools.listChanged, true);
+    assert.equal(disc.result.ttlMs, 0, "our tool list genuinely changes; discover must not be cached as fresh");
+
+    // A version we serve is accepted.
+    const okVer = await shim.handle({
+      jsonrpc: "2.0", id: 2, method: "ping",
+      params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } },
+    });
+    assert.equal(okVer.result.resultType, "complete", "a modern client's ping must be discriminated too");
+
+    // One we do not serve gets the defined error, listing what we do serve, so
+    // the client can retry rather than guess.
+    const badVer = await shim.handle({
+      jsonrpc: "2.0", id: 3, method: "ping",
+      params: { _meta: { "io.modelcontextprotocol/protocolVersion": "1900-01-01" } },
+    });
+    assert.equal(badVer.error.code, -32022, "UnsupportedProtocolVersionError");
+    assert.equal(badVer.error.data.requested, "1900-01-01");
+    assert.ok(badVer.error.data.supported.includes("2026-07-28"));
+
+    // A LEGACY request declares no version and must be unaffected.
+    const legacy = await shim.handle({ jsonrpc: "2.0", id: 4, method: "ping", params: {} });
+    assert.deepEqual(legacy.result, {}, "a request with no declared version stays legacy and is served, byte-identical");
+
+    // The offline fallback is a complete-but-stale result.
+    const offline = await shim.handle({ jsonrpc: "2.0", id: 5, method: "tools/list", params: {} });
+    assert.equal(offline.result.resultType, "complete");
+    assert.equal(offline.result.ttlMs, 0);
+
+    // A client that DECLARED a modern version gets the discriminator on the
+    // ordinary paths too, not only on the two results we synthesize - the
+    // backend is legacy and supplies none, so without this a modern client
+    // would get legacy-shaped results for nearly every real call.
+    const modernCall = await shim.handle({
+      jsonrpc: "2.0", id: 6, method: "tools/call",
+      params: { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } },
+    });
+    assert.equal(modernCall.result.resultType, "complete", "a modern client's tools/call result must be discriminated");
+
+    // ...and a LEGACY client's bytes are unchanged: it never asked to move.
+    const legacyCall = await shim.handle({ jsonrpc: "2.0", id: 7, method: "tools/call", params: {} });
+    assert.equal(legacyCall.result.resultType, undefined, "a legacy client's result must not gain fields it never asked for");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
