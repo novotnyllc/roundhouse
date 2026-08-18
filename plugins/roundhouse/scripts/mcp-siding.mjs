@@ -46,7 +46,14 @@ export const PROTOCOL_VERSION = "2025-06-18";
 // and a legacy-only client FAILS a modern server — so being dual-era is what
 // keeps the shim working while either side moves. Newest first: a client
 // choosing from this list should land on the newest we both support.
-export const SUPPORTED_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
+// ONLY versions this shim genuinely serves. 2025-11-25 was advertised here and
+// was a lie: the legacy initialize branch never reads the client's requested
+// version and always answers the pinned 2025-06-18, so a client that selected
+// 2025-11-25 from discovery would then fail negotiation. The backend-era work
+// did not change that - initialize still answers PROTOCOL_VERSION - so the
+// honest list stays short. A client cannot tell the difference until it has
+// already committed.
+export const SUPPORTED_PROTOCOL_VERSIONS = ["2026-07-28", "2025-06-18"];
 
 // The newest revision we speak; what the backend-era probe asks for.
 export const MODERN_PROTOCOL_VERSION = "2026-07-28";
@@ -446,11 +453,26 @@ class MalformedResponse extends Error {}
 // Absent means complete: an interim result always states its own resultType
 // (input_required), so anything silent is a finished answer. Never overwrite
 // one the backend did set.
-function withResultType(result, declaredVersion) {
+function withResultType(result, declaredVersion, method) {
   if (declaredVersion === undefined || declaredVersion < "2026-07-28") return result;
   if (result === null || typeof result !== "object" || Array.isArray(result)) return result;
-  if (result.resultType !== undefined) return result;
-  return { ...result, resultType: "complete" };
+  const out = result.resultType === undefined ? { ...result, resultType: "complete" } : { ...result };
+  // A COMPLETE tools/list MUST carry caching hints (2026-07-28,
+  // server/utilities/caching). Without them a strict modern client rejects the
+  // inventory immediately after adopting the version we advertised - the worst
+  // possible moment, since it has already committed. The legacy backend sends
+  // none, so we supply them.
+  //
+  // ttlMs 0 is the honest value, not a placeholder: this shim's list genuinely
+  // changes underneath a client (cached inventory while the app is closed, live
+  // once it opens), so nothing may hold it as fresh. cacheScope private because
+  // a desktop app's tools are that machine's session, and sharing them across
+  // authorization contexts is not ours to authorize.
+  if (out.resultType === "complete" && method === "tools/list") {
+    if (out.ttlMs === undefined) out.ttlMs = 0;
+    if (out.cacheScope === undefined) out.cacheScope = "private";
+  }
+  return out;
 }
 
 export function validateResultShape(method, result) {
@@ -1746,7 +1768,7 @@ export class Shim {
       // resultType marks this a COMPLETE result (2026-07-28) — it is a real
       // answer, just a stale one — while ttlMs:0 stops the client caching our
       // stale copy as fresh. Harmless to a legacy client, which ignores both.
-      return { tools: cached, resultType: "complete", ttlMs: 0 };
+      return { tools: cached, resultType: "complete", ttlMs: 0, cacheScope: "private" };
     }
   }
 
@@ -1959,9 +1981,12 @@ export class Shim {
         cacheScope: "public",
       });
     }
-    if (method === "ping") return ok(id, {});
-    if (method === "tools/list") return ok(id, withResultType(await this.toolsList(params, id), wanted));
-    if (method === "tools/call") return ok(id, withResultType(await this.toolsCall(params, id), wanted));
+    // ping is a liveness check a modern client may reject if it cannot tell a
+    // complete result from an interim one, so it needs the discriminator just
+    // as the tool branches do.
+    if (method === "ping") return ok(id, withResultType({}, wanted, method));
+    if (method === "tools/list") return ok(id, withResultType(await this.toolsList(params, id), wanted, method));
+    if (method === "tools/call") return ok(id, withResultType(await this.toolsCall(params, id), wanted, method));
     try {
       const result = await this.backend(method, params, id);
       return ok(id, result);
