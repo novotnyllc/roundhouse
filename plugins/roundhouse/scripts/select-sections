@@ -80,6 +80,30 @@ scopes_for() {
   esac
 }
 
+# Sections are SOURCED cumulatively, so a few genuinely build on an earlier
+# one's fixtures. Profiling each section in isolation found exactly one such
+# pair — 67 reads snapshot.jsonl and $oversized_setting, both produced by 65 —
+# and the other 29 ran standalone cleanly, which `set -eu` makes a meaningful
+# result rather than a lucky one. Declared here so the matrix can never
+# schedule a dependent section without its producer.
+# The matrix runs ONE JOB PER LINE, so a dependency has to travel inside the
+# entry, not merely appear elsewhere in the list: emitting "65" and "67" as
+# separate lines would still schedule a job that runs 67 alone and fails.
+# ROUNDHOUSE_TEST_ONLY accepts several numbers, so the pair ships as one entry.
+# When 67 is present, 65 rides with it and its standalone entry is dropped so
+# it is not run twice.
+expand_deps() {
+  local out=" $* " result=""
+  local pair_needed=false
+  case $out in *" 67 "*) pair_needed=true ;; esac
+  if [ "$pair_needed" = true ]; then
+    out=$(printf '%s' "$out" | sed 's/ 67 / /; s/ 65 / /')
+  fi
+  for n in $out; do result="$result$n\n"; done
+  [ "$pair_needed" = false ] || result="${result}65 67\n"
+  printf "$result"
+}
+
 want_scopes=false
 [ "${1:-}" != --scopes ] || want_scopes=true
 
@@ -126,5 +150,8 @@ if [ "$want_scopes" = true ]; then
   # is no mandatory preamble scope.
   for n in $scope_selected; do printf '%s\n' "$n"; done | sort -u
 else
-  for n in $ALWAYS $selected; do printf '%s\n' "$n"; done | sort -u
+  # Piped, not $(...) in a for-loop: command substitution word-splits, which
+  # would tear the "65 67" entry back into two independent jobs and reinstate
+  # the exact failure the pairing exists to prevent.
+  expand_deps $ALWAYS $selected | sort -u
 fi
