@@ -1,0 +1,198 @@
+#!/bin/bash
+# Runs the gate AGENTS.md already mandates, before a push rather than after it.
+#
+# Every mechanical defect a reviewer caught on #17 was catchable here and was
+# only caught because a human-facing review round paid for it:
+#   - integrity.json left stale after editing a hashed file
+#   - a `perl` replacement that ate `@appArgs` (Perl array interpolation) so the
+#     documented install command silently lost its --app argument
+#   - `$appPath` tested but never assigned, making the preflight vacuous
+#
+# The first is a direct AGENTS.md requirement. The others are shell/PowerShell
+# snippets embedded in SKILL.md, which are shipped instructions: if a snippet
+# reads a variable it never assigns, the documented procedure is broken for
+# every user who follows it, and nothing else in the suite looks at them.
+#
+# Usage: plugins/roundhouse/scripts/preflight
+# Exit non-zero on any failure. Safe to run repeatedly.
+set -uo pipefail
+
+cd "$(dirname "$0")/../../.." || exit 1
+fail=0
+note() { printf '%s\n' "$*" >&2; }
+
+# --- 0. merge drivers the .gitattributes entries rely on -------------------
+# REPORTS, never configures. Writing .git/config is a repository mutation, and
+# mutations here belong in an explicit sealed setup operation with target
+# resolution and post-change checks - not as a side effect of an audit command
+# somebody ran to check their work. Preflight's job is to tell you the truth
+# about the checkout, so an unconfigured driver is a finding, not a chore to
+# silently perform.
+missing_drivers=()
+[ "$(git config --get merge.ours.driver || true)" = "true" ] ||
+  missing_drivers+=("git config merge.ours.driver true")
+# EXACT value, not merely present. `merge.pluginversion.driver true` satisfies
+# a nonempty test and then resolves every version-only conflict by exiting 0
+# without touching %A — silently keeping the branch's LOWER version, which is
+# the precise regression this driver exists to prevent.
+expected_pluginversion="plugins/roundhouse/scripts/git-merge-plugin-version %O %A %B"
+[ "$(git config --get merge.pluginversion.driver || true)" = "$expected_pluginversion" ] ||
+  missing_drivers+=("git config merge.pluginversion.driver '$expected_pluginversion'")
+if [ ${#missing_drivers[@]} -gt 0 ]; then
+  note "WARN merge drivers not configured; .gitattributes entries are inert and"
+  note "     conflicts will look ordinary. Run:"
+  for cmd in "${missing_drivers[@]}"; do note "       $cmd"; done
+else
+  note "ok   merge drivers configured"
+fi
+
+# --- 1. integrity manifest is regenerated and committed --------------------
+# Capture the generator's OWN exit status first. It can refuse before touching
+# integrity.json at all (e.g. exit 65 when only one plugin manifest is bumped),
+# and a clean `git diff` afterwards would then read as "current" and let the
+# mandated gate fail open on the very inconsistency it exists to catch.
+integrity_out=$(plugins/roundhouse/scripts/update-integrity 2>&1)
+integrity_rc=$?
+if [ "$integrity_rc" -ne 0 ]; then
+  note "FAIL update-integrity exited $integrity_rc"
+  [ -n "$integrity_out" ] && note "$integrity_out"
+  fail=1
+elif ! git diff --quiet HEAD -- plugins/roundhouse/integrity.json; then
+  # Against HEAD, not the index. Worktree-vs-index passes the moment you `git
+  # add` the regenerated file, even though every COMMIT being pushed still
+  # carries the stale manifest — so preflight would green-light a push whose
+  # integrity metadata is wrong. HEAD is the thing being pushed.
+  note "FAIL integrity.json differs from HEAD — regenerate and COMMIT it, not just stage it."
+  fail=1
+else
+  note "ok   integrity.json current"
+fi
+
+# --- 2. shipped snippets reference only variables they assign --------------
+# Deliberately checks the SHIPPED docs, not a copy: a snippet is an instruction
+# a user will paste, so an unassigned variable is a broken procedure, not a nit.
+snippet_check=$(node - <<'NODE'
+const fs = require("fs");
+const path = require("path");
+let bad = 0;
+const files = [];
+const walk = (d) => {
+  for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+    const p = path.join(d, e.name);
+    if (e.isDirectory()) walk(p);
+    else if (e.name === "SKILL.md") files.push(p);
+  }
+};
+if (fs.existsSync("plugins/roundhouse/skills")) walk("plugins/roundhouse/skills");
+
+// Shell builtins and documented caller-supplied values.
+const KNOWN = new Set(["skilldir", "_", "lastexitcode", "psscriptroot", "args", "true", "false", "null", "env"]);
+
+for (const file of files) {
+  const text = fs.readFileSync(file, "utf8");
+  const blocks = [...text.matchAll(/```powershell\n([\s\S]*?)\n```/g)].map((m) => m[1]);
+  // Snippets in one doc are a SEQUENCE the reader pastes in order, so a value
+  // assigned in an earlier block is legitimately in scope later. Accumulate
+  // rather than resetting per block - otherwise every multi-step procedure
+  // reports false failures and the gate gets ignored, which is worse than not
+  // having it.
+  // IN EXECUTION ORDER. Collecting every assignment up front would accept a
+  // variable read in an early snippet and assigned only in a later one - which
+  // is precisely the use-before-assignment defect this exists to catch, since a
+  // reader pasting the documented sequence hits the unset variable. Walk
+  // statements in order and let a name become known only once it is assigned.
+  const assigned = new Set();
+  // Matches BOTH `$name` and PowerShell's braced `${name}`; `${appPath}` is a
+  // perfectly valid reference and was invisible to the old pattern, so an
+  // unassigned braced variable passed the checker entirely. `$env:X` is
+  // excluded - it is supplied by the environment, not the snippet.
+  const VAR = /\$(?!env:)\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g;
+  // Case-insensitive too: the assignment that defines $AppPath must be found
+  // when looking up the normalized name.
+  const ASSIGN = (n) => new RegExp(`\\$\\{?${n}\\}?\\s*=`, "i");
+  for (const block of blocks) {
+    // Fold line continuations into ONE logical line first. PowerShell is still
+    // evaluating the right-hand side of an assignment across the break, so
+    // splitting on physical lines marked $x assigned before the continuation
+    // line read it - accepting exactly the use-before-assignment this gate
+    // exists to catch. Joined, the read sits in the same statement as the
+    // assignment and is correctly reported.
+    //
+    // Note the deliberate absence of literal backticks and apostrophes in this
+    // whole node program: it sits inside a $( ) command substitution, and bash
+    // 3.2 on macOS still counts quotes and backticks there even inside a quoted
+    // heredoc. One unpaired character makes the file an unterminated
+    // substitution that bash -n rejects - invisible on a bash 5 dev machine,
+    // and a hard failure on macOS CI. \x60 is the continuation marker.
+    const logical = block.replace(/\x60[ \t]*\r?\n/g, " ");
+    for (const raw of logical.split("\n")) {
+      const line = raw.replace(/#.*$/, "");
+      // Per STATEMENT, not per line: `$x = 1; Write-Output $x` is valid, and
+      // recording assignments only after the whole line made the second read
+      // look like a use-before-assignment. Splitting on `;` advances the state
+      // at the boundary where PowerShell actually would.
+      for (const stmt of line.split(";")) {
+        const defined = [];
+        for (const m of stmt.matchAll(VAR)) {
+          // PowerShell variable names are CASE-INSENSITIVE: `$AppPath = ...`
+          // followed by `Test-Path $appPath` is one variable, and a
+          // case-sensitive Set reported the second as a use-before-assignment
+          // and failed a perfectly valid shipped snippet.
+          const name = m[1].toLowerCase();
+          if (KNOWN.has(name)) continue;
+          const at = stmt.search(ASSIGN(name));
+          // The occurrence AT the assignment is the definition; anything else
+          // - including this statement's own right-hand side - is a read.
+          if (at !== -1 && m.index === at) { defined.push(name); continue; }
+          if (assigned.has(name)) continue;
+          console.error(`FAIL ${file}: PowerShell snippet reads $${m[1]} before anything assigns it`);
+          bad = 1;
+        }
+        for (const name of defined) assigned.add(name);
+      }
+    }
+  }
+}
+process.exit(bad);
+NODE
+) || fail=1
+[ -n "$snippet_check" ] && note "$snippet_check"
+[ "$fail" -eq 0 ] && note "ok   shipped snippets assign what they read"
+
+# --- 3. the mandated fixture suite -----------------------------------------
+# AGENTS.md names test-roundhouse, and it must PRINT "PASS" — substituting the
+# narrower shim selftest here would let a failure in any other fixture through
+# while this still reported PASSED, which is worse than having no gate because
+# it reads as coverage. PREFLIGHT_FAST=1 runs only the shim selftest for a tight
+# inner loop; it is deliberately NOT the default.
+if [ "${PREFLIGHT_FAST:-0}" = "1" ]; then
+  if node plugins/roundhouse/scripts/mcp-siding.selftest.mjs >/dev/null 2>&1; then
+    note "ok   mcp-siding selftest (PREFLIGHT_FAST — full suite SKIPPED)"
+  else
+    note "FAIL mcp-siding selftest"
+    fail=1
+  fi
+else
+  # Unset the scope selectors. test-roundhouse honours ROUNDHOUSE_TEST_SCOPE /
+  # _ONLY / _TIER and will exit early with a scoped PASS, which this gate would
+  # then accept as a full run - a release gate that reports PASSED for a partial
+  # suite is worse than no gate, because it reads as coverage.
+  suite_out=$(env -u ROUNDHOUSE_TEST_SCOPE -u ROUNDHOUSE_TEST_ONLY -u ROUNDHOUSE_TEST_TIER \
+    plugins/roundhouse/scripts/test-roundhouse 2>&1)
+  suite_rc=$?
+  if [ "$suite_rc" -eq 0 ] && printf '%s' "$suite_out" | grep -q '^PASS'; then
+    note "ok   test-roundhouse"
+  else
+    note "FAIL test-roundhouse (exit $suite_rc)"
+    printf '%s\n' "$suite_out" | tail -15 >&2
+    fail=1
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  note ""
+  note "preflight FAILED — fix the above before pushing."
+  exit 1
+fi
+note ""
+note "preflight PASSED"

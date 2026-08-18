@@ -39,6 +39,8 @@ jobs:
           bash -n plugins/roundhouse/scripts/enroll-ssh-posix
           bash -n plugins/roundhouse/scripts/launcher-install
           bash -n plugins/roundhouse/scripts/prepare-ssh-identity
+          bash -n plugins/roundhouse/scripts/git-merge-plugin-version
+          bash -n plugins/roundhouse/scripts/preflight
           bash -n plugins/roundhouse/scripts/privilege-broker-posix
           bash -n plugins/roundhouse/scripts/test-roundhouse
           bash -n plugins/roundhouse/scripts/update-integrity

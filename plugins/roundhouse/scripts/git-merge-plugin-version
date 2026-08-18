@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# git merge driver for plugin manifests. Invoked as: %O %A %B
+#
+# Plugin versions only ever increment, so a version-only conflict has one
+# correct answer — the higher version — and resolving it by hand on every
+# stacked merge is pure churn. `merge=ours` is NOT good enough here: it keeps
+# the CURRENT branch's version even when main has moved ahead, which silently
+# regresses the release number.
+#
+# Deliberately narrow. It resolves ONLY when the two sides are identical apart
+# from the version field: anything else is a real content conflict and is left
+# for a human, exit 1 and all. A driver that "helpfully" resolved a description
+# or role-list conflict by picking a side would hide a decision.
+set -uo pipefail
+# %O (the ancestor) is deliberately unbound: the max-version rule needs only the
+# two sides. Naming it would be an unused variable, and shellcheck is right to
+# say so.
+ours=$2 theirs=$3
+
+command -v jq >/dev/null 2>&1 || exit 1
+
+va=$(jq -r '.version // empty' "$ours" 2>/dev/null) || exit 1
+vb=$(jq -r '.version // empty' "$theirs" 2>/dev/null) || exit 1
+[ -n "$va" ] && [ -n "$vb" ] || exit 1
+
+# The repository's established comparator, not `sort -V`. sort's -V is a GNU
+# extension absent from BSD/macOS sort, where the pipeline would fail and the
+# fail-closed check would then refuse every conflict — safe, but the feature
+# would simply never work on the primary development platform. This is the same
+# awk comparison RESOLVER_SH uses in mcp-siding.mjs, for the same reason.
+version_gt() {
+  awk -F. -v left="$1" -v right="$2" '
+    function part(version, part_index, pieces) {
+      return split(version, pieces, /[.]/) >= part_index ? pieces[part_index] + 0 : 0
+    }
+    BEGIN {
+      for (part_index = 1; part_index <= 4; part_index++) {
+        l = part(left, part_index)
+        r = part(right, part_index)
+        if (l > r) exit 0
+        if (l < r) exit 1
+      }
+      exit 1
+    }
+  '
+}
+
+# Both must look like versions before they are compared; anything else is not a
+# version-only conflict and belongs to a human.
+case $va in ""|*[!0-9.]*) exit 1 ;; esac
+case $vb in ""|*[!0-9.]*) exit 1 ;; esac
+
+if version_gt "$va" "$vb"; then winner=$va; else winner=$vb; fi
+
+# Are the sides otherwise identical? Normalize BOTH to the winning version and
+# compare the whole document. If anything else differs, this is not a version
+# conflict and must not be auto-resolved.
+norm_a=$(jq -S --arg v "$winner" '.version = $v' "$ours" 2>/dev/null) || exit 1
+norm_b=$(jq -S --arg v "$winner" '.version = $v' "$theirs" 2>/dev/null) || exit 1
+[ "$norm_a" = "$norm_b" ] || exit 1
+
+# Write the merged result to %A, preserving our formatting with only the
+# version changed.
+tmp=$(mktemp) || exit 1
+jq --arg v "$winner" '.version = $v' "$ours" > "$tmp" 2>/dev/null || { rm -f "$tmp"; exit 1; }
+mv -- "$tmp" "$ours" || exit 1
+exit 0

@@ -81,6 +81,10 @@
       "sha256": "d7f07d713340a1481fffc615b6518e847fc9ddbc525f766aae5fa9016597da31"
     },
     {
+      "path": "scripts/git-merge-plugin-version",
+      "sha256": "3cc1954ce2a3d687cdc9fa88ed51e992bcb7ba9990a433ac4f7a8edb6fd43ba1"
+    },
+    {
       "path": "scripts/homebrew-bridge.rb",
       "sha256": "31e4b44ebac0673c45569440345f55eab598b4406be13244ff4bda8c06abaf65"
     },
@@ -179,6 +183,10 @@
     {
       "path": "scripts/mcp-siding.selftest.mjs",
       "sha256": "6015cb39332b0055109def775089de0436e84d45d9e8cd00f1911d9799fec5a0"
+    },
+    {
+      "path": "scripts/preflight",
+      "sha256": "ece027b78daf3fd1cb7bfe83ba82cbf1d80861fcac87dfdeda5342727370237c"
     },
     {
       "path": "scripts/prepare-ssh-identity",
