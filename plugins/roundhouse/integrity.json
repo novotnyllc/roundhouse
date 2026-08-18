@@ -182,7 +182,7 @@
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
-      "sha256": "23a3e1f1a57ee4e88562aacb12466d015f1bb1f189ee0561aacd3fda7ae6ee04"
+      "sha256": "46ef0b8ef127a29613b964bf79fed4b7c1d1035bdd22997d96b6236c5fce2f68"
     },
     {
       "path": "scripts/preflight",
