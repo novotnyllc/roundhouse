@@ -925,7 +925,12 @@ oversized_setting=$(awk 'BEGIN { for (i = 0; i < 8193; i++) printf "x" }')
 
 # The collected snapshot 65 asserts over and 67/68 read. Guarded, because it
 # is the one costly fixture here and most sections never touch it.
-if want_section 65 || want_section 67 || want_section 68; then
+# A SCOPE run (u2-contracts and friends) exits from its own block long before
+# these sections would be reached, and want_section answers true for everything
+# when ROUNDHOUSE_TEST_ONLY is unset - so without the scope check every scoped
+# job paid ~9s building two snapshots nothing would read.
+if [ -z "${ROUNDHOUSE_TEST_SCOPE:-}" ] &&
+  { want_section 65 || want_section 67 || want_section 68; }; then
   "$cli" collect --target test-host --section all --output "$tmp/snapshot.jsonl"
   # A second capture a second later: identical inventory, different timestamps
   # and run IDs. 65 compares the pair to prove that difference is not reported
