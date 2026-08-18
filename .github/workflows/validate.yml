@@ -16,7 +16,13 @@ jobs:
       - name: Lint GitHub Actions workflows
         uses: docker://rhysd/actionlint@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 # v1.7.7
 
+  # The full serial suite still runs — on pushes to main, as the backstop that
+  # catches anything the change-scoped selection got wrong. PRs run the selected
+  # sections in parallel instead (see `select` / `sections` below). Keeping this
+  # on main means a mis-scoped rule costs one late red build rather than silent
+  # loss of coverage.
   posix:
+    if: github.event_name != 'pull_request'
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -160,6 +166,86 @@ jobs:
           set -eu
           plugins/roundhouse/scripts/${{ matrix.helper }} self-test
 
+  # Which test sections does THIS change actually require? Measured motivation:
+  # the preamble (00/05/07) is ~3s and most sections are single-digit seconds,
+  # while the serial suite was 16.8 min on macOS — so the cost is a few heavy
+  # sections that most changes do not touch.
+  #
+  # select-sections is fail-safe: an unmapped path, or no input at all, selects
+  # everything. Adding a rule makes CI faster; forgetting one only makes it
+  # slower, never blinder.
+  select:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      sections: ${{ steps.pick.outputs.sections }}
+      all: ${{ steps.pick.outputs.all }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          base='${{ github.event.pull_request.base.sha }}'
+          head='${{ github.event.pull_request.head.sha }}'
+          changed=$(git diff --name-only "$base" "$head")
+          printf 'changed paths:\n%s\n' "$changed"
+          picked=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections)
+          printf 'selected: %s\n' "$(printf '%s' "$picked" | tr '\n' ' ')"
+          if [ "$picked" = all ]; then
+            echo 'all=true' >> "$GITHUB_OUTPUT"
+            echo 'sections=[]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'all=false' >> "$GITHUB_OUTPUT"
+            json=$(printf '%s\n' "$picked" | grep -v '^$' | sort -u |
+              awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+            echo "sections=$json" >> "$GITHUB_OUTPUT"
+          fi
+
+  # One job per selected section. Wall time becomes the preamble plus the single
+  # slowest SELECTED section, rather than the sum of everything.
+  sections:
+    needs: select
+    if: github.event_name == 'pull_request' && needs.select.outputs.all == 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        section: ${{ fromJSON(needs.select.outputs.sections) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install OpenSSH server for scope validation
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+      - name: Section ${{ matrix.section }}
+        shell: bash
+        env:
+          ROUNDHOUSE_TEST_ONLY: ${{ matrix.section }}
+        run: plugins/roundhouse/scripts/test-roundhouse
+
+  # When selection says "everything", run the serial suite rather than a matrix
+  # of every section: the sections are sourced cumulatively, so a full matrix
+  # would repeat the shared preamble 30 times for no gain.
+  sections-all:
+    needs: select
+    if: github.event_name == 'pull_request' && needs.select.outputs.all == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install OpenSSH server for scope validation
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+      - name: Run full fixture suite
+        shell: bash
+        run: plugins/roundhouse/scripts/test-roundhouse
+
   scope-matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -275,20 +361,68 @@ jobs:
   # into one context. Require `ci-ok` in protection instead of the volatile
   # per-cell contexts — adding or renaming a scope never desyncs the rule.
   ci-ok:
-    # helpers included deliberately: splitting them out of posix would have
-    # silently removed them from the required set otherwise, turning a speedup
-    # into a coverage loss.
-    needs: [actionlint, posix, helpers, scope-matrix, scoped, windows]
+    needs: [actionlint, posix, helpers, select, sections, sections-all, scope-matrix, scoped, windows]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs succeeded
         shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTIONLINT: ${{ needs.actionlint.result }}
+          POSIX: ${{ needs.posix.result }}
+          HELPERS: ${{ needs.helpers.result }}
+          SELECT: ${{ needs.select.result }}
+          SECTIONS: ${{ needs.sections.result }}
+          SECTIONS_ALL: ${{ needs.sections-all.result }}
+          SCOPE_MATRIX: ${{ needs.scope-matrix.result }}
+          SCOPED: ${{ needs.scoped.result }}
+          WINDOWS: ${{ needs.windows.result }}
         run: |
-          set -eu
-          results='${{ join(needs.*.result, ',') }}'
-          printf 'needed results: %s\n' "$results"
-          case ",$results," in
-            *,failure,*|*,cancelled,*|*,skipped,*)
-              printf 'a required job did not succeed\n' >&2; exit 1 ;;
-          esac
+          set -euo pipefail
+          fail=0
+          note() { printf '%s\n' "$*" >&2; }
+
+          # Checked per job, not as one joined blob. Three jobs are now
+          # deliberately conditional, and the old `case` treated ANY `skipped`
+          # as failure — so loosening it wholesale would have let a pull request
+          # pass with no fixture suite run at all. Each job states which
+          # outcomes are legitimate for it, and anything else is a failure.
+          must_succeed() {
+            local name=$1 result=$2
+            [ "$result" = success ] && return 0
+            note "FAIL $name: $result"
+            fail=1
+          }
+          must_succeed actionlint "$ACTIONLINT"
+          must_succeed helpers "$HELPERS"
+          must_succeed scope-matrix "$SCOPE_MATRIX"
+          must_succeed scoped "$SCOPED"
+          must_succeed windows "$WINDOWS"
+
+          if [ "$EVENT" = pull_request ]; then
+            # posix is the main-branch backstop and is expected to be skipped.
+            [ "$POSIX" = skipped ] || must_succeed posix "$POSIX"
+            must_succeed select "$SELECT"
+            # EXACTLY ONE of the two fixture paths must have run and passed.
+            # Both skipped means the suite silently did not run, which is the
+            # failure this whole change could most plausibly introduce.
+            case "$SECTIONS/$SECTIONS_ALL" in
+              success/skipped|skipped/success) : ;;
+              *)
+                note "FAIL fixture suite: sections=$SECTIONS sections-all=$SECTIONS_ALL"
+                note "     exactly one of them must run and succeed"
+                fail=1 ;;
+            esac
+          else
+            # On a push the serial suite is the gate; the PR-only jobs are
+            # expected to be skipped.
+            must_succeed posix "$POSIX"
+            for pair in "select/$SELECT" "sections/$SECTIONS" "sections-all/$SECTIONS_ALL"; do
+              name=${pair%%/*}; result=${pair#*/}
+              [ "$result" = skipped ] || must_succeed "$name" "$result"
+            done
+          fi
+
+          [ "$fail" -eq 0 ] || { note "a required job did not succeed"; exit 1; }
+          printf 'all required jobs succeeded (%s)\n' "$EVENT"

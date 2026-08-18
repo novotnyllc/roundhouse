@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Which test sections must run for a given set of changed paths?
+#
+# Reads changed paths on stdin (one per line), prints the section numbers to
+# run, one per line, or the single token `all`.
+#
+# Unmapped paths are split by whether they are even INPUTS to the suite:
+#
+#   * inside the tested surface (the roundhouse plugin's scripts, skills and
+#     manifests) -> run EVERYTHING. A new file there plausibly changes what the
+#     suite validates, and guessing its blast radius is how a gate quietly
+#     stops gating.
+#   * anywhere else -> run nothing extra. Adding an unrelated file, a new
+#     top-level directory, another plugin, or a note cannot affect a suite that
+#     does not read them, and forcing a full run for those is pure tax.
+#
+# The asymmetry is deliberate: forgetting a rule for a real input costs time,
+# never coverage, while treating every unknown path as harmless would trade
+# coverage for speed silently.
+set -uo pipefail
+
+# Section numbers that are ALWAYS run: the shared preamble every other section
+# is sourced on top of, so nothing can be validated without them. Measured at
+# roughly three seconds, which is why this is cheap to keep unconditional.
+ALWAYS="00 05 07"
+
+# path prefix -> sections. First match wins, longest prefixes first.
+# Anything touching the harness, the shared libs, the CLI, or CI config is
+# deliberately `all`: those are inputs to every section, so a targeted subset
+# would be guessing about blast radius.
+rules() {
+  cat <<'MAP'
+plugins/roundhouse/scripts/tests/	all
+plugins/roundhouse/scripts/test-roundhouse	all
+plugins/roundhouse/scripts/lib/	all
+plugins/roundhouse/scripts/roundhouse	all
+plugins/roundhouse/scripts/select-sections	all
+plugins/roundhouse/integrity.json	all
+.github/	all
+AGENTS.md	all
+plugins/roundhouse/scripts/mcp-siding.mjs	76
+plugins/roundhouse/scripts/mcp-siding.selftest.mjs	76
+plugins/roundhouse/scripts/mcp-siding-windows.ps1	76 67
+plugins/roundhouse/skills/mcp-shim/	76
+plugins/roundhouse/scripts/collect-posix	10 12 14
+plugins/roundhouse/scripts/enroll-ssh-posix	12 14
+plugins/roundhouse/scripts/prepare-ssh-identity	12 14
+plugins/roundhouse/scripts/certify-ssh-node	12 14
+plugins/roundhouse/scripts/enroll-privilege-posix	50
+plugins/roundhouse/scripts/privilege-broker-posix	50
+plugins/roundhouse/scripts/launcher-install	40
+plugins/roundhouse/scripts/update-integrity	00
+plugins/roundhouse/scripts/preflight	00
+plugins/roundhouse/scripts/git-merge-plugin-version	00
+docs/	none
+README.md	none
+UPSTREAM.md	none
+MAP
+}
+
+selected=""
+saw_any=false
+while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  saw_any=true
+  match=""
+  while IFS=$'\t' read -r prefix sections; do
+    [ -n "$prefix" ] || continue
+    case $path in
+      "$prefix"*) match=$sections; break ;;
+    esac
+  done < <(rules)
+
+  if [ -z "$match" ]; then
+    case $path in
+      # Unmapped but INSIDE the tested surface: cannot reason about it, so run
+      # everything rather than guess.
+      plugins/roundhouse/scripts/*|plugins/roundhouse/skills/*|\
+      plugins/roundhouse/.claude-plugin/*|plugins/roundhouse/.codex-plugin/*)
+        printf 'all\n'
+        exit 0 ;;
+      # Outside it: not an input to this suite. Nothing to run.
+      *) continue ;;
+    esac
+  fi
+  [ "$match" = none ] && continue
+  [ "$match" = all ] && { printf 'all\n'; exit 0; }
+  selected="$selected $match"
+done
+
+# No input at all is not "nothing changed" — it is "I was told nothing", which
+# is the same unknown as an unmapped path.
+[ "$saw_any" = true ] || { printf 'all\n'; exit 0; }
+
+for n in $ALWAYS $selected; do printf '%s\n' "$n"; done | sort -u
