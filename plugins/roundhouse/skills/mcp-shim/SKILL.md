@@ -52,7 +52,8 @@ asked.
 
 **Never register a literal path to `mcp-siding.mjs` — plugin tree or
 anywhere else — and never copy the script.** Every registration instead
-embeds `mcp-siding.mjs --print-shim-script`'s output: a small POSIX
+points at the installed launcher (`mcp-siding.mjs --print-launcher`'s
+output, written to `~/.local/bin/mcp-siding`): a small POSIX
 `/bin/sh` resolver that finds the script fresh at every server start
 (see the `RESOLVER_SH` comment in the script for exactly how and why —
 `--print-resolver` prints just that part), followed by a second resolver
@@ -80,7 +81,7 @@ route below; native Windows (PowerShell or cmd.exe, no POSIX layer) takes
 resolve the script at spawn time; they differ only in the shell the
 registration is written in.
 
-The POSIX route's registrations bake in `/bin/sh -c "$SCRIPT"` and its
+The POSIX route's registrations name `~/.local/bin/mcp-siding` and its
 install snippet is POSIX shell, so running it on native Windows would be
 accepted by the harness CLI and then leave a server that can never spawn.
 Guard before that mutation happens, not after:
@@ -162,26 +163,45 @@ for node_candidate in "$MCP_SIDING_NODE" "$(command -v node 2>/dev/null)" \
 done
 [ -n "$node_bin" ] || { echo "mcp-siding: no node with global fetch/ReadableStream (this shim needs Node 18+) found on this host - cannot build the registration script. Install a newer Node or set \$MCP_SIDING_NODE." >&2; exit 1; }
 
-SCRIPT=$("$node_bin" "$SKILL_DIR/../../scripts/mcp-siding.mjs" --print-shim-script \
-  --backend-url <URL> --name <NAME> --app "<APP_PATH>")
+# Install the launcher once per host. It is backend-agnostic: it resolves the
+# newest installed mcp-siding.mjs and a usable node at RUN time and forwards
+# "$@", so one file serves every backend and stays correct across plugin
+# updates. Re-running it is safe and is how you pick up resolver changes.
+# Absolute paths and ${LAUNCHER%/*} rather than dirname: this snippet runs
+# under a sanitized PATH, so it may only rely on shell builtins and binaries
+# named in full.
+LAUNCHER=$HOME/.local/bin/mcp-siding
+/bin/mkdir -p "${LAUNCHER%/*}"
+"$node_bin" "$SKILL_DIR/../../scripts/mcp-siding.mjs" --print-launcher >"$LAUNCHER.tmp"
+/bin/chmod 755 "$LAUNCHER.tmp"
+/bin/sh -n "$LAUNCHER.tmp" || { echo "mcp-siding: emitted launcher is not valid sh" >&2; exit 1; }
+/bin/mv -f "$LAUNCHER.tmp" "$LAUNCHER"
 ```
 <!-- mcp-siding-selftest: node-resolver-install-snippet:end -->
 
-Omit `--app` for a backend with no launchable app. `--print-shim-script`
-only emits flags you pass it explicitly — `mcp-siding.mjs`'s own defaults
-handle the rest at runtime. Using the same `$node_bin` to generate the
-script and `NODE_RESOLVER_SH` to run it means install and runtime agree
-on what counts as a usable runtime — never install successfully with one
-node and then spawn under a different one.
+The launcher carries no backend flags — those live in the registration's
+own argument list, so `~/.local/bin/mcp-siding` is shared by every backend
+you register. Omit `--app` for a backend with no launchable app.
+
+**The harness config holds a command and arguments, never a shell script.**
+That is not cosmetic. A config cannot name a versioned plugin path without
+breaking on the next update, which is why the resolver used to be inlined
+into the registration as ~90 lines of `sh -c`. Installing it as a file keeps
+the version independence and takes the shell out of the config — the same
+trade `roundhouse launcher-install` makes for the CLI. It also removes a
+failure class rather than guarding against it: with no TOML multiline
+literal there is no closing delimiter for a quoted final argument to
+collide with, which is what broke Bun's TOML parser and, through it,
+`ocx doctor`.
 
 Then, per harness — state the exact command before running it, and always
-verify afterward. `"$SCRIPT"` must be passed as captured, as a single
-argument: do not re-quote, re-escape, or reconstruct it by hand.
+verify afterward. Pass the backend flags as separate arguments after the
+launcher path; do not wrap them in a shell or re-quote them by hand.
 
 | Harness | Add | Verify | Remove |
 | --- | --- | --- | --- |
-| Claude Code | `claude mcp add <NAME> -s user -- /bin/sh -c "$SCRIPT"` | `claude mcp get <NAME>` — must report `Connected`; anything else is a failed mutation (diagnose below) | `claude mcp remove <NAME> -s user` |
-| Codex | `codex mcp add <NAME> -- /bin/sh -c "$SCRIPT"` | `codex mcp get <NAME>` to confirm the registration, THEN the probe below — `codex mcp get` alone is not a connectivity check | `codex mcp remove <NAME>` |
+| Claude Code | `claude mcp add <NAME> -s user -- "$LAUNCHER" --backend-url <URL> --name <NAME> --app "<APP_PATH>"` | `claude mcp get <NAME>` — must report `Connected`; anything else is a failed mutation (diagnose below) | `claude mcp remove <NAME> -s user` |
+| Codex | `codex mcp add <NAME> -- "$LAUNCHER" --backend-url <URL> --name <NAME> --app "<APP_PATH>"` | `codex mcp get <NAME>` to confirm the registration, THEN the probe below — `codex mcp get` alone is not a connectivity check | `codex mcp remove <NAME>` |
 
 **The two harnesses need genuinely different post-checks — this is not a
 stylistic choice, and making them uniform is what broke this once
@@ -211,7 +231,8 @@ test, so add a real probe alongside it — run the registered command
 directly and send it an `initialize` request:
 
 ```bash
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | /bin/sh -c "$SCRIPT"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' |
+  "$LAUNCHER" --backend-url <URL> --name <NAME> --app "<APP_PATH>"
 ```
 
 (carry over any `--env` values the registration used — e.g.
@@ -243,7 +264,7 @@ on Codex — is a failed mutation, not an acceptable outcome. Diagnose
 before leaving it in place: confirm `roundhouse` is actually installed
 and its plugin cache contains `scripts/mcp-siding.mjs`, and that a Node
 18+ with global `fetch`/`ReadableStream` resolves (PATH, Homebrew,
-Volta, asdf, or `$MCP_SIDING_NODE`) — running `/bin/sh -c "$SCRIPT"`
+Volta, asdf, or `$MCP_SIDING_NODE`) — running `"$LAUNCHER"`
 directly surfaces the resolvers' own stderr naming exactly what was
 checked (see "Resolver finds nothing" under Known holes below). If the
 cause cannot be fixed immediately, remove the registration
@@ -386,13 +407,13 @@ Two Windows-specific notes worth carrying:
 To register and exercise an unpublished working-tree build instead of a
 published plugin version, pin it explicitly with `MCP_SIDING_PATH` — the
 resolver's first branch, checked before `$CLAUDE_PLUGIN_ROOT` and everything
-below it. Build `$SCRIPT` the same way as a normal install (above), suffix
+below it. Install the launcher the same way as a normal install (above), suffix
 the name (e.g. `fusion-dev`) so a local build never silently clobbers a
 working published registration, and add the env var to the registration:
 
 ```bash
-claude mcp add fusion-dev -s user -e MCP_SIDING_PATH=/absolute/path/to/checkout/scripts/mcp-siding.mjs -- /bin/sh -c "$SCRIPT"
-codex mcp add fusion-dev --env MCP_SIDING_PATH=/absolute/path/to/checkout/scripts/mcp-siding.mjs -- /bin/sh -c "$SCRIPT"
+claude mcp add fusion-dev -s user -e MCP_SIDING_PATH=/absolute/path/to/checkout/scripts/mcp-siding.mjs -- "$LAUNCHER" --backend-url <URL> --name fusion-dev
+codex mcp add fusion-dev --env MCP_SIDING_PATH=/absolute/path/to/checkout/scripts/mcp-siding.mjs -- "$LAUNCHER" --backend-url <URL> --name fusion-dev
 ```
 
 This pins one exact path and will not follow plugin updates — the opposite
@@ -482,8 +503,8 @@ remove-then-re-add sequence is what keeps this safe there, not the tool.
   this machine, or was removed after this server was registered. The
   registered command exits immediately with a message on stderr naming
   every path it checked. That subprocess-level failure is identical on
-  both harnesses, since both spawn the literal identical `/bin/sh -c
-  "$SCRIPT"` command — but the two harnesses do not surface it
+  both harnesses, since both spawn the identical launcher command — but
+  the two harnesses do not surface it
   identically, and this skill's own post-checks do not treat it
   identically either (see Install a server above): `claude mcp get`
   reports `Failed to connect` directly, a genuine probe; `codex mcp get`

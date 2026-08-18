@@ -1617,6 +1617,7 @@ export async function selftest() {
   //          happily, so `mcp add` would register something that could
   //          never start. Real subprocess, real flags, same diagnostic. --
   await selftestPrintShimScriptValidatesLikeBuildShimFromArgs();
+  await selftestShimScriptNeverEndsOnAQuote();
 
   // -- 7j4c. N44: an unrecognized flag must be rejected on BOTH paths -
   //          a real launch (before the stdio server ever opens) and
@@ -4059,12 +4060,16 @@ async function selftestInstallNodeResolverSnippet() {
     await mkdir(asdfShimDir, { recursive: true });
     const asdfNodePath = join(asdfShimDir, "node");
     await stageNodeWrapper(asdfNodePath);
-    const withFallback = spawnSync("/bin/sh", ["-c", `${snippet}\nprintf '%s' "$SCRIPT"`], {
+    // The snippet now INSTALLS a launcher rather than capturing a script into
+    // $SCRIPT, so the contract it must satisfy is "a runnable launcher exists
+    // at $LAUNCHER" - print the installed file, not a variable.
+    const withFallback = spawnSync("/bin/sh", ["-c", `${snippet}\n/bin/cat "$LAUNCHER"`], {
       env: { ...baseEnv, HOME: fakeHome },
       encoding: "utf8",
     });
     assert.equal(withFallback.status, 0, `install snippet failed with a usable fallback node (stderr: ${withFallback.stderr})`);
-    assert.match(withFallback.stdout, /exec "\$node_bin"/, "the documented install command must still produce a valid registration script");
+    assert.match(withFallback.stdout, /exec "\$node_bin" "\$p" "\$@"/, "the documented install command must install a launcher that forwards its arguments");
+    assert.match(withFallback.stdout, /^#!\/bin\/sh/, "the installed launcher must carry a POSIX sh shebang");
   } finally {
     await rm(fakeHome, { recursive: true, force: true });
   }
@@ -4076,12 +4081,12 @@ async function selftestInstallNodeResolverSnippet() {
 
   // set to a usable node -> wins, unchanged (PATH broken, so this proves
   // the override itself resolves, not a PATH fallback).
-  const usableOverride = spawnSync("/bin/sh", ["-c", `${snippet}\nprintf '%s' "$SCRIPT"`], {
+  const usableOverride = spawnSync("/bin/sh", ["-c", `${snippet}\n/bin/cat "$LAUNCHER"`], {
     env: { ...baseEnv, MCP_SIDING_NODE: realNode },
     encoding: "utf8",
   });
   assert.equal(usableOverride.status, 0, `install snippet failed with a usable $MCP_SIDING_NODE override (stderr: ${usableOverride.stderr})`);
-  assert.match(usableOverride.stdout, /exec "\$node_bin"/, "a usable $MCP_SIDING_NODE override must still produce a valid registration script");
+  assert.match(usableOverride.stdout, /exec "\$node_bin" "\$p" "\$@"/, "a usable $MCP_SIDING_NODE override must still install a working launcher");
 
   // set to a nonexistent path while a perfectly good node exists on PATH -
   // must fail closed, not fall through to that usable alternative (the
@@ -4133,7 +4138,7 @@ async function selftestInstallNodeResolverSnippet() {
     await mkdir(rewrittenDir, { recursive: true });
     await stageNodeWrapper(join(rewrittenDir, "opt-homebrew-node"));
     const rewrittenSnippet = rewriteHardcodedNodeFallbacks(snippet, rewrittenDir);
-    const positiveControl = spawnSync("/bin/sh", ["-c", `${rewrittenSnippet}\nprintf '%s' "$SCRIPT"`], {
+    const positiveControl = spawnSync("/bin/sh", ["-c", `${rewrittenSnippet}\n/bin/cat "$LAUNCHER"`], {
       env: { ...baseEnv, HOME: fallbackRewriteHome },
       encoding: "utf8",
     });
@@ -4311,7 +4316,12 @@ async function selftestWindowsRegistration() {
   // the other would be a silently different server on one platform.
   const sameFlags = { "backend-url": "http://127.0.0.1:3845/mcp", name: "figma", app: "/Applications/Figma.app", launch: false };
   const flagNames = (line) => [...line.matchAll(/'(--[a-z-]+)'/g)].map((match) => match[1]);
-  const posixFlags = flagNames(buildShimScript(sameFlags).trim().split("\n").at(-1));
+  // By content, not by position: the POSIX script ends with a sentinel line
+  // (see buildShimScript) so the TOML delimiter never lands on a shell quote,
+  // and .at(-1) would silently start reading that comment instead of the exec.
+  const execLine = buildShimScript(sameFlags).split("\n").find((line) => line.startsWith("exec "));
+  assert.ok(execLine, "the POSIX registration must contain an exec line");
+  const posixFlags = flagNames(execLine);
   assert.deepEqual(posixFlags, ["--backend-url", "--name", "--app", "--no-launch"], "the POSIX registration's flag set is the reference");
   assert.deepEqual(
     flagNames(buildShimScriptPowerShell(sameFlags, region).trim().split("\n").at(-1)),
@@ -5302,6 +5312,96 @@ async function selftestMalformedDiscoveryStaysUndecided() {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+// N45: a generated script must never leave a TOML multiline-literal delimiter
+// adjacent to a shell quote. Codex writes buildShimScript()'s output into
+// config.toml as a multiline literal, and the exec line's last argument is a
+// quoted path - so a delimiter placed straight after it yields four
+// apostrophes. Python tomllib accepts that; Bun's TOML parser rejects it, and
+// the failure surfaces far away (ocx doctor blaming a nonexistent sqlite_home).
+// A trailing newline alone does NOT fix it: the documented install idiom
+// captures through $(...), which strips every trailing newline before Codex
+// sees the text. Hence a non-quote final LINE, which survives any capture.
+async function selftestShimScriptNeverEndsOnAQuote() {
+  const SQ = "'";
+  const DELIM = SQ.repeat(3);
+  const QUAD = SQ.repeat(4);
+
+  // The exact reported shape: final shell token single-quoted, path with spaces.
+  const script = buildShimScript({
+    "backend-url": "http://127.0.0.1:27182/mcp",
+    name: "fusion",
+    app: "/Users/example/Applications/Autodesk Fusion.app",
+  });
+
+  assert.equal(script.endsWith("\n"), true, "generated shim script must still end with a newline");
+  assert.ok(
+    script.split("\n").some((line) => line.startsWith("exec ")),
+    "generated shim script must still contain its exec line",
+  );
+
+  // Both capture idioms must be safe: the lossy one because a human or a
+  // third-party script may still use it, the preserving one because it is what
+  // the skill documents.
+  const lossy = script.replace(/\n+$/, "");
+  assert.equal(lossy.endsWith(SQ), false, "captured shim script must not end on a shell quote");
+
+  for (const [label, captured] of [["lossy", lossy], ["preserving", script]]) {
+    const toml = `[mcp_servers.fusion]\ncommand = "/bin/sh"\nargs = ["-c", ${DELIM}\n${captured}${DELIM}]\n`;
+    assert.equal(toml.includes(QUAD), false, `${label} capture must not emit four apostrophes`);
+
+    const dir = await mkdtemp(join(tmpdir(), "siding-toml-"));
+    try {
+      const file = join(dir, "config.toml");
+      await writeFile(file, toml);
+
+      // Parse with every TOML parser present on the host. Bun is named
+      // explicitly because it is the parser that exposed the incompatibility.
+      const parsers = [
+        ["python3", ["-c", "import tomllib,sys;sys.stdout.write(tomllib.load(open(sys.argv[1],'rb'))['mcp_servers']['fusion']['args'][1])", file], ["-c", "import tomllib"]],
+        ["bun", ["-e", `process.stdout.write(Bun.TOML.parse(require("fs").readFileSync(${JSON.stringify(file)},"utf8")).mcp_servers.fusion.args[1])`], ["-e", "Bun.TOML.parse('a=1')"]],
+      ];
+      // Probe the CAPABILITY, not the binary. The suite sanitizes PATH, so the
+      // python3 on it can predate tomllib (3.11) - checking `--version` would
+      // pass and then the import fails inside the real call.
+      let parsed = 0;
+      for (const [bin, args, probe] of parsers) {
+        if (spawnSync(bin, probe, { encoding: "utf8" }).status !== 0) continue;
+        const run = spawnSync(bin, args, { encoding: "utf8" });
+        assert.equal(run.status, 0, `${bin} must parse the ${label} generated TOML: ${run.stderr}`);
+        // The shell payload survives the round trip intact, modulo the trailing
+        // newline the lossy capture drops.
+        // Normalize the leading newline before comparing. TOML says a newline
+        // straight after the opening delimiter is trimmed; tomllib does that,
+        // Bun 1.3.14 does not and hands back a leading blank line. Inert for
+        // /bin/sh, but it is a real parser difference, so this assertion is
+        // about the SCRIPT surviving intact, not about who is spec-correct.
+        assert.equal(
+          run.stdout.replace(/^\n/, "").replace(/\n+$/, ""),
+          captured.replace(/^\n/, "").replace(/\n+$/, ""),
+          `${bin} round trip must preserve the ${label} shell script exactly`,
+        );
+        parsed += 1;
+      }
+      // The shape assertions above are parser-free and always run; an actual
+      // parse is a bonus when the host has one. Never silently pass as though
+      // a parser had confirmed it.
+      if (parsed === 0) process.stderr.write(`  (no TOML parser on PATH; ${label} shape checked without a parse)\n`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  // The escaping boundary must not have been relaxed to dodge the delimiter.
+  const hostile = buildShimScript({
+    "backend-url": "http://x",
+    name: "a" + SQ + "; touch /tmp/pwned; " + SQ,
+    app: "/A B.app",
+  });
+  assert.equal(hostile.includes("touch /tmp/pwned"), true, "hostile input must survive as inert data");
+  const syntax = spawnSync("/bin/sh", ["-n"], { input: hostile, encoding: "utf8" });
+  assert.equal(syntax.status, 0, `hostile shim script must remain valid sh: ${syntax.stderr}`);
 }
 
 async function selftestBackendEraDetection() {
