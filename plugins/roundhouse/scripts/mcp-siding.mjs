@@ -327,8 +327,22 @@ function shimFlagArgs(flags) {
 // Builds the full sh -c script body (resolvers + the final exec line) for
 // a registration: `RESOLVER_SH`, then `NODE_RESOLVER_SH`, then
 // `exec "$node_bin" "$p" <flags>`.
+// A generated script must never END on a shell quote. Codex writes this
+// text into config.toml as a multiline literal, and the exec line's last
+// argument is a quoted path; a closing delimiter placed straight after it
+// produces four apostrophes. Python tomllib accepts that, Bun's TOML parser
+// rejects it outright, so the breakage is invisible until something
+// Bun-based reads the config (ocx doctor, via Bun 1.3.14).
+//
+// A trailing newline does NOT solve this: the documented install idiom
+// captures the script through $(...), which strips every trailing newline
+// before Codex ever sees it. A final line that is not a quote survives any
+// capture, which is why this is a line of text rather than whitespace.
+const SHIM_SCRIPT_SENTINEL =
+  "# end of generated shim - this line keeps the TOML delimiter off a quote";
+
 export function buildShimScript(flags) {
-  return `${RESOLVER_SH}\n${NODE_RESOLVER_SH}\nexec "$node_bin" "$p" ${shimFlagArgs(flags).map(shQuote).join(" ")}\n`;
+  return `${RESOLVER_SH}\n${NODE_RESOLVER_SH}\nexec "$node_bin" "$p" ${shimFlagArgs(flags).map(shQuote).join(" ")}\n${SHIM_SCRIPT_SENTINEL}\n`;
 }
 
 // The marked region of the sibling mcp-siding-windows.ps1 - the PowerShell

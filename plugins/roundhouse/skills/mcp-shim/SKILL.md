@@ -162,8 +162,14 @@ for node_candidate in "$MCP_SIDING_NODE" "$(command -v node 2>/dev/null)" \
 done
 [ -n "$node_bin" ] || { echo "mcp-siding: no node with global fetch/ReadableStream (this shim needs Node 18+) found on this host - cannot build the registration script. Install a newer Node or set \$MCP_SIDING_NODE." >&2; exit 1; }
 
+# The trailing X and the ${SCRIPT%X} strip are not a flourish: $(...) removes
+# EVERY trailing newline, and Codex writes this script into config.toml as a
+# multiline literal. Without the final newline the closing delimiter lands on
+# the same line as the script's last character, which is how a quoted final
+# argument once produced four apostrophes and broke Bun's TOML parser.
 SCRIPT=$("$node_bin" "$SKILL_DIR/../../scripts/mcp-siding.mjs" --print-shim-script \
-  --backend-url <URL> --name <NAME> --app "<APP_PATH>")
+  --backend-url <URL> --name <NAME> --app "<APP_PATH>"; printf X)
+SCRIPT=${SCRIPT%X}
 ```
 <!-- mcp-siding-selftest: node-resolver-install-snippet:end -->
 
