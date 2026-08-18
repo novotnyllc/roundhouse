@@ -56,7 +56,7 @@ plugins/roundhouse/scripts/certify-ssh-node	12 14
 plugins/roundhouse/scripts/enroll-privilege-posix	50
 plugins/roundhouse/scripts/privilege-broker-posix	50
 plugins/roundhouse/scripts/launcher-install	40
-plugins/roundhouse/scripts/update-integrity	00
+plugins/roundhouse/scripts/update-integrity	00 60
 plugins/roundhouse/scripts/preflight	00
 plugins/roundhouse/scripts/git-merge-plugin-version	00
 docs/	none
@@ -74,35 +74,20 @@ scopes_for() {
     plugins/roundhouse/scripts/prepare-ssh-identity*|\
     plugins/roundhouse/scripts/certify-ssh-node*) printf 'u2-contracts\n' ;;
     plugins/roundhouse/scripts/enroll-privilege-posix*|\
-    plugins/roundhouse/scripts/privilege-broker-posix*) printf 'macos-privilege-contracts\n' ;;
+    plugins/roundhouse/scripts/privilege-broker-posix*) printf 'macos-privilege-contracts\nu2-contracts\n' ;;
     plugins/roundhouse/scripts/launcher-install*) printf 'u4-contracts\nu5-contracts\n' ;;
     *) return 1 ;;
   esac
 }
 
-# Sections are SOURCED cumulatively, so a few genuinely build on an earlier
-# one's fixtures. Profiling each section in isolation found exactly one such
-# pair — 67 reads snapshot.jsonl and $oversized_setting, both produced by 65 —
-# and the other 29 ran standalone cleanly, which `set -eu` makes a meaningful
-# result rather than a lucky one. Declared here so the matrix can never
-# schedule a dependent section without its producer.
-# The matrix runs ONE JOB PER LINE, so a dependency has to travel inside the
-# entry, not merely appear elsewhere in the list: emitting "65" and "67" as
-# separate lines would still schedule a job that runs 67 alone and fails.
-# ROUNDHOUSE_TEST_ONLY accepts several numbers, so the pair ships as one entry.
-# When 67 is present, 65 rides with it and its standalone entry is dropped so
-# it is not run twice.
-expand_deps() {
-  local out=" $* " result=""
-  local pair_needed=false
-  case $out in *" 67 "*) pair_needed=true ;; esac
-  if [ "$pair_needed" = true ]; then
-    out=$(printf '%s' "$out" | sed 's/ 67 / /; s/ 65 / /')
-  fi
-  for n in $out; do result="$result$n\n"; done
-  [ "$pair_needed" = false ] || result="${result}65 67\n"
-  printf "$result"
-}
+# Sections are SOURCED cumulatively, and a few used to build on an earlier
+# one's fixtures: 67 read $oversized_setting and snapshot.jsonl from 65, 68 read
+# snapshot-2.jsonl from 65, and 71/72/74/75 read $fleet_fixture_yq from 70. That
+# made a per-section matrix unschedulable without pairing entries together.
+# Those fixtures now live in the always-run 07 harness, so every section stands
+# alone and the matrix can schedule them in any combination. Verified by running
+# each one with ROUNDHOUSE_TEST_ONLY and a clean HOME, which `set -eu` makes a
+# meaningful result rather than a lucky one.
 
 want_scopes=false
 [ "${1:-}" != --scopes ] || want_scopes=true
@@ -153,5 +138,5 @@ else
   # Piped, not $(...) in a for-loop: command substitution word-splits, which
   # would tear the "65 67" entry back into two independent jobs and reinstate
   # the exact failure the pairing exists to prevent.
-  expand_deps $ALWAYS $selected | sort -u
+  printf '%s\n' $ALWAYS $selected | sort -u
 fi

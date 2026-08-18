@@ -9,28 +9,6 @@
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
 
-# The suite sanitizes PATH to $tmp/bin:/usr/bin:/bin and yq is not a system
-# binary on any of the fleet's platforms, so probe the standard install
-# locations the way the real-jj block does. yq is a hard prerequisite of the
-# design (§5.1); a host without it gets the same loud skip rather than a
-# mystery failure, and CI runners carry it.
-fleet_fixture_tool() {
-  fixture_found=$(command -v "$1" 2>/dev/null || true)
-  if [ -z "$fixture_found" ]; then
-    for fixture_candidate in "/opt/homebrew/bin/$1" "/usr/local/bin/$1" \
-      "$HOME/.local/bin/$1" "$HOME/.cargo/bin/$1"; do
-      [ ! -x "$fixture_candidate" ] || {
-        fixture_found=$fixture_candidate
-        break
-      }
-    done
-  fi
-  printf '%s\n' "$fixture_found"
-}
-fleet_fixture_yq=$(fleet_fixture_tool yq)
-fleet_fixture_path=$PATH
-[ -z "$fleet_fixture_yq" ] || fleet_fixture_path="$(dirname "$fleet_fixture_yq"):$PATH"
-
 if [ -z "$fleet_fixture_yq" ]; then
   printf '\n'
   printf '========================================================================\n'
