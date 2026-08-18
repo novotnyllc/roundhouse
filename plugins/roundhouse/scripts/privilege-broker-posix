@@ -613,14 +613,29 @@ if [ "$homebrew_bridge" = true ]; then
 fi
 
 fixture_pause() {
-  local phase=$1 marker
+  local phase=$1 marker pause_ticks pause_limit pause_max
   [ "$fixture_mode" = true ] && [ "${ROUNDHOUSE_U2_PAUSE_AT:-}" = "$phase" ] || return 0
   marker=${ROUNDHOUSE_U2_PAUSE_MARKER:-}
   case $marker in /*) ;; *) return 1 ;; esac
+  pause_limit=${ROUNDHOUSE_U2_PAUSE_TIMEOUT:-120}
+  case $pause_limit in '' | *[!0-9]*) return 1 ;; esac
+  # Ticks, not seconds: this loop polls at 0.05s, so the bound is 20 per second.
+  pause_ticks=0
+  pause_max=$((pause_limit * 20))
   printf 'pause|1|point=%s|pid=%s\n' "$phase" "$$" >"$marker" || return 1
+  # Bounded for the same reason as u2_pause in enroll-privilege-posix, and it
+  # matters more here: release is a kill from the driver rather than a
+  # .continue write, so a driver that dies first leaves this spinning at 20Hz
+  # while it still holds the global admission lock.
   while [ ! -e "$marker.continue" ]; do
     [ ! -e "$marker.kill" ] || exit 137
+    if [ "$pause_ticks" -ge "$pause_max" ]; then
+      printf 'fixture_pause: no release at %s after %ss; abandoning\n' "$phase" "$pause_limit" >&2
+      /bin/rm -f "$marker" "$marker.continue"
+      return 1
+    fi
     /bin/sleep 0.05
+    pause_ticks=$((pause_ticks + 1))
   done
 }
 
