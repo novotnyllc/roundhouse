@@ -128,16 +128,6 @@ jobs:
               if set(fields) != {"name", "description"} or fields["name"] != path.parent.name:
                   raise SystemExit(f"invalid skill identity: {path}")
           PY
-      - name: Run fixture suite
-        shell: bash
-        env:
-          # jj is installed above, so a skipped real-jj block is a broken
-          # install rather than an unequipped host: fail instead of noticing.
-          ROUNDHOUSE_REQUIRE_REAL_JJ: 'true'
-        run: |
-          chmod -R go-w plugins/roundhouse
-          plugins/roundhouse/scripts/test-roundhouse
-
   # The scoped suites are early-exit shortcuts *inside* the same self-check:
   # a default invocation defines their bodies and never calls them, so they
   # ran nowhere until a human typed the variable. The list is derived from
@@ -175,11 +165,10 @@ jobs:
   # everything. Adding a rule makes CI faster; forgetting one only makes it
   # slower, never blinder.
   select:
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       sections: ${{ steps.pick.outputs.sections }}
-      all: ${{ steps.pick.outputs.all }}
+      scopes: ${{ steps.pick.outputs.scopes }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -188,27 +177,56 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base='${{ github.event.pull_request.base.sha }}'
-          head='${{ github.event.pull_request.head.sha }}'
-          changed=$(git diff --name-only "$base" "$head")
-          printf 'changed paths:\n%s\n' "$changed"
-          picked=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections)
-          printf 'selected: %s\n' "$(printf '%s' "$picked" | tr '\n' ' ')"
-          if [ "$picked" = all ]; then
-            echo 'all=true' >> "$GITHUB_OUTPUT"
-            echo 'sections=[]' >> "$GITHUB_OUTPUT"
+          every() {
+            for f in plugins/roundhouse/scripts/tests/*.sh; do
+              n=$(basename "$f" | cut -d- -f1)
+              case "$n" in 00|05|07) continue ;; esac
+              printf '%s\n' "$n"
+            done | sort -u
+          }
+
+          if [ '${{ github.event_name }}' = pull_request ]; then
+            base='${{ github.event.pull_request.base.sha }}'
+            head='${{ github.event.pull_request.head.sha }}'
+            changed=$(git diff --name-only "$base" "$head")
+            printf 'changed paths:\n%s\n' "$changed"
+            picked=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections)
           else
-            echo 'all=false' >> "$GITHUB_OUTPUT"
-            json=$(printf '%s\n' "$picked" | grep -v '^$' | sort -u |
-              awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
-            echo "sections=$json" >> "$GITHUB_OUTPUT"
+            picked=all
           fi
 
-  # One job per selected section. Wall time becomes the preamble plus the single
-  # slowest SELECTED section, rather than the sum of everything.
+          if [ "$picked" = all ]; then
+            picked=$(printf '00\n05\n07\n'; every)
+          fi
+          printf 'selected: %s\n' "$(printf '%s' "$picked" | tr '\n' ' ')"
+
+          json=$(printf '%s\n' "$picked" | grep -v '^$' | sort -u |
+            awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+          echo "sections=$json" >> "$GITHUB_OUTPUT"
+
+          # Scopes are SEPARATE coverage, not a grouping of sections: the
+          # *_contracts functions are only invoked from a scope guard, so an
+          # unscoped run never executes them. They are also where the
+          # 17-minute job lived, which is exactly why they must be selected by
+          # change rather than run every time.
+          if [ '${{ github.event_name }}' = pull_request ]; then
+            scopes=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections --scopes)
+          else
+            scopes=all
+          fi
+          if [ "$scopes" = all ]; then
+            scopes=$(grep -ho 'ROUNDHOUSE_TEST_SCOPE:-}" != [a-z0-9-]*' \
+              plugins/roundhouse/scripts/tests/*.sh | sed 's/.*!= //' | sort -u)
+          fi
+          printf 'scopes: %s\n' "$(printf '%s' "$scopes" | tr '\n' ' ')"
+          sjson=$(printf '%s\n' "$scopes" | grep -v '^$' | sort -u |
+            awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+          echo "scopes=$sjson" >> "$GITHUB_OUTPUT"
+
+  # One job per section, on every event. Wall time is the ~3s preamble plus the
+  # slowest SELECTED section, never the sum of all of them.
   sections:
     needs: select
-    if: github.event_name == 'pull_request' && needs.select.outputs.all == 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -220,62 +238,52 @@ jobs:
       - name: Install OpenSSH server for scope validation
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+      - name: Install jj and yq for the real-jj sections
+        shell: bash
+        run: |
+          set -eu
+          jj_version=0.44.0
+          yq_version=4.44.3
+          case "$RUNNER_OS-$(uname -m)" in
+            Linux-x86_64) jj_asset=x86_64-unknown-linux-musl; yq_asset=linux_amd64 ;;
+            Linux-aarch64) jj_asset=aarch64-unknown-linux-musl; yq_asset=linux_arm64 ;;
+            macOS-arm64) jj_asset=aarch64-apple-darwin; yq_asset=darwin_arm64 ;;
+            macOS-x86_64) jj_asset=x86_64-apple-darwin; yq_asset=darwin_amd64 ;;
+            *) echo "no pinned build for $RUNNER_OS-$(uname -m)" >&2; exit 1 ;;
+          esac
+          jj_tmp=$(mktemp -d)
+          curl -fsSL --retry 3 \
+            "https://github.com/jj-vcs/jj/releases/download/v$jj_version/jj-v$jj_version-$jj_asset.tar.gz" |
+            tar -xz -C "$jj_tmp"
+          sudo install -m 0755 "$jj_tmp/jj" /usr/local/bin/jj
+          rm -rf "$jj_tmp"
+          # Always install the pinned yq — never fall back to the runner's
+          # pre-installed one. Number-form handling differs across yq versions
+          # (some preserve 12.0, 4.44.3 normalizes it to 12), and the fold
+          # digest's item identity depends on it, so the version must be pinned.
+          curl -fsSL --retry 3 -o /tmp/yq \
+            "https://github.com/mikefarah/yq/releases/download/v$yq_version/yq_$yq_asset"
+          sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+          jj --version
+          yq --version
       - name: Section ${{ matrix.section }}
         shell: bash
         env:
           ROUNDHOUSE_TEST_ONLY: ${{ matrix.section }}
+          # Travels with the suite. Without it a real-jj section prints a NOTICE
+          # and PASSES, so moving the suite here without this flag would have
+          # silently stopped verifying the store's repository half.
+          ROUNDHOUSE_REQUIRE_REAL_JJ: 'true'
         run: plugins/roundhouse/scripts/test-roundhouse
 
-  # When selection says "everything", run the serial suite rather than a matrix
-  # of every section: the sections are sourced cumulatively, so a full matrix
-  # would repeat the shared preamble 30 times for no gain.
-  sections-all:
-    needs: select
-    if: github.event_name == 'pull_request' && needs.select.outputs.all == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Install OpenSSH server for scope validation
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
-      - name: Run full fixture suite
-        shell: bash
-        run: plugins/roundhouse/scripts/test-roundhouse
-
-  scope-matrix:
-    runs-on: ubuntu-latest
-    outputs:
-      scopes: ${{ steps.derive.outputs.scopes }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - id: derive
-        shell: bash
-        run: |
-          set -eu
-          scopes=$(grep -ho 'ROUNDHOUSE_TEST_SCOPE:-}" != [a-z0-9-]*' \
-            plugins/roundhouse/scripts/tests/*.sh |
-            awk '{ print $NF }' | LC_ALL=C sort -u |
-            jq -Rsc 'split("\n") | map(select(. != ""))')
-          [ "$scopes" != '[]' ] || {
-            printf 'no ROUNDHOUSE_TEST_SCOPE suites found\n' >&2
-            exit 1
-          }
-          printf 'scopes=%s\n' "$scopes" >>"$GITHUB_OUTPUT"
-
-  # One runner per scope per platform. Each scope re-runs the sections ahead
-  # of it, so these are siblings of the `posix` fixture step rather than extra
-  # work bolted onto it: wall time stays one suite, not the sum of eight.
   scoped:
-    needs: scope-matrix
+    needs: select
+    if: needs.select.outputs.scopes != '[]'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        scope: ${{ fromJSON(needs.scope-matrix.outputs.scopes) }}
+        scope: ${{ fromJSON(needs.select.outputs.scopes) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -361,68 +369,35 @@ jobs:
   # into one context. Require `ci-ok` in protection instead of the volatile
   # per-cell contexts — adding or renaming a scope never desyncs the rule.
   ci-ok:
-    needs: [actionlint, posix, helpers, select, sections, sections-all, scope-matrix, scoped, windows]
+    needs: [actionlint, posix, helpers, select, sections, scoped, windows]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs succeeded
         shell: bash
         env:
-          EVENT: ${{ github.event_name }}
-          ACTIONLINT: ${{ needs.actionlint.result }}
-          POSIX: ${{ needs.posix.result }}
-          HELPERS: ${{ needs.helpers.result }}
-          SELECT: ${{ needs.select.result }}
-          SECTIONS: ${{ needs.sections.result }}
-          SECTIONS_ALL: ${{ needs.sections-all.result }}
-          SCOPE_MATRIX: ${{ needs.scope-matrix.result }}
-          SCOPED: ${{ needs.scoped.result }}
-          WINDOWS: ${{ needs.windows.result }}
+          RESULTS: ${{ join(needs.*.result, ',') }}
         run: |
           set -euo pipefail
-          fail=0
-          note() { printf '%s\n' "$*" >&2; }
-
-          # Checked per job, not as one joined blob. Three jobs are now
-          # deliberately conditional, and the old `case` treated ANY `skipped`
-          # as failure — so loosening it wholesale would have let a pull request
-          # pass with no fixture suite run at all. Each job states which
-          # outcomes are legitimate for it, and anything else is a failure.
-          must_succeed() {
-            local name=$1 result=$2
-            [ "$result" = success ] && return 0
-            note "FAIL $name: $result"
-            fail=1
-          }
-          must_succeed actionlint "$ACTIONLINT"
-          must_succeed helpers "$HELPERS"
-          must_succeed scope-matrix "$SCOPE_MATRIX"
-          must_succeed scoped "$SCOPED"
-          must_succeed windows "$WINDOWS"
-
-          if [ "$EVENT" = pull_request ]; then
-            # posix is the main-branch backstop and is expected to be skipped.
-            [ "$POSIX" = skipped ] || must_succeed posix "$POSIX"
-            must_succeed select "$SELECT"
-            # EXACTLY ONE of the two fixture paths must have run and passed.
-            # Both skipped means the suite silently did not run, which is the
-            # failure this whole change could most plausibly introduce.
-            case "$SECTIONS/$SECTIONS_ALL" in
-              success/skipped|skipped/success) : ;;
-              *)
-                note "FAIL fixture suite: sections=$SECTIONS sections-all=$SECTIONS_ALL"
-                note "     exactly one of them must run and succeed"
-                fail=1 ;;
+          printf 'results: %s\n' "$RESULTS"
+          # Every job runs on every event now, so a plain check is honest again:
+          # no job is legitimately skipped, and treating a skip as acceptable is
+          # how a gate stops gating.
+          # `scoped` is legitimately skipped when a change implicates no
+          # contract scope, so a bare skipped-is-failure check would break every
+          # such PR. Everything else must have succeeded.
+          case ",$RESULTS," in
+            *,failure,*|*,cancelled,*)
+              printf 'a required job did not succeed\n' >&2; exit 1 ;;
+          esac
+          for r in ${RESULTS//,/ }; do
+            case $r in
+              success|skipped) ;;
+              *) printf 'unexpected result: %s\n' "$r" >&2; exit 1 ;;
             esac
-          else
-            # On a push the serial suite is the gate; the PR-only jobs are
-            # expected to be skipped.
-            must_succeed posix "$POSIX"
-            for pair in "select/$SELECT" "sections/$SECTIONS" "sections-all/$SECTIONS_ALL"; do
-              name=${pair%%/*}; result=${pair#*/}
-              [ "$result" = skipped ] || must_succeed "$name" "$result"
-            done
-          fi
-
-          [ "$fail" -eq 0 ] || { note "a required job did not succeed"; exit 1; }
-          printf 'all required jobs succeeded (%s)\n' "$EVENT"
+          done
+          case "${{ needs.sections.result }}" in
+            success) ;;
+            *) printf 'the section matrix must run and succeed\n' >&2; exit 1 ;;
+          esac
+          printf 'all required jobs succeeded\n'

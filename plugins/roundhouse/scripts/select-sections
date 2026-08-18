@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Which test sections must run for a given set of changed paths?
 #
-# Reads changed paths on stdin (one per line), prints the section numbers to
-# run, one per line, or the single token `all`.
+# Reads changed paths on stdin (one per line). With no argument, prints the
+# SECTION numbers to run. With `--scopes`, prints the ROUNDHOUSE_TEST_SCOPE
+# names to run. Either may print the single token `all`.
+#
+# Scopes are not a grouping of sections — they are separate coverage. The
+# *_contracts functions are DEFINED in sections 10/12/14 but only INVOKED from
+# a scope guard, so an unscoped run never executes them however many sections
+# it runs. That is also where the 17-minute job was: the contracts themselves,
+# not the sections around them.
 #
 # Unmapped paths are split by whether they are even INPUTS to the suite:
 #
@@ -58,7 +65,26 @@ UPSTREAM.md	none
 MAP
 }
 
+# scope -> the path prefixes that can affect it. Same fail-safe split as
+# sections: unmapped inside the tested surface means run every scope.
+scopes_for() {
+  case $1 in
+    plugins/roundhouse/scripts/collect-posix*|\
+    plugins/roundhouse/scripts/enroll-ssh-posix*|\
+    plugins/roundhouse/scripts/prepare-ssh-identity*|\
+    plugins/roundhouse/scripts/certify-ssh-node*) printf 'u2-contracts\n' ;;
+    plugins/roundhouse/scripts/enroll-privilege-posix*|\
+    plugins/roundhouse/scripts/privilege-broker-posix*) printf 'macos-privilege-contracts\n' ;;
+    plugins/roundhouse/scripts/launcher-install*) printf 'u4-contracts\nu5-contracts\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+want_scopes=false
+[ "${1:-}" != --scopes ] || want_scopes=true
+
 selected=""
+scope_selected=""
 saw_any=false
 while IFS= read -r path; do
   [ -n "$path" ] || continue
@@ -86,10 +112,19 @@ while IFS= read -r path; do
   [ "$match" = none ] && continue
   [ "$match" = all ] && { printf 'all\n'; exit 0; }
   selected="$selected $match"
+  if scope_hit=$(scopes_for "$path"); then
+    scope_selected="$scope_selected $scope_hit"
+  fi
 done
 
 # No input at all is not "nothing changed" — it is "I was told nothing", which
 # is the same unknown as an unmapped path.
 [ "$saw_any" = true ] || { printf 'all\n'; exit 0; }
 
-for n in $ALWAYS $selected; do printf '%s\n' "$n"; done | sort -u
+if [ "$want_scopes" = true ]; then
+  # No scope implicated means no scope needs running - unlike sections, there
+  # is no mandatory preamble scope.
+  for n in $scope_selected; do printf '%s\n' "$n"; done | sort -u
+else
+  for n in $ALWAYS $selected; do printf '%s\n' "$n"; done | sort -u
+fi
