@@ -210,7 +210,7 @@
     },
     {
       "path": "scripts/select-sections",
-      "sha256": "678b2ae9fe5911c7f5a89a1781ffa040404c6c05f507e9cbefb5f571c0a8066b"
+      "sha256": "d1bc5b080ec2fd9f0c10d82e5d12d36130daf4e13e4b55b4bbbd2503b37446a3"
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",

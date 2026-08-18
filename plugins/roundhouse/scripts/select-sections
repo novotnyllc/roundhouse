@@ -80,6 +80,24 @@ scopes_for() {
   esac
 }
 
+# helper -> the paths that can affect its self-test. Each helper ships its own
+# `self-test`, and those are the most expensive jobs in the matrix - the
+# enroll-ssh-posix one alone is ~10 min on macOS - so running all six legs for a
+# docs change is the single biggest avoidable cost in CI. Same fail-safe split
+# as sections and scopes: unmapped inside the tested surface runs every helper.
+helpers_for() {
+  case $1 in
+    plugins/roundhouse/scripts/enroll-ssh-posix*) printf 'enroll-ssh-posix\n' ;;
+    plugins/roundhouse/scripts/prepare-ssh-identity*) printf 'prepare-ssh-identity\n' ;;
+    plugins/roundhouse/scripts/certify-ssh-node*) printf 'certify-ssh-node\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+ALL_HELPERS='enroll-ssh-posix
+prepare-ssh-identity
+certify-ssh-node'
+
 # Sections are SOURCED cumulatively, and a few used to build on an earlier
 # one's fixtures: 67 read $oversized_setting and snapshot.jsonl from 65, 68 read
 # snapshot-2.jsonl from 65, and 71/72/74/75 read $fleet_fixture_yq from 70. That
@@ -90,10 +108,15 @@ scopes_for() {
 # meaningful result rather than a lucky one.
 
 want_scopes=false
-[ "${1:-}" != --scopes ] || want_scopes=true
+want_helpers=false
+case ${1:-} in
+  --scopes) want_scopes=true ;;
+  --helpers) want_helpers=true ;;
+esac
 
 selected=""
 scope_selected=""
+helper_selected=""
 saw_any=false
 while IFS= read -r path; do
   [ -n "$path" ] || continue
@@ -112,25 +135,37 @@ while IFS= read -r path; do
       # everything rather than guess.
       plugins/roundhouse/scripts/*|plugins/roundhouse/skills/*|\
       plugins/roundhouse/.claude-plugin/*|plugins/roundhouse/.codex-plugin/*)
-        printf 'all\n'
+        if [ "$want_helpers" = true ]; then printf '%s\n' "$ALL_HELPERS"; else printf 'all\n'; fi
         exit 0 ;;
       # Outside it: not an input to this suite. Nothing to run.
       *) continue ;;
     esac
   fi
   [ "$match" = none ] && continue
-  [ "$match" = all ] && { printf 'all\n'; exit 0; }
+  if [ "$match" = all ]; then
+    if [ "$want_helpers" = true ]; then printf '%s\n' "$ALL_HELPERS"; else printf 'all\n'; fi
+    exit 0
+  fi
   selected="$selected $match"
   if scope_hit=$(scopes_for "$path"); then
     scope_selected="$scope_selected $scope_hit"
+  fi
+  if helper_hit=$(helpers_for "$path"); then
+    helper_selected="$helper_selected $helper_hit"
   fi
 done
 
 # No input at all is not "nothing changed" — it is "I was told nothing", which
 # is the same unknown as an unmapped path.
-[ "$saw_any" = true ] || { printf 'all\n'; exit 0; }
+if [ "$saw_any" != true ]; then
+  if [ "$want_helpers" = true ]; then printf '%s\n' "$ALL_HELPERS"; else printf 'all\n'; fi
+  exit 0
+fi
 
-if [ "$want_scopes" = true ]; then
+if [ "$want_helpers" = true ]; then
+  # Like scopes: no helper implicated means no helper self-test needs running.
+  for n in $helper_selected; do printf '%s\n' "$n"; done | sort -u
+elif [ "$want_scopes" = true ]; then
   # No scope implicated means no scope needs running - unlike sections, there
   # is no mandatory preamble scope.
   for n in $scope_selected; do printf '%s\n' "$n"; done | sort -u

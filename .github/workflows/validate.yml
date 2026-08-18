@@ -94,12 +94,18 @@ jobs:
   # small stat/tr/cut execs), so there is nothing to cache and nothing blocked
   # on I/O: running them concurrently is the whole optimization. One job per
   # helper also names which helper failed instead of one opaque step.
+  # Depends on `select` - about six seconds - so that a change implicating no
+  # helper skips these entirely. That is a real dependency, not a concurrent
+  # one: the matrix cannot be built before the list exists. Worth it, because
+  # the enroll-ssh-posix leg alone runs ~10 min on macOS.
   helpers:
+    needs: select
+    if: needs.select.outputs.helpers != '[]'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        helper: [enroll-ssh-posix, prepare-ssh-identity, certify-ssh-node]
+        helper: ${{ fromJSON(needs.select.outputs.helpers) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -125,6 +131,7 @@ jobs:
     outputs:
       sections: ${{ steps.pick.outputs.sections }}
       scopes: ${{ steps.pick.outputs.scopes }}
+      helpers: ${{ steps.pick.outputs.helpers }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -181,6 +188,19 @@ jobs:
           sjson=$(printf '%s\n' "$scopes" | { grep -v '^$' || true; } | sort -u |
             awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
           echo "scopes=$sjson" >> "$GITHUB_OUTPUT"
+
+          # Which helper self-tests does this change implicate? These are the
+          # most expensive jobs in the matrix, so running all six legs for a
+          # change that touches none of them is the biggest avoidable cost here.
+          if [ '${{ github.event_name }}' = pull_request ]; then
+            helpers=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections --helpers)
+          else
+            helpers=$(printf '%s\n' '' | plugins/roundhouse/scripts/select-sections --helpers)
+          fi
+          printf 'helpers: %s\n' "$(printf '%s' "$helpers" | tr '\n' ' ')"
+          hjson=$(printf '%s\n' "$helpers" | { grep -v '^$' || true; } | sort -u |
+            awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+          echo "helpers=$hjson" >> "$GITHUB_OUTPUT"
 
   # One job per section, on every event. Wall time is the ~3s preamble plus the
   # slowest SELECTED section, never the sum of all of them.
@@ -335,28 +355,39 @@ jobs:
       - name: All required jobs succeeded
         shell: bash
         env:
-          RESULTS: ${{ join(needs.*.result, ',') }}
+          # Named individually rather than join(needs.*.result): a positional
+          # list cannot say WHICH job skipped, and "some job skipped" is not a
+          # verdict. Only two jobs may legitimately skip.
+          ACTIONLINT: ${{ needs.actionlint.result }}
+          POSIX: ${{ needs.posix.result }}
+          SELECT: ${{ needs.select.result }}
+          SECTIONS: ${{ needs.sections.result }}
+          WINDOWS: ${{ needs.windows.result }}
+          SCOPED: ${{ needs.scoped.result }}
+          HELPERS: ${{ needs.helpers.result }}
         run: |
           set -euo pipefail
-          printf 'results: %s\n' "$RESULTS"
-          # Every job runs on every event now, so a plain check is honest again:
-          # no job is legitimately skipped, and treating a skip as acceptable is
-          # how a gate stops gating.
-          # `scoped` is legitimately skipped when a change implicates no
-          # contract scope, so a bare skipped-is-failure check would break every
-          # such PR. Everything else must have succeeded.
-          case ",$RESULTS," in
-            *,failure,*|*,cancelled,*)
-              printf 'a required job did not succeed\n' >&2; exit 1 ;;
-          esac
-          for r in ${RESULTS//,/ }; do
-            case $r in
-              success|skipped) ;;
-              *) printf 'unexpected result: %s\n' "$r" >&2; exit 1 ;;
+          printf 'actionlint=%s posix=%s select=%s sections=%s windows=%s scoped=%s helpers=%s\n' \
+            "$ACTIONLINT" "$POSIX" "$SELECT" "$SECTIONS" "$WINDOWS" "$SCOPED" "$HELPERS"
+
+          # These run on every event and must SUCCEED. A skip here means the
+          # gate stopped gating, which is worse than a red build because it is
+          # quiet - so a skip is a failure for them, not a pass.
+          for pair in "actionlint:$ACTIONLINT" "posix:$POSIX" "select:$SELECT" \
+                      "sections:$SECTIONS" "windows:$WINDOWS"; do
+            case ${pair#*:} in
+              success) ;;
+              *) printf '%s must run and succeed (got %s)\n' "${pair%%:*}" "${pair#*:}" >&2; exit 1 ;;
             esac
           done
-          case "${{ needs.sections.result }}" in
-            success) ;;
-            *) printf 'the section matrix must run and succeed\n' >&2; exit 1 ;;
-          esac
+
+          # These two are change-scoped and skip when nothing implicates them:
+          # no contract scope, no helper self-test. Success or skipped only -
+          # never failure or cancellation.
+          for pair in "scoped:$SCOPED" "helpers:$HELPERS"; do
+            case ${pair#*:} in
+              success|skipped) ;;
+              *) printf '%s did not succeed (got %s)\n' "${pair%%:*}" "${pair#*:}" >&2; exit 1 ;;
+            esac
+          done
           printf 'all required jobs succeeded\n'
