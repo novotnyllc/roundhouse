@@ -66,7 +66,7 @@
     },
     {
       "path": "scripts/enroll-privilege-posix",
-      "sha256": "855e6b0b186a97abfb2b72cee341f597376a2b3a0dcb4b60403a099887f18dc5"
+      "sha256": "a29a3152707458f64224082d7ec0fcd00f7de6704b8e7d263d2118e3504f76da"
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
@@ -194,7 +194,7 @@
     },
     {
       "path": "scripts/privilege-broker-posix",
-      "sha256": "767030d5b299b0c2b312b1afbb1683f153629f7aa1c8c32c68b05313ad9490a9"
+      "sha256": "7cc1e5e9527a6604b99df68cf264800bd998839b159971c01465a5dd8c0df233"
     },
     {
       "path": "scripts/privilege-broker-windows.ps1",

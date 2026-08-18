@@ -551,6 +551,46 @@ test_u2_collector_contracts() {
   [ "$(u2_enrollment_state_digest)" = "$u2_under_lock_before" ] ||
     fail "U2 under-lock current-state race was not exactly recoverable"
 
+  # A pause nobody releases must ABANDON, not wait forever: the only writer of
+  # .continue is this driver, and a driver that hits `fail` exits without it.
+  u2_pause_marker="$tmp/u2-abandoned-pause"
+  ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" \
+    ROUNDHOUSE_U2_PAUSE_AT=lifecycle-lock-held \
+    ROUNDHOUSE_U2_PAUSE_MARKER="$u2_pause_marker" \
+    ROUNDHOUSE_U2_PAUSE_TIMEOUT=2 \
+    "$enrollment" install "$u2_bundle2" "$u2_manifest2_digest" "$u2_confirmation2_digest" \
+    >"$tmp/u2-abandoned-pause-result" 2>&1 &
+  u2_abandon_job=$!
+  # Bounded from OUTSIDE the process under test, so a regression fails here
+  # rather than inheriting the hang. 60s because this must also cover reaching
+  # the pause point, which the suite elsewhere budgets 45s for on its own; a
+  # tighter bound would misreport a slow runner as an unbounded wait. There is
+  # no portable `timeout` on macOS, so poll.
+  u2_abandon_waited=0
+  while kill -0 "$u2_abandon_job" 2>/dev/null && [ "$u2_abandon_waited" -lt 60 ]; do
+    sleep 1
+    u2_abandon_waited=$((u2_abandon_waited + 1))
+  done
+  if kill -0 "$u2_abandon_job" 2>/dev/null; then
+    u2_kill_paused "$u2_pause_marker" "$u2_abandon_job"
+    fail "U2 unreleased pause did not abandon within 60s; the pause wait is unbounded again"
+  fi
+  if wait "$u2_abandon_job"; then
+    fail "U2 install succeeded despite a pause that was never released"
+  fi
+  # The abandon is loud at every call site, unlike the reason code, which only
+  # 13 of the 24 sites map to fixture_pause_failed.
+  grep -Fq 'abandoning' "$tmp/u2-abandoned-pause-result" ||
+    fail "U2 abandoned pause did not say so on stderr"
+  grep -Fqx 'reason|fixture_pause_failed' "$tmp/u2-abandoned-pause-result" ||
+    fail "U2 unreleased pause did not report fixture_pause_failed"
+  [ ! -e "$u2_pause_marker" ] ||
+    fail "U2 abandoned pause left its marker behind"
+  [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] ||
+    fail "U2 abandoned pause did not release the lifecycle lock"
+  [ "$(u2_enrollment_state_digest)" = "$u2_under_lock_before" ] ||
+    fail "U2 abandoned pause mutated enrolled state"
+
   u2_reboot_before=$(u2_enrollment_state_digest)
   mkdir "$u2_root/var/lib/roundhouse-lifecycle.lock"
   chmod 700 "$u2_root/var/lib/roundhouse-lifecycle.lock"

@@ -2440,17 +2440,34 @@ recover_lifecycle_transaction() {
 
 u2_pause() {
   local point=$1 marker=${ROUNDHOUSE_U2_PAUSE_MARKER:-} marker_tmp owner_pid
+  local pause_waited pause_limit
   capture_current_process_id owner_pid || return 1
   [ "$fixture_mode" = true ] || return 0
   [ "${ROUNDHOUSE_U2_PAUSE_AT:-}" = "$point" ] || return 0
+  pause_waited=0
+  pause_limit=${ROUNDHOUSE_U2_PAUSE_TIMEOUT:-120}
+  # Gate the value like every other numeric input here. A non-integer makes the
+  # `-ge` below a failed test rather than a false one, and an `if` condition is
+  # exempt from `set -e` - so a typo would silently restore the unbounded wait
+  # this exists to remove. A negative would abandon on the first iteration.
+  case $pause_limit in '' | *[!0-9]*) return 1 ;; esac
   case $marker in /*) ;; *) return 1 ;; esac
   marker_tmp=$marker.$owner_pid.tmp
   printf 'pause|1|point=%s|pid=%s\n' "$point" "$owner_pid" >"$marker_tmp" || return 1
   /bin/chmod 0600 "$marker_tmp" || return 1
   /bin/mv -f "$marker_tmp" "$marker" || return 1
+  # Bounded. The only writer of .continue is the test driver, and a driver that
+  # hits `fail` exits without writing it - leaving this process asleep forever,
+  # still holding the lifecycle lock it acquires immediately before pausing.
   while [ ! -e "$marker.continue" ]; do
     if [ -e "$marker.kill" ]; then kill -9 "$owner_pid"; fi
+    if [ "$pause_waited" -ge "$pause_limit" ]; then
+      printf 'u2_pause: no release at %s after %ss; abandoning\n' "$point" "$pause_limit" >&2
+      /bin/rm -f "$marker" "$marker.continue"
+      return 1
+    fi
     /bin/sleep 1 9>&-
+    pause_waited=$((pause_waited + 1))
   done
   /bin/rm -f "$marker" "$marker.continue"
 }
