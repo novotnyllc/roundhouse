@@ -5,22 +5,6 @@
       "sha256": "6ef89c68e6027e9a7127cfa5418bb17ca1e049119b6d11e80ff7c75efa631ecc"
     },
     {
-      "path": ".claude-plugin/plugin.json",
-      "sha256": "6ef89c68e6027e9a7127cfa5418bb17ca1e049119b6d11e80ff7c75efa631ecc"
-    },
-    {
-      "path": ".claude-plugin/plugin.json",
-      "sha256": "6ef89c68e6027e9a7127cfa5418bb17ca1e049119b6d11e80ff7c75efa631ecc"
-    },
-    {
-      "path": ".codex-plugin/plugin.json",
-      "sha256": "cd03dba3ac8d0f001f33837ebe9363123fc02028b9f8db59d78561d12d3b31a9"
-    },
-    {
-      "path": ".codex-plugin/plugin.json",
-      "sha256": "cd03dba3ac8d0f001f33837ebe9363123fc02028b9f8db59d78561d12d3b31a9"
-    },
-    {
       "path": ".codex-plugin/plugin.json",
       "sha256": "cd03dba3ac8d0f001f33837ebe9363123fc02028b9f8db59d78561d12d3b31a9"
     },
