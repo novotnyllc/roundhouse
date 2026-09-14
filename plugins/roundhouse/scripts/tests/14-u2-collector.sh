@@ -5,7 +5,9 @@
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
 
-test_u2_collector_contracts() {
+# Both standalone scopes establish the same signed terminal result through
+# the real broker before checking requests or exercising lifecycle recovery.
+prepare_u2_completed_request_fixture() {
   u2_happy=$(u2_make_envelope apt.update-metadata.v1 \
     request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)))
   if ! APT_EXEC_MARKER="$apt_marker" ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" \
@@ -46,6 +48,11 @@ test_u2_collector_contracts() {
   grep -Fqx 'journal|2' "$u2_canonical" &&
     grep -Fqx 'effect-phase|verified' "$u2_canonical" ||
     fail "U2 canonical journal did not retain the v2 verified terminal state"
+
+}
+
+test_u2_collector_contracts() {
+  prepare_u2_completed_request_fixture
   u2_query=$(u2_make_envelope broker.query-result.v1 \
     request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)))
   cp "$u2_query" "$tmp/u2-query-original-envelope"
@@ -452,6 +459,9 @@ test_u2_collector_contracts() {
     fail "U2 failed audit projection left a temporary"
   fi
 
+}
+
+test_u2_lifecycle_contracts() {
   u2_build2="$tmp/u2-bundle-2"
   u2_generation2="$u2_root/etc/roundhouse/generations/2"
   cp -Rp "$u2_bundle" "$u2_build2"
@@ -832,12 +842,13 @@ EOF
 }
 
 # The composite scope retains the complete sequential contract. Each CI scope
-# builds its own fixture; collector setup uses the real preview/install path.
+# builds its own fixture; collector and lifecycle setup use real enrollment.
 test_u2_contracts() {
   setup_u2_fixture
   test_u2_broker_contracts
   test_u2_enrollment_contracts
   test_u2_collector_contracts
+  test_u2_lifecycle_contracts
 }
 
 [ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-broker-contracts ] || {
@@ -862,8 +873,17 @@ test_u2_contracts() {
   exit 0
 }
 
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-lifecycle-contracts ] || {
+  setup_u2_fixture
+  prepare_u2_collector_fixture
+  prepare_u2_completed_request_fixture
+  test_u2_lifecycle_contracts
+  printf 'PASS: U2 lifecycle contracts\n'
+  exit 0
+}
+
 # Manual full-suite alias. CI scope discovery explicitly excludes this alias
-# because the three independent scopes above already execute every case.
+# because the four independent scopes above already execute every case.
 [ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-contracts ] || {
   test_u2_contracts
   printf 'PASS: U2 contracts\n'

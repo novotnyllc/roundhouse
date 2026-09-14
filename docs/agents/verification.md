@@ -60,13 +60,15 @@ POSIX platform, fanned out from the `scope-matrix` job) and `windows`
 
    Today that is `chezmoi-fixture`, `u1-characterization`, `u1-contracts`,
    `u2-broker-contracts`, `u2-enrollment-contracts`, `u2-collector-contracts`,
-   `u4-contracts`, `u5-contracts` and `macos-privilege-contracts`.
+   `u2-lifecycle-contracts`, `u4-contracts`, `u5-contracts` and `macos-privilege-contracts`.
    Each U2 scope builds fresh keys, signed bundles, and native command fixtures.
-   The collector scope activates its fixture through real enrollment preview
-   and installation before exercising broker requests, upgrade, and revocation.
+   The collector and lifecycle scopes activate their fixtures through real
+   enrollment preview and installation, then execute a real signed broker
+   request. The collector scope checks requests, journals, and readiness;
+   the lifecycle scope checks upgrade and revocation recovery.
    All rejection and lifecycle failure cases remain in the contract bodies.
    `ROUNDHOUSE_TEST_SCOPE=u2-contracts` still runs the complete U2 sequence
-   manually; CI excludes that composite alias to avoid repeating the three jobs.
+   manually; CI excludes that composite alias to avoid repeating the four jobs.
    Serially the loop costs several times one
    default run, because the scopes share prefixes they each re-execute; CI
    parallelises it instead.

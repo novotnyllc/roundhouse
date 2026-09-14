@@ -206,7 +206,7 @@ jobs:
               plugins/roundhouse/scripts/tests/*.sh | sed 's/.*!= //' |
               grep -v '^u2-contracts$' | sort -u)
           fi
-          # u2-contracts remains a manual composite. Its three independent
+          # u2-contracts remains a manual composite. Its four independent
           # scopes cover every case without duplicating the serial long job.
           printf 'scopes: %s\n' "$(printf '%s' "$scopes" | tr '\n' ' ')"
           # No implicated scope is a legitimate answer (docs-only changes), and
