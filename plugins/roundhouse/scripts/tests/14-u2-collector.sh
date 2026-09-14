@@ -5,8 +5,8 @@
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
 
-# Collector, upgrade, and revocation scopes establish the same signed
-# terminal result through the real broker before exercising their contracts.
+# Requires prepare_u2_broker_requests. Executes one signed request and checks
+# readiness; sets u2_canonical and u2_projection to its completed result files.
 prepare_u2_completed_request_fixture() {
   u2_happy=$(u2_make_envelope apt.update-metadata.v1 \
     request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)))
@@ -461,6 +461,8 @@ test_u2_collector_contracts() {
 
 }
 
+# Requires setup_u2_fixture's bundle and release key. Stages signed generation 2
+# and sets its bundle path, manifest digest, and u2_generation2 destination.
 prepare_u2_upgrade_candidate() {
   u2_build2="$tmp/u2-bundle-2"
   u2_generation2="$u2_root/etc/roundhouse/generations/2"
@@ -506,6 +508,8 @@ prepare_u2_upgrade_candidate() {
   chmod -R go-w "$u2_root"
 }
 
+# Requires enrolled generation 1 and the staged upgrade candidate. Runs a real
+# upgrade preview and sets u2_confirmation2_digest for that candidate and state.
 preview_u2_upgrade_candidate() {
   if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" preview "$u2_bundle2" \
       >"$tmp/u2-preview2"; then
@@ -518,8 +522,8 @@ preview_u2_upgrade_candidate() {
 
 }
 
-# Shared success path installs generation 2 and checks its native attestation
-# and collector readiness after either a clean or resumable upgrade.
+# Requires the staged generation-2 candidate and its confirmation digest.
+# Installs or resumes the upgrade, then verifies attestation and readiness.
 complete_u2_upgrade_fixture() {
   if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle2" \
       "$u2_manifest2_digest" "$u2_confirmation2_digest" >"$tmp/u2-upgraded"; then
@@ -538,11 +542,17 @@ complete_u2_upgrade_fixture() {
     fail "U2 collector did not validate the upgraded generation"
 }
 
-test_u2_upgrade_contracts() {
+# Requires generation 1 with its completed request. Stages generation 2,
+# invalidates the old OpenSSH attestation, and captures upgrade confirmation.
+prepare_u2_upgrade_contract_fixture() {
   prepare_u2_upgrade_candidate
   printf '%064d\n' 0 >"$u2_generation/ssh-keygen.sha256"
   preview_u2_upgrade_candidate
+}
 
+# Requires the prepared upgrade fixture. Every race and interrupted owner
+# must restore the exact generation-1 state before the next contract group.
+test_u2_upgrade_confirmation_contracts() {
   u2_under_lock_before=$(u2_enrollment_state_digest)
   u2_candidate_policy_mode=$(test_file_mode "$u2_bundle2/policy.actions")
   cp -p "$u2_bundle2/policy.actions" "$tmp/u2-candidate-policy-before-lock-race"
@@ -650,9 +660,13 @@ EOF
     [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
     [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] ||
     fail "U2 boot-bound stale owner recovery did not restore exact state"
+}
+
+# Requires the prepared upgrade fixture. Runs the named failpoints in argument
+# order; each failed install must restore the starting generation-1 state.
+test_u2_upgrade_failpoints() {
   u2_upgrade_before=$(u2_enrollment_state_digest)
-  for u2_failpoint in after-drain after-generation after-broker after-trust after-sudoers \
-    after-active after-public-receipt; do
+  for u2_failpoint in "$@"; do
     if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_U2_FAILPOINT="$u2_failpoint" \
         "$enrollment" install "$u2_bundle2" "$u2_manifest2_digest" "$u2_confirmation2_digest" \
         >"$tmp/u2-upgrade-$u2_failpoint" 2>/dev/null; then
@@ -663,7 +677,11 @@ EOF
       [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] ||
       fail "U2 upgrade rollback changed the previous generation at $u2_failpoint"
   done
+}
 
+# Requires generation 1 and its confirmed upgrade candidate. Exercises draining
+# and retry, then leaves generation 2 installed with readiness verified.
+test_u2_upgrade_completion_contracts() {
   mkdir "$u2_root/var/lib/roundhouse/lock/active"
   chmod 700 "$u2_root/var/lib/roundhouse/lock/active"
   if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle2" \
@@ -679,8 +697,23 @@ EOF
   complete_u2_upgrade_fixture
 }
 
-test_u2_revocation_contracts() {
-  printf '%064d\n' 0 >"$u2_generation2/ssh-keygen.sha256"
+# Keeps the complete manual failpoint sequence in its original argument order,
+# then exercises draining and completes the confirmed generation-2 upgrade.
+test_u2_upgrade_rollback_contracts() {
+  test_u2_upgrade_failpoints after-drain after-generation after-broker after-trust after-sudoers \
+    after-active after-public-receipt
+  test_u2_upgrade_completion_contracts
+}
+
+test_u2_upgrade_contracts() {
+  prepare_u2_upgrade_contract_fixture
+  test_u2_upgrade_confirmation_contracts
+  test_u2_upgrade_rollback_contracts
+}
+
+# Requires prepared generation 2. Each interruption restores its reserve
+# and enrollment, leaving no lifecycle lock or recovery state for the next group.
+test_u2_revocation_reserve_contracts() {
   u2_pause_marker="$tmp/u2-revocation-reserve-pause"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" \
     ROUNDHOUSE_U2_PAUSE_AT=revocation-reserve-released \
@@ -730,7 +763,11 @@ test_u2_revocation_contracts() {
     [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&
     [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/2 ] ||
     fail "U2 killed reserve-temp restoration did not recover atomically"
+}
 
+# Requires prepared generation 2. Contention and repeated SIGKILL recovery
+# must restore its exact enrolled state before subsequent revocation checks.
+test_u2_revocation_recovery_contracts() {
   u2_revoke_crash_before=$(u2_enrollment_state_digest)
   u2_pause_marker="$tmp/u2-revoke-lock-pause"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" \
@@ -793,7 +830,11 @@ test_u2_revocation_contracts() {
     [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&
     [ ! -e "$u2_root/var/lib/roundhouse/quarantine/revoked-2-$u2_manifest2_digest" ] ||
     fail "U2 repeated revoke SIGKILL recovery did not restore exact enrolled state"
+}
 
+# Requires prepared generation 2. Checks rollback and draining, then revokes
+# the enrollment while retaining quarantine and completed-request evidence.
+test_u2_revocation_rollback_contracts() {
   u2_revoke_before=$(u2_enrollment_state_digest)
   cp "$tmp/u2-enrollment-state" "$tmp/u2-revoke-before-state"
   for u2_failpoint in revoke-after-sudoers revoke-after-quarantine revoke-after-public-status; do
@@ -858,6 +899,22 @@ test_u2_revocation_contracts() {
     fail "U2 collector did not keep unenrolled macOS actions inactive"
 }
 
+test_u2_revocation_contracts() {
+  printf '%064d\n' 0 >"$u2_generation2/ssh-keygen.sha256"
+  test_u2_revocation_reserve_contracts
+  test_u2_revocation_recovery_contracts
+  test_u2_revocation_rollback_contracts
+}
+
+# Requires generation 1 with its completed request. Previews and installs
+# generation 2, then invalidates its OpenSSH attestation for revocation checks.
+prepare_u2_revocation_contract_fixture() {
+  prepare_u2_upgrade_candidate
+  preview_u2_upgrade_candidate
+  complete_u2_upgrade_fixture
+  printf '%064d\n' 0 >"$u2_generation2/ssh-keygen.sha256"
+}
+
 # The composite scope retains the complete sequential contract. Each CI scope
 # builds its own fixture; collector, upgrade, and revocation use real enrollment.
 test_u2_contracts() {
@@ -891,29 +948,51 @@ test_u2_contracts() {
   exit 0
 }
 
-[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-upgrade-contracts ] || {
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-upgrade-confirmation-contracts ] || {
   setup_u2_fixture
   prepare_u2_collector_fixture
   prepare_u2_completed_request_fixture
-  test_u2_upgrade_contracts
-  printf 'PASS: U2 upgrade contracts\n'
+  prepare_u2_upgrade_contract_fixture
+  test_u2_upgrade_confirmation_contracts
+  test_u2_upgrade_failpoints after-drain after-generation after-broker
+  printf 'PASS: U2 upgrade confirmation contracts\n'
   exit 0
 }
 
-[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-revocation-contracts ] || {
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-upgrade-rollback-contracts ] || {
   setup_u2_fixture
   prepare_u2_collector_fixture
   prepare_u2_completed_request_fixture
-  prepare_u2_upgrade_candidate
-  preview_u2_upgrade_candidate
-  complete_u2_upgrade_fixture
-  test_u2_revocation_contracts
-  printf 'PASS: U2 revocation contracts\n'
+  prepare_u2_upgrade_contract_fixture
+  test_u2_upgrade_failpoints after-trust after-sudoers after-active after-public-receipt
+  test_u2_upgrade_completion_contracts
+  printf 'PASS: U2 upgrade rollback contracts\n'
+  exit 0
+}
+
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-revocation-recovery-contracts ] || {
+  setup_u2_fixture
+  prepare_u2_collector_fixture
+  prepare_u2_completed_request_fixture
+  prepare_u2_revocation_contract_fixture
+  test_u2_revocation_recovery_contracts
+  printf 'PASS: U2 revocation recovery contracts\n'
+  exit 0
+}
+
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-revocation-rollback-contracts ] || {
+  setup_u2_fixture
+  prepare_u2_collector_fixture
+  prepare_u2_completed_request_fixture
+  prepare_u2_revocation_contract_fixture
+  test_u2_revocation_reserve_contracts
+  test_u2_revocation_rollback_contracts
+  printf 'PASS: U2 revocation rollback contracts\n'
   exit 0
 }
 
 # Manual full-suite alias. CI scope discovery explicitly excludes this alias
-# because the five independent scopes above already execute every case.
+# because the seven independent scopes above already execute every case.
 [ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-contracts ] || {
   test_u2_contracts
   printf 'PASS: U2 contracts\n'

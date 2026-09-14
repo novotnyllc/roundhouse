@@ -60,19 +60,24 @@ POSIX platform, fanned out from the `scope-matrix` job) and `windows`
 
    Today that is `chezmoi-fixture`, `u1-characterization`, `u1-contracts`,
    `u2-broker-contracts`, `u2-enrollment-contracts`, `u2-collector-contracts`,
-   `u2-upgrade-contracts`, `u2-revocation-contracts`, `u4-contracts`,
-   `u5-contracts` and `macos-privilege-contracts`.
+   `u2-upgrade-confirmation-contracts`, `u2-upgrade-rollback-contracts`,
+   `u2-revocation-recovery-contracts`, `u2-revocation-rollback-contracts`,
+   `u4-contracts`, `u5-contracts` and `macos-privilege-contracts`.
    Each U2 scope builds fresh keys, signed bundles, and native command fixtures.
    The collector, upgrade, and revocation scopes activate their fixtures
    through real enrollment preview and installation, then execute a real
    signed broker request. The collector scope checks requests, journals, and
-   readiness. The upgrade scope checks upgrade failures and recovery.
-   The revocation scope first completes a real successful upgrade to generation 2,
-   then checks revocation failures and recovery. The upgrade failure matrix runs
-   only in the upgrade scope.
+   readiness. Upgrade confirmation checks cover races, abandoned pauses, stale
+   owners, and the first three rollback failpoints; upgrade rollback checks cover
+   the final four failpoints and draining retries. Together they retain the same
+   seven-case rollback matrix, which the manual composite runs in full.
+   Each revocation scope first completes a real upgrade to generation 2.
+   Revocation recovery checks cover lock contention and repeated SIGKILL recovery;
+   revocation rollback checks cover reserve interruption, failpoints, and final
+   revocation. The manual composite retains every case in its original order.
    All rejection and lifecycle failure cases remain in the contract bodies.
    `ROUNDHOUSE_TEST_SCOPE=u2-contracts` still runs the complete U2 sequence
-   manually; CI excludes that composite alias to avoid repeating the five jobs.
+   manually; CI excludes that composite alias to avoid repeating the seven jobs.
    Serially the loop costs several times one
    default run, because the scopes share prefixes they each re-execute; CI
    parallelises it instead.

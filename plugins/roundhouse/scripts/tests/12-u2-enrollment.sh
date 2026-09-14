@@ -5,8 +5,8 @@
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
 
-# Shared setup performs real preview/installation for the standalone collector
-# scope. Failure matrices remain in the enrollment contract body below.
+# Requires setup_u2_fixture. Runs the real generation-1 enrollment preview
+# and sets u2_confirmation_digest for the staged u2_bundle.
 preview_u2_fixture() {
   if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" preview "$u2_bundle" \
       >"$tmp/u2-preview"; then
@@ -21,6 +21,8 @@ preview_u2_fixture() {
   [ "${#u2_confirmation_digest}" -eq 64 ] || fail "U2 enrollment preview omitted its confirmation digest"
 }
 
+# Requires installed generation 1. Checks its canary, grants, attestation,
+# and allocated reserve; sets u2_revocation_reserve for lifecycle tests.
 assert_u2_enrolled_fixture() {
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" status >"$tmp/u2-enrolled"
   grep -Fqx 'state|enrolled' "$tmp/u2-enrolled" || fail "U2 fixture enrollment did not activate"
@@ -61,6 +63,8 @@ assert_u2_enrolled_fixture() {
     fail "U2 repeated SIGKILL recovery left lifecycle transaction artifacts"
 }
 
+# Requires installed generation 1. Binds request digests, defines the signed
+# u2_make_envelope helper, and records u2_now for request validity windows.
 prepare_u2_broker_requests() {
   u2_broker_digest=$(u2_sha256 "$broker")
   u2_constraints_digest=$(u2_sha256 "$u2_root/etc/roundhouse/generations/1/policy.constraints")
@@ -148,6 +152,8 @@ EOF
   u2_now=$(date -u +%s)
 }
 
+# Requires setup_u2_fixture. Enrolls generation 1 through real preview/install,
+# validates it, and prepares signing state for the standalone scopes.
 prepare_u2_collector_fixture() {
   preview_u2_fixture
   if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle" \

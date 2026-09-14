@@ -218,7 +218,7 @@
     },
     {
       "path": "scripts/select-sections",
-      "sha256": "ff934fb48789fb4a9b5d97faa896ece2e9ffed8184cc0baba20dc56ddd0c9731"
+      "sha256": "5d831a4c37708d5880d781a1d058ca547f803e255eef48008a9bfcb7d5522168"
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",

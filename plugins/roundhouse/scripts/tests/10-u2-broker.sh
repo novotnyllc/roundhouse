@@ -5,6 +5,8 @@
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
 
+# Requires the shared test preamble. Creates fresh keys, native command
+# fixtures, and a signed generation-1 bundle; sets U2 globals and helpers.
 setup_u2_fixture() {
   broker="$script_dir/privilege-broker-posix"
   enrollment="$script_dir/enroll-privilege-posix"
