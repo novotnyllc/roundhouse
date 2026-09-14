@@ -5,8 +5,8 @@
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
 
-# Both standalone scopes establish the same signed terminal result through
-# the real broker before checking requests or exercising lifecycle recovery.
+# Collector, upgrade, and revocation scopes establish the same signed
+# terminal result through the real broker before exercising their contracts.
 prepare_u2_completed_request_fixture() {
   u2_happy=$(u2_make_envelope apt.update-metadata.v1 \
     request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)))
@@ -461,7 +461,7 @@ test_u2_collector_contracts() {
 
 }
 
-test_u2_lifecycle_contracts() {
+prepare_u2_upgrade_candidate() {
   u2_build2="$tmp/u2-bundle-2"
   u2_generation2="$u2_root/etc/roundhouse/generations/2"
   cp -Rp "$u2_bundle" "$u2_build2"
@@ -504,7 +504,9 @@ test_u2_lifecycle_contracts() {
   printf 'bootstrap|1|manifest-sha256=%s|release-principal=roundhouse-release\n' \
     "$u2_manifest2_digest" >"$u2_bootstrap/receipts/$u2_manifest2_digest"
   chmod -R go-w "$u2_root"
-  printf '%064d\n' 0 >"$u2_generation/ssh-keygen.sha256"
+}
+
+preview_u2_upgrade_candidate() {
   if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" preview "$u2_bundle2" \
       >"$tmp/u2-preview2"; then
     cat "$tmp/u2-preview2" >&2
@@ -513,6 +515,33 @@ test_u2_lifecycle_contracts() {
   grep -Fqx 'from-epoch|1' "$tmp/u2-preview2" && grep -Fqx 'to-epoch|2' "$tmp/u2-preview2" ||
     fail "U2 upgrade preview did not describe the generation transition"
   u2_confirmation2_digest=$(awk -F '|' '$1=="confirmation-sha256"{print $2}' "$tmp/u2-preview2")
+
+}
+
+# Shared success path installs generation 2 and checks its native attestation
+# and collector readiness after either a clean or resumable upgrade.
+complete_u2_upgrade_fixture() {
+  if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle2" \
+      "$u2_manifest2_digest" "$u2_confirmation2_digest" >"$tmp/u2-upgraded"; then
+    cat "$tmp/u2-upgraded" >&2
+    fail "U2 resumable upgrade was rejected"
+  fi
+  [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/2 ] &&
+    [ -d "$u2_generation2" ] && [ ! -e "$u2_root/var/lib/roundhouse/draining" ] ||
+    fail "U2 resumable upgrade did not activate generation 2"
+  [ "$(sed -n '1p' "$u2_generation2/ssh-keygen.sha256")" = "$(u2_sha256 /usr/bin/ssh-keygen)" ] ||
+    fail "U2 authenticated upgrade did not repair the OpenSSH attestation"
+  ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_IDENTITY="$tmp/u2-no-identity" \
+    "$collector" "$tmp/config.json" test-apt u2-upgraded-readiness none >"$tmp/u2-upgraded-readiness.jsonl"
+  [ "$(jq -r 'select(.kind=="privilege_broker") | [.data.lifecycle_status,.data.enrollment_epoch] | @tsv' \
+    "$tmp/u2-upgraded-readiness.jsonl")" = "$(printf 'ready\t2')" ] ||
+    fail "U2 collector did not validate the upgraded generation"
+}
+
+test_u2_upgrade_contracts() {
+  prepare_u2_upgrade_candidate
+  printf '%064d\n' 0 >"$u2_generation/ssh-keygen.sha256"
+  preview_u2_upgrade_candidate
 
   u2_under_lock_before=$(u2_enrollment_state_digest)
   u2_candidate_policy_mode=$(test_file_mode "$u2_bundle2/policy.actions")
@@ -647,22 +676,10 @@ EOF
   [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/1 ] ||
     fail "U2 draining upgrade changed the active generation"
   rmdir "$u2_root/var/lib/roundhouse/lock/active"
-  if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle2" \
-      "$u2_manifest2_digest" "$u2_confirmation2_digest" >"$tmp/u2-upgraded"; then
-    cat "$tmp/u2-upgraded" >&2
-    fail "U2 resumable upgrade was rejected"
-  fi
-  [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/2 ] &&
-    [ -d "$u2_generation2" ] && [ ! -e "$u2_root/var/lib/roundhouse/draining" ] ||
-    fail "U2 resumable upgrade did not activate generation 2"
-  [ "$(sed -n '1p' "$u2_generation2/ssh-keygen.sha256")" = "$(u2_sha256 /usr/bin/ssh-keygen)" ] ||
-    fail "U2 authenticated upgrade did not repair the OpenSSH attestation"
-  ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_IDENTITY="$tmp/u2-no-identity" \
-    "$collector" "$tmp/config.json" test-apt u2-upgraded-readiness none >"$tmp/u2-upgraded-readiness.jsonl"
-  [ "$(jq -r 'select(.kind=="privilege_broker") | [.data.lifecycle_status,.data.enrollment_epoch] | @tsv' \
-    "$tmp/u2-upgraded-readiness.jsonl")" = "$(printf 'ready\t2')" ] ||
-    fail "U2 collector did not validate the upgraded generation"
+  complete_u2_upgrade_fixture
+}
 
+test_u2_revocation_contracts() {
   printf '%064d\n' 0 >"$u2_generation2/ssh-keygen.sha256"
   u2_pause_marker="$tmp/u2-revocation-reserve-pause"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" \
@@ -842,13 +859,14 @@ EOF
 }
 
 # The composite scope retains the complete sequential contract. Each CI scope
-# builds its own fixture; collector and lifecycle setup use real enrollment.
+# builds its own fixture; collector, upgrade, and revocation use real enrollment.
 test_u2_contracts() {
   setup_u2_fixture
   test_u2_broker_contracts
   test_u2_enrollment_contracts
   test_u2_collector_contracts
-  test_u2_lifecycle_contracts
+  test_u2_upgrade_contracts
+  test_u2_revocation_contracts
 }
 
 [ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-broker-contracts ] || {
@@ -873,17 +891,29 @@ test_u2_contracts() {
   exit 0
 }
 
-[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-lifecycle-contracts ] || {
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-upgrade-contracts ] || {
   setup_u2_fixture
   prepare_u2_collector_fixture
   prepare_u2_completed_request_fixture
-  test_u2_lifecycle_contracts
-  printf 'PASS: U2 lifecycle contracts\n'
+  test_u2_upgrade_contracts
+  printf 'PASS: U2 upgrade contracts\n'
+  exit 0
+}
+
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-revocation-contracts ] || {
+  setup_u2_fixture
+  prepare_u2_collector_fixture
+  prepare_u2_completed_request_fixture
+  prepare_u2_upgrade_candidate
+  preview_u2_upgrade_candidate
+  complete_u2_upgrade_fixture
+  test_u2_revocation_contracts
+  printf 'PASS: U2 revocation contracts\n'
   exit 0
 }
 
 # Manual full-suite alias. CI scope discovery explicitly excludes this alias
-# because the four independent scopes above already execute every case.
+# because the five independent scopes above already execute every case.
 [ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-contracts ] || {
   test_u2_contracts
   printf 'PASS: U2 contracts\n'
