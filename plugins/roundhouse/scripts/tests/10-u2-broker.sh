@@ -5,7 +5,7 @@
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
 
-test_u2_broker_contracts() {
+setup_u2_fixture() {
   broker="$script_dir/privilege-broker-posix"
   enrollment="$script_dir/enroll-privilege-posix"
   collector="$script_dir/collect-posix"
@@ -13,17 +13,6 @@ test_u2_broker_contracts() {
   [ -x "$enrollment" ] || fail "U2 POSIX enrollment entrypoint is missing or not executable"
 
   apt_marker="$tmp/u2-apt-executed"
-  if APT_EXEC_MARKER="$apt_marker" "$broker" unexpected </dev/null >/dev/null 2>&1; then
-    fail "U2 broker accepted an argument"
-  fi
-  [ ! -e "$apt_marker" ] || fail "U2 argument rejection reached APT"
-
-  if printf '%s\n' 'request|2' | APT_EXEC_MARKER="$apt_marker" \
-      "$broker" >/dev/null 2>&1; then
-    fail "U2 broker accepted an unknown request version"
-  fi
-  [ ! -e "$apt_marker" ] || fail "U2 malformed request reached APT"
-
   u2_root="$tmp/u2-root"
   u2_bootstrap="$u2_root/var/lib/roundhouse-bootstrap"
   u2_build="$tmp/u2-bundle"
@@ -567,6 +556,20 @@ EOF
       "$stage_digest" >"$u2_bootstrap/receipts/$stage_digest"
     chmod -R go-w "$u2_staged_candidate" "$u2_bootstrap/receipts/$stage_digest"
   }
+
+}
+
+test_u2_broker_contracts() {
+  if APT_EXEC_MARKER="$apt_marker" "$broker" unexpected </dev/null >/dev/null 2>&1; then
+    fail "U2 broker accepted an argument"
+  fi
+  [ ! -e "$apt_marker" ] || fail "U2 argument rejection reached APT"
+
+  if printf '%s\n' 'request|2' | APT_EXEC_MARKER="$apt_marker" \
+      "$broker" >/dev/null 2>&1; then
+    fail "U2 broker accepted an unknown request version"
+  fi
+  [ ! -e "$apt_marker" ] || fail "U2 malformed request reached APT"
 
   for u2_writable_mode in 775 757 777 1777; do
     chmod "$u2_writable_mode" "$u2_bundle/apt/sources.list.d"

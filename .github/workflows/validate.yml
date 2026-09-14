@@ -203,8 +203,11 @@ jobs:
           fi
           if [ "$scopes" = all ]; then
             scopes=$(grep -ho 'ROUNDHOUSE_TEST_SCOPE:-}" != [a-z0-9-]*' \
-              plugins/roundhouse/scripts/tests/*.sh | sed 's/.*!= //' | sort -u)
+              plugins/roundhouse/scripts/tests/*.sh | sed 's/.*!= //' |
+              grep -v '^u2-contracts$' | sort -u)
           fi
+          # u2-contracts remains a manual composite. Its three independent
+          # scopes cover every case without duplicating the serial long job.
           printf 'scopes: %s\n' "$(printf '%s' "$scopes" | tr '\n' ' ')"
           # No implicated scope is a legitimate answer (docs-only changes), and
           # grep exits 1 on no match, which under `set -o pipefail` would abort

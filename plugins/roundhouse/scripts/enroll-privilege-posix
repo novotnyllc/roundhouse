@@ -160,21 +160,45 @@ sha256_stream() {
   printf '%s\n' "$hash_output"
 }
 
-safe_permissions() {
-  mode=$(file_mode "$1") || return 1
+permissions_mode_safe() {
+  mode=$1
   permissions=$mode
   [ "${#permissions}" -le 3 ] || permissions=${permissions: -3}
   [ "${#permissions}" -eq 3 ] || return 1
   case ${permissions:1:2} in *2*|*3*|*6*|*7*) return 1 ;; esac
 }
 
+safe_permissions() {
+  mode=$(file_mode "$1") || return 1
+  permissions_mode_safe "$mode"
+}
+
+protected_metadata() {
+  local protected_metadata_record protected_metadata_owner protected_metadata_tail
+  local protected_metadata_mode protected_metadata_size
+  # Read a fresh tuple for this guard only. Later exact-mode, digest, and
+  # under-lock checks still perform their own metadata reads.
+  protected_metadata_record=$(portable_stat '%Su|%Lp|%z' '%U|%a|%s' "$1") || return 1
+  case $protected_metadata_record in *$'\n'*|*$'\r'*) return 1 ;; esac
+  protected_metadata_owner=${protected_metadata_record%%|*}
+  protected_metadata_tail=${protected_metadata_record#*|}
+  protected_metadata_mode=${protected_metadata_tail%%|*}
+  protected_metadata_size=${protected_metadata_tail#*|}
+  [ "$protected_metadata_record" = \
+    "$protected_metadata_owner|$protected_metadata_mode|$protected_metadata_size" ] || return 1
+  case $protected_metadata_mode in ''|*[!0-7]*) return 1 ;; esac
+  case $protected_metadata_size in ''|*[!0-9]*) return 1 ;; esac
+  [ "$protected_metadata_owner" = "$2" ] &&
+    permissions_mode_safe "$protected_metadata_mode" &&
+    { [ "$#" -lt 3 ] || [ "$protected_metadata_size" -le "$3" ]; }
+}
+
 protected_directory() {
-  if [ -d "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$protected_owner" ] &&
-    safe_permissions "$1"; then
+  if [ -d "$1" ] && [ ! -L "$1" ] && protected_metadata "$1" "$protected_owner"; then
     return 0
   fi
   [ "$fixture_mode" = false ] && [ "$platform_boundary" = macos ] && [ -L "$1" ] || return 1
-  [ "$(file_owner "$1")" = root ] && safe_permissions "$1" && protected_directory /private || return 1
+  protected_metadata "$1" root && protected_directory /private || return 1
   case $1 in
     /etc) [ "$(/usr/bin/readlink /etc)" = private/etc ] && protected_directory /private/etc ;;
     /var) [ "$(/usr/bin/readlink /var)" = private/var ] && protected_directory /private/var ;;
@@ -183,8 +207,7 @@ protected_directory() {
 }
 
 protected_file() {
-  [ -f "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$protected_owner" ] &&
-    safe_permissions "$1" && [ "$(file_size "$1")" -le "$2" ]
+  [ -f "$1" ] && [ ! -L "$1" ] && protected_metadata "$1" "$protected_owner" "$2"
 }
 
 system_ssh_keygen_digest() {

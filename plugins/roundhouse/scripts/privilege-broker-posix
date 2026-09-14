@@ -202,8 +202,8 @@ https_source_uri() {
   for segment in "${uri_segments[@]}"; do [ "$segment" != . ] && [ "$segment" != .. ] || return 1; done
 }
 
-permissions_safe() {
-  mode=$(file_mode "$1") || return 1
+permissions_mode_safe() {
+  mode=$1
   permissions=$mode
   [ "${#permissions}" -le 3 ] || permissions=${permissions: -3}
   [ "${#permissions}" -eq 3 ] || return 1
@@ -212,14 +212,38 @@ permissions_safe() {
   case $group_digit$world_digit in *2*|*3*|*6*|*7*) return 1 ;; esac
 }
 
+permissions_safe() {
+  mode=$(file_mode "$1") || return 1
+  permissions_mode_safe "$mode"
+}
+
+protected_metadata() {
+  local protected_metadata_record protected_metadata_owner protected_metadata_tail
+  local protected_metadata_mode protected_metadata_size
+  # Read a fresh tuple for this guard only. Later exact-mode, digest, and
+  # under-lock checks still perform their own metadata reads.
+  protected_metadata_record=$(portable_stat '%Su|%Lp|%z' '%U|%a|%s' "$1") || return 1
+  case $protected_metadata_record in *$'\n'*|*$'\r'*) return 1 ;; esac
+  protected_metadata_owner=${protected_metadata_record%%|*}
+  protected_metadata_tail=${protected_metadata_record#*|}
+  protected_metadata_mode=${protected_metadata_tail%%|*}
+  protected_metadata_size=${protected_metadata_tail#*|}
+  [ "$protected_metadata_record" = \
+    "$protected_metadata_owner|$protected_metadata_mode|$protected_metadata_size" ] || return 1
+  case $protected_metadata_mode in ''|*[!0-7]*) return 1 ;; esac
+  case $protected_metadata_size in ''|*[!0-9]*) return 1 ;; esac
+  [ "$protected_metadata_owner" = "$2" ] &&
+    permissions_mode_safe "$protected_metadata_mode" &&
+    { [ "$#" -lt 3 ] || [ "$protected_metadata_size" -le "$3" ]; }
+}
+
 protected_directory() {
   path=$1
-  if [ -d "$path" ] && [ ! -L "$path" ] &&
-    [ "$(file_owner "$path")" = "$protected_owner" ] && permissions_safe "$path"; then
+  if [ -d "$path" ] && [ ! -L "$path" ] && protected_metadata "$path" "$protected_owner"; then
     return 0
   fi
   [ "$fixture_mode" = false ] && [ "$broker_platform" = macos ] && [ -L "$path" ] || return 1
-  [ "$(file_owner "$path")" = root ] && permissions_safe "$path" && protected_directory /private || return 1
+  protected_metadata "$path" root && protected_directory /private || return 1
   case $path in
     /etc) [ "$(/usr/bin/readlink /etc)" = private/etc ] && protected_directory /private/etc ;;
     /var) [ "$(/usr/bin/readlink /var)" = private/var ] && protected_directory /private/var ;;
@@ -230,9 +254,7 @@ protected_directory() {
 protected_file() {
   path=$1
   maximum=$2
-  [ -f "$path" ] && [ ! -L "$path" ] &&
-    [ "$(file_owner "$path")" = "$protected_owner" ] && permissions_safe "$path" &&
-    [ "$(file_size "$path")" -le "$maximum" ]
+  [ -f "$path" ] && [ ! -L "$path" ] && protected_metadata "$path" "$protected_owner" "$maximum"
 }
 
 attested_system_ssh_keygen() {

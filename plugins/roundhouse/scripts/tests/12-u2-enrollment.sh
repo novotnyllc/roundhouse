@@ -5,7 +5,9 @@
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
 
-test_u2_enrollment_contracts() {
+# Shared setup performs real preview/installation for the standalone collector
+# scope. Failure matrices remain in the enrollment contract body below.
+preview_u2_fixture() {
   if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" preview "$u2_bundle" \
       >"$tmp/u2-preview"; then
     cat "$tmp/u2-preview" >&2
@@ -17,6 +19,151 @@ test_u2_enrollment_contracts() {
     "$tmp/u2-preview" || fail "U2 enrollment preview omitted bound APT source authority"
   u2_confirmation_digest=$(awk -F '|' '$1=="confirmation-sha256"{print $2}' "$tmp/u2-preview")
   [ "${#u2_confirmation_digest}" -eq 64 ] || fail "U2 enrollment preview omitted its confirmation digest"
+}
+
+assert_u2_enrolled_fixture() {
+  ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" status >"$tmp/u2-enrolled"
+  grep -Fqx 'state|enrolled' "$tmp/u2-enrolled" || fail "U2 fixture enrollment did not activate"
+  grep -Fqx 'scope|fixture' "$u2_root/var/lib/roundhouse-public/canary" ||
+    fail "U2 fixture canary was not labeled"
+  grep -Fqx 'positive-no-argument|fixture-simulated-broker-reached' \
+    "$u2_root/var/lib/roundhouse-public/canary" ||
+    fail "U2 fixture positive canary was not explicit"
+  grep -Fqx 'negative-with-argument|fixture-passed' "$u2_root/var/lib/roundhouse-public/canary" ||
+    fail "U2 fixture negative argument canary did not pass"
+  grep -Fqx 'complete-sudoers|fixture-not-run' "$u2_root/var/lib/roundhouse-public/canary" ||
+    fail "U2 fixture claimed complete native sudoers validation"
+  [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/1 ] ||
+    fail "U2 enrollment did not atomically select generation 1"
+  [ -x "$u2_root/usr/libexec/roundhouse/posix-broker" ] ||
+    fail "U2 enrollment did not install the protected broker"
+  grep -Fqx 'roundhouse ALL=(root) NOPASSWD:NOSETENV: /usr/libexec/roundhouse/posix-broker ""' \
+    "$u2_root/etc/sudoers.d/roundhouse-posix-broker" ||
+    fail "U2 sudoers fixture was not the fixed no-argument broker grant"
+  [ -f "$u2_root/var/lib/roundhouse-public/enrollment" ] &&
+    [ -f "$u2_root/var/lib/roundhouse-public/canary" ] ||
+    fail "U2 enrollment did not create public status before the first request"
+  u2_revocation_reserve="$u2_root/var/lib/roundhouse/revocation.reserve"
+  u2_reserve_size=$(t_size "$u2_revocation_reserve")
+  u2_reserve_blocks=$(t_blocks "$u2_revocation_reserve")
+  u2_reserve_device=$(t_device "$u2_revocation_reserve")
+  u2_state_device=$(t_device "$u2_root/var/lib/roundhouse")
+  [ "$u2_reserve_size" -eq 4194304 ] && [ $((u2_reserve_blocks * 512)) -ge 1048576 ] &&
+    [ "$u2_reserve_device" = "$u2_state_device" ] ||
+    fail "U2 enrollment did not allocate a real same-filesystem revocation reserve"
+  [ "$(sed -n '1p' "$u2_generation/ssh-keygen.sha256")" = "$(u2_sha256 /usr/bin/ssh-keygen)" ] &&
+    [ "$(wc -l <"$u2_generation/ssh-keygen.sha256" | tr -d ' ')" = 1 ] ||
+    fail "U2 enrollment did not bind the absolute system ssh-keygen into the generation"
+  [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] &&
+  [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&
+    [ ! -e "$u2_root/var/lib/roundhouse/rollback/install-0-1-$u2_manifest_digest" ] ||
+    fail "U2 repeated SIGKILL recovery left lifecycle transaction artifacts"
+}
+
+prepare_u2_broker_requests() {
+  u2_broker_digest=$(u2_sha256 "$broker")
+  u2_constraints_digest=$(u2_sha256 "$u2_root/etc/roundhouse/generations/1/policy.constraints")
+  u2_context_digest=$(u2_sha256 "$u2_root/etc/roundhouse/generations/1/context.canary")
+  u2_metadata_digest=$(printf '%s\n' 'metadata|1' | u2_sha256_stream)
+  u2_precondition_digest=$(printf 'metadata|%s\n' "$u2_metadata_digest" | u2_sha256_stream)
+  u2_make_envelope() {
+    envelope_action=$1
+    envelope_request_id=$2
+    envelope_created=$3
+    envelope_expiry=$4
+    envelope_node=${5:-node-a}
+    envelope_token=${6:--}
+    envelope_manager=${7:-not-applicable}
+    envelope_protocol=${8:-1}
+    envelope_plan=${9:-plan-0123456789abcdef}
+    envelope_certificate=${10:-$tmp/u2-node-key-cert.pub}
+    envelope_precondition=${11:-$u2_precondition_digest}
+    envelope_epoch=${12:-1}
+    envelope_ca_fingerprint=${13:-${u2_request_ca_fingerprint:-$u2_ca_fingerprint}}
+    envelope_ca_generation=${14:-${u2_request_ca_generation:-1}}
+    envelope_node_fingerprint=$("$ssh_keygen" -lf "$envelope_certificate" -E sha256 | awk 'NR==1{print $2}')
+    envelope_serial=$(TZ=UTC "$ssh_keygen" -Lf "$envelope_certificate" | awk '/Serial:/{print $2;exit}')
+    envelope_valid_after=$(TZ=UTC "$ssh_keygen" -Lf "$envelope_certificate" |
+      awk '/Valid: from/{gsub(/[-:]/,"",$3);print $3"Z"}')
+    envelope_valid_before=$(TZ=UTC "$ssh_keygen" -Lf "$envelope_certificate" |
+      awk '/Valid: from/{gsub(/[-:]/,"",$5);print $5"Z"}')
+    request_suffix=${envelope_request_id#request-}
+    request_file="$tmp/u2-request-$request_suffix"
+    signature_file="$request_file.sig"
+    envelope_file="$tmp/u2-envelope-$request_suffix"
+    rm -f "$signature_file"
+    [ ! -e "$signature_file" ] || fail "U2 signature output collision could not be removed"
+    envelope_private=${envelope_certificate%-cert.pub}
+    [ "$envelope_private" != "$envelope_certificate" ] && [ -f "$envelope_private" ] ||
+      fail "U2 certificate did not resolve to its fixture-private sibling"
+    cat >"$request_file" <<EOF
+request|1
+target-host-id|test-apt
+target-uid|$u2_uid
+plan-id|$envelope_plan
+request-id|$envelope_request_id
+action-id|$envelope_action
+policy-token|$envelope_token
+broker-protocol|$envelope_protocol
+broker-version|${u2_request_broker_version:-1.0.0}
+broker-sha256|$u2_broker_digest
+policy-sha256|$u2_policy_digest
+constraints-sha256|$u2_constraints_digest
+precondition-sha256|$envelope_precondition
+created-at|$envelope_created
+expires-at|$envelope_expiry
+transport|posix-ssh
+request-principal|roundhouse
+required-context|posix-root-v1
+observed-execution-principal|root
+console-session-state|none
+platform-boundary|linux
+enrollment-epoch|$envelope_epoch
+context-canary-sha256|$u2_context_digest
+pinned-host-key-fingerprint|$u2_host_fingerprint
+node-id|$envelope_node
+fleet-domain|fleet.example
+fleet-ca-fingerprint|$envelope_ca_fingerprint
+ca-generation|$envelope_ca_generation
+node-key-fingerprint|$envelope_node_fingerprint
+certificate-serial|$envelope_serial
+certificate-valid-after|$envelope_valid_after
+certificate-valid-before|$envelope_valid_before
+certificate-source-addresses|-
+manager-source-identity|$envelope_manager
+end-request|
+EOF
+    SSH_AUTH_SOCK='' "$ssh_keygen" -Y sign -f "$envelope_certificate" -n roundhouse-request \
+      "$request_file" >/dev/null
+    {
+      cat "$request_file"
+      printf 'certificate|%s\nsignature-begin\n' "$(sed -n '1p' "$envelope_certificate")"
+      cat "$signature_file"
+      printf 'end-envelope\n'
+    } >"$envelope_file"
+    printf '%s\n' "$envelope_file"
+  }
+
+  u2_now=$(date -u +%s)
+}
+
+prepare_u2_collector_fixture() {
+  preview_u2_fixture
+  if ! ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle" \
+      "$u2_manifest_digest" "$u2_confirmation_digest" >"$tmp/u2-collector-enrollment"; then
+    cat "$tmp/u2-collector-enrollment" >&2
+    fail "U2 standalone collector fixture enrollment failed"
+  fi
+  grep -Fqx 'state|enrolled' "$tmp/u2-collector-enrollment" &&
+    grep -Fqx 'reason|generation_activated' "$tmp/u2-collector-enrollment" ||
+    fail "U2 standalone collector fixture did not activate through real enrollment"
+  assert_u2_enrolled_fixture
+  prepare_u2_broker_requests
+}
+
+test_u2_enrollment_contracts() {
+  preview_u2_fixture
   for u2_preview_binding in uri suite component publisher; do
     u2_attack_build="$tmp/u2-preview-binding-$u2_preview_binding"
     cp -R "$u2_bundle" "$u2_attack_build"
@@ -483,43 +630,7 @@ test_u2_enrollment_contracts() {
     [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&
     grep -Fqx unrelated-survives "$u2_root/var/lib/roundhouse/unrelated-lifecycle-sentinel" ||
     fail "U2 committed retry rolled back new state or left lifecycle debris"
-  ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" status >"$tmp/u2-enrolled"
-  grep -Fqx 'state|enrolled' "$tmp/u2-enrolled" || fail "U2 fixture enrollment did not activate"
-  grep -Fqx 'scope|fixture' "$u2_root/var/lib/roundhouse-public/canary" ||
-    fail "U2 fixture canary was not labeled"
-  grep -Fqx 'positive-no-argument|fixture-simulated-broker-reached' \
-    "$u2_root/var/lib/roundhouse-public/canary" ||
-    fail "U2 fixture positive canary was not explicit"
-  grep -Fqx 'negative-with-argument|fixture-passed' "$u2_root/var/lib/roundhouse-public/canary" ||
-    fail "U2 fixture negative argument canary did not pass"
-  grep -Fqx 'complete-sudoers|fixture-not-run' "$u2_root/var/lib/roundhouse-public/canary" ||
-    fail "U2 fixture claimed complete native sudoers validation"
-  [ "$(readlink "$u2_root/etc/roundhouse/active")" = generations/1 ] ||
-    fail "U2 enrollment did not atomically select generation 1"
-  [ -x "$u2_root/usr/libexec/roundhouse/posix-broker" ] ||
-    fail "U2 enrollment did not install the protected broker"
-  grep -Fqx 'roundhouse ALL=(root) NOPASSWD:NOSETENV: /usr/libexec/roundhouse/posix-broker ""' \
-    "$u2_root/etc/sudoers.d/roundhouse-posix-broker" ||
-    fail "U2 sudoers fixture was not the fixed no-argument broker grant"
-  [ -f "$u2_root/var/lib/roundhouse-public/enrollment" ] &&
-    [ -f "$u2_root/var/lib/roundhouse-public/canary" ] ||
-    fail "U2 enrollment did not create public status before the first request"
-  u2_revocation_reserve="$u2_root/var/lib/roundhouse/revocation.reserve"
-  u2_reserve_size=$(t_size "$u2_revocation_reserve")
-  u2_reserve_blocks=$(t_blocks "$u2_revocation_reserve")
-  u2_reserve_device=$(t_device "$u2_revocation_reserve")
-  u2_state_device=$(t_device "$u2_root/var/lib/roundhouse")
-  [ "$u2_reserve_size" -eq 4194304 ] && [ $((u2_reserve_blocks * 512)) -ge 1048576 ] &&
-    [ "$u2_reserve_device" = "$u2_state_device" ] ||
-    fail "U2 enrollment did not allocate a real same-filesystem revocation reserve"
-  [ "$(sed -n '1p' "$u2_generation/ssh-keygen.sha256")" = "$(u2_sha256 /usr/bin/ssh-keygen)" ] &&
-    [ "$(wc -l <"$u2_generation/ssh-keygen.sha256" | tr -d ' ')" = 1 ] ||
-    fail "U2 enrollment did not bind the absolute system ssh-keygen into the generation"
-  [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] &&
-    [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] &&
-  [ ! -e "$u2_root/var/lib/roundhouse/draining" ] &&
-    [ ! -e "$u2_root/var/lib/roundhouse/rollback/install-0-1-$u2_manifest_digest" ] ||
-    fail "U2 repeated SIGKILL recovery left lifecycle transaction artifacts"
+  assert_u2_enrolled_fixture
 
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_IDENTITY="$tmp/u2-no-identity" \
     "$collector" "$tmp/config.json" test-apt u2-pre-broker-ready none \
@@ -544,90 +655,7 @@ test_u2_enrollment_contracts() {
     "$tmp/u2-live-apt-restored.jsonl")" = "$(printf 'ready\ttrue')" ] ||
     fail "U2 collector did not recover after restoring live APT authority"
 
-  u2_broker_digest=$(u2_sha256 "$broker")
-  u2_constraints_digest=$(u2_sha256 "$u2_root/etc/roundhouse/generations/1/policy.constraints")
-  u2_context_digest=$(u2_sha256 "$u2_root/etc/roundhouse/generations/1/context.canary")
-  u2_metadata_digest=$(printf '%s\n' 'metadata|1' | u2_sha256_stream)
-  u2_precondition_digest=$(printf 'metadata|%s\n' "$u2_metadata_digest" | u2_sha256_stream)
-  u2_make_envelope() {
-    envelope_action=$1
-    envelope_request_id=$2
-    envelope_created=$3
-    envelope_expiry=$4
-    envelope_node=${5:-node-a}
-    envelope_token=${6:--}
-    envelope_manager=${7:-not-applicable}
-    envelope_protocol=${8:-1}
-    envelope_plan=${9:-plan-0123456789abcdef}
-    envelope_certificate=${10:-$tmp/u2-node-key-cert.pub}
-    envelope_precondition=${11:-$u2_precondition_digest}
-    envelope_epoch=${12:-1}
-    envelope_ca_fingerprint=${13:-${u2_request_ca_fingerprint:-$u2_ca_fingerprint}}
-    envelope_ca_generation=${14:-${u2_request_ca_generation:-1}}
-    envelope_node_fingerprint=$("$ssh_keygen" -lf "$envelope_certificate" -E sha256 | awk 'NR==1{print $2}')
-    envelope_serial=$(TZ=UTC "$ssh_keygen" -Lf "$envelope_certificate" | awk '/Serial:/{print $2;exit}')
-    envelope_valid_after=$(TZ=UTC "$ssh_keygen" -Lf "$envelope_certificate" |
-      awk '/Valid: from/{gsub(/[-:]/,"",$3);print $3"Z"}')
-    envelope_valid_before=$(TZ=UTC "$ssh_keygen" -Lf "$envelope_certificate" |
-      awk '/Valid: from/{gsub(/[-:]/,"",$5);print $5"Z"}')
-    request_suffix=${envelope_request_id#request-}
-    request_file="$tmp/u2-request-$request_suffix"
-    signature_file="$request_file.sig"
-    envelope_file="$tmp/u2-envelope-$request_suffix"
-    rm -f "$signature_file"
-    [ ! -e "$signature_file" ] || fail "U2 signature output collision could not be removed"
-    envelope_private=${envelope_certificate%-cert.pub}
-    [ "$envelope_private" != "$envelope_certificate" ] && [ -f "$envelope_private" ] ||
-      fail "U2 certificate did not resolve to its fixture-private sibling"
-    cat >"$request_file" <<EOF
-request|1
-target-host-id|test-apt
-target-uid|$u2_uid
-plan-id|$envelope_plan
-request-id|$envelope_request_id
-action-id|$envelope_action
-policy-token|$envelope_token
-broker-protocol|$envelope_protocol
-broker-version|${u2_request_broker_version:-1.0.0}
-broker-sha256|$u2_broker_digest
-policy-sha256|$u2_policy_digest
-constraints-sha256|$u2_constraints_digest
-precondition-sha256|$envelope_precondition
-created-at|$envelope_created
-expires-at|$envelope_expiry
-transport|posix-ssh
-request-principal|roundhouse
-required-context|posix-root-v1
-observed-execution-principal|root
-console-session-state|none
-platform-boundary|linux
-enrollment-epoch|$envelope_epoch
-context-canary-sha256|$u2_context_digest
-pinned-host-key-fingerprint|$u2_host_fingerprint
-node-id|$envelope_node
-fleet-domain|fleet.example
-fleet-ca-fingerprint|$envelope_ca_fingerprint
-ca-generation|$envelope_ca_generation
-node-key-fingerprint|$envelope_node_fingerprint
-certificate-serial|$envelope_serial
-certificate-valid-after|$envelope_valid_after
-certificate-valid-before|$envelope_valid_before
-certificate-source-addresses|-
-manager-source-identity|$envelope_manager
-end-request|
-EOF
-    SSH_AUTH_SOCK='' "$ssh_keygen" -Y sign -f "$envelope_certificate" -n roundhouse-request \
-      "$request_file" >/dev/null
-    {
-      cat "$request_file"
-      printf 'certificate|%s\nsignature-begin\n' "$(sed -n '1p' "$envelope_certificate")"
-      cat "$signature_file"
-      printf 'end-envelope\n'
-    } >"$envelope_file"
-    printf '%s\n' "$envelope_file"
-  }
-
-  u2_now=$(date -u +%s)
+  prepare_u2_broker_requests
   cp -p "$u2_revocation_reserve" "$tmp/u2-revocation-reserve-real"
   rm -f "$u2_revocation_reserve"
   /bin/dd if=/dev/zero of="$u2_revocation_reserve" bs=1048576 count=0 seek=4 \

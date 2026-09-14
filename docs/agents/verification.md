@@ -52,14 +52,22 @@ POSIX platform, fanned out from the `scope-matrix` job) and `windows`
 
    ```sh
    for scope in $(grep -ho 'ROUNDHOUSE_TEST_SCOPE:-}" != [a-z0-9-]*' \
-       plugins/roundhouse/scripts/tests/*.sh | awk '{ print $NF }' | sort -u); do
+       plugins/roundhouse/scripts/tests/*.sh | awk '{ print $NF }' | \
+       grep -v '^u2-contracts$' | sort -u); do
      ROUNDHOUSE_TEST_SCOPE="$scope" plugins/roundhouse/scripts/test-roundhouse
    done
    ```
 
    Today that is `chezmoi-fixture`, `u1-characterization`, `u1-contracts`,
-   `u2-contracts`, `u4-contracts`, `u5-contracts` and
-   `macos-privilege-contracts`. Serially the loop costs several times one
+   `u2-broker-contracts`, `u2-enrollment-contracts`, `u2-collector-contracts`,
+   `u4-contracts`, `u5-contracts` and `macos-privilege-contracts`.
+   Each U2 scope builds fresh keys, signed bundles, and native command fixtures.
+   The collector scope activates its fixture through real enrollment preview
+   and installation before exercising broker requests, upgrade, and revocation.
+   All rejection and lifecycle failure cases remain in the contract bodies.
+   `ROUNDHOUSE_TEST_SCOPE=u2-contracts` still runs the complete U2 sequence
+   manually; CI excludes that composite alias to avoid repeating the three jobs.
+   Serially the loop costs several times one
    default run, because the scopes share prefixes they each re-execute; CI
    parallelises it instead.
 

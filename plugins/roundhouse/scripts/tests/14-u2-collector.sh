@@ -831,15 +831,39 @@ EOF
     fail "U2 collector did not keep unenrolled macOS actions inactive"
 }
 
-# One 2,150-line function until this split. The three parts run in order
-# and share the globals the first one sets, so the sequence a scoped run
-# sees is unchanged.
+# The composite scope retains the complete sequential contract. Each CI scope
+# builds its own fixture; collector setup uses the real preview/install path.
 test_u2_contracts() {
+  setup_u2_fixture
   test_u2_broker_contracts
   test_u2_enrollment_contracts
   test_u2_collector_contracts
 }
 
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-broker-contracts ] || {
+  setup_u2_fixture
+  test_u2_broker_contracts
+  printf 'PASS: U2 broker contracts\n'
+  exit 0
+}
+
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-enrollment-contracts ] || {
+  setup_u2_fixture
+  test_u2_enrollment_contracts
+  printf 'PASS: U2 enrollment contracts\n'
+  exit 0
+}
+
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-collector-contracts ] || {
+  setup_u2_fixture
+  prepare_u2_collector_fixture
+  test_u2_collector_contracts
+  printf 'PASS: U2 collector contracts\n'
+  exit 0
+}
+
+# Manual full-suite alias. CI scope discovery explicitly excludes this alias
+# because the three independent scopes above already execute every case.
 [ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-contracts ] || {
   test_u2_contracts
   printf 'PASS: U2 contracts\n'

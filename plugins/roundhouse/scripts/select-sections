@@ -67,14 +67,18 @@ MAP
 
 # scope -> the path prefixes that can affect it. Same fail-safe split as
 # sections: unmapped inside the tested surface means run every scope.
+u2_scopes() {
+  printf 'u2-broker-contracts\nu2-enrollment-contracts\nu2-collector-contracts\n'
+}
+
 scopes_for() {
   case $1 in
     plugins/roundhouse/scripts/collect-posix*|\
     plugins/roundhouse/scripts/enroll-ssh-posix*|\
     plugins/roundhouse/scripts/prepare-ssh-identity*|\
-    plugins/roundhouse/scripts/certify-ssh-node*) printf 'u2-contracts\n' ;;
+    plugins/roundhouse/scripts/certify-ssh-node*) u2_scopes ;;
     plugins/roundhouse/scripts/enroll-privilege-posix*|\
-    plugins/roundhouse/scripts/privilege-broker-posix*) printf 'macos-privilege-contracts\nu2-contracts\n' ;;
+    plugins/roundhouse/scripts/privilege-broker-posix*) printf 'macos-privilege-contracts\n'; u2_scopes ;;
     plugins/roundhouse/scripts/launcher-install*) printf 'u4-contracts\nu5-contracts\n' ;;
     *) return 1 ;;
   esac

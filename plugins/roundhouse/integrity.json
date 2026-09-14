@@ -66,7 +66,7 @@
     },
     {
       "path": "scripts/enroll-privilege-posix",
-      "sha256": "170462f378a6854d4947afac220e904a0aed779736d488644fbd2074fe61ae66"
+      "sha256": "044bdb42111c4dbc984c65de0d95a6f30b545b85fdf254c39f30fcca0f503575"
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
@@ -194,7 +194,7 @@
     },
     {
       "path": "scripts/privilege-broker-posix",
-      "sha256": "363c3fb4cae5129ba21ca4785b44ef70cd99c3da0915959454fa0534213fe139"
+      "sha256": "dd982d7286166847ed6f4524b4a356fc2cc85f0e7e99f9be67f26dc08bd4fb84"
     },
     {
       "path": "scripts/privilege-broker-windows.ps1",
@@ -218,7 +218,7 @@
     },
     {
       "path": "scripts/select-sections",
-      "sha256": "d1bc5b080ec2fd9f0c10d82e5d12d36130daf4e13e4b55b4bbbd2503b37446a3"
+      "sha256": "a8ade92269e66408aab31083cb4f365501a117c791b9d99779c8252a24432e32"
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",
