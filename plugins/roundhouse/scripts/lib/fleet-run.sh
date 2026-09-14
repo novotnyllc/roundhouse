@@ -980,6 +980,55 @@ fleet_run_plugin_identity_matches() {
     [ "$fleet_run_identity_version" = "$fleet_run_identity_installed_version" ]
 }
 
+fleet_run_install_skill() (
+  # Keep skills.sh's canonical installation and lock intact. Both standalone
+  # repositories and collections go through its explicit skill selector.
+  skill_name=$1
+  skill_source=$2
+  printf '%s\n' "$skill_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || return 75
+  skill_lock="$HOME/.agents/.skill-lock.json"
+  skill_canonical="$HOME/.agents/skills/$skill_name"
+  if [ -f "$skill_lock" ]; then
+    jq -e '(.skills // .) | type == "object"' "$skill_lock" >/dev/null 2>&1 || return 75
+    if [ -f "$skill_canonical/SKILL.md" ] &&
+      jq -e --arg name "$skill_name" '(.skills // .)[$name] | type == "object"' \
+        "$skill_lock" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  # Local-path installs are canonical too, but skills.sh does not lock them.
+  [ ! -f "$skill_canonical/SKILL.md" ] || return 0
+  skill_roots=$(jq -c --arg host "$3" '
+    (.machines[$host].groups // []) as $host_groups |
+    (.skill_roots // [])[] |
+    select((.groups // []) as $groups | ($groups | length) == 0 or
+      any($groups[]; . as $group | $host_groups | index($group) != null))' \
+    "$(config_path)" 2>/dev/null) || return 75
+  while IFS= read -r skill_root; do
+    [ -n "$skill_root" ] || continue
+    skill_path=$(expand_user_path "$(printf '%s\n' "$skill_root" | jq -r '.path')")
+    # -f follows valid manager symlinks; an empty directory is not a skill.
+    [ ! -f "$skill_path/$skill_name/SKILL.md" ] || return 0
+  done <<EOF
+$skill_roots
+EOF
+  fleet_validate_fetch_url "$skill_source" || return 75
+  command -v npx >/dev/null 2>&1 || return 75
+  skill_agents=$(printf '%s\n' "$skill_roots" | jq -rs '
+    [.[].agents[]? | select(. == "codex" or . == "claude") |
+      if . == "claude" then "claude-code" else . end] | unique | .[]') || return 75
+  [ -n "$skill_agents" ] || return 75
+  set -- skills add "$skill_source" --skill "$skill_name" --full-depth --global --yes --agent
+  # Only the two fixed manager agent identifiers above enter this word split.
+  for skill_agent in $skill_agents; do set -- "$@" "$skill_agent"; done
+  npx "$@" >/dev/null 2>&1 || return 75
+  [ -f "$skill_canonical/SKILL.md" ] || return 75
+  # skills.sh does not write global update records for local-path sources.
+  case $skill_source in /* | file:///*) return 0 ;; esac
+  jq -e --arg name "$skill_name" '(.skills // .)[$name] | type == "object"' \
+      "$skill_lock" >/dev/null 2>&1 || return 75
+)
+
 fleet_run_apply_item() {
   # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
@@ -1186,20 +1235,8 @@ fleet_run_apply_item() {
       fleet_run_surface=$(fleet_resolve_surface "$3" skills "$fleet_run_name")
       [ "$(printf '%s\n' "$fleet_run_surface" | jq -r '.delivery')" = standalone ] ||
         return 0
-      # Both misses are HELD, not satisfied: an unresolvable source is a
-      # definitions gap someone has to close, and a missing skill root is this
-      # host's own configuration. Neither is evidence the item needs no work.
       fleet_run_source=$(printf '%s\n' "$fleet_run_surface" | jq -r '.source // ""')
-      [ -n "$fleet_run_source" ] || return 75
-      fleet_run_root=$(jq -r '(.skill_roots // [])[0].path // empty' \
-        "$(config_path)" 2>/dev/null) || fleet_run_root=
-      [ -n "$fleet_run_root" ] || return 75
-      fleet_run_root=$(expand_user_path "$fleet_run_root")
-      [ ! -d "$fleet_run_root/$fleet_run_name" ] || return 0
-      fleet_validate_fetch_url "$fleet_run_source" || return 75
-      mkdir -p "$fleet_run_root"
-      git clone --depth 1 -- "$fleet_run_source" \
-        "$fleet_run_root/$fleet_run_name" >/dev/null 2>&1
+      fleet_run_install_skill "$fleet_run_name" "$fleet_run_source" "$2"
       ;;
     hooks)
       # §5.1.3's trust gate, and it is the ONLY thing standing between a

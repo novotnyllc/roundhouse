@@ -807,6 +807,76 @@ JSON
       '"enabled"' '' >/dev/null 2>&1 || run_status=$?
     [ "$run_status" -eq 75 ] ||
       fail "a host that cannot place a standalone skill reported it satisfied (got $run_status)"
+    # Individual skills retain manager provenance and never expose repository
+    # siblings. The fake manager models explicit selection from both layouts.
+    (
+      HOME="$run_root/skill-home"
+      ROUNDHOUSE_CONFIG="$run_root/skill-config.json"
+      export HOME ROUNDHOUSE_CONFIG
+      mkdir -p "$HOME/.agents/skills/managed" "$HOME/.codex/skills" \
+        "$run_root/skill-repository/selected" "$run_root/skill-repository/unrelated" \
+        "$run_root/standalone-repository"
+      printf 'managed contents\n' >"$HOME/.agents/skills/managed/SKILL.md"
+      printf 'selected contents\n' >"$run_root/skill-repository/selected/SKILL.md"
+      printf 'unrelated contents\n' >"$run_root/skill-repository/unrelated/SKILL.md"
+      printf 'standalone contents\n' >"$run_root/standalone-repository/SKILL.md"
+      printf '{"skills":{"managed":{"source":"example/collection","skillPath":"nested/managed","skillFolderHash":"unchanged"}}}\n' \
+        >"$HOME/.agents/.skill-lock.json"
+      cp "$HOME/.agents/.skill-lock.json" "$run_root/skill-lock-before.json"
+      ln -s "$HOME/.agents/skills/managed" "$HOME/.codex/skills/managed"
+      printf '{"skill_roots":[{"path":"~/.codex/skills","agents":["codex"]},{"path":"~/.claude/skills","agents":["claude"]}]}\n' \
+        >"$ROUNDHOUSE_CONFIG"
+      npx() {
+        [ "$#" -eq 11 ] && [ "$1" = skills ] && [ "$2" = add ] &&
+          [ "$4" = --skill ] && [ "$6" = --full-depth ] && [ "$7" = --global ] &&
+          [ "$8" = --yes ] && [ "$9" = --agent ] && [ "${10}" = claude-code ] &&
+          [ "${11}" = codex ] ||
+          fail "skill install omitted explicit skill/agent selection: $*"
+        printf '%s\n' "$5" >>"$run_root/skill-manager-calls"
+        [ "$5" != noop ] || return 0
+        mkdir -p "$HOME/.agents/skills/$5"
+        if [ -f "$3/SKILL.md" ]; then
+          cp "$3/SKILL.md" "$HOME/.agents/skills/$5/SKILL.md"
+        else
+          cp "$3/$5/SKILL.md" "$HOME/.agents/skills/$5/SKILL.md"
+        fi
+        jq --arg name "$5" --arg source "$3" \
+          '.skills[$name] = {source:$source,skillPath:$name}' \
+          "$HOME/.agents/.skill-lock.json" >"$run_root/skill-lock-next.json"
+        mv "$run_root/skill-lock-next.json" "$HOME/.agents/.skill-lock.json"
+      }
+      fleet_run_apply_item "$run_store" vireo '{}' skills.managed '"enabled"' '' ||
+        fail "existing canonical managed skill was not recognised without a definition"
+      [ ! -e "$run_root/skill-manager-calls" ] || fail "existing managed skill was reinstalled"
+      cmp "$HOME/.agents/.skill-lock.json" "$run_root/skill-lock-before.json" ||
+        fail "existing manager lock changed"
+      [ -L "$HOME/.codex/skills/managed" ] || fail "existing mitigation link changed"
+      [ "$(cat "$HOME/.agents/skills/managed/SKILL.md")" = 'managed contents' ] ||
+        fail "existing canonical contents changed"
+      run_skill_defs=$(jq -cn --arg collection "$run_root/skill-repository" \
+        --arg standalone "$run_root/standalone-repository" \
+        '{skills:{selected:{source:$collection},standalone:{source:$standalone},noop:{source:$collection}}}')
+      fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.selected '"enabled"' '' ||
+        fail "missing collection skill failed to install"
+      [ "$(cat "$HOME/.agents/skills/selected/SKILL.md")" = 'selected contents' ] ||
+        fail "the selected skill contents were not installed"
+      [ "$(find "$HOME" -name SKILL.md | wc -l | tr -d ' ')" -eq 2 ] ||
+        fail "the multi-skill installation exposed unrelated skills"
+      [ ! -e "$HOME/.codex/skills/selected" ] || fail "repository was cloned into the discovery root"
+      jq -e '.skills.selected.skillPath == "selected" and .skills.managed.skillFolderHash == "unchanged"' \
+        "$HOME/.agents/.skill-lock.json" >/dev/null || fail "manager tracking was lost"
+      fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.standalone '"enabled"' '' ||
+        fail "standalone repository support regressed"
+      [ -f "$HOME/.agents/skills/standalone/SKILL.md" ] || fail "standalone skill was not installed"
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.noop '"enabled"' '' || run_status=$?
+      [ "$run_status" -eq 75 ] || fail "manager success without installed skill was accepted"
+      # Presence in a later configured root (including symlinks) also suffices.
+      mkdir -p "$HOME/.claude/skills/manual"
+      printf 'manual\n' >"$HOME/.claude/skills/manual/SKILL.md"
+      fleet_run_apply_item "$run_store" vireo '{}' skills.manual '"enabled"' '' ||
+        fail "a skill in a later configured root was ignored"
+    )
     # The harness-absent arm is the same rule and cannot be reached
     # behaviourally here — the fixture PATH ships a `claude` stub — so it is
     # asserted on the apply layer's own text, the way tests/75-guards.sh
