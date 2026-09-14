@@ -164,7 +164,7 @@ directory_birth_time() {
 directory_digest() {
   root=$1
   # ponytail: newline-bearing file names are unsupported; skill trees use portable names.
-  find "$root" -type f -not -path '*/.git/*' 2>/dev/null | LC_ALL=C sort |
+  find -H "$root" -type f -not -path '*/.git/*' 2>/dev/null | LC_ALL=C sort |
     while IFS= read -r file; do
       printf '%s\t%s\n' "${file#"$root"/}" "$(sha256_file "$file")"
     done | sha256_stream
@@ -2356,7 +2356,7 @@ EOF
       continue
     fi
     [ ! -f "$root_path/.SKILLS_MANAGED_BY_JSM" ] || root_manager=jsm
-    find "$root_path" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort |
+    find -H "$root_path" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) 2>/dev/null | LC_ALL=C sort |
       while IFS= read -r skill_path; do
         [ -f "$skill_path/SKILL.md" ] || continue
         name=$(basename "$skill_path" | clip)

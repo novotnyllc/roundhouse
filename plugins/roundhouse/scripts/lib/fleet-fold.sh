@@ -684,6 +684,20 @@ fleet_skill_root_source() {
   # remote is the recorded source. This is what the shipped inventory already
   # collects (collect-posix's skill_root walk), read the same two ways here so
   # there is one notion of where a standalone skill came from.
+  # skills.sh owns the canonical content and source subfolder in its lock.
+  # Reuse its source even when no configured harness root points at it.
+  if [ -f "$HOME/.agents/.skill-lock.json" ]; then
+    source_managed=$(jq -er --arg name "$1" '
+      (.skills // .)[$name] | (.sourceUrl // .source // empty) |
+      select(type == "string" and length > 0) |
+      if test("^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$")
+      then "https://github.com/" + . else . end' \
+      "$HOME/.agents/.skill-lock.json" 2>/dev/null) || source_managed=
+    if [ -n "$source_managed" ]; then
+      printf '%s\n' "$source_managed" | sanitize_remote
+      return 0
+    fi
+  fi
   jq -r '(.skill_roots // [])[] | .path' "$(config_path)" 2>/dev/null |
     while read -r source_root; do
       [ -n "$source_root" ] || continue

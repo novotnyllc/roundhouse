@@ -47,6 +47,14 @@ doesn't move a train the shop hasn't cleared:
 | Integrations | Optional chezmoi cooperation through [`agent-utilities`](https://github.com/novotnyllc/agent-utilities) |
 | Transport | `remote-mac`, `ssh-doctor`, SSH certificate enrollment, the Codex remote-control contract, the signed `windows-sftp` lane |
 
+## Standalone skill installation
+
+Missing skills require npm’s `npx` to run skills.sh with an explicit skill
+selection. This applies to both single-skill repositories and collections.
+Roundhouse holds the item when that manager is unavailable; it does not
+bootstrap Node or clone a repository into skill discovery as a fallback.
+Existing skills remain in place, and their manager update metadata is preserved.
+
 ## The family
 
 Work routing and delivery live in
