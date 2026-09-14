@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "6ef89c68e6027e9a7127cfa5418bb17ca1e049119b6d11e80ff7c75efa631ecc"
+      "sha256": "357b0d641706a3d40952e12dd08152012a9d8b0f890de2c35f93a4c25ce1b9e8"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "cd03dba3ac8d0f001f33837ebe9363123fc02028b9f8db59d78561d12d3b31a9"
+      "sha256": "5e9b8f7fe6520a20bd7a460e43df79f2a3c1fa7962607ff863ae223f2cd4ae54"
     },
     {
       "path": "assets/icon.png",
@@ -66,7 +66,7 @@
     },
     {
       "path": "scripts/enroll-privilege-posix",
-      "sha256": "a29a3152707458f64224082d7ec0fcd00f7de6704b8e7d263d2118e3504f76da"
+      "sha256": "170462f378a6854d4947afac220e904a0aed779736d488644fbd2074fe61ae66"
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
@@ -194,7 +194,7 @@
     },
     {
       "path": "scripts/privilege-broker-posix",
-      "sha256": "7cc1e5e9527a6604b99df68cf264800bd998839b159971c01465a5dd8c0df233"
+      "sha256": "363c3fb4cae5129ba21ca4785b44ef70cd99c3da0915959454fa0534213fe139"
     },
     {
       "path": "scripts/privilege-broker-windows.ps1",
@@ -305,5 +305,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.18"
+  "version": "0.9.20"
 }

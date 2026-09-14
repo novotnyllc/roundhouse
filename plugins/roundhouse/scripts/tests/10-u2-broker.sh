@@ -46,8 +46,7 @@ test_u2_broker_contracts() {
   chmod -R go-w "$u2_root" "$u2_build"
 
   u2_sha256() {
-    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
-    else shasum -a 256 "$1" | awk '{print $1}'; fi
+    u2_sha256_stream <"$1"
   }
   u2_tree_digest() {
     tree=$1
@@ -67,6 +66,8 @@ test_u2_broker_contracts() {
   }
   u2_sha256_stream() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'
+    elif [ -x /sbin/sha256sum ]; then /sbin/sha256sum | awk '{print $1}'
+    elif [ -x /usr/bin/openssl ]; then /usr/bin/openssl dgst -sha256 | awk '{print $NF}'
     else shasum -a 256 | awk '{print $1}'; fi
   }
   u2_path_set_digest() {
@@ -330,6 +331,8 @@ release=$6
 [ "$(sed -n '1p' "$signature")" = 'roundhouse-test-signature|1' ] || exit 65
 sha256_file() {
   if [ -x /usr/bin/sha256sum ]; then /usr/bin/sha256sum "$1" | /usr/bin/awk '{print $1}'
+  elif [ -x /sbin/sha256sum ]; then /sbin/sha256sum "$1" | /usr/bin/awk '{print $1}'
+  elif [ -x /usr/bin/openssl ]; then /usr/bin/openssl dgst -sha256 <"$1" | /usr/bin/awk '{print $NF}'
   else /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
   fi
 }
@@ -535,11 +538,26 @@ EOF
   u2_stage_candidate() {
     stage_build=$1
     rm -f "$stage_build/bootstrap.manifest" "$stage_build/bootstrap.manifest.sig"
-    find "$stage_build" -type f ! -name bootstrap.manifest ! -name bootstrap.manifest.sig -print | \
-      LC_ALL=C sort | while IFS= read -r stage_file; do
-      stage_relative=${stage_file#"$stage_build"/}
-      printf 'file|%s|%s\n' "$stage_relative" "$(u2_sha256 "$stage_file")"
-    done | LC_ALL=C sort -t '|' -k2,2 >"$stage_build/bootstrap.manifest"
+    # Hash every candidate byte afresh, but amortize process startup over the
+    # file list. In particular, macOS shasum starts Perl for every invocation.
+    # Do not sign a partial manifest if find, hashing, or parsing fails.
+    (
+      set -o pipefail
+      cd "$stage_build"
+      if command -v sha256sum >/dev/null 2>&1; then
+        find . -type f ! -name bootstrap.manifest ! -name bootstrap.manifest.sig \
+          -exec sha256sum {} +
+      elif [ -x /sbin/sha256sum ]; then
+        find . -type f ! -name bootstrap.manifest ! -name bootstrap.manifest.sig \
+          -exec /sbin/sha256sum {} +
+      else
+        find . -type f ! -name bootstrap.manifest ! -name bootstrap.manifest.sig \
+          -exec shasum -a 256 {} +
+      fi | awk '
+        length($1) != 64 || $1 ~ /[^0-9a-f]/ || substr($0,65,4) != "  ./" {exit 1}
+        {printf "file|%s|%s\n", substr($0,69), $1}
+      ' | LC_ALL=C sort -t '|' -k2,2
+    ) >"$stage_build/bootstrap.manifest" || fail "U2 candidate manifest hashing failed"
     "$ssh_keygen" -Y sign -f "$tmp/u2-release-key" -n roundhouse-release \
       "$stage_build/bootstrap.manifest" >/dev/null
     stage_digest=$(u2_sha256 "$stage_build/bootstrap.manifest")
@@ -550,13 +568,15 @@ EOF
     chmod -R go-w "$u2_staged_candidate" "$u2_bootstrap/receipts/$stage_digest"
   }
 
-  chmod 777 "$u2_bundle/apt/sources.list.d"
-  if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" preview "$u2_bundle" \
-      >"$tmp/u2-writable-source-directory" 2>/dev/null; then
-    fail "U2 enrollment accepted a writable nested APT source directory"
-  fi
-  grep -Fqx 'reason|candidate_validation_failed' "$tmp/u2-writable-source-directory" ||
-    fail "U2 writable nested APT directory did not fail candidate validation"
+  for u2_writable_mode in 775 757 777 1777; do
+    chmod "$u2_writable_mode" "$u2_bundle/apt/sources.list.d"
+    if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" preview "$u2_bundle" \
+        >"$tmp/u2-writable-source-directory" 2>/dev/null; then
+      fail "U2 enrollment accepted nested APT source directory mode $u2_writable_mode"
+    fi
+    grep -Fqx 'reason|candidate_validation_failed' "$tmp/u2-writable-source-directory" ||
+      fail "U2 writable nested APT directory did not fail candidate validation: $u2_writable_mode"
+  done
   chmod 755 "$u2_bundle/apt/sources.list.d"
 
   mv "$u2_bundle/apt/sources.list.d/roundhouse.sources" "$tmp/u2-source-before-symlink"
