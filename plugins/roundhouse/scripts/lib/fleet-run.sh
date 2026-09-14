@@ -1045,7 +1045,10 @@ fleet_run_install_skill() (
     [ -n "$skill_root" ] || continue
     skill_path=$(expand_user_path "$(printf '%s\n' "$skill_root" | jq -r '.path')")
     # -f follows valid manager symlinks; an empty directory is not a skill.
-    [ ! -f "$skill_path/$skill_name/SKILL.md" ] || return 0
+    if [ -f "$skill_path/$skill_name/SKILL.md" ]; then
+      fleet_run_skill_exposed "$skill_name" "$skill_roots"
+      return $?
+    fi
   done <<EOF
 $skill_roots
 EOF

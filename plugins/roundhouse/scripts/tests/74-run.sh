@@ -907,8 +907,13 @@ JSON
       # Presence in a later configured root (including symlinks) also suffices.
       mkdir -p "$HOME/.claude/skills/manual"
       printf 'manual\n' >"$HOME/.claude/skills/manual/SKILL.md"
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo '{}' skills.manual '"enabled"' '' || run_status=$?
+      [ "$run_status" -eq 75 ] || fail "partial manual harness exposure was accepted"
+      mkdir -p "$HOME/.codex/skills/manual"
+      printf 'manual\n' >"$HOME/.codex/skills/manual/SKILL.md"
       fleet_run_apply_item "$run_store" vireo '{}' skills.manual '"enabled"' '' ||
-        fail "a skill in a later configured root was ignored"
+        fail "configured manual harness exposure was ignored"
     )
     # The harness-absent arm is the same rule and cannot be reached
     # behaviourally here — the fixture PATH ships a `claude` stub — so it is
