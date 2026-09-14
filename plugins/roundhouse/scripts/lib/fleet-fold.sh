@@ -689,7 +689,9 @@ fleet_skill_root_source() {
   if [ -f "$HOME/.agents/.skill-lock.json" ]; then
     source_managed=$(jq -er --arg name "$1" '
       (.skills // .)[$name] | (.sourceUrl // .source // empty) |
-      select(type == "string" and length > 0)' \
+      select(type == "string" and length > 0) |
+      if test("^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$")
+      then "https://github.com/" + . else . end' \
       "$HOME/.agents/.skill-lock.json" 2>/dev/null) || source_managed=
     if [ -n "$source_managed" ]; then
       printf '%s\n' "$source_managed" | sanitize_remote

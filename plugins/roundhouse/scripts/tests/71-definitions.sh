@@ -381,6 +381,11 @@ SH
       rm "$HOME/.agents/skills/managed-example/SKILL.md"
       [ "$(fleet_resolve_surface '{}' skills managed-example | jq -r '.source')" = \
         https://example.invalid/multi.git ] || fail "missing canonical content lost its managed repair source"
+      printf '%s\n' '{"skills":{"managed-example":{"source":"example/collection","skillPath":"skills/managed-example"}}}' \
+        >"$HOME/.agents/.skill-lock.json"
+      defs_managed_source=$(fleet_resolve_surface '{}' skills managed-example | jq -r '.source')
+      [ "$defs_managed_source" = https://github.com/example/collection ] &&
+        fleet_validate_fetch_url "$defs_managed_source" || fail "managed GitHub shorthand cannot be fetched for repair"
       [ "$(fleet_resolve_surface '{"skills":{"managed-example":{"source":"https://example.invalid/override.git"}}}' skills managed-example | jq -r '.source')" = \
         https://example.invalid/override.git ] || fail "managed source overrode an explicit definition"
     )

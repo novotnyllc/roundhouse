@@ -824,6 +824,8 @@ JSON
         >"$HOME/.agents/.skill-lock.json"
       cp "$HOME/.agents/.skill-lock.json" "$run_root/skill-lock-before.json"
       ln -s "$HOME/.agents/skills/managed" "$HOME/.codex/skills/managed"
+      mkdir -p "$HOME/.claude/skills"
+      ln -s "$HOME/.agents/skills/managed" "$HOME/.claude/skills/managed"
       printf '{"skill_roots":[{"path":"~/.codex/skills","agents":["codex"]},{"path":"~/.claude/skills","agents":["claude"]}]}\n' \
         >"$ROUNDHOUSE_CONFIG"
       npx() {
@@ -842,6 +844,7 @@ JSON
         else
           cp "$3/$5/SKILL.md" "$HOME/.agents/skills/$5/SKILL.md"
         fi
+        [ "$5" = unexposed ] || ln -s "$HOME/.agents/skills/$5" "$HOME/.claude/skills/$5"
         jq --arg name "$5" --arg source "$3" \
           '.skills[$name] = {source:$source,skillPath:$name}' \
           "$HOME/.agents/.skill-lock.json" >"$run_root/skill-lock-next.json"
@@ -855,9 +858,23 @@ JSON
       [ -L "$HOME/.codex/skills/managed" ] || fail "existing mitigation link changed"
       [ "$(cat "$HOME/.agents/skills/managed/SKILL.md")" = 'managed contents' ] ||
         fail "existing canonical contents changed"
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo \
+        '{"skills":{"managed":{"source":"https://github.com/other/collection"}}}' \
+        skills.managed '"enabled"' '' || run_status=$?
+      [ "$run_status" -eq 75 ] || fail "a managed skill with a different source was accepted"
+      fleet_run_apply_item "$run_store" vireo \
+        '{"skills":{"managed":{"source":"https://github.com/example/collection.git"}}}' \
+        skills.managed '"enabled"' '' || fail "equivalent manager source spellings differed"
+      rm "$HOME/.claude/skills/managed"
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo '{}' skills.managed '"enabled"' '' || run_status=$?
+      [ "$run_status" -eq 75 ] || fail "canonical presence hid missing Claude exposure"
+      [ ! -e "$run_root/skill-manager-calls" ] || fail "missing exposure reinstalled managed contents"
+      ln -s "$HOME/.agents/skills/managed" "$HOME/.claude/skills/managed"
       run_skill_defs=$(jq -cn --arg collection "$run_root/skill-repository" \
         --arg standalone "$run_root/standalone-repository" \
-        '{skills:{selected:{source:$collection},standalone:{source:$standalone},noop:{source:$collection}}}')
+        '{skills:{selected:{source:$collection},standalone:{source:$standalone},unexposed:{source:$standalone},noop:{source:$collection}}}')
       fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.selected '"enabled"' '' ||
         fail "missing collection skill failed to install"
       [ "$(cat "$HOME/.agents/skills/selected/SKILL.md")" = 'selected contents' ] ||
@@ -873,6 +890,20 @@ JSON
       run_status=0
       fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.noop '"enabled"' '' || run_status=$?
       [ "$run_status" -eq 75 ] || fail "manager success without installed skill was accepted"
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.unexposed '"enabled"' '' || run_status=$?
+      [ "$run_status" -eq 75 ] || fail "manager install without requested harness exposure was accepted"
+      cp "$ROUNDHOUSE_CONFIG" "$run_root/skill-config-before.json"
+      jq '.skill_roots[0].path = "~/custom-skills"' "$ROUNDHOUSE_CONFIG" >"$run_root/skill-config-custom.json"
+      cp "$run_root/skill-config-custom.json" "$ROUNDHOUSE_CONFIG"
+      fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.selected '"enabled"' '' ||
+        fail "native harness exposure did not satisfy an alternative custom root"
+      rm "$HOME/.claude/skills/selected"
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.selected '"enabled"' '' || run_status=$?
+      [ "$run_status" -eq 75 ] || fail "canonical presence hid missing requested harness exposure"
+      ln -s "$HOME/.agents/skills/selected" "$HOME/.claude/skills/selected"
+      cp "$run_root/skill-config-before.json" "$ROUNDHOUSE_CONFIG"
       # Presence in a later configured root (including symlinks) also suffices.
       mkdir -p "$HOME/.claude/skills/manual"
       printf 'manual\n' >"$HOME/.claude/skills/manual/SKILL.md"

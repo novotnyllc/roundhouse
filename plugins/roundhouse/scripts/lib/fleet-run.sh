@@ -980,6 +980,40 @@ fleet_run_plugin_identity_matches() {
     [ "$fleet_run_identity_version" = "$fleet_run_identity_installed_version" ]
 }
 
+fleet_run_skill_source_identity() {
+  # Compare skills.sh's GitHub shorthand and equivalent Git remote spellings.
+  printf '%s\n' "$1" | sed -E \
+    -e 's#^git@([^:]+):#https://\1/#' \
+    -e 's#^ssh://(git@)?#https://#' \
+    -e 's#^([^/:]+/[^/:]+)$#https://github.com/\1#' \
+    -e 's#/$##' -e 's#\.git$##'
+}
+
+fleet_run_skill_exposed() (
+  # Roots can be alternatives for one harness. Accept configured exposure or
+  # the manager's native location, including Codex's universal directory.
+  exposed_agents=$(printf '%s\n' "$2" | jq -rs '[.[].agents[]?] | unique | .[]') || return 75
+  [ -n "$exposed_agents" ] || return 75
+  for exposed_agent in $exposed_agents; do
+    case $exposed_agent in
+      codex) exposed_native="$HOME/.agents/skills" ;;
+      claude) exposed_native="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills" ;;
+      *) return 75 ;;
+    esac
+    [ ! -f "$exposed_native/$1/SKILL.md" ] || continue
+    exposed=false
+    while IFS= read -r exposed_root; do
+      printf '%s\n' "$exposed_root" | jq -e --arg agent "$exposed_agent" \
+        '(.agents // []) | index($agent) != null' >/dev/null || continue
+      exposed_path=$(expand_user_path "$(printf '%s\n' "$exposed_root" | jq -r '.path')")
+      [ ! -f "$exposed_path/$1/SKILL.md" ] || exposed=true
+    done <<EOF
+$2
+EOF
+    [ "$exposed" = true ] || return 75
+  done
+)
+
 fleet_run_install_skill() (
   # Keep skills.sh's canonical installation and lock intact. Both standalone
   # repositories and collections go through its explicit skill selector.
@@ -990,20 +1024,23 @@ fleet_run_install_skill() (
   skill_canonical="$HOME/.agents/skills/$skill_name"
   if [ -f "$skill_lock" ]; then
     jq -e '(.skills // .) | type == "object"' "$skill_lock" >/dev/null 2>&1 || return 75
-    if [ -f "$skill_canonical/SKILL.md" ] &&
-      jq -e --arg name "$skill_name" '(.skills // .)[$name] | type == "object"' \
-        "$skill_lock" >/dev/null 2>&1; then
-      return 0
+    skill_locked_source=$(jq -r --arg name "$skill_name" \
+      '(.skills // .)[$name] | .sourceUrl // .source // empty' "$skill_lock") || return 75
+    if [ -n "$skill_source" ] && [ -n "$skill_locked_source" ]; then
+      [ "$(fleet_run_skill_source_identity "$skill_source")" = \
+        "$(fleet_run_skill_source_identity "$skill_locked_source")" ] || return 75
     fi
   fi
-  # Local-path installs are canonical too, but skills.sh does not lock them.
-  [ ! -f "$skill_canonical/SKILL.md" ] || return 0
   skill_roots=$(jq -c --arg host "$3" '
     (.machines[$host].groups // []) as $host_groups |
     (.skill_roots // [])[] |
     select((.groups // []) as $groups | ($groups | length) == 0 or
       any($groups[]; . as $group | $host_groups | index($group) != null))' \
     "$(config_path)" 2>/dev/null) || return 75
+  if [ -f "$skill_canonical/SKILL.md" ]; then
+    fleet_run_skill_exposed "$skill_name" "$skill_roots"
+    return $?
+  fi
   while IFS= read -r skill_root; do
     [ -n "$skill_root" ] || continue
     skill_path=$(expand_user_path "$(printf '%s\n' "$skill_root" | jq -r '.path')")
@@ -1023,6 +1060,7 @@ EOF
   for skill_agent in $skill_agents; do set -- "$@" "$skill_agent"; done
   npx --yes "$@" >/dev/null 2>&1 || return 75
   [ -f "$skill_canonical/SKILL.md" ] || return 75
+  fleet_run_skill_exposed "$skill_name" "$skill_roots" || return 75
   # skills.sh does not write global update records for local-path sources.
   case $skill_source in /* | file:///*) return 0 ;; esac
   jq -e --arg name "$skill_name" '(.skills // .)[$name] | type == "object"' \
