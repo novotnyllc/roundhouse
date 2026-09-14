@@ -1021,7 +1021,7 @@ EOF
   set -- skills add "$skill_source" --skill "$skill_name" --full-depth --global --yes --agent
   # Only the two fixed manager agent identifiers above enter this word split.
   for skill_agent in $skill_agents; do set -- "$@" "$skill_agent"; done
-  npx "$@" >/dev/null 2>&1 || return 75
+  npx --yes "$@" >/dev/null 2>&1 || return 75
   [ -f "$skill_canonical/SKILL.md" ] || return 75
   # skills.sh does not write global update records for local-path sources.
   case $skill_source in /* | file:///*) return 0 ;; esac

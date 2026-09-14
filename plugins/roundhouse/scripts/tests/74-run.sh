@@ -827,6 +827,8 @@ JSON
       printf '{"skill_roots":[{"path":"~/.codex/skills","agents":["codex"]},{"path":"~/.claude/skills","agents":["claude"]}]}\n' \
         >"$ROUNDHOUSE_CONFIG"
       npx() {
+        [ "$1" = --yes ] || fail "npx package installation could prompt"
+        shift
         [ "$#" -eq 11 ] && [ "$1" = skills ] && [ "$2" = add ] &&
           [ "$4" = --skill ] && [ "$6" = --full-depth ] && [ "$7" = --global ] &&
           [ "$8" = --yes ] && [ "$9" = --agent ] && [ "${10}" = claude-code ] &&
