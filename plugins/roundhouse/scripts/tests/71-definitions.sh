@@ -368,6 +368,28 @@ SH
       "$HOME/.claude/agents/nosuch.md" ] ||
       fail "a standalone agent with no entry did not fall back to the user scope"
 
+    # Canonical manager content needs no configured harness link or git clone.
+    (
+      HOME="$defs_root/managed-home"
+      export HOME
+      mkdir -p "$HOME/.agents/skills/managed-example"
+      printf '%s\n' 'name: managed-example' >"$HOME/.agents/skills/managed-example/SKILL.md"
+      printf '%s\n' '{"skills":{"managed-example":{"sourceUrl":"https://example.invalid/multi.git","skillPath":"skills/managed-example"}}}' \
+        >"$HOME/.agents/.skill-lock.json"
+      [ "$(fleet_resolve_surface '{}' skills managed-example | jq -r '.source')" = \
+        https://example.invalid/multi.git ] || fail "canonical managed skill source was not resolved"
+      rm "$HOME/.agents/skills/managed-example/SKILL.md"
+      [ "$(fleet_resolve_surface '{}' skills managed-example | jq -r '.source')" = \
+        https://example.invalid/multi.git ] || fail "missing canonical content lost its managed repair source"
+      printf '%s\n' '{"skills":{"managed-example":{"source":"example/collection","skillPath":"skills/managed-example"}}}' \
+        >"$HOME/.agents/.skill-lock.json"
+      defs_managed_source=$(fleet_resolve_surface '{}' skills managed-example | jq -r '.source')
+      [ "$defs_managed_source" = https://github.com/example/collection ] &&
+        fleet_validate_fetch_url "$defs_managed_source" || fail "managed GitHub shorthand cannot be fetched for repair"
+      [ "$(fleet_resolve_surface '{"skills":{"managed-example":{"source":"https://example.invalid/override.git"}}}' skills managed-example | jq -r '.source')" = \
+        https://example.invalid/override.git ] || fail "managed source overrode an explicit definition"
+    )
+
     # --- hooks resolve like everything else; TRUST is a separate question ---
     # `hooks` was a held CATEGORY until the §5.1.3 trust gate was
     # re-implemented. It is now gated per item (fleet_hook_trust, exercised in

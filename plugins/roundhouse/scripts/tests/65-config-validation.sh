@@ -124,6 +124,20 @@ assert_contains "$json" '"consistent":true'
   fail "POSIX capability did not resolve a per-host artifact path"
 if printf '%s' "$json" | grep -q 'other-group'; then fail "capability group filter leaked another group"; fi
 assert_contains "$json" '"id":"standalone:manual:manual-example"'
+
+# A manager's harness symlink inventories exactly the canonical skill tree.
+ln -s manual-example "$tmp/home/.agents/skills/linked-example"
+ln -s absent-example "$tmp/home/.agents/skills/broken-example"
+"$cli" collect --target test-host --section agents --section auth --output "$tmp/linked-skills.jsonl"
+jq -se '
+  [.[] | select(.kind == "skill" and .data.root == "manual")] as $skills |
+  ($skills | map(select(.data.name == "linked-example")) | length) == 1 and
+  ($skills | map(select(.data.name == "broken-example")) | length) == 0 and
+  ($skills | map(select(.data.name == "linked-example" or .data.name == "manual-example")) |
+    map(.data.digest.value) | unique | length) == 1
+' "$tmp/linked-skills.jsonl" >/dev/null || fail "skill symlink inventory or canonical digest differs"
+rm "$tmp/home/.agents/skills/linked-example" "$tmp/home/.agents/skills/broken-example"
+
 assert_contains "$json" '"id":"shared-agent-definition"'
 assert_contains "$json" '"id":"empty-agent-definitions"'
 assert_contains "$json" '"scope":"directory-files"'
