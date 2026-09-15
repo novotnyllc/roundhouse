@@ -6,61 +6,97 @@
 # shellcheck shell=bash
 
 test_u2_collector_primitive_contracts() (
-  # Exercise the collector's real helpers without repeating a full enrollment.
-  sed -n '/^sha256_file() {/,/^u2_record_value() {/p' "$collector" | sed '$d' \
-    >"$tmp/u2-collector-helpers.sh"
-  # shellcheck disable=SC1091 # extracted from the current collector above
-  . "$tmp/u2-collector-helpers.sh"
+  # Extract named production functions without running their entrypoints.
+  u2_extract_primitive() {
+    awk -v name="$2" '
+      $0 == name "() {" { if (found++) exit 1; copying=1 }
+      copying { print }
+      copying && $0 == "}" { copying=0 }
+      END { if (found != 1 || copying) exit 1 }
+    ' "$1"
+  }
+  u2_primitive_platform=$(/usr/bin/uname -s)
   u2_hash_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
   u2_hash_empty=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
   u2_hash_path="$tmp/collector hash\\name"$'\n''-fixture'
   printf abc >"$u2_hash_path"
-  [ "$(sha256_file "$u2_hash_path")" = "$u2_hash_abc" ] &&
-    [ "$(printf abc | sha256_stream)" = "$u2_hash_abc" ] &&
-    [ "$(sha256_stream </dev/null)" = "$u2_hash_empty" ] ||
-    fail "collector hashing changed bytes or treated a filename as hash output"
-  if sha256_file "$tmp/collector-missing" >/dev/null 2>&1; then
-    fail "collector hashing accepted an unreadable file"
-  fi
-
-  # A plausible digest on stdout must never hide the backend's failed status.
-  # These command functions intercept both native and PATH-resolved backends.
-  (
-    collector_hash_backend() {
-      printf '%s\n' "$collector_hash_output"
-      return "$collector_hash_status"
-    }
-    sha256sum() { collector_hash_backend; }
-    shasum() { collector_hash_backend; }
-    openssl() { collector_hash_backend; }
-    /usr/bin/sha256sum() { collector_hash_backend; }
-    /sbin/sha256sum() { collector_hash_backend; }
-    /usr/bin/shasum() { collector_hash_backend; }
-    /usr/bin/env() { collector_hash_backend; }
-    collector_hash_output="$u2_hash_abc  -"
-    collector_hash_status=73
-    if sha256_stream </dev/null >"$tmp/u2-collector-failed-hash"; then
-      fail "collector hashing accepted output from a failed backend"
-    else
-      [ "$?" -eq 73 ] || fail "collector hashing lost the backend's failed status"
-    fi
-    [ ! -s "$tmp/u2-collector-failed-hash" ] ||
-      fail "collector hashing emitted a digest after backend failure"
-    collector_hash_status=0
-    for collector_hash_output in not-a-digest "$u2_hash_abc  -"$'\n'"$u2_hash_abc  -"; do
-      if sha256_stream </dev/null >"$tmp/u2-collector-malformed-hash"; then
-        fail "collector hashing accepted malformed or multiple backend digests"
+  printf 'invalid-openssl-configuration\n' >"$tmp/u2-collector-openssl.cnf"
+  for u2_hash_helper in collect-posix enroll-ssh-posix certify-ssh-node prepare-ssh-identity; do
+    (
+      case $u2_hash_helper in
+        prepare-ssh-identity) u2_hash_functions=digest_text; u2_hash_stream=digest_text ;;
+        *) u2_hash_functions='sha256_file sha256_stream'; u2_hash_stream=sha256_stream ;;
+      esac
+      for u2_hash_function in $u2_hash_functions; do
+        u2_extract_primitive "$script_dir/$u2_hash_helper" "$u2_hash_function" ||
+          fail "$u2_hash_helper hash function extraction failed"
+      done >"$tmp/u2-hash-helpers.sh"
+      # shellcheck disable=SC1091 # named functions extracted from production above
+      . "$tmp/u2-hash-helpers.sh"
+      [ "$(printf abc | "$u2_hash_stream")" = "$u2_hash_abc" ] &&
+        [ "$("$u2_hash_stream" </dev/null)" = "$u2_hash_empty" ] ||
+        fail "$u2_hash_helper hashing changed stdin bytes"
+      if [ "$u2_hash_helper" != prepare-ssh-identity ]; then
+        [ "$(sha256_file "$u2_hash_path")" = "$u2_hash_abc" ] ||
+          fail "$u2_hash_helper hashing treated a filename as hash output"
+        if sha256_file "$tmp/collector-missing" >/dev/null 2>&1; then
+          fail "$u2_hash_helper hashing accepted an unreadable file"
+        fi
       fi
-      [ ! -s "$tmp/u2-collector-malformed-hash" ] ||
-        fail "collector hashing emitted malformed backend output"
-    done
-  )
 
-  if [ "$(/usr/bin/uname -s)" = Darwin ]; then
-    printf 'invalid-openssl-configuration\n' >"$tmp/u2-collector-openssl.cnf"
-    [ "$(OPENSSL_CONF="$tmp/u2-collector-openssl.cnf" OPENSSL_MODULES="$tmp/missing-modules" \
-      sha256_file "$u2_hash_path")" = "$u2_hash_abc" ] ||
-      fail "collector hashing loaded caller-selected OpenSSL configuration"
+      # A plausible digest on stdout must never hide the backend's failed status.
+      # Intercept native and PATH-resolved backends, including /bin fallbacks.
+      (
+        u2_hash_backend() {
+          printf '%s\n' "$u2_hash_output"
+          return "$u2_hash_status"
+        }
+        sha256sum() { u2_hash_backend; }
+        shasum() { u2_hash_backend; }
+        openssl() { u2_hash_backend; }
+        /usr/bin/sha256sum() { u2_hash_backend; }
+        /bin/sha256sum() { u2_hash_backend; }
+        /sbin/sha256sum() { u2_hash_backend; }
+        /usr/bin/shasum() { u2_hash_backend; }
+        /bin/shasum() { u2_hash_backend; }
+        /usr/bin/env() { u2_hash_backend; }
+        u2_hash_output="$u2_hash_abc  -"
+        u2_hash_status=73
+        if "$u2_hash_stream" </dev/null >"$tmp/u2-collector-failed-hash"; then
+          fail "$u2_hash_helper hashing accepted output from a failed backend"
+        else
+          [ "$?" -eq 73 ] || fail "$u2_hash_helper hashing lost the backend's failed status"
+        fi
+        [ ! -s "$tmp/u2-collector-failed-hash" ] ||
+          fail "$u2_hash_helper hashing emitted a digest after backend failure"
+        u2_hash_status=0
+        for u2_hash_output in not-a-digest "$u2_hash_abc  -"$'\n'"$u2_hash_abc  -"; do
+          if "$u2_hash_stream" </dev/null >"$tmp/u2-collector-malformed-hash"; then
+            fail "$u2_hash_helper hashing accepted malformed or multiple backend digests"
+          fi
+          [ ! -s "$tmp/u2-collector-malformed-hash" ] ||
+            fail "$u2_hash_helper hashing emitted malformed backend output"
+        done
+      )
+
+      if [ "$u2_primitive_platform" = Darwin ]; then
+        [ "$(printf abc | OPENSSL_CONF="$tmp/u2-collector-openssl.cnf" \
+          OPENSSL_MODULES="$tmp/missing-modules" "$u2_hash_stream")" = "$u2_hash_abc" ] ||
+          fail "$u2_hash_helper hashing loaded caller-selected OpenSSL configuration"
+      fi
+    )
+  done
+
+  # Metadata checks remain collector-only and observe each change afresh.
+  for u2_metadata_function in collector_stat u2_permissions_mode_safe u2_metadata_ready \
+    u2_directory_ready u2_file_ready u2_validate_protected_ancestors; do
+    u2_extract_primitive "$collector" "$u2_metadata_function" ||
+      fail "collector metadata function extraction failed"
+  done >"$tmp/u2-collector-helpers.sh"
+  collector_stat_platform=$u2_primitive_platform
+  # shellcheck disable=SC1091 # named functions extracted from the current collector
+  . "$tmp/u2-collector-helpers.sh"
+  if [ "$u2_primitive_platform" = Darwin ]; then
     u2_root='' platform=macos u2_directory_ready /etc root &&
       u2_root='' platform=macos u2_directory_ready /var root ||
       fail "collector rejected native macOS protected ancestor symlinks"
