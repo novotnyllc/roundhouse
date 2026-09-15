@@ -68,7 +68,7 @@ MAP
 # scope -> the path prefixes that can affect it. Same fail-safe split as
 # sections: unmapped inside the tested surface means run every scope.
 u2_scopes() {
-  printf 'u2-broker-contracts\nu2-enrollment-preparation-contracts\nu2-enrollment-recovery-contracts\nu2-collector-contracts\nu2-upgrade-confirmation-contracts\nu2-upgrade-rollback-contracts\nu2-revocation-recovery-contracts\nu2-revocation-rollback-contracts\n'
+  printf 'u2-broker-contracts\nu2-enrollment-preparation-contracts\nu2-enrollment-rollback-contracts\nu2-enrollment-recovery-contracts\nu2-collector-contracts\nu2-upgrade-confirmation-contracts\nu2-upgrade-rollback-contracts\nu2-revocation-recovery-contracts\nu2-revocation-rollback-contracts\n'
 }
 
 scopes_for() {

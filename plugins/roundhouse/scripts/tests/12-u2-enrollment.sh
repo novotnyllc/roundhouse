@@ -476,8 +476,8 @@ test_u2_enrollment_preparation_contracts() {
 }
 
 # Requires the unenrolled fixture, its real preview confirmation, and sentinel.
-# Keeps the rollback and SIGKILL chain together, then validates generation 1.
-test_u2_enrollment_recovery_contracts() {
+# Every first-install failpoint must restore the unenrolled state.
+test_u2_enrollment_rollback_contracts() {
   for u2_failpoint in after-drain after-generation after-broker after-trust after-sudoers \
     after-active after-public-receipt; do
     if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_U2_FAILPOINT="$u2_failpoint" \
@@ -493,7 +493,11 @@ test_u2_enrollment_recovery_contracts() {
       [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.lock" ] ||
       fail "U2 first-install rollback was incomplete at $u2_failpoint"
   done
+}
 
+# Requires the unenrolled fixture, its real preview confirmation, and sentinel.
+# Keeps the contention and SIGKILL chain together, then validates generation 1.
+test_u2_enrollment_recovery_contracts() {
   u2_pause_marker="$tmp/u2-install-lock-pause"
   ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" \
     ROUNDHOUSE_U2_PAUSE_AT=lifecycle-lock-held \
@@ -702,5 +706,6 @@ test_u2_enrollment_recovery_contracts() {
 # The manual composite preserves the complete original enrollment sequence.
 test_u2_enrollment_contracts() {
   test_u2_enrollment_preparation_contracts
+  test_u2_enrollment_rollback_contracts
   test_u2_enrollment_recovery_contracts
 }

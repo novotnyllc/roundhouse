@@ -948,6 +948,14 @@ test_u2_contracts() {
   exit 0
 }
 
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-enrollment-rollback-contracts ] || {
+  setup_u2_fixture
+  prepare_u2_enrollment_recovery_fixture
+  test_u2_enrollment_rollback_contracts
+  printf 'PASS: U2 enrollment rollback contracts\n'
+  exit 0
+}
+
 [ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-collector-contracts ] || {
   setup_u2_fixture
   prepare_u2_collector_fixture
@@ -1000,7 +1008,7 @@ test_u2_contracts() {
 }
 
 # Manual full-suite alias. CI scope discovery explicitly excludes this alias
-# because the eight independent scopes above already execute every case.
+# because the nine independent scopes above already execute every case.
 [ "${ROUNDHOUSE_TEST_SCOPE:-}" != u2-contracts ] || {
   test_u2_contracts
   printf 'PASS: U2 contracts\n'

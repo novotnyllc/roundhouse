@@ -60,15 +60,17 @@ POSIX platform, fanned out from the `scope-matrix` job) and `windows`
 
    Today that is `chezmoi-fixture`, `u1-characterization`, `u1-contracts`,
    `u2-broker-contracts`, `u2-enrollment-preparation-contracts`,
-   `u2-enrollment-recovery-contracts`, `u2-collector-contracts`,
+   `u2-enrollment-rollback-contracts`, `u2-enrollment-recovery-contracts`,
+   `u2-collector-contracts`,
    `u2-upgrade-confirmation-contracts`, `u2-upgrade-rollback-contracts`,
    `u2-revocation-recovery-contracts`, `u2-revocation-rollback-contracts`,
    `u4-contracts`, `u5-contracts` and `macos-privilege-contracts`.
    Each U2 scope builds fresh keys, signed bundles, and native command fixtures.
    Enrollment preparation covers preview binding, collisions, and interrupted
-   preparation and retirement. Enrollment recovery starts unenrolled with a real
-   preview and its lifecycle sentinel, then runs every first-install rollback
-   failpoint and the complete contention, SIGKILL, and commit-finalization chain.
+   preparation and retirement. Enrollment rollback and recovery each start
+   unenrolled with a real preview and lifecycle sentinel. Rollback covers every
+   first-install failpoint; recovery keeps the complete contention, SIGKILL,
+   and commit-finalization chain together.
    The collector, upgrade, and revocation scopes activate their fixtures
    through real enrollment preview and installation, then execute a real
    signed broker request. The collector scope checks requests, journals, and
@@ -82,7 +84,7 @@ POSIX platform, fanned out from the `scope-matrix` job) and `windows`
    revocation. The manual composite retains every case in its original order.
    All rejection and lifecycle failure cases remain in the contract bodies.
    `ROUNDHOUSE_TEST_SCOPE=u2-contracts` still runs the complete U2 sequence
-   manually; CI excludes that composite alias to avoid repeating the eight jobs.
+   manually; CI excludes that composite alias to avoid repeating the nine jobs.
    Serially the loop costs several times one
    default run, because the scopes share prefixes they each re-execute; CI
    parallelises it instead.
