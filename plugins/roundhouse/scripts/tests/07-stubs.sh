@@ -768,6 +768,9 @@ case "${5:-}" in
     ;;
   *03-hash-failed.plist)
     printf '%s\n' '{"Label":"com.example.hash-failed","Program":"/usr/bin/example","RunAtLoad":true}'
+    # The definition disappeared after parsing; every hash backend must report
+    # the failed read without publishing a digest or a successful definition.
+    rm -f "$5"
     ;;
   *04-good.plist)
     printf '%s\n' '{"Label":"com.example.good","Program":"/usr/bin/example","RunAtLoad":true}'
@@ -778,27 +781,6 @@ cat >"$fake_darwin_bin/launchctl" <<'SH'
 #!/usr/bin/env bash
 [ "${1:-}" = print ] && printf 'last exit code = 7\n'
 SH
-real_sha256sum=$(command -v sha256sum || true)
-if [ -n "$real_sha256sum" ]; then
-  cat >"$fake_darwin_bin/sha256sum" <<'SH'
-#!/usr/bin/env bash
-if [ "${1:-}" = "$FAKE_DARWIN_HOME/Library/LaunchAgents/03-hash-failed.plist" ]; then
-  exit 1
-fi
-exec "$REAL_SHA256SUM" "$@"
-SH
-  export REAL_SHA256SUM="$real_sha256sum"
-else
-  real_shasum=$(command -v shasum)
-  cat >"$fake_darwin_bin/shasum" <<'SH'
-#!/usr/bin/env bash
-if [ "${3:-}" = "$FAKE_DARWIN_HOME/Library/LaunchAgents/03-hash-failed.plist" ]; then
-  exit 1
-fi
-exec "$REAL_SHASUM" "$@"
-SH
-  export REAL_SHASUM="$real_shasum"
-fi
 cat >"$fake_darwin_bin/crontab" <<'SH'
 #!/usr/bin/env bash
 [ "${1:-}" = -l ] && printf '0 * * * * echo later\n'

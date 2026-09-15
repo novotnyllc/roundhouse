@@ -91,6 +91,12 @@ cli_function_body() {
 want_section() {
   n=$1
   case "$n" in 00|05|07) return 0 ;; esac
+  # Plan scopes enter only their section over a fresh shared harness. Other
+  # sections can mutate manager/config state before 68, so they are not setup.
+  case "${ROUNDHOUSE_TEST_SCOPE:-}" in
+    plan-packages|plan-agents|plan-projects|plan-chezmoi|plan-auth)
+      [ "$n" = 68 ]; return $? ;;
+  esac
   case "${ROUNDHOUSE_TEST_TIER:-all}" in
     fast) [ "$n" -lt 90 ] || return 1 ;;
     jj)   [ "$n" -ge 90 ] || return 1 ;;

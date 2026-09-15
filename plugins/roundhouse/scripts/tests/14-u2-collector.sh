@@ -5,6 +5,118 @@
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
 
+test_u2_collector_primitive_contracts() (
+  # Exercise the collector's real helpers without repeating a full enrollment.
+  sed -n '/^sha256_file() {/,/^u2_record_value() {/p' "$collector" | sed '$d' \
+    >"$tmp/u2-collector-helpers.sh"
+  # shellcheck disable=SC1091 # extracted from the current collector above
+  . "$tmp/u2-collector-helpers.sh"
+  u2_hash_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+  u2_hash_empty=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  u2_hash_path="$tmp/collector hash\\name"$'\n''-fixture'
+  printf abc >"$u2_hash_path"
+  [ "$(sha256_file "$u2_hash_path")" = "$u2_hash_abc" ] &&
+    [ "$(printf abc | sha256_stream)" = "$u2_hash_abc" ] &&
+    [ "$(sha256_stream </dev/null)" = "$u2_hash_empty" ] ||
+    fail "collector hashing changed bytes or treated a filename as hash output"
+  if sha256_file "$tmp/collector-missing" >/dev/null 2>&1; then
+    fail "collector hashing accepted an unreadable file"
+  fi
+
+  # A plausible digest on stdout must never hide the backend's failed status.
+  # These command functions intercept both native and PATH-resolved backends.
+  (
+    collector_hash_backend() {
+      printf '%s\n' "$collector_hash_output"
+      return "$collector_hash_status"
+    }
+    sha256sum() { collector_hash_backend; }
+    shasum() { collector_hash_backend; }
+    openssl() { collector_hash_backend; }
+    /usr/bin/sha256sum() { collector_hash_backend; }
+    /sbin/sha256sum() { collector_hash_backend; }
+    /usr/bin/shasum() { collector_hash_backend; }
+    /usr/bin/env() { collector_hash_backend; }
+    collector_hash_output="$u2_hash_abc  -"
+    collector_hash_status=73
+    if sha256_stream </dev/null >"$tmp/u2-collector-failed-hash"; then
+      fail "collector hashing accepted output from a failed backend"
+    else
+      [ "$?" -eq 73 ] || fail "collector hashing lost the backend's failed status"
+    fi
+    [ ! -s "$tmp/u2-collector-failed-hash" ] ||
+      fail "collector hashing emitted a digest after backend failure"
+    collector_hash_status=0
+    for collector_hash_output in not-a-digest "$u2_hash_abc  -"$'\n'"$u2_hash_abc  -"; do
+      if sha256_stream </dev/null >"$tmp/u2-collector-malformed-hash"; then
+        fail "collector hashing accepted malformed or multiple backend digests"
+      fi
+      [ ! -s "$tmp/u2-collector-malformed-hash" ] ||
+        fail "collector hashing emitted malformed backend output"
+    done
+  )
+
+  if [ "$(/usr/bin/uname -s)" = Darwin ]; then
+    printf 'invalid-openssl-configuration\n' >"$tmp/u2-collector-openssl.cnf"
+    [ "$(OPENSSL_CONF="$tmp/u2-collector-openssl.cnf" OPENSSL_MODULES="$tmp/missing-modules" \
+      sha256_file "$u2_hash_path")" = "$u2_hash_abc" ] ||
+      fail "collector hashing loaded caller-selected OpenSSL configuration"
+    u2_root='' platform=macos u2_directory_ready /etc root &&
+      u2_root='' platform=macos u2_directory_ready /var root ||
+      fail "collector rejected native macOS protected ancestor symlinks"
+  fi
+
+  u2_metadata_owner=$(id -un)
+  u2_metadata_root="$tmp/u2-collector-metadata"
+  mkdir "$u2_metadata_root"
+  chmod 755 "$u2_metadata_root"
+  u2_root=$u2_metadata_root
+  printf abc >"$u2_metadata_root/file"
+  chmod 644 "$u2_metadata_root/file"
+  u2_directory_ready "$u2_metadata_root" "$u2_metadata_owner" 755 &&
+    u2_file_ready "$u2_metadata_root/file" "$u2_metadata_owner" 3 644 ||
+    fail "collector rejected valid protected metadata"
+  if u2_file_ready "$u2_metadata_root/file" roundhouse-wrong-owner 3 644; then
+    fail "collector ignored a protected-file owner mismatch"
+  fi
+  (
+    collector_expected_owner=$u2_metadata_owner
+    collector_stat() { printf '%s|644|3\n' "$collector_expected_owner"; return 74; }
+    if u2_file_ready "$u2_metadata_root/file" "$u2_metadata_owner" 3 644; then
+      fail "collector accepted metadata from a failed stat command"
+    fi
+  )
+  chmod 666 "$u2_metadata_root/file"
+  if u2_file_ready "$u2_metadata_root/file" "$u2_metadata_owner" 3 644; then
+    fail "collector reused metadata after file permissions changed"
+  fi
+  chmod 600 "$u2_metadata_root/file"
+  if u2_file_ready "$u2_metadata_root/file" "$u2_metadata_owner" 3 644; then
+    fail "collector lost the exact-mode check for safe permissions"
+  fi
+  chmod 644 "$u2_metadata_root/file"
+  printf d >>"$u2_metadata_root/file"
+  if u2_file_ready "$u2_metadata_root/file" "$u2_metadata_owner" 3 644; then
+    fail "collector reused metadata after file size changed"
+  fi
+  ln -s file "$u2_metadata_root/link"
+  if u2_file_ready "$u2_metadata_root/link" "$u2_metadata_owner" 4 644; then
+    fail "collector accepted a protected-file symlink"
+  fi
+  ln -s . "$u2_metadata_root/directory-link"
+  if u2_directory_ready "$u2_metadata_root/directory-link" "$u2_metadata_owner" 755; then
+    fail "collector accepted an unapproved protected-directory symlink"
+  fi
+  chmod 777 "$u2_metadata_root"
+  if u2_validate_protected_ancestors "$u2_metadata_root/file" "$u2_metadata_owner"; then
+    fail "collector reused metadata after ancestor permissions changed"
+  fi
+  chmod 755 "$u2_metadata_root"
+  u2_file_ready "$u2_metadata_root/file" "$u2_metadata_owner" 4 644 &&
+    u2_validate_protected_ancestors "$u2_metadata_root/file" "$u2_metadata_owner" ||
+    fail "collector retained stale rejection after metadata was restored"
+)
+
 # Requires prepare_u2_broker_requests. Executes one signed request and checks
 # readiness; sets u2_canonical and u2_projection to its completed result files.
 prepare_u2_completed_request_fixture() {
@@ -52,6 +164,7 @@ prepare_u2_completed_request_fixture() {
 }
 
 test_u2_collector_contracts() {
+  test_u2_collector_primitive_contracts
   prepare_u2_completed_request_fixture
   u2_query=$(u2_make_envelope broker.query-result.v1 \
     request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)))

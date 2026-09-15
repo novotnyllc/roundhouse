@@ -17,6 +17,10 @@ unset BASH_ENV CDPATH ENV GLOBIGNORE SSH_AUTH_SOCK SSH_AGENT_PID SSH_ASKPASS \
   http_proxy https_proxy ftp_proxy all_proxy no_proxy \
   HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
 
+# The actual host OS is constant for this process; fixture platform is separate.
+host_os=$(/usr/bin/uname -s)
+readonly host_os
+
 readonly ssh_keygen=/usr/bin/ssh-keygen
 readonly key_name=node-key
 readonly request_name=certificate-request
@@ -55,7 +59,7 @@ record() {
 }
 
 portable_stat() {
-  case $(/usr/bin/uname -s) in
+  case $host_os in
     Darwin) /usr/bin/stat -f "$1" "$3" 2>/dev/null ;;
     Linux) /usr/bin/stat -c "$2" "$3" 2>/dev/null ;;
     *) return 1 ;;
@@ -69,12 +73,12 @@ file_links() { portable_stat %l %h "$1"; }
 file_device_inode() { portable_stat '%d:%i' '%d:%i' "$1"; }
 
 is_wsl() {
-  [ "$(/usr/bin/uname -s)" = Linux ] && [ -r /proc/sys/kernel/osrelease ] &&
+  [ "$host_os" = Linux ] && [ -r /proc/sys/kernel/osrelease ] &&
     /usr/bin/grep -Eiq '(microsoft|wsl)' /proc/sys/kernel/osrelease
 }
 
 platform_boundary() {
-  case $(/usr/bin/uname -s) in
+  case $host_os in
     Darwin) printf '%s' macos ;;
     Linux)
       if is_wsl; then printf '%s' wsl; else printf '%s' linux; fi
@@ -86,9 +90,10 @@ platform_boundary() {
 safe_permissions() {
   local mode permissions
   mode=$(file_mode "$1") || return 1
-  permissions=$(printf '%s' "$mode" | /usr/bin/sed 's/.*\(...\)$/\1/')
+  permissions=$mode
+  [ "${#permissions}" -le 3 ] || permissions=${permissions: -3}
   [ "${#permissions}" -eq 3 ] || return 1
-  case $(printf '%s' "$permissions" | /usr/bin/cut -c 2-3) in *2*|*3*|*6*|*7*) return 1 ;; esac
+  case ${permissions#?} in *2*|*3*|*6*|*7*) return 1 ;; esac
 }
 
 safe_extended_acl() {
@@ -98,13 +103,14 @@ safe_extended_acl() {
   # therefore permitted.  Any macOS allow entry, every default POSIX ACL, and
   # every named POSIX grant are rejected.
   local mode acl_tool acl
-  mode=$(/bin/ls -ld "$1" 2>/dev/null | /usr/bin/awk 'NR == 1 { print $1; exit }') || return 1
+  mode=$(/bin/ls -ld "$1" 2>/dev/null) || return 1
+  mode=${mode%%[[:space:]]*}
   [ -n "$mode" ] || return 1
   case $mode in
     *+*) ;;
     *) return 0 ;;
   esac
-  case $(/usr/bin/uname -s) in
+  case $host_os in
     Darwin)
       # The first line is the normal ls record.  A non-empty ACL record has
       # the stable numeric-index/principal/allow-or-deny shape below.  Treat a
@@ -148,7 +154,7 @@ safe_extended_acl() {
 }
 
 clear_inherited_acl() {
-  case $(/usr/bin/uname -s) in
+  case $host_os in
     Darwin) /bin/chmod -N "$1" >/dev/null 2>&1 || return 1 ;;
     Linux)
       if [ -x /usr/bin/setfacl ]; then
@@ -678,7 +684,7 @@ snapshot_and_validate_request() {
 }
 
 iso_utc_epoch() {
-  case $(/usr/bin/uname -s) in
+  case $host_os in
     Darwin) /bin/date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s ;;
     Linux) /bin/date -u -d "$1" +%s ;;
     *) return 1 ;;
@@ -1079,22 +1085,33 @@ clear_prepare_cleanup_traps() {
 }
 
 digest_text() {
-  if [ -x /usr/bin/shasum ]; then
-    /usr/bin/shasum -a 256 | /usr/bin/awk 'NF >= 1 && $1 ~ /^[0-9a-f]{64}$/ { print $1; exit }'
-  elif [ -x /bin/shasum ]; then
-    /bin/shasum -a 256 | /usr/bin/awk 'NF >= 1 && $1 ~ /^[0-9a-f]{64}$/ { print $1; exit }'
-  elif [ -x /usr/bin/sha256sum ]; then
-    /usr/bin/sha256sum | /usr/bin/awk 'NF >= 1 && $1 ~ /^[0-9a-f]{64}$/ { print $1; exit }'
+  local hash_output
+  if [ -x /usr/bin/sha256sum ]; then
+    hash_output=$(/usr/bin/sha256sum) || return
   elif [ -x /bin/sha256sum ]; then
-    /bin/sha256sum | /usr/bin/awk 'NF >= 1 && $1 ~ /^[0-9a-f]{64}$/ { print $1; exit }'
+    hash_output=$(/bin/sha256sum) || return
+  elif [ -x /sbin/sha256sum ]; then
+    hash_output=$(/sbin/sha256sum) || return
+  elif [ -x /usr/bin/openssl ]; then
+    # Privileged hashing must not load caller-selected OpenSSL providers/config.
+    hash_output=$(/usr/bin/env -i LC_ALL=C OPENSSL_CONF=/dev/null \
+      /usr/bin/openssl dgst -sha256 -r) || return
+  elif [ -x /usr/bin/shasum ]; then
+    hash_output=$(/usr/bin/shasum -a 256) || return
+  elif [ -x /bin/shasum ]; then
+    hash_output=$(/bin/shasum -a 256) || return
   else
     return 1
   fi
+  case $hash_output in *$'\n'*|*$'\r'*) return 1 ;; esac
+  hash_output=${hash_output%% *}
+  [[ $hash_output =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$hash_output"
 }
 
 current_boot_identity() {
   local value
-  case $(/usr/bin/uname -s) in
+  case $host_os in
     Darwin)
       value=$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null | /usr/bin/awk '
         /\{ sec = [0-9]+/ { sub(/^.*\{ sec = /, ""); sub(/,.*/, ""); print; exit }
@@ -1115,7 +1132,7 @@ current_boot_identity() {
 process_start_identity() {
   local pid=$1 value
   [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
-  case $(/usr/bin/uname -s) in
+  case $host_os in
     Darwin)
       value=$(/bin/ps -o lstart= -p "$pid" 2>/dev/null | /usr/bin/awk '
         NF == 5 { print $0; exit }
@@ -1772,7 +1789,7 @@ self_test() {
   ! validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
   /bin/rm -f "$hardlink_path"
   validate_identity_directory "$current" fleet.example node-a 'mu-posix,mu-request' '10.0.0.0/8,192.0.2.0/24' || return 1
-  if [ "$(/usr/bin/uname -s)" = Darwin ]; then
+  if [ "$host_os" = Darwin ]; then
     # Protective macOS denies do not grant a different principal access;
     # effective allow entries still invalidate every protected object.
     /bin/chmod +a 'group:everyone deny delete' "$current/$key_name" || return 1

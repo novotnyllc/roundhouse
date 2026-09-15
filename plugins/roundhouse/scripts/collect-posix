@@ -96,43 +96,55 @@ expand_home() {
 }
 
 sha256_file() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print tolower($1)}'
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print tolower($1)}'
-  else
-    openssl dgst -sha256 "$1" | awk '{print tolower($NF)}'
-  fi
+  # Hash stdin so filenames cannot become options or escaped digest output.
+  sha256_stream <"$1"
 }
 
 sha256_stream() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum | awk '{print tolower($1)}'
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 | awk '{print tolower($1)}'
+  local hash_output
+  if [ -x /usr/bin/sha256sum ]; then
+    hash_output=$(/usr/bin/sha256sum) || return
+  elif [ -x /sbin/sha256sum ]; then
+    hash_output=$(/sbin/sha256sum) || return
+  elif [ -x /usr/bin/openssl ]; then
+    # OpenSSL must not load caller-selected configuration or provider modules.
+    hash_output=$(/usr/bin/env -i LC_ALL=C OPENSSL_CONF=/dev/null \
+      /usr/bin/openssl dgst -sha256 -r) || return
   else
-    openssl dgst -sha256 | awk '{print tolower($NF)}'
+    hash_output=$(/usr/bin/shasum -a 256) || return
   fi
+  case $hash_output in *$'\n'*|*$'\r'*) return 1 ;; esac
+  hash_output=${hash_output%% *}
+  [[ $hash_output =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$hash_output"
+}
+
+# A fixture's reported platform can differ from the machine running stat.
+collector_stat_platform=$(/usr/bin/uname -s)
+readonly collector_stat_platform
+collector_stat() {
+  case $collector_stat_platform in
+    Darwin) /usr/bin/stat -f "$1" "$3" 2>/dev/null ;;
+    Linux) /usr/bin/stat -c "$2" "$3" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
 }
 
 file_mode() {
-  value=$(stat -f %Lp "$1" 2>/dev/null) ||
-    value=$(stat -c %a "$1" 2>/dev/null) ||
-    value=unknown
+  local value
+  value=$(collector_stat %Lp %a "$1") || value=unknown
   printf '%s\n' "$value"
 }
 
 file_owner() {
-  value=$(stat -f %Su "$1" 2>/dev/null) ||
-    value=$(stat -c %U "$1" 2>/dev/null) ||
-    value=unknown
+  local value
+  value=$(collector_stat %Su %U "$1") || value=unknown
   printf '%s\n' "$value"
 }
 
 file_size() {
-  value=$(stat -f %z "$1" 2>/dev/null) ||
-    value=$(stat -c %s "$1" 2>/dev/null) ||
-    value=0
+  local value
+  value=$(collector_stat %z %s "$1") || value=0
   printf '%s\n' "$value"
 }
 
@@ -185,21 +197,44 @@ canonical_git_source() {
   esac
 }
 
-u2_safe_permissions() {
-  u2_permissions=$(file_mode "$1") || return 1
-  u2_permissions=$(printf '%s' "$u2_permissions" | sed 's/.*\(...\)$/\1/')
+u2_permissions_mode_safe() {
+  local u2_permissions=$1
+  case $u2_permissions in ''|*[!0-7]*) return 1 ;; esac
+  [ "${#u2_permissions}" -le 3 ] || u2_permissions=${u2_permissions: -3}
   [ "${#u2_permissions}" -eq 3 ] || return 1
-  case $(printf '%s' "$u2_permissions" | cut -c 2-3) in *2*|*3*|*6*|*7*) return 1 ;; esac
+  case ${u2_permissions:1:2} in *2*|*3*|*6*|*7*) return 1 ;; esac
+}
+
+u2_safe_permissions() {
+  local u2_permissions
+  u2_permissions=$(file_mode "$1") || return 1
+  u2_permissions_mode_safe "$u2_permissions"
+}
+
+u2_metadata_ready() {
+  local u2_metadata_record u2_metadata_owner u2_metadata_tail u2_metadata_mode u2_metadata_size
+  # Observe a fresh tuple for this guard only; later guards read it again.
+  u2_metadata_record=$(collector_stat '%Su|%Lp|%z' '%U|%a|%s' "$1") || return 1
+  case $u2_metadata_record in *$'\n'*|*$'\r'*) return 1 ;; esac
+  u2_metadata_owner=${u2_metadata_record%%|*}
+  u2_metadata_tail=${u2_metadata_record#*|}
+  u2_metadata_mode=${u2_metadata_tail%%|*}
+  u2_metadata_size=${u2_metadata_tail#*|}
+  [ "$u2_metadata_record" = "$u2_metadata_owner|$u2_metadata_mode|$u2_metadata_size" ] || return 1
+  case $u2_metadata_size in ''|*[!0-9]*) return 1 ;; esac
+  [ "$u2_metadata_owner" = "$2" ] && u2_permissions_mode_safe "$u2_metadata_mode" &&
+    { [ -z "${3:-}" ] || [ "$u2_metadata_size" -le "$3" ]; } || return 1
+  if [ -n "${4:-}" ]; then
+    [ "${#u2_metadata_mode}" -le 3 ] || u2_metadata_mode=${u2_metadata_mode: -3}
+    [ "$u2_metadata_mode" = "$4" ] || return 1
+  fi
 }
 
 u2_directory_ready() {
-  u2_path=$1
-  u2_owner=$2
-  u2_mode=${3:-}
-  u2_checked_path=$u2_path
+  local u2_path=$1 u2_owner=$2 u2_mode=${3:-} u2_checked_path=$1
   if [ -L "$u2_path" ]; then
     [ -z "${u2_root:-}" ] && [ "${platform:-}" = macos ] && [ "$u2_owner" = root ] || return 1
-    [ "$(file_owner "$u2_path")" = root ] && u2_safe_permissions "$u2_path" &&
+    u2_metadata_ready "$u2_path" root &&
       u2_directory_ready /private root || return 1
     case $u2_path in
       /etc)
@@ -214,25 +249,11 @@ u2_directory_ready() {
     esac
   fi
   [ -d "$u2_checked_path" ] && [ ! -L "$u2_checked_path" ] &&
-    [ "$(file_owner "$u2_checked_path")" = "$u2_owner" ] &&
-    u2_safe_permissions "$u2_checked_path" || return 1
-  if [ -n "$u2_mode" ]; then
-    u2_observed_mode=$(file_mode "$u2_checked_path" | sed 's/.*\(...\)$/\1/')
-    [ "$u2_observed_mode" = "$u2_mode" ] || return 1
-  fi
+    u2_metadata_ready "$u2_checked_path" "$u2_owner" '' "$u2_mode"
 }
 
 u2_file_ready() {
-  u2_path=$1
-  u2_owner=$2
-  u2_maximum=$3
-  u2_mode=${4:-}
-  [ -f "$u2_path" ] && [ ! -L "$u2_path" ] && [ "$(file_owner "$u2_path")" = "$u2_owner" ] &&
-    [ "$(file_size "$u2_path")" -le "$u2_maximum" ] && u2_safe_permissions "$u2_path" || return 1
-  if [ -n "$u2_mode" ]; then
-    u2_observed_mode=$(file_mode "$u2_path" | sed 's/.*\(...\)$/\1/')
-    [ "$u2_observed_mode" = "$u2_mode" ] || return 1
-  fi
+  [ -f "$1" ] && [ ! -L "$1" ] && u2_metadata_ready "$1" "$2" "$3" "${4:-}"
 }
 
 u2_validate_protected_ancestors() {
@@ -254,7 +275,10 @@ u2_validate_protected_ancestors() {
 }
 
 u2_identity_mode() {
-  file_mode "$1" | sed 's/.*\(...\)$/\1/'
+  local u2_observed_mode
+  u2_observed_mode=$(file_mode "$1") || return 1
+  [ "${#u2_observed_mode}" -le 3 ] || u2_observed_mode=${u2_observed_mode: -3}
+  printf '%s\n' "$u2_observed_mode"
 }
 
 u2_path_set_digest() {

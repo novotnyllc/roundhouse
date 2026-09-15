@@ -181,6 +181,31 @@ prepare_u2_enrollment_recovery_fixture() {
 # lifecycle recovery, leaving the fixture unenrolled after parked-drain cleanup.
 test_u2_enrollment_preparation_contracts() {
   preview_u2_fixture
+  # Authenticate malformed contexts so rejection reaches the schema parser.
+  # The fixture's two config digests match, so their order needs its own check.
+  for u2_context_attack in extra-field reordered-config; do
+    u2_attack_build="$tmp/u2-context-$u2_context_attack"
+    cp -R "$u2_bundle" "$u2_attack_build"
+    case $u2_context_attack in
+      extra-field)
+        sed '$s/$/|/' "$u2_attack_build/apt.context" >"$tmp/u2-attacked-context"
+        ;;
+      reordered-config)
+        awk 'NR==3{saved=$0;next} NR==4{print;print saved;next} {print}' \
+          "$u2_attack_build/apt.context" >"$tmp/u2-attacked-context"
+        ;;
+    esac
+    mv "$tmp/u2-attacked-context" "$u2_attack_build/apt.context"
+    chmod 644 "$u2_attack_build/apt.context"
+    u2_stage_candidate "$u2_attack_build"
+    if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" "$enrollment" preview "$u2_staged_candidate" \
+        >"$tmp/u2-context-$u2_context_attack-result" 2>/dev/null; then
+      fail "U2 enrollment preview accepted malformed APT context: $u2_context_attack"
+    fi
+    grep -Fqx 'reason|candidate_validation_failed' "$tmp/u2-context-$u2_context_attack-result" &&
+      [ ! -e "$u2_root/etc/roundhouse/active" ] ||
+      fail "U2 malformed APT context bypassed semantic validation: $u2_context_attack"
+  done
   for u2_preview_binding in uri suite component publisher; do
     u2_attack_build="$tmp/u2-preview-binding-$u2_preview_binding"
     cp -R "$u2_bundle" "$u2_attack_build"

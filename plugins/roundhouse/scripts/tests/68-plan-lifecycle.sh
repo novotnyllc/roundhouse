@@ -5,6 +5,40 @@
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
 
+# CI selects complete domain lifecycles. A manual section/default run keeps
+# their original order and shared state. Scope runs get a fresh 00/05/07 root;
+# 07 deliberately skips its snapshots for scopes, so prerequisites are explicit.
+plan_fixture_snapshot() {
+  [ -f "$tmp/snapshot.jsonl" ] ||
+    "$cli" collect --target test-host --section all --output "$tmp/snapshot.jsonl"
+}
+
+plan_fixture_recapture() {
+  plan_fixture_snapshot
+  if [ ! -f "$tmp/snapshot-2.jsonl" ]; then
+    sleep 1
+    "$cli" collect --target test-host --section all --output "$tmp/snapshot-2.jsonl"
+  fi
+}
+
+plan_fixture_readiness() {
+  [ ! -f "$tmp/codex-readiness.json" ] || return 0
+  jq -n --arg path "$tmp/home/dev/example" '{
+    host_id:"test-host", project:"example", status:"available",
+    codex_host:"test-codex-host", native_path:$path,
+    expected_source:"github.com:owner/example.git",
+    codex_project_id:"project-opaque-id", task_id:"task-opaque-id",
+    correlation_id:"correlation-opaque-id"
+  }' >"$tmp/codex-readiness.json"
+  chmod 600 "$tmp/codex-readiness.json"
+}
+
+plan_reauth_contracts() {
+  if [ ! -f "$tmp/ignore-native-auth.json" ]; then
+    jq '.auth_artifacts["native-test-auth"].strategy = "ignore"' \
+      "$tmp/config.json" >"$tmp/ignore-native-auth.json"
+    chmod 600 "$tmp/ignore-native-auth.json"
+  fi
 AUTH_CHECK_FAIL=1 "$cli" collect --target test-host --section auth \
   --output "$tmp/reauth-required-auth-posix.jsonl"
 "$cli" validate "$tmp/reauth-required-auth-posix.jsonl"
@@ -36,7 +70,10 @@ fi
   "$tmp/reauth-plan.json"
 [ "$(jq -r '.operations[0].type' "$tmp/reauth-plan.json")" = auth-reauth ] ||
   fail "seal-plan rejected a configured reauthentication operation"
+}
 
+plan_package_contracts() {
+  plan_fixture_recapture
 cat >"$tmp/plan-draft.json" <<JSON
 {
   "domain": "updates",
@@ -159,7 +196,10 @@ printf '%s\n' 2.50.0 >"$BREW_STATE_FILE"
   fail "package apply did not verify the upgraded native-manager version"
 [ "$(jq -r 'select(.kind == "operation" and (.id | startswith("apply:"))) | .data.operation_status' "$tmp/applied.jsonl")" = completed ] ||
   fail "package apply emitted no completed verification operation"
+}
 
+plan_agent_contracts() {
+  plan_fixture_snapshot
 cp "$tmp/skill-lock-fixture.json" "$tmp/home/.agents/.skill-lock.json"
 cat >"$tmp/runtime-plan-draft.json" <<'JSON'
 {
@@ -366,7 +406,11 @@ case $ssh_remote_dir in
   *) fail "SSH apply did not use a /tmp target workspace" ;;
 esac
 [ ! -e "$ssh_remote_dir" ] || fail "SSH apply did not clean its target workspace"
+}
 
+plan_project_contracts() {
+  plan_fixture_snapshot
+  plan_fixture_readiness
 cat >"$tmp/project-plan-draft.json" <<JSON
 {
   "domain": "projects",
@@ -486,7 +530,10 @@ fi
   [.data.task_id,.data.correlation_id] | @tsv
 ' "$tmp/project-enriched.jsonl")" = "$(printf 'task-opaque-id\tcorrelation-opaque-id')" ] ||
   fail "Codex readiness did not enrich the apply operation correlation"
+}
 
+plan_chezmoi_contracts() {
+  plan_fixture_snapshot
 cat >"$tmp/chezmoi-plan-draft.json" <<'JSON'
 {
   "domain": "chezmoi",
@@ -647,7 +694,9 @@ if "$cli" seal-plan "$tmp/duplicate-targeted-chezmoi-plan-draft.json" \
   "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/duplicate-targeted-chezmoi-plan.json" >/dev/null 2>&1; then
   fail "targeted chezmoi plan accepted duplicate targets"
 fi
+}
 
+plan_auth_contracts() {
 "$cli" collect --target test-host --section auth --output "$tmp/auth-plan-snapshot.jsonl"
 sleep 1
 "$cli" collect --target test-host --section auth --output "$tmp/auth-current-snapshot.jsonl"
@@ -724,3 +773,38 @@ chmod 666 "$tmp/config.json"
 if "$cli" check-mutation-config >/dev/null 2>&1; then
   fail "writable mutation config passed integrity check"
 fi
+}
+
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != plan-packages ] || {
+  plan_package_contracts
+  printf 'PASS: plan-packages\n'
+  exit 0
+}
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != plan-agents ] || {
+  plan_agent_contracts
+  printf 'PASS: plan-agents\n'
+  exit 0
+}
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != plan-projects ] || {
+  plan_project_contracts
+  printf 'PASS: plan-projects\n'
+  exit 0
+}
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != plan-chezmoi ] || {
+  plan_chezmoi_contracts
+  printf 'PASS: plan-chezmoi\n'
+  exit 0
+}
+[ "${ROUNDHOUSE_TEST_SCOPE:-}" != plan-auth ] || {
+  plan_reauth_contracts
+  plan_auth_contracts
+  printf 'PASS: plan-auth\n'
+  exit 0
+}
+
+plan_reauth_contracts
+plan_package_contracts
+plan_agent_contracts
+plan_project_contracts
+plan_chezmoi_contracts
+plan_auth_contracts
