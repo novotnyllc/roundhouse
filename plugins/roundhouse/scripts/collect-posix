@@ -104,14 +104,20 @@ sha256_stream() {
   local hash_output
   if [ -x /usr/bin/sha256sum ]; then
     hash_output=$(/usr/bin/sha256sum) || return
+  elif [ -x /bin/sha256sum ]; then
+    hash_output=$(/bin/sha256sum) || return
   elif [ -x /sbin/sha256sum ]; then
     hash_output=$(/sbin/sha256sum) || return
   elif [ -x /usr/bin/openssl ]; then
     # OpenSSL must not load caller-selected configuration or provider modules.
     hash_output=$(/usr/bin/env -i LC_ALL=C OPENSSL_CONF=/dev/null \
       /usr/bin/openssl dgst -sha256 -r) || return
-  else
+  elif [ -x /usr/bin/shasum ]; then
     hash_output=$(/usr/bin/shasum -a 256) || return
+  elif [ -x /bin/shasum ]; then
+    hash_output=$(/bin/shasum -a 256) || return
+  else
+    return 1
   fi
   case $hash_output in *$'\n'*|*$'\r'*) return 1 ;; esac
   hash_output=${hash_output%% *}

@@ -79,6 +79,41 @@ test_u2_collector_primitive_contracts() (
         done
       )
 
+      if [ "$u2_hash_helper" = collect-posix ]; then
+        (
+          # Exercise non-merged-/usr layouts without changing system files.
+          function [ {
+            if builtin [ "$#" -eq 3 ] && builtin [ "$1" = -x ]; then
+              builtin [ "$2" = "$u2_available_hash_backend" ]
+            else
+              builtin [ "$@"
+            fi
+          }
+          /bin/sha256sum() { printf '%s  -\n' "$u2_hash_abc"; return "$u2_hash_status"; }
+          /bin/shasum() { printf '%s  -\n' "$u2_hash_abc"; return "$u2_hash_status"; }
+          for u2_available_hash_backend in /bin/sha256sum /bin/shasum; do
+            u2_hash_status=0
+            [ "$(printf abc | sha256_stream)" = "$u2_hash_abc" ] &&
+              [ "$(sha256_file "$u2_hash_path")" = "$u2_hash_abc" ] ||
+              fail "collector skipped the available $u2_available_hash_backend backend"
+            u2_hash_status=73
+            if sha256_stream </dev/null >"$tmp/u2-collector-bin-hash"; then
+              fail "collector accepted a failed $u2_available_hash_backend backend"
+            else
+              [ "$?" -eq 73 ] || fail "collector lost the /bin backend's failed status"
+            fi
+            [ ! -s "$tmp/u2-collector-bin-hash" ] ||
+              fail "collector emitted a digest after /bin backend failure"
+          done
+          u2_available_hash_backend=none
+          if sha256_stream </dev/null >"$tmp/u2-collector-no-hash"; then
+            fail "collector accepted hashing without a trusted backend"
+          fi
+          [ ! -s "$tmp/u2-collector-no-hash" ] ||
+            fail "collector emitted a digest without a trusted backend"
+        )
+      fi
+
       if [ "$u2_primitive_platform" = Darwin ]; then
         [ "$(printf abc | OPENSSL_CONF="$tmp/u2-collector-openssl.cnf" \
           OPENSSL_MODULES="$tmp/missing-modules" "$u2_hash_stream")" = "$u2_hash_abc" ] ||
