@@ -168,7 +168,18 @@ prepare_u2_collector_fixture() {
   prepare_u2_broker_requests
 }
 
-test_u2_enrollment_contracts() {
+# Requires setup_u2_fixture. Runs the real preview and creates the unrelated
+# sentinel checked after recovery; the fixture remains unenrolled.
+prepare_u2_enrollment_recovery_fixture() {
+  preview_u2_fixture
+  mkdir -p "$u2_root/var/lib/roundhouse"
+  printf '%s\n' unrelated-survives >"$u2_root/var/lib/roundhouse/unrelated-lifecycle-sentinel"
+  chmod 600 "$u2_root/var/lib/roundhouse/unrelated-lifecycle-sentinel"
+}
+
+# Requires setup_u2_fixture. Checks preview binding, collisions, and early
+# lifecycle recovery, leaving the fixture unenrolled after parked-drain cleanup.
+test_u2_enrollment_preparation_contracts() {
   preview_u2_fixture
   for u2_preview_binding in uri suite component publisher; do
     u2_attack_build="$tmp/u2-preview-binding-$u2_preview_binding"
@@ -462,7 +473,11 @@ test_u2_enrollment_contracts() {
   [ ! -e "$u2_root/var/lib/roundhouse-lifecycle.recovery" ] &&
     [ ! -e "$u2_root/var/lib/roundhouse/draining" ] ||
     fail "U2 settled parked drain did not finalize idempotently"
+}
 
+# Requires the unenrolled fixture, its real preview confirmation, and sentinel.
+# Keeps the rollback and SIGKILL chain together, then validates generation 1.
+test_u2_enrollment_recovery_contracts() {
   for u2_failpoint in after-drain after-generation after-broker after-trust after-sudoers \
     after-active after-public-receipt; do
     if ROUNDHOUSE_U2_FIXTURE_ROOT="$u2_root" ROUNDHOUSE_U2_FAILPOINT="$u2_failpoint" \
@@ -682,4 +697,10 @@ test_u2_enrollment_contracts() {
   u2_expect_rejected openssh_attestation_drift "$u2_ssh_attestation" "$tmp/u2-ssh-attestation-drift"
   mv "$tmp/u2-ssh-keygen-attestation" "$u2_generation/ssh-keygen.sha256"
   [ ! -e "$apt_marker" ] || fail "U2 ssh-keygen attestation drift reached native APT"
+}
+
+# The manual composite preserves the complete original enrollment sequence.
+test_u2_enrollment_contracts() {
+  test_u2_enrollment_preparation_contracts
+  test_u2_enrollment_recovery_contracts
 }
