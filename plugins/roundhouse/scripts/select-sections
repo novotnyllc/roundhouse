@@ -5,11 +5,10 @@
 # SECTION numbers to run. With `--scopes`, prints the ROUNDHOUSE_TEST_SCOPE
 # names to run. Either may print the single token `all`.
 #
-# Scopes are not a grouping of sections — they are separate coverage. The
-# *_contracts functions are DEFINED in sections 10/12/14 but only INVOKED from
-# a scope guard, so an unscoped run never executes them however many sections
-# it runs. That is also where the 17-minute job was: the contracts themselves,
-# not the sections around them.
+# Most scopes are additional coverage: *_contracts functions in sections
+# 10/12/14 are only invoked by their scope guards. The five plan scopes instead
+# partition section 68's default coverage. CI runs those scopes instead of the
+# serial 68 job; manual invocations retain the complete section.
 #
 # Unmapped paths are split by whether they are even INPUTS to the suite:
 #
@@ -69,6 +68,10 @@ MAP
 # sections: unmapped inside the tested surface means run every scope.
 u2_scopes() {
   printf 'u2-broker-contracts\nu2-enrollment-preparation-contracts\nu2-enrollment-rollback-contracts\nu2-enrollment-recovery-contracts\nu2-collector-contracts\nu2-upgrade-confirmation-contracts\nu2-upgrade-rollback-contracts\nu2-revocation-recovery-contracts\nu2-revocation-rollback-contracts\n'
+}
+
+plan_scopes() {
+  printf 'plan-packages\nplan-agents\nplan-projects\nplan-chezmoi\nplan-auth\n'
 }
 
 scopes_for() {
@@ -151,6 +154,11 @@ while IFS= read -r path; do
     exit 0
   fi
   selected="$selected $match"
+  # A future targeted mapping to 68 must carry every plan group too. The all
+  # paths above return all for scopes, which CI expands from the scope guards.
+  case " $match " in
+    *" 68 "*) scope_selected="$scope_selected $(plan_scopes)" ;;
+  esac
   if scope_hit=$(scopes_for "$path"); then
     scope_selected="$scope_selected $scope_hit"
   fi

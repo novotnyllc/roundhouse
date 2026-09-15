@@ -1,9 +1,14 @@
 # Verification
 
-`.github/workflows/validate.yml` runs `posix` (ubuntu-latest and
-macos-latest), `scoped` (one runner per `ROUNDHOUSE_TEST_SCOPE` suite per
-POSIX platform, fanned out from the `scope-matrix` job) and `windows`
-(windows-latest). Reproduce them locally before pushing plugin changes.
+`.github/workflows/validate.yml` checks POSIX syntax/integrity in `posix`,
+ordinary sections in `sections`, scoped contracts in `scoped`, and helper
+self-tests in `helpers`, each on ubuntu-latest and macos-latest. `select`
+uses `scripts/select-sections` and its `--scopes`/`--helpers` modes to choose
+PR coverage from changed paths; main pushes select everything. Unknown inputs within the tested surface
+fall back to full coverage. Unrelated changes need no extra scopes or helpers.
+The workflow also runs `actionlint`, native `windows` checks, and the stable
+`ci-ok` gate over all results. Reproduce the relevant gates locally before
+pushing plugin changes.
 
 ## POSIX gates
 
@@ -35,20 +40,26 @@ POSIX platform, fanned out from the `scope-matrix` job) and `windows`
 4. **Self-tests** — the transport and identity helpers each answer a
    `self-test` subcommand: `enroll-ssh-posix self-test`,
    `prepare-ssh-identity self-test`, `certify-ssh-node self-test`. Any new
-   script in these lanes carries the same convention.
+   script in these lanes carries the same convention. CI runs enrollment's
+   Linux and macOS fixture lifecycles in separate jobs on **both actual runner
+   OSes**, using `ROUNDHOUSE_SSH_SELFTEST_PLATFORM=linux` or `macos`. Each
+   selected run includes the WSL rejection check; an unset selector runs both
+   lifecycles and WSL. Other helpers run once per runner OS.
 5. **Skill frontmatter** — every `plugins/roundhouse/skills/*/SKILL.md` has
    exactly `name` and `description`, both non-empty, with `name` equal to its
    directory name.
-6. **Fixture suite** — `plugins/roundhouse/scripts/test-roundhouse`. CI runs
-   `chmod -R go-w plugins/roundhouse` first; group- or world-writable files
-   in the tree make the suite fail on strict-permission checks, so run the
-   same `chmod` locally if the suite complains about permissions.
-7. **Scoped fixture suites** — the same self-check re-entered with
-   `ROUNDHOUSE_TEST_SCOPE`. A scope runs every section ahead of it and then
-   the contract body that a default invocation only *defines* and never
-   calls, so gate 6 does not cover them. The `scopes` job derives the list
-   from the sections and the `scoped` matrix gives each one its own runner
-   on both platforms — never hand-maintain a copy of that list. Locally:
+6. **Fixture suite** — `plugins/roundhouse/scripts/test-roundhouse` remains
+   the full manual release gate. CI uses `ROUNDHOUSE_TEST_ONLY` to run selected
+   section numbers independently over the shared `00/05/07` harness. Sections
+   at or after 90 also load the real-jj bootstrap prerequisite. Group- or
+   world-writable plugin files fail strict-permission checks; use
+   `chmod -R go-w plugins/roundhouse` locally, as the scoped CI jobs do.
+7. **Scoped fixture suites** — re-enter the same driver with
+   `ROUNDHOUSE_TEST_SCOPE`. Most scopes invoke contract bodies that the default
+   suite only defines, so gate 6 does not replace them. `select` derives the
+   full scope list from source guards, excluding the manual `u2-contracts`
+   composite; `scoped` runs each selected scope on both platforms. Discover
+   and run the complete scope set locally with:
 
    ```sh
    for scope in $(grep -ho 'ROUNDHOUSE_TEST_SCOPE:-}" != [a-z0-9-]*' \
@@ -58,13 +69,13 @@ POSIX platform, fanned out from the `scope-matrix` job) and `windows`
    done
    ```
 
-   Today that is `chezmoi-fixture`, `u1-characterization`, `u1-contracts`,
-   `u2-broker-contracts`, `u2-enrollment-preparation-contracts`,
-   `u2-enrollment-rollback-contracts`, `u2-enrollment-recovery-contracts`,
-   `u2-collector-contracts`,
-   `u2-upgrade-confirmation-contracts`, `u2-upgrade-rollback-contracts`,
-   `u2-revocation-recovery-contracts`, `u2-revocation-rollback-contracts`,
-   `u4-contracts`, `u5-contracts` and `macos-privilege-contracts`.
+   Five scopes partition ordinary section 68: `plan-packages`, `plan-agents`,
+   `plan-projects`, `plan-chezmoi`, and `plan-auth`. Each starts with only
+   `00/05/07/68` and explicitly builds its snapshot/readiness prerequisites.
+   CI selects all five whenever section 68 is required and omits the serial
+   68 job. `ROUNDHOUSE_TEST_ONLY=68` and the default manual suite retain every
+   original assertion in the original lifecycle order.
+
    Each U2 scope builds fresh keys, signed bundles, and native command fixtures.
    Enrollment preparation covers preview binding, collisions, and interrupted
    preparation and retirement. Enrollment rollback and recovery each start
@@ -84,17 +95,25 @@ POSIX platform, fanned out from the `scope-matrix` job) and `windows`
    revocation. The manual composite retains every case in its original order.
    All rejection and lifecycle failure cases remain in the contract bodies.
    `ROUNDHOUSE_TEST_SCOPE=u2-contracts` still runs the complete U2 sequence
-   manually; CI excludes that composite alias to avoid repeating the nine jobs.
-   Serially the loop costs several times one
-   default run, because the scopes share prefixes they each re-execute; CI
-   parallelises it instead.
+   manually; CI excludes that composite alias to avoid repeating the nine scopes.
+   Each scoped invocation owns a fresh fixture root; running another scope
+   first is not a prerequisite. CI parallelizes them rather than running the
+   complete local loop serially.
 
-The Linux job also installs `openssh-server` before the scope validation.
+Linux helper, section, and scope jobs install `openssh-server` only if `sshd`
+is absent, with bounded retries.
 
-`tests/90-real-jj.sh` is the one block no gate can force: it probes for
-`jj >= 0.43`, drives two real working copies when it finds one, and prints a
-loud NOTICE when it does not. CI runners have no `jj`, so run gate 6 once on
-a jj-equipped host before merging anything that touches sync.
+The `sections` jobs install pinned `jj` 0.44.0 and `yq` 4.44.3 and set
+`ROUNDHOUSE_REQUIRE_REAL_JJ=true`. `tests/90-jj-bootstrap.sh` requires usable
+`jj >= 0.43` and `yq` when that flag is set; CI therefore fails rather than
+skipping real-jj coverage. Local runs without the flag print a NOTICE and
+skip those fixtures when dependencies are unavailable. Set the flag when
+validating sync changes locally, for example:
+
+```sh
+ROUNDHOUSE_TEST_TIER=jj ROUNDHOUSE_REQUIRE_REAL_JJ=true \
+  plugins/roundhouse/scripts/test-roundhouse
+```
 
 ## Windows gates
 

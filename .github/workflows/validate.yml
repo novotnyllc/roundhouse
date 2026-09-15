@@ -16,11 +16,9 @@ jobs:
       - name: Lint GitHub Actions workflows
         uses: docker://rhysd/actionlint@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 # v1.7.7
 
-  # The full serial suite still runs — on pushes to main, as the backstop that
-  # catches anything the change-scoped selection got wrong. PRs run the selected
-  # sections in parallel instead (see `select` / `sections` below). Keeping this
-  # on main means a mis-scoped rule costs one late red build rather than silent
-  # loss of coverage.
+  # Syntax, source integrity, and metadata are checked on both platforms.
+  # Main pushes run every section/scope in parallel below as the backstop for
+  # change-scoped PR selection; the serial suite remains a manual release gate.
   posix:
     strategy:
       matrix:
@@ -86,28 +84,18 @@ jobs:
               if set(fields) != {"name", "description"} or fields["name"] != path.parent.name:
                   raise SystemExit(f"invalid skill identity: {path}")
           PY
-  # The scoped suites are early-exit shortcuts *inside* the same self-check:
-  # a default invocation defines their bodies and never calls them, so they
-  # ran nowhere until a human typed the variable. The list is derived from
-  # the sections themselves — adding a scope enrolls it in CI, and no list
-  # here can silently rot behind the tree.
-  # Split out of `posix`, where the three ran SEQUENTIALLY and cost 13.8 min of
-  # a 30.8 min job on macOS. They are fork-bound shell fixtures (thousands of
-  # small stat/tr/cut execs), so there is nothing to cache and nothing blocked
-  # on I/O: running them concurrently is the whole optimization. One job per
-  # helper also names which helper failed instead of one opaque step.
-  # Depends on `select` - about six seconds - so that a change implicating no
-  # helper skips these entirely. That is a real dependency, not a concurrent
-  # one: the matrix cannot be built before the list exists. Worth it, because
-  # the enroll-ssh-posix leg alone runs ~10 min on macOS.
+  # Independent helper self-tests run on both host OSes. Enrollment has two
+  # complete fixture-platform lifecycles; give each its own job while retaining
+  # both on Linux and macOS. Other helpers still get one job per host OS.
   helpers:
+    name: helpers (${{ matrix.os }}, ${{ matrix.fixture.helper }}, ${{ matrix.fixture.platform || 'self-test' }})
     needs: select
     if: needs.select.outputs.helpers != '[]'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        helper: ${{ fromJSON(needs.select.outputs.helpers) }}
+        fixture: ${{ fromJSON(needs.select.outputs.helpers) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -136,11 +124,13 @@ jobs:
           done
           printf 'could not install openssh-server\n' >&2
           exit 1
-      - name: Validate ${{ matrix.helper }}
+      - name: Validate ${{ matrix.fixture.helper }}
         shell: bash
+        env:
+          ROUNDHOUSE_SSH_SELFTEST_PLATFORM: ${{ matrix.fixture.platform }}
         run: |
           set -eu
-          plugins/roundhouse/scripts/${{ matrix.helper }} self-test
+          plugins/roundhouse/scripts/${{ matrix.fixture.helper }} self-test
 
   # Which test sections does THIS change actually require? Measured motivation:
   # the preamble (00/05/07) is ~3s and most sections are single-digit seconds,
@@ -187,15 +177,15 @@ jobs:
           fi
           printf 'selected: %s\n' "$(printf '%s' "$picked" | tr '\n' ' ')"
 
-          json=$(printf '%s\n' "$picked" | grep -v '^$' | sort -u |
+          # Section 68 is covered by the five plan scopes. Filter it even for
+          # targeted selections, so CI never repeats their serial composite.
+          json=$(printf '%s\n' "$picked" | grep -vE '^(|68)$' | sort -u |
             awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
           echo "sections=$json" >> "$GITHUB_OUTPUT"
 
-          # Scopes are SEPARATE coverage, not a grouping of sections: the
-          # *_contracts functions are only invoked from a scope guard, so an
-          # unscoped run never executes them. They are also where the
-          # 17-minute job lived, which is exactly why they must be selected by
-          # change rather than run every time.
+          # Most scopes invoke contracts absent from an ordinary section run.
+          # The plan scopes instead partition section 68, including on main's
+          # full selection. Derive the complete list from the source guards.
           if [ '${{ github.event_name }}' = pull_request ]; then
             scopes=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections --scopes)
           else
@@ -216,17 +206,19 @@ jobs:
             awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
           echo "scopes=$sjson" >> "$GITHUB_OUTPUT"
 
-          # Which helper self-tests does this change implicate? These are the
-          # most expensive jobs in the matrix, so running all six legs for a
-          # change that touches none of them is the biggest avoidable cost here.
+          # Only enrollment expands into two fixture-platform entries. Keep
+          # the selector's helper names unchanged for local callers.
           if [ '${{ github.event_name }}' = pull_request ]; then
             helpers=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections --helpers)
           else
             helpers=$(printf '%s\n' '' | plugins/roundhouse/scripts/select-sections --helpers)
           fi
           printf 'helpers: %s\n' "$(printf '%s' "$helpers" | tr '\n' ' ')"
-          hjson=$(printf '%s\n' "$helpers" | { grep -v '^$' || true; } | sort -u |
-            awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+          hjson=$(printf '%s\n' "$helpers" | jq -Rsc '
+            split("\n") | map(select(length > 0)) | unique |
+            map(if . == "enroll-ssh-posix" then
+              {helper:., platform:"linux"}, {helper:., platform:"macos"}
+            else {helper:., platform:""} end)')
           echo "helpers=$hjson" >> "$GITHUB_OUTPUT"
 
   # One job per section, on every event. Wall time is the ~3s preamble plus the

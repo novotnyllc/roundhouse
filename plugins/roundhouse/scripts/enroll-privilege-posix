@@ -689,10 +689,6 @@ path_set_digest() {
   printf '%s\n' "$answer"
 }
 
-context_value() {
-  /usr/bin/awk -F '|' -v key="$1" '$1==key{print $2;exit}' "$bundle/apt.context"
-}
-
 context_binary() {
   local name=$1 context=${2:-apt.context}
   /usr/bin/awk -F '|' -v name="$name" '$1=="binary"&&$2==name{print $3;exit}' "$bundle/$context"
@@ -866,8 +862,10 @@ validate_apt_context() {
   local apt_architecture apt_config_digest effective_config_digest sources_digest keyrings_digest
   local preferences_digest source_identities_digest methods_digest compressors_digest helpers_digest
   local apt_get_digest apt_config_binary_digest apt_cache_digest dpkg_digest dpkg_query_digest
-  local dpkg_deb_digest setsid_digest candidate_generation effective_dump dependency
-  /usr/bin/awk -F '|' '
+  local dpkg_deb_digest setsid_digest candidate_generation effective_dump dependency apt_context_fields
+  # Read each validation boundary afresh. Emit values only from the same
+  # schema-checked input, including exact field counts and printable bytes.
+  apt_context_fields=$(/usr/bin/awk -F '|' '
     BEGIN {
       value[2]="architecture"; value[3]="config-file-sha256"; value[4]="effective-config-sha256"
       value[5]="sources-sha256"; value[6]="keyrings-sha256"; value[7]="preferences-sha256"
@@ -878,28 +876,18 @@ validate_apt_context() {
     }
     $0!~/^[ -~]+$/ { exit 1 }
     NR==1 { if(NF!=2||$1!="apt-context"||$2!="2")exit 1; next }
-    NR>=2&&NR<=11 { if(NF!=2||$1!=value[NR])exit 1; next }
-    NR>=12&&NR<=18 { if(NF!=3||$1!="binary"||$2!=binary[NR])exit 1; next }
+    NR>=2&&NR<=11 { if(NF!=2||$1!=value[NR])exit 1; field[NR]=$2; next }
+    NR>=12&&NR<=18 { if(NF!=3||$1!="binary"||$2!=binary[NR])exit 1; field[NR]=$3; next }
     { exit 1 }
-    END { if(NR!=18)exit 1 }
-  ' "$bundle/apt.context" || return 1
-  apt_architecture=$(context_value architecture)
-  apt_config_digest=$(context_value config-file-sha256)
-  effective_config_digest=$(context_value effective-config-sha256)
-  sources_digest=$(context_value sources-sha256)
-  keyrings_digest=$(context_value keyrings-sha256)
-  preferences_digest=$(context_value preferences-sha256)
-  source_identities_digest=$(context_value source-identities-sha256)
-  methods_digest=$(context_value methods-sha256)
-  compressors_digest=$(context_value compressors-sha256)
-  helpers_digest=$(context_value helpers-sha256)
-  apt_get_digest=$(context_binary apt-get)
-  apt_config_binary_digest=$(context_binary apt-config)
-  apt_cache_digest=$(context_binary apt-cache)
-  dpkg_digest=$(context_binary dpkg)
-  dpkg_query_digest=$(context_binary dpkg-query)
-  dpkg_deb_digest=$(context_binary dpkg-deb)
-  setsid_digest=$(context_binary setsid)
+    END {
+      if(NR!=18)exit 1
+      for(i=2;i<=18;i++)printf "%s%s",field[i],(i==18?"\n":"|")
+    }
+  ' "$bundle/apt.context") || return 1
+  IFS='|' read -r apt_architecture apt_config_digest effective_config_digest sources_digest \
+    keyrings_digest preferences_digest source_identities_digest methods_digest \
+    compressors_digest helpers_digest apt_get_digest apt_config_binary_digest apt_cache_digest \
+    dpkg_digest dpkg_query_digest dpkg_deb_digest setsid_digest <<<"$apt_context_fields" || return 1
   [[ $apt_architecture =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] &&
     digest "$apt_config_digest" && digest "$effective_config_digest" &&
     digest "$sources_digest" && digest "$keyrings_digest" && digest "$preferences_digest" &&
