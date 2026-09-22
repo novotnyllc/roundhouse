@@ -1055,11 +1055,14 @@ YAML
     # to the real collector passes for the wrong reason on the next runner
     # image, and this hook decides what gets DESCRIBED, never what is trusted.
     cat >"$run_root/snapshot.jsonl" <<'JSONL'
-{"kind":"plugin","status":"present","data":{"name":"ponytail","marketplace":"novotnyllc","enabled":true}}
-{"kind":"plugin","status":"present","data":{"name":"legal","marketplace":"novotnyllc","enabled":false}}
+{"kind":"plugin","status":"present","data":{"agent":"claude","name":"ponytail","marketplace":"novotnyllc","enabled":true}}
+{"kind":"plugin","status":"present","data":{"agent":"claude","name":"legal","marketplace":"novotnyllc","enabled":false}}
+{"kind":"plugin","status":"present","data":{"agent":"codex","name":"ponytail","marketplace":"codex-catalog","enabled":false}}
+{"kind":"plugin","status":"present","data":{"agent":"codex","name":"codex-only","marketplace":"codex-catalog","enabled":true}}
+{"kind":"plugin","status":"present","data":{"name":"unknown-harness","marketplace":"unknown","enabled":true}}
 {"kind":"skill","status":"present","data":{"name":"grilling"}}
 {"kind":"package","status":"present","data":{"name":"jq"}}
-{"kind":"plugin","status":"absent","data":{"name":"never-installed","marketplace":"x","enabled":true}}
+{"kind":"plugin","status":"absent","data":{"agent":"claude","name":"never-installed","marketplace":"x","enabled":true}}
 JSONL
     run_seed_host=$(fleet_host_name)
     cat >"$run_store/hosts/$run_seed_host.yaml" <<'YAML'
@@ -1079,6 +1082,12 @@ YAML
     run_seeded="$run_store/hosts/$run_seed_host.yaml"
     grep -Fq 'ponytail:' "$run_seeded" ||
       fail "seeding did not describe an installed plugin"
+    yq -e '.plugins.ponytail.state == "enabled" and .plugins.ponytail.marketplace == "novotnyllc"' \
+      "$run_seeded" >/dev/null ||
+      fail "a same-name Codex plugin replaced the Claude desired plugin"
+    yq -e '.plugins."codex-only" == null and .plugins."unknown-harness" == null' \
+      "$run_seeded" >/dev/null ||
+      fail "seeding sent a non-Claude plugin to the Claude-only apply surface"
     yq -e '.plugins.legal.state == "disabled"' "$run_seeded" >/dev/null ||
       fail "seeding lost a plugin's disabled state"
     ! grep -Fq 'never-installed' "$run_seeded" ||
@@ -1090,6 +1099,9 @@ YAML
     # the safety property worth paying a verbose host file for.
     [ -f "$(fleet_applied_path "$run_store" "$run_seed_host")" ] ||
       fail "seeding wrote no applied/<host>.yaml, so the first run would adopt everything"
+    [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" plugins.codex-only)" ] &&
+      [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" plugins.unknown-harness)" ] ||
+      fail "seeding asserted applied evidence for a non-Claude plugin"
     # It stops at the working copy: no describe, no bookmark, no push. There is
     # no repository here at all, and seeding must not need one.
     [ ! -e "$run_store/.jj" ] ||

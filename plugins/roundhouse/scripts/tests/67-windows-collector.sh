@@ -51,7 +51,87 @@ if [ -n "$pwsh_command" ]; then
   "$cli" validate "$tmp/windows-packages.jsonl"
   [ "$(jq -r 'select(.kind == "package" and .id == "winget:Example.Package") | .data.candidate_version' \
     "$tmp/windows-packages.jsonl")" = 2.0.0 ] ||
-    fail "authoritative winget table did not produce a candidate"
+    fail "native winget continuous separator and upgrade summary did not produce a candidate"
+
+  cat >"$tmp/windows-package-draft.json" <<'JSON'
+{"domain":"updates","target":"test-windows","operations":[{"type":"package-upgrade","kind":"package","id":"winget:Example.Package","candidate_version":"2.0.0","argv":["winget","upgrade","--id","Example.Package","--exact","--version","2.0.0","--accept-package-agreements","--accept-source-agreements","--disable-interactivity"]}]}
+JSON
+  "$cli" seal-plan "$tmp/windows-package-draft.json" "$tmp/windows-packages.jsonl" \
+    "$tmp/windows-package-plan.json" || fail "Windows package candidate could not seal with a configured control project"
+  jq -e --arg version "$plugin_version" '
+    .target == "test-windows" and .required_executor.version == $version and
+    .operations[0].candidate_version == "2.0.0"
+  ' "$tmp/windows-package-plan.json" >/dev/null || fail "Windows package plan lost its candidate or executor binding"
+  for required_windows_field in expected_hostname expected_user codex_control_project; do
+    jq --arg field "$required_windows_field" 'del(.machines["test-windows"][$field])' \
+      "$ROUNDHOUSE_CONFIG" >"$tmp/windows-missing-control-config.json"
+    if ROUNDHOUSE_CONFIG="$tmp/windows-missing-control-config.json" "$cli" seal-plan \
+      "$tmp/windows-package-draft.json" "$tmp/windows-packages.jsonl" \
+      "$tmp/windows-missing-control-plan.json" >"$tmp/windows-missing-control.log" 2>&1; then
+      fail "Windows package plan sealed without $required_windows_field"
+    fi
+    assert_contains "$(cat "$tmp/windows-missing-control.log")" \
+      'Windows mutation requires expected identity and a configured Codex control project'
+    [ ! -e "$tmp/windows-missing-control-plan.json" ] ||
+      fail "rejected Windows control config left a sealed plan"
+  done
+
+  for winget_mode in native grouped none native-blank-prefix native-unicode-name native-astral-name; do
+    WINGET_MODE="$winget_mode" HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile \
+      -File "$script_dir/collect-windows.ps1" -ConfigPath "$tmp/windows-worker-config.json" \
+      -HostId test-windows -ControllerConfigDigest "$config_hash" -Sections packages \
+      >"$tmp/windows-packages-$winget_mode.jsonl"
+    "$cli" validate "$tmp/windows-packages-$winget_mode.jsonl"
+    [ "$(jq -s 'map(select(.kind == "error" and .id == "packages:winget-updates")) | length' \
+      "$tmp/windows-packages-$winget_mode.jsonl")" -eq 0 ] ||
+      fail "authoritative winget $winget_mode output was rejected"
+  done
+  for winget_mode in native-unicode-name native-astral-name; do
+    [ "$(jq -s 'map(select(.kind == "package" and .data.update_available == true and .confidence == "high")) | length' \
+      "$tmp/windows-packages-$winget_mode.jsonl")" -eq 5 ] ||
+      fail "native winget $winget_mode display width hid otherwise valid upgrades"
+  done
+  [ "$(jq -s 'map(select(.kind == "package" and .data.update_available == true and .confidence == "high")) | length' \
+    "$tmp/windows-packages-native.jsonl")" -eq 5 ] ||
+    fail "native winget summary did not cover both ordinary and explicitly targeted upgrades"
+  [ "$(jq -r 'select(.kind == "package" and .id == "winget:Space.Version") | .data.candidate_version' \
+    "$tmp/windows-packages-native.jsonl")" = '7.2.1 (48556)' ] ||
+    fail "native winget multiword candidate version was split"
+  [ "$(jq -r 'select(.kind == "package" and .id == "winget:Range.Version") | .data.candidate_version' \
+    "$tmp/windows-packages-native.jsonl")" = 150.104.1.0 ] ||
+    fail "native winget multiword installed version shifted the candidate columns"
+  [ "$(jq -r 'select(.kind == "package" and .id == "winget:Current.Package") | .data.update_available' \
+    "$tmp/windows-packages-native.jsonl")" = false ] ||
+    fail "authoritative winget inventory did not identify a current exported package"
+  [ "$(jq -r 'select(.kind == "package" and .id == "winget:Example.Package") | .data.update_available' \
+    "$tmp/windows-packages-none.jsonl")" = false ] ||
+    fail "authoritative winget no-upgrades output did not identify a current package"
+
+  for winget_mode in native-id-truncated native-installed-truncated native-available-truncated \
+      native-source-truncated native-row-truncated native-duplicate native-case-duplicate \
+      native-footer-missing native-count-mismatch native-secondary-header-missing \
+      native-secondary-malformed native-unexpected-footer native-source-mismatch \
+      native-installed-mismatch native-id-case-mismatch native-source-case-mismatch \
+      native-source-warning native-unexpected-prefix native-nonascii-version \
+      native-misaligned-suffix native-suffix-extra-column; do
+    WINGET_MODE="$winget_mode" HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile \
+      -File "$script_dir/collect-windows.ps1" -ConfigPath "$tmp/windows-worker-config.json" \
+      -HostId test-windows -ControllerConfigDigest "$config_hash" -Sections packages \
+      >"$tmp/windows-packages-$winget_mode.jsonl"
+    "$cli" validate "$tmp/windows-packages-$winget_mode.jsonl"
+    [ "$(jq -s 'map(select(.kind == "error" and .id == "packages:winget-updates" and
+      .errors[0].code == "candidate_query_unverified")) | length' \
+      "$tmp/windows-packages-$winget_mode.jsonl")" -eq 1 ] ||
+      fail "unverified winget $winget_mode output was not reported"
+    [ "$(jq -s 'map(select(.kind == "package" and
+      (.data.candidate_version != null or .data.update_available != null or .confidence != "medium"))) | length' \
+      "$tmp/windows-packages-$winget_mode.jsonl")" -eq 0 ] ||
+      fail "unverified winget $winget_mode output produced an actionable candidate"
+  done
+  [ "$(jq -r 'select(.kind == "package" and .id == "winget:9FAILED12345") |
+    (.data.source == "msstore" and .data.update_available == null and .confidence == "medium")' \
+    "$tmp/windows-packages-native-source-warning.jsonl")" = true ] ||
+    fail "failed winget source was reported as current after a successful independent export"
 
   WINGET_MODE=invalid HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile \
     -File "$script_dir/collect-windows.ps1" -ConfigPath "$tmp/windows-worker-config.json" \

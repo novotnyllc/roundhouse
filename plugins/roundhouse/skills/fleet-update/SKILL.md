@@ -15,12 +15,9 @@ and inventory the package section first.
 authorization — plan, seal, verify, and apply in one pass without asking
 again. A request to inspect, report, or plan stops at the read-only plan, and
 apply permission is never inferred from it. The sealed pipeline below is
-safety mechanics, not an approval gate. This is mechanical-tier work: a
-session running a premium model delegates the run to a cheap-model child
-(the routed mechanical tier) rather than executing inline — skills cannot
-switch the session's own model. That child's dispatch prompt carries
-railyard's dispatch banner instruction (`▸ <model>/<effort> · …` echoed first,
-non-blocking; see railyard's harness-model-invocation reference).
+safety mechanics, not an approval gate. Execute ordinary CLI operations
+directly. The calling workflow owns any model selection or agent dispatch
+policy.
 
 - Homebrew: on an update request, refresh metadata (`brew update`) and
   proceed; use `brew outdated --json=v2` for the plan and `brew upgrade` for
@@ -125,7 +122,7 @@ Both intervals are jittered from the host **name**, so the fleet does not
 re-synchronise on the same minute; the interval keys live in the store's
 policy block, not on the machine being governed.
 
-`railyard:setup` installs the entry on request. **Absorb, never duplicate**:
+The calling workflow installs the entry on request. **Absorb, never duplicate**:
 if `com.novotnyllc.roundhouse.autoupdate` (or its systemd/Task Scheduler
 equivalent) exists, unload and remove it in the same step that installs the
 fleet entry. A host carrying both is the exact double-runner this rule exists
@@ -168,8 +165,7 @@ recovery rather than forcing. `roundhouse fleet-unlock` releases a lock left by
 a killed run; `roundhouse fleet-lock` taken by hand also exits 75 when the lock
 is already held. Unattended runs skip protected/privileged actions — those
 stay interactive by design. Failures land in the store's own alert and journal
-records, surface in `roundhouse fleet-pending`, and are reported at the next
-`railyard:doctor` run.
+records and surface in `roundhouse fleet-pending` and `roundhouse fleet-doctor`.
 
 ## Protected package actions
 

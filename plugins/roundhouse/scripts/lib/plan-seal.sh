@@ -125,8 +125,8 @@ seal_plan_command() {
       .machines[$target] as $machine |
       ($machine.expected_hostname | type == "string" and length > 0) and
       ($machine.expected_user | type == "string" and length > 0) and
-      ($machine.codex_control_project | type == "string" and
-        .projects[$machine.codex_control_project] != null)
+      ($machine.codex_control_project | type == "string" and length > 0) and
+      (.projects[$machine.codex_control_project] != null)
     ' "$config" >/dev/null || {
       printf 'roundhouse: Windows mutation requires expected identity and a configured Codex control project\n' >&2
       exit 65

@@ -2491,12 +2491,16 @@ fleet_seed_command() (
   # shipped collector observes. `agents`, `mcp_servers` and `hooks` have no
   # observed-state side at all (declared boundary B-3), so seeding them would
   # be inventing state rather than reading it.
+  # The plugins apply surface is Claude-owned. Codex rows share plugin names
+  # but can name a different marketplace or state; reducing both harnesses
+  # into this map would overwrite Claude's record and ask its manager to
+  # install Codex-only plugins. Unknown ownership cannot prove a Claude want.
   seed_desired=$(jq -sc '
     # `.enabled // true` would read FALSE as absent — jq'\''s alternative operator
     # treats false and null alike, and a disabled plugin would seed as enabled.
     def state($e): if $e.data.enabled == false then "disabled" else "enabled" end;
     reduce (.[] | select(.status == "present")) as $r ({};
-      if $r.kind == "plugin" then
+      if $r.kind == "plugin" and $r.data.agent == "claude" then
         .plugins[$r.data.name] = (if ($r.data.marketplace // "") == "" then state($r)
           else {state: state($r), marketplace: $r.data.marketplace} end)
       elif $r.kind == "skill" then .skills[$r.data.name] = "enabled"

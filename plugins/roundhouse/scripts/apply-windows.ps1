@@ -931,15 +931,13 @@ function New-ApplyOperationRecord(
             source = "sealed-plan"
             method = $(if ($Completed) { "exact-argv+native-exit+post-inventory" } else { "exact-argv+native-failure+post-inventory-attempt" })
         })
-        errors = $(if ($Completed) {
-            @()
-        } else {
-            @(@{
+        errors = @(if (-not $Completed) {
+            @{
                 code = "operation_failed"
                 severity = "error"
                 retryable = $true
                 message = [string]$Result.message
-            })
+            }
         })
     }
 }
@@ -988,15 +986,13 @@ function New-ApplySummaryRecord(
             source = "sealed-plan"
             method = $(if ($Completed) { "verified-execution+post-inventory" } else { "partial-execution+post-inventory-attempt" })
         })
-        errors = $(if ($Completed) {
-            @()
-        } else {
-            @(@{
+        errors = @(if (-not $Completed) {
+            @{
                 code = "apply_partial"
                 severity = "error"
                 retryable = $true
                 message = [string]$Failure.message
-            })
+            }
         })
     }
 }
@@ -1304,6 +1300,29 @@ if ($SelfTest) {
             @($PartialLines | Where-Object { $_.id -eq "apply:plan-0000000000000000" -and
                 $_.status -eq "partial" -and $_.data.failed_operation_index -eq 0 }).Count -ne 1) {
             throw "Partial result serialization self-test failed"
+        }
+        foreach ($Record in $PartialLines) {
+            if ($Record.errors -isnot [array] -or $Record.errors.Count -ne 1) {
+                throw "Partial result errors must serialize as a JSON array"
+            }
+        }
+        $CompletedResult = [ordered]@{}
+        foreach ($Key in $PartialFailure.Keys) { $CompletedResult[$Key] = $PartialFailure[$Key] }
+        $CompletedResult.operation_status = "completed"
+        $CompletedResult.exit_code = 0
+        $CompletedOperationRecord = New-ApplyOperationRecord $CompletedResult "fixture-snapshot" `
+            "2026-01-01T00:00:00Z" $PartialPlan "plan-0000000000000000" "fixture-host" `
+            ("b" * 64) ("c" * 64)
+        $CompletedSummaryRecord = New-ApplySummaryRecord $null "fixture-snapshot" `
+            "2026-01-01T00:00:00Z" $PartialPlan "plan-0000000000000000" "fixture-host" `
+            ("d" * 64) ("b" * 64) ("c" * 64) "completed"
+        Write-Result @($CompletedOperationRecord, $CompletedSummaryRecord)
+        $CompletedLines = @(Get-Content -LiteralPath $ResultPath | ForEach-Object { $_ | ConvertFrom-Json })
+        foreach ($Record in $CompletedLines) {
+            if ($Record.errors -isnot [array] -or $Record.errors.Count -ne 0 -or
+                $Record.data.operation_status -ne "completed") {
+                throw "Completed result errors must serialize as an empty JSON array"
+            }
         }
 
         if ($IsWindows) {

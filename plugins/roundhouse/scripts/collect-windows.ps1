@@ -1974,6 +1974,105 @@ function Invoke-WindowsSftpReceiptSelfTest {
     }
 }
 
+function Get-WingetUpgradeCandidates([string[]]$Lines, [object]$Export) {
+    $HeaderPattern = '^Name +(?<id>Id) +(?<installed>Version) +(?<available>Available) +(?<source>Source) *$'
+    $HeaderIndex = -1
+    for ($Index = 0; $Index -lt $Lines.Count; $Index++) {
+        if ($Lines[$Index] -cmatch $HeaderPattern) { $HeaderIndex = $Index; break }
+        # A successful command can still warn that a source was not searched.
+        if (-not [string]::IsNullOrWhiteSpace($Lines[$Index])) { break }
+    }
+    if ($HeaderIndex -lt 0) {
+        if (($Lines -join "`n").Trim() -cmatch
+            '^(No installed package found matching input criteria|No applicable upgrade found)\.?$') {
+            return @{}
+        }
+        return $null
+    }
+
+    $Rows = @{}
+    $SummaryCount = $null
+    $ExpectHeader = $true
+    $TargetedTable = $false
+    $TableRowCount = 0
+    for ($Index = $HeaderIndex; $Index -lt $Lines.Count; $Index++) {
+        $Line = $Lines[$Index]
+        if ([string]::IsNullOrWhiteSpace($Line)) { continue }
+        if ($ExpectHeader) {
+            $Header = [regex]::Match($Line, $HeaderPattern)
+            if (-not $Header.Success -or $Index + 1 -ge $Lines.Count) { return $null }
+            $Offsets = @(0; $Header.Groups['id'].Index; $Header.Groups['installed'].Index
+                $Header.Groups['available'].Index; $Header.Groups['source'].Index)
+            $Index++
+            $Separator = $Lines[$Index]
+            if ($Separator -notmatch '^(?:-{3,}|-{3,}(?: +-+){4}) *$' -or
+                $Separator.TrimEnd().Length -lt $Line.TrimEnd().Length) { return $null }
+            $ExpectHeader = $false
+            $TableRowCount = 0
+            continue
+        }
+        if ($Line -cmatch '^(?<count>[0-9]+) upgrades? available\.$') {
+            $Count = 0
+            if ($TargetedTable -or $null -ne $SummaryCount -or $TableRowCount -eq 0 -or
+                -not [int]::TryParse($Matches['count'], [ref]$Count) -or $Count -le 0) { return $null }
+            $SummaryCount = $Count
+            continue
+        }
+        if ($Line -ceq 'The following packages have an upgrade available, but require explicit targeting for upgrade:') {
+            if ($TargetedTable -or $null -eq $SummaryCount) { return $null }
+            $TargetedTable = $true
+            $ExpectHeader = $true
+            continue
+        }
+        if ($null -ne $SummaryCount -and -not $TargetedTable) { return $null }
+
+        # Anchor the fixed-width identity columns at the final Source token so
+        # Unicode display names need no UTF-16/display-width approximation.
+        # Identity/version/source fields must be printable ASCII; non-ASCII
+        # fields remain unknown. Whitespace splitting would lose spaced versions.
+        $SourceMatch = [regex]::Match($Line, '(?<source>\S+) *$')
+        if (-not $SourceMatch.Success) { return $null }
+        $Shift = $SourceMatch.Groups['source'].Index - $Offsets[4]
+        $RowOffsets = @(0; $Offsets[1..4] | ForEach-Object { $_ + $Shift })
+        if ($RowOffsets[1] -le 0) { return $null }
+        $Fields = @()
+        for ($Column = 0; $Column -lt 5; $Column++) {
+            if ([char]::IsWhiteSpace($Line[$RowOffsets[$Column]])) { return $null }
+            if ($Column -lt 4) {
+                if ($Line[$RowOffsets[$Column + 1] - 1] -ne ' ') { return $null }
+                $Fields += $Line.Substring($RowOffsets[$Column], $RowOffsets[$Column + 1] - $RowOffsets[$Column]).TrimEnd()
+            } else {
+                $Fields += $Line.Substring($RowOffsets[$Column]).TrimEnd()
+            }
+        }
+        if ($Fields[1] -match '\s' -or $Fields[4] -match '\s' -or
+            @($Fields[1..4] | Where-Object { $_ -match '[^\x20-\x7e]|\.{3}|^-+$' }).Count -gt 0 -or
+            $Rows.ContainsKey($Fields[1])) { return $null }
+        $Rows[$Fields[1]] = @{ id = $Fields[1]; installed = $Fields[2]; available = $Fields[3]; source = $Fields[4] }
+        $TableRowCount++
+    }
+    # WinGet's summary includes rows in the following explicit-target table.
+    if ($ExpectHeader -or $TableRowCount -eq 0 -or $null -eq $SummaryCount -or
+        $SummaryCount -ne $Rows.Count) { return $null }
+
+    $Candidates = @{}
+    foreach ($Source in @($Export.Sources)) {
+        foreach ($Package in @($Source.Packages)) {
+            $Id = [string]$Package.PackageIdentifier
+            if (-not $Rows.ContainsKey($Id)) { continue }
+            $Row = $Rows[$Id]
+            # Hashtable lookup rejects case-variant duplicates, while exact
+            # binding prevents a different source/version from inheriting a row.
+            if ($Candidates.ContainsKey($Id) -or $Row.id -cne $Id -or
+                $Row.source -cne [string]$Source.SourceDetails.Name -or
+                $Row.installed -cne [string]$Package.Version) { return $null }
+            $Candidates[$Id] = $Row.available
+        }
+    }
+    if ($Candidates.Count -ne $Rows.Count) { return $null }
+    return $Candidates
+}
+
 if ($SelfTest) {
     Invoke-WindowsSftpReceiptSelfTest
     exit 0
@@ -2034,38 +2133,7 @@ if (Test-Section "packages") {
                 $UpgradeLines = @(& winget upgrade --accept-source-agreements --disable-interactivity 2>$null)
                 $UpgradeSucceeded = $?
                 $UpgradeExitCode = $LASTEXITCODE
-                if ($UpgradeSucceeded -and ($null -eq $UpgradeExitCode -or $UpgradeExitCode -eq 0)) {
-                    $HeaderIndex = -1
-                    for ($Index = 0; $Index -lt $UpgradeLines.Count; $Index++) {
-                        if ([string]$UpgradeLines[$Index] -match '^Name\s{2,}Id\s{2,}Version\s{2,}Available\s{2,}Source\s*$') {
-                            $HeaderIndex = $Index
-                            break
-                        }
-                    }
-                    if ($HeaderIndex -ge 0 -and $HeaderIndex + 1 -lt $UpgradeLines.Count -and
-                        [string]$UpgradeLines[$HeaderIndex + 1] -match '^-{3,}(\s+-{2,}){4}\s*$') {
-                        $CandidateQueryAuthoritative = $true
-                        foreach ($Line in @($UpgradeLines | Select-Object -Skip ($HeaderIndex + 2))) {
-                            if ([string]::IsNullOrWhiteSpace([string]$Line)) { continue }
-                            if ([string]$Line -notmatch '^(?<name>.*?)\s{2,}(?<id>\S+)\s+(?<installed>\S+)\s+(?<available>\S+)\s+(?<source>\S+)\s*$' -or
-                                [string]$Matches.available -match '^-+$' -or
-                                $Candidates.ContainsKey([string]$Matches.id)) {
-                                $CandidateQueryAuthoritative = $false
-                                $Candidates.Clear()
-                                break
-                            }
-                            $Candidates[[string]$Matches.id] = [string]$Matches.available
-                        }
-                    } elseif (($UpgradeLines -join "`n") -match
-                        '(?m)^(No installed package found matching input criteria|No applicable upgrade found)\.?$') {
-                        $CandidateQueryAuthoritative = $true
-                    }
-                    if (-not $CandidateQueryAuthoritative) {
-                        Add-Record -Kind "error" -Id "packages:winget-updates" -Status "partial" -Confidence "high" -Errors @(
-                            @{ code = "candidate_query_unverified"; severity = "warning"; retryable = $true; message = "winget upgrade output was not an authoritative package table" }
-                        )
-                    }
-                } else {
+                if (-not $UpgradeSucceeded -or ($null -ne $UpgradeExitCode -and $UpgradeExitCode -ne 0)) {
                     Add-Record -Kind "error" -Id "packages:winget-updates" -Status "unavailable" -Confidence "medium" -Errors @(
                         @{ code = "candidate_query_failed"; severity = "warning"; retryable = $true; message = "winget upgrade inventory failed" }
                     )
@@ -2078,6 +2146,17 @@ if (Test-Section "packages") {
                 }
                 if (Test-Path -LiteralPath $Temp) {
                     $Export = Get-Content -LiteralPath $Temp -Raw | ConvertFrom-Json
+                    if ($UpgradeSucceeded -and ($null -eq $UpgradeExitCode -or $UpgradeExitCode -eq 0)) {
+                        $ParsedCandidates = Get-WingetUpgradeCandidates $UpgradeLines $Export
+                        $CandidateQueryAuthoritative = $null -ne $ParsedCandidates
+                        if ($CandidateQueryAuthoritative) {
+                            $Candidates = $ParsedCandidates
+                        } else {
+                            Add-Record -Kind "error" -Id "packages:winget-updates" -Status "partial" -Confidence "high" -Errors @(
+                                @{ code = "candidate_query_unverified"; severity = "warning"; retryable = $true; message = "winget upgrade output was not an authoritative package table" }
+                            )
+                        }
+                    }
                     foreach ($Source in @($Export.Sources)) {
                         foreach ($Package in @($Source.Packages)) {
                             $Name = Limit-Text $Package.PackageIdentifier
