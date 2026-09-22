@@ -12,6 +12,10 @@ installed_version=2.50.0
 [ -z "${BREW_STATE_FILE:-}" ] || [ ! -f "$BREW_STATE_FILE" ] ||
   installed_version=$(cat "$BREW_STATE_FILE")
 if [ "${1:-}" = outdated ] && [ "${2:-}" = --json=v2 ]; then
+  if [ "${BREW_FORMULA_CASK_OVERLAP:-0}" = 1 ]; then
+    printf '%s\n' '{"formulae":[{"name":"git","current_version":"2.51.0"},{"name":"powershell","current_version":"7.5.3"}],"casks":[{"name":"visual-tool","current_version":"1.1.0"},{"name":"powershell","current_version":"7.5.5"}]}'
+    exit 0
+  fi
   if [ "$installed_version" = 2.51.0 ]; then
     printf '%s\n' '{"formulae":[],"casks":[{"name":"visual-tool","current_version":"1.1.0"}]}'
   else
@@ -27,10 +31,18 @@ fi
 if [ "${1:-}" = list ] && [ "${2:-}" = --cask ] && [ "${3:-}" = --versions ]; then
   [ "${BREW_CASK_FAIL:-0}" != 1 ] || exit 1
   printf 'visual-tool 1.0.0\n'
+  [ "${BREW_FORMULA_CASK_OVERLAP:-0}" != 1 ] || printf 'powershell 7.5.4\n'
+  exit 0
+fi
+if [ "${1:-}" = list ] && [ "${2:-}" = --formula ] && [ "${3:-}" = --versions ]; then
+  printf 'git %s\njq 1.7.1\n' "$installed_version"
+  [ "${BREW_FORMULA_CASK_OVERLAP:-0}" != 1 ] || printf 'powershell 7.5.2\n'
   exit 0
 fi
 if [ "${1:-}" = list ] && [ "${2:-}" = --versions ]; then
-  printf 'git %s\njq 1.7.1\n' "$installed_version"
+  # Homebrew's unqualified list includes both formulae and casks.
+  printf 'git %s\njq 1.7.1\nvisual-tool 1.0.0\n' "$installed_version"
+  [ "${BREW_FORMULA_CASK_OVERLAP:-0}" != 1 ] || printf 'powershell 7.5.2\npowershell 7.5.4\n'
   exit 0
 fi
 exit 1
@@ -388,15 +400,67 @@ chmod +x "$tmp/bin/op"
 
 cat >"$tmp/bin/winget" <<'SH'
 #!/usr/bin/env bash
+winget_row() {
+  printf '%-16s %-18s %-16s %-16s %s\n' "$@"
+}
 case ${1:-} in
   upgrade)
     if [ "${WINGET_MODE:-valid}" = invalid ]; then
       printf '%s\n' 'Nom  Identifiant  Version  Disponible  Source' 'malformed row'
+    elif [ "${WINGET_MODE:-valid}" = none ]; then
+      printf '%s\n' 'No installed package found matching input criteria.'
     else
-      printf '%s\n' \
-        'Name  Id  Version  Available  Source' \
-        '----  --  -------  ---------  ------' \
-        'Example  Example.Package  1.0.0  2.0.0  winget'
+      winget_row Name Id Version Available Source
+      if [ "${WINGET_MODE:-valid}" = grouped ]; then
+        winget_row ---------------- ------------------ ---------------- ---------------- ------
+      else
+        printf '%s\n' '----------------------------------------------------------------------------'
+      fi
+      package_id=Example.Package
+      installed=1.0.0
+      available=2.0.0
+      source=winget
+      case ${WINGET_MODE:-valid} in
+        native-id-truncated) package_id='Example.Pack…' ;;
+        native-installed-truncated) installed='1.0…' ;;
+        native-available-truncated) available='2.0…' ;;
+        native-source-truncated) source='win…' ;;
+        native-source-mismatch) source=other ;;
+        native-installed-mismatch) installed=0.9.0 ;;
+        native-id-case-mismatch) package_id=example.package ;;
+        native-source-case-mismatch) source=WinGet ;;
+        native-row-truncated) source= ;;
+      esac
+      winget_row 'Example package' "$package_id" "$installed" "$available" "$source"
+      case ${WINGET_MODE:-valid} in
+        native*)
+          winget_row 'Spaced version' Space.Version '7.1.5 (43453)' '7.2.1 (48556)' winget
+          winget_row 'Range version' Range.Version '< 150.104.1.0' 150.104.1.0 winget
+          case $WINGET_MODE in
+            native-duplicate) winget_row Duplicate Example.Package 1.0.0 2.0.0 winget ;;
+            native-case-duplicate) winget_row Duplicate example.package 1.0.0 2.0.0 winget ;;
+          esac
+          case $WINGET_MODE in
+            native-footer-missing) ;;
+            native-count-mismatch) printf '%s\n' '99 upgrades available.' ;;
+            *) printf '%s\n' '5 upgrades available.' ;;
+          esac
+          printf '\n%s\n' 'The following packages have an upgrade available, but require explicit targeting for upgrade:'
+          if [ "$WINGET_MODE" != native-secondary-header-missing ]; then
+            printf '%s\n' \
+              'Name Id           Version Available Source' \
+              '------------------------------------------'
+          fi
+          printf '%s\n' 'One  One.Target   1.0.0   2.0.0     winget'
+          if [ "$WINGET_MODE" = native-secondary-malformed ]; then
+            printf '%s\n' 'malformed row'
+          else
+            printf '%s\n' 'Two  Two.Target   1.0.0   2.0.0     winget'
+          fi
+          [ "$WINGET_MODE" != native-unexpected-footer ] || printf '%s\n' 'unexpected trailing output'
+          ;;
+        *) printf '%s\n' '1 upgrade available.' ;;
+      esac
     fi
     ;;
   export)
@@ -407,9 +471,18 @@ case ${1:-} in
         *) shift ;;
       esac
     done
-    printf '%s\n' \
-      '{"Sources":[{"SourceDetails":{"Name":"winget"},"Packages":[{"PackageIdentifier":"Example.Package","Version":"1.0.0"}]}]}' \
-      >"$output"
+    case ${WINGET_MODE:-valid} in
+      native*)
+        printf '%s\n' \
+          '{"Sources":[{"SourceDetails":{"Name":"winget"},"Packages":[{"PackageIdentifier":"Example.Package","Version":"1.0.0"},{"PackageIdentifier":"Space.Version","Version":"7.1.5 (43453)"},{"PackageIdentifier":"Range.Version","Version":"< 150.104.1.0"},{"PackageIdentifier":"One.Target","Version":"1.0.0"},{"PackageIdentifier":"Two.Target","Version":"1.0.0"},{"PackageIdentifier":"Current.Package","Version":"1.0.0"}]}]}' \
+          >"$output"
+        ;;
+      *)
+        printf '%s\n' \
+          '{"Sources":[{"SourceDetails":{"Name":"winget"},"Packages":[{"PackageIdentifier":"Example.Package","Version":"1.0.0"}]}]}' \
+          >"$output"
+        ;;
+    esac
     ;;
   *) exit 64 ;;
 esac

@@ -1965,7 +1965,7 @@ if has_section packages; then
             emit error "packages:$manager-updates" unavailable high '{}' '[]' \
               '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"brew outdated inventory failed"}]'
           fi
-          if brew_packages=$(brew list --versions 2>/dev/null); then
+          if brew_packages=$(brew list --formula --versions 2>/dev/null); then
             printf '%s\n' "$brew_packages" |
               awk 'NF >= 2 { print $1 "\t" $2 }' >"$installed_formulae"
             join_package_candidates "$installed_formulae" "$candidate_formulae" |

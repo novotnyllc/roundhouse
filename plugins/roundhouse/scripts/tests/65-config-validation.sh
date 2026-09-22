@@ -428,6 +428,23 @@ if grep -vF 'exec "$SHELL" -lc' "$SSH_COMMAND_LOG" >/dev/null; then
   fail "SSH transport bypassed the configured login shell"
 fi
 
+if ! BREW_FORMULA_CASK_OVERLAP=1 "$cli" collect --target test-host --section packages \
+  --output "$tmp/brew-overlap.jsonl"; then
+  fail "same-name Homebrew formula and cask did not produce valid inventory"
+fi
+"$cli" validate "$tmp/brew-overlap.jsonl"
+jq -se '
+  [.[] | select(.kind == "package")] as $packages |
+  ($packages | map(select(.id == "homebrew:visual-tool")) | length) == 0 and
+  ($packages | map(select(.data.name == "powershell")) | length) == 2 and
+  ($packages | map(select(.id == "homebrew:powershell" and
+    .data.installed_version == "7.5.2" and .data.candidate_version == "7.5.3" and
+    .data.update_available == true)) | length) == 1 and
+  ($packages | map(select(.id == "homebrew-cask:powershell" and
+    .data.installed_version == "7.5.4" and .data.candidate_version == "7.5.5" and
+    .data.update_available == true)) | length) == 1
+' "$tmp/brew-overlap.jsonl" >/dev/null || fail "Homebrew formula and cask identities were conflated"
+
 set +e
 BREW_FAIL=1 "$cli" collect --target test-host --section packages --output "$tmp/brew-failed.jsonl"
 brew_failed_rc=$?

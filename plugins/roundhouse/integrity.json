@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "3725f592321ab1d33174af2895f154713cd896549d5fc3cfbbec908a3e6ba110"
+      "sha256": "01263ddb1b3dc65ec11907839d552fe601cea507b30e748aa17bef1ba5f754ea"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "47c6800668ea584ea4d9cc649c7cc1ce696c86202ca78ef3d9ad84f796e7e0b9"
+      "sha256": "c2c1e8e81329f7a68e0db3aa32d11de3d04d909eafa8a7a6d8ccf795b693238c"
     },
     {
       "path": "assets/icon.png",
@@ -58,11 +58,11 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "2516f2ee44b698ca6745537a34e4f8e1e1aeb7f27a66216166a9eb6882c53157"
+      "sha256": "37d3317c7d727e248fdf0fefa49b063f781910c7d004747a009072958080d716"
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "6bbecbf5df941e0509c22b8f01ab3be4938d762ed38d7ffaf9deb90ea3d56bb2"
+      "sha256": "617ca800b0b4f1996822928fd94207b95353d8449000dff590a5bb59f3f532bd"
     },
     {
       "path": "scripts/enroll-privilege-posix",
@@ -130,7 +130,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "5b477a88069b1967af3d086e9c25c3d08617da72d132b13dfda6b36515a00642"
+      "sha256": "0f3c2c1acb6cde797edec348ea7906af17ebdf48b96242937e4c0c405223058c"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -305,5 +305,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.21"
+  "version": "0.9.22"
 }
