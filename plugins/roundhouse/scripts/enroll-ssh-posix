@@ -538,7 +538,7 @@ validate_host_key() {
 
 effective_value() {
   local source=$1 key=$2
-  /usr/bin/awk -v key="$key" '$1==key{if(found++)exit 1;$1="";sub(/^ /,"");value=$0}
+  /usr/bin/awk -v key="$key" 'tolower($1)==tolower(key){if(found++)exit 1;$1="";sub(/^ /,"");value=$0}
     END{if(found!=1)exit 1;print value}' "$source"
 }
 
@@ -2326,6 +2326,18 @@ selftest_run_fixture() {
     [ ! -L "$root/etc/roundhouse/ssh/active" ] || return 1
 }
 
+selftest_effective_keywords() {
+  local root=$1 output
+  output=$root/sshd-keywords.effective
+  # Native OpenSSH may retain keyword casing; argument casing is significant.
+  printf 'TrustedUserCAKeys /Example/FleetCA.pub\nForceCommand /Example/Dispatcher\n' >"$output"
+  [ "$(effective_value "$output" trustedusercakeys)" = /Example/FleetCA.pub ] &&
+    [ "$(effective_value "$output" forcecommand)" = /Example/Dispatcher ] || return 1
+  if effective_value "$output" absentkey >/dev/null; then return 1; fi
+  printf 'trustedusercakeys /Example/FleetCA.pub\n' >>"$output"
+  if effective_value "$output" trustedusercakeys >/dev/null; then return 1; fi
+}
+
 self_test() {
   local self raw_root linux_root macos_root wsl_root selected_platform
   [ "${ROUNDHOUSE_U6_SELFTEST_TRACE:-}" != 1 ] || set -x
@@ -2347,6 +2359,10 @@ self_test() {
   printf 'roundhouse-u6-selftest\n' >"$selftest_root/.u6-selftest-root"
   /bin/chmod 0700 "$selftest_root"; /bin/chmod 0600 "$selftest_root/.u6-selftest-root"
   trap 'selftest_cleanup' EXIT HUP INT TERM
+  selftest_effective_keywords "$selftest_root" || {
+    printf 'enroll-ssh-posix self-test: sshd keyword casing failed\n' >&2
+    return 1
+  }
   linux_root=$selftest_root/linux; macos_root=$selftest_root/macos; wsl_root=$selftest_root/wsl
   /bin/mkdir "$linux_root" "$macos_root" "$wsl_root"
   /bin/chmod 0700 "$linux_root" "$macos_root" "$wsl_root"

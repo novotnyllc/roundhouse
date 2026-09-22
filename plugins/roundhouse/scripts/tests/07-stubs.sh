@@ -410,6 +410,11 @@ case ${1:-} in
     elif [ "${WINGET_MODE:-valid}" = none ]; then
       printf '%s\n' 'No installed package found matching input criteria.'
     else
+      case ${WINGET_MODE:-valid} in
+        native-source-warning) printf '%s\n' 'Failed when searching source; results will not be included: msstore' ;;
+        native-unexpected-prefix) printf '%s\n' 'unexpected leading output' ;;
+        native-blank-prefix) printf '\n\n' ;;
+      esac
       winget_row Name Id Version Available Source
       if [ "${WINGET_MODE:-valid}" = grouped ]; then
         winget_row ---------------- ------------------ ---------------- ---------------- ------
@@ -429,13 +434,36 @@ case ${1:-} in
         native-installed-mismatch) installed=0.9.0 ;;
         native-id-case-mismatch) package_id=example.package ;;
         native-source-case-mismatch) source=WinGet ;;
+        native-misaligned-suffix) source=' winget' ;;
+        native-suffix-extra-column) source='winget extra' ;;
         native-row-truncated) source= ;;
       esac
-      winget_row 'Example package' "$package_id" "$installed" "$available" "$source"
+      case ${WINGET_MODE:-valid} in
+        native-unicode-name)
+          # Native Name cells occupy 16 display columns plus one separator.
+          printf '%s%13s' '漢字' ''
+          printf '%-18s %-16s %-16s %s\n' "$package_id" "$installed" "$available" "$source"
+          ;;
+        native-astral-name)
+          printf '%s%16s' '𝅘𝅥𝅮' ''
+          printf '%-18s %-16s %-16s %s\n' "$package_id" "$installed" "$available" "$source"
+          ;;
+        native-nonascii-version)
+          printf '%-16s %-18s %-16s %s%11s%s\n' 'Example package' "$package_id" "$installed" '2.0.0β' '' "$source"
+          ;;
+        *) winget_row 'Example package' "$package_id" "$installed" "$available" "$source" ;;
+      esac
       case ${WINGET_MODE:-valid} in
         native*)
-          winget_row 'Spaced version' Space.Version '7.1.5 (43453)' '7.2.1 (48556)' winget
-          winget_row 'Range version' Range.Version '< 150.104.1.0' 150.104.1.0 winget
+          if [ "$WINGET_MODE" = native-unicode-name ]; then
+            printf '%s%16s' 'q́' ''
+            printf '%-18s %-16s %-16s %s\n' Space.Version '7.1.5 (43453)' '7.2.1 (48556)' winget
+            printf '%s%15s' '👩‍💻' ''
+            printf '%-18s %-16s %-16s %s\n' Range.Version '< 150.104.1.0' 150.104.1.0 winget
+          else
+            winget_row 'Spaced version' Space.Version '7.1.5 (43453)' '7.2.1 (48556)' winget
+            winget_row 'Range version' Range.Version '< 150.104.1.0' 150.104.1.0 winget
+          fi
           case $WINGET_MODE in
             native-duplicate) winget_row Duplicate Example.Package 1.0.0 2.0.0 winget ;;
             native-case-duplicate) winget_row Duplicate example.package 1.0.0 2.0.0 winget ;;
@@ -476,6 +504,11 @@ case ${1:-} in
         printf '%s\n' \
           '{"Sources":[{"SourceDetails":{"Name":"winget"},"Packages":[{"PackageIdentifier":"Example.Package","Version":"1.0.0"},{"PackageIdentifier":"Space.Version","Version":"7.1.5 (43453)"},{"PackageIdentifier":"Range.Version","Version":"< 150.104.1.0"},{"PackageIdentifier":"One.Target","Version":"1.0.0"},{"PackageIdentifier":"Two.Target","Version":"1.0.0"},{"PackageIdentifier":"Current.Package","Version":"1.0.0"}]}]}' \
           >"$output"
+        if [ "$WINGET_MODE" = native-source-warning ]; then
+          jq '.Sources += [{SourceDetails:{Name:"msstore"},Packages:[{PackageIdentifier:"9FAILED12345",Version:"1.0.0"}]}]' \
+            "$output" >"$output.new"
+          mv "$output.new" "$output"
+        fi
         ;;
       *)
         printf '%s\n' \

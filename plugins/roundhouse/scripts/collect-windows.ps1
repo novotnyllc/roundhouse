@@ -1979,6 +1979,8 @@ function Get-WingetUpgradeCandidates([string[]]$Lines, [object]$Export) {
     $HeaderIndex = -1
     for ($Index = 0; $Index -lt $Lines.Count; $Index++) {
         if ($Lines[$Index] -cmatch $HeaderPattern) { $HeaderIndex = $Index; break }
+        # A successful command can still warn that a source was not searched.
+        if (-not [string]::IsNullOrWhiteSpace($Lines[$Index])) { break }
     }
     if ($HeaderIndex -lt 0) {
         if (($Lines -join "`n").Trim() -cmatch
@@ -2022,23 +2024,29 @@ function Get-WingetUpgradeCandidates([string[]]$Lines, [object]$Export) {
             $ExpectHeader = $true
             continue
         }
-        if (($null -ne $SummaryCount -and -not $TargetedTable) -or
-            $Line.Length -le $Offsets[4]) { return $null }
+        if ($null -ne $SummaryCount -and -not $TargetedTable) { return $null }
 
-        # WinGet pads columns to their header positions; splitting on whitespace
-        # loses versions such as "< 150.104.1.0" or "7.1.5 (43453)".
+        # Anchor the fixed-width identity columns at the final Source token so
+        # Unicode display names need no UTF-16/display-width approximation.
+        # Identity/version/source fields must be printable ASCII; non-ASCII
+        # fields remain unknown. Whitespace splitting would lose spaced versions.
+        $SourceMatch = [regex]::Match($Line, '(?<source>\S+) *$')
+        if (-not $SourceMatch.Success) { return $null }
+        $Shift = $SourceMatch.Groups['source'].Index - $Offsets[4]
+        $RowOffsets = @(0; $Offsets[1..4] | ForEach-Object { $_ + $Shift })
+        if ($RowOffsets[1] -le 0) { return $null }
         $Fields = @()
         for ($Column = 0; $Column -lt 5; $Column++) {
-            if ([char]::IsWhiteSpace($Line[$Offsets[$Column]])) { return $null }
+            if ([char]::IsWhiteSpace($Line[$RowOffsets[$Column]])) { return $null }
             if ($Column -lt 4) {
-                if ($Line[$Offsets[$Column + 1] - 1] -ne ' ') { return $null }
-                $Fields += $Line.Substring($Offsets[$Column], $Offsets[$Column + 1] - $Offsets[$Column]).TrimEnd()
+                if ($Line[$RowOffsets[$Column + 1] - 1] -ne ' ') { return $null }
+                $Fields += $Line.Substring($RowOffsets[$Column], $RowOffsets[$Column + 1] - $RowOffsets[$Column]).TrimEnd()
             } else {
-                $Fields += $Line.Substring($Offsets[$Column]).TrimEnd()
+                $Fields += $Line.Substring($RowOffsets[$Column]).TrimEnd()
             }
         }
         if ($Fields[1] -match '\s' -or $Fields[4] -match '\s' -or
-            @($Fields[1..4] | Where-Object { $_ -match '[\x00-\x1f\x7f\u2026]|\.{3}|^-+$' }).Count -gt 0 -or
+            @($Fields[1..4] | Where-Object { $_ -match '[^\x20-\x7e]|\.{3}|^-+$' }).Count -gt 0 -or
             $Rows.ContainsKey($Fields[1])) { return $null }
         $Rows[$Fields[1]] = @{ id = $Fields[1]; installed = $Fields[2]; available = $Fields[3]; source = $Fields[4] }
         $TableRowCount++
