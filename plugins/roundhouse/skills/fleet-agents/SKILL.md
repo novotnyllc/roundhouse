@@ -643,42 +643,11 @@ outside-marketplace record to be unchanged. Report before/after versions per
 plugin. A failure in one plugin or harness does not erase other evidence or stop
 the remaining marketplace plugins from being attempted.
 
-### Required plugin dependencies
-
-A host that carries `railyard` REQUIRES two plugins, and railyard auto-installs
-both: the `compound-engineering` plugin, version 3.20.0 or newer, from the
-`EveryInc/compound-engineering-plugin` marketplace — railyard's delivery,
-review, and orchestration skills invoke compound-engineering skills directly —
-and the `ponytail` plugin from the `DietrichGebert/ponytail` marketplace, the
-efficiency discipline railyard carries into the code and the process loop.
-railyard without either is a broken install, not a lighter one. Converging
-these dependencies is part of the routine refresh's existing mutation
-authorization, not a separate consent: when the refresh finds `railyard`
-installed on a harness and either required plugin missing there, add the
-marketplace and install the plugin on that harness in the same pass. Do not ask
-for a second approval, and do not install them on a harness that does not carry
-railyard. Run only these target-native sequences:
-
-```text
-codex plugin marketplace add EveryInc/compound-engineering-plugin --json
-codex plugin add compound-engineering@compound-engineering-plugin --json
-codex plugin marketplace add DietrichGebert/ponytail --json
-codex plugin add ponytail@ponytail --json
-
-claude plugin marketplace add EveryInc/compound-engineering-plugin
-claude plugin install compound-engineering@compound-engineering-plugin --scope user
-claude plugin marketplace add DietrichGebert/ponytail
-claude plugin install ponytail@ponytail --scope user
-```
-
-Each Codex install goes through the hook-approval helper like any other Codex
-plugin install. An installed-but-older `compound-engineering` converges through
-the normal marketplace-refresh path for its own marketplace; do not pin or
-downgrade it — ponytail converges the same way. Report each dependency as a
-converged item in the refresh result — per host and harness, with the before
-state (absent, or the prior version) and the installed version — so a fleet
-that was silently missing one shows up as converged evidence rather than as a
-surprise.
+Plugin dependencies belong to the workflow that declares them. Execute only
+the user-authorized desired state supplied by that owner, using each target's
+native plugin manager and the same verification and hook-trust checks as other
+plugin changes. Do not infer dependencies from the presence of another plugin
+or reinstall a removed plugin merely because a workflow previously used it.
 
 The only pre-helper fallback is a separately approved self-update of
 `roundhouse@novotnyllc` from an integrity-verified release that lacks

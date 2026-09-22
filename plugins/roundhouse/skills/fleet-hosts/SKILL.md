@@ -36,9 +36,9 @@ lane.
    KRL on the target. Do not shortcut with raw `authorized_keys` edits.
 4. **Prerequisites on the target** (consent, via the target's own managers) —
    `tmux` and `jq` through `roundhouse:fleet-update`; agent harnesses
-   verified and plugin/marketplace parity (railyard, roundhouse,
-   agent-utilities, compound-engineering, ponytail) through
-   `roundhouse:fleet-agents`' routine refresh; project checkouts through
+   verified and user-authorized plugin/marketplace desired state supplied by
+   the owning workflows applied through `roundhouse:fleet-agents`' routine
+   refresh; project checkouts through
    `roundhouse:fleet-projects`
    when the host will take delivery work.
 5. **Optional store credential** (separate consent; only when the host opts
