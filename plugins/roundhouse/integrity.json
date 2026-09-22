@@ -166,7 +166,7 @@
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "d1c55d0aeb0a7f200399d6fd06d253aadad1de5dd8d9d5f9f796b63579f042f6"
+      "sha256": "4f104ea9f33ea89eed2f07739ef5220ca2e143d4c00e03f375d4c5423859315b"
     },
     {
       "path": "scripts/lib/plan-verify.sh",
@@ -270,7 +270,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "171d10db767f3c96578e739d9a1e3b3d7b0282d33636637c7d4a0da34898f4b0"
+      "sha256": "eeb1021a69b66e2eab7ce72e326be9903afb22871736d688736186ecf9aacac5"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",

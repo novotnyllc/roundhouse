@@ -53,6 +53,29 @@ if [ -n "$pwsh_command" ]; then
     "$tmp/windows-packages.jsonl")" = 2.0.0 ] ||
     fail "native winget continuous separator and upgrade summary did not produce a candidate"
 
+  cat >"$tmp/windows-package-draft.json" <<'JSON'
+{"domain":"updates","target":"test-windows","operations":[{"type":"package-upgrade","kind":"package","id":"winget:Example.Package","candidate_version":"2.0.0","argv":["winget","upgrade","--id","Example.Package","--exact","--version","2.0.0","--accept-package-agreements","--accept-source-agreements","--disable-interactivity"]}]}
+JSON
+  "$cli" seal-plan "$tmp/windows-package-draft.json" "$tmp/windows-packages.jsonl" \
+    "$tmp/windows-package-plan.json" || fail "Windows package candidate could not seal with a configured control project"
+  jq -e --arg version "$plugin_version" '
+    .target == "test-windows" and .required_executor.version == $version and
+    .operations[0].candidate_version == "2.0.0"
+  ' "$tmp/windows-package-plan.json" >/dev/null || fail "Windows package plan lost its candidate or executor binding"
+  for required_windows_field in expected_hostname expected_user codex_control_project; do
+    jq --arg field "$required_windows_field" 'del(.machines["test-windows"][$field])' \
+      "$ROUNDHOUSE_CONFIG" >"$tmp/windows-missing-control-config.json"
+    if ROUNDHOUSE_CONFIG="$tmp/windows-missing-control-config.json" "$cli" seal-plan \
+      "$tmp/windows-package-draft.json" "$tmp/windows-packages.jsonl" \
+      "$tmp/windows-missing-control-plan.json" >"$tmp/windows-missing-control.log" 2>&1; then
+      fail "Windows package plan sealed without $required_windows_field"
+    fi
+    assert_contains "$(cat "$tmp/windows-missing-control.log")" \
+      'Windows mutation requires expected identity and a configured Codex control project'
+    [ ! -e "$tmp/windows-missing-control-plan.json" ] ||
+      fail "rejected Windows control config left a sealed plan"
+  done
+
   for winget_mode in native grouped none native-blank-prefix native-unicode-name native-astral-name; do
     WINGET_MODE="$winget_mode" HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile \
       -File "$script_dir/collect-windows.ps1" -ConfigPath "$tmp/windows-worker-config.json" \

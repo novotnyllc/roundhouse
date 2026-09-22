@@ -41,8 +41,13 @@ assert_ordered "$fleet_agents_skill" \
 # Workflow owners declare plugin dependencies; Roundhouse executes their
 # authorized desired state without recreating a removed behavior plugin.
 if grep -Eiq 'ponytail|compound-engineering' \
-  "$fleet_agents_skill" "$script_dir/../skills/fleet-hosts/SKILL.md"; then
+  "$fleet_agents_skill" "$script_dir/../skills/fleet-hosts/SKILL.md" \
+  "$script_dir/../skills/fleet-update/SKILL.md"; then
   fail "fleet instructions hardcode a workflow plugin dependency"
+fi
+if grep -Eiq 'premium model|cheap-model child|mechanical-tier work' \
+  "$script_dir/../skills/fleet-update/SKILL.md"; then
+  fail "fleet-update prescribes model selection instead of executing owner-supplied policy"
 fi
 assert_contains "$fleet_agents_text" 'Plugin dependencies belong to the workflow that declares them'
 assert_contains "$fleet_agents_text" 'Do not infer dependencies from the presence of another plugin'
