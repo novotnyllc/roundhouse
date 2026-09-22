@@ -1965,11 +1965,32 @@ if has_section packages; then
             emit error "packages:$manager-updates" unavailable high '{}' '[]' \
               '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"brew outdated inventory failed"}]'
           fi
-          if brew_packages=$(brew list --formula --versions 2>/dev/null); then
+          # A formula may retain several kegs; list order is not current state.
+          # Keg-only/unlinked formulae without linked_keg need one installed version.
+          if brew_packages=$(brew info --json=v2 --installed --formula 2>/dev/null) &&
             printf '%s\n' "$brew_packages" |
-              awk 'NF >= 2 { print $1 "\t" $2 }' >"$installed_formulae"
+              jq -r '
+                def version_text: type == "string" and length > 0 and
+                  (test("[[:space:][:cntrl:]]") | not);
+                if type != "object" or (.formulae | type) != "array" then
+                  error("invalid formula inventory") else .formulae end |
+                if (map(.name) | unique | length) != length then
+                  error("duplicate formula identity") else . end |
+                map(
+                  if (.name | version_text | not) or (.installed | type) != "array" then
+                    error("invalid installed formula") else . end |
+                  [.installed[].version] as $versions |
+                  (if .linked_keg != null then .linked_keg
+                   elif ($versions | length) == 1 then $versions[0]
+                   else null end) as $current |
+                  if ($current | version_text) and ($versions | all(version_text)) and
+                    ($versions | map(select(. == $current)) | length) == 1 then
+                    [.name, $current]
+                  else error("installed current keg is not authoritative") end
+                ) | .[] | @tsv
+              ' >"$installed_formulae" 2>/dev/null; then
             join_package_candidates "$installed_formulae" "$candidate_formulae" |
-              emit_package_lines "$manager" list-installed
+              emit_package_lines "$manager" info-installed-formulae
           else
             emit error "packages:$manager" unavailable high '{}' '[]' \
               '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"brew package inventory failed"}]'

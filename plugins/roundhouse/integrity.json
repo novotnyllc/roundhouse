@@ -42,7 +42,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "e4f36d2f8df05909a6aa7022223f8c9fd1a9a349c9ef4562372d2bec43946335"
+      "sha256": "f5e0a04025ef0f926f6a7d3649ed68c8e7a05065e9f50e7b490df194464d3162"
     },
     {
       "path": "scripts/certify-ssh-node",
@@ -58,7 +58,7 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "37d3317c7d727e248fdf0fefa49b063f781910c7d004747a009072958080d716"
+      "sha256": "cee9a308b4caf778e7c85d272d7dbe82583025ae692910ae73d8f7eee01814cc"
     },
     {
       "path": "scripts/collect-windows.ps1",

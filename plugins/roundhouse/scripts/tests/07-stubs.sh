@@ -28,6 +28,35 @@ if [ "${1:-}" = upgrade ] && [ "${2:-}" = git ]; then
   printf '%s\n' "${BREW_UPGRADE_VERSION:-2.51.0}" >"$BREW_STATE_FILE"
   exit 0
 fi
+if [ "${1:-}" = info ] && [ "${2:-}" = --json=v2 ] &&
+  [ "${3:-}" = --installed ] && [ "${4:-}" = --formula ]; then
+  case ${BREW_KEG_MODE:-valid} in
+    invalid-json) printf '{invalid\n' ;;
+    invalid-shape) printf '%s\n' '{"formulae":{}}' ;;
+    *)
+      jq -cn --arg version "$installed_version" --arg overlap "${BREW_FORMULA_CASK_OVERLAP:-0}" \
+        --arg mode "${BREW_KEG_MODE:-valid}" '
+        {formulae:[
+          {name:"git",linked_keg:$version,installed:[{version:$version}]},
+          {name:"jq",linked_keg:"1.7.1",installed:[{version:"1.7.1"}]}],casks:[]} |
+        if $overlap == "1" then .formulae += [
+          {name:"powershell",linked_keg:"7.5.2",installed:[{version:"7.5.2"}]}] else . end |
+        if $mode == "shuffled" then .formulae += [
+          {name:"openexr",linked_keg:"3.4.15_1",versions:{stable:"99.0"},installed:[{version:"3.4.15"},{version:"3.4.14"},{version:"3.4.15_1"}]},
+          {name:"snappy",linked_keg:"1.3.1",installed:[{version:"1.3.0"},{version:"1.3.1"},{version:"1.2.2"}]},
+          {name:"kept-old",linked_keg:"2.0",installed:[{version:"3.0"},{version:"2.0"}]},
+          {name:"keg-only-single",linked_keg:null,keg_only:true,installed:[{version:"1.0_1"}]},
+          {name:"unlinked-single",linked_keg:null,keg_only:false,installed:[{version:"1.2"}]}]
+        elif $mode == "linked-not-installed" then .formulae[0].linked_keg = "9.0"
+        elif $mode == "unlinked-multiple" then .formulae[0] =
+          {name:"git",linked_keg:null,keg_only:true,installed:[{version:"2.50.0"},{version:"2.49.0"}]}
+        elif $mode == "duplicate-version" then .formulae[0].installed += [{version:$version}]
+        elif $mode == "empty" then .formulae = []
+        else . end'
+      ;;
+  esac
+  exit 0
+fi
 if [ "${1:-}" = list ] && [ "${2:-}" = --cask ] && [ "${3:-}" = --versions ]; then
   [ "${BREW_CASK_FAIL:-0}" != 1 ] || exit 1
   printf 'visual-tool 1.0.0\n'
@@ -35,7 +64,12 @@ if [ "${1:-}" = list ] && [ "${2:-}" = --cask ] && [ "${3:-}" = --versions ]; th
   exit 0
 fi
 if [ "${1:-}" = list ] && [ "${2:-}" = --formula ] && [ "${3:-}" = --versions ]; then
+  [ "${BREW_KEG_MODE:-valid}" != empty ] || exit 0
   printf 'git %s\njq 1.7.1\n' "$installed_version"
+  if [ "${BREW_KEG_MODE:-valid}" = shuffled ]; then
+    printf '%s\n' 'openexr 3.4.15 3.4.14 3.4.15_1' 'snappy 1.3.0 1.3.1 1.2.2' \
+      'kept-old 3.0 2.0' 'keg-only-single 1.0_1' 'unlinked-single 1.2'
+  fi
   [ "${BREW_FORMULA_CASK_OVERLAP:-0}" != 1 ] || printf 'powershell 7.5.2\n'
   exit 0
 fi
