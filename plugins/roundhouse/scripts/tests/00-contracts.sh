@@ -9,9 +9,23 @@ remote_control_reference="$script_dir/../references/codex-remote-control.md"
 fleet_agents_text=$(cat "$fleet_agents_skill")
 remote_control_text=$(cat "$remote_control_reference")
 
+# Codex task dispatch defers model and reasoning-effort choice to
+# `railyard:model-routing` and carries it through the task tool's own
+# controls. Roundhouse keeps no model constants and no retired resolver
+# ceremony (resolve/admit/claim/reconcile receipts, dispatch banners).
+routing_retired_pattern='model-routing/v1|contractVersion|budgetEffect|claim-dispatch|admit\(requestId\)|model_routing_capability_unavailable|visible-provider bridge|visible-task authority|senderOwnerDigest|dispatch banner|harness-model-invocation|▸ <model>|Allocation:|shared routing dispatch|admitted and claimed'
+routing_model_constant_pattern='(^|[^[:alnum:]_])((GPT|gpt)-[0-9]+[[:alnum:].-]*|Sol|Luna|Astra|Opus|Fable|Sonnet|Haiku)([^[:alnum:]_]|$)|claude-(opus|sonnet|haiku|fable)'
 for routing_consumer in fleet-agents fleet-auth fleet-inventory fleet-projects fleet-update; do
   routing_consumer_text=$(cat "$script_dir/../skills/$routing_consumer/SKILL.md")
-  assert_contains "$routing_consumer_text" 'railyard/model-routing/v1'
+  assert_contains "$routing_consumer_text" '`railyard:model-routing`'
+done
+for routing_doc in "$script_dir"/../skills/*/SKILL.md "$script_dir"/../references/*.md; do
+  if grep -Eq -- "$routing_retired_pattern" "$routing_doc"; then
+    fail "$(basename "$(dirname "$routing_doc")")/$(basename "$routing_doc") still carries the retired model-routing resolver contract"
+  fi
+  if grep -Eq -- "$routing_model_constant_pattern" "$routing_doc"; then
+    fail "$(basename "$(dirname "$routing_doc")")/$(basename "$routing_doc") embeds a model constant instead of deferring to railyard:model-routing"
+  fi
 done
 
 assert_contains "$fleet_agents_text" 'ROUNDHOUSE_CONFIG'
@@ -57,31 +71,14 @@ assert_contains "$remote_control_text" '`wait_threads`'
 assert_contains "$remote_control_text" '`wait_threads`, and `set_thread_archived`'
 assert_contains "$remote_control_text" 'An absent eager tool listing is not evidence'
 assert_contains "$remote_control_text" '`railyard:model-routing`'
-assert_contains "$remote_control_text" '`contractVersion: "railyard/model-routing/v1"`'
-assert_contains "$remote_control_text" '`callerKind: "fleet"`'
-assert_contains "$remote_control_text" '`codex-task-create` or'
-assert_contains "$remote_control_text" '`codex-task-message`'
-assert_contains "$remote_control_text" '`task_create` or `task_message`'
-assert_contains "$remote_control_text" '`senderOwnerDigest`'
-assert_contains "$remote_control_text" 'visible-task authority receipt'
-assert_contains "$remote_control_text" 'execution-host and'
-assert_contains "$remote_control_text" 'target-platform identities'
-assert_contains "$remote_control_text" 'work-class digest'
-assert_contains "$remote_control_text" '`budgetEffect: "start"`'
-assert_contains "$remote_control_text" '`admit(requestId)`'
-assert_contains "$remote_control_text" '`claim-dispatch`'
-assert_contains "$remote_control_text" 'adapter/path/model/effort controls'
-assert_contains "$remote_control_text" '`budgetEffect: "none"`'
-assert_contains "$remote_control_text" '`budgetEffect: "adjust_active"`'
-assert_contains "$remote_control_text" 'Every same-task chunk retrieval is a fresh `task_message` routing boundary'
-assert_contains "$remote_control_text" 'visible-provider bridge'
-assert_contains "$remote_control_text" 'acknowledgement-only bootstrap'
-assert_contains "$remote_control_text" 'provider-local activation/follow-up'
-assert_contains "$remote_control_text" 'model_routing_capability_unavailable'
-assert_contains "$remote_control_text" 'Do not call a provider'
-assert_contains "$remote_control_text" 'model constants'
-assert_contains "$remote_control_text" 'transport matrix'
-assert_contains "$remote_control_text" 'state, or cache lookup'
+assert_contains "$remote_control_text" 'Create a visible Codex task only for an operation the user explicitly
+requested'
+assert_contains "$remote_control_text" "task tool's own model and effort controls"
+assert_contains "$remote_control_text" 'report that instead of silently
+substituting'
+assert_contains "$remote_control_text" 'Do not copy model names, effort
+defaults, or routing tables into Roundhouse'
+assert_contains "$remote_control_text" 'Model choice never relaxes the 48 KiB'
 assert_contains "$remote_control_text" 'Every remote-control operation starts a new visible task'
 assert_contains "$remote_control_text" 'Never resume,'
 assert_contains "$remote_control_text" 'Reuse only the tool-availability result'

@@ -58,8 +58,8 @@ SSH to the sibling, `cd /mnt/c`, and run winget and the other native
 managers through full-path `cmd.exe /c` — native processes from any
 harness. Only when WSL is absent or unreachable, or the work needs the
 Desktop app surface, does Codex fall back to
-`"$SKILL_DIR/../../references/codex-remote-control.md"` (with its exact
-shared `railyard/model-routing/v1` dispatch before task creation); Claude
+`"$SKILL_DIR/../../references/codex-remote-control.md"` (model and effort
+chosen per `railyard:model-routing`); Claude
 reports that fallback lane as unsupported. Never run the managers
 WSL-side in place of native Windows. Preserve native approval
 prompts, stop per host on failure, and recapture package inventory afterward.

@@ -46,9 +46,8 @@ configured project name, `available`/`missing`/`unreachable`, configured
 project/task/correlation IDs when available. Then run
 `"$CLI" record-codex-readiness SNAPSHOT METADATA OUTPUT` so Director receives
 the controller-observed status in canonical JSONL. Direct Windows task creation follows
-`"$SKILL_DIR/../../references/codex-remote-control.md"`, including its exact
-shared `railyard/model-routing/v1` dispatch before task creation or a
-work-starting follow-up, and never WSL.
+`"$SKILL_DIR/../../references/codex-remote-control.md"`, which defers the
+task's model and effort choice to `railyard:model-routing`, and never WSL.
 Cross-host handoff requires matching saved-project repository identity at both
 ends; creating a remote task directly only requires the destination saved
 project.
