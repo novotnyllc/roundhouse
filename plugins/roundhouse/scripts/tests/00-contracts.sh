@@ -13,8 +13,8 @@ remote_control_text=$(cat "$remote_control_reference")
 # `railyard:model-routing` and carries it through the task tool's own
 # controls. Roundhouse keeps no model constants and no retired resolver
 # ceremony (resolve/admit/claim/reconcile receipts, dispatch banners).
-routing_retired_pattern='model-routing/v1|contractVersion|budgetEffect|claim-dispatch|admit\(requestId\)|model_routing_capability_unavailable|visible-provider bridge|visible-task authority|senderOwnerDigest|dispatch banner|harness-model-invocation|▸ <model>|Allocation:'
-routing_model_constant_pattern='(^|[^[:alnum:]_])(GPT-[0-9]|gpt-[0-9]|Sol|Luna|Astra|Opus|Fable|Sonnet|Haiku)([^[:alnum:]_]|$)|claude-(opus|sonnet|haiku|fable)'
+routing_retired_pattern='model-routing/v1|contractVersion|budgetEffect|claim-dispatch|admit\(requestId\)|model_routing_capability_unavailable|visible-provider bridge|visible-task authority|senderOwnerDigest|dispatch banner|harness-model-invocation|▸ <model>|Allocation:|shared routing dispatch|admitted and claimed'
+routing_model_constant_pattern='(^|[^[:alnum:]_])((GPT|gpt)-[0-9]+[[:alnum:].-]*|Sol|Luna|Astra|Opus|Fable|Sonnet|Haiku)([^[:alnum:]_]|$)|claude-(opus|sonnet|haiku|fable)'
 for routing_consumer in fleet-agents fleet-auth fleet-inventory fleet-projects fleet-update; do
   routing_consumer_text=$(cat "$script_dir/../skills/$routing_consumer/SKILL.md")
   assert_contains "$routing_consumer_text" '`railyard:model-routing`'
