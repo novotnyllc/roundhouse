@@ -36,9 +36,8 @@ state. The invoking agent must check and report Codex Desktop Remote enablement
 manually because it has no documented persistent config key or inventory record.
 
 For `codex-remote-control`, Codex must read and follow
-`"$SKILL_DIR/../../references/codex-remote-control.md"`, including its exact
-shared `railyard/model-routing/v1` dispatch before task creation or a
-work-starting follow-up. Claude must report that
+`"$SKILL_DIR/../../references/codex-remote-control.md"`, which defers the
+task's model and effort choice to `railyard:model-routing`. Claude must report that
 transport as unsupported. Never route Windows through WSL unless the config
 explicitly chooses a different transport.
 

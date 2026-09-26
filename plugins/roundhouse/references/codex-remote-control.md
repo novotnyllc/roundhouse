@@ -38,70 +38,24 @@ that a tool is unavailable. Classify failure precisely:
 
 Do not collapse these states into a generic task-control failure.
 
-## Shared model-routing dispatch
+## Task model and effort
 
-Before every visible Codex task creation and every task message or follow-up,
-invoke the installed runtime skill `railyard:model-routing`; it is the
-only routing authority used here. Send exact
-`contractVersion: "railyard/model-routing/v1"`. Do not call a provider
-router, copy model constants, effort defaults, a transport matrix, scoring,
-state, or cache lookup into Roundhouse. If the skill or that exact
-compatible contract is absent, stop the affected Codex dispatch with
-`model_routing_capability_unavailable`; retain local/SSH evidence but never
-create an unbound task or omit model/effort controls.
+Create a visible Codex task only for an operation the user explicitly
+requested. A config or catalog entry, prior task, or standing policy is not
+that request.
 
-Roundhouse remains the sole sender for its native remote actions and
-retains host/project matching, Windows-native execution, executor readiness,
-payload/chunk validation, and cleanup. The routing request is bounded,
-content-free policy metadata and includes:
+Before creating the task, and before any follow-up that starts or expands
+work, choose the model and reasoning effort per `railyard:model-routing` when
+it is installed; otherwise choose deliberately from what the task tool offers.
+Pass the pair through the task tool's own model and effort controls. If the
+tool cannot accept the chosen pair, report that instead of silently
+substituting another model or effort. Do not copy model names, effort
+defaults, or routing tables into Roundhouse.
 
-- `callerKind: "fleet"`, a stable `senderOwnerDigest`, unique
-  request/action ID, `adapterId` (`codex-task-create` or
-  `codex-task-message`), and `dispatchKind` (`task_create` or `task_message`);
-- the selected host/task/transport readiness, separate execution-host and
-  target-platform identities, exact carrier transport, bounded destination
-  work-class digest and `workShape`, privacy/context constraints, and the
-  standalone task/run budget scope or accepted orchestrator lease;
-- a one-use visible-task authority receipt for `task_create`. A user policy,
-  catalog entry, prior task, or caller Boolean is not task authority; and
-- for `task_message`, the destination task identity, its resolver-owned prior
-  route receipt with prior model/effort, and whether the bounded work class
-  continues or changes.
-
-For a work-starting task creation or message, set `budgetEffect: "start"` and
-follow the returned sequence exactly: resolve, `admit(requestId)`,
-`claim-dispatch`, perform the native action, then reconcile the returned
-receipt. Pass the returned validated adapter/path/model/effort controls to the
-Codex task action verbatim. A missing/unselectable control, requested-versus-
-actual mismatch, or incompatible path uses only the resolver's disclosed
-fallback or blocks; never silently inherit or substitute a route.
-
-A status request, non-expanding clarification, cancellation, or narrowing that
-the adapter attests does not start work instead uses `budgetEffect: "none"` and
-obtains an immutable no-start action receipt. It does not reserve, claim, or
-authorize later work. A message that expands the objective, acceptance checks,
-files, unit volume, provider/carrier calls, or expected duration is active work:
-before sending, use `budgetEffect: "adjust_active"` to admit the additional
-conservative ceiling against the existing attempt, then send and reconcile it;
-an active-work adjustment creates no new dispatch claim.
-If it cannot fit, narrow, cancel, wait for newly admitted work, or block.
-
-Every same-task chunk retrieval is a fresh `task_message` routing boundary.
-Re-resolve its bounded chunk work class and prior route before each follow-up;
-inherit only when the fresh decision selects the exact attested winning prior
-model and effort for the unchanged class. Status replies never prove that later
-chunk work is admitted. Preserve the existing 48 KiB limits, ordering, digest
-validation, and task correlation after routing.
-
-When the returned path requires a visible-provider bridge, it is two separately
-accounted actions. First resolve/admit/claim an acknowledgement-only bootstrap,
-consume the visible-task authority, create the task with its returned controls,
-verify tool-returned task identity, and compare the secret-free acknowledgement.
-That bootstrap forbids mutable work. Only after it succeeds, re-resolve,
-admit, and claim the provider-local activation/follow-up; reconcile each phase
-separately. A bootstrap failure settles only that attempt and never authorizes
-activation. Same-provider or verified plaintext paths use the single returned
-native action instead.
+Status, chunk-retrieval, cleanup, and cancellation follow-ups on the same task
+keep its existing model and effort. Model choice never relaxes the 48 KiB
+chunk limit, ordering, digest validation, task correlation, host/project
+matching, or Windows-native execution below.
 
 ## Fresh-task project binding
 

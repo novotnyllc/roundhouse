@@ -696,13 +696,11 @@ absent or unreachable, or the work needs the Desktop app surface.
 
 For a configured `codex-remote-control` target, follow the routine-refresh
 path in `"$SKILL_DIR/../../references/codex-remote-control.md"`, using a visible
-native task and native PowerShell. Before its task creation and every chunk or
-other work-starting follow-up, invoke the reference's exact shared
-`railyard/model-routing/v1` runtime-skill contract; no local model
-policy is permitted. Every such dispatch prompt carries railyard's dispatch
-banner instruction (`▸ <model>/<effort> · …` echoed first, non-blocking; see
-railyard's harness-model-invocation reference). Lazy-discover the task-control
-app tools before declaring them unavailable.
+native task and native PowerShell. Choose the task's model and reasoning
+effort per `railyard:model-routing` and pass them through the task tool's own
+controls, as that reference describes; Roundhouse keeps no model policy of its
+own. Lazy-discover the task-control app tools before declaring them
+unavailable.
 
 A harness that cannot drive the Codex task surface (Claude Code) is not
 blocked from the declarative half: stage the marketplace desired-record and
