@@ -30,8 +30,10 @@ the exact source/path operations with
 `"$CLI" verify-preconditions PLAN CURRENT-SNAPSHOT` to succeed. Obtain
 separate approval, execute only the sealed argv, and inventory again afterward.
 For a local target use `"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; for SSH use
-`"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`; native Windows uses the
-remote-control worker contract. Apply recaptures trusted preflight itself and
+`"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`; native Windows uses
+`"$CLI" apply-interop-plan PLAN PLAN-ID OUTPUT` when it declares
+`wsl_interop_via`, otherwise the remote-control worker contract. Apply
+recaptures trusted preflight itself and
 preserves authoritative partial output after a failed operation or
 postcondition when post-inventory remains available. SSH uses bounded
 connection/keepalive timeouts and verifies the configured native hostname/user.

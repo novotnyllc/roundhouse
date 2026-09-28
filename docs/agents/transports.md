@@ -8,6 +8,9 @@ they are Roundhouse's job, not a caller's.
 - SSH enrollment and certificates (`fleet-hosts`, `certify-ssh-node`,
   `enroll-ssh-posix`, `prepare-ssh-identity`).
 - `remote-mac` for remote-machine mechanics, `ssh-doctor` for diagnosis.
+- The WSL interop lane to native Windows (`collect`, `apply-interop-plan`):
+  SSH to the `wsl_interop_via` sibling, launch the installed, verified
+  Windows executor natively. Described in the remote-control reference.
 - The Codex remote-control contract:
   [`plugins/roundhouse/references/codex-remote-control.md`](../../plugins/roundhouse/references/codex-remote-control.md).
 

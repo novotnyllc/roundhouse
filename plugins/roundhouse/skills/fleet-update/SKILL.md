@@ -44,8 +44,10 @@ platform identity, recapture package inventory, and require
 `"$CLI" verify-preconditions PLAN CURRENT-SNAPSHOT` to succeed. This binds
 config, plan integrity, and preconditions without executing plan text. Then
 execute only the exact argv sealed in the plan. For a local target use `"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; for SSH
-use `"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`. Both recapture trusted
-preflight and enforce the same executor, identity, manager-command,
+use `"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`; for native Windows with a
+`wsl_interop_via` sibling use `"$CLI" apply-interop-plan PLAN PLAN-ID OUTPUT`
+(winget upgrades run through the installed, verified `apply-windows.ps1`).
+Each recaptures trusted preflight and enforces the same executor, identity, manager-command,
 fresh-precondition, and semantic post-state checks. If an operation or
 postcondition fails, preserve the authoritative partial result emitted when
 post-inventory remains available. SSH uses bounded connection/keepalive

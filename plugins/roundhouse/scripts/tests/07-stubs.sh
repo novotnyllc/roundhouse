@@ -446,9 +446,24 @@ cat >"$tmp/bin/winget" <<'SH'
 winget_row() {
   printf '%-16s %-18s %-16s %-16s %s\n' "$@"
 }
+# WINGET_STATE_FILE (opt-in) makes an exact `upgrade --id ... --version V`
+# converge: V is recorded, later listings report no upgrades, and the export
+# reports V as installed. Unset, every call keeps the stateless behaviour.
+winget_state_version=
+[ -z "${WINGET_STATE_FILE:-}" ] || [ ! -s "$WINGET_STATE_FILE" ] ||
+  winget_state_version=$(cat "$WINGET_STATE_FILE")
 case ${1:-} in
   upgrade)
-    if [ "${WINGET_MODE:-valid}" = invalid ]; then
+    if [ -n "${WINGET_STATE_FILE:-}" ] && [ "${2:-}" = --id ]; then
+      while [ $# -gt 0 ]; do
+        case $1 in --version) printf '%s\n' "$2" >"$WINGET_STATE_FILE"; exit 0 ;; esac
+        shift
+      done
+      exit 64
+    fi
+    if [ -n "$winget_state_version" ]; then
+      printf '%s\n' 'No installed package found matching input criteria.'
+    elif [ "${WINGET_MODE:-valid}" = invalid ]; then
       printf '%s\n' 'Nom  Identifiant  Version  Disponible  Source' 'malformed row'
     elif [ "${WINGET_MODE:-valid}" = none ]; then
       printf '%s\n' 'No installed package found matching input criteria.'
@@ -554,9 +569,8 @@ case ${1:-} in
         fi
         ;;
       *)
-        printf '%s\n' \
-          '{"Sources":[{"SourceDetails":{"Name":"winget"},"Packages":[{"PackageIdentifier":"Example.Package","Version":"1.0.0"}]}]}' \
-          >"$output"
+        printf '{"Sources":[{"SourceDetails":{"Name":"winget"},"Packages":[{"PackageIdentifier":"Example.Package","Version":"%s"}]}]}\n' \
+          "${winget_state_version:-1.0.0}" >"$output"
         ;;
     esac
     ;;

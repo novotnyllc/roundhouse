@@ -724,8 +724,9 @@ recapture inventory, and require
 separate user approval and execute only the exact sealed argv. Do not silently
 convert a standalone skill into a plugin or vice versa. For a local target use
 `"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; for SSH use
-`"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`; Windows uses the native worker
-contract in the remote-control reference. Apply recaptures trusted preflight
+`"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`; Windows with a `wsl_interop_via`
+sibling uses `"$CLI" apply-interop-plan PLAN PLAN-ID OUTPUT`, otherwise the
+native worker contract in the remote-control reference. Apply recaptures trusted preflight
 itself. Preserve its authoritative partial output when an operation or
 postcondition fails.
 The executor supports exact `codex update` and `claude update` runtime updates,

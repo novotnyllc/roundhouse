@@ -77,6 +77,7 @@ collect_command() {
   rc=0
   operation_status=completed
   operation_envelope_status=present
+  worker_records=false
   case $transport in
     local)
       ROUNDHOUSE_OBSERVED_AT="$observed" "$script_dir/collect-posix" "$config" "$target" "$snapshot_id" "$sections" >>"$records" || {
@@ -173,14 +174,27 @@ REMOTE_COLLECTOR
       fi
       ;;
     codex-remote-control)
-      error=$(jq -cn '[{code:"codex_task_required",severity:"warning",retryable:true,message:"Use the fleet skill to create a visible task on the saved Codex Desktop project"}]')
-      jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" \
-        --arg snapshot_id "$snapshot_id" --arg host_id "$target" --arg observed_at "$observed" \
-        --argjson errors "$error" \
-        '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:"error",id:"transport:codex-remote-control",observed_at:$observed_at,status:"unavailable",confidence:"high",data:{transport:"codex-remote-control"},evidence:[],errors:$errors}' >>"$records"
-      rc=2
-      operation_status=blocked
-      operation_envelope_status=unavailable
+      if interop_alias=$(wsl_interop_alias "$config" "$target"); then
+        interop_collect "$interop_alias" "$target" "$snapshot_id" "$sections" \
+          "$config_digest" "$observed" "$tmp" "$records"
+        if [ "$interop_collect_ok" = true ]; then
+          # The native worker's snapshot and collect records are authoritative.
+          worker_records=true
+        else
+          rc=2
+          operation_status=blocked
+          operation_envelope_status=unavailable
+        fi
+      else
+        error=$(jq -cn '[{code:"codex_task_required",severity:"warning",retryable:true,message:"Use the fleet skill to create a visible task on the saved Codex Desktop project"}]')
+        jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" \
+          --arg snapshot_id "$snapshot_id" --arg host_id "$target" --arg observed_at "$observed" \
+          --argjson errors "$error" \
+          '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:"error",id:"transport:codex-remote-control",observed_at:$observed_at,status:"unavailable",confidence:"high",data:{transport:"codex-remote-control"},evidence:[],errors:$errors}' >>"$records"
+        rc=2
+        operation_status=blocked
+        operation_envelope_status=unavailable
+      fi
       ;;
     *)
       printf 'roundhouse: transport not supported by this command: %s\n' "$transport" >&2
@@ -222,6 +236,9 @@ REMOTE_COLLECTOR
     operation_envelope_status=partial
   fi
 
+  # A native Windows worker already emitted its own snapshot and collect
+  # records; the controller adds its own only when it is the record source.
+  [ "$worker_records" = true ] ||
   jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" \
     --arg snapshot_id "$snapshot_id" --arg host_id "$target" --arg observed_at "$observed" \
     --arg transport "$transport" --arg sections "$sections" \

@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "59cab9027c9df5f7740c604cc0e13fe70a7f4074f314dd3243045c1f15260fdf"
+      "sha256": "5e77ff437961b9725f939c293eda203ac9db2e8ed2889b8a5f1ecaf9cee0caac"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "4dd9e128f2abee706e602bd7cb15fd43445e0657699170bd63eb4566e1b9219b"
+      "sha256": "4cd9fac95a6ebfb0010fd03b27eb134c12eba5b79a28198c03a843358dc3c09f"
     },
     {
       "path": "assets/icon.png",
@@ -22,7 +22,7 @@
     },
     {
       "path": "references/codex-remote-control.md",
-      "sha256": "8ed0cf45d00aed5fa6c03be9a988cbfa40256e995656462b38e0fdc662afd8f4"
+      "sha256": "c7af46481881905567d1b2d511de0e184c60168c6ee323c8207d8d1733972777"
     },
     {
       "path": "references/privilege-policy.default",
@@ -89,12 +89,16 @@
       "sha256": "31e4b44ebac0673c45569440345f55eab598b4406be13244ff4bda8c06abaf65"
     },
     {
+      "path": "scripts/interop-windows.ps1",
+      "sha256": "017b6fbd3e353657d5f960cca06dd65793e3d7a5a6d696a1af5ef7f71ebbf89d"
+    },
+    {
       "path": "scripts/launcher-install",
       "sha256": "6d7cc04bdcc554a25855061eaceac38a5cb71a9b8deddae5606d5d7b28869679"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
-      "sha256": "2bb67c44f34416a5792cff4b50c861dc375cbee18444dee97aa33b4cc5994708"
+      "sha256": "9b4120ae99867c6d8028ee199fd8a9b306902512161c1f30482a7a8abc07ffcf"
     },
     {
       "path": "scripts/lib/broker-posix.sh",
@@ -106,7 +110,7 @@
     },
     {
       "path": "scripts/lib/config.sh",
-      "sha256": "534c4d2097cea8c684eba9875327c6a3e7b10723ae8607fde81ebbe8d5db9b8b"
+      "sha256": "de639e78461933940ffae7b70a83d4c87deae69468edc4f02c2861f3882a84e9"
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
@@ -153,8 +157,12 @@
       "sha256": "0f55dae5d344399213571da64e6d38a3b2e3f31c3c7d867e5f0e4c758ed1f2d3"
     },
     {
+      "path": "scripts/lib/interop.sh",
+      "sha256": "9e099e442765fd82284398780429b2fac2be8ead24f90154eb9a41423f20f773"
+    },
+    {
       "path": "scripts/lib/inventory.sh",
-      "sha256": "ced9a30aabf9343884547f9cc9a6bb54f9aca30fb5a083daf539ef4763feb713"
+      "sha256": "718a473bd3e3d40c66fdf34fb61419a67d3d969bee3ae7eace49b1e91deec5b8"
     },
     {
       "path": "scripts/lib/plan-apply.sh",
@@ -166,7 +174,7 @@
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "1ca433686ab7d2769ae4910b2b512507695895448a044d12bafc5f15bd25df60"
+      "sha256": "31937e11c60b313aacd6e98e4315fd70da677e2379129f281cd7bb742c956f87"
     },
     {
       "path": "scripts/lib/plan-verify.sh",
@@ -210,7 +218,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "d372c30fb76a30e619bff18846c7b50349fc7590255c7af9ec2d8a0156783524"
+      "sha256": "9ecf7370e66e896ecbe15e3c6a3df7045304f5f34fd6b8776ca726d395f7f3fa"
     },
     {
       "path": "scripts/roundhouse-trustd",
@@ -218,7 +226,7 @@
     },
     {
       "path": "scripts/select-sections",
-      "sha256": "17a4e824811cfade3bd320d7bac56f2ecdcfe9fb532e1fafbc9ec8562808317e"
+      "sha256": "b2566ce1d534781430113797f1a1f3999b0f4fd2ea0e7d57dd7d0bbb92e91705"
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",
@@ -226,7 +234,7 @@
     },
     {
       "path": "skills/fleet-agents/SKILL.md",
-      "sha256": "fc3203a8c434cab42f70b2e85d06fc6e8a2f22bbc0086d77e94e454177966bb0"
+      "sha256": "433c80e7562dbaef1c959850d323ea27fb27e8b7b4b994cec29823e55e8baf6a"
     },
     {
       "path": "skills/fleet-agents/agents/openai.yaml",
@@ -242,11 +250,11 @@
     },
     {
       "path": "skills/fleet-hosts/SKILL.md",
-      "sha256": "384609a061454041f3d28181039bf8e8c7a2dd35fae7ca2b3c68401601536e42"
+      "sha256": "2438c4416a40ba3ed0c6571bae90c1af3950eb19cb08f612c68c35955d471e3c"
     },
     {
       "path": "skills/fleet-inventory/SKILL.md",
-      "sha256": "28a767a5179199526af071e4c55d733505e98e8f3e26a63e7243f6b1a6643158"
+      "sha256": "e0e605281acdbc42d843c001c1f32a7aedf8b10f49abda20ed3a3e82b6a587f8"
     },
     {
       "path": "skills/fleet-inventory/agents/openai.yaml",
@@ -254,7 +262,7 @@
     },
     {
       "path": "skills/fleet-projects/SKILL.md",
-      "sha256": "2cb555cec1f4b2d978dd2870f3d32016912ea7cb06a02accaf666f80ec96e8e0"
+      "sha256": "23b0faff802b051185d59a38734119737db2c03344ed5828e5beb5b063ec6d41"
     },
     {
       "path": "skills/fleet-projects/agents/openai.yaml",
@@ -262,7 +270,7 @@
     },
     {
       "path": "skills/fleet-readiness/SKILL.md",
-      "sha256": "fd994fb17615fd0b84a3bbf30506b5e0f252434e158dc31ff427641bb7f8eb1a"
+      "sha256": "871e9950286bd0510f510e7e47385eec12f286218c7f411459afe12f6fb516fe"
     },
     {
       "path": "skills/fleet-readiness/agents/openai.yaml",
@@ -270,7 +278,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "da51e1c6ed4abfa8ae1e9ad2ad18d7c5db62f395540006beb72cd46d4adc715c"
+      "sha256": "b312ba515d8a19237f5765693af2a45d5298ba80b76c3e389051ccfe500e14a2"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",
@@ -305,5 +313,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.24"
+  "version": "0.9.25"
 }

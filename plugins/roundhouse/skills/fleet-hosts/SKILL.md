@@ -19,7 +19,8 @@ only for a native-Windows destination]; groups [none]. For a Windows
 machine, also ask whether WSL runs on the same hardware (and vice versa):
 paired entries share a `physical_host` value, and the Windows entry sets
 `wsl_interop_via: <wsl-entry-name>` so maintenance can use the interop
-lane.
+lane. Validation requires that sibling to be a configured `platform: wsl`,
+`transport: ssh` entry on the same `physical_host`.
 
 1. **Reachability** — `ssh -o BatchMode=yes <alias> 'echo ok'` through the
    login shell. Fix reachability first (`roundhouse:ssh-doctor` for macOS

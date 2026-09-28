@@ -35,11 +35,15 @@ Claude CLI and Desktop Code as sharing supported settings but separate login
 state. The invoking agent must check and report Codex Desktop Remote enablement
 manually because it has no documented persistent config key or inventory record.
 
-For `codex-remote-control`, Codex must read and follow
+For `codex-remote-control` with a `wsl_interop_via` sibling,
+`"$CLI" collect --target HOST` collects natively through the WSL interop lane
+from any harness; `executor_update_required` means the installed Windows
+Roundhouse does not match this controller. Otherwise, or when WSL is
+unreachable, Codex must read and follow
 `"$SKILL_DIR/../../references/codex-remote-control.md"`, which defers the
-task's model and effort choice to `railyard:model-routing`. Claude must report that
-transport as unsupported. Never route Windows through WSL unless the config
-explicitly chooses a different transport.
+task's model and effort choice to `railyard:model-routing`, and Claude must
+report that transport as unsupported. Never substitute WSL-side execution for
+native Windows evidence.
 
 ## Protected broker readiness
 

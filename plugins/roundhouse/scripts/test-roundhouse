@@ -140,6 +140,8 @@ if want_section 65; then . "$script_dir/tests/65-config-validation.sh"; fi
 if want_section 67; then . "$script_dir/tests/67-windows-collector.sh"; fi
 # shellcheck source=tests/68-plan-lifecycle.sh
 if want_section 68; then . "$script_dir/tests/68-plan-lifecycle.sh"; fi
+# shellcheck source=tests/69-windows-interop.sh
+if want_section 69; then . "$script_dir/tests/69-windows-interop.sh"; fi
 # shellcheck source=tests/70-fold.sh
 if want_section 70; then . "$script_dir/tests/70-fold.sh"; fi
 # shellcheck source=tests/71-definitions.sh
