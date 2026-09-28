@@ -735,6 +735,27 @@ if "$cli" seal-plan "$tmp/full-digest-chezmoi-plan-draft.json" \
   fail "a full chezmoi apply accepted a target status digest"
 fi
 
+# The native Windows executor verifies neither the digest nor the extra key,
+# so a Windows plan may not carry it.
+jq -c '.host_id = "test-windows" | if .kind == "operation" then .data.host_id = "test-windows" else . end' \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" \
+  >"$tmp/windows-targeted-chezmoi-snapshot.jsonl"
+windows_target='C:\Users\Fixture\.gitconfig'
+jq --arg target "$windows_target" '.target = "test-windows" |
+  .operations[0].targets = [$target] | .operations[0].argv = ["chezmoi","--no-tty","apply","--",$target]' \
+  "$tmp/digest-targeted-chezmoi-plan-draft.json" >"$tmp/windows-digest-chezmoi-plan-draft.json"
+if "$cli" seal-plan "$tmp/windows-digest-chezmoi-plan-draft.json" \
+  "$tmp/windows-targeted-chezmoi-snapshot.jsonl" "$tmp/windows-digest-chezmoi-plan.json" \
+  >"$tmp/windows-digest.log" 2>&1; then
+  fail "a Windows targeted plan sealed a status digest its executor never checks"
+fi
+assert_contains "$(cat "$tmp/windows-digest.log")" 'not supported by the native Windows executor'
+jq 'del(.operations[0].status_digest)' "$tmp/windows-digest-chezmoi-plan-draft.json" \
+  >"$tmp/windows-plain-chezmoi-plan-draft.json"
+"$cli" seal-plan "$tmp/windows-plain-chezmoi-plan-draft.json" \
+  "$tmp/windows-targeted-chezmoi-snapshot.jsonl" "$tmp/windows-plain-chezmoi-plan.json" ||
+  fail "a Windows targeted plan without a status digest no longer seals"
+
 # Targeted plans must also run through the SSH worker, whose closed schema-2
 # validator previously rejected the targets key outright.
 jq '.target = "test-ssh"' "$tmp/digest-targeted-chezmoi-plan-draft.json" \
@@ -778,9 +799,25 @@ CHEZMOI_EXTERNAL_PATH=$external_path "$cli" collect --target test-host --section
   [.data.state, .data.local_commits_from_upstream, .data.upstream_head] | @tsv' \
   "$tmp/external-snapshot.jsonl")" = "$(printf 'rewritten-resettable\ttrue\t%s' "$rewritten_head")" ] ||
   fail "collector did not classify a rewritten clean external as resettable"
-jq -n --arg id "$external_path" --arg head "$rewritten_head" '{domain:"chezmoi",target:"test-host",
-  operations:[{type:"chezmoi-external-reset",kind:"chezmoi_external",id:$id,upstream_head:$head,
+local_head=$("$REAL_GIT" -C "$external_path" rev-parse HEAD)
+jq -n --arg id "$external_path" --arg head "$rewritten_head" --arg local "$local_head" '{domain:"chezmoi",target:"test-host",
+  operations:[{type:"chezmoi-external-reset",kind:"chezmoi_external",id:$id,head:$local,upstream_head:$head,
     argv:["git","-C",$id,"reset","--hard","--quiet",$head]}]}' >"$tmp/external-reset-draft.json"
+jq --arg head "$rewritten_head" '.operations[0].head = $head' "$tmp/external-reset-draft.json" \
+  >"$tmp/wrong-head-external-reset-draft.json"
+if "$cli" seal-plan "$tmp/wrong-head-external-reset-draft.json" "$tmp/external-snapshot.jsonl" \
+  "$tmp/wrong-head-external-reset-plan.json" >/dev/null 2>&1; then
+  fail "external reset sealed against a HEAD it did not observe"
+fi
+# An ignored local file counts as local data: a hard reset could overwrite it.
+printf 'local-only\n' >"$external_path/.git/info/exclude"
+printf 'kept\n' >"$external_path/local-only"
+CHEZMOI_EXTERNAL_PATH=$external_path "$cli" collect --target test-host --section chezmoi \
+  --output "$tmp/external-ignored-snapshot.jsonl"
+[ "$(jq -r --arg id "$external_path" 'select(.kind == "chezmoi_external" and .id == $id) | .data.state' \
+  "$tmp/external-ignored-snapshot.jsonl")" = rewritten-local-changes ] ||
+  fail "collector treated an external with an ignored local file as resettable"
+rm -f "$external_path/local-only"
 jq '.operations[0].argv += ["--no-recurse-submodules"]' "$tmp/external-reset-draft.json" \
   >"$tmp/unsafe-external-reset-draft.json"
 if CHEZMOI_EXTERNAL_PATH=$external_path "$cli" seal-plan "$tmp/unsafe-external-reset-draft.json" \
@@ -799,6 +836,26 @@ CHEZMOI_EXTERNAL_PATH=$external_path "$cli" apply-plan "$tmp/external-reset-plan
 ' "$tmp/external-reset-result.jsonl")" = completed ] ||
   fail "external reset did not report completed verification"
 
+"$REAL_GIT" -C "$external_upstream_repo" -c user.name=t -c user.email=t@example.invalid \
+  commit -q --amend -m rewritten-mid
+"$REAL_GIT" -C "$external_path" fetch -q
+# A clone that an earlier sealed reset moved is still upstream-only history.
+CHEZMOI_EXTERNAL_PATH=$external_path "$cli" collect --target test-host --section chezmoi \
+  --output "$tmp/external-again-snapshot.jsonl"
+[ "$(jq -r --arg id "$external_path" 'select(.kind == "chezmoi_external" and .id == $id) | .data.state' \
+  "$tmp/external-again-snapshot.jsonl")" = rewritten-resettable ] ||
+  fail "a clone moved by an earlier reset to an upstream commit was not resettable again"
+
+# A local commit whose subject says "Fast-forward" is still a local commit.
+"$REAL_GIT" -C "$external_path" -c user.name=t -c user.email=t@example.invalid \
+  commit -q --allow-empty -m "Fast-forward"
+CHEZMOI_EXTERNAL_PATH=$external_path "$cli" collect --target test-host --section chezmoi \
+  --output "$tmp/external-ff-subject-snapshot.jsonl"
+[ "$(jq -r --arg id "$external_path" 'select(.kind == "chezmoi_external" and .id == $id) | .data.local_commits_from_upstream' \
+  "$tmp/external-ff-subject-snapshot.jsonl")" = false ] ||
+  fail "a local commit with a Fast-forward subject counted as upstream history"
+"$REAL_GIT" -C "$external_path" reset -q --hard HEAD~1
+
 # A local commit or local change is never reset away.
 "$REAL_GIT" -C "$external_upstream_repo" -c user.name=t -c user.email=t@example.invalid \
   commit -q --amend -m rewritten-again
@@ -811,7 +868,8 @@ CHEZMOI_EXTERNAL_PATH=$external_path "$cli" collect --target test-host --section
   "$tmp/external-local-snapshot.jsonl")" = rewritten-local-changes ] ||
   fail "collector treated a local external commit as upstream history"
 again_head=$("$REAL_GIT" -C "$external_upstream_repo" rev-parse HEAD)
-jq --arg head "$again_head" '.operations[0].upstream_head = $head | .operations[0].argv[6] = $head' \
+jq --arg head "$again_head" --arg local "$("$REAL_GIT" -C "$external_path" rev-parse HEAD)" \
+  '.operations[0].upstream_head = $head | .operations[0].argv[6] = $head | .operations[0].head = $local' \
   "$tmp/external-reset-draft.json" >"$tmp/local-external-reset-draft.json"
 if "$cli" seal-plan "$tmp/local-external-reset-draft.json" "$tmp/external-local-snapshot.jsonl" \
   "$tmp/local-external-reset-plan.json" >/dev/null 2>&1; then

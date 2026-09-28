@@ -369,14 +369,21 @@ chezmoi_targets_status_digest() {
 }
 
 check_chezmoi_external_resettable() {
-  # A reset may only move a clean git-repo external that chezmoi manages to the
-  # sealed upstream commit. Whether every local commit came from upstream is
-  # bound by the sealed chezmoi_external record, rechecked just before this.
+  # A reset may only move a clean git-repo external that chezmoi manages, from
+  # the sealed HEAD to the sealed upstream commit. Whether every local commit
+  # came from upstream is bound by the sealed chezmoi_external record,
+  # rechecked just before this.
   external_path=$1
-  external_upstream=$2
+  external_head=$2
+  external_upstream=$3
   validate_chezmoi_targets "$external_path" || return
-  [ -d "$external_path/.git" ] && [ ! -L "$external_path" ] || {
-    printf 'roundhouse: chezmoi external is not a git checkout\n' >&2
+  [ -d "$external_path" ] && [ ! -L "$external_path" ] &&
+    [ -d "$external_path/.git" ] && [ ! -L "$external_path/.git" ] || {
+    printf 'roundhouse: chezmoi external is not a plain git checkout\n' >&2
+    return 64
+  }
+  [ "$(cd -P -- "$external_path" && pwd)" = "$(git -C "$external_path" rev-parse --show-toplevel 2>/dev/null)" ] || {
+    printf 'roundhouse: chezmoi external is not its own repository root\n' >&2
     return 64
   }
   chezmoi managed --include=externals --path-style=absolute 2>/dev/null |
@@ -384,8 +391,17 @@ check_chezmoi_external_resettable() {
       printf 'roundhouse: path is not a chezmoi-managed external\n' >&2
       return 64
     }
-  [ -z "$(GIT_OPTIONAL_LOCKS=0 git -C "$external_path" status --porcelain 2>/dev/null)" ] || {
-    printf 'roundhouse: chezmoi external has local changes\n' >&2
+  external_status=$(GIT_OPTIONAL_LOCKS=0 git -C "$external_path" status --porcelain --ignored \
+    --untracked-files=all 2>/dev/null) || {
+    printf 'roundhouse: chezmoi external status failed\n' >&2
+    return 70
+  }
+  [ -z "$external_status" ] || {
+    printf 'roundhouse: chezmoi external has local, untracked, or ignored files\n' >&2
+    return 65
+  }
+  [ "$(git -C "$external_path" rev-parse HEAD 2>/dev/null)" = "$external_head" ] || {
+    printf 'roundhouse: chezmoi external HEAD moved after planning\n' >&2
     return 65
   }
   [ "$(git -C "$external_path" rev-parse '@{u}' 2>/dev/null)" = "$external_upstream" ] || {
@@ -675,7 +691,7 @@ EOF
         printf 'roundhouse: unsafe chezmoi external reset argv\n' >&2
         return 64
       }
-      check_chezmoi_external_resettable "$id" "$external_upstream" || return
+      check_chezmoi_external_resettable "$id" "$(jq -r '.head' "$operation")" "$external_upstream" || return
       ;;
     project-clone|project-update)
       project_source=$(jq -r --arg id "$id" '.projects[$id].source // empty' "$config")

@@ -611,9 +611,10 @@ verify_preconditions_command() {
       (if .type == "chezmoi-external-reset" then
         (.id | type == "string" and length <= 512 and startswith("/") and
           (contains("\\") | not) and (test("(^|/)\\.\\.?($|/)") | not)) and
+        (.head | type == "string" and test("^[0-9a-f]{40}$")) and
         (.upstream_head | type == "string" and test("^[0-9a-f]{40}$")) and
         .argv == ["git","-C",.id,"reset","--hard","--quiet",.upstream_head]
-       elif has("upstream_head") then false
+       elif has("upstream_head") or has("head") then false
        else true end)
     ] | all) and
     (if .domain == "updates" then

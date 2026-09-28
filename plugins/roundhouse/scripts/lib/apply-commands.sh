@@ -687,7 +687,7 @@ validate_legacy_ssh_plan_file() {
            exact(["argv","id","kind","targets","type"]) or
            exact(["argv","id","kind","status_digest","targets","type"])
          elif .type == "chezmoi-external-reset" then
-           exact(["argv","id","kind","type","upstream_head"])
+           exact(["argv","head","id","kind","type","upstream_head"])
          else exact(["argv","id","kind","type"]) end) and
         (.argv | type == "array" and length > 0 and length <= 64 and
           all(.[]; type == "string" and length > 0)) and

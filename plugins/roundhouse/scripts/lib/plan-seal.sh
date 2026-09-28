@@ -58,9 +58,10 @@ seal_plan_command() {
       (if .type == "chezmoi-external-reset" then
         (.id | type == "string" and length <= 512 and startswith("/") and
           (contains("\\") | not) and (test("(^|/)\\.\\.?($|/)") | not)) and
+        (.head | type == "string" and test("^[0-9a-f]{40}$")) and
         (.upstream_head | type == "string" and test("^[0-9a-f]{40}$")) and
         .argv == ["git","-C",.id,"reset","--hard","--quiet",.upstream_head]
-       elif has("upstream_head") then false
+       elif has("upstream_head") or has("head") then false
        else true end)
     ] | all) and
     (if .domain == "updates" then
@@ -152,7 +153,9 @@ seal_plan_command() {
       elif .domain == "agents" then
         [.operations[] | .type == "agent-update"] | all
       elif .domain == "chezmoi" then
-        [.operations[] | .type != "chezmoi-external-reset"] | all
+        # The native Windows executor has neither the reset nor the target
+        # status digest check.
+        [.operations[] | .type != "chezmoi-external-reset" and (has("status_digest") | not)] | all
       elif .domain == "projects" then true
       else false end
     ' "$draft" >/dev/null || {
@@ -320,7 +323,7 @@ seal_plan_command() {
           any($records[]; .kind == "chezmoi_external" and .id == $operation.id and
             .status == "present" and .data.state == "rewritten-resettable" and
             .data.dirty_count == 0 and .data.local_commits_from_upstream == true and
-            .data.upstream_head == $operation.upstream_head)
+            .data.head == $operation.head and .data.upstream_head == $operation.upstream_head)
         else true end)
     ' >/dev/null || {
       printf 'roundhouse: %s plan does not match an actionable observed state\n' \
