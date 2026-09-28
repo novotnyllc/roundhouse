@@ -123,6 +123,8 @@ EOF
 # shellcheck source=lib/fleet-doctor.sh
 . "$script_dir/lib/fleet-doctor.sh"
 
+select_mikefarah_yq
+
 # Definitions only: a caller that sources this file for its functions stops
 # here, before dispatch. The self-check suite uses it to reach internal
 # helpers without reproducing the file's layout.

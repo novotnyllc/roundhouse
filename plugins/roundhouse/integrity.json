@@ -90,7 +90,7 @@
     },
     {
       "path": "scripts/launcher-install",
-      "sha256": "5a645e53ace59958cc77ec9b7b924aec4dac8a8df4b37b70c89d985d9b9e0a0d"
+      "sha256": "e20f6e41071348eac944cce1d27e0e5571c5ae76ff038d655bcda8fac20fe0f6"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
@@ -130,7 +130,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "0f3c2c1acb6cde797edec348ea7906af17ebdf48b96242937e4c0c405223058c"
+      "sha256": "93340e5ccfebf29c0d2babfbe7feafca6d3c9619a93d7872e61ddd30c5d3f71c"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -146,7 +146,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "bf763e20ba4efa71152583fcff00ef8b295a0a797ad89778faf73fb588147987"
+      "sha256": "62f6ef65394a7828f7ca76e8ef5cc5eeabb8095e49d82026cc2f7bbc11834f99"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -210,7 +210,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "2293cd4948229cc5d2affcdcdabd6f9970f69302494852afd8b22a624a8e0804"
+      "sha256": "d372c30fb76a30e619bff18846c7b50349fc7590255c7af9ec2d8a0156783524"
     },
     {
       "path": "scripts/roundhouse-trustd",

@@ -11,9 +11,39 @@ require_jq() {
   fi
 }
 
+yq_is_mikefarah() {
+  "$1" --version 2>/dev/null | grep -qi mikefarah
+}
+
+select_mikefarah_yq() {
+  # The fleet store needs mikefarah yq v4. Some hosts (Debian/Ubuntu under WSL)
+  # put the unrelated Python `yq` first on PATH, so when the first `yq` is not
+  # mikefarah's, find one that is and front it through a one-entry shim
+  # directory. Only `yq` moves; every other tool keeps its PATH position.
+  selected_yq=$(command -v yq 2>/dev/null || true)
+  if [ -n "$selected_yq" ] && yq_is_mikefarah "$selected_yq"; then
+    return 0
+  fi
+  for yq_candidate in $(which -a yq 2>/dev/null) \
+    "${HOMEBREW_PREFIX:-/nonexistent}/bin/yq" /home/linuxbrew/.linuxbrew/bin/yq \
+    /opt/homebrew/bin/yq /usr/local/bin/yq; do
+    if ! { [ -x "$yq_candidate" ] && yq_is_mikefarah "$yq_candidate"; }; then continue; fi
+    yq_shim=${XDG_CACHE_HOME:-$HOME/.cache}/roundhouse/yq-shim
+    (umask 077 && mkdir -p "$yq_shim") 2>/dev/null || return 0
+    ln -sfn "$yq_candidate" "$yq_shim/yq" 2>/dev/null || return 0
+    PATH="$yq_shim:$PATH"
+    export PATH
+    return 0
+  done
+}
+
 require_yq() {
   if ! command -v yq >/dev/null 2>&1; then
     printf 'roundhouse: yq is required; the fleet store is YAML\n' >&2
+    exit 69
+  fi
+  if ! yq_is_mikefarah "$(command -v yq)"; then
+    printf 'roundhouse: mikefarah yq v4 is required; %s is a different yq\n' "$(command -v yq)" >&2
     exit 69
   fi
 }

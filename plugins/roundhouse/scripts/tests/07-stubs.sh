@@ -287,6 +287,15 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = marketplace ] &&
   exit 0
 fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = marketplace ] &&
+  [ "\${3:-}" = add ]; then
+  [ -z "\${CLAUDE_MARKETPLACE_ADD_LOG:-}" ] || printf '%s\n' "\$4" >>"\$CLAUDE_MARKETPLACE_ADD_LOG"
+  if [ -n "\${CLAUDE_PLUGIN_MARKETPLACE_FILE:-}" ] && [ -n "\${CLAUDE_MARKETPLACE_ADD_NAME:-}" ]; then
+    jq --arg n "\$CLAUDE_MARKETPLACE_ADD_NAME" '. + [{name:\$n}]' "\$CLAUDE_PLUGIN_MARKETPLACE_FILE" \
+      >"\$CLAUDE_PLUGIN_MARKETPLACE_FILE.new" && mv "\$CLAUDE_PLUGIN_MARKETPLACE_FILE.new" "\$CLAUDE_PLUGIN_MARKETPLACE_FILE"
+  fi
+  exit 0
+fi
+if [ "\${1:-}" = plugin ] && [ "\${2:-}" = marketplace ] &&
   [ "\${3:-}" = update ]; then
   [ -z "\${CLAUDE_MARKETPLACE_UPDATE_MARKER:-}" ] ||
     printf '%s\n' "\$4" >>"\$CLAUDE_MARKETPLACE_UPDATE_MARKER"

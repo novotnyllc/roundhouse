@@ -682,6 +682,48 @@ JSON
       fail "plugin state re-read accepted output from a failed list command"
     unset -f claude
 
+    # A declared marketplace the harness never registered (headless hosts never
+    # run Claude Code's interactive registration) is added from the user's own
+    # synced declaration, and only from it.
+    run_market_file="$run_root/marketplaces.json"
+    run_market_log="$run_root/marketplace-add.log"
+    printf '[]\n' >"$run_market_file"
+    : >"$run_market_log"
+    mkdir -p "$HOME/.claude"
+    run_saved_settings=$(cat "$HOME/.claude/settings.json" 2>/dev/null || printf '{}')
+    printf '%s\n' '{"extraKnownMarketplaces":{"test-market":{"source":{"source":"github","repo":"owner/test-market"}},"bad-market":{"source":{"source":"directory","path":"-rf"}}}}' \
+      >"$HOME/.claude/settings.json"
+    CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_market_file" CLAUDE_MARKETPLACE_ADD_LOG="$run_market_log" \
+      CLAUDE_MARKETPLACE_ADD_NAME=test-market CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      fleet_run_ensure_marketplace test-market || fail "a declared unregistered marketplace was not registered"
+    [ "$(cat "$run_market_log")" = owner/test-market ] ||
+      fail "marketplace registration did not use the declared source"
+    CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_market_file" CLAUDE_MARKETPLACE_ADD_LOG="$run_market_log" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_ensure_marketplace test-market ||
+      fail "an already registered marketplace was not accepted"
+    [ "$(wc -l <"$run_market_log" | tr -d ' ')" -eq 1 ] || fail "a registered marketplace was added again"
+    for run_market_refused in undeclared-market bad-market; do
+      run_status=0
+      CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_market_file" CLAUDE_MARKETPLACE_ADD_LOG="$run_market_log" \
+        CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_ensure_marketplace "$run_market_refused" || run_status=$?
+      [ "$run_status" -eq 75 ] || fail "$run_market_refused marketplace registration exited $run_status, not 75"
+    done
+    [ "$(wc -l <"$run_market_log" | tr -d ' ')" -eq 1 ] ||
+      fail "an undeclared or option-shaped marketplace source reached the manager"
+    printf '%s\n' "$run_saved_settings" >"$HOME/.claude/settings.json"
+
+    # A different `yq` first on PATH (the Python one on Ubuntu) is stepped over.
+    run_yq_decoy="$run_root/yq-decoy"
+    mkdir -p "$run_yq_decoy"
+    printf '#!/bin/sh\necho "yq 3.4.3"\n' >"$run_yq_decoy/yq"
+    chmod +x "$run_yq_decoy/yq"
+    (
+      PATH="$run_yq_decoy:$PATH" XDG_CACHE_HOME="$run_root/cache"
+      export PATH XDG_CACHE_HOME
+      select_mikefarah_yq
+      yq_is_mikefarah "$(command -v yq)" || fail "the Python yq decoy was not stepped over"
+    ) || exit 1
+
     # §5.1.3: a STANDALONE hook is arbitrary code from outside the plugin trust
     # flow. It folds, resolves, reviews and journals — and the apply path
     # refuses it. The gate itself is exercised in tests/75-guards.sh; what is
