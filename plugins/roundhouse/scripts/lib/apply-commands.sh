@@ -581,6 +581,11 @@ apply_plan_command() {
       elif .type == "chezmoi-pull" then
         any($records[]; .kind == "file" and .id == "chezmoi:source" and
           .status == "present" and .data.dirty_count == 0)
+      elif .type == "chezmoi-external-reset" then
+        . as $operation |
+        any($records[]; .kind == "chezmoi_external" and .id == $operation.id and
+          .status == "present" and .data.head == $operation.upstream_head and
+          .data.dirty_count == 0 and .data.state == "current")
       elif .type == "chezmoi-apply" then
         if has("targets") then true else
           any($records[]; .kind == "chezmoi_state" and .id == "live" and
@@ -678,6 +683,11 @@ validate_legacy_ssh_plan_file() {
         .type != "semantic-action" and
         (if .type == "package-upgrade" then
            exact(["argv","candidate_version","id","kind","type"])
+         elif .type == "chezmoi-apply" and has("targets") then
+           exact(["argv","id","kind","targets","type"]) or
+           exact(["argv","id","kind","status_digest","targets","type"])
+         elif .type == "chezmoi-external-reset" then
+           exact(["argv","id","kind","type","upstream_head"])
          else exact(["argv","id","kind","type"]) end) and
         (.argv | type == "array" and length > 0 and length <= 64 and
           all(.[]; type == "string" and length > 0)) and

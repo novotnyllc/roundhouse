@@ -532,6 +532,12 @@ fi
   fail "Codex readiness did not enrich the apply operation correlation"
 }
 
+t_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d ' ' -f 1
+  else shasum -a 256 | cut -d ' ' -f 1
+  fi
+}
+
 plan_chezmoi_contracts() {
   plan_fixture_snapshot
 cat >"$tmp/chezmoi-plan-draft.json" <<'JSON'
@@ -694,6 +700,124 @@ if "$cli" seal-plan "$tmp/duplicate-targeted-chezmoi-plan-draft.json" \
   "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/duplicate-targeted-chezmoi-plan.json" >/dev/null 2>&1; then
   fail "targeted chezmoi plan accepted duplicate targets"
 fi
+
+# A targeted plan may seal the exact `chezmoi status -- TARGET...` bytes; the
+# executor refuses before mutating if they changed, so a live edit made after
+# planning is never overwritten.
+targeted_status_digest=$(printf ' M %s\n' "$targeted_chezmoi_path" | t_sha256)
+jq --arg digest "$targeted_status_digest" '.operations[0].status_digest = $digest' \
+  "$tmp/targeted-chezmoi-plan-draft.json" >"$tmp/digest-targeted-chezmoi-plan-draft.json"
+"$cli" seal-plan "$tmp/digest-targeted-chezmoi-plan-draft.json" \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/digest-targeted-chezmoi-plan.json"
+digest_targeted_plan_id=$(jq -r '.plan_id' "$tmp/digest-targeted-chezmoi-plan.json")
+rm -f "$CHEZMOI_TARGET_APPLY_MARKER"
+CHEZMOI_TARGET_STATUS_DRIFT=1 "$cli" apply-plan "$tmp/digest-targeted-chezmoi-plan.json" \
+  "$digest_targeted_plan_id" "$tmp/digest-targeted-chezmoi-result.jsonl"
+[ -e "$CHEZMOI_TARGET_APPLY_MARKER" ] || fail "matching sealed target status did not apply"
+jq --arg digest "$(printf 'x' | t_sha256)" '.operations[0].status_digest = $digest' \
+  "$tmp/targeted-chezmoi-plan-draft.json" >"$tmp/stale-targeted-chezmoi-plan-draft.json"
+"$cli" seal-plan "$tmp/stale-targeted-chezmoi-plan-draft.json" \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/stale-targeted-chezmoi-plan.json"
+stale_targeted_plan_id=$(jq -r '.plan_id' "$tmp/stale-targeted-chezmoi-plan.json")
+rm -f "$CHEZMOI_TARGET_APPLY_MARKER"
+if CHEZMOI_TARGET_STATUS_DRIFT=1 "$cli" apply-plan "$tmp/stale-targeted-chezmoi-plan.json" \
+  "$stale_targeted_plan_id" "$tmp/stale-targeted-chezmoi-result.jsonl" >"$tmp/stale-targeted.stderr" 2>&1; then
+  fail "targeted chezmoi apply ignored a changed sealed target status"
+fi
+grep -F "roundhouse: chezmoi targets changed after planning" "$tmp/stale-targeted.stderr" >/dev/null ||
+  fail "changed target status was not reported"
+[ ! -e "$CHEZMOI_TARGET_APPLY_MARKER" ] || fail "changed target status reached the native command"
+jq --arg digest "$targeted_status_digest" '.operations[0] |= (del(.targets) |
+  .argv = ["chezmoi","--no-tty","apply"] | .status_digest = $digest)' \
+  "$tmp/targeted-chezmoi-plan-draft.json" >"$tmp/full-digest-chezmoi-plan-draft.json"
+if "$cli" seal-plan "$tmp/full-digest-chezmoi-plan-draft.json" \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/full-digest-chezmoi-plan.json" >/dev/null 2>&1; then
+  fail "a full chezmoi apply accepted a target status digest"
+fi
+
+# Targeted plans must also run through the SSH worker, whose closed schema-2
+# validator previously rejected the targets key outright.
+jq '.target = "test-ssh"' "$tmp/digest-targeted-chezmoi-plan-draft.json" \
+  >"$tmp/ssh-targeted-chezmoi-plan-draft.json"
+CHEZMOI_STATUS_DRIFT=1 "$cli" collect --target test-ssh --section chezmoi \
+  --output "$tmp/ssh-targeted-chezmoi-snapshot.jsonl"
+"$cli" seal-plan "$tmp/ssh-targeted-chezmoi-plan-draft.json" \
+  "$tmp/ssh-targeted-chezmoi-snapshot.jsonl" "$tmp/ssh-targeted-chezmoi-plan.json"
+ssh_targeted_plan_id=$(jq -r '.plan_id' "$tmp/ssh-targeted-chezmoi-plan.json")
+rm -f "$CHEZMOI_TARGET_APPLY_MARKER"
+CHEZMOI_TARGET_STATUS_DRIFT=1 "$cli" apply-ssh-plan "$tmp/ssh-targeted-chezmoi-plan.json" \
+  "$ssh_targeted_plan_id" "$tmp/ssh-targeted-chezmoi-result.jsonl"
+[ -e "$CHEZMOI_TARGET_APPLY_MARKER" ] || fail "targeted chezmoi apply did not run over SSH"
+[ "$(jq -r --arg plan "$ssh_targeted_plan_id" '
+  select(.kind == "operation" and .id == ("apply:" + $plan)) | .data.operation_status
+' "$tmp/ssh-targeted-chezmoi-result.jsonl")" = completed ] ||
+  fail "targeted SSH chezmoi apply did not report completed verification"
+
+plan_chezmoi_external_contracts
+}
+
+plan_chezmoi_external_contracts() {
+# A git-repo external whose upstream rewrote history. The collector reports it
+# without fetching; a sealed reset moves only a clean clone whose every commit
+# came from upstream.
+external_upstream_repo=$tmp/external-upstream
+external_path=$tmp/home/.local/share/external-example
+rm -rf "$external_upstream_repo" "$external_path"
+"$REAL_GIT" init -q -b main "$external_upstream_repo"
+printf 'one\n' >"$external_upstream_repo/file"
+"$REAL_GIT" -C "$external_upstream_repo" add file
+"$REAL_GIT" -C "$external_upstream_repo" -c user.name=t -c user.email=t@example.invalid commit -qm one
+"$REAL_GIT" clone -q "$external_upstream_repo" "$external_path"
+"$REAL_GIT" -C "$external_upstream_repo" -c user.name=t -c user.email=t@example.invalid \
+  commit -q --amend -m rewritten
+"$REAL_GIT" -C "$external_path" fetch -q
+rewritten_head=$("$REAL_GIT" -C "$external_upstream_repo" rev-parse HEAD)
+CHEZMOI_EXTERNAL_PATH=$external_path "$cli" collect --target test-host --section chezmoi \
+  --output "$tmp/external-snapshot.jsonl"
+[ "$(jq -r --arg id "$external_path" 'select(.kind == "chezmoi_external" and .id == $id) |
+  [.data.state, .data.local_commits_from_upstream, .data.upstream_head] | @tsv' \
+  "$tmp/external-snapshot.jsonl")" = "$(printf 'rewritten-resettable\ttrue\t%s' "$rewritten_head")" ] ||
+  fail "collector did not classify a rewritten clean external as resettable"
+jq -n --arg id "$external_path" --arg head "$rewritten_head" '{domain:"chezmoi",target:"test-host",
+  operations:[{type:"chezmoi-external-reset",kind:"chezmoi_external",id:$id,upstream_head:$head,
+    argv:["git","-C",$id,"reset","--hard","--quiet",$head]}]}' >"$tmp/external-reset-draft.json"
+jq '.operations[0].argv += ["--no-recurse-submodules"]' "$tmp/external-reset-draft.json" \
+  >"$tmp/unsafe-external-reset-draft.json"
+if CHEZMOI_EXTERNAL_PATH=$external_path "$cli" seal-plan "$tmp/unsafe-external-reset-draft.json" \
+  "$tmp/external-snapshot.jsonl" "$tmp/unsafe-external-reset-plan.json" >/dev/null 2>&1; then
+  fail "external reset accepted extra argv"
+fi
+"$cli" seal-plan "$tmp/external-reset-draft.json" "$tmp/external-snapshot.jsonl" \
+  "$tmp/external-reset-plan.json"
+external_reset_plan_id=$(jq -r '.plan_id' "$tmp/external-reset-plan.json")
+CHEZMOI_EXTERNAL_PATH=$external_path "$cli" apply-plan "$tmp/external-reset-plan.json" \
+  "$external_reset_plan_id" "$tmp/external-reset-result.jsonl"
+[ "$("$REAL_GIT" -C "$external_path" rev-parse HEAD)" = "$rewritten_head" ] ||
+  fail "sealed external reset did not move the clone to the sealed upstream commit"
+[ "$(jq -r --arg plan "$external_reset_plan_id" '
+  select(.kind == "operation" and .id == ("apply:" + $plan)) | .data.operation_status
+' "$tmp/external-reset-result.jsonl")" = completed ] ||
+  fail "external reset did not report completed verification"
+
+# A local commit or local change is never reset away.
+"$REAL_GIT" -C "$external_upstream_repo" -c user.name=t -c user.email=t@example.invalid \
+  commit -q --amend -m rewritten-again
+"$REAL_GIT" -C "$external_path" fetch -q
+"$REAL_GIT" -C "$external_path" -c user.name=t -c user.email=t@example.invalid \
+  commit -q --allow-empty -m local-work
+CHEZMOI_EXTERNAL_PATH=$external_path "$cli" collect --target test-host --section chezmoi \
+  --output "$tmp/external-local-snapshot.jsonl"
+[ "$(jq -r --arg id "$external_path" 'select(.kind == "chezmoi_external" and .id == $id) | .data.state' \
+  "$tmp/external-local-snapshot.jsonl")" = rewritten-local-changes ] ||
+  fail "collector treated a local external commit as upstream history"
+again_head=$("$REAL_GIT" -C "$external_upstream_repo" rev-parse HEAD)
+jq --arg head "$again_head" '.operations[0].upstream_head = $head | .operations[0].argv[6] = $head' \
+  "$tmp/external-reset-draft.json" >"$tmp/local-external-reset-draft.json"
+if "$cli" seal-plan "$tmp/local-external-reset-draft.json" "$tmp/external-local-snapshot.jsonl" \
+  "$tmp/local-external-reset-plan.json" >/dev/null 2>&1; then
+  fail "external reset sealed over a local commit"
+fi
+rm -rf "$external_upstream_repo" "$external_path"
 }
 
 plan_auth_contracts() {

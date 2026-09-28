@@ -560,6 +560,10 @@ cat >"$tmp/bin/chezmoi" <<'SH'
 #!/usr/bin/env bash
 case ${1:-} in
   source-path) printf '%s\n' "$HOME/.local/share/chezmoi" ;;
+  managed)
+    [ "$*" = "managed --include=externals --path-style=absolute" ] || exit 64
+    [ -z "${CHEZMOI_EXTERNAL_PATH:-}" ] || printf '%s\n' "$CHEZMOI_EXTERNAL_PATH"
+    ;;
   status)
     if [ "${2:-}" = -- ]; then
       [ "$#" -gt 2 ] || exit 64

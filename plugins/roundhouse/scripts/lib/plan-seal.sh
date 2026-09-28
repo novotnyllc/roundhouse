@@ -32,10 +32,10 @@ seal_plan_command() {
         "package-metadata-refresh","package-upgrade","package-cleanup",
         "agent-update",
         "auth-reauth","auth-install",
-        "chezmoi-pull","chezmoi-apply",
+        "chezmoi-pull","chezmoi-apply","chezmoi-external-reset",
         "project-clone","project-update"
       )) and
-      (.kind | IN("package","agent_runtime","plugin","skill","capability","skill_root","agent_artifact","auth_artifact","file","chezmoi_state","project")) and
+      (.kind | IN("package","agent_runtime","plugin","skill","capability","skill_root","agent_artifact","auth_artifact","file","chezmoi_state","chezmoi_external","project")) and
       (.id | type == "string" and length > 0) and
       (.argv | type == "array" and length > 0 and length <= 64) and
       ([.argv[] | type == "string" and length > 0] | all) and
@@ -50,6 +50,17 @@ seal_plan_command() {
              (test("^[A-Za-z]:\\\\") and contains("\\"))) and
             (test("(^|[/\\\\])\\.\\.?($|[/\\\\])") | not)] | all))
        elif has("targets") then false
+       else true end) and
+      (if has("status_digest") then
+        .type == "chezmoi-apply" and has("targets") and
+        (.status_digest | type == "string" and test("^[0-9a-f]{64}$"))
+       else true end) and
+      (if .type == "chezmoi-external-reset" then
+        (.id | type == "string" and length <= 512 and startswith("/") and
+          (contains("\\") | not) and (test("(^|/)\\.\\.?($|/)") | not)) and
+        (.upstream_head | type == "string" and test("^[0-9a-f]{40}$")) and
+        .argv == ["git","-C",.id,"reset","--hard","--quiet",.upstream_head]
+       elif has("upstream_head") then false
        else true end)
     ] | all) and
     (if .domain == "updates" then
@@ -61,7 +72,8 @@ seal_plan_command() {
      elif .domain == "chezmoi" then
        [.operations[] |
          (.type == "chezmoi-pull" and .kind == "file" and .id == "chezmoi:source") or
-         (.type == "chezmoi-apply" and .kind == "chezmoi_state" and .id == "live")
+         (.type == "chezmoi-apply" and .kind == "chezmoi_state" and .id == "live") or
+         (.type == "chezmoi-external-reset" and .kind == "chezmoi_external")
        ] | all
      elif .domain == "projects" then
        [.operations[] | .kind == "project" and (.type | startswith("project-"))] | all
@@ -139,7 +151,9 @@ seal_plan_command() {
         ] | all
       elif .domain == "agents" then
         [.operations[] | .type == "agent-update"] | all
-      elif .domain == "chezmoi" or .domain == "projects" then true
+      elif .domain == "chezmoi" then
+        [.operations[] | .type != "chezmoi-external-reset"] | all
+      elif .domain == "projects" then true
       else false end
     ' "$draft" >/dev/null || {
       printf 'roundhouse: operation is not supported by the native Windows executor\n' >&2
@@ -301,6 +315,12 @@ seal_plan_command() {
         elif .type == "chezmoi-pull" then
           any($records[]; .kind == "file" and .id == "chezmoi:source" and
             .status == "present" and .data.dirty_count == 0)
+        elif .type == "chezmoi-external-reset" then
+          . as $operation |
+          any($records[]; .kind == "chezmoi_external" and .id == $operation.id and
+            .status == "present" and .data.state == "rewritten-resettable" and
+            .data.dirty_count == 0 and .data.local_commits_from_upstream == true and
+            .data.upstream_head == $operation.upstream_head)
         else true end)
     ' >/dev/null || {
       printf 'roundhouse: %s plan does not match an actionable observed state\n' \

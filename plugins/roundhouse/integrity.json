@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "5e7eeccf8af06924b5eec8e4577782b48aa090bb2d038c1f838daf717801d9a1"
+      "sha256": "59cab9027c9df5f7740c604cc0e13fe70a7f4074f314dd3243045c1f15260fdf"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "73847454acf298802ea3c798f0b228f79de9d34a43ce19f0e95c62360bf222d0"
+      "sha256": "4dd9e128f2abee706e602bd7cb15fd43445e0657699170bd63eb4566e1b9219b"
     },
     {
       "path": "assets/icon.png",
@@ -58,7 +58,7 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "cee9a308b4caf778e7c85d272d7dbe82583025ae692910ae73d8f7eee01814cc"
+      "sha256": "7438ed691b8f69c461fd4dbe27f95aa86cae04b551e15ef7dd803ee42bb006c9"
     },
     {
       "path": "scripts/collect-windows.ps1",
@@ -94,7 +94,7 @@
     },
     {
       "path": "scripts/lib/apply-commands.sh",
-      "sha256": "95b4f4264f22035895fc005bb3b21e376a36ab4699d168570b8dcfad9a6fbbeb"
+      "sha256": "8cf7851f190507f5578a21853db7cea82767d8909e41e13f14a7130fa573ae6c"
     },
     {
       "path": "scripts/lib/broker-posix.sh",
@@ -158,7 +158,7 @@
     },
     {
       "path": "scripts/lib/plan-apply.sh",
-      "sha256": "3c3b18b1bf93a8796fc8bd8e55d600cba24aca7e15c067da1fbe59c790af2c4d"
+      "sha256": "dff351a82002ccacc5080941ece89239df760d3228473a21e0d035607cd1e8fa"
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
@@ -166,11 +166,11 @@
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "4f104ea9f33ea89eed2f07739ef5220ca2e143d4c00e03f375d4c5423859315b"
+      "sha256": "d05ccbc9645a62dcfb87306614b108650b38b593d2719c57f5344f34925f25d9"
     },
     {
       "path": "scripts/lib/plan-verify.sh",
-      "sha256": "a2eb6642592cf21622cfb02166622a59cddbb61697f5720945a9c910bf0de6a5"
+      "sha256": "d5dc138da1ff383514d3a26f90f93b1c79d321690b0fa8868a487915ec5295d9"
     },
     {
       "path": "scripts/mcp-siding-windows.ps1",
@@ -305,5 +305,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.23"
+  "version": "0.9.24"
 }

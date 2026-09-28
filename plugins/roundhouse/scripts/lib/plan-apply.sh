@@ -357,6 +357,43 @@ check_chezmoi_targets() {
   }
 }
 
+chezmoi_targets_status_digest() {
+  # sha256 of `chezmoi status -- TARGET...`, the bytes a targeted plan seals.
+  digest_status=$(mktemp "${TMPDIR:-/tmp}/roundhouse-chezmoi-status.XXXXXX")
+  if ! chezmoi status -- "$@" >"$digest_status"; then
+    rm -f "$digest_status"
+    return 70
+  fi
+  sha256_file "$digest_status"
+  rm -f "$digest_status"
+}
+
+check_chezmoi_external_resettable() {
+  # A reset may only move a clean git-repo external that chezmoi manages to the
+  # sealed upstream commit. Whether every local commit came from upstream is
+  # bound by the sealed chezmoi_external record, rechecked just before this.
+  external_path=$1
+  external_upstream=$2
+  validate_chezmoi_targets "$external_path" || return
+  [ -d "$external_path/.git" ] && [ ! -L "$external_path" ] || {
+    printf 'roundhouse: chezmoi external is not a git checkout\n' >&2
+    return 64
+  }
+  chezmoi managed --include=externals --path-style=absolute 2>/dev/null |
+    grep -Fqx -- "$external_path" || {
+      printf 'roundhouse: path is not a chezmoi-managed external\n' >&2
+      return 64
+    }
+  [ -z "$(GIT_OPTIONAL_LOCKS=0 git -C "$external_path" status --porcelain 2>/dev/null)" ] || {
+    printf 'roundhouse: chezmoi external has local changes\n' >&2
+    return 65
+  }
+  [ "$(git -C "$external_path" rev-parse '@{u}' 2>/dev/null)" = "$external_upstream" ] || {
+    printf 'roundhouse: chezmoi external upstream moved after planning\n' >&2
+    return 65
+  }
+}
+
 check_chezmoi_target_postconditions() {
   plan=$1
   index=0
@@ -610,6 +647,17 @@ EOF
           return 64
         }
         check_chezmoi_targets drifted "$@" || return
+        sealed_status_digest=$(jq -r '.status_digest // empty' "$operation")
+        if [ -n "$sealed_status_digest" ]; then
+          current_status_digest=$(chezmoi_targets_status_digest "$@") || {
+            printf 'roundhouse: chezmoi target status failed\n' >&2
+            return 70
+          }
+          [ "$current_status_digest" = "$sealed_status_digest" ] || {
+            printf 'roundhouse: chezmoi targets changed after planning; create a new plan\n' >&2
+            return 65
+          }
+        fi
         set -- chezmoi --no-tty apply -- "$@"
       else
         { [ $# -eq 3 ] && [ "$1" = chezmoi ] && [ "$2" = --no-tty ] &&
@@ -618,6 +666,16 @@ EOF
           return 64
         }
       fi
+      ;;
+    chezmoi-external-reset)
+      external_upstream=$(jq -r '.upstream_head' "$operation")
+      { [ $# -eq 7 ] && [ "$1" = git ] && [ "$2" = -C ] && [ "$3" = "$id" ] &&
+        [ "$4" = reset ] && [ "$5" = --hard ] && [ "$6" = --quiet ] &&
+        [ "$7" = "$external_upstream" ]; } || {
+        printf 'roundhouse: unsafe chezmoi external reset argv\n' >&2
+        return 64
+      }
+      check_chezmoi_external_resettable "$id" "$external_upstream" || return
       ;;
     project-clone|project-update)
       project_source=$(jq -r --arg id "$id" '.projects[$id].source // empty' "$config")
