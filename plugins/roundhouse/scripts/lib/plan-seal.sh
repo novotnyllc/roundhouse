@@ -135,14 +135,18 @@ seal_plan_command() {
     exit 64
   }
   if [ "$platform" = windows ] && [ "$privileged" = false ] && [ "$mixed_privileged" = false ]; then
-    jq -e --arg target "$target" '
+    # An ordinary Windows plan needs a native lane to run on: the saved Codex
+    # control project, or the WSL interop sibling (apply-interop-plan).
+    interop_lane=false
+    wsl_interop_alias "$config" "$target" >/dev/null && interop_lane=true
+    jq -e --arg target "$target" --argjson interop "$interop_lane" '
       .machines[$target] as $machine |
       ($machine.expected_hostname | type == "string" and length > 0) and
       ($machine.expected_user | type == "string" and length > 0) and
-      ($machine.codex_control_project | type == "string" and length > 0) and
-      (.projects[$machine.codex_control_project] != null)
+      ((($machine.codex_control_project | type == "string" and length > 0) and
+        (.projects[$machine.codex_control_project] != null)) or $interop)
     ' "$config" >/dev/null || {
-      printf 'roundhouse: Windows mutation requires expected identity and a configured Codex control project\n' >&2
+      printf 'roundhouse: Windows mutation requires expected identity and a configured Codex control project or WSL interop sibling\n' >&2
       exit 65
     }
     jq -e '

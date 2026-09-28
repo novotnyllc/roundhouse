@@ -44,6 +44,7 @@ Usage:
   roundhouse preview-privilege-revocation TARGET OUTPUT.json|-
   roundhouse apply-native-plan PLAN.json PLAN-ID OUTPUT.jsonl
   roundhouse apply-ssh-plan PLAN.json PLAN-ID OUTPUT.jsonl
+  roundhouse apply-interop-plan PLAN.json PLAN-ID OUTPUT.jsonl
   roundhouse dispatch-posix-request
   roundhouse fleet-init
   roundhouse fleet-enroll
@@ -102,6 +103,8 @@ EOF
 . "$script_dir/lib/broker-windows.sh"
 # shellcheck source=lib/broker-posix.sh
 . "$script_dir/lib/broker-posix.sh"
+# shellcheck source=lib/interop.sh
+. "$script_dir/lib/interop.sh"
 # shellcheck source=lib/apply-commands.sh
 . "$script_dir/lib/apply-commands.sh"
 # shellcheck source=lib/fleet-store.sh
@@ -189,6 +192,7 @@ case $command in
     ;;
   apply-native-plan) [ $# -eq 3 ] || usage; apply_plan_command "$1" "$2" "$3" true ;;
   apply-ssh-plan) [ $# -eq 3 ] || usage; apply_ssh_plan_command "$1" "$2" "$3" ;;
+  apply-interop-plan) [ $# -eq 3 ] || usage; apply_interop_plan_command "$1" "$2" "$3" ;;
   dispatch-posix-request) [ $# -eq 0 ] || usage; dispatch_posix_request_command ;;
   fleet-init) [ $# -eq 0 ] || usage; fleet_init_command ;;
   fleet-enroll) [ $# -eq 0 ] || usage; fleet_enroll_command ;;

@@ -806,6 +806,148 @@ REMOTE_WORKER
   fi
 )
 
+apply_interop_plan_command() (
+  plan=$1
+  confirmation=$2
+  output=$3
+  require_jq
+  check_private_owned_file "$plan" "apply plan"
+  # Everything below up to the first interop launch is local: classification,
+  # integrity, configuration, executor, and native-executor support are all
+  # settled before anything runs on the target. Protected schema 3/4 plans
+  # never reach this ordinary lane.
+  validate_legacy_ssh_plan_file "$plan"
+  check_mutation_config
+  plan_id=$(jq -r '.plan_id' "$plan")
+  [ "$plan_id" = "$confirmation" ] || {
+    printf 'roundhouse: apply confirmation must equal the sealed plan ID\n' >&2
+    exit 64
+  }
+  plan_digest=$(jq -cS 'del(.plan_id,.plan_digest)' "$plan" | sha256_stream)
+  [ "$plan_digest" = "$(jq -r '.plan_digest.value' "$plan")" ] || {
+    printf 'roundhouse: apply plan integrity check failed\n' >&2
+    exit 65
+  }
+  [ "$plan_id" = "plan-$(printf '%s' "$plan_digest" | cut -c 1-16)" ] || {
+    printf 'roundhouse: apply plan ID does not match its digest\n' >&2
+    exit 65
+  }
+  target=$(jq -r '.target' "$plan")
+  domain=$(jq -r '.domain' "$plan")
+  config=$(config_path)
+  alias=$(wsl_interop_alias "$config" "$target") || {
+    printf 'roundhouse: apply-interop-plan requires a native-Windows target with a configured wsl_interop_via SSH sibling\n' >&2
+    exit 64
+  }
+  jq -e --arg target "$target" '
+    .machines[$target] |
+    (.expected_hostname | type == "string" and length > 0) and
+    (.expected_user | type == "string" and length > 0)
+  ' "$config" >/dev/null || {
+    printf 'roundhouse: mutation requires expected_hostname and expected_user for %s\n' "$target" >&2
+    exit 65
+  }
+  # The same native-executor limits sealing enforces, rechecked here so a plan
+  # sealed elsewhere cannot reach the target with an operation it cannot run.
+  jq -e '
+    (.domain | IN("updates","agents","chezmoi","projects")) and
+    (.required_section | IN("packages","agents","chezmoi","projects")) and
+    all(.operations[]; (.type | startswith("auth-") | not) and
+      .type != "chezmoi-external-reset" and (has("status_digest") | not))
+  ' "$plan" >/dev/null || {
+    printf 'roundhouse: operation is not supported by the native Windows executor\n' >&2
+    exit 69
+  }
+  controller_digest=$(sha256_file "$config")
+  [ "$(jq -r '.configuration_digest.value' "$plan")" = "$controller_digest" ] || {
+    printf 'roundhouse: configuration changed after planning; create a new plan\n' >&2
+    exit 65
+  }
+  verify_executor_requirement "$plan" >/dev/null
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-interop-apply.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  worker_config_command "$target" "$domain" "$tmp/config.json"
+  worker_digest=$(sha256_file "$tmp/config.json")
+  [ "$worker_digest" = "$(jq -r '.worker_configuration_digest.value' "$plan")" ] || {
+    printf 'roundhouse: generated worker configuration does not match the sealed plan\n' >&2
+    exit 65
+  }
+  interop_executor_requirement "$tmp/executor.json"
+  cp "$plan" "$tmp/plan.json"
+  plan_sha256=$(sha256_file "$tmp/plan.json")
+  interop_build_input "$tmp" apply "$target" "$controller_digest" \
+    "$(jq -cn --arg plan_id "$plan_id" '{plan_id:$plan_id}')" "$tmp/input.json"
+
+  transport_rc=0
+  interop_invoke "$alias" "$tmp/input.json" "$tmp/output" || transport_rc=$?
+  if ! interop_read_envelope "$tmp/output" "$tmp/envelope.json" "$tmp/result.jsonl"; then
+    printf 'roundhouse: WSL interop sibling %s returned no native Windows result (status %s)\n' \
+      "$alias" "$transport_rc" >&2
+    exit 70
+  fi
+  interop_report_stage "$tmp/envelope.json"
+  state=$(jq -r '.state' "$tmp/envelope.json")
+  case $state in
+    completed|partial) ;;
+    executor_update_required)
+      interop_executor_update_message "$target" "$tmp/envelope.json" \
+        "$(jq -r '.version' "$tmp/executor.json")"
+      exit 69
+      ;;
+    *)
+      printf 'roundhouse: native Windows apply failed before producing a result: %s\n' \
+        "$(interop_envelope_field "$tmp/envelope.json" '.message')" >&2
+      exit 70
+      ;;
+  esac
+  if [ ! -s "$tmp/result.jsonl" ] || ! ( validate_file "$tmp/result.jsonl" ) >/dev/null 2>&1; then
+    printf 'roundhouse: native Windows apply returned no valid result records\n' >&2
+    exit 70
+  fi
+  # Success is only the worker's own final apply:PLAN-ID record, bound to this
+  # plan file, both configuration digests, and the sealed executor, plus one
+  # completed record per operation. Prose and exit status are never evidence.
+  jq -e -s --arg target "$target" --arg plan_id "$plan_id" --arg plan_sha256 "$plan_sha256" \
+    --arg digest "$controller_digest" --arg worker_digest "$worker_digest" --arg state "$state" \
+    --slurpfile plan "$plan" '
+    $plan[0] as $p |
+    . as $records |
+    all($records[]; .host_id == $target) and
+    any($records[]; .kind == "snapshot" and
+      .data.configuration_digest.value == $digest and
+      .data.worker_configuration_digest.value == $worker_digest) and
+    ([$records[] | select(.kind == "operation" and .id == ("apply:" + $plan_id))] |
+      length == 1 and (.[0] |
+        .data.plan_id == $plan_id and .data.plan_file_sha256 == $plan_sha256 and
+        .data.configuration_digest == $digest and .data.worker_configuration_digest == $worker_digest and
+        .data.executor == $p.required_executor and
+        .data.operation_count == ($p.operations | length) and
+        (if $state == "completed" then
+          .status == "present" and .data.operation_status == "completed" and
+          .data.post_inventory_status == "completed"
+        else
+          .status == "partial" and .data.operation_status == "partial"
+        end))) and
+    (if $state == "completed" then
+      all(range(0; $p.operations | length); . as $index |
+        any($records[]; .kind == "operation" and
+          .id == ("apply:" + $plan_id + ":" + ($index | tostring)) and
+          .status == "present" and .data.operation_status == "completed" and
+          .data.operation_index == $index and .data.plan_id == $plan_id and
+          .data.configuration_digest == $digest and .data.worker_configuration_digest == $worker_digest))
+    else true end)
+  ' "$tmp/result.jsonl" >/dev/null || {
+    printf 'roundhouse: Windows worker returned no authoritative completion record\n' >&2
+    exit 70
+  }
+  safe_output "$tmp/result.jsonl" "$output"
+  if [ "$state" != completed ]; then
+    printf 'roundhouse: native Windows worker reported a partial apply: %s\n' \
+      "$(interop_envelope_field "$tmp/envelope.json" '.message')" >&2
+    exit 70
+  fi
+)
+
 lookup_privilege_result_command() (
   plan=$1
   index=$2

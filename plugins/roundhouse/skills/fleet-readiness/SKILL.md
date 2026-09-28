@@ -49,7 +49,12 @@ natively as the Windows user, so their evidence IS native-Windows evidence.
 (Pure WSL-side execution still never proves native Windows; interop-launched
 processes are not WSL-side execution.) A Windows logoff usually stops the
 WSL VM, so a logged-off host presents as plain SSH-unreachable — not an
-interop-specific error. The visible Codex task remains the
+interop-specific error. The CLI drives this lane for inventory and ordinary
+sealed plans: `"$CLI" collect --target HOST` uses it whenever
+`wsl_interop_via` resolves, and `"$CLI" apply-interop-plan PLAN PLAN-ID OUTPUT`
+applies; both run only the installed Windows Roundhouse that matches the
+controller's version and passes `-VerifyExecutor`, else fail closed with
+`executor_update_required`. The visible Codex task remains the
 lane for work needing the Desktop app surface, or when WSL is absent or
 unreachable — and it covers only ordinary native Windows work. Protected or logged-off Windows work requires fresh
 `privilege_broker` readiness from the enrolled `windows-sftp` route; never

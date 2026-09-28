@@ -3,11 +3,51 @@
 > **Check the interop lane first.** For a target whose registry entry
 > declares `wsl_interop_via`, CLI-shaped work defaults to the WSL interop
 > lane (SSH to the sibling, `cd /mnt/c`, full-path `cmd.exe /c` — native
-> processes, any harness). This contract is the fallback for Desktop-app
-> surface work, or when WSL is absent or unreachable.
+> processes, any harness). Inventory and ordinary sealed plans ride it
+> through the CLI (see [WSL interop lane](#wsl-interop-lane)). This contract
+> is the fallback for Desktop-app surface work, or when WSL is absent or
+> unreachable.
 
 Use this only for a machine whose configured transport is
-`codex-remote-control`. Never substitute WSL or SSH.
+`codex-remote-control`. Never substitute WSL-side execution or SSH for native
+evidence; interop-launched Windows processes are native, not WSL.
+
+## WSL interop lane
+
+A `platform: windows` entry whose `wsl_interop_via` names a configured
+`platform: wsl`, `transport: ssh` sibling (same `physical_host` when both set
+one) is reachable without a Codex task, from any harness:
+
+- `roundhouse collect --target HOST [--section S]...` uses it automatically.
+- `roundhouse apply-interop-plan PLAN PLAN-ID OUTPUT` applies an ordinary
+  schema-2 plan sealed for that host.
+
+The controller SSHes to the sibling, changes to `/mnt/c`, and starts
+`/mnt/c/Program Files/PowerShell/7/pwsh.exe` with a fixed `-EncodedCommand`
+bootstrap. Nothing else crosses the quoting chain: the integrity-verified
+`scripts/interop-windows.ps1` launcher and one bounded request (the same
+`worker-config` output, the executor requirement built from `integrity.json`
+exactly as the Windows CI job builds it, and for apply the exact plan bytes,
+each with its SHA-256) travel on stdin. The launcher stages them in a
+per-invocation, owner-only directory under the Windows user's temp directory
+and always removes it. It selects the installed
+`%USERPROFILE%\.codex` then `.claude` plugin root whose version equals the
+controller's and runs that root's own `apply-windows.ps1 -VerifyExecutor`. No
+match, or a failed verification, returns `executor_update_required` and runs
+nothing else; controller script bytes never execute as the executor.
+
+Collect then runs that root's `collect-windows.ps1` with the same parameters as
+step 6 below and returns its JSONL unchanged after the step 9 validation.
+Apply first verifies the plan locally (digest, ID, confirmation, configuration
+and worker-config digests, controller executor, native-executor operation
+limits), then runs the verified `apply-windows.ps1`, which rechecks identity
+and preconditions natively immediately before mutation. Success is accepted
+only from the validated final `apply:PLAN-ID` record bound to the plan-file
+SHA-256, both configuration digests, and the sealed executor, plus a completed
+record per operation. Partial evidence is written and exits 70; executor
+mismatch exits 69 with no output. Error record codes are
+`executor_update_required`, `wsl_interop_unavailable`, `native_worker_failed`,
+and `invalid_worker_result`.
 
 ## Task-control capability check
 
@@ -301,7 +341,7 @@ constraints. It intentionally reports no controller policy-proposal digest,
 context-canary digest, or action-specific constraint-set digest. It therefore
 cannot replace the ordinary inventory and precondition evidence needed to seal
 or verify a mixed schema-4 plan. The ordinary `collect` path remains Codex
-Desktop and is never silently routed through SFTP.
+Desktop or the WSL interop lane and is never silently routed through SFTP.
 
 Build logged-off profile payloads with `roundhouse profile-bundle`.
 The builder compiles each destination's handler, artifact, manager, and logical

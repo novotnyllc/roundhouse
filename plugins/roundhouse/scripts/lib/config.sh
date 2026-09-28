@@ -300,6 +300,18 @@ validate_config_file() {
       (if .transport == "codex-remote-control" then
         .platform == "windows" and (.codex_host | type == "string" and length > 0)
       else true end) and
+      # The WSL interop lane: a native-Windows entry may name its WSL sibling
+      # on the same hardware. A bounded worker config carries only its own
+      # target, so the sibling is resolved only in a full controller config.
+      ((.wsl_interop_via // null) == null or
+        (.platform == "windows" and
+         (.wsl_interop_via | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+         (if ($config.worker // null) == null then
+            ($config.machines[$machine.wsl_interop_via] // null) as $sibling |
+            $sibling != null and $sibling.platform == "wsl" and $sibling.transport == "ssh" and
+            (($machine.physical_host // null) == null or ($sibling.physical_host // null) == null or
+              $machine.physical_host == $sibling.physical_host)
+          else true end))) and
       (if .transport == "ssh" then
         (.ssh_alias | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))
       else true end) and
