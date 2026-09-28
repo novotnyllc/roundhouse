@@ -809,6 +809,16 @@ if "$cli" seal-plan "$tmp/wrong-head-external-reset-draft.json" "$tmp/external-s
   "$tmp/wrong-head-external-reset-plan.json" >/dev/null 2>&1; then
   fail "external reset sealed against a HEAD it did not observe"
 fi
+# SHA-256 repositories use 64-character object IDs.
+jq --arg h "$(printf '%064d' 0)" '.operations[0].head = $h | .operations[0].upstream_head = $h | .operations[0].argv[6] = $h' \
+  "$tmp/external-reset-draft.json" >"$tmp/sha256-external-reset-draft.json"
+if "$cli" seal-plan "$tmp/sha256-external-reset-draft.json" "$tmp/external-snapshot.jsonl" \
+  "$tmp/sha256-external-reset-plan.json" >"$tmp/sha256-external.log" 2>&1; then
+  fail "a reset sealed against object IDs the snapshot did not observe"
+fi
+if grep -F 'invalid plan draft' "$tmp/sha256-external.log" >/dev/null; then
+  fail "a 64-character object ID was rejected as malformed"
+fi
 # An ignored local file counts as local data: a hard reset could overwrite it.
 printf 'local-only\n' >"$external_path/.git/info/exclude"
 printf 'kept\n' >"$external_path/local-only"

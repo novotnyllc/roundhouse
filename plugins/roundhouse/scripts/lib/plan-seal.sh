@@ -58,8 +58,9 @@ seal_plan_command() {
       (if .type == "chezmoi-external-reset" then
         (.id | type == "string" and length <= 512 and startswith("/") and
           (contains("\\") | not) and (test("(^|/)\\.\\.?($|/)") | not)) and
-        (.head | type == "string" and test("^[0-9a-f]{40}$")) and
-        (.upstream_head | type == "string" and test("^[0-9a-f]{40}$")) and
+        # Full object IDs in either Git object format (SHA-1 or SHA-256).
+        (.head | type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$")) and
+        (.upstream_head | type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$")) and
         .argv == ["git","-C",.id,"reset","--hard","--quiet",.upstream_head]
        elif has("upstream_head") or has("head") then false
        else true end)

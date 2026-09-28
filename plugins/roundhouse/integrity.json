@@ -166,11 +166,11 @@
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "e378b43e9de0800563e542aa65884efa094d45118b944f9e4177068709f3aa27"
+      "sha256": "1ca433686ab7d2769ae4910b2b512507695895448a044d12bafc5f15bd25df60"
     },
     {
       "path": "scripts/lib/plan-verify.sh",
-      "sha256": "3d51f1f681f322f382c82f9fc52e1ee32a94c5d6b28da6f11493a931add6bdd8"
+      "sha256": "9ab4335a1546bdaa37eeac60b2ba4edf5e5e5b8ad748529cc4f9c3f47dd37ffd"
     },
     {
       "path": "scripts/mcp-siding-windows.ps1",
