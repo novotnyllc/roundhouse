@@ -90,7 +90,7 @@
     },
     {
       "path": "scripts/launcher-install",
-      "sha256": "e20f6e41071348eac944cce1d27e0e5571c5ae76ff038d655bcda8fac20fe0f6"
+      "sha256": "6d7cc04bdcc554a25855061eaceac38a5cb71a9b8deddae5606d5d7b28869679"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
