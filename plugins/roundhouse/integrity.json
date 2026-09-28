@@ -22,7 +22,7 @@
     },
     {
       "path": "references/codex-remote-control.md",
-      "sha256": "4a13023f0836c161e61f6a1a4440917a96617615b60cdd0be0e8a9c52904d573"
+      "sha256": "c7af46481881905567d1b2d511de0e184c60168c6ee323c8207d8d1733972777"
     },
     {
       "path": "references/privilege-policy.default",
@@ -90,7 +90,7 @@
     },
     {
       "path": "scripts/interop-windows.ps1",
-      "sha256": "cc3ba6b067ea82989faf46ae58583cd4a0a3f6ea58c0eb82fd436b3cdb9d2f8f"
+      "sha256": "017b6fbd3e353657d5f960cca06dd65793e3d7a5a6d696a1af5ef7f71ebbf89d"
     },
     {
       "path": "scripts/launcher-install",

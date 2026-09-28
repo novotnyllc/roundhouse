@@ -149,7 +149,9 @@ function Get-ExecutorRoots([string]$Marketplace, [string]$Version) {
             }
         }
     }
-    return @{ Roots = @($Roots); Versions = @($Versions | Sort-Object -Unique) }
+    # A diagnostic only: capped at the 64 entries the controller's envelope
+    # check accepts, so a long cache history never voids a valid result.
+    return @{ Roots = @($Roots); Versions = @($Versions | Sort-Object -Unique | Select-Object -Last 64) }
 }
 
 function Invoke-ChildPowerShell([string]$Pwsh, [string[]]$Arguments) {

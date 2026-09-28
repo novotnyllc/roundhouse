@@ -2,8 +2,8 @@
 
 > **Check the interop lane first.** For a target whose registry entry
 > declares `wsl_interop_via`, CLI-shaped work defaults to the WSL interop
-> lane (SSH to the sibling, `cd /mnt/c`, full-path `cmd.exe /c` — native
-> processes, any harness). Inventory and ordinary sealed plans ride it
+> lane (SSH to the sibling, `cd /mnt/c`, full-path PowerShell 7 with a fixed
+> `-EncodedCommand` bootstrap — native processes, any harness). Inventory and ordinary sealed plans ride it
 > through the CLI (see [WSL interop lane](#wsl-interop-lane)). This contract
 > is the fallback for Desktop-app surface work, or when WSL is absent or
 > unreachable.
