@@ -875,15 +875,20 @@ fleet_run_ensure_marketplace() {
   fi
   fleet_run_ensure_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
   [ -f "$fleet_run_ensure_settings" ] || return 75
+  # A declared ref (branch or tag) is kept with `#ref`, so registration
+  # resolves the revision the user pinned rather than the default branch.
   fleet_run_ensure_source=$(jq -er --arg n "$fleet_run_ensure_name" '
     .extraKnownMarketplaces[$n].source // empty |
-    if .source == "github" then .repo
+    ((.ref // "") | if . == "" then "" else "#" + . end) as $ref |
+    if .source == "github" then .repo + $ref
+    elif .source == "git" then .url + $ref
     elif .source == "directory" then .path
-    elif .source == "git" or .source == "url" then .url
+    elif .source == "url" then .url
     else empty end
   ' "$fleet_run_ensure_settings" 2>/dev/null) || return 75
   case $fleet_run_ensure_source in
     ''|-*|*[[:space:]]*) return 75 ;;
+    *'#'*) case ${fleet_run_ensure_source##*#} in ''|*[!A-Za-z0-9._/-]*) return 75 ;; esac ;;
   esac
   claude plugin marketplace add "$fleet_run_ensure_source" >/dev/null 2>&1 || return 75
   claude plugin marketplace list --json 2>/dev/null | jq -e --arg n "$fleet_run_ensure_name" '

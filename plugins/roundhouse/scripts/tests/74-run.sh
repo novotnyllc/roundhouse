@@ -691,7 +691,7 @@ JSON
     : >"$run_market_log"
     mkdir -p "$HOME/.claude"
     run_saved_settings=$(cat "$HOME/.claude/settings.json" 2>/dev/null || printf '{}')
-    printf '%s\n' '{"extraKnownMarketplaces":{"test-market":{"source":{"source":"github","repo":"owner/test-market"}},"bad-market":{"source":{"source":"directory","path":"-rf"}}}}' \
+    printf '%s\n' '{"extraKnownMarketplaces":{"test-market":{"source":{"source":"github","repo":"owner/test-market"}},"pinned-market":{"source":{"source":"github","repo":"owner/pinned","ref":"stable"}},"bad-ref-market":{"source":{"source":"github","repo":"owner/x","ref":"a;b"}},"bad-market":{"source":{"source":"directory","path":"-rf"}}}}' \
       >"$HOME/.claude/settings.json"
     CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_market_file" CLAUDE_MARKETPLACE_ADD_LOG="$run_market_log" \
       CLAUDE_MARKETPLACE_ADD_NAME=test-market CLAUDE_CONFIG_DIR="$HOME/.claude" \
@@ -702,14 +702,19 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_ensure_marketplace test-market ||
       fail "an already registered marketplace was not accepted"
     [ "$(wc -l <"$run_market_log" | tr -d ' ')" -eq 1 ] || fail "a registered marketplace was added again"
-    for run_market_refused in undeclared-market bad-market; do
+    CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_market_file" CLAUDE_MARKETPLACE_ADD_LOG="$run_market_log" \
+      CLAUDE_MARKETPLACE_ADD_NAME=pinned-market CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      fleet_run_ensure_marketplace pinned-market || fail "a pinned marketplace was not registered"
+    [ "$(sed -n 2p "$run_market_log")" = owner/pinned#stable ] ||
+      fail "marketplace registration dropped the declared ref"
+    for run_market_refused in undeclared-market bad-market bad-ref-market; do
       run_status=0
       CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_market_file" CLAUDE_MARKETPLACE_ADD_LOG="$run_market_log" \
         CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_ensure_marketplace "$run_market_refused" || run_status=$?
       [ "$run_status" -eq 75 ] || fail "$run_market_refused marketplace registration exited $run_status, not 75"
     done
-    [ "$(wc -l <"$run_market_log" | tr -d ' ')" -eq 1 ] ||
-      fail "an undeclared or option-shaped marketplace source reached the manager"
+    [ "$(wc -l <"$run_market_log" | tr -d ' ')" -eq 2 ] ||
+      fail "an undeclared, option-shaped, or bad-ref marketplace source reached the manager"
     printf '%s\n' "$run_saved_settings" >"$HOME/.claude/settings.json"
 
     # A different `yq` first on PATH (the Python one on Ubuntu) is stepped over.
@@ -722,6 +727,7 @@ JSON
       export PATH XDG_CACHE_HOME
       select_mikefarah_yq
       yq_is_mikefarah "$(command -v yq)" || fail "the Python yq decoy was not stepped over"
+      [ ! -e "$run_root/cache/roundhouse" ] || fail "selecting yq wrote to the cache directory"
     ) || exit 1
 
     # §5.1.3: a STANDALONE hook is arbitrary code from outside the plugin trust
