@@ -857,6 +857,45 @@ EOF
   return 75
 }
 
+fleet_run_ensure_marketplace() {
+  # fleet_run_ensure_marketplace NAME — register a declared marketplace that
+  # the harness does not know yet. Claude Code registers the synced
+  # extraKnownMarketplaces only on an interactive trusted start, so on a host
+  # driven headlessly a declared marketplace can stay unregistered forever and
+  # every install from it holds. The source comes only from the user's own
+  # synced declaration; nothing is registered that the settings do not name.
+  fleet_run_ensure_name=$1
+  fleet_upstream_id_valid "$fleet_run_ensure_name" || return 75
+  command -v claude >/dev/null 2>&1 || return 75
+  fleet_run_ensure_list=$(claude plugin marketplace list --json 2>/dev/null) || return 75
+  if printf '%s\n' "$fleet_run_ensure_list" | jq -e --arg n "$fleet_run_ensure_name" '
+    (if type == "array" then . else (.marketplaces // []) end) | any(.[]; .name == $n)
+  ' >/dev/null 2>&1; then
+    return 0
+  fi
+  fleet_run_ensure_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+  [ -f "$fleet_run_ensure_settings" ] || return 75
+  # A declared ref (branch or tag) is kept with `#ref`, so registration
+  # resolves the revision the user pinned rather than the default branch.
+  fleet_run_ensure_source=$(jq -er --arg n "$fleet_run_ensure_name" '
+    .extraKnownMarketplaces[$n].source // empty |
+    ((.ref // "") | if . == "" then "" else "#" + . end) as $ref |
+    if .source == "github" then .repo + $ref
+    elif .source == "git" then .url + $ref
+    elif .source == "directory" then .path
+    elif .source == "url" then .url
+    else empty end
+  ' "$fleet_run_ensure_settings" 2>/dev/null) || return 75
+  case $fleet_run_ensure_source in
+    ''|-*|*[[:space:]]*) return 75 ;;
+    *'#'*) case ${fleet_run_ensure_source##*#} in ''|*[!A-Za-z0-9._/-]*) return 75 ;; esac ;;
+  esac
+  claude plugin marketplace add "$fleet_run_ensure_source" >/dev/null 2>&1 || return 75
+  claude plugin marketplace list --json 2>/dev/null | jq -e --arg n "$fleet_run_ensure_name" '
+    (if type == "array" then . else (.marketplaces // []) end) | any(.[]; .name == $n)
+  ' >/dev/null 2>&1 || return 75
+}
+
 fleet_run_installed_plugin() {
   # No installed-plugins file, or the plugin absent from it, means "not
   # installed yet" — an empty identity that must proceed to install, not a
@@ -1178,7 +1217,11 @@ fleet_run_apply_item() {
       fleet_run_plugin_mutated=false
       fleet_run_resolved_sha=
       if [ -n "$fleet_run_market" ]; then
-        fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id") || return 75
+        # An unregistered marketplace has no catalog; register it from the
+        # declared source, then look again.
+        fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id") ||
+          { fleet_run_ensure_marketplace "$fleet_run_market" &&
+            fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id"); } || return 75
         fleet_run_resolved_sha=$(printf '%s\n' "$fleet_run_catalog" |
           jq -r '.source.sha // empty')
         fleet_run_resolved_version=$(printf '%s\n' "$fleet_run_catalog" |
@@ -2336,6 +2379,8 @@ fleet_run_full_pass() (
     full_result=unavailable
     if command -v claude >/dev/null 2>&1; then
       full_result=failed
+      # `update` cannot refresh a marketplace that was never registered.
+      fleet_run_ensure_marketplace "$full_upstream" >/dev/null 2>&1 || :
       ! claude plugin marketplace update "$full_upstream" >/dev/null 2>&1 ||
         full_result=ok
     fi

@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "5e7eeccf8af06924b5eec8e4577782b48aa090bb2d038c1f838daf717801d9a1"
+      "sha256": "59cab9027c9df5f7740c604cc0e13fe70a7f4074f314dd3243045c1f15260fdf"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "73847454acf298802ea3c798f0b228f79de9d34a43ce19f0e95c62360bf222d0"
+      "sha256": "4dd9e128f2abee706e602bd7cb15fd43445e0657699170bd63eb4566e1b9219b"
     },
     {
       "path": "assets/icon.png",
@@ -58,7 +58,7 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "cee9a308b4caf778e7c85d272d7dbe82583025ae692910ae73d8f7eee01814cc"
+      "sha256": "6c31b0c2ce0343061aac2e1829430613c630da724af636a7787a1b026be4da03"
     },
     {
       "path": "scripts/collect-windows.ps1",
@@ -90,11 +90,11 @@
     },
     {
       "path": "scripts/launcher-install",
-      "sha256": "5a645e53ace59958cc77ec9b7b924aec4dac8a8df4b37b70c89d985d9b9e0a0d"
+      "sha256": "6d7cc04bdcc554a25855061eaceac38a5cb71a9b8deddae5606d5d7b28869679"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
-      "sha256": "95b4f4264f22035895fc005bb3b21e376a36ab4699d168570b8dcfad9a6fbbeb"
+      "sha256": "2bb67c44f34416a5792cff4b50c861dc375cbee18444dee97aa33b4cc5994708"
     },
     {
       "path": "scripts/lib/broker-posix.sh",
@@ -130,7 +130,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "0f3c2c1acb6cde797edec348ea7906af17ebdf48b96242937e4c0c405223058c"
+      "sha256": "6a474a1a7cbdc5c2a4ead9d60b28c8844df0b5f1eac31ebbb4c2be5de1fc5cc6"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -146,7 +146,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "bf763e20ba4efa71152583fcff00ef8b295a0a797ad89778faf73fb588147987"
+      "sha256": "4d3691a7475d587666d2b9e333e6aa2f58f9b88db711754861b3bd6ef36b7b7d"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -158,7 +158,7 @@
     },
     {
       "path": "scripts/lib/plan-apply.sh",
-      "sha256": "3c3b18b1bf93a8796fc8bd8e55d600cba24aca7e15c067da1fbe59c790af2c4d"
+      "sha256": "aa056f8b3226808ac274cc148230c7b304a4f4bdb0466511e99480e9076d7aef"
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
@@ -166,11 +166,11 @@
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "4f104ea9f33ea89eed2f07739ef5220ca2e143d4c00e03f375d4c5423859315b"
+      "sha256": "1ca433686ab7d2769ae4910b2b512507695895448a044d12bafc5f15bd25df60"
     },
     {
       "path": "scripts/lib/plan-verify.sh",
-      "sha256": "a2eb6642592cf21622cfb02166622a59cddbb61697f5720945a9c910bf0de6a5"
+      "sha256": "9ab4335a1546bdaa37eeac60b2ba4edf5e5e5b8ad748529cc4f9c3f47dd37ffd"
     },
     {
       "path": "scripts/mcp-siding-windows.ps1",
@@ -210,7 +210,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "2293cd4948229cc5d2affcdcdabd6f9970f69302494852afd8b22a624a8e0804"
+      "sha256": "d372c30fb76a30e619bff18846c7b50349fc7590255c7af9ec2d8a0156783524"
     },
     {
       "path": "scripts/roundhouse-trustd",
@@ -305,5 +305,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.23"
+  "version": "0.9.24"
 }

@@ -525,6 +525,21 @@ JSONC
         *) fail "the remote prologue did not choose the global version maximum when $guard_newer was newer" ;;
       esac
     done
+    # The launcher adds group/other write protection to the caller's umask and
+    # never loosens a stricter one.
+    guard_umask_home="$tmp/guards-umask"
+    guard_launcher="$guard_umask_home/.local/bin/roundhouse"
+    mkdir -p "$guard_umask_home/.claude/plugins/cache/test/roundhouse/0.10.0/scripts"
+    printf '#!/bin/sh\numask\n' >"$guard_umask_home/.claude/plugins/cache/test/roundhouse/0.10.0/scripts/roundhouse"
+    chmod 755 "$guard_umask_home/.claude/plugins/cache/test/roundhouse/0.10.0/scripts/roundhouse"
+    HOME="$guard_umask_home" PATH=/usr/bin:/bin \
+      ROUNDHOUSE_CONFIG="$tmp/launcher-config.json" \
+      "$cli" launcher-install "$guard_launcher" test-host >/dev/null
+    for guard_mask in 002:0022 077:0077 027:0027; do
+      guard_got=$(umask "${guard_mask%%:*}"; HOME="$guard_umask_home" PATH=/usr/bin:/bin "$guard_launcher")
+      [ "$guard_got" = "${guard_mask##*:}" ] ||
+        fail "the launcher turned umask ${guard_mask%%:*} into $guard_got, not ${guard_mask##*:}"
+    done
     # A PATH launcher is a mutation: both parent directories must be private,
     # and a config with multiple local entries must not select by JSON order.
     for guard_parent in .local .local/bin; do

@@ -17,6 +17,11 @@ fi
 cat <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+# Plugin installs and state written through Roundhouse stay non-writable by
+# group and others even where the login umask is 002 (the WSL default). The
+# write bits are added to the caller's mask, so a stricter umask such as 077
+# is kept.
+umask "$(printf '%04o' "$(( 8#$(umask) | 8#022 ))")"
 
 roundhouse_version_valid() {
   case "$1" in
