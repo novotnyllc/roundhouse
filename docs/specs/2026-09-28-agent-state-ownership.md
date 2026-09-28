@@ -1,210 +1,234 @@
-# Agent state: one owner per fact
+# Automatic fleet sync: one loop, one writer per fact
 
-Status: **design proposal, rev 1** · 2026-09-28 · nothing implemented here.
+Status: **design proposal, rev 2** · 2026-09-28 · nothing implemented here.
 
-This reads on top of `2026-08-06-dsc-storage-design-v2.md` (V2: the store,
-layers, trust, reconcile and canary rules) and `2026-08-10-dsc-scaling.md`.
-It changes who owns agent-tooling state, and it adds the missing pieces
-that let that owner actually keep hosts current. The storage model, the
-trust ratchet, the reconcile point and the sealed-plan pipeline are not
-changed.
+Rev 1 made adoption a manual, reviewed step. That defeats the purpose of
+the system, which is that a change made on any machine reaches every
+machine without anyone doing anything. Rev 2 keeps everything automatic.
+It fixes the actual defect instead: several automations compete, and none
+of them owns the whole loop.
 
-## 1. What went wrong
+This reads on top of `2026-08-06-dsc-storage-design-v2.md` (V2), which
+covers the store, layers, trust, reconcile and canary. It keeps V2's trust
+ratchet, reconcile point and signed store. It deliberately changes one V2
+non-goal, "timestamps are evidence, not a decision rule", for agent
+tooling: see §3.3.
 
-One day of fleet work, 2026-09-28, surfaced a series of failures that
-look unrelated but share one cause.
+## 1. What the fleet should do
 
-| Symptom | What caused it |
+The owner works on one machine at a time. Whatever they do there becomes
+how every machine is, on its own:
+
+- **Adding.** Install or enable a plugin, add a marketplace, add a skill, or
+  configure a tool on any host. Within one cycle, typically ≤ 25 minutes,
+  every host has it, in every harness it applies to.
+- **Removing.** Uninstall or disable it on any host, and it goes away everywhere.
+- **Upstream releases.** A new version of anything installed arrives
+  everywhere, first on a canary, then on the rest.
+- **Native Windows.** It takes part like any other machine.
+- **Settings.** A preference changed on one host propagates the same way.
+  So does a tool key entered on one host, encrypted so it never appears in
+  plain text.
+- **When a person is involved.** Nothing needs approval. A person hears
+  about it only when something is genuinely ambiguous or unsafe (§3.5),
+  and even then as an alert with an undo, not a gate that stops the fleet.
+
+## 2. Why it didn't do that on 2026-09-28
+
+| Symptom | Cause |
 |---|---|
-| iris-windows ran Claude Compound Engineering 3.28.0 and Railyard 0.10.0 when the rest of the fleet had 3.29.0 and 0.12.5. | Native Windows is not a fleet member, and nothing schedules convergence for it. |
-| No host had converged Roundhouse desired state since 2026-09-22. | `fleet-run` is not scheduled anywhere. macbook-pro's LaunchAgent is installed but not loaded, and its last runs refused a 32-day-old lock with "remove it". mac-mini and mac-studio have no job loaded. iris-wsl has no timer. The repo has no scheduler installer: the scheduling contract exists only in `fleet-update` prose, checked by a doc-text test. Only Claude's own marketplace `autoUpdate` kept anything current. |
-| Peers never apply plugin changes even when running. | They wait on canary evidence from macbook-pro. macbook-pro is dead (above) and holds its own plugin items: "installed marketplace identity unavailable". The identity gate never retries marketplace registration, and the full pass skips held items' marketplaces. |
-| `music-control`, then `codex@openai-codex` and `superpowers`, spread to every host and had to be retired by hand the same day. | fleet-chezmoi captures every `enabledPlugins` and `extraKnownMarketplaces` entry. A plugin installed on one host becomes fleet-wide on the next capture. |
-| The Roundhouse store still declares those three plugins `enabled`. | Retirement happened in dotfiles (a retired list). Nothing told the store. Re-seed "upserts, never removes". |
-| Impeccable could not be declared correctly. | It comes from the pbakaus marketplace on Claude and the curated marketplace on Codex. The store keys a plugin by name with one marketplace. The apply path is Claude-only in code (`fleet-run.sh` seed comment: "the plugins apply surface is Claude-owned"). |
-| last30days runs keyless on three hosts. | Its `~/.config/last30days/.env` exists only where someone created it. No system owns per-tool config or the secrets it needs. |
-| Codex `model` flips between `gpt-6-sol` and `gpt-6-astra`. | Three writers: the dotfiles Codex modify script (sol/medium), Roundhouse `config.json` `agent_artifacts[codex-settings]` (astra/max, inventory only), and the Codex app (wrote astra at 18:02). |
-| iris-wsl reported six "edited" marketplace entries. | Claude rewrote key order; fleet-chezmoi compared text. Fixed in agent-utilities 0.19.1, but it only mattered because fleet-chezmoi was capturing state it should not own. |
+| Nothing converged since 2026-09-22 | `fleet-run` is not scheduled on any host. The launch agents are unloaded, and the canary's last runs refused a 32-day-old lock with "remove it". The repo has no scheduler installer. |
+| Peers never applied plugin changes | They wait on the dead canary. The canary's own plugin items are held on "installed marketplace identity unavailable", and nothing retries marketplace registration. |
+| iris-windows stale | Native Windows isn't enrolled, and no run targets it. |
+| A test plugin (`music-control`) spread fleet-wide, then `codex` and `superpowers` spread and were retired the same day | Two capture paths run independently. fleet-chezmoi captures `settings.json` entries, and Roundhouse re-seeds host inventory. Neither can tell a deliberate change from an echo of the other, and nothing marks a local directory marketplace as local. |
+| The store still enables the retired plugins | Retirement went through dotfiles' retired list. Roundhouse re-seed "upserts, never removes", and `absent` never uninstalls. |
+| Impeccable could not be declared per harness | Store records are keyed by name with one marketplace, and the apply path is Claude-only. |
+| last30days keyless on most hosts | No system owns tool config or its secrets. |
+| Codex `model` flip-flops | Three writers: the dotfiles modify script, Roundhouse `config.json` expectations, and the Codex app. |
 
-**Root cause.** The same agent-tooling facts have up to five writers:
-- the dotfiles `settings.json` template and its retired list
-- the Roundhouse store
-- fleet-chezmoi capture, plus its `plugins` step
-- the harnesses themselves (`claude plugin …`, `autoUpdate`, the Codex app)
-- Roundhouse's `config.json` expectations
+Automation was not the problem. There were five automations — dotfiles templates, fleet-chezmoi capture, fleet-chezmoi plugin convergence, Roundhouse seed/apply, and harness auto-update — each writing overlapping state, each blind to the others. The one that could reconcile them had stopped, and nobody noticed.
 
-No document names one owner. V2's co-ownership rule covers `config_files` keys only. Where two writers disagree, the winner is whoever ran last. And the one writer designed to converge the fleet, `fleet-run`, has no owner for its own scheduling or liveness, so it stopped silently.
+## 3. The design
 
-## 2. Principles
+### 3.1 One loop per host
 
-1. **One owner per fact.** Every piece of agent state has exactly one system that declares it and one that converges it. Every other system may observe it and report on it, and must not write it.
-2. **Desired state is declared, never inferred from a host.** A change made on one host is evidence. It becomes desired state only through an explicit step: a reviewed adoption, not an automatic capture.
-3. **Every declaration has a full lifecycle.** Add, change, retire and remove each have a defined path. Retirement propagates to every host and ends in an uninstall.
-4. **Per-harness, not per-name.** Claude and Codex are separate surfaces. The same logical plugin may come from different marketplaces in each.
-5. **Convergence is a liveness obligation.** A host that has not converged in 2× its cadence is an alert on every other host, not a silent gap. The scheduler and its lock belong to the system that needs them.
-6. **Native Windows is a first-class target.** Its desired state and freshness are the same as any host's, reached through the lane that works: WSL interop, landed in Roundhouse 0.9.25.
-7. **Secrets stay in the secret store.** Systems declare which secret a tool needs, render it where the tool reads it, and verify that it is present. No value is logged or captured.
+Every host runs one scheduled loop, `roundhouse fleet-run`, every 20 minutes. Each pass does four things in order:
 
-## 3. Ownership map
+1. **Observe.**
+   - Read the host's actual agent state from each harness's own records: installed and enabled plugins per harness, registered marketplaces, standalone skills, tool config files, and the harness preference keys the fleet syncs.
+   - Diff it against what this host last applied (`applied/<host>`).
+   - Anything that differs is a **local change**.
+2. **Publish.** Each local change becomes a signed **change event** in the store (§3.2), fleet-wide by default.
+3. **Converge.**
+   - Fold the store (events plus layers) into this host's desired state.
+   - Apply it through each harness's own commands: install, update, enable, disable and uninstall, for Claude and for Codex.
+   - Verify each result.
+4. **Report.** Write a heartbeat, journal the outcomes, and raise any alert.
 
-| Fact | Declared by | Converged by | Everyone else |
-|---|---|---|---|
-| Which plugins each harness has installed and enabled (Claude and Codex) | **Roundhouse store**, `plugins` category, harness-qualified (§4.1) | **Roundhouse fleet-run** | dotfiles: never writes. fleet-chezmoi: observes and reports only. Harness autoUpdate: freshness only. |
-| Which marketplaces each harness has registered, with source and ref | **Roundhouse store**, new `marketplaces` category (§4.2) | **Roundhouse fleet-run** | dotfiles stops shipping `extraKnownMarketplaces`. fleet-chezmoi stops capturing it. |
-| Standalone skills | Roundhouse store `skills` (unchanged) | Roundhouse fleet-run | unchanged |
-| Plugin and skill versions | Marketplace pins: novotnyllc/marketplace for ours, upstream catalogs for others | fleet-run: `update` to the pinned SHA | Harness autoUpdate may run ahead; the next run reconciles. |
-| Per-tool config and secrets (for example last30days `.env`) | **Roundhouse store**, new `tool_config` category, names only (§4.4) | **dotfiles renders the file** from its secret data; Roundhouse **verifies presence** | fleet-chezmoi holds any secret-looking value back from capture, as it does today. |
-| Harness preferences: Claude settings keys other than plugins and marketplaces; Codex `model` and effort | **dotfiles** (template or modify script) | chezmoi apply, driven by fleet-chezmoi | Roundhouse `config.json` stops declaring expected values; it only inventories. An app write is drift, sent to review (as fleet-chezmoi already does for modify sources). |
-| Instructions files (`CLAUDE.md`, `AGENTS.md`), env, PATH, shells | dotfiles | chezmoi apply | unchanged |
-| Hook trust (Codex `[hooks.state]`) | host-local, never synced | `codex-plugin-hooks.mjs` after each install or update | unchanged |
-| fleet-run scheduling, lock and liveness | **Roundhouse**, new `scheduler` ownership (§4.5) | `roundhouse launcher-install` / `fleet-doctor` | dotfiles never ships a Roundhouse job. |
-| Host identity names | Roundhouse `config.json` machine names | — | dotfiles roles map to them through one table (§4.7), not two naming schemes. |
+This one loop replaces fleet-chezmoi's plugin capture and convergence, dotfiles' plugin keys, and Roundhouse's upsert-only re-seed. Those were several writers; now there is one. Harness auto-update may still run between passes. The next Observe step sees its result as an ordinary version change and reconciles it.
 
-## 4. Changes
+### 3.2 Change events, not snapshots
 
-### 4.1 Harness-qualified plugin records
-
-A plugin item gains optional per-harness sub-records. The existing scalar and
-`{state, marketplace}` forms keep working and mean "Claude", which is exactly
-what the code does today.
+A host's inventory is not written wholesale into the store as desired state; that is what re-seed does today, and it is why removals never happen. Instead, each observed difference is one event:
 
 ```yaml
-plugins:
-  impeccable:
-    claude: {marketplace: impeccable}          # state defaults to enabled
-    codex:  {marketplace: openai-curated-remote}   # Codex's curated catalog
-  last30days:
-    claude: {marketplace: last30days-skill}
-    codex:  {marketplace: last30days-skill}
-  superpowers: absent                          # retired on every harness
-  context7:
-    claude: {marketplace: claude-plugins-official}
-    codex: absent                              # a per-harness knockout
+# store/events/<item>/<utc-ts>-<host>.yaml  (host-keyed, one writer)
+item: plugins.impeccable.codex        # category.name.harness
+value: {state: enabled, marketplace: openai-curated-remote}
+observed_at: 2026-09-28T18:24:47Z     # when this host first saw the change
+host: mac-studio
+cause: local                          # local | upstream | applied-from:<event>
 ```
 
-- **Identity** becomes `plugins.<name>.<harness>` for digests, verdicts, `applied/`, holds and journal lines. A bare `plugins.<name>` value folds into `.claude`. This is one normalization rule in `fleet_fold`, and existing digests are unchanged.
-- **Codex apply path**, new. It uses the harness's own commands, as V2 already prescribes:
-  - `codex plugin marketplace upgrade`
-  - `codex plugin add NAME@MARKET` for an install
-  - the existing `update-codex-plugin` helper for an update, which carries hook-trust snapshot and approval
-  - enable and disable through the `[plugins."NAME@MARKET"] enabled` key, written under the same review
-  - The install and update verifications mirror the Claude path: SHA and version.
-- **Seeding** records what each harness actually has, under its harness key. This replaces the 2026-09-22 filter that dropped Codex rather than modelling it.
+- **Fold rule.** For each item, the event with the latest `observed_at` wins. It becomes the effective fleet value, and hand-written layer values still override it (§3.4).
+- **Echo filter.** A host applying another host's change records `cause: applied-from`, which never generates a new event. Only genuine local changes do. This is what stops a change bouncing around the fleet.
+- **Compaction.** The full pass compacts old events per item to the latest one, with a floor so undo still works (§3.5). This keeps the evidence bounded, per the scaling spec.
 
-### 4.2 A `marketplaces` category
+### 3.3 Last change wins, and why that is correct here
 
-```yaml
-marketplaces:
-  impeccable:        {claude: {source: github, repo: pbakaus/impeccable}}
-  openai-curated-remote: {codex: builtin}      # shipped with Codex; never registered
-  novotnyllc:        {claude: {source: github, repo: novotnyllc/marketplace},
-                      codex:  {source: git, url: https://github.com/novotnyllc/marketplace.git}}
-  openai-codex: absent
-```
+V2 made timestamps evidence rather than a decision rule, because it assumed concurrent editors. This fleet has one operator working on one machine at a time, so the most recent deliberate change is the intent. For agent-tooling items, the rules are:
 
-- `fleet_run_ensure_marketplace` reads the source from the store, not from `~/.claude/settings.json`. The #32 fallback to `extraKnownMarketplaces` stays only for the migration window (§6, P1).
-- **Identity-gate self-repair.** When a plugin's installed marketplace identity is unavailable, the run re-registers or refreshes the declared marketplace and retries once before holding. The full pass refreshes the marketplaces of held items too; today it skips them, which makes those holds permanent.
-- **Relative-source catalogs.** Marketplaces whose manifest uses `./plugin` sources (impeccable, last30days) get their identity from the marketplace checkout's commit, not from a per-plugin SHA they do not have. Without this, those plugins can never pass the identity gate.
+- **Latest `observed_at` wins**, per item and per harness.
+- **Timestamps come from the host that made the change**, read from harness records such as install times, or from the host's first observation of the change. The host clock is checked against the store commit time, and a host whose skew exceeds 5 minutes raises an alert. Its events are ordered by commit time instead.
+- **Genuinely concurrent changes** (two hosts changed the same item within one cycle) resolve to the later one, raise an alert that names both, and offer the undo. The fleet doesn't stop.
 
-### 4.3 Retirement ends in an uninstall
+Items outside agent tooling keep V2's conflict ladder unchanged: packages, privileged operations and projects.
 
-- `absent` at the fleet, os, group or host layer already knocks an item out of the fold. What is new is that the apply side acts on it: for an item in `applied/<host>`, `absent` now runs the harness's uninstall (`claude plugin uninstall --scope user`, `codex plugin remove`) and verifies the result, instead of only forgetting the record.
-  - V2's removal rules are unchanged: only what `applied/` owns, capped per run, and never on an unreadable source.
-- **A local uninstall observed at seed time** becomes a named, reviewable proposal: `proposals/retire-<item>-on-<host>.yaml`. It is not silently re-upserted and not silently dropped, so the V2 §10.3 table gets the row it was missing.
-- **The proposals path gets fixed before anyone relies on it:**
-  - **Unanimity bug.** A host with no value drops out of the comparison because `jq --argjson value ""` exits 2, so "unanimous" proposals list only two of four hosts.
-  - **Accept edits too little.** `fleet-accept` deletes from the flat host file but not from `hosts/<h>/*.yaml`. It must edit every tier it read.
+### 3.4 Scope: fleet by default, with local and layered exceptions
 
-### 4.4 `tool_config`: declared needs, rendered files, verified presence
+- **Default.** A change is fleet-wide, applying to every host where that harness exists.
+- **Local by nature.** Some changes never propagate:
+  - a directory or local-path marketplace, and every plugin from it (`music-control` was one);
+  - a plugin that exists in only one harness, which applies to hosts that have that harness;
+  - platform-bound items, via `os/<platform>.yaml`. `tart-xcode-runner`, for example, is macOS-only.
+- **Local by choice.** A host-layer entry `pin: local` makes an item stay host-local, and the loop never publishes events for it. This is the one thing written by hand, and only for exceptions.
+- **Hand-written layers still work.** `fleet.yaml`, `os/`, `groups/` and `hosts/` values beat events. They're the way to force a value regardless of what hosts do: a lock, not a workflow.
 
-```yaml
-tool_config:
-  last30days:
-    requires: [plugins.last30days]
-    file: {path: ~/.config/last30days/.env, mode: "0600"}
-    keys: [SCRAPECREATORS_API_KEY]        # names only; values never enter the store
-    settings: {INCLUDE_SOURCES: "..."}    # non-secret settings may be literal
-```
+### 3.5 Intent, safety, and undo, all automatic
 
-- **The store declares what a tool needs**: names, the file, its mode, and non-secret settings.
-- **dotfiles renders the file** from its existing secret data (`.chezmoidata.toml` env entries with `secret = true`, the pattern already used for API keys), because rendering user files is chezmoi's job. Values never pass through Roundhouse or its journals.
-- **Roundhouse verifies presence.** The collector reports the file's mode and which declared keys are set. It never reports their values. A missing key is a `tool_config` finding. last30days's own `doctor` is the deeper check, run after apply.
-- A secret held back by fleet-chezmoi's secret filter is not an error to route around. It is exactly the case this category exists for.
+- **Uninstall versus damage.**
+  - **Deliberate removal** means the plugin is gone from the harness's own records (`installed_plugins.json`, `enabledPlugins`, or Codex's `[plugins.*]`). That publishes a removal.
+  - **Damage** means the records are intact but files are missing or corrupt. That is repaired locally and never published.
+- **Mass-change breaker.** A host whose single pass would publish more than 5 removals, or more than 25% of its items, publishes them as `held`. It keeps converging everything else and raises an alert: this is what a wiped or restored home directory looks like. The first host to observe it again after an operator's `fleet-release` sends them on.
+- **Undo.** Every applied change is journaled with the event that caused it. `roundhouse fleet-undo ITEM` publishes a reversing event, restoring the previous value everywhere. So "latest wins" is always one command from being reversed.
+- **Secrets are never plain.** Tool secret values are captured only in encrypted form (§3.7).
+- **Sensitive files are never touched.** SSH keys, auth files and MCP secrets are never observed or published. V2's `never:` list and `agent-settings-and-auth.md` rules stay.
 
-### 4.5 fleet-run owns its scheduler and its liveness
+### 3.6 Per-harness items and a real Codex path
 
-- **`roundhouse launcher-install` also installs the scheduler**:
-  - a launchd agent on macOS
+- **Item identity** becomes `plugins.<name>.<harness>`, and likewise `marketplaces.<name>.<harness>` and `skills.<name>.<harness>`. Impeccable is simply two items:
+  - `plugins.impeccable.claude`, from the pbakaus marketplace
+  - `plugins.impeccable.codex`, from `openai-curated-remote`
+
+  Each is observed, published and applied on its own. An existing bare `plugins.<name>` value folds into `.claude`, which is what the code does today, so existing digests don't change.
+- **Codex apply** uses the harness's own verbs:
+  - `codex plugin marketplace add`, `upgrade` and `remove`
+  - `codex plugin add NAME@MARKET` and `codex plugin remove`
+  - updates through the existing hook-trust-preserving `update-codex-plugin` helper
+  - enable and disable through the `[plugins."NAME@MARKET"] enabled` key
+
+  Results are verified by SHA and version, as the Claude path already does.
+- **Marketplace sources** are items too, recorded with their source and ref. They are registered from the store, not from `settings.json`. A held plugin's marketplace is re-registered and refreshed before the item is held again, so today's permanent holds can't recur.
+- **Relative-source catalogs** (`./plugin`, as used by impeccable and last30days) take their identity from the marketplace checkout's commit, so they can pass the identity gate.
+
+### 3.7 Tool config and secrets, synced automatically
+
+- A tool's config file is an item: `tool_config.last30days`, path `~/.config/last30days/.env`. The loop observes it like any other item.
+- **Settings** (for example `INCLUDE_SOURCES`) are published as ordinary values.
+- **Secret values** are detected by the existing secret patterns plus declared key names. They are encrypted before they leave the host, using **age**, with every enrolled host's Roundhouse node key as a recipient. Node keys are already ed25519 SSH keys and age accepts them directly, so no new key management is needed.
+  - Only ciphertext is in the store.
+  - Each host decrypts with its own node key when rendering the file (mode 0600).
+  - Values are never logged, journaled or printed.
+- Configuring last30days once, on any host, configures it everywhere. Rotating a key is the same: change it on one host.
+- Existing plaintext secrets in `.chezmoidata.toml` can migrate to this, a later cleanup and not a prerequisite.
+
+### 3.8 Harness preferences have one owner: the loop
+
+Harness preference keys the fleet syncs are items in the same loop, not a second system. They include:
+
+- Claude `settings.json` keys such as `remoteControlAtStartup` and `theme`
+- Codex `config.toml` `model` and `model_reasoning_effort`
+
+Observed on any host and published as events, they converge everywhere. The rest of each file stays host-local, and nothing is ever copied wholesale. Where they come from today:
+
+- **dotfiles** stops templating those keys (and the plugin and marketplace keys), keeping everything else it owns: instruction files, env, PATH, shells.
+- **Roundhouse `config.json`** stops declaring expected values.
+- **The Codex app** writing `model` counts as a local change, like any other. If the owner picks Astra in the app on one machine, every machine gets Astra.
+
+### 3.9 The loop keeps itself alive
+
+- **Self-installed scheduler.** `roundhouse launcher-install` installs and loads the per-host job:
+  - launchd on macOS
   - systemd user timers on Linux and WSL
-  - a per-user scheduled task for a native Windows host with no WSL sibling
-  - It is idempotent, and it absorbs any existing entry rather than adding a duplicate, as `fleet-update` already requires in prose.
-  - `fleet-doctor` checks the job is loaded and its program path resolves.
-- **Stale-lock recovery.** A lock whose holder PID is not alive, or is not a Roundhouse process, is taken over automatically, and the takeover is journaled. The "remove it" refusal survives only for a live holder.
-- **Heartbeat and fleet liveness.** Every run journals a liveness record, as the canary already requires. `fleet-doctor` on every host alerts for any enrolled host whose last successful run is older than 2× its cadence. This restores the SYNC §8 requirement that V2's doctor table dropped. fleet-chezmoi's probe adds a `roundhouse-stale` finding for the same condition, so any sync session sees it.
-- **Canary failover.** A canary silent for more than `canary_wait_hours × 2` raises a fleet alert. The next host in a declared `canaries:` list takes over. Waiting on a dead canary forever is the failure this prevents.
+  - for native Windows, iris-wsl's job covers it (§3.10)
 
-### 4.6 Native Windows through its WSL sibling
+  Every pass re-asserts that the job is loaded, so a job that falls out repairs itself on the next manual or scheduled run.
+- **Stale locks self-recover.** A lock whose holder PID is dead, or isn't a Roundhouse process, is taken over and journaled. A live holder is the only thing that still blocks.
+- **Liveness is visible everywhere.** Each pass writes a heartbeat. Every host's pass alerts when any enrolled host hasn't completed a pass in 2× its cadence, and fleet-chezmoi's probe shows the same finding. A silent fleet can't stay silent.
+- **Canary failover.** Upstream updates still go to a canary first. A canary silent for more than twice the canary wait hands over to the next host on the canary list. User-originated changes don't wait on a canary: the originating host already has the change, so it is its own canary.
 
-V2 §9.2 describes iris-windows as a second instance operated from iris-wsl. The 2026-08-10 scaling note superseded that with native membership, which needs jj, signing and a launcher on Windows. None of those exist. The interop lane (0.9.25) now gives native execution without any of them, so this proposal returns to the §9.2 shape:
+### 3.10 Native Windows, operated from its WSL sibling
 
-- iris-windows gets a host file, `hosts/iris-windows.yaml`, and `os/windows.yaml`. It also gets its own key and principal (`iris-windows@<domain>`), held on the WSL side under `~/.config/roundhouse-iris-windows/`, as §9.2 describes.
-- iris-wsl's scheduled `fleet-run` does a second pass for iris-windows. It resolves that host's fold and applies plugin, marketplace and skill items through the interop lane: native `claude` and `codex` commands, run in the logged-in session. It journals as iris-windows.
-- **Logged off** means WSL is down, so no run happens. That is the existing SYNC §8 expectation, now visible through the liveness alert.
-- The Codex remote-control lane remains the fallback when WSL is unreachable.
+- iris-windows becomes an enrolled host: `hosts/iris-windows.yaml` and `os/windows.yaml`. It gets its own key and principal, `iris-windows@<domain>`, held on the WSL side under `~/.config/roundhouse-iris-windows/`, as V2 §9.2 describes.
+- iris-wsl's scheduled pass runs a second pass for iris-windows. Observe, Converge and Report all go through the 0.9.25 interop lane, so native `claude` and `codex` run in the logged-in session. Its events are signed as iris-windows.
+- **Logged off** means WSL is down and the pass doesn't run. The liveness alert makes that visible, and the next logged-in pass catches up.
+- **The alternative** is native membership (the 2026-08-10 decision). That needs jj, signing and a launcher on Windows, none of which exist. The operated instance delivers the same automation now. Native membership remains possible later without redoing any of this.
 
-**Decision needed.** This reverses a recorded user decision (native membership, 2026-08-10). The recommendation is the WSL-operated instance, because it works with what exists today and adds no Windows-side trust roots. Native membership stays possible later without redoing this.
+### 3.11 fleet-chezmoi's place
 
-### 4.7 dotfiles and fleet-chezmoi step back from plugin state
+fleet-chezmoi keeps doing what only it can: the dotfiles files chezmoi owns, meaning the instruction files, shell env, PATH, templates and scripts. For those files it becomes automatic too:
 
-- **dotfiles** drops `enabledPlugins` and `extraKnownMarketplaces` from `.chezmoitemplates/claude-code-settings.json`, and the matching sections of the retired list. The modify script keeps the other keys it owns.
-- **fleet-chezmoi**:
-  - removes those two keys from `.fleet-chezmoi.json` `managed_json`, so it can no longer promote a host's plugin into fleet state;
-  - replaces its `plugins` step (`converge-plugins.sh`) with "run `roundhouse fleet-run --fast` on that host";
-  - keeps reporting plugin drift from Roundhouse's own view, not from the union of whatever hosts happen to have.
-- **One host-name map.** dotfiles roles (`claires-macbook-pro`, `claires-mini`, `primary-mac`, `iris-wsl`, `windows-side`) map to Roundhouse machine names in one table, owned by dotfiles and read by fleet-chezmoi. Two unrelated naming schemes invite exactly the mistakes seen here.
+- The Roundhouse loop runs fleet-chezmoi's fast path on each pass, as sealed plans applied under policy instead of per-stage approval:
+  - pull when the source is clean and behind
+  - apply source-driven changes
+  - capture uncontested plain-file edits
+- Conflicts, secret-looking values and sensitive paths still go to an alert with evidence, because a text merge can't be resolved safely by timestamp alone.
+- It no longer touches plugins, marketplaces or harness preferences. The loop owns those.
 
-## 5. What this fixes
+## 4. How the same day plays out under this design
 
-| Symptom | Fixed by |
+| Event | What happens |
 |---|---|
-| iris-windows plugins stale | §4.6: iris-wsl's run converges it; §4.5: liveness makes it visible |
-| Fleet-wide convergence dead since 2026-09-22 | §4.5: scheduler owned and installed, stale lock recovered, liveness alerted |
-| Peers stuck behind a dead canary | §4.5 failover; §4.2 identity self-repair |
-| Plugins spreading from one host | §4.7: capture no longer owns plugin state; §2: adoption is explicit |
-| Store still enabling retired plugins | §3: the store is the only declaration; §4.3: `absent` uninstalls |
-| Impeccable per harness | §4.1 harness-qualified records and the Codex apply path |
-| last30days unconfigured | §4.4 `tool_config` |
-| Codex model flip-flop | §3: dotfiles owns preferences; Roundhouse stops declaring them |
+| `music-control` installed on one Mac from a local directory marketplace | Local by nature (§3.4). It stays on that Mac. |
+| `superpowers` and `codex` installed on mac-studio | Published as events. Every host has them within a cycle. |
+| The owner uninstalls them on one host | That host's records show a deliberate removal (§3.5). A removal event is published, and every host uninstalls them next pass. One event, not a dotfiles edit plus a store edit. |
+| Impeccable moved to the curated catalog on Codex | The Codex item on the host where it was moved changes marketplace. Every host's Codex follows. Claude's item is untouched. |
+| last30days configured on the MacBook | The settings are published and the key is encrypted to every node. Every host renders `~/.config/last30days/.env`. |
+| Codex app switches to Astra | That is a local change to `model`. Every host follows, and `fleet-undo` restores Sol. |
+| A new Compound Engineering release | The canary updates, then the peers. iris-windows follows through iris-wsl's pass. |
+| The canary's scheduler dies | The next pass anywhere reports the canary silent. Failover to the next canary. The dead job is re-asserted on its host's next run. |
+
+## 5. Guarantees kept from the original work
+
+- Every mutation still runs as a sealed plan with a precondition recheck immediately before it. Identity is verified before mutation, and a backup is taken before an apply. Policy replaces per-set human approval; the plans are unchanged.
+- No secret value is printed, logged, journaled or stored in plain text.
+- Native Windows work runs only as native processes: interop or Codex remote control, never WSL-side execution.
+- No sudo or Administrator password is ever requested or relayed.
+- Every change is attributable (host, time, cause) and reversible (`fleet-undo`).
 
 ## 6. Migration
 
-Each phase ships alone and leaves the fleet better than it found it.
+Each phase ships alone.
 
-- **P0: stop the bleeding.** Data plus operations, no new code.
-  1. Store edits, signed through the normal promote gate:
-     - `superpowers`, `codex` and `music-control` become `absent` at the fleet layer;
-     - impeccable and last30days get correct marketplaces;
-     - the stale seeded mixed-harness entries are removed.
-  2. Only after that, reload `fleet-run` on every POSIX host and clear the dead lock. Reloading first would converge the stale declarations.
-  3. Remove the duplicate Codex `impeccable@impeccable` on iris-wsl and iris-windows.
-  4. Render last30days `.env` on every host (the §4.4 file, done by hand once).
-  5. Update iris-windows's Claude plugins once through the interop lane.
-- **P1: ownership.** dotfiles and fleet-chezmoi step back (§4.7). Roundhouse keeps the `extraKnownMarketplaces` fallback for one release so nothing is left without a marketplace source.
-- **P2: Roundhouse model.** Harness-qualified plugins, the Codex apply path, the `marketplaces` category, uninstall on `absent`, the identity-gate and relative-source fixes, and the proposals fixes (§4.1–4.3). This is one PR series with tests in the existing fixture style.
-- **P3: liveness.** Scheduler install, stale-lock recovery, heartbeat alerts, canary failover, and the fleet-chezmoi finding (§4.5).
-- **P4: Windows.** The iris-windows operated instance (§4.6).
-- **P5: tool config.** The `tool_config` category, the collector presence check, and the dotfiles renderer (§4.4).
+- **P0: restart and clean.**
+  1. Repair the store data: retire `codex`, `superpowers` and `music-control`; correct impeccable and last30days.
+  2. Only then reload the loop on every POSIX host and clear the dead lock. Doing it first would converge the stale entries.
+  3. Remove the duplicate Codex impeccable.
+  4. Configure last30days everywhere once.
+  5. Update iris-windows's Claude plugins through the interop lane.
+- **P1: liveness.** Self-installed scheduler, stale-lock recovery, heartbeat alerts, canary failover. This alone would have prevented the six-day stall.
+- **P2: per-harness items.** Harness-qualified identity, the Codex apply path, marketplace items, uninstall on removal, and the identity-gate and relative-source fixes.
+- **P3: the event loop.**
+  - Observe, publish, fold and converge with events, the echo filter, scope rules, the breaker and `fleet-undo`.
+  - Re-seed is retired in favor of Observe.
+  - dotfiles drops the plugin, marketplace and preference keys, and fleet-chezmoi drops plugin capture, in the same release, so there's never a moment with two writers.
+- **P4: native Windows.** The operated instance.
+- **P5: tool config and preferences.** Encrypted tool secrets, and harness preference keys as items.
+- **P6: automate fleet-chezmoi's fast path** under the loop (§3.11).
 
-## 7. Non-goals
+## 7. Decisions for the owner
 
-- No change to trust, signing, the reconcile point, or the sealed-plan pipeline.
-- No syncing of whole harness state directories, `[hooks.state]`, auth files or MCP secrets. V2 and `agent-settings-and-auth.md` already forbid this.
-- No automatic promotion of host-local changes. Adoption stays an explicit, reviewed step.
-- No replacement for harness `autoUpdate`. It stays as a freshness accelerator that the next run reconciles.
-
-## 8. Open decisions
-
-1. **Windows shape** (§4.6): the WSL-operated instance (recommended) or native membership.
-2. **Canary list** (§4.5): which hosts may take over as canary, and in what order.
-3. **Codex preference owner** (§3): confirm dotfiles owns `model`/`model_reasoning_effort`. If Astra should be the default, change it there, once.
-4. **Where secrets live** (§4.4): stay with the existing `.chezmoidata.toml` pattern, or move tool secrets to 1Password references rendered at apply time.
+1. **Windows:** the operated instance from iris-wsl (recommended), or native membership.
+2. **Canary order:** which hosts may act as canary, and in what order.
+3. **Breaker thresholds:** 5 removals or 25% per pass (proposed).
+4. **Secrets:** age-encrypted in the store to node keys (proposed), or 1Password references resolved at render time.
