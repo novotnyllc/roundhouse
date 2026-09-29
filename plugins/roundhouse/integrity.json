@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "26feafabc1bcc56b2ed0f426a6963430fe1653531b7222a4097a14d3e9a2b228"
+      "sha256": "8d3d11d0f0f6d4bde47bb958a29df40b8166bc82421b443422c760b256b0038f"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "de8b6d883a37f24099584c64156dd81deca67154c81bef80948b701f90216b3b"
+      "sha256": "d64d42d29f88397c606dedd3d73e6864475846916e9ac80dc2ce1d70d0c03b6b"
     },
     {
       "path": "assets/icon.png",
@@ -146,7 +146,7 @@
     },
     {
       "path": "scripts/lib/fleet-vcs.sh",
-      "sha256": "bc4a6060b6e300a7a1d44e046294109498bdf0db988d2755711213abf7dae339"
+      "sha256": "b6e2cb9aede7dd215fe5f0d4c3451ebbd8bbe32aed7c7c024687ac09d4bae750"
     },
     {
       "path": "scripts/lib/host.sh",
@@ -317,5 +317,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.27"
+  "version": "0.9.28"
 }
