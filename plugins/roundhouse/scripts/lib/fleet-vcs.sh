@@ -240,12 +240,41 @@ fleet_vcs_trailers() {
   # and let the rest of that string pose as further trailers. The claims are
   # unverifiable either way, but a block that stays well-formed is what lets
   # a resolver parse the two it actually reads.
+  #
+  # Every value also fits §10.4's replicated cap. The redaction sweep refuses
+  # to publish any commit whose trailer exceeds it, so an unbounded items list
+  # — a run that touches hundreds of items — wedged the store: every later
+  # publish carried the oversized commit and was refused. The items list keeps
+  # whole names and counts the rest; nothing parses it back.
   printf 'roundhouse-host: %s\n' "$(printf '%s' "$1" | tr '\n\r' '  ')"
   printf 'roundhouse-session: %s\n' "$(printf '%s' "$2" | tr '\n\r' '  ')"
-  printf 'roundhouse-intent: %s\n' "$(printf '%s' "$3" | tr '\n\r' '  ')"
+  printf 'roundhouse-intent: %s\n' \
+    "$(printf '%s' "$3" | tr '\n\r' '  ' | LC_ALL=C cut -c "1-$fleet_replicated_cap")"
   [ -z "${5:-}" ] ||
     printf 'roundhouse-reverts: %s\n' "$(printf '%s' "$5" | tr '\n\r' '  ')"
-  printf 'roundhouse-items: %s\n' "$(printf '%s' "$4" | tr '\n\r' '  ')"
+  printf 'roundhouse-items: %s\n' \
+    "$(printf '%s' "$4" | tr '\n\r' '  ' | fleet_vcs_bounded_list "$fleet_replicated_cap")"
+}
+
+fleet_vcs_bounded_list() {
+  # `… | fleet_vcs_bounded_list CAP` — a space-separated list cut to at most
+  # CAP bytes at a name boundary, with `(+N more)` naming what was dropped.
+  LC_ALL=C awk -v cap="$1" '{
+    n = split($0, t, / +/); out = ""; kept = 0
+    for (i = 1; i <= n; i++) {
+      if (t[i] == "") continue
+      cand = (out == "" ? t[i] : out " " t[i])
+      rest = 0
+      for (j = i + 1; j <= n; j++) if (t[j] != "") rest++
+      suffix = rest ? " (+" rest " more)" : ""
+      if (length(cand suffix) > cap) break
+      out = cand; kept++
+    }
+    total = 0
+    for (i = 1; i <= n; i++) if (t[i] != "") total++
+    if (kept < total) out = out (out == "" ? "" : " ") "(+" (total - kept) " more)"
+    printf "%s", out
+  }'
 }
 
 fleet_vcs_working_copy_files() {

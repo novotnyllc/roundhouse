@@ -53,6 +53,31 @@ mkdir -p "$reconcile_root"
   [ "$(fleet_vcs_trailers vireo scheduled/agent 'one
 roundhouse-session: interactive/human' plugins.x | grep -c '^roundhouse-session:')" -eq 1 ] ||
     fail "a newline in roundhouse-intent injected a second trailer"
+  # §10.4 refuses to publish a trailer over the replicated cap, so a run that
+  # touches hundreds of items must still write a publishable block: whole
+  # names, then a count of what was dropped.
+  reconcile_many=$(for reconcile_n in $(seq 1 300); do
+    printf 'packages.item-%03d ' "$reconcile_n"; done)
+  reconcile_items=$(fleet_vcs_trailers vireo scheduled/agent 'fast convergence' \
+    "$reconcile_many" | sed -n 's/^roundhouse-items: //p')
+  [ "$(printf '%s' "$reconcile_items" | wc -c | tr -d ' ')" -le "$fleet_replicated_cap" ] ||
+    fail "an items list of 300 names exceeded the replicated cap and would wedge publishing"
+  case $reconcile_items in
+    'packages.item-001 packages.item-002 '*' (+'*' more)') ;;
+    *) fail "the bounded items list did not keep whole names and count the rest: $reconcile_items" ;;
+  esac
+  reconcile_kept=$(printf '%s' "$reconcile_items" | tr ' ' '\n' | grep -c '^packages\.item-')
+  reconcile_more=$(printf '%s' "$reconcile_items" | sed -n 's/.*(+\([0-9]*\) more)$/\1/p')
+  [ $((reconcile_kept + reconcile_more)) -eq 300 ] ||
+    fail "the bounded items list lost count: kept $reconcile_kept, reported $reconcile_more more"
+  reconcile_intent=$(fleet_vcs_trailers vireo scheduled/agent \
+    "$(printf 'x%.0s' $(seq 1 600))" - | sed -n 's/^roundhouse-intent: //p')
+  [ "$(printf '%s' "$reconcile_intent" | wc -c | tr -d ' ')" -le "$fleet_replicated_cap" ] ||
+    fail "an oversized roundhouse-intent exceeded the replicated cap"
+  # A short list is untouched.
+  fleet_vcs_trailers vireo scheduled/agent 'x' 'plugins.a plugins.b' |
+    grep -Fqx 'roundhouse-items: plugins.a plugins.b' ||
+    fail "bounding altered a list that already fit"
 )
 
 # --- real jj: the runbook against two real diverged stores ---
