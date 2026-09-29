@@ -74,6 +74,14 @@ roundhouse-session: interactive/human' plugins.x | grep -c '^roundhouse-session:
     "$(printf 'x%.0s' $(seq 1 600))" - | sed -n 's/^roundhouse-intent: //p')
   [ "$(printf '%s' "$reconcile_intent" | wc -c | tr -d ' ')" -le "$fleet_replicated_cap" ] ||
     fail "an oversized roundhouse-intent exceeded the replicated cap"
+  # A cap that lands inside a multibyte character must not split it: jj
+  # refuses a description that is not valid UTF-8.
+  reconcile_intent=$(fleet_vcs_trailers vireo revert \
+    "$(printf 'x%.0s' $(seq 1 399))é" - | sed -n 's/^roundhouse-intent: //p')
+  printf '%s' "$reconcile_intent" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 ||
+    fail "truncating roundhouse-intent split a multibyte character into invalid UTF-8"
+  [ "$(printf '%s' "$reconcile_intent" | wc -c | tr -d ' ')" -le "$fleet_replicated_cap" ] ||
+    fail "a multibyte roundhouse-intent exceeded the replicated cap"
   # A short list is untouched.
   fleet_vcs_trailers vireo scheduled/agent 'x' 'plugins.a plugins.b' |
     grep -Fqx 'roundhouse-items: plugins.a plugins.b' ||

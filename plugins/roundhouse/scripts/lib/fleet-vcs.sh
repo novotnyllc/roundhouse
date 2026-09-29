@@ -248,8 +248,12 @@ fleet_vcs_trailers() {
   # whole names and counts the rest; nothing parses it back.
   printf 'roundhouse-host: %s\n' "$(printf '%s' "$1" | tr '\n\r' '  ')"
   printf 'roundhouse-session: %s\n' "$(printf '%s' "$2" | tr '\n\r' '  ')"
+  # The cut is by byte, so it can split a multibyte character; `iconv -c`
+  # drops that partial tail, keeping the value valid UTF-8 (jj refuses to
+  # store anything else) and still under the cap.
   printf 'roundhouse-intent: %s\n' \
-    "$(printf '%s' "$3" | tr '\n\r' '  ' | LC_ALL=C cut -c "1-$fleet_replicated_cap")"
+    "$(printf '%s' "$3" | tr '\n\r' '  ' | LC_ALL=C cut -c "1-$fleet_replicated_cap" |
+      iconv -c -f UTF-8 -t UTF-8 2>/dev/null)"
   [ -z "${5:-}" ] ||
     printf 'roundhouse-reverts: %s\n' "$(printf '%s' "$5" | tr '\n\r' '  ')"
   printf 'roundhouse-items: %s\n' \
