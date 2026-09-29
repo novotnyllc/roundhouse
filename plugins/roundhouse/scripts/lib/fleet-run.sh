@@ -2561,6 +2561,12 @@ fleet_seed_command() (
   # carries both, validated (platform is one of macos/linux/wsl/windows and
   # every group matches the name charset), so there is nothing to infer.
   #
+  # `package_managers` is the same kind of fact: the apply path and the update
+  # pass read the host's list from the fold to resolve every package. Seeding
+  # without it left the list empty, so the resolver tried no manager and held
+  # every enabled package as "no package manager on this host can provide" —
+  # on hosts whose manager plainly provides it.
+  #
   # PRESENCE, not truthiness: a machine legitimately in no groups carries
   # `groups: []`, and dropping an empty list is not the same as having no
   # opinion. The `machine-truth` doctor row compares `.groups // null` on both
@@ -2571,6 +2577,7 @@ fleet_seed_command() (
     (.machines[$host] // {}) |
     {} + (if has("platform") then {platform: .platform} else {} end)
        + (if has("groups") then {groups: .groups} else {} end)
+       + (if has("package_managers") then {package_managers: .package_managers} else {} end)
     ' "$(config_path)" 2>/dev/null) || seed_facts='{}'
   [ -n "$seed_facts" ] || seed_facts='{}'
 

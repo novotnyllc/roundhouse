@@ -690,6 +690,7 @@ fleet_enroll_seed_host_facts() {
     (.machines[$host] // {}) |
     {} + (if has("platform") then {platform: .platform} else {} end)
        + (if has("groups") then {groups: .groups} else {} end)
+       + (if has("package_managers") then {package_managers: .package_managers} else {} end)
   ' "$(config_path)" 2>/dev/null) || seed_facts='{}'
   [ -n "$seed_facts" ] || seed_facts='{}'
   mkdir -p "$(dirname "$seed_file")"

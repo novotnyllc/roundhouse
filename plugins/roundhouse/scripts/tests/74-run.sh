@@ -1176,6 +1176,10 @@ JSONC
       fail "seeding did not take platform from config.json — machine-truth still needs a hand-authored host file"
     [ "$(yq -r '(.groups // []) | join(",")' "$run_seeded")" = development,canary ] ||
       fail "seeding did not take groups from config.json"
+    # Without the manager list the resolver tries nothing and every enabled
+    # package is held as unprovidable on a host whose manager provides it.
+    [ "$(yq -r '(.package_managers // []) | join(",")' "$run_seeded")" = apt ] ||
+      fail "seeding did not take package_managers from config.json — every package would be held"
     yq -e '.plugins.ponytail != null' "$run_seeded" >/dev/null ||
       fail "seeding the facts cost the observed surfaces"
     # A fact already in the host file WINS: someone wrote it deliberately and
@@ -1224,7 +1228,8 @@ JSONC
       fail "fleet-seed refused a machine whose config states no facts"
     [ -f "$run_seeded" ] ||
       fail "the seed wrote a different host file than the fixture expects"
-    yq -e '.platform == null and .groups == null and .plugins.ponytail != null' \
+    yq -e '.platform == null and .groups == null and .package_managers == null and
+      .plugins.ponytail != null' \
       "$run_seeded" >/dev/null ||
       fail "an unlisted machine had facts invented for it"
     # An ABSENT field and an empty list are different answers, and the doctor
