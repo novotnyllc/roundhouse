@@ -44,6 +44,8 @@ case "$1 ${2:-}" in
   "prefix --global") printf '%s\n' "$prefix" ;;
   "root --global") printf '%s/lib/node_modules\n' "$prefix" ;;
   "ls --global")
+    [ "${NPM_STUB_LS_FAIL:-0}" != 1 ] ||
+      { printf '%s\n' '{"error":{"code":"ENOTDIR","summary":"prefix is not a directory"}}'; exit 1; }
     jq -c '{name:"lib",dependencies:(with_entries(.value = {version:.value}))}' "$state" ;;
   "outdated --global")
     [ "${NPM_STUB_OUTDATED_EMPTY:-0}" != 1 ] || exit 0
@@ -165,6 +167,11 @@ nfx_reset_state
     fail "the fixed-directory test hook was honoured outside the self-check"
   [ "$(npm_global_list | jq -r '.["@example/tool"]')" = 1.0.0 ] ||
     fail "npm global inventory did not parse npm ls"
+  # A fatal npm ls prints only an `error` object; that is a failed query, not
+  # an empty global tree.
+  if NPM_STUB_LS_FAIL=1 npm_global_list >/dev/null; then
+    fail "an npm ls error object read as 'no global packages'"
+  fi
   [ "$(npm_global_outdated | jq -c .)" = '{"npm":"12.1.0","@example/tool":"2.0.0"}' ] ||
     fail "npm outdated parsing did not tolerate its exit status 1"
   # npm prints `{}` itself when nothing is outdated; EMPTY output is a failed

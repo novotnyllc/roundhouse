@@ -2275,7 +2275,9 @@ if ((Test-Section "packages") -and (@($Machine.package_managers) -contains "npm"
         }
         try {
             $List = (Invoke-NpmText $NpmPath @("ls", "--global", "--json", "--depth=0")) | ConvertFrom-Json
-            if ($null -eq $List) { throw "npm ls failed" }
+            # A fatal npm ls prints only an `error` object: a failed query, not
+            # an empty global tree.
+            if ($null -eq $List -or $null -ne $List.PSObject.Properties["error"]) { throw "npm ls failed" }
             $Installed = @{}
             if ($null -ne $List.dependencies) {
                 foreach ($Property in $List.dependencies.PSObject.Properties) {

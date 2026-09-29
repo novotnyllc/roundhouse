@@ -96,10 +96,13 @@ npm_global_run() (
 npm_global_list() (
   # `{name: installed_version}` for every top-level global package. `npm ls`
   # exits non-zero for extraneous or invalid trees while still printing the
-  # tree, so the JSON shape, not the status, is what is trusted.
+  # tree, so the JSON shape, not the status, is what is trusted. A fatal error
+  # prints an object with only `error`; that is a failed query, never an empty
+  # tree.
   npm_list_json=$(npm_global_run ls --global --json --depth=0 2>/dev/null) || :
   printf '%s\n' "$npm_list_json" | jq -ce '
-    if type == "object" and ((.dependencies // {}) | type == "object") then
+    if type == "object" and (has("error") | not) and
+      ((.dependencies // {}) | type == "object") then
       (.dependencies // {}) | with_entries(
         select(.value | type == "object" and (.version | type == "string")) |
         .value = .value.version)

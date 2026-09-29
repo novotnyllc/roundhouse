@@ -62,7 +62,7 @@
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "7af2120fa64af095c4128eeaed076c6b414fa6485f76acd558b243f6731c31d2"
+      "sha256": "678b18b3ec49a30d5d62184a9c85d8bf6b88cc0dd1fcd18070ce644437022f7f"
     },
     {
       "path": "scripts/enroll-privilege-posix",
@@ -166,7 +166,7 @@
     },
     {
       "path": "scripts/lib/npm.sh",
-      "sha256": "1acf3ef2cc1f7f941f5a966638d8c8dd8c7c4bb0cd0a1f1f7fc09dbc8e5981a4"
+      "sha256": "09b2f01f20f9d56dfd709fbc324399607981038d1c66e5def83785fd1977db67"
     },
     {
       "path": "scripts/lib/plan-apply.sh",
