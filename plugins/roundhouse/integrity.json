@@ -42,7 +42,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "503faf02b7d290732d60f14f7348c0443e436e43ba17e658cc687599bfe280b3"
+      "sha256": "b1b72336151bd41d521d7c5b46d5389ef478e661b48e08364b80cdd844ad87ba"
     },
     {
       "path": "scripts/certify-ssh-node",
@@ -134,7 +134,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "5f79c27dfe5cb9683ce53f46205a706a0101dc89d7acc565d61f43ed7526040a"
+      "sha256": "3a777ee1d1f688d3cba891ddbd399fe0d83bd4cba245b1cdffe617457e29fc49"
     },
     {
       "path": "scripts/lib/fleet-store.sh",

@@ -2477,7 +2477,13 @@ fleet_run_full_pass() (
           # installed globals, so an absent package is left to the fast pass.
           full_npm_name=$(printf '%s\n' "$full_resolved" | jq -r '.name')
           if [ "$full_npm_queried" = false ]; then
-            full_npm_outdated=$(npm_global_outdated 2>/dev/null) || full_npm_outdated='{}'
+            # A failed query still skips every npm global this pass (nothing
+            # is known to be behind), but says so once rather than reading as
+            # "all current".
+            full_npm_outdated=$(npm_global_outdated 2>/dev/null) || {
+              full_npm_outdated='{}'
+              printf 'roundhouse: npm outdated query failed; npm globals are skipped this pass\n' >&2
+            }
             full_npm_queried=true
           fi
           full_npm_latest=$(printf '%s\n' "$full_npm_outdated" |

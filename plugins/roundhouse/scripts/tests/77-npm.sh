@@ -292,6 +292,15 @@ nfx_reset_state
     grep -Fq 'install --global npm@12.1.0' "$nfx_log" ||
       fail "one held updater stopped the rest of the npm pass ($nfx_local)"
   done
+  # A failed outdated query skips the npm globals but says so, once.
+  nfx_reset_state
+  NPM_STUB_OUTDATED_FAIL=1 nfx_run_full "$nfx_full_fold" "$nfx_full_defs" \
+    "$nfx_root/local-declared.json"
+  [ "$(grep -c 'npm outdated query failed; npm globals are skipped this pass' \
+    "$nfx_root/full-out")" -eq 1 ] ||
+    fail "a failed npm outdated query was not reported exactly once"
+  ! grep -Fq 'install --global' "$nfx_log" ||
+    fail "the full cadence installed an npm global after its outdated query failed"
   nfx_reset_state
   nfx_run_full "$nfx_full_fold" "$nfx_full_defs" "$nfx_root/local-declared.json"
   grep -Fq 'tool update node=' "$nfx_log" ||

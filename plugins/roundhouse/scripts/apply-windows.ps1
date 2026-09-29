@@ -784,21 +784,43 @@ function Assert-NpmRegistryCandidate([string]$Npm, [string]$Name, [string]$Candi
     }
 }
 
-function Invoke-NpmUpdater([object]$Operation, [string[]]$Argv) {
-    $Name = ([string]$Operation.id).Substring(4)
+function Get-SelectedNpm {
     $Npm = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $Npm -or [string]$Npm.Source -match 'fnm_multishells') { throw "Required command is unavailable: npm" }
-    Assert-NpmRegistryCandidate ([string]$Npm.Source) $Name ([string]$Operation.candidate_version)
-    $Path = Get-NpmUpdaterPath $Name $Argv[0]
-    & $Path @($Argv | Select-Object -Skip 1) *> $null
-    $Succeeded = $?
-    $NativeExitCode = $LASTEXITCODE
-    if (-not $Succeeded -or ($null -ne $NativeExitCode -and $NativeExitCode -ne 0)) {
-        $Failure = [InvalidOperationException]::new("Native command failed: $($Argv[0])")
-        $Failure.Data["ExitCode"] = $(if ($null -eq $NativeExitCode) { 1 } else { [int]$NativeExitCode })
-        throw $Failure
+    return [string]$Npm.Source
+}
+
+function Invoke-WithNpmOnPath([string]$NpmSource, [scriptblock]$Body) {
+    # npm.cmd and every global-prefix shim run the node.exe beside themselves
+    # or, failing that, the first node on PATH. The global prefix carries no
+    # node.exe, so without this an updater could run under an unrelated Node.
+    # The selected npm's own directory goes first for the call, then PATH is
+    # restored whatever happens.
+    $Saved = $env:PATH
+    try {
+        $env:PATH = (Split-Path -Parent $NpmSource) + [IO.Path]::PathSeparator + $Saved
+        return (& $Body)
+    } finally {
+        $env:PATH = $Saved
     }
-    return $(if ($null -eq $NativeExitCode) { 0 } else { [int]$NativeExitCode })
+}
+
+function Invoke-NpmUpdater([object]$Operation, [string[]]$Argv) {
+    $Name = ([string]$Operation.id).Substring(4)
+    $NpmSource = Get-SelectedNpm
+    Assert-NpmRegistryCandidate $NpmSource $Name ([string]$Operation.candidate_version)
+    $Path = Get-NpmUpdaterPath $Name $Argv[0]
+    return Invoke-WithNpmOnPath $NpmSource {
+        & $Path @($Argv | Select-Object -Skip 1) *> $null
+        $Succeeded = $?
+        $NativeExitCode = $LASTEXITCODE
+        if (-not $Succeeded -or ($null -ne $NativeExitCode -and $NativeExitCode -ne 0)) {
+            $Failure = [InvalidOperationException]::new("Native command failed: $($Argv[0])")
+            $Failure.Data["ExitCode"] = $(if ($null -eq $NativeExitCode) { 1 } else { [int]$NativeExitCode })
+            throw $Failure
+        }
+        $(if ($null -eq $NativeExitCode) { 0 } else { [int]$NativeExitCode })
+    }
 }
 
 function Invoke-Exact([string[]]$Argv) {
@@ -1129,6 +1151,14 @@ if ($SelfTest) {
             type = "package-upgrade"; kind = "package"; id = "npm:@example/tool"
             candidate_version = "2.0.0"; argv = @("npm", "install", "--global", "@example/tool@2.0.0")
         }
+        $NpmPathBefore = $env:PATH
+        $NpmSeenPath = Invoke-WithNpmOnPath (Join-Path (Join-Path ([IO.Path]::GetTempPath()) "rh-npm-dir") "npm.cmd") { $env:PATH }
+        if (-not $NpmSeenPath.StartsWith((Join-Path ([IO.Path]::GetTempPath()) "rh-npm-dir") + [IO.Path]::PathSeparator) -or
+            $env:PATH -ne $NpmPathBefore) {
+            throw "npm PATH binding self-test failed"
+        }
+        try { Invoke-WithNpmOnPath "C:\npm\npm.cmd" { throw "inner" } | Out-Null } catch { }
+        if ($env:PATH -ne $NpmPathBefore) { throw "npm PATH binding did not restore PATH after a failure" }
         $NpmArgv = @(Get-ExactArgv $NpmOperation $null $null)
         if ((ConvertTo-CanonicalJson $NpmArgv) -ne '["npm","install","--global","@example/tool@2.0.0"]' -or
             (Test-NpmUpdaterOperation $NpmOperation)) {
@@ -1813,6 +1843,8 @@ for ($Index = 0; $Index -lt @($Plan.operations).Count; $Index++) {
             $ExitCode = Invoke-CodexPluginHooks "update" $ExpectedArgv[3]
         } elseif (Test-NpmUpdaterOperation $Operation) {
             $ExitCode = Invoke-NpmUpdater $Operation $ExpectedArgv
+        } elseif ($Operation.type -eq "package-upgrade" -and [string]$Operation.id -like "npm:*") {
+            $ExitCode = Invoke-WithNpmOnPath (Get-SelectedNpm) { Invoke-Exact $ExpectedArgv }
         } else {
             $ExitCode = Invoke-Exact $ExpectedArgv
         }
