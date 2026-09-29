@@ -14,6 +14,11 @@ fleet_categories() {
   # (see fleet_unknown_categories), which is the deliberate asymmetry: an
   # unknown key inside a known item cannot under-converge, an unknown category
   # can.
+  #
+  # `runtimes` holds exactly one item, `runtimes.node`: the host-default Node
+  # that runs the managed npm globals (§5.1.2's amendment). A store that
+  # declares it must not reach a host older than the build that knows it; such
+  # a host holds everything and alerts, which is this rule working.
   cat <<'EOF'
 policy
 packages
@@ -24,6 +29,7 @@ hooks
 mcp_servers
 config_files
 projects
+runtimes
 EOF
 }
 
@@ -695,6 +701,32 @@ fleet_resolve_package() {
         fi
         [ "$resolve_update_ok" = true ] || {
           resolve_detail="npm update for $resolve_concrete must be argv: a bin of the package and literal arguments"
+          continue
+        }
+      fi
+      # `node_switch:` names the package's own post-switch hooks (a list of
+      # argv, each a bin of the package) that must run after a Node runtime
+      # switch carries it to a new prefix. Same grammar and the same trust
+      # rule as `update:`: the definition can only REQUIRE a hook; this host's
+      # config.json `node_switch_hooks` decides whether it runs.
+      if printf '%s\n' "$resolve_spec" | jq -e '.attributes | has("node_switch")' >/dev/null; then
+        resolve_hooks_ok=false
+        if printf '%s\n' "$resolve_spec" | jq -e '.attributes.node_switch |
+          type == "array" and length >= 1 and length <= 4 and
+          all(.[]; type == "array" and length >= 1 and all(.[]; type == "string"))' >/dev/null; then
+          resolve_hooks_ok=true
+          while IFS= read -r resolve_hook; do
+            [ -n "$resolve_hook" ] || continue
+            resolve_update=()
+            while IFS= read -r resolve_update_arg; do
+              resolve_update+=("$resolve_update_arg")
+            done < <(printf '%s\n' "$resolve_hook" | jq -r '.[]')
+            [ "$(printf '%s\n' "$resolve_hook" | jq 'length')" -eq "${#resolve_update[@]}" ] &&
+              npm_updater_argv_valid "${resolve_update[@]}" || resolve_hooks_ok=false
+          done < <(printf '%s\n' "$resolve_spec" | jq -c '.attributes.node_switch[]')
+        fi
+        [ "$resolve_hooks_ok" = true ] || {
+          resolve_detail="npm node_switch for $resolve_concrete must be a list of argv: bins of the package and literal arguments"
           continue
         }
       fi

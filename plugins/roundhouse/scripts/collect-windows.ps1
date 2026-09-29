@@ -2153,9 +2153,66 @@ function Get-NpmUpdaterPath([string]$Npm, [string]$Name, [string]$Bin) {
     return $null
 }
 
+# The Node runtime on Windows is winget's OpenJS.NodeJS (the Current line),
+# held to one major with a gating pin (`winget pin add --id OpenJS.NodeJS
+# --version 26.*`). Its record carries that pin and where node.exe lives: the
+# MSI installs machine-wide, and a machine-scope upgrade needs elevation, which
+# the ordinary sealed lane refuses (only the protected
+# winget.upgrade-machine-package.v1 action may carry it).
+function Get-WingetPinFromLines([string[]]$Lines, [string]$PackageId) {
+    foreach ($Line in $Lines) {
+        $Text = [string]$Line
+        if ($Text -cnotmatch ('(^|\s)' + [regex]::Escape($PackageId) + '(\s|$)')) { continue }
+        if ($Text -cmatch '\s(?<type>Pinning|Blocking|Gating)(\s+(?<version>[0-9A-Za-z.*+-]{1,64}))?\s*$') {
+            return [ordered]@{
+                type = [string]$Matches.type
+                version = $(if ($Matches.version) { [string]$Matches.version } else { $null })
+            }
+        }
+    }
+    return $null
+}
+
+function Get-NodeInstallScope([string]$NodePath) {
+    if ([string]::IsNullOrWhiteSpace($NodePath)) { return $null }
+    foreach ($Root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not [string]::IsNullOrWhiteSpace($Root) -and
+            $NodePath.StartsWith($Root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            return "machine"
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA) -and
+        $NodePath.StartsWith($env:LOCALAPPDATA.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        return "user"
+    }
+    return $null
+}
+
+function Invoke-NodeRuntimeSelfTest {
+    $Pin = Get-WingetPinFromLines @(
+        "Name    Id            Version Source Pin type Pinned version",
+        "-------------------------------------------------------------",
+        "Node.js OpenJS.NodeJS 26.7.0  winget Gating   26.*") "OpenJS.NodeJS"
+    if ($null -eq $Pin -or $Pin.type -cne "Gating" -or $Pin.version -cne "26.*") {
+        throw "self_test_node_gating_pin_not_parsed"
+    }
+    $Blocking = Get-WingetPinFromLines @("Node.js OpenJS.NodeJS 26.7.0 winget Blocking") "OpenJS.NodeJS"
+    if ($null -eq $Blocking -or $Blocking.type -cne "Blocking" -or $null -ne $Blocking.version) {
+        throw "self_test_node_blocking_pin_not_parsed"
+    }
+    if ($null -ne (Get-WingetPinFromLines @("Node.js OpenJS.NodeJS.LTS 24.1.0 winget Gating 24.*") "OpenJS.NodeJS")) {
+        throw "self_test_node_pin_matched_another_package"
+    }
+    if ($null -ne (Get-WingetPinFromLines @("There are no pins configured.") "OpenJS.NodeJS")) {
+        throw "self_test_node_pin_invented"
+    }
+    if ($null -ne (Get-NodeInstallScope "")) { throw "self_test_node_scope_invented" }
+}
+
 if ($SelfTest) {
     Invoke-WindowsSftpReceiptSelfTest
     Invoke-NpmNodeSelfTest
+    Invoke-NodeRuntimeSelfTest
     exit 0
 }
 
@@ -2246,8 +2303,7 @@ if (Test-Section "packages") {
                             } else {
                                 $null
                             }
-                            Add-Record -Kind "package" -Id ("winget:" + $Name) -Status "present" `
-                                -Confidence $(if ($CandidateQueryAuthoritative) { "high" } else { "medium" }) -Data @{
+                            $PackageData = @{
                                 manager = "winget"
                                 name = $Name
                                 installed_version = Limit-Text $Package.Version
@@ -2256,7 +2312,25 @@ if (Test-Section "packages") {
                                     $null -ne $Candidate -and $Candidate -ne [string]$Package.Version
                                 } else { $null }
                                 source = Limit-Text $Source.SourceDetails.Name
-                            } -Evidence @(@{ source = "package-manager"; method = "winget-export+upgrade-list" })
+                            }
+                            if ([string]$Package.PackageIdentifier -ceq "OpenJS.NodeJS") {
+                                # The Node runtime: its gating pin (the line it
+                                # is held to) and whether node.exe is installed
+                                # machine-wide, which decides the elevation an
+                                # upgrade needs.
+                                $PinLines = @(& winget pin list --id OpenJS.NodeJS --exact `
+                                    --accept-source-agreements --disable-interactivity 2>$null)
+                                $PinSucceeded = $? -and ($null -eq $LASTEXITCODE -or $LASTEXITCODE -eq 0)
+                                $NodeCommand = Get-Command node -CommandType Application -ErrorAction SilentlyContinue |
+                                    Select-Object -First 1
+                                $PackageData.pin = $(if ($PinSucceeded) { Get-WingetPinFromLines $PinLines "OpenJS.NodeJS" } else { $null })
+                                $PackageData.pin_query = $(if ($PinSucceeded) { "ok" } else { "failed" })
+                                $PackageData.install_scope = Get-NodeInstallScope $(if ($null -ne $NodeCommand) { [string]$NodeCommand.Source } else { "" })
+                                $PackageData.line = Limit-Text (([string]$Package.Version) -split '\.')[0]
+                            }
+                            Add-Record -Kind "package" -Id ("winget:" + $Name) -Status "present" `
+                                -Confidence $(if ($CandidateQueryAuthoritative) { "high" } else { "medium" }) -Data $PackageData `
+                                -Evidence @(@{ source = "package-manager"; method = "winget-export+upgrade-list" })
                         }
                     }
                 }

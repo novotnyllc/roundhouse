@@ -160,6 +160,8 @@ if want_section 76; then . "$script_dir/tests/76-mcp-siding.sh"; fi
 if want_section 77; then . "$script_dir/tests/77-npm.sh"; fi
 # shellcheck source=tests/78-fleet-parked.sh
 if want_section 78; then . "$script_dir/tests/78-fleet-parked.sh"; fi
+# shellcheck source=tests/79-node-runtime.sh
+if want_section 79; then . "$script_dir/tests/79-node-runtime.sh"; fi
 # shellcheck source=tests/90-jj-bootstrap.sh
 if want_section 90; then . "$script_dir/tests/90-jj-bootstrap.sh"; fi
 # shellcheck source=tests/91-jj-integrity.sh

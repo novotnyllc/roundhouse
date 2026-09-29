@@ -1126,8 +1126,139 @@ fleet_run_package_managers() {
   fi
 }
 
+fleet_run_node_plan() (
+  # `fleet_run_node_plan FOLD DEFS MANAGERS GLOBALS` — what a Node switch on
+  # this host must carry and run, as one JSON object:
+  #
+  #   carry      [{name, version}] — every ENABLED package in the fold that
+  #              resolves to npm here AND is installed under the current
+  #              default (GLOBALS, `{name: version}`), at that installed
+  #              version. The carry reproduces what exists; it never adds a
+  #              package, so a definition edit cannot smuggle one in.
+  #   hooks      [{package, argv}] — the post-switch hooks this host's own
+  #              config.json declares (`node_switch_hooks`) for carried
+  #              packages. Only local configuration introduces a command.
+  #   held       null, or why the switch must not run: a definition requires
+  #              a `node_switch` hook this host has not declared identically.
+  #   unmanaged  globals under the current default that no enabled package
+  #              manages. They stay under the old version and are reported.
+  plan_fold=$1
+  plan_defs=$2
+  plan_managers=$3
+  plan_globals=$4
+  plan_local=$(jq -c '.node_switch_hooks // {}' "$(config_path)" 2>/dev/null) ||
+    plan_local='{}'
+  [ -n "$plan_local" ] || plan_local='{}'
+  plan_entries='[]'
+  while IFS= read -r plan_package; do
+    [ -n "$plan_package" ] || continue
+    [ "$(fleet_run_state_of "$(printf '%s\n' "$plan_fold" |
+      jq -c --arg p "$plan_package" '.packages[$p]')")" = enabled ] || continue
+    # shellcheck disable=SC2086 # the host's package_managers list, in order
+    plan_resolved=$(fleet_resolve_package "$plan_defs" "$plan_package" $plan_managers) || continue
+    [ "$(printf '%s\n' "$plan_resolved" | jq -r '.manager')" = npm ] || continue
+    plan_entries=$(printf '%s\n' "$plan_entries" | jq -c --arg logical "$plan_package" \
+      --argjson resolved "$plan_resolved" \
+      '. + [{logical: $logical, name: $resolved.name,
+        wanted: ($resolved.attributes.node_switch // [])}]')
+  done <<EOF
+$(printf '%s\n' "$plan_fold" | jq -r '(.packages // {}) | keys[]')
+EOF
+  jq -cn --argjson entries "$plan_entries" --argjson globals "$plan_globals" \
+    --argjson local "$plan_local" '
+    [$entries[] | select($globals[.name] != null)] as $managed |
+    ($managed | unique_by(.name)) as $carried |
+    {
+      carry: [$carried[] | {name, version: $globals[.name]}],
+      hooks: [$carried[] | .name as $n |
+        ($local["npm:" + $n] // [])[] | {package: ("npm:" + $n), argv: .}],
+      held: (first($managed[] | . as $e |
+        ($local["npm:" + .name] // []) as $declared |
+        select(any($e.wanted[]; . as $w | any($declared[]; . == $w) | not)) |
+        "packages.\(.logical) requires node_switch hook(s) \($e.wanted | tojson) that this host'"'"'s config.json node_switch_hooks does not declare") // null),
+      unmanaged: ([$globals | keys[]] - [$carried[].name])
+    }'
+)
+
+fleet_run_node_converge() (
+  # `fleet_run_node_converge VALUE DEFS FOLD MANAGERS MODE` — bring fnm's
+  # default Node to what `runtimes.node` declares (lib/node-runtime.sh).
+  #
+  #   apply  the reviewed desired-state apply (fast pass, first time or on a
+  #          changed value): switch only when the default is outside the
+  #          declared major, or is not the pinned version
+  #   full   the full cadence: also move to the newest release inside the
+  #          major, which fnm never does on its own
+  #
+  # Exit 0 converged (or already there), 75 held. Every hold prints a line
+  # naming the reason; nothing is ever silently skipped.
+  node_value=$1
+  node_defs=$2
+  node_fold=$3
+  node_managers=$4
+  node_mode=$5
+  node_hold() {
+    printf '  hold  runtimes.node — %s\n' "$1"
+    exit 75
+  }
+  node_spec=$(node_runtime_spec "$node_value") ||
+    node_hold 'needs `major:` or an exact `version:` (and a version inside that major)'
+  node_root=$(node_fnm_root) ||
+    node_hold 'no fnm default Node on this host (fnm with a default alias)'
+  node_fnm_bin >/dev/null || node_hold 'fnm is not installed on this host'
+  node_current=$(node_fnm_default "$node_root") ||
+    node_hold "the fnm default alias in $node_root does not name an installed version"
+  node_major=$(printf '%s\n' "$node_spec" | jq -r '.major')
+  node_pinned=$(printf '%s\n' "$node_spec" | jq -r '.version // empty')
+  if [ -n "$node_pinned" ]; then
+    [ "$node_current" != "$node_pinned" ] || exit 0
+    node_target=$node_pinned
+  else
+    node_in_line=false
+    [ "$(node_version_major "$node_current")" != "$node_major" ] || node_in_line=true
+    [ "$node_mode" != apply ] || [ "$node_in_line" != true ] || exit 0
+    node_target=$(node_fnm_remote_latest "$node_root" "$node_major") ||
+      node_hold "cannot list the published Node $node_major releases"
+    if [ "$node_in_line" = true ] && ! node_version_newer "$node_target" "$node_current"; then
+      exit 0
+    fi
+  fi
+  # Without the fold there is no way to know which globals are managed, and a
+  # switch that carried nothing would strand every one of them.
+  [ -n "$node_fold" ] ||
+    node_hold 'no folded desired state to compute the managed npm globals from'
+  node_globals=$(npm_global_list) ||
+    node_hold "the npm global inventory under $node_current failed"
+  node_plan=$(fleet_run_node_plan "$node_fold" "$node_defs" "$node_managers" "$node_globals") ||
+    node_hold 'could not compute the managed npm globals to carry'
+  node_plan_held=$(printf '%s\n' "$node_plan" | jq -r '.held // empty')
+  [ -z "$node_plan_held" ] || node_hold "$node_plan_held"
+  printf '  switch runtimes.node %s -> %s (carrying %s)\n' "$node_current" "$node_target" \
+    "$(printf '%s\n' "$node_plan" | jq -r '[.carry[] | "\(.name)@\(.version)"] |
+      if length == 0 then "no managed npm globals" else join(" ") end')"
+  node_status=0
+  node_switch_out=$(node_runtime_switch "$node_target" \
+    "$(printf '%s\n' "$node_plan" | jq -c '.carry')" \
+    "$(printf '%s\n' "$node_plan" | jq -c '.hooks')" 2>&1) || node_status=$?
+  [ -z "$node_switch_out" ] || printf '%s\n' "$node_switch_out" | sed 's/^/        /'
+  [ "$node_status" -eq 0 ] &&
+    [ "$(node_fnm_default "$node_root" 2>/dev/null)" = "$node_target" ] ||
+    node_hold "switch to $node_target failed (see above); the fnm default is $(node_fnm_default "$node_root" 2>/dev/null || printf unknown)"
+  printf '%s\n' "$node_plan" | jq -r --arg old "$node_current" '
+    select(.unmanaged | length > 0) |
+    "  note  runtimes.node — unmanaged npm globals stay under \($old): \(.unmanaged | join(" "))"'
+  node_stale=$(node_fnm_installed "$node_root" | grep -Fvx "$node_target" | tr '\n' ' ')
+  [ -z "$node_stale" ] ||
+    printf '  note  runtimes.node — older Node versions remain installed (never removed here): %s\n' \
+      "${node_stale% }"
+  exit 0
+)
+
 fleet_run_apply_item() {
-  # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
+  # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS [FOLD]
+  #
+  # FOLD is the host's folded desired state. Only `runtimes.node` reads it: a
+  # Node switch carries the npm globals the fold manages.
   #
   # Exit 0 applied, 70 SATISFIED, 75 held. Presence for manager-installed items
   # is always the manager's own command; only STATE falls back to a config
@@ -1367,6 +1498,14 @@ fleet_run_apply_item() {
       # surface that lets a human SEE a hand-edit, not one that reverts it.
       fleet_config_drift "$2" "$fleet_run_name" "$5"
       return 0
+      ;;
+    runtimes)
+      # Exactly one runtime is managed: the host-default Node under the
+      # managed npm globals (§5.1.2's amendment). Any other name is a runtime
+      # this build has no position on, and is held rather than satisfied.
+      [ "$fleet_run_name" = node ] || return 75
+      [ "$(fleet_run_state_of "$5")" = enabled ] || return 70
+      fleet_run_node_converge "$5" "$3" "${7:-}" "$6" apply
       ;;
     agents | mcp_servers | projects)
       # The B-3 categories, NAMED rather than caught by a wildcard: no
@@ -1977,8 +2116,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fleet_run_verdict_write "$run_item" "$run_digest" "$run_reason"
     run_status=0
     fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
-      "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" ||
-      run_status=$?
+      "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" \
+      "$run_fold" || run_status=$?
     case $run_status in
       0)
         # An unwritable applied/<h>.yaml is loud and narrow, never fatal: the
@@ -2436,6 +2575,23 @@ fleet_run_full_pass() (
   # export is a read of a commit and nothing may write back through it.
   fleet_seed_command || :
   fleet_run_proposals "$full_store" "$full_host" "$full_layers" "$6" || :
+
+  # The Node runtime under the managed npm globals, BEFORE the package pass:
+  # fnm never moves the default within a major on its own, so this pass does,
+  # to the newest release in the declared major (or back to the pinned exact
+  # version after a drift). Running it first means the npm pass below then
+  # sees the globals under the runtime they will actually run on. The same
+  # holds as every other item apply: a held or canary-waiting `runtimes.node`
+  # is not touched by maintenance.
+  full_runtime=$(printf '%s\n' "$full_fold" | jq -c '(.runtimes // {}).node // empty')
+  if [ -n "$full_runtime" ] &&
+    [ "$(fleet_run_state_of "$full_runtime")" = enabled ] &&
+    ! { [ -n "$full_hold_dir" ] &&
+      fleet_run_item_is_held runtimes.node "" \
+        "$full_hold_dir/sigholds" "$full_hold_dir/verdicts"; }; then
+    fleet_run_node_converge "$full_runtime" "$full_defs" "$full_fold" \
+      "$(fleet_run_package_managers "$full_fold" "$full_host")" full </dev/null || :
+  fi
 
   # The fleet-update contract, as a predicate: an unpinned package is kept
   # current by this pass — that is what anyone gets by doing nothing — and a
@@ -2998,8 +3154,8 @@ fleet_apply_command() (
   fleet_run_apply_item "$apply_store" "$apply_host" \
     "$(fleet_definitions_load "$apply_store")" "$apply_item" \
     "$(fleet_item_value "$apply_fold" "$apply_item")" \
-    "$(fleet_run_package_managers "$apply_fold" "$apply_host")" ||
-    apply_status=$?
+    "$(fleet_run_package_managers "$apply_fold" "$apply_host")" \
+    "$apply_fold" || apply_status=$?
   apply_now=$(fleet_now)
   case $apply_status in
     0)

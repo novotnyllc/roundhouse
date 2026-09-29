@@ -439,7 +439,8 @@ name (`superpowers/brainstorming`) resolves through its plugin; a bare name is a
 standalone item (§5.1.3). Categories are a
 closed set:
 `policy`, `packages`, `plugins`, `skills`, `agents`, `hooks`, `mcp_servers`,
-`config_files`, `projects`. Adaptive reading, with a deliberate asymmetry:
+`config_files`, `projects`, `runtimes` (the last added 2026-09-29, one item,
+`runtimes.node`; §5.1.2). Adaptive reading, with a deliberate asymmetry:
 
 - **unknown key *inside* a known item → ignored** (cannot under-converge)
 - **unknown *category*, or an unrecognised layer directory → every item held,
@@ -754,10 +755,41 @@ would trade a two-line definition for a resolver nobody asked for.
 
 *(Amendment, 2026-09-28: global npm packages are now a package manager, `npm`,
 opt-in per package through an `npm:` definition entry; see
-[`2026-09-28-npm-global-manager.md`](2026-09-28-npm-global-manager.md). That
-document's §7 proposes narrowing this exclusion so fnm can converge the single
-host-default Node. Until that amendment is accepted, the paragraph above
-stands.)*
+[`2026-09-28-npm-global-manager.md`](2026-09-28-npm-global-manager.md).)*
+
+**Amendment, 2026-09-29: one runtime is in scope — the host-default Node that
+runs the managed npm globals.** This is a narrow, explicit exception, not a
+language-version-manager feature. It covers exactly one item,
+`runtimes.node`, in a new category, `runtimes`, and exactly one runtime source
+per platform: fnm's `default` alias on POSIX (fnm is itself a Homebrew or
+Linuxbrew formula) and winget's `OpenJS.NodeJS` on Windows. Per-project and
+per-shell selection (`.nvmrc`, `fnm use`, `nvm`, `pyenv`, `rbenv`, `asdf`)
+stay out of scope, and no other runtime is added by this amendment.
+
+Why the exception, and why now: nothing owned Node, so the fleet drifted —
+Node 24 on Windows while POSIX ran 26, and fnm defaults left on whatever
+version each host happened to install, because fnm never moves within a major
+on its own. That was tolerable while Node was only a tool. It stopped being
+tolerable when npm globals became managed packages: under fnm every global
+lives under one Node version's prefix, so the runtime decides where the
+managed packages are and which of them exist. A package manager whose floor
+moves without an owner is not converged.
+
+```yaml
+runtimes:
+  node: {major: 26}          # the newest release in the major; the normal form
+# or, narrower, per host by ordinary layering:
+runtimes:
+  node: {version: "26.7.0"}  # an exact pin, the same opt-out as a package version:
+```
+
+A switch is one operation with its own failure handling (install, move the
+default, carry the managed globals at their installed versions, run declared
+post-switch hooks, verify, and restore the previous default on any failure),
+and old versions are never removed by it. The mechanics, the trust rule for
+hooks (only the host's own `config.json` introduces a command) and the
+Windows elevation boundary are in §7 of
+[`2026-09-28-npm-global-manager.md`](2026-09-28-npm-global-manager.md).
 
 #### 5.1.3 The four agent-surface categories resolve the same way
 
@@ -3573,6 +3605,7 @@ category states its own semantics, because the honest answer differs:
 | `config_files` | **Reversible.** Managed keys are restored to their prior values from `applied/<host>.yaml`, which records exactly what roundhouse wrote. Unmanaged keys are untouched, as always. |
 | `mcp_servers`, `hooks` | **Reversible for configuration; not for effects.** Removing a hook stops it firing; it does not undo what it already did. |
 | `projects` | **Not reversible by this system.** Reverting a project entry stops managing it; it does not restore repository state. Says so here and in the category docs. |
+| `runtimes` | **Reversible.** Reverting `runtimes.node` switches the default back the same way it moved forward; no switch ever removes a Node version, so the previous one is still installed. |
 
 **Anything non-reversible must say so in its category documentation**, and the
 apply-time review shows that flag before the operator or agent passes the revert.

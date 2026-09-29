@@ -12,6 +12,9 @@ observed_at=${ROUNDHOUSE_OBSERVED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
 # the desired-state run, so all three agree on which Node owns the globals.
 # shellcheck source=lib/npm.sh
 . "$script_dir/lib/npm.sh"
+# …and so is the fnm runtime under it (the `fnm:node` record).
+# shellcheck source=lib/node-runtime.sh
+. "$script_dir/lib/node-runtime.sh"
 
 has_section() {
   [ "$sections" = all ] || case ",$sections," in *",$1,"*) return 0 ;; *) return 1 ;; esac
@@ -2113,8 +2116,73 @@ NPM_UPDATERS
                       elif $unproven["npm:"+$name] == true then "unproven" else null end)},
                   evidence:[{source:"package-manager",method:"npm-ls-global+outdated"}],errors:[]}'
           else
+            npm_installed=
             emit error packages:npm unavailable high '{}' '[]' \
               '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"npm global inventory failed"}]'
+          fi
+          # The runtime under those globals, when fnm provides it: `fnm:node`,
+          # a package record whose installed_version is fnm's default and
+          # whose candidate is the newest published release in that major.
+          # It also binds the global set (`globals`) and the prefix, so a
+          # sealed switch plan stops verifying the moment either changes.
+          if node_root=$(node_fnm_root 2>/dev/null) &&
+            node_default=$(node_fnm_default "$node_root" 2>/dev/null); then
+            node_line=$(node_version_major "$node_default")
+            node_installed_list=$(node_fnm_installed "$node_root" |
+              jq -Rsc 'split("\n") | map(select(length > 0))')
+            node_prefix=$(node_fnm_prefix "$node_root" "$node_default" | clip) || node_prefix=
+            node_candidate=
+            node_candidate_known=false
+            if node_candidate=$(node_fnm_remote_latest "$node_root" "$node_line" 2>/dev/null); then
+              node_candidate_known=true
+              node_version_newer "$node_candidate" "$node_default" || node_candidate=
+            else
+              node_candidate=
+              emit error packages:fnm-updates unavailable high '{}' '[]' \
+                '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"fnm list-remote inventory failed"}]'
+            fi
+            # Configured post-switch hooks, proven the same way as updaters:
+            # argv[0] must be a bin of the installed package. A sealed switch
+            # refuses a carried package whose hook is unproven here.
+            node_hooks_unproven='[]'
+            while IFS= read -r node_hook_entry; do
+              [ -n "$node_hook_entry" ] || continue
+              node_hook_name=$(printf '%s\n' "$node_hook_entry" | jq -r '.key | sub("^npm:"; "")')
+              [ -n "$npm_installed" ] &&
+                printf '%s\n' "$npm_installed" | jq -e --arg name "$node_hook_name" 'has($name)' \
+                  >/dev/null || continue
+              while IFS= read -r node_hook_bin; do
+                [ -n "$node_hook_bin" ] || continue
+                npm_updater_path "$node_hook_name" "$node_hook_bin" >/dev/null 2>&1 && continue
+                node_hooks_unproven=$(printf '%s\n' "$node_hooks_unproven" |
+                  jq -c --arg key "npm:$node_hook_name" '. + [$key] | unique')
+              done <<NODE_HOOK_BINS
+$(printf '%s\n' "$node_hook_entry" | jq -r '.value[][0]')
+NODE_HOOK_BINS
+            done <<NODE_HOOKS
+$(jq -c '(.node_switch_hooks // {}) | to_entries[]' "$config")
+NODE_HOOKS
+            jq -cn \
+              --arg schema roundhouse.inventory --argjson schema_version 1 \
+              --arg snapshot_id "$snapshot_id" --arg host_id "$host_id" \
+              --arg observed_at "$observed_at" --arg default "$node_default" \
+              --arg candidate "$node_candidate" --argjson known "$node_candidate_known" \
+              --arg line "$node_line" --argjson installed "$node_installed_list" \
+              --arg root "$node_root" --arg prefix "$node_prefix" \
+              --arg globals "${npm_installed:-}" --argjson unproven "$node_hooks_unproven" '
+                {schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
+                  host_id:$host_id,kind:"package",id:"fnm:node",observed_at:$observed_at,
+                  status:"present",confidence:(if $known then "high" else "medium" end),
+                  data:{manager:"fnm",name:"node",installed_version:$default,
+                    candidate_version:(if $candidate == "" then null else $candidate end),
+                    update_available:(if $known then $candidate != "" else null end),
+                    line:$line,installed_versions:$installed,
+                    stale_versions:($installed - [$default]),
+                    fnm_dir:($root[0:8192]),
+                    prefix:(if $prefix == "" then null else $prefix end),
+                    globals:(if $globals == "" then null else ($globals | fromjson) end),
+                    switch_hooks_unproven:$unproven},
+                  evidence:[{source:"package-manager",method:"fnm-default-alias+list-remote"}],errors:[]}'
           fi
         else
           emit error packages:npm unavailable high '{}' '[]' \

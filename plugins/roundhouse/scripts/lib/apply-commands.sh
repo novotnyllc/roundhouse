@@ -573,7 +573,14 @@ apply_plan_command() {
         . as $operation |
         any($records[]; .kind == $operation.kind and .id == $operation.id and
           .status == "present" and
-          .data.installed_version == $operation.candidate_version)
+          .data.installed_version == $operation.candidate_version and
+          # A Node switch is complete only when every carried global is
+          # present under the NEW default at its carried version.
+          (if $operation.id == "fnm:node" then
+             (.data.globals | type == "object") and
+             (.data.globals as $globals |
+               all($operation.carry[]; $globals[.name] == .version))
+           else true end))
       elif (.type == "auth-reauth" or .type == "auth-install") then
         . as $operation |
         any($records[]; .kind == $operation.kind and .id == $operation.id and
@@ -681,7 +688,12 @@ validate_legacy_ssh_plan_file() {
     (.operations | type == "array" and length > 0 and
       all(.[];
         .type != "semantic-action" and
-        (if .type == "package-upgrade" then
+        (if .type == "package-upgrade" and .id == "fnm:node" then
+           # A Node runtime switch carries its exact globals and hooks; their
+           # shapes were checked at seal time and are checked again by
+           # verify-preconditions and the executor on the target.
+           exact(["argv","candidate_version","carry","hooks","id","kind","type"])
+         elif .type == "package-upgrade" then
            exact(["argv","candidate_version","id","kind","type"])
          elif .type == "chezmoi-apply" and has("targets") then
            exact(["argv","id","kind","targets","type"]) or

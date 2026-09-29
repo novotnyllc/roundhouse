@@ -1,7 +1,8 @@
 # npm global packages, and the Node runtime under them
 
 Status: sections 1–6 shipped in 0.9.27. Section 7 (Node runtime convergence)
-and section 8 (`~/.npmrc`) are follow-up design, not implemented.
+shipped in 0.9.29, with the deferrals listed in §7.8. Section 8 (`~/.npmrc`)
+is follow-up design, not implemented.
 
 ## 1. Problem
 
@@ -216,6 +217,26 @@ refused without executing when the registry `latest` has moved, apply through
 the updater, and the Windows collector under pwsh. `apply-windows.ps1
 -SelfTest` covers the Windows argv allowlist and the registry-candidate check.
 
+`scripts/tests/79-node-runtime.sh` covers §7 with a stub fnm and a stub npm
+that keeps its globals per prefix: version grammar and numeric ordering, the
+`runtimes.node` grammar, the release list (LTS codenames, a failed query),
+switch refusals that change nothing (a carry not installed, a hook that is not
+a bin of its package or of a carried one, shell syntax), restore of the
+default after a failed carry, a failed hook and a failed install, a
+successful switch that carries exactly the managed globals and runs the hook
+under the new node while leaving the old version and its globals intact, the
+carry and hook plan (store-only and mismatched hooks hold, host-only hooks
+run, unmanaged globals reported), convergence on the reviewed apply and the
+full cadence (in-line no-op, newest in line, exact pin both ways, a new
+major, unreachable release list, unusable value, no fnm), the category arm,
+the full cadence ordering the switch before the npm pass and skipping a held
+item, config validation and the POSIX-only worker projection, the `fnm:node`
+collector record, sealing refusals (omitted, extra or unproven hooks, a wrong
+carry, argv, candidate or runtime id), a failed sealed switch that restores
+and reports `partial` and invalidates its plan, a completed sealed switch with
+its post-state, and, under pwsh, the Windows pin and scope record and the
+machine-scope hold. `collect-windows.ps1 -SelfTest` covers the pin parser.
+
 ## 6. Known limits
 
 - `npm outdated`'s `latest` can be lower than an installed prerelease. The
@@ -227,58 +248,213 @@ the updater, and the Windows collector under pwsh. `apply-windows.ps1
   check and the updater's own lookup. The post-check turns that into
   `partial` (2.4).
 
-## 7. Follow-up: converge the Node runtime (not implemented)
+## 7. The Node runtime (implemented in 0.9.29)
 
-Deferred because it cuts across a decision the storage design states
-explicitly. §5.1.2 of `2026-08-06-dsc-storage-design-v2.md` puts language
-version managers (nvm, pyenv, rbenv, asdf) out of scope. fnm is used here as
-the host's Node source, not for per-project selection, but that is an
-amendment to §5.1.2 and should be made deliberately rather than slipped in
-with a package manager. Carrying globals across a Node upgrade is also a
-multi-step mutation with its own failure modes.
+The storage design's §5.1.2 now carries the amendment this needed: one
+runtime, the host-default Node that runs the managed npm globals, is in scope.
+Per-project and per-shell selection stay out. The first draft of this section
+proposed a logical package `node` with a new `stream` pin in
+`definitions.yaml`. What shipped differs where the draft could not do the job,
+and each difference is noted below.
 
-Proposed shape:
+### 7.1 Desired state: `runtimes.node`
 
-1. **Amend §5.1.2.** A version manager may be a package manager for the
-   single host-default runtime it selects (`fnm default`). Per-project and
-   per-shell selection stay out of scope.
-2. **Logical package `node`, stream-pinned.**
-   `node: {version: "26", fnm: node, winget: OpenJS.NodeJS}`. Here `version`
-   is a stream (major), not an exact pin. That is a new pin mechanism,
-   `stream`, allowed only for `fnm` and `winget`.
-3. **POSIX `fnm` manager.**
-   - Inventory: `fnm list`, the `fnm default` alias target, and the newest
-     remote in the stream (`fnm ls-remote` filtered to `v26.*`). Emit
-     `fnm:node` with `installed_version` set to the default version and
-     `candidate_version` set to the newest stream version.
-   - Sealed operation `runtime-upgrade` (a new type, so it cannot be confused
-     with a package upgrade), `id: "fnm:node"`, with fixed argv
-     `["fnm","install","<v>"]` then `["fnm","default","<v>"]`. The executor
-     knows only these two.
-   - **Global carry-over, inside the same operation:** before switching,
-     record the old default's globals (`npm ls -g --json --depth=0` through
-     the durable npm). After `fnm default <v>`, the durable npm resolves to
-     the new prefix. Install the same set there at the same versions
-     (`npm install --global a@x b@y …`, one exact list). Declared updaters
-     are not used for carry-over; an exact reinstall is.
-   - Post-state: the default equals `<v>`, and every recorded global is
-     present under the new prefix at its recorded version. On failure, point
-     `fnm default` back at the old version, which is never uninstalled here
-     (removal is the separately capped decision §10.3 already describes).
-     Report `partial` with both prefixes.
-   - The precondition digest already covers `prefix` and `node_version` on
-     every `npm:*` record, so npm plans sealed before a runtime upgrade stop
-     verifying after it.
-4. **Windows.** winget `OpenJS.NodeJS` already resolves through the existing
-   winget manager. What is missing is the stream pin. Map `version: "26"` to
-   `winget pin add --id OpenJS.NodeJS --version 26.*` (idempotent, reported
-   by `winget pin list`) and upgrade within the stream with the existing
-   exact-version `winget.upgrade-machine-package.v1` path. `%APPDATA%\npm`
-   survives the upgrade, so Windows needs no carry-over. Only a post-upgrade
-   `npm ls` check is needed.
-5. **Parity.** A `fleet-doctor` row comparing `node_version` and each
-   `npm:*` `installed_version` across hosts. Both are already in the
-   inventory records.
+A new folded category, `runtimes`, with exactly one item:
+
+```yaml
+runtimes:
+  node: {major: 26}            # the newest published release in major 26
+runtimes:
+  node: {version: "26.7.0"}    # an exact pin
+```
+
+- **Folded, not a definition.** Definitions sit outside the fold, so a
+  `version: "26"` there could not be overridden per host. A category in the
+  four layers gets per-host (or per-group, per-OS) override by ordinary
+  layering, plus the review, canary gate and journal every item gets.
+- **`major:` is the normal form.** fnm never moves within a major on its own,
+  and the Windows pin is a major (`26.*`). Security releases arrive as patch
+  releases; an exact version as the default form would need a store edit for
+  each one, which is the drift this exists to end. `version:` is the opt-out,
+  exactly as `version:` is for a package. Both at once must agree (the pin
+  inside the major), or the item holds. `version: null` in a narrower layer
+  drops a wider layer's pin.
+- **A category, not a package.** A `packages.node` item would reach the
+  resolver's default rule on hosts older than this change (`brew install
+  node`, the very Homebrew-node hazard §2.1 describes) and would need `fnm`
+  in `package_managers`, where it would then be offered every other package.
+  The cost of a new category is the documented one: a host that predates it
+  holds everything until it is upgraded, so `runtimes:` enters the store only
+  once every host runs 0.9.29 or later.
+- Any other `runtimes.<name>` holds. `runtimes.node: disabled` is satisfied
+  and changes nothing.
+
+### 7.2 Inventory
+
+POSIX (`collect-posix`, on hosts that list `npm`): a `package` record
+`fnm:node` next to the `npm:*` records.
+
+```json
+{"manager":"fnm","name":"node","installed_version":"v26.7.0",
+ "candidate_version":"v26.10.0","update_available":true,"line":"26",
+ "installed_versions":["v24.18.0","v26.7.0"],"stale_versions":["v24.18.0"],
+ "fnm_dir":"/Users/u/.local/share/fnm",
+ "prefix":"/Users/u/.local/share/fnm/node-versions/v26.7.0/installation",
+ "globals":{"@bitkyc08/opencodex":"2.71.0","npm":"11.6.0"},
+ "switch_hooks_unproven":[]}
+```
+
+`installed_version` is read from the `aliases/default` link itself, in the fnm
+root lib/npm.sh already resolves (same roots, same order, same predicate), so
+the runtime observed is always the one that owns the globals. The candidate is
+the newest release in that major from `fnm list-remote`, parsed by the first
+token of each line; `--filter`/`--sort` are not relied on. A failed query is
+`packages:fnm-updates` unavailable, never "current". `globals` and `prefix`
+make the record a precondition over the whole global set.
+
+Windows (`collect-windows.ps1`): the existing `winget:OpenJS.NodeJS` record
+gains `pin` (`{type:"Gating",version:"26.*"}` from `winget pin list`),
+`pin_query`, `line`, and `install_scope` (`machine` when `node.exe` is under
+Program Files, `user` under LocalAppData, otherwise null).
+
+### 7.3 The switch (`scripts/lib/node-runtime.sh`)
+
+`node_runtime_switch TARGET CARRY HOOKS` is shared by the sealed executor and
+the desired-state run:
+
+1. Validate. Every carried `{name, version}` must be installed under the
+   current default at exactly that version (the carry reproduces what exists;
+   it never introduces a package). Every hook must name a carried package and
+   be provable, under the current prefix, as a bin of it (the §2.4 proof).
+   Refusal here is exit 65 with nothing changed.
+2. `fnm install TARGET`, then `fnm default TARGET` (fnm pinned to the root with
+   `FNM_DIR`, stdin closed).
+3. Require the durable npm to be the new default's own npm running under the
+   new node.
+4. One exact `npm install --global a@x b@y …` through it.
+5. Require every carried package present under the new prefix at its version.
+6. Run each hook by absolute path under the new node (re-proved under the new
+   prefix first).
+
+Any failure after step 2 points `fnm default` back at the old version and
+exits 1; exit 70 means even that failed and says so. Hooks that already ran
+are not undone; the new version stays installed, so a service a hook moved
+keeps working. **No switch removes a Node version**: a running service may
+still execute from the old prefix. Old versions are reported
+(`stale_versions`, and a `note` line in the run). Removal stays the separate,
+capped decision of the storage design's §10.3.
+
+### 7.4 Post-switch hooks and their trust root
+
+opencodex's background service embeds the absolute path of its runtime; after
+a switch the service must be repaired (`ocx service`), and a WSL `ocx
+codex-shim` wrapper that hardcoded the old path had to be reinstalled. Rather
+than special-case a package, a package declares hooks from its own bins:
+
+- Definition (store): `node_switch:` on the npm entry, a list of 1–4 argv in
+  the §2.4 updater grammar, validated at resolution (a malformed one is a hold
+  naming the package).
+- Local configuration (trust root): top-level `node_switch_hooks` in
+  `config.json`, `{"npm:@bitkyc08/opencodex": [["ocx","service"]]}`, validated
+  with the same grammar and projected into the bounded worker configuration
+  for POSIX targets only.
+
+The store can only *require* a hook. A switch runs exactly the hooks the
+host's own `config.json` declares for the carried packages, and holds before
+touching anything if a definition requires one the host has not declared
+identically. A host may declare more than the definition requires (the
+WSL-only shim reinstall), because local configuration is already the trust
+root for commands. This is §2.4's rule with one widening: the updater must be
+declared identically because it replaces the npm install, while a hook
+requirement is a floor.
+
+### 7.5 Desired-state run
+
+- **Reviewed apply** (fast cadence, a new or changed `runtimes.node` value):
+  switch only when the default is outside the major, or is not the pin.
+- **Full cadence**: before the npm package pass, move to the newest release
+  in the major, or back to the pin after a drift. It skips a held or
+  canary-waiting `runtimes.node`, like every other maintenance action. Running
+  first means the npm pass then sees the globals under the runtime they will
+  run on.
+- The carry is every **enabled** package of the fold that resolves to npm on
+  this host and is installed under the current default, at its installed
+  version. Unmanaged globals are left under the old version and reported.
+  `npm` itself is carried only when the store manages it; the npm pass that
+  follows then moves it forward if the carried version is behind.
+- Hold lines: `  hold  runtimes.node — <reason>`, for an unusable value, a
+  host without an fnm default, no fnm binary, an unreachable release list, a
+  failed global inventory, an undeclared required hook, or a failed switch
+  (after its restore).
+
+### 7.6 Sealed lane
+
+A `package-upgrade` with `id: "fnm:node"`:
+
+```json
+{"type":"package-upgrade","kind":"package","id":"fnm:node",
+ "candidate_version":"v26.10.0","argv":["fnm","default","v26.10.0"],
+ "carry":[{"name":"@bitkyc08/opencodex","version":"2.71.0"}],
+ "hooks":[{"package":"npm:@bitkyc08/opencodex","argv":["ocx","service"]}]}
+```
+
+The draft proposed a new operation type with two argv; a composite with one
+fixed marker argv is what the executor actually runs, and keeping
+`package-upgrade` keeps the `updates` domain's existing contract (exact
+observed candidate, fresh precondition recapture, semantic post-state). The
+argv is the marker only; the executor knows no other `fnm` shape. `carry` and
+`hooks` are refused on every other operation.
+
+- `seal-plan`: candidate must be the observed `candidate_version` (so the
+  sealed lane moves within the current major; a major change is a store edit);
+  every carried package is in the record's `globals` at that version; no
+  carried package is in `switch_hooks_unproven`; `hooks` equals, in carry
+  order, every argv the configuration declares for the carried packages
+  (omitting a configured service repair is refused, as is adding one).
+- `verify-preconditions`: the `fnm:node` record digest covers the default,
+  the installed versions, the global set and the candidate.
+- Executor: re-checks the argv marker and the hooks against its own (worker)
+  configuration, then runs §7.3.
+- Post-state: `installed_version == candidate_version` and every carried
+  package present in the new record's `globals` at its version. A failure
+  restores the default and reports `partial`. The `npm:*` records move to the
+  new `prefix`/`node_version`, so npm plans sealed before a switch stop
+  verifying after it.
+
+### 7.7 Windows
+
+winget `OpenJS.NodeJS` already resolves through the winget manager, and
+`%APPDATA%\npm` survives Node upgrades, so Windows needs no carry-over and no
+hooks. The Node MSI installs machine-wide, and a machine-scope upgrade needs
+elevation. Unattended runs never attempt it (DSC does not run on native
+Windows at all), and `seal-plan` refuses an ordinary-lane
+`winget:OpenJS.NodeJS` upgrade unless the record shows `install_scope:
+"user"`, with `hold: Node.js (winget OpenJS.NodeJS) is installed machine-wide
+and needs elevation`. The elevation path the repository already supports is
+the protected `winget.upgrade-machine-package.v1` semantic action, which runs
+as LocalSystem through the enrolled broker within the channel its policy token
+enrolls; where readiness advertises it, that is the lane. Otherwise the answer
+is the hold, never a UAC prompt.
+
+### 7.8 Deferred
+
+- **Windows pin reconciliation.** The collector reports the gating pin; nothing
+  yet sets `winget pin add --id OpenJS.NodeJS --version <major>.*` from
+  `runtimes.node`, and nothing compares the two. That needs a sealed
+  native-Windows pin operation and belongs with the WSL sibling's view of the
+  Windows host.
+- **A sealed major switch.** The sealed lane moves within the current major
+  only; crossing majors goes through `runtimes.node` and its review and canary
+  gates.
+- **Removal of old versions.** Reported, never automated (§7.3).
+- **Parity.** A `fleet-doctor` row comparing `fnm:node`/`OpenJS.NodeJS`
+  versions against the declared line across hosts. Every input is already in
+  the inventory records.
+- **Post-upgrade `npm ls` on Windows.** The `npm:*` records already carry
+  `node_version`, so the next inventory shows the new runtime; no explicit
+  check is sealed.
+- **Other runtime sources** (nvm, Volta, Homebrew `node@N` as the default) and
+  other runtimes. Out of scope by the §5.1.2 amendment.
 
 ## 8. `~/.npmrc`: chezmoi owns it
 

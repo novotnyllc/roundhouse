@@ -42,6 +42,27 @@ seal_plan_command() {
       (if .type == "package-upgrade" then
         (.candidate_version | type == "string" and length > 0)
       else true end) and
+      # A Node runtime switch (`fnm:node`, lib/node-runtime.sh) is the one
+      # package-upgrade with more than argv: the exact globals it carries and
+      # the post-switch hooks it runs. Its argv is the fixed marker
+      # `fnm default <candidate>`; the executor knows only this composite.
+      (if (.id | startswith("fnm:")) then
+        .id == "fnm:node" and .type == "package-upgrade" and
+        (.candidate_version | type == "string" and test("^v[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,6}$")) and
+        .argv == ["fnm","default",.candidate_version] and
+        (.carry | type == "array" and length <= 256 and ((map(.name) | unique | length) == length) and
+          all(.[]; type == "object" and (keys == ["name","version"]) and
+            (.name | type == "string" and length <= 214 and
+              test("^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
+            (.version | type == "string" and length <= 128 and test("^[0-9A-Za-z][0-9A-Za-z.+-]*$")))) and
+        (.hooks | type == "array" and length <= 64 and
+          all(.[]; type == "object" and (keys == ["argv","package"]) and
+            (.package | type == "string" and startswith("npm:")) and
+            (.argv | type == "array" and length >= 1 and length <= 8 and
+              (.[0] | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+              all(.[1:][]; type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$")))))
+       elif has("carry") or has("hooks") then false
+       else true end) and
       (if .type == "chezmoi-apply" and has("targets") then
         (.targets | type == "array" and length > 0 and length <= 16 and
           (unique | length) == length and
@@ -135,6 +156,22 @@ seal_plan_command() {
     printf 'roundhouse: npm upgrade argv is neither the exact global install nor the configured updater\n' >&2
     exit 65
   }
+  # A Node switch runs exactly the post-switch hooks the configuration
+  # declares for the packages it carries, in carry order: none omitted (a
+  # forgotten service repair is the failure this exists to prevent) and none
+  # added. Configured argv compared whole, the package_updaters precedent.
+  jq -e --slurpfile draft "$draft" '
+    . as $config |
+    all(($draft[0].operations // [])[];
+      if .type == "package-upgrade" and .id == "fnm:node" then
+        .hooks == [.carry[] | .name as $n |
+          (($config.node_switch_hooks // {})["npm:" + $n] // [])[] |
+          {package: ("npm:" + $n), argv: .}]
+      else true end)
+  ' "$config" >/dev/null || {
+    printf 'roundhouse: Node switch hooks differ from the configured node_switch_hooks of the carried packages\n' >&2
+    exit 65
+  }
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")
   jq -e --arg platform "$platform" '
     all(.operations[];
@@ -179,6 +216,25 @@ seal_plan_command() {
       else false end
     ' "$draft" >/dev/null || {
       printf 'roundhouse: operation is not supported by the native Windows executor\n' >&2
+      exit 69
+    }
+  fi
+  if [ "$platform" = windows ]; then
+    # Node on Windows is winget's OpenJS.NodeJS MSI, installed machine-wide:
+    # its upgrade needs elevation (UAC), which the ordinary lane never
+    # attempts. Only a user-scope install observed as such may upgrade here;
+    # a machine-scope one goes through the protected
+    # winget.upgrade-machine-package.v1 action when readiness advertises it,
+    # and is otherwise a hold. Unknown scope is machine scope.
+    jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
+      all($draft[0].operations[];
+        if .type == "package-upgrade" and .id == "winget:OpenJS.NodeJS" then
+          . as $operation |
+          any($records[]; .kind == "package" and .id == $operation.id and
+            .data.install_scope == "user")
+        else true end)
+    ' >/dev/null || {
+      printf 'roundhouse: hold: Node.js (winget OpenJS.NodeJS) is installed machine-wide and needs elevation; seal the protected winget.upgrade-machine-package.v1 action when readiness advertises it, never a UAC prompt\n' >&2
       exit 69
     }
   fi
@@ -329,7 +385,17 @@ seal_plan_command() {
             (if ($operation.id | startswith("npm:")) and
                 $operation.argv != ["npm","install","--global",
                   (($operation.id | ltrimstr("npm:")) + "@" + $operation.candidate_version)]
-             then .data.updater == $operation.argv else true end))
+             then .data.updater == $operation.argv else true end) and
+            # A Node switch carries only globals installed under the current
+            # default at exactly the recorded versions, and never a package
+            # whose configured post-switch hook was unproven at collect time.
+            (if $operation.id == "fnm:node" then
+               (.data.prefix | type == "string") and (.data.globals | type == "object") and
+               (.data.globals as $globals | all($operation.carry[]; $globals[.name] == .version)) and
+               ((.data.switch_hooks_unproven // []) as $unproven |
+                 all($operation.carry[]; ("npm:" + .name) as $key |
+                   any($unproven[]; . == $key) | not))
+             else true end))
         elif .type == "agent-update" and .kind == "agent_runtime" then
           . as $operation |
           any($records[]; .kind == $operation.kind and .id == $operation.id and

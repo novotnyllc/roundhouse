@@ -595,6 +595,27 @@ verify_preconditions_command() {
       (if .type == "package-upgrade" then
         (.candidate_version | type == "string" and length > 0)
       else true end) and
+      # A Node runtime switch (`fnm:node`, lib/node-runtime.sh) is the one
+      # package-upgrade with more than argv: the exact globals it carries and
+      # the post-switch hooks it runs. Its argv is the fixed marker
+      # `fnm default <candidate>`; the executor knows only this composite.
+      (if (.id | startswith("fnm:")) then
+        .id == "fnm:node" and .type == "package-upgrade" and
+        (.candidate_version | type == "string" and test("^v[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,6}$")) and
+        .argv == ["fnm","default",.candidate_version] and
+        (.carry | type == "array" and length <= 256 and ((map(.name) | unique | length) == length) and
+          all(.[]; type == "object" and (keys == ["name","version"]) and
+            (.name | type == "string" and length <= 214 and
+              test("^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
+            (.version | type == "string" and length <= 128 and test("^[0-9A-Za-z][0-9A-Za-z.+-]*$")))) and
+        (.hooks | type == "array" and length <= 64 and
+          all(.[]; type == "object" and (keys == ["argv","package"]) and
+            (.package | type == "string" and startswith("npm:")) and
+            (.argv | type == "array" and length >= 1 and length <= 8 and
+              (.[0] | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+              all(.[1:][]; type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$")))))
+       elif has("carry") or has("hooks") then false
+       else true end) and
       (if .type == "chezmoi-apply" and has("targets") then
         (.targets | type == "array" and length > 0 and length <= 16 and
           (unique | length) == length and
