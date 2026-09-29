@@ -246,6 +246,26 @@ SH
         "$run_root/layers" "$run_root/package-open-tmp" >/dev/null
       grep -Fqx 'upgrade example' "$run_package_upgrade_marker" ||
         fail "full cadence package control did not run an unheld upgrade"
+      # linuxbrew is brew on Linux: it upgrades, not skips.
+      : >"$run_package_upgrade_marker"
+      fleet_run_full_pass "$run_store" vireo \
+        '{"packages":{"example":"enabled"},"package_managers":["linuxbrew"]}' \
+        '{"packages":{"example":{"linuxbrew":"example"}}}' \
+        "$run_root/layers" "$run_root/package-open-tmp" >/dev/null
+      grep -Fqx 'upgrade example' "$run_package_upgrade_marker" ||
+        fail "full cadence skipped a linuxbrew package instead of upgrading it"
+      # apt has no user-space update path: the pass says so rather than
+      # skipping silently, and runs nothing.
+      : >"$run_package_upgrade_marker"
+      run_apt_out=$(fleet_run_full_pass "$run_store" vireo \
+        '{"packages":{"example":"enabled"},"package_managers":["apt"]}' \
+        '{"packages":{"example":{"apt":"example"}}}' \
+        "$run_root/layers" "$run_root/package-open-tmp")
+      printf '%s\n' "$run_apt_out" |
+        grep -Fq 'hold  packages.example — apt has no user-space update path' ||
+        fail "full cadence silently skipped an apt package instead of reporting the hold"
+      [ ! -s "$run_package_upgrade_marker" ] ||
+        fail "full cadence ran brew for an apt-resolved package"
     )
     run_unsafe_market=$(fleet_run_plugin_marketplaces \
       '{"plugins":{"example":"enabled"}}' \

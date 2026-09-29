@@ -2444,11 +2444,17 @@ fleet_run_full_pass() (
       [ "$(printf '%s\n' "$full_resolved" | jq -r '.resolved')" = true ] || continue
       # `</dev/null` on each: this loop is fed by a pipeline, so its stdin is
       # the package list and a greedy manager would eat the rest of it.
-      case $(printf '%s\n' "$full_resolved" | jq -r '.manager') in
-        homebrew) brew upgrade "$(printf '%s\n' "$full_resolved" | jq -r '.name')" >/dev/null 2>&1 </dev/null || : ;;
+      full_manager=$(printf '%s\n' "$full_resolved" | jq -r '.manager')
+      case $full_manager in
+        homebrew | linuxbrew) brew upgrade "$(printf '%s\n' "$full_resolved" | jq -r '.name')" >/dev/null 2>&1 </dev/null || : ;;
         winget) winget upgrade --id "$(printf '%s\n' "$full_resolved" | jq -r '.name')" \
           --silent --accept-package-agreements --accept-source-agreements >/dev/null 2>&1 </dev/null || : ;;
         scoop) scoop update "$(printf '%s\n' "$full_resolved" | jq -r '.name')" >/dev/null 2>&1 </dev/null || : ;;
+        # A manager with no user-space update path (apt needs root, and
+        # roundhouse never uses sudo) is reported, never silently skipped —
+        # the same answer fleet_install_package gives at install time.
+        *) printf '  hold  packages.%s — %s has no user-space update path\n' \
+          "$full_package" "$full_manager" ;;
       esac
     done
 
