@@ -568,7 +568,7 @@ fleet_pin_mechanism() {
   #   (empty)  the manager cannot express it: treat exactly like `unavailable`
   case $1 in
     winget | apt) printf 'flag\n' ;;
-    homebrew) printf 'formula\n' ;;
+    homebrew | linuxbrew) printf 'formula\n' ;;
   esac
 }
 
@@ -813,7 +813,9 @@ fleet_install_package() {
   # stdin is the verdict or package list, and one greedy child consumed a
   # 4-item run down to 1.
   case $1 in
-    homebrew)
+    # linuxbrew is the same `brew` on Linux; the sealed-plan executor and the
+    # collector already treat the two alike.
+    homebrew | linuxbrew)
       if [ "$3" = true ]; then
         brew install --cask "$2" >/dev/null 2>&1 </dev/null
       else
