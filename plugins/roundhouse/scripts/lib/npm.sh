@@ -217,3 +217,26 @@ npm_global_run_updater() (
 npm_global_installed_version() (
   npm_global_list | jq -r --arg name "$1" '.[$name] // empty'
 )
+
+npm_global_list_detail() (
+  # `{name: {version, pinnable}}` for every top-level global, including the
+  # ones npm_global_list drops: a global without a version, or one sourced
+  # from `file:`, `link:` or git (an `npm link`, a local tarball), cannot be
+  # reinstalled by exact registry version and is reported unpinnable, never
+  # silently left out. Same failure rules as npm_global_list.
+  npm_detail_json=$(npm_global_run ls --global --json --depth=0 2>/dev/null) || :
+  printf '%s\n' "$npm_detail_json" | jq -ce '
+    if type == "object" and (has("error") | not) and
+      ((.dependencies // {}) | type == "object") then
+      (.dependencies // {}) | with_entries(
+        select(.value | type == "object") |
+        .value = {
+          version: (if (.value.version | type) == "string" then .value.version else null end),
+          pinnable: ((.value.version | type) == "string" and
+            (.value.version | test("^[0-9A-Za-z][0-9A-Za-z.+-]*$")) and
+            (.key | test("^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
+            ((.value.resolved // "") | test("^(file:|link:|git[+:]|github:|gitlab:|bitbucket:)") | not) and
+            (.value.link // false) != true)
+        })
+    else error("invalid npm ls output") end' 2>/dev/null
+)

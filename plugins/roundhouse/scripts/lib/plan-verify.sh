@@ -560,68 +560,34 @@ verify_privileged_preconditions_command() {
 }
 
 fleet_node_snapshot_verify() {
-  # `fleet_node_snapshot_verify PLAN SNAPSHOT CONFIG` — the Node switch checks
-  # that need only the sealed plan, a fresh snapshot and the executor's own
-  # configuration, never a store: for every `fnm:node` operation, the carry
-  # is exactly the sealed managed set ∩ what the snapshot shows installed,
-  # at the installed versions; the hooks are exactly what the configuration
-  # declares for the carried packages; and every hook the managed set
-  # requires is declared. The sealed `managed` list is trusted here because
-  # the plan digest, checked before this runs, covers it.
-  jq -e -n --slurpfile plan "$1" --slurpfile records "$2" --slurpfile config "$3" '
-    ($config[0].node_switch_hooks // {}) as $local |
-    (first($records[] | select(.kind == "package" and .id == "fnm:node" and
-      .status == "present") | .data.globals) // null) as $globals |
-    all($plan[0].operations[] | select(.type == "package-upgrade" and .id == "fnm:node");
-      . as $op |
-      ([$op.managed[].name] | unique) as $names |
-      [$names[] | select($globals[.] != null)] as $carried |
-      ($globals | type == "object") and
-      $op.carry == [$carried[] | {name: ., version: $globals[.]}] and
-      $op.hooks == [$carried[] | . as $n | ($local["npm:" + $n] // [])[] |
-        {package: ("npm:" + $n), argv: .}] and
-      all($op.managed[]; . as $m | ($local["npm:" + $m.name] // []) as $declared |
-        all($m.required[]; . as $w | any($declared[]; . == $w))))
-  ' >/dev/null
-}
-
-fleet_node_store_verify() {
-  # `fleet_node_store_verify PLAN SNAPSHOT` — the store-backed half: the
-  # carry predicate re-derived from THIS host's store for the plan's target
-  # must hold nothing and equal the sealed managed set, carry and hooks. It
-  # runs where the store is authoritative for planning: the host that
-  # applies a local plan, and the CONTROLLER of a remote lane, before
-  # anything is transferred. A target's own store is never consulted for a
-  # remote plan: it may be absent or lag, which is not evidence about the
-  # plan.
-  store_verify_target=$(jq -r '.target' "$1")
-  store_verify_globals=$(jq -cs 'first(.[] | select(.kind == "package" and .id == "fnm:node" and
-    .status == "present") | .data.globals) // null' "$2")
-  store_verify_plan=$(fleet_node_store_plan "$store_verify_target" "$store_verify_globals" \
-    "$(jq -c '.node_switch_hooks // {}' "$(config_path)")") || {
-    printf 'roundhouse: the managed npm set for %s is unknown (store desired state or recorded globals unavailable); a Node switch cannot verify its carry\n' \
-      "$store_verify_target" >&2
-    return 65
-  }
-  jq -e --argjson current "$store_verify_plan" '
+  # `fleet_node_snapshot_verify PLAN SNAPSHOT CONFIG` — the Node switch check
+  # every executing host runs: the carry rule (node_switch_plan) over the
+  # fresh snapshot must hold nothing it can see (no unpinnable global) and
+  # give exactly the sealed carry and hooks, and every sealed `required` hook
+  # must be among the hooks. It needs no store: the carry is the installed
+  # set, and the definition-derived `required` list is bound by the plan
+  # digest, checked before this runs.
+  snapshot_verify_record=$(jq -cs 'first(.[] | select(.kind == "package" and .id == "fnm:node" and
+    .status == "present") | .data) // null' "$2")
+  printf '%s\n' "$snapshot_verify_record" | jq -e '(.globals | type == "object") and
+    ((.globals_unpinnable // []) | type == "array") and (.installed_version | type == "string")' \
+    >/dev/null 2>&1 || return 1
+  snapshot_verify_plan=$(node_switch_plan \
+    "$(printf '%s\n' "$snapshot_verify_record" | jq -c '.globals')" \
+    "$(printf '%s\n' "$snapshot_verify_record" | jq -c '.globals_unpinnable // []')" \
+    "$(printf '%s\n' "$snapshot_verify_record" | jq -r '.installed_version')" '{}' \
+    "$(jq -c '.node_switch_hooks // {}' "$3")") || return 1
+  jq -e --argjson current "$snapshot_verify_plan" '
     $current.held == null and
     all(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node");
-      .managed == $current.managed and .carry == $current.carry and .hooks == $current.hooks)
-  ' "$1" >/dev/null || {
-    printf 'roundhouse: the managed npm globals changed since planning (%s); create a new plan\n' \
-      "$(printf '%s\n' "$store_verify_plan" | jq -r '.held // "managed set, carry or hooks differ"')" >&2
-    return 65
-  }
+      . as $op | $op.carry == $current.carry and $op.hooks == $current.hooks and
+      all($op.required[]; . as $r | any($op.hooks[]; . == $r)))
+  ' "$1" >/dev/null
 }
 
 verify_preconditions_command() {
-  # `verify_preconditions_command PLAN SNAPSHOT [NATIVE]` — NATIVE=true on a
-  # remote lane's target worker, where the store-backed Node check has
-  # already run on the controller and the target's own store is not
-  # evidence (fleet_node_store_verify).
   plan=$1
   snapshot=$2
-  verify_native=${3:-false}
   require_jq
   check_mutation_config
   check_private_owned_file "$plan" "apply plan"
@@ -674,16 +640,14 @@ verify_preconditions_command() {
             (.argv | type == "array" and length >= 1 and length <= 8 and
               (.[0] | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
               all(.[1:][]; type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$"))))) and
-        # The desired-state managed set the carry must equal (managed ∩
-        # installed); re-derived from the store at seal and at apply.
-        (.managed | type == "array" and length <= 256 and
-          all(.[]; type == "object" and (keys == ["name","package","required"]) and
-            (.package | type == "string" and length > 0 and length <= 256) and
-            (.name | type == "string" and length <= 214 and
-              test("^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
-            (.required | type == "array" and length <= 4 and
-              all(.[]; type == "array" and length >= 1 and length <= 8 and all(.[]; type == "string")))))
-       elif has("carry") or has("hooks") or has("managed") then false
+        # The node_switch hooks the definitions require for the carried
+        # packages, derived at seal from the controller store and bound here
+        # by the plan digest; every one must appear in `hooks`.
+        (.required | type == "array" and length <= 64 and
+          all(.[]; type == "object" and (keys == ["argv","package"]) and
+            (.package | type == "string" and startswith("npm:")) and
+            (.argv | type == "array" and length >= 1 and length <= 8 and all(.[]; type == "string"))))
+       elif has("carry") or has("hooks") or has("required") then false
        else true end) and
       (if .type == "chezmoi-apply" and has("targets") then
         (.targets | type == "array" and length > 0 and length <= 16 and
@@ -864,18 +828,14 @@ verify_preconditions_command() {
     printf 'roundhouse: target state changed after planning; create a new plan\n' >&2
     exit 65
   }
-  # A Node switch: the snapshot-bound checks always, and the store-backed
-  # re-derivation only where the store is authoritative (not on a remote
-  # lane's worker; its controller ran it before transfer).
+  # A Node switch: its carry must still be exactly the installed set the
+  # fresh snapshot shows, with the configured hooks (fleet_node_snapshot_verify).
   if jq -e 'any(.operations[]?; .type == "package-upgrade" and .id == "fnm:node")' \
     "$plan" >/dev/null 2>&1; then
     fleet_node_snapshot_verify "$plan" "$snapshot" "$config" || {
-      printf 'roundhouse: the Node switch carry or hooks no longer match the managed set and the installed globals; create a new plan\n' >&2
+      printf 'roundhouse: the Node switch carry or hooks no longer match the installed npm globals; create a new plan\n' >&2
       exit 65
     }
-    if [ "$verify_native" != true ]; then
-      fleet_node_store_verify "$plan" "$snapshot" || exit 65
-    fi
   fi
   jq -cn --arg plan_id "$expected_plan_id" --arg target "$target" \
     '{verified:true,plan_id:$plan_id,target:$target}'

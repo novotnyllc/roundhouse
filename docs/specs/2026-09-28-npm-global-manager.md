@@ -301,7 +301,7 @@ POSIX (`collect-posix`, on hosts that list `npm`): a `package` record
  "fnm_dir":"/Users/u/.local/share/fnm",
  "prefix":"/Users/u/.local/share/fnm/node-versions/v26.7.0/installation",
  "globals":{"@bitkyc08/opencodex":"2.71.0","npm":"11.6.0"},
- "switch_hooks_unproven":[]}
+ "globals_unpinnable":[],"switch_hooks_unproven":[]}
 ```
 
 `installed_version` is read from the `aliases/default` link itself, in the fnm
@@ -310,7 +310,9 @@ the runtime observed is always the one that owns the globals. The candidate is
 the newest release in that major from `fnm list-remote`, parsed by the first
 token of each line; `--filter`/`--sort` are not relied on. A failed query is
 `packages:fnm-updates` unavailable, never "current". `globals` and `prefix`
-make the record a precondition over the whole global set.
+make the record a precondition over the whole global set, and
+`globals_unpinnable` names the globals a switch could not reinstall by exact
+registry version (`file:`, `link:` or git sourced, or without a version).
 
 Windows (`collect-windows.ps1`): the existing `winget:OpenJS.NodeJS` record
 gains `pin` (`{type:"Gating",version:"26.*"}` from `winget pin list`),
@@ -382,34 +384,37 @@ requirement is a floor.
   canary-waiting `runtimes.node`, like every other maintenance action. Running
   first means the npm pass then sees the globals under the runtime they will
   run on.
-- **The carry rule, the only one.** A Node switch may only proceed when the
-  complete set of managed npm globals is known with certainty and fully
-  carried, with all required hooks; any uncertainty or hold touching that
-  set holds the switch. One predicate (`fleet_run_node_plan`) implements it
-  for the reviewed apply, the full cadence, and the sealed lane's seal and
-  apply-time verification:
-  - *Managed set*: every enabled package whose definition declares it an npm
-    global (an `npm:` entry that is not `unavailable`) on a host that manages
-    npm, with the `node_switch` hooks its definition requires.
-  - *Carry*: exactly managed ∩ installed under the current default, at the
-    installed versions. It reproduces what exists and never adds a package.
-  - *Hooks*: exactly what this host's `config.json` declares for the carried
-    packages, which must include every hook the definitions require.
-  - *Holds*, each before anything moves and naming the blocking item: a
-    managed-set package or its definition (`packages.<x>`,
-    `definitions.packages.<x>`) held this run (signature, review, canary or
-    apply hold, the same hold file the package pass reads); an enabled
-    package declared an npm global that does not resolve to npm (malformed
-    name, `update:` or `node_switch:`); a global `applied/<host>.yaml`
-    records the package was installed as (its `npm` annotation, kept across
-    re-records) that is still installed and would not be carried (renamed,
-    re-mapped, or pending a held removal); a required hook the host has not
-    declared.
-  - *Not managed, never a hold*: no `npm:` entry, `npm: unavailable`, no npm
-    manager on the host, or desired `disabled`. Unmanaged globals are left
-    under the old version and reported.
-  `npm` itself is carried only when the store manages it; the npm pass that
-  follows then moves it forward if the carried version is behind.
+- **The carry rule, the only one: a switch carries every global installed
+  under the current default, at its exact installed version.** Nothing is
+  added, and nothing installed is left behind. One pure function
+  (`node_switch_plan`) implements it for the reviewed apply, the full
+  cadence, `fleet-apply runtimes.node`, `seal-plan` and the executor's
+  `verify-preconditions`, from nothing but the installed set:
+  - *Not carried*: what the new Node provides itself, `npm`, and `corepack`
+    when the old default bundled it (Node 24 and older; on later releases a
+    corepack global was installed by someone and is carried). `npm` then
+    comes from the new Node; the npm pass that follows moves a store-managed
+    npm forward.
+  - *Holds*: a global that cannot be reinstalled by exact registry version
+    (`file:`, `link:`, git, no version; the switch names it instead of
+    stranding it), a malformed `node_switch` on a definition of a carried
+    package, and a required hook the host has not declared.
+  - *Hooks* keep their trust model: `required` is every `node_switch` hook a
+    definition requires for a carried package (not only store-managed
+    ones), `hooks` is what this host's `config.json` `node_switch_hooks`
+    declares for the carried packages, in carry order, and is what runs.
+    Every required hook must be declared; the host may add more.
+
+  *Why not the desired state.* The first rule derived the carry from the
+  store: enabled packages declared as npm globals, intersected with what was
+  installed. Each review round then found another installed global it could
+  strand: a package whose definition did not resolve, one whose definition
+  or desired state was held this run, one renamed or re-mapped since it was
+  installed, one changed to `disabled` while that change was itself held,
+  and the manual `fleet-apply` path, which has no run holds at all. Every fix
+  added state (hold files, applied-record annotations, a store re-derivation
+  at apply) and left the class open. The installed set has none of those
+  failure modes, needs no store, and is what the switch must preserve anyway.
 - A switch that fails and cannot confirm the previous default restored
   (the executor's exit 70) leaves a default nobody verified: the run reports
   it (`hold  runtimes.node — … is unverified`), alerts
@@ -422,11 +427,11 @@ requirement is a floor.
   `packages.node` (Homebrew would read it as its `node` formula) and not
   `runtimes.node`, which enters the store by hand. Nor does it seed an `npm:*`
   record: without an `npm:` definition it would resolve to a system manager
-  and own the global without it ever entering the managed set.
+  instead of npm.
 - Hold lines: `  hold  runtimes.node — <reason>`, for an unusable value, a
   host without an fnm default, no fnm binary, an unreachable release list, a
-  failed global inventory, an undeclared required hook, or a failed switch
-  (after its restore).
+  failed global inventory, an unpinnable global, a malformed or undeclared
+  required hook, or a failed switch (after its restore).
 
 ### 7.6 Sealed lane
 
@@ -435,47 +440,37 @@ A `package-upgrade` with `id: "fnm:node"`:
 ```json
 {"type":"package-upgrade","kind":"package","id":"fnm:node",
  "candidate_version":"v26.10.0","argv":["fnm","default","v26.10.0"],
- "managed":[{"package":"opencodex","name":"@bitkyc08/opencodex",
-   "required":[["ocx","service"]]}],
  "carry":[{"name":"@bitkyc08/opencodex","version":"2.71.0"}],
- "hooks":[{"package":"npm:@bitkyc08/opencodex","argv":["ocx","service"]}]}
+ "hooks":[{"package":"npm:@bitkyc08/opencodex","argv":["ocx","service"]}],
+ "required":[{"package":"npm:@bitkyc08/opencodex","argv":["ocx","service"]}]}
 ```
 
 The draft proposed a new operation type with two argv; a composite with one
 fixed marker argv is what the executor actually runs, and keeping
 `package-upgrade` keeps the `updates` domain's existing contract (exact
 observed candidate, fresh precondition recapture, semantic post-state). The
-argv is the marker only; the executor knows no other `fnm` shape. `managed`,
-`carry` and `hooks` are refused on every other operation.
+argv is the marker only; the executor knows no other `fnm` shape. `carry`,
+`hooks` and `required` are refused on every other operation.
 
 - `seal-plan`: candidate must be the observed `candidate_version` (so the
   sealed lane moves within the current major; a major change is a store edit);
-  no carried package is in `switch_hooks_unproven`; and the carry rule (§7.5)
-  run over the store's desired state for the target (its fold, definitions
-  and `applied/` record) and the record's `globals` must hold nothing and
-  produce exactly the draft's `managed`, `carry` and `hooks`. An empty,
-  partial or padded carry, a misstated managed set, and an omitted or extra
-  hook are refused; so is a target with no desired state in the store, since
-  its managed set is unknown. Run holds are a scheduled-run concept; the
-  sealed lane has none to consult.
-- Apply-time checks, split by where their evidence lives. The plan digest
-  covers `managed`, `carry` and `hooks`, so every executor can trust the
-  sealed managed set without re-deriving it.
-  - *Snapshot-bound, on the host that executes* (every lane): the
-    `fnm:node` record digest (default, installed versions, global set,
-    candidate), and `carry` == sealed `managed` ∩ what the fresh snapshot
-    shows installed, `hooks` == what the executor's own configuration
-    declares for the carried packages, every required hook declared.
-  - *Store-backed, where the store is authoritative*: the carry rule
-    re-derived from the store and compared again, so a definition or
-    desired-state change since sealing refuses the plan. `apply-plan` (a
-    local target) and `verify-preconditions` run it on the host itself.
-    `apply-ssh-plan` runs it on the CONTROLLER, against a fresh read-only
-    inventory of the target, before the plan or worker configuration is
-    transferred; the SSH worker never reads the target's own store, which
-    may be absent or lag and is not evidence about the plan. The interop
-    lane never carries a switch: `fnm:node` does not seal for a Windows
-    target.
+  the switch must come before every `npm:*` upgrade in the same plan (an npm
+  upgrade first would change a version the carry names, and the switch would
+  refuse partway through an already-mutated plan); no carried package is in
+  `switch_hooks_unproven`; and the carry rule (§7.5) over the snapshot's
+  `globals`, `globals_unpinnable` and default, with the store's definitions
+  for hook requirements, must hold nothing and give exactly the draft's
+  `carry`, `hooks` and `required`. An empty, partial or padded carry, an
+  omitted or extra hook, and misstated requirements are refused; so is a
+  host with no store, whose hook requirements are unknown.
+- Apply time, on the host that executes, in every lane (local, and the SSH
+  worker): the `fnm:node` record digest (default, installed versions, global
+  set, candidate), then the carry rule over the fresh snapshot must give
+  exactly the sealed `carry` and `hooks`, and every sealed `required` hook
+  must be among the hooks. It needs no store: the carry is the installed set,
+  and `required` is bound by the plan digest. No lane reads a store at apply.
+  The interop lane never carries a switch: `fnm:node` does not seal for a
+  Windows target.
 - Executor: re-checks the argv marker and the hooks against its own (worker)
   configuration, then runs §7.3.
 - Post-state: `installed_version == candidate_version` and every carried
@@ -510,10 +505,6 @@ is the hold, never a UAC prompt.
   only; crossing majors goes through `runtimes.node` and its review and canary
   gates.
 - **Removal of old versions.** Reported, never automated (§7.3).
-- **`npm` annotations for items applied before 0.9.29.** A package applied as
-  an npm global by an earlier build carries no annotation, so a later
-  re-mapping of it is not seen as a previously managed global. No such item
-  existed in the fleet store when this shipped.
 - **Parity.** A `fleet-doctor` row comparing `fnm:node`/`OpenJS.NodeJS`
   versions against the declared line across hosts. Every input is already in
   the inventory records.

@@ -1126,185 +1126,10 @@ fleet_run_package_managers() {
   fi
 }
 
-fleet_run_node_plan() (
-  # `fleet_run_node_plan FOLD DEFS MANAGERS GLOBALS [APPLIED] [HOLD_DIR] [HOOKS]`
-  # — THE carry predicate. Every lane that switches Node asks this one
-  # function, so there is one answer to "what must a switch carry":
-  #
-  #   A Node switch may only proceed when the complete set of managed npm
-  #   globals is known with certainty and fully carried, with all required
-  #   hooks. Any uncertainty or hold touching that set holds the switch.
-  #
-  # Inputs: the host's fold and definitions, its package managers, GLOBALS
-  # (`{name: version}` under the current default), APPLIED (this host's
-  # applied/<host>.yaml as JSON; its `npm` annotations remember which npm
-  # globals a package was installed as), HOLD_DIR (the run's `sigholds` and
-  # `verdicts`, empty outside a scheduled run) and HOOKS (the host's own
-  # config.json `node_switch_hooks`; default: read from config_path).
-  #
-  # Output, one JSON object:
-  #
-  #   managed    [{package, name, required}] — every ENABLED package whose
-  #              definition declares it an npm global and which resolves to
-  #              npm here, with the node_switch hooks its definition requires.
-  #              The desired-state evidence a sealed plan carries verbatim.
-  #   carry      [{name, version}] — managed ∩ installed, at the installed
-  #              version, by name. Never a package that is not installed now.
-  #   hooks      [{package, argv}] — the hooks the host's config declares for
-  #              each carried package, in carry order. Only local configuration
-  #              introduces a command.
-  #   held       null, or the first reason the switch must not run:
-  #                * a managed-set package (declared npm now, or annotated npm
-  #                  in applied/) is held this run: its packages.<x> or
-  #                  definitions.packages.<x> item is signature-, review-,
-  #                  canary- or apply-held, so its definition is not known
-  #                  with certainty
-  #                * an enabled package declared as an npm global does not
-  #                  resolve to npm here (malformed name/update/node_switch)
-  #                * a global applied/ records as installed for a package
-  #                  (the `npm` annotation) is still installed and would not
-  #                  be carried: renamed, re-mapped, or pending removal
-  #                * a definition requires a hook the host has not declared
-  #              A package with no `npm:` entry, `npm: unavailable`, no npm
-  #              manager on the host, or desired `disabled` is deliberately not
-  #              a managed npm global and never holds the switch.
-  #   unmanaged  installed globals outside the carry; reported, left behind.
-  plan_fold=$1
-  plan_defs=$2
-  plan_managers=$3
-  plan_globals=$4
-  plan_applied=${5:-'{}'}
-  [ -n "$plan_applied" ] || plan_applied='{}'
-  plan_hold_dir=${6:-}
-  if [ "$#" -ge 7 ]; then
-    plan_local=$7
-  else
-    plan_local=$(jq -c '.node_switch_hooks // {}' "$(config_path)" 2>/dev/null) ||
-      plan_local='{}'
-  fi
-  [ -n "$plan_local" ] || plan_local='{}'
-  printf '%s\n' "$plan_globals" | jq -e 'type == "object"' >/dev/null 2>&1 || exit 65
-  plan_entries='[]'
-  plan_previous='[]'
-  plan_held=
-  plan_host_npm=false
-  case " $plan_managers " in *" npm "*) plan_host_npm=true ;; esac
-  plan_item_held() {
-    [ -n "$plan_hold_dir" ] || return 1
-    fleet_run_item_is_held "$1" "" "$plan_hold_dir/sigholds" "$plan_hold_dir/verdicts"
-  }
-  while IFS= read -r plan_package; do
-    [ -n "$plan_package" ] || continue
-    plan_state=$(printf '%s\n' "$plan_fold" | jq -c --arg p "$plan_package" '(.packages // {})[$p] // null')
-    [ "$plan_state" = null ] || plan_state=$(fleet_run_state_of "$plan_state")
-    plan_annotated=$(printf '%s\n' "$plan_applied" |
-      jq -c --arg i "packages.$plan_package" '[(.items // {})[$i].npm // [] | .[]? | strings]')
-    # A carry candidate: enabled, declared an npm global by its definition
-    # (the resolver's own predicate: an `npm:` entry that is present and not
-    # `unavailable`), on a host that manages npm.
-    plan_candidate=false
-    if [ "$plan_state" = enabled ] && [ "$plan_host_npm" = true ] &&
-      fleet_definition_entry "$plan_defs" packages "$plan_package" |
-      jq -e '(.npm // null) != null and .npm != "unavailable"' >/dev/null 2>&1; then
-      plan_candidate=true
-    fi
-    # Anything that is, or was installed as, a managed npm global and is not
-    # deliberately disabled belongs to the set whose certainty is required.
-    if [ "$plan_state" != disabled ] &&
-      { [ "$plan_candidate" = true ] || [ "$plan_annotated" != '[]' ]; }; then
-      for plan_item in "packages.$plan_package" "definitions.packages.$plan_package"; do
-        if [ -z "$plan_held" ] && plan_item_held "$plan_item"; then
-          plan_held="$plan_item is held this run, so the npm globals it manages are not known with certainty; a switch could strand them"
-        fi
-      done
-      [ "$plan_annotated" = '[]' ] ||
-        plan_previous=$(printf '%s\n' "$plan_previous" | jq -c --arg p "$plan_package" \
-          --argjson names "$plan_annotated" '. + [{package: $p, names: $names}]')
-    fi
-    [ "$plan_candidate" = true ] || continue
-    plan_status=0
-    # shellcheck disable=SC2086 # the host's package_managers list, in order
-    plan_resolved=$(fleet_resolve_package "$plan_defs" "$plan_package" $plan_managers) ||
-      plan_status=$?
-    if [ "$plan_status" -ne 0 ] ||
-      [ "$(printf '%s\n' "$plan_resolved" | jq -r '.manager // empty')" != npm ]; then
-      [ -n "$plan_held" ] ||
-        plan_held="packages.$plan_package is declared as an npm global but does not resolve to npm on this host ($(printf '%s\n' "$plan_resolved" |
-          jq -r '.detail // "resolved to another manager"' 2>/dev/null)); a switch would strand it under the old prefix"
-      continue
-    fi
-    plan_entries=$(printf '%s\n' "$plan_entries" | jq -c --arg logical "$plan_package" \
-      --argjson resolved "$plan_resolved" \
-      '. + [{package: $logical, name: $resolved.name,
-        required: ($resolved.attributes.node_switch // [])}]')
-  done <<EOF
-$( { printf '%s\n' "$plan_fold" | jq -r '(.packages // {}) | keys[]'
-  printf '%s\n' "$plan_applied" | jq -r '(.items // {}) | keys[] | select(startswith("packages.")) | ltrimstr("packages.")'
-} | LC_ALL=C sort -u)
-EOF
-  jq -cn --argjson managed "$plan_entries" --argjson globals "$plan_globals" \
-    --argjson local "$plan_local" --argjson previous "$plan_previous" --arg held "$plan_held" '
-    ($managed | map(.name) | unique) as $names |
-    [$names[] | select($globals[.] != null)] as $carried |
-    {
-      managed: $managed,
-      carry: [$carried[] | {name: ., version: $globals[.]}],
-      hooks: [$carried[] | . as $n |
-        ($local["npm:" + $n] // [])[] | {package: ("npm:" + $n), argv: .}],
-      held: (first(
-        (if $held == "" then empty else $held end),
-        ($previous[] | .package as $p | .names[] as $n |
-          select($globals[$n] != null and (any($names[]; . == $n) | not)) |
-          "packages.\($p) was installed as the npm global \($n), which is still installed and would not be carried (renamed, re-mapped or pending removal); remove it or restore its definition"),
-        ($managed[] | . as $e |
-          ($local["npm:" + .name] // []) as $declared |
-          select(any($e.required[]; . as $w | any($declared[]; . == $w) | not)) |
-          "packages.\(.package) requires node_switch hook(s) \($e.required | tojson) that this host'"'"'s config.json node_switch_hooks does not declare")
-      ) // null),
-      unmanaged: ([$globals | keys[]] - $carried)
-    }'
-)
-
-fleet_node_store_plan() (
-  # `fleet_node_store_plan TARGET GLOBALS HOOKS` — the carry predicate over
-  # the store's desired state for TARGET, for the sealed lane (seal-plan and
-  # verify-preconditions). The managed set is derived from the store, never
-  # accepted from a draft: a plan whose `managed`, `carry` or `hooks` differ
-  # from this answer does not seal, and does not verify at apply. Run holds
-  # are a scheduled-run concept; the sealed lane has none to consult.
-  #
-  # Exit 65 when the store has no desired state for TARGET: without it the
-  # managed set is unknown, and an unknown set cannot be proven carried.
-  store_plan_store=$(fleet_store_path)
-  store_plan_host_files=$(fleet_tier_files "$store_plan_store" "hosts/$1")
-  [ -n "$store_plan_host_files" ] || exit 65
-  store_plan_fold=$(fleet_fold "$store_plan_store" "$1") || exit 65
-  store_plan_defs=$(fleet_definitions_load "$store_plan_store") || exit 65
-  store_plan_applied=$(fleet_record_read "$(fleet_applied_path "$store_plan_store" "$1")" '{}') ||
-    exit 65
-  fleet_run_node_plan "$store_plan_fold" "$store_plan_defs" \
-    "$(fleet_run_package_managers "$store_plan_fold" "$1")" "$2" "$store_plan_applied" "" "$3"
-)
-
-fleet_run_annotate_npm() {
-  # `fleet_run_annotate_npm STORE HOST ITEM DEFS MANAGERS` — after a package
-  # item is recorded applied, remember which npm global it was installed as.
-  # The annotation outlives a later re-mapping, which is what lets the carry
-  # predicate see a global that is still installed but no longer managed.
-  case $3 in packages.*) ;; *) return 0 ;; esac
-  # shellcheck disable=SC2086 # the host's package_managers list, in order
-  annotate_resolved=$(fleet_resolve_package "$4" "${3#packages.}" $5 2>/dev/null) || return 0
-  [ "$(printf '%s\n' "$annotate_resolved" | jq -r '.manager')" = npm ] || return 0
-  fleet_applied_annotate_npm "$1" "$2" "$3" \
-    "$(printf '%s\n' "$annotate_resolved" | jq -r '.name')"
-}
-
 fleet_run_node_converge() (
-  # `fleet_run_node_converge VALUE DEFS FOLD MANAGERS MODE [STORE HOST
-  # HOLD_DIR]` — bring fnm's default Node to what `runtimes.node` declares
-  # (lib/node-runtime.sh). STORE and HOST locate this host's applied/ record
-  # and HOLD_DIR this run's holds, both inputs of the carry predicate
-  # (fleet_run_node_plan).
+  # `fleet_run_node_converge VALUE DEFS MODE` — bring fnm's default Node to
+  # what `runtimes.node` declares (lib/node-runtime.sh). The carry is every
+  # installed global (node_switch_plan); DEFS only adds hook requirements.
   #
   #   apply  the reviewed desired-state apply (fast pass, first time or on a
   #          changed value): switch only when the default is outside the
@@ -1319,12 +1144,8 @@ fleet_run_node_converge() (
   # is ever silently skipped.
   node_value=$1
   node_defs=$2
-  node_fold=$3
-  node_managers=$4
-  node_mode=$5
-  node_store=${6:-}
-  node_host=${7:-}
-  node_hold_dir=${8:-}
+  node_mode=$3
+  [ -n "$node_defs" ] || node_defs='{}'
   node_hold() {
     printf '  hold  runtimes.node — %s\n' "$1"
     exit 75
@@ -1351,25 +1172,21 @@ fleet_run_node_converge() (
       exit 0
     fi
   fi
-  # Without the fold there is no way to know which globals are managed, and a
-  # switch that carried nothing would strand every one of them.
-  [ -n "$node_fold" ] ||
-    node_hold 'no folded desired state to compute the managed npm globals from'
-  node_globals=$(npm_global_list) ||
+  node_detail=$(npm_global_list_detail) ||
     node_hold "the npm global inventory under $node_current failed"
-  node_applied='{}'
-  if [ -n "$node_store" ] && [ -n "$node_host" ]; then
-    node_applied=$(fleet_record_read "$(fleet_applied_path "$node_store" "$node_host")" '{}') ||
-      node_hold 'could not read this host'"'"'s applied record to know which npm globals it manages'
-  fi
-  node_plan=$(fleet_run_node_plan "$node_fold" "$node_defs" "$node_managers" "$node_globals" \
-    "$node_applied" "$node_hold_dir") ||
-    node_hold 'could not compute the managed npm globals to carry'
+  node_split=$(node_globals_split "$node_detail") ||
+    node_hold "the npm global inventory under $node_current is unreadable"
+  node_local=$(jq -c '.node_switch_hooks // {}' "$(config_path)" 2>/dev/null) || node_local='{}'
+  [ -n "$node_local" ] || node_local='{}'
+  node_plan=$(node_switch_plan "$(printf '%s\n' "$node_split" | jq -c '.globals')" \
+    "$(printf '%s\n' "$node_split" | jq -c '.unpinnable')" "$node_current" \
+    "$node_defs" "$node_local") ||
+    node_hold 'could not compute the npm globals to carry'
   node_plan_held=$(printf '%s\n' "$node_plan" | jq -r '.held // empty')
   [ -z "$node_plan_held" ] || node_hold "$node_plan_held"
   printf '  switch runtimes.node %s -> %s (carrying %s)\n' "$node_current" "$node_target" \
     "$(printf '%s\n' "$node_plan" | jq -r '[.carry[] | "\(.name)@\(.version)"] |
-      if length == 0 then "no managed npm globals" else join(" ") end')"
+      if length == 0 then "no npm globals" else join(" ") end')"
   node_status=0
   node_switch_out=$(node_runtime_switch "$node_target" \
     "$(printf '%s\n' "$node_plan" | jq -c '.carry')" \
@@ -1379,7 +1196,7 @@ fleet_run_node_converge() (
   if ! { [ "$node_status" -eq 0 ] && [ "$node_final" = "$node_target" ]; }; then
     # Restored (or never moved) is an ordinary hold. Anything else, including
     # the switch's own "could not restore" (70), leaves a default nobody
-    # verified carries the managed globals.
+    # verified carries the installed globals.
     if [ "$node_status" -ne 70 ] && [ "$node_final" = "$node_current" ]; then
       node_hold "switch to $node_target failed (see above); the fnm default is still $node_current"
     fi
@@ -1387,9 +1204,9 @@ fleet_run_node_converge() (
       "$node_target" "${node_final:-unknown}"
     exit 76
   fi
-  printf '%s\n' "$node_plan" | jq -r --arg old "$node_current" '
-    select(.unmanaged | length > 0) |
-    "  note  runtimes.node — unmanaged npm globals stay under \($old): \(.unmanaged | join(" "))"'
+  printf '%s\n' "$node_plan" | jq -r --arg new "$node_target" '
+    select(.excluded | length > 0) |
+    "  note  runtimes.node — not carried, provided by \($new) itself: \(.excluded | join(" "))"'
   node_stale=$(node_fnm_installed "$node_root" | grep -Fvx "$node_target" | tr '\n' ' ')
   [ -z "$node_stale" ] ||
     printf '  note  runtimes.node — older Node versions remain installed (never removed here): %s\n' \
@@ -1398,12 +1215,7 @@ fleet_run_node_converge() (
 )
 
 fleet_run_apply_item() {
-  # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS [FOLD] [HOLD_DIR]
-  #
-  # FOLD is the host's folded desired state and HOLD_DIR the run's holds
-  # (`sigholds`, `verdicts`). Only `runtimes.node` reads them: a Node switch
-  # carries the npm globals the fold manages, and holds while any of them is
-  # itself held.
+  # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
   # Exit 0 applied, 70 SATISFIED, 75 held. Presence for manager-installed items
   # is always the manager's own command; only STATE falls back to a config
@@ -1650,16 +1462,10 @@ fleet_run_apply_item() {
       # this build has no position on, and is held rather than satisfied.
       [ "$fleet_run_name" = node ] || return 75
       [ "$(fleet_run_state_of "$5")" = enabled ] || return 70
-      # HOLD_DIR is complete for every managed-set item by now: the verdict
-      # list is processed in C order, so each definitions.packages.* and
-      # packages.* item has been gated (and any hold recorded) before
-      # runtimes.node.
-      #
       # 76 (an unverified default) passes through, so the run can keep the
       # full cadence's npm pass off it; every other failure is a plain hold.
       fleet_run_node_status=0
-      fleet_run_node_converge "$5" "$3" "${7:-}" "$6" apply "$1" "$2" "${8:-}" ||
-        fleet_run_node_status=$?
+      fleet_run_node_converge "$5" "$3" apply || fleet_run_node_status=$?
       case $fleet_run_node_status in
         0 | 76) return "$fleet_run_node_status" ;;
         *) return 75 ;;
@@ -2274,8 +2080,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fleet_run_verdict_write "$run_item" "$run_digest" "$run_reason"
     run_status=0
     fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
-      "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" \
-      "$run_fold" "$run_tmp" || run_status=$?
+      "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" ||
+      run_status=$?
     case $run_status in
       0)
         # An unwritable applied/<h>.yaml is loud and narrow, never fatal: the
@@ -2283,8 +2089,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         # bare call under `set -e` would abort the run mid-apply instead of
         # narrowing what is applicable.
         fleet_applied_record "$run_store" "$run_host" "$run_item" "$run_digest" \
-          "$run_now" && fleet_run_annotate_npm "$run_store" "$run_host" "$run_item" \
-          "$run_defs" "$(fleet_run_package_managers "$run_fold" "$run_host")" || {
+          "$run_now" || {
           printf 'roundhouse: could not record %s in applied/%s.yaml; the item is applied but unowned\n' \
             "$run_item" "$run_host" >&2
           fleet_alert_write "$run_store" "$run_host" record-write \
@@ -2765,9 +2570,7 @@ fleet_run_full_pass() (
       fleet_run_item_is_held runtimes.node "" \
         "$full_hold_dir/sigholds" "$full_hold_dir/verdicts"; }; then
     full_node_status=0
-    fleet_run_node_converge "$full_runtime" "$full_defs" "$full_fold" \
-      "$(fleet_run_package_managers "$full_fold" "$full_host")" full \
-      "$full_store" "$full_host" "$full_hold_dir" </dev/null ||
+    fleet_run_node_converge "$full_runtime" "$full_defs" full </dev/null ||
       full_node_status=$?
     if [ "$full_node_status" -eq 76 ]; then
       full_npm_blocked=true
@@ -3358,16 +3161,13 @@ fleet_apply_command() (
   fleet_run_apply_item "$apply_store" "$apply_host" \
     "$(fleet_definitions_load "$apply_store")" "$apply_item" \
     "$(fleet_item_value "$apply_fold" "$apply_item")" \
-    "$(fleet_run_package_managers "$apply_fold" "$apply_host")" \
-    "$apply_fold" || apply_status=$?
+    "$(fleet_run_package_managers "$apply_fold" "$apply_host")" ||
+    apply_status=$?
   apply_now=$(fleet_now)
   case $apply_status in
     0)
       fleet_applied_record "$apply_store" "$apply_host" "$apply_item" \
         "$apply_digest" "$apply_now"
-      fleet_run_annotate_npm "$apply_store" "$apply_host" "$apply_item" \
-        "$(fleet_definitions_load "$apply_store")" \
-        "$(fleet_run_package_managers "$apply_fold" "$apply_host")" || :
       fleet_journal_append "$apply_store" "$apply_host" \
         "$(jq -cn --arg item "$apply_item" --arg d "$apply_digest" \
           --arg at "$apply_now" \

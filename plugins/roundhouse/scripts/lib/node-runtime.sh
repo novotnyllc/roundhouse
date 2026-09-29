@@ -370,3 +370,85 @@ $(printf '%s\n' "$node_hooks" | jq -c '.[]')
 EOF
   exit 0
 )
+
+node_globals_split() (
+  # `node_globals_split DETAIL` — npm_global_list_detail's answer as the two
+  # facts a switch plan reads: `globals` ({name: version} for every global
+  # with a version, as npm_global_list reports them) and `unpinnable` (the
+  # names that cannot be reinstalled by exact registry version).
+  printf '%s\n' "$1" | jq -ce '
+    {globals: (with_entries(select(.value.version | type == "string") | .value = .value.version)),
+     unpinnable: ([to_entries[] | select(.value.pinnable != true) | .key] | sort)}' 2>/dev/null
+)
+
+node_switch_plan() (
+  # `node_switch_plan GLOBALS UNPINNABLE OLD DEFS HOOKS` — THE carry rule, one
+  # pure function every lane asks (the scheduled cadences, seal-plan, and the
+  # executor's verify-preconditions):
+  #
+  #   The carry is every global installed under the current default, at its
+  #   exact installed version. Nothing is added, and nothing installed is
+  #   left behind.
+  #
+  # It depends on nothing but what is installed: not desired state, not
+  # definitions, not holds. (An earlier rule derived the carry from desired
+  # state, and every refinement found another way to strand a package that
+  # was held, renamed or disabled-but-held.) Two things are not carried:
+  #
+  #   excluded    what the new Node provides itself: `npm`, and `corepack`
+  #               when OLD is a release that bundles it (Node 24 and older)
+  #   unpinnable  a global that cannot be reinstalled by exact registry
+  #               version (`file:`, `link:`, git, no version). The switch
+  #               HOLDS naming it rather than strand it.
+  #
+  # Hooks keep their trust model. `required` is every `node_switch` hook a
+  # definition (DEFS) requires for a CARRIED package; `hooks` is what this
+  # host's config.json (HOOKS, `node_switch_hooks`) declares for the carried
+  # packages, in carry order, and is what runs. A required hook that is not
+  # declared, or a malformed `node_switch` on a carried package, holds.
+  jq -cn --argjson globals "$1" --argjson unpinnable "$2" --arg old "$3" \
+    --argjson defs "$4" --argjson local "$5" '
+    def argv_ok: type == "array" and length >= 1 and length <= 8 and
+      all(.[]; type == "string") and
+      (.[0] | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+      all(.[1:][]; length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$"));
+    ((($old | ltrimstr("v") | split(".")[0] | tonumber?) // 0) as $major |
+      ["npm"] + (if $major < 25 then ["corepack"] else [] end)) as $provided |
+    def provided($n): any($provided[]; . == $n);
+    ([$globals | keys[]] + $unpinnable | unique) as $installed |
+    [$globals | to_entries[] | .key as $n |
+      select((provided($n) | not) and (any($unpinnable[]; . == $n) | not)) |
+      {name: $n, version: .value}] | sort_by(.name) | . as $carry |
+    [$carry[].name] as $carried |
+    [($defs.packages // {}) | to_entries[] | .key as $logical | .value |
+      select(type == "object") | .npm as $npm |
+      (if ($npm | type) == "string" and $npm != "unavailable" then $npm
+       elif ($npm | type) == "object" then ($npm.name // $logical) else null end) as $name |
+      select($name != null and any($carried[]; . == $name)) |
+      {logical: $logical, name: $name,
+       hooks: (if ($npm | type) == "object" then ($npm.node_switch // null) else null end)} |
+      select(.hooks != null)] as $wants |
+    [$wants[] | select((.hooks | type == "array" and length >= 1 and length <= 4 and
+      all(.[]; argv_ok)) | not)] as $malformed |
+    [$carried[] | . as $n | $wants[] | select(.name == $n) |
+      select(.hooks | type == "array" and all(.[]; argv_ok)) |
+      .hooks[] | {package: ("npm:" + $n), argv: .}] as $required |
+    [$carried[] | . as $n | ($local["npm:" + $n] // [])[] |
+      {package: ("npm:" + $n), argv: .}] as $hooks |
+    {
+      carry: $carry,
+      excluded: [$installed[] | select(provided(.))],
+      unpinnable: [$unpinnable[] | select(provided(.) | not)] | unique,
+      required: $required,
+      hooks: $hooks,
+      held: (first(
+        ([$unpinnable[] | select(provided(.) | not)] | unique |
+          select(length > 0) |
+          "npm globals \(join(" ")) cannot be reinstalled by exact registry version (file:, link:, git or no version); a switch would strand them: reinstall them from the registry or remove them"),
+        ($malformed[] |
+          "definitions.packages.\(.logical) declares a malformed node_switch for the carried npm global \(.name)"),
+        ($required[] | . as $r | select(any($hooks[]; . == $r) | not) |
+          "\($r.package) requires node_switch hook \($r.argv | tojson) that this host'"'"'s config.json node_switch_hooks does not declare")
+      ) // null)
+    }'
+)

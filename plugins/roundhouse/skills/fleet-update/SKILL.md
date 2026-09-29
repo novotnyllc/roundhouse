@@ -65,26 +65,26 @@ policy.
   the npm records: `installed_version` is `fnm default`, `candidate_version`
   the newest published release in that major (`fnm list-remote`), plus
   `installed_versions`, `stale_versions` (installed, not the default),
-  `globals` (the default's top-level globals) and `switch_hooks_unproven`.
+  `globals` (the default's top-level globals), `globals_unpinnable` (globals
+  that cannot be reinstalled by exact registry version: `file:`, `link:`,
+  git, no version) and `switch_hooks_unproven`.
   A switch is a `package-upgrade` with `id: "fnm:node"`, argv exactly
-  `["fnm","default","<candidate_version>"]`, a `managed` list
-  `[{"package","name","required"}]`, a `carry` list `[{"name","version"}]`
-  and a `hooks` list `[{"package","argv"}]`. All three are not chosen but
-  derived: seal-plan runs the one carry rule (see the full cadence below)
-  over the store's desired state for the target and the recorded `globals`,
-  and requires the draft to equal it exactly: `managed` is every enabled
-  package declared an npm global there with its required `node_switch`
-  hooks, `carry` is managed ∩ installed at the recorded versions, and
-  `hooks` is, in carry order, every argv the configuration declares under
-  top-level `node_switch_hooks` for the carried packages (for example
-  `"npm:@bitkyc08/opencodex": [["ocx", "service"]]`), which must include
-  every required one. An empty or partial carry, a misstated managed set, a
-  target without desired state in the store, and any hold are refused. At
-  apply the executing host re-checks what its fresh snapshot proves (carry
-  == managed ∩ installed, hooks, required hooks); the store-backed
-  re-derivation runs where the store is authoritative: on the host itself
-  for `apply-plan`, and on the controller before any transfer for
-  `apply-ssh-plan` (the SSH worker never reads the target's store).
+  `["fnm","default","<candidate_version>"]`, a `carry` list
+  `[{"name","version"}]`, a `hooks` list and a `required` list (both
+  `[{"package","argv"}]`), placed before any `npm:*` upgrade in the same plan.
+  None of them is chosen; seal-plan derives them with the one carry rule and
+  requires the draft to equal it exactly: `carry` is every global the
+  snapshot shows installed under the current default at its exact version,
+  less `npm` (and `corepack` when the old Node bundled it), which the new
+  Node provides; `hooks` is, in carry order, every argv the configuration
+  declares under top-level `node_switch_hooks` for the carried packages (for
+  example `"npm:@bitkyc08/opencodex": [["ocx", "service"]]`); `required` is
+  every `node_switch` hook the store definitions require for a carried
+  package, each of which must be in `hooks`. An empty or partial carry, a
+  hook mismatch, an unpinnable global, and a host with no store (hook
+  requirements unknown) are refused. At apply, the executing host (local or
+  the SSH worker) re-derives the carry from its fresh snapshot and requires
+  the same carry, hooks and required hooks; no lane reads a store at apply.
   The executor proves each hook bin under the current prefix, then runs
   `fnm install`, `fnm default`, one exact `npm install --global a@x b@y …`
   under the new node, verifies every carried version, and runs each hook by
@@ -225,18 +225,13 @@ the full cadence does, to the newest published release in that major. An
 exact `version:` pins, like a package `version:`, and the full cadence then
 only restores it after a drift (a host that must drop a fleet pin sets
 `version: null`). The reviewed apply (fast cadence, on a new or changed value)
-switches only when the default is outside the major or is not the pin. A
-switch carries every enabled package of the fold that resolves to npm and is
-installed under the current default, at its installed version (it never adds
-a package), then runs post-switch hooks. One rule governs every lane: a
-switch proceeds only when the complete set of managed npm globals is known
-with certainty and fully carried with all required hooks, and anything
-uncertain holds it, naming the item: a managed package or its definition
-held this run (signature, review, canary, apply), an npm-declared package
-that does not resolve to npm, a global `applied/` recorded for a package
-that is still installed but would not be carried, or an undeclared required
-hook. A package with no `npm:` entry, `npm: unavailable` or desired
-`disabled` is not managed and never holds it. A
+switches only when the default is outside the major or is not the pin. One
+rule governs every lane: a switch carries every global installed under the
+current default at its exact version (less `npm`, and a bundled `corepack`,
+which the new Node provides), then runs post-switch hooks. It never adds a
+package and never leaves an installed one behind, whatever the store says
+about it (disabled, renamed, held); a global it cannot reinstall by exact
+registry version (`file:`, `link:`, git) holds the switch by name. A
 switch that fails and cannot confirm the old default restored reports the
 default as unverified, alerts `node-runtime-unverified`, and skips only the
 npm globals in that full pass. `fleet-seed` never seeds `packages.node` or
@@ -245,12 +240,12 @@ record (npm manages only through an `npm:` definition). A definition may require
 `node_switch:` on its npm entry (`opencodex: {npm: {name:
 "@bitkyc08/opencodex", update: [ocx, update], node_switch: [[ocx,
 service]]}}`), but only this host's `config.json` `node_switch_hooks`
-introduces a command: every hook the definition requires must be declared
-there identically, or the switch prints `hold  runtimes.node — packages.<name>
-requires node_switch hook(s) …` and changes nothing. The host may declare
-further host-only hooks (a WSL-only shim reinstall, say); those run too.
-Unmanaged globals and older Node versions stay where they are and are
-reported as `note` lines. `runtimes.node: disabled` stops managing the
+introduces a command: every hook a definition requires for a carried
+package must be declared there identically, or the switch prints `hold
+runtimes.node — npm:<name> requires node_switch hook …` and changes nothing.
+The host may declare further host-only hooks (a WSL-only shim reinstall,
+say); those run too. What the new Node provides, and older Node versions
+(never removed), are reported as `note` lines. `runtimes.node: disabled` stops managing the
 runtime. Only fnm is a runtime source; DSC never runs on native Windows, whose
 Node converges only through the sealed lane above. Add `runtimes:` to the
 store only once every host runs a Roundhouse that knows the category (0.9.29

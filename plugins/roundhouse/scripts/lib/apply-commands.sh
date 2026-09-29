@@ -532,7 +532,7 @@ apply_plan_command() {
     printf 'roundhouse: apply preflight inventory was partial\n' >&2
     exit 70
   fi
-  verify_preconditions_command "$plan" "$work/pre.jsonl" "$native_mode" >/dev/null
+  verify_preconditions_command "$plan" "$work/pre.jsonl" >/dev/null
   operation_count=$(jq '.operations | length' "$plan")
   index=0
   apply_status=completed
@@ -692,7 +692,7 @@ validate_legacy_ssh_plan_file() {
            # A Node runtime switch carries its exact globals and hooks; their
            # shapes were checked at seal time and are checked again by
            # verify-preconditions and the executor on the target.
-           exact(["argv","candidate_version","carry","hooks","id","kind","managed","type"])
+           exact(["argv","candidate_version","carry","hooks","id","kind","required","type"])
          elif .type == "package-upgrade" then
            exact(["argv","candidate_version","id","kind","type"])
          elif .type == "chezmoi-apply" and has("targets") then
@@ -744,25 +744,6 @@ apply_ssh_plan_command() (
     printf 'roundhouse: generated worker configuration does not match the sealed plan\n' >&2
     exit 65
   }
-  # A Node switch's store-backed check runs HERE, on the controller whose
-  # store the plan was sealed against, before anything is transferred: the
-  # worker verifies only what its fresh snapshot can prove, and never reads
-  # the target's own store (fleet_node_store_verify). The plan's integrity
-  # is checked first, since the worker will trust its sealed managed set.
-  if jq -e 'any(.operations[]?; .type == "package-upgrade" and .id == "fnm:node")' \
-    "$plan" >/dev/null 2>&1; then
-    [ "$(jq -cS 'del(.plan_id,.plan_digest)' "$plan" | sha256_stream)" = \
-      "$(jq -r '.plan_digest.value' "$plan")" ] || {
-      printf 'roundhouse: apply plan integrity check failed\n' >&2
-      exit 65
-    }
-    "$script_dir/roundhouse" collect --target "$target" --section host --section packages \
-      --output "$tmp/node-controller.jsonl" >/dev/null || {
-      printf 'roundhouse: could not inventory %s for the Node switch check\n' "$target" >&2
-      exit 70
-    }
-    fleet_node_store_verify "$plan" "$tmp/node-controller.jsonl" || exit 65
-  fi
   remote_dir=$(ssh_run "$alias" \
     'umask 077; mktemp -d /tmp/roundhouse-apply.XXXXXX') || {
       printf 'roundhouse: SSH target did not create a private workspace\n' >&2

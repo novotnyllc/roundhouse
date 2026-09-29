@@ -20,7 +20,7 @@ nrt_template="$nrt_root/template"
 nrt_log="$nrt_root/calls.log"
 nrt_remote="$nrt_root/remote.txt"
 nrt_catalog="$nrt_root/catalog.json"
-# The store the sealed lane derives the managed npm set from.
+# The store whose definitions state the hooks a sealed switch requires.
 nrt_store="$nrt_root/sealed-store"
 mkdir -p "$nrt_bin" "$nrt_template/bin" "$nrt_fnm/aliases" "$nrt_fnm/node-versions"
 
@@ -45,7 +45,11 @@ printf 'npm %s node=%s prefix=%s\n' "$*" "$(node --version 2>/dev/null || printf
 case "$1 ${2:-}" in
   "prefix --global") printf '%s\n' "$prefix" ;;
   "root --global") printf '%s/lib/node_modules\n' "$prefix" ;;
-  "ls --global") jq -c '{name:"lib",dependencies:(with_entries(.value = {version:.value}))}' "$state" ;;
+  "ls --global")
+    # NRT_NPM_LINKED adds an `npm link`ed global: file:-resolved, not
+    # reinstallable by registry version.
+    jq -c --arg linked "${NRT_NPM_LINKED:-}" '{name:"lib",dependencies:(with_entries(.value = {version:.value}) +
+      (if $linked == "" then {} else {($linked): {version:"0.0.1",resolved:"file:../../dev/devtool"}} end))}' "$state" ;;
   "outdated --global") printf '{}\n' ;;
   "install --global")
     [ "${NRT_NPM_FAIL_INSTALL:-0}" != 1 ] || exit 1
@@ -256,158 +260,109 @@ nrt_reset
     [ "$(jq -r '.unmanaged' "$nrt_fnm/node-versions/v26.0.0/installation/globals.json")" = 0.1.0 ] ||
     fail "the switch removed the old version or its globals"
 
-  # --- the desired-state plan: what to carry, which hooks, when to hold ------
+  # --- the carry rule: every installed global, hooks by local trust ---------
   nrt_reset
   nrt_defs='{"packages":{
     "svc":{"npm":{"name":"@example/svc","node_switch":[["svc","service"]]}},
     "plain":{"npm":"plain"},
-    "absent":{"npm":"absent-pkg"},
     "brewonly":{"homebrew":"brewonly"},
-    "npm-off":{"npm":"unavailable","homebrew":"unmanaged"},
-    "bad-name":{"npm":"../escape"},
-    "bad-hook":{"npm":{"name":"plain","node_switch":["svc service"]}}}}'
-  # npm-off is enabled and installed as a global, but its definition says npm
-  # is unavailable: deliberately not an npm global, never carried, never a hold.
-  nrt_fold='{"packages":{"svc":"enabled","plain":{"state":"enabled"},"absent":"enabled","brewonly":"enabled","npm-off":"enabled","off":"disabled"},"runtimes":{"node":{"major":26}}}'
+    "npm-off":{"npm":"unavailable","homebrew":"unmanaged"}}}'
+  nrt_fold='{"packages":{"svc":"enabled","plain":{"state":"enabled"},"brewonly":"enabled","npm-off":"enabled","off":"disabled"},"runtimes":{"node":{"major":26}}}'
   nrt_globals_now=$(npm_global_list)
   [ "$(fleet_resolve_package "$nrt_defs" svc homebrew npm | jq -c '.attributes.node_switch')" = \
     '[["svc","service"]]' ] || fail "a declared node_switch hook did not ride through the resolver"
   nrt_status=0
-  fleet_resolve_package "$nrt_defs" bad-hook npm >/dev/null || nrt_status=$?
+  fleet_resolve_package '{"packages":{"bad-hook":{"npm":{"name":"plain","node_switch":["svc service"]}}}}' \
+    bad-hook npm >/dev/null || nrt_status=$?
   [ "$nrt_status" -eq 75 ] || fail "a node_switch that is not a list of argv resolved"
   printf '%s\n' '{"version":1,"node_switch_hooks":{"npm:@example/svc":[["svc","service"],["svc","shim"]]}}' \
     >"$nrt_root/local-declared.json"
   printf '%s\n' '{"version":1}' >"$nrt_root/local-undeclared.json"
   printf '%s\n' '{"version":1,"node_switch_hooks":{"npm:@example/svc":[["svc","restart"]]}}' \
     >"$nrt_root/local-mismatched.json"
-  nrt_plan=$(ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
-    fleet_run_node_plan "$nrt_fold" "$nrt_defs" "homebrew npm" "$nrt_globals_now")
+  nrt_plan_for() {
+    # nrt_plan_for CONFIG [GLOBALS] [UNPINNABLE] [OLD] [DEFS]
+    node_switch_plan "${2:-$nrt_globals_now}" "${3:-[]}" "${4:-v26.0.0}" "${5:-$nrt_defs}" \
+      "$(jq -c '.node_switch_hooks // {}' "$nrt_root/$1.json")"
+  }
+  nrt_plan=$(nrt_plan_for local-declared)
+  # Every installed global is carried, at its installed version, whatever the
+  # desired state says about it (unmanaged, npm unavailable, disabled): only
+  # npm itself is left to the new Node.
   [ "$(printf '%s\n' "$nrt_plan" | jq -c '.carry')" = \
-    '[{"name":"@example/svc","version":"1.0.0"},{"name":"plain","version":"2.0.0"}]' ] ||
-    fail "the carry was not exactly the enabled, installed npm packages of the fold"
+    '[{"name":"@example/svc","version":"1.0.0"},{"name":"plain","version":"2.0.0"},{"name":"unmanaged","version":"0.1.0"}]' ] &&
+    [ "$(printf '%s\n' "$nrt_plan" | jq -c '.excluded')" = '["npm"]' ] ||
+    fail "the carry was not every installed global less what the new Node provides"
   # Local configuration may add host-only hooks; the definition's are a floor.
   [ "$(printf '%s\n' "$nrt_plan" | jq -c '[.hooks[].argv]')" = '[["svc","service"],["svc","shim"]]' ] &&
+    [ "$(printf '%s\n' "$nrt_plan" | jq -c '.required')" = \
+      '[{"package":"npm:@example/svc","argv":["svc","service"]}]' ] &&
     [ "$(printf '%s\n' "$nrt_plan" | jq -r '.held')" = null ] ||
     fail "the locally declared post-switch hooks were not planned"
-  [ "$(printf '%s\n' "$nrt_plan" | jq -c '.unmanaged')" = '["npm","unmanaged"]' ] ||
-    fail "unmanaged globals were not reported"
   for nrt_local in local-undeclared local-mismatched; do
-    ROUNDHOUSE_CONFIG=$nrt_root/$nrt_local.json \
-      fleet_run_node_plan "$nrt_fold" "$nrt_defs" "homebrew npm" "$nrt_globals_now" |
-      jq -e '.held | contains("packages.svc requires node_switch hook")' >/dev/null ||
+    nrt_plan_for "$nrt_local" |
+      jq -e '.held | startswith("npm:@example/svc requires node_switch hook [\"svc\",\"service\"]")' >/dev/null ||
       fail "a store-only post-switch hook did not hold the switch ($nrt_local)"
   done
-  # An enabled package declared as an npm global that does not resolve (a
-  # malformed name or node_switch) cannot be carried: it holds the switch
-  # rather than being silently left behind in the old prefix. On a host that
-  # does not manage npm it is not a carry candidate at all.
-  for nrt_bad_item in bad-name bad-hook; do
-    nrt_bad_fold=$(printf '%s\n' "$nrt_fold" | jq -c --arg p "$nrt_bad_item" '.packages[$p] = "enabled"')
-    ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
-      fleet_run_node_plan "$nrt_bad_fold" "$nrt_defs" "homebrew npm" "$nrt_globals_now" |
-      jq -e --arg p "$nrt_bad_item" '.held | startswith("packages.\($p) is declared as an npm global but does not resolve to npm on this host")' \
-      >/dev/null || fail "an unresolvable npm global did not hold the switch ($nrt_bad_item)"
-    ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
-      fleet_run_node_plan "$nrt_bad_fold" "$nrt_defs" "homebrew" "$nrt_globals_now" |
-      jq -e '.held == null and .carry == []' >/dev/null ||
-      fail "a host without npm held the switch on an npm definition ($nrt_bad_item)"
-  done
-  # The managed set must be CERTAIN: a held definition or package (signature,
-  # review, canary or apply hold, the same hold file the package pass reads)
-  # holds the switch, naming the item.
-  mkdir -p "$nrt_root/plan-holds"
-  : >"$nrt_root/plan-holds/verdicts"
-  for nrt_hold_line in 'definitions.packages.svc signature from an unverifiable commit' \
-    'packages.plain canary evidence unavailable' 'packages.svc held by review'; do
-    printf '%s\n' "$nrt_hold_line" >"$nrt_root/plan-holds/sigholds"
-    ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
-      fleet_run_node_plan "$nrt_fold" "$nrt_defs" "homebrew npm" "$nrt_globals_now" '{}' \
-        "$nrt_root/plan-holds" |
-      jq -e --arg item "${nrt_hold_line%% *}" '.held | startswith("\($item) is held this run")' >/dev/null ||
-      fail "a held managed-set item did not hold the switch: $nrt_hold_line"
-  done
-  printf 'packages.brewonly canary evidence unavailable\n' >"$nrt_root/plan-holds/sigholds"
-  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
-    fleet_run_node_plan "$nrt_fold" "$nrt_defs" "homebrew npm" "$nrt_globals_now" '{}' \
-      "$nrt_root/plan-holds" | jq -e '.held == null' >/dev/null ||
-    fail "a held package outside the managed npm set held the switch"
-  # A global applied/ records as installed for a package (the npm annotation)
-  # that is still installed but would no longer be carried holds the switch;
-  # a deliberately disabled package, or an annotated global no longer
-  # installed, does not.
-  nrt_prev_fold=$(printf '%s\n' "$nrt_fold" | jq -c '.packages["old-tool"] = "enabled"')
-  nrt_prev_applied='{"items":{"packages.old-tool":{"digest":"d","at":"t","npm":["unmanaged"]}}}'
-  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
-    fleet_run_node_plan "$nrt_prev_fold" "$nrt_defs" "homebrew npm" "$nrt_globals_now" \
-      "$nrt_prev_applied" | jq -e '.held | startswith("packages.old-tool was installed as the npm global unmanaged")' \
-      >/dev/null || fail "a previously managed global that would not be carried did not hold the switch"
-  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
-    fleet_run_node_plan "$(printf '%s\n' "$nrt_fold" | jq -c '.packages["old-tool"] = "disabled"')" \
-      "$nrt_defs" "homebrew npm" "$nrt_globals_now" "$nrt_prev_applied" | jq -e '.held == null' >/dev/null ||
-    fail "a disabled previously managed package held the switch"
-  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
-    fleet_run_node_plan "$nrt_prev_fold" "$nrt_defs" "homebrew npm" \
-      "$(printf '%s\n' "$nrt_globals_now" | jq -c 'del(.unmanaged)')" "$nrt_prev_applied" |
-    jq -e '.held == null' >/dev/null ||
-    fail "an annotated global that is no longer installed held the switch"
-  # The annotation is written with the applied record and survives a re-record.
-  mkdir -p "$nrt_root/annotate-store/applied"
-  fleet_applied_record "$nrt_root/annotate-store" nrt-host packages.svc d1 t1
-  fleet_run_annotate_npm "$nrt_root/annotate-store" nrt-host packages.svc "$nrt_defs" "homebrew npm"
-  fleet_run_annotate_npm "$nrt_root/annotate-store" nrt-host packages.brewonly "$nrt_defs" "homebrew npm"
-  fleet_applied_record "$nrt_root/annotate-store" nrt-host packages.svc d2 t2
-  [ "$(fleet_record_read "$(fleet_applied_path "$nrt_root/annotate-store" nrt-host)" '{}' |
-    jq -c '.items["packages.svc"] | [.digest,.npm]')" = '["d2",["@example/svc"]]' ] ||
-    fail "the applied record did not keep which npm global a package was installed as"
+  # A malformed node_switch on a carried package holds; one on a package that
+  # is not installed changes nothing.
+  nrt_plan_for local-declared "$nrt_globals_now" '[]' v26.0.0 \
+    '{"packages":{"bad-hook":{"npm":{"name":"plain","node_switch":["svc service"]}}}}' |
+    jq -e '.held == "definitions.packages.bad-hook declares a malformed node_switch for the carried npm global plain"' \
+    >/dev/null || fail "a malformed node_switch on a carried global did not hold the switch"
+  nrt_plan_for local-declared "$nrt_globals_now" '[]' v26.0.0 \
+    '{"packages":{"bad-hook":{"npm":{"name":"not-installed","node_switch":["svc service"]}}}}' |
+    jq -e '.held == null' >/dev/null || fail "a malformed node_switch on an absent global held the switch"
+  # corepack is the new Node's own only where the old one bundled it (24 and
+  # older); on 26 a corepack global was installed by someone and is carried.
+  nrt_with_corepack=$(printf '%s\n' "$nrt_globals_now" | jq -c '. + {corepack:"0.30.0"}')
+  nrt_plan_for local-declared "$nrt_with_corepack" '[]' v24.1.0 |
+    jq -e '.excluded == ["corepack","npm"] and all(.carry[]; .name != "corepack")' >/dev/null ||
+    fail "a corepack bundled with the old Node was carried"
+  nrt_plan_for local-declared "$nrt_with_corepack" '[]' v26.0.0 |
+    jq -e 'any(.carry[]; .name == "corepack")' >/dev/null ||
+    fail "a user-installed corepack was not carried"
+  # A global that cannot be reinstalled by exact registry version holds the
+  # switch by name; it is never silently left behind.
+  [ "$(NRT_NPM_LINKED=devtool node_globals_split "$(NRT_NPM_LINKED=devtool npm_global_list_detail)" |
+    jq -c '.unpinnable')" = '["devtool"]' ] ||
+    fail "a file:/link global was not reported unpinnable"
+  nrt_plan_for local-declared "$nrt_globals_now" '["devtool"]' |
+    jq -e '.held | startswith("npm globals devtool cannot be reinstalled by exact registry version")' \
+    >/dev/null || fail "an unpinnable global did not hold the switch"
 
   # --- desired-state convergence ----------------------------------------------
   nrt_converge() {
-    ROUNDHOUSE_CONFIG=$nrt_root/$1.json fleet_run_node_converge "$2" "$nrt_defs" "$nrt_fold" \
-      "homebrew npm" "$3" >"$nrt_root/converge-out" 2>&1
+    ROUNDHOUSE_CONFIG=$nrt_root/$1.json fleet_run_node_converge "$2" "$nrt_defs" "$3" \
+      >"$nrt_root/converge-out" 2>&1
   }
   # A default already inside the declared major is the desired state on the
   # reviewed apply; nothing is fetched or switched.
   nrt_converge local-declared '{"major":26}' apply || fail "an in-line default did not converge"
   ! grep -Eq 'fnm (install|default|list-remote)' "$nrt_log" ||
     fail "the reviewed apply touched fnm for a default already in its major"
-  # A malformed npm global in the fold holds the switch before anything moves.
+  # A linked global holds the switch before anything moves.
   nrt_status=0
-  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json fleet_run_node_converge '{"major":26}' \
-    "$nrt_defs" "$(printf '%s\n' "$nrt_fold" | jq -c '.packages["bad-name"] = "enabled"')" \
-    "homebrew npm" full >"$nrt_root/converge-out" 2>&1 || nrt_status=$?
+  NRT_NPM_LINKED=devtool nrt_converge local-declared '{"major":26}' full || nrt_status=$?
   [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v26.0.0 ] &&
-    grep -Fq '  hold  runtimes.node — packages.bad-name is declared as an npm global but does not resolve' \
-      "$nrt_root/converge-out" ||
-    fail "a switch ran while an enabled npm global could not be resolved"
-  ! grep -Eq 'fnm (install|default) |npm install' "$nrt_log" ||
-    fail "a switch held for an unresolvable npm global still installed something"
-  # A held managed-set definition holds a scheduled switch before anything moves.
-  mkdir -p "$nrt_root/converge-holds"
-  printf 'definitions.packages.svc signature from an unverifiable commit\n' >"$nrt_root/converge-holds/sigholds"
-  : >"$nrt_root/converge-holds/verdicts"
-  nrt_status=0
-  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json fleet_run_node_converge '{"major":26}' \
-    "$nrt_defs" "$nrt_fold" "homebrew npm" full "" "" "$nrt_root/converge-holds" \
-    >"$nrt_root/converge-out" 2>&1 || nrt_status=$?
-  [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v26.0.0 ] &&
-    grep -Fq '  hold  runtimes.node — definitions.packages.svc is held this run' "$nrt_root/converge-out" &&
+    grep -Fq '  hold  runtimes.node — npm globals devtool cannot be reinstalled' "$nrt_root/converge-out" &&
     ! grep -Eq 'fnm (install|default) |npm install' "$nrt_log" ||
-    fail "a scheduled switch ran while a managed definition was held"
+    fail "a switch ran while a linked global could not be carried"
   # A store-only hook holds the switch and changes nothing.
   nrt_status=0
   nrt_converge local-undeclared '{"major":26}' full || nrt_status=$?
   [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v26.0.0 ] &&
-    grep -Fq '  hold  runtimes.node — packages.svc requires node_switch hook' "$nrt_root/converge-out" ||
+    grep -Fq '  hold  runtimes.node — npm:@example/svc requires node_switch hook' "$nrt_root/converge-out" ||
     fail "the full cadence switched without the host declaring the required hook"
   ! grep -Eq 'fnm (install|default) ' "$nrt_log" || fail "a held switch still ran fnm"
   # The full cadence moves to the newest release in the line.
   nrt_converge local-declared '{"major":26}' full || fail "the full cadence did not converge the line"
   [ "$(nrt_default)" = v26.10.0 ] || fail "the full cadence did not move to the newest in-line release"
-  grep -Fq '  switch runtimes.node v26.0.0 -> v26.10.0 (carrying @example/svc@1.0.0 plain@2.0.0)' \
+  grep -Fq '  switch runtimes.node v26.0.0 -> v26.10.0 (carrying @example/svc@1.0.0 plain@2.0.0 unmanaged@0.1.0)' \
     "$nrt_root/converge-out" || fail "the switch was not reported with its carry"
   grep -Fq 'bin svc shim node=v26.10.0' "$nrt_log" || fail "a host-only hook did not run"
-  grep -Fq '  note  runtimes.node — unmanaged npm globals stay under v26.0.0: npm unmanaged' \
-    "$nrt_root/converge-out" || fail "unmanaged globals left behind were not reported"
+  grep -Fq '  note  runtimes.node — not carried, provided by v26.10.0 itself: npm' \
+    "$nrt_root/converge-out" || fail "what the new Node provides was not reported"
   grep -Fq '  note  runtimes.node — older Node versions remain installed (never removed here): v26.0.0' \
     "$nrt_root/converge-out" || fail "the old Node version was not reported as left installed"
   : >"$nrt_log"
@@ -416,8 +371,8 @@ nrt_reset
   # An exact pin wins over the newest release, in both directions.
   nrt_converge local-declared '{"version":"26.2.0"}' apply || fail "an exact pin did not converge"
   [ "$(nrt_default)" = v26.2.0 ] || fail "the fnm default did not move to the pinned version"
-  [ "$(nrt_globals v26.2.0)" = '{"@example/svc":"1.0.0","plain":"2.0.0"}' ] ||
-    fail "the pinned switch did not carry the managed globals"
+  [ "$(nrt_globals v26.2.0)" = '{"@example/svc":"1.0.0","plain":"2.0.0","unmanaged":"0.1.0"}' ] ||
+    fail "the pinned switch did not carry every installed global"
   : >"$nrt_log"
   nrt_converge local-declared '{"version":"26.2.0"}' full || fail "a satisfied pin did not converge"
   ! grep -Eq 'fnm (install|default|list-remote)' "$nrt_log" || fail "the full cadence moved a pinned runtime"
@@ -429,11 +384,6 @@ nrt_reset
   [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v27.0.0 ] ||
     fail "an unreachable release list did not hold the switch"
   nrt_status=0
-  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json fleet_run_node_converge '{"major":25}' \
-    "$nrt_defs" '' "homebrew npm" apply >/dev/null 2>&1 || nrt_status=$?
-  [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v27.0.0 ] ||
-    fail "a switch without the fold ran (it would strand every managed global)"
-  nrt_status=0
   nrt_converge local-declared '"enabled"' apply || nrt_status=$?
   [ "$nrt_status" -eq 75 ] || fail "a runtimes.node without major or version did not hold"
   nrt_status=0
@@ -441,17 +391,26 @@ nrt_reset
     nrt_converge local-declared '{"major":26}' apply) || nrt_status=$?
   [ "$nrt_status" -eq 75 ] || fail "a host without an fnm default did not hold"
 
-  # --- the category arm --------------------------------------------------------
+  # --- the category arm, and the manual fleet-apply path ------------------------
   nrt_status=0
   fleet_run_apply_item "$nrt_root/store" nrt-host "$nrt_defs" runtimes.python '{"major":3}' \
-    "homebrew npm" "$nrt_fold" >/dev/null 2>&1 || nrt_status=$?
+    "homebrew npm" >/dev/null 2>&1 || nrt_status=$?
   [ "$nrt_status" -eq 75 ] || fail "an unmanaged runtime name did not hold"
   nrt_status=0
   fleet_run_apply_item "$nrt_root/store" nrt-host "$nrt_defs" runtimes.node '"disabled"' \
-    "homebrew npm" "$nrt_fold" >/dev/null 2>&1 || nrt_status=$?
+    "homebrew npm" >/dev/null 2>&1 || nrt_status=$?
   [ "$nrt_status" -eq 70 ] || fail "a disabled runtimes.node was not satisfied"
   [ -z "$(fleet_unknown_categories '{"runtimes":{"node":{"major":26}}}')" ] ||
     fail "runtimes is not a known category"
+  # `fleet-apply runtimes.node` has no fold and no run holds, and needs
+  # neither: it carries everything installed.
+  nrt_reset
+  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
+    fleet_run_apply_item "$nrt_root/store" nrt-host "$nrt_defs" runtimes.node '{"major":27}' \
+    "homebrew npm" >/dev/null 2>&1 || fail "the manual runtimes.node apply did not converge"
+  [ "$(nrt_default)" = v27.0.0 ] &&
+    [ "$(nrt_globals v27.0.0)" = '{"@example/svc":"1.0.0","plain":"2.0.0","unmanaged":"0.1.0"}' ] ||
+    fail "the manual runtimes.node apply did not carry everything installed"
 
   # --- the full cadence runs the runtime before the npm pass --------------------
   nrt_reset
@@ -486,6 +445,18 @@ nrt_reset
     [ "$nrt_switch_line" -lt "$nrt_outdated_line" ] &&
     grep -Fq 'npm outdated --global --json node=v26.10.0' "$nrt_log" ||
     fail "the npm pass did not run after the runtime switch, under the new node"
+  # A package just changed to `disabled` while that change (and its
+  # definition) is held is still installed, so it is carried: the carry reads
+  # what is installed, never desired state or holds.
+  nrt_reset
+  printf '%s\n' 'packages.svc canary evidence unavailable' \
+    'definitions.packages.svc signature from an unverifiable commit' >"$nrt_root/full-tmp/sigholds"
+  nrt_run_full '{"packages":{"svc":"disabled","plain":"enabled"},"package_managers":["homebrew","npm"],"runtimes":{"node":{"major":26}}}'
+  [ "$(nrt_default)" = v26.10.0 ] &&
+    [ "$(nrt_globals v26.10.0)" = '{"@example/svc":"1.0.0","plain":"2.0.0","unmanaged":"0.1.0"}' ] &&
+    grep -Fq 'bin svc service node=v26.10.0' "$nrt_log" ||
+    fail "a disabled-and-held installed package was not carried with its hook"
+  : >"$nrt_root/full-tmp/sigholds"
 
   # --- an unverified default keeps npm off it, and only npm ---------------------
   nrt_mixed_fold='{"packages":{"svc":"enabled","plain":"enabled","brewonly":"enabled"},"package_managers":["homebrew","npm"],"runtimes":{"node":{"major":26}}}'
@@ -542,11 +513,9 @@ chmod 600 "$tmp/node-config.json"
 nrt_cli() {
   nrt_env ROUNDHOUSE_CONFIG="$tmp/node-config.json" "$cli" "$@"
 }
-# The target's desired state: two managed npm globals (one requiring a hook)
-# and nothing else. The sealed lane derives the managed set from it.
-mkdir -p "$nrt_store/hosts" "$nrt_store/applied"
-printf '%s\n' 'packages:' '  svc: enabled' '  plain: enabled' '  brewonly: enabled' \
-  >"$nrt_store/hosts/test-host.yaml"
+# The store's definitions: the only store input a sealed switch reads, for
+# the node_switch hooks they require of carried packages.
+mkdir -p "$nrt_store"
 printf '%s\n' 'packages:' \
   '  svc: {npm: {name: "@example/svc", node_switch: [[svc, service]]}}' \
   '  plain: {npm: plain}' '  brewonly: {homebrew: brewonly}' >"$nrt_store/definitions.yaml"
@@ -573,31 +542,37 @@ nrt_cli worker-config test-windows updates "$tmp/node-windows-worker-config.json
   fail "post-switch hooks were projected to a Windows target"
 
 if [ -z "$fleet_fixture_yq" ]; then
-  printf 'NOTICE: the sealed Node switch derives its managed set from a store and needs yq; skipped\n'
+  printf 'NOTICE: the sealed Node switch reads store definitions and needs yq; skipped\n'
 else
   nrt_cli collect --target test-host --section host --section packages --output "$tmp/node-snapshot.jsonl"
   "$cli" validate "$tmp/node-snapshot.jsonl"
   [ "$(jq -c 'select(.kind == "package" and .id == "fnm:node") | .data |
     [.installed_version,.candidate_version,.update_available,.line,.installed_versions,.stale_versions,
-     .globals["@example/svc"],.switch_hooks_unproven]' "$tmp/node-snapshot.jsonl")" = \
-    '["v26.0.0","v26.10.0",true,"26",["v26.0.0"],[],"1.0.0",[]]' ] ||
+     .globals["@example/svc"],.globals_unpinnable,.switch_hooks_unproven]' "$tmp/node-snapshot.jsonl")" = \
+    '["v26.0.0","v26.10.0",true,"26",["v26.0.0"],[],"1.0.0",[],[]]' ] ||
     fail "the POSIX collector did not report the fnm runtime with its line candidate and globals"
+  NRT_NPM_LINKED=devtool nrt_cli collect --target test-host --section host --section packages \
+    --output "$tmp/node-linked-snapshot.jsonl"
+  [ "$(jq -c 'select(.kind == "package" and .id == "fnm:node") | .data.globals_unpinnable' \
+    "$tmp/node-linked-snapshot.jsonl")" = '["devtool"]' ] ||
+    fail "the POSIX collector did not report an unpinnable global"
 
-  nrt_managed='[{"package":"plain","name":"plain","required":[]},{"package":"svc","name":"@example/svc","required":[["svc","service"]]}]'
+  nrt_required='[{"package":"npm:@example/svc","argv":["svc","service"]}]'
   nrt_draft() {
-    # nrt_draft CANDIDATE CARRY HOOKS ARGV... (the managed set is $nrt_managed)
+    # nrt_draft CANDIDATE CARRY HOOKS ARGV... (required hooks: $nrt_required)
     jq -n --arg candidate "$1" --argjson carry "$2" --argjson hooks "$3" \
-      --argjson managed "$nrt_managed" --args \
+      --argjson required "$nrt_required" --args \
       '{domain:"updates",target:"test-host",operations:[{type:"package-upgrade",kind:"package",
         id:"fnm:node",candidate_version:$candidate,argv:$ARGS.positional,carry:$carry,hooks:$hooks,
-        managed:$managed}]}' \
+        required:$required}]}' \
       -- "${@:4}"
   }
-  nrt_carry='[{"name":"@example/svc","version":"1.0.0"},{"name":"plain","version":"2.0.0"}]'
+  nrt_carry='[{"name":"@example/svc","version":"1.0.0"},{"name":"plain","version":"2.0.0"},{"name":"unmanaged","version":"0.1.0"}]'
   nrt_hooks='[{"package":"npm:@example/svc","argv":["svc","service"]}]'
   nrt_seal_refused() {
-    # nrt_seal_refused LABEL DRAFT-FILE
-    if nrt_cli seal-plan "$2" "$tmp/node-snapshot.jsonl" "$tmp/node-refused-plan.json" >/dev/null 2>&1; then
+    # nrt_seal_refused LABEL DRAFT-FILE [SNAPSHOT]
+    if nrt_cli seal-plan "$2" "${3:-$tmp/node-snapshot.jsonl}" "$tmp/node-refused-plan.json" \
+      >"$nrt_root/seal-refused.log" 2>&1; then
       fail "a Node switch sealed with $1"
     fi
   }
@@ -607,6 +582,9 @@ else
     '[{"package":"npm:@example/svc","argv":["svc","service"]},{"package":"npm:plain","argv":["plain","x"]}]' \
     fnm default v26.10.0 >"$tmp/node-draft-extrahook.json"
   nrt_seal_refused 'a post-switch hook the configuration does not declare' "$tmp/node-draft-extrahook.json"
+  (nrt_required='[]'; nrt_draft v26.10.0 "$nrt_carry" "$nrt_hooks" fnm default v26.10.0) \
+    >"$tmp/node-draft-norequired.json"
+  nrt_seal_refused 'the required hooks the definitions state omitted' "$tmp/node-draft-norequired.json"
   nrt_draft v26.10.0 '[{"name":"plain","version":"9.9.9"}]' '[]' fnm default v26.10.0 \
     >"$tmp/node-draft-wrongcarry.json"
   nrt_seal_refused 'a carried version that is not installed' "$tmp/node-draft-wrongcarry.json"
@@ -616,25 +594,35 @@ else
   nrt_seal_refused 'a version that is not the observed candidate' "$tmp/node-draft-notcandidate.json"
   jq '.operations[0].id = "fnm:python"' "$tmp/node-draft-nohooks.json" >"$tmp/node-draft-otherid.json"
   nrt_seal_refused 'a runtime other than node' "$tmp/node-draft-otherid.json"
-  # The carry must be the COMPLETE managed set that is installed, with the
-  # managed set the store states: empty, partial and misstated all refused.
+  # The carry is every installed global: empty and partial are refused, and a
+  # linked global holds the switch outright.
   nrt_draft v26.10.0 '[]' '[]' fnm default v26.10.0 >"$tmp/node-draft-empty.json"
   nrt_seal_refused 'an empty carry' "$tmp/node-draft-empty.json"
-  nrt_draft v26.10.0 '[{"name":"@example/svc","version":"1.0.0"}]' "$nrt_hooks" fnm default v26.10.0 \
-    >"$tmp/node-draft-partial.json"
+  nrt_draft v26.10.0 '[{"name":"@example/svc","version":"1.0.0"},{"name":"plain","version":"2.0.0"}]' \
+    "$nrt_hooks" fnm default v26.10.0 >"$tmp/node-draft-partial.json"
   nrt_seal_refused 'a partial carry' "$tmp/node-draft-partial.json"
-  (nrt_managed='[{"package":"svc","name":"@example/svc","required":[["svc","service"]]}]'
-    nrt_draft v26.10.0 '[{"name":"@example/svc","version":"1.0.0"}]' "$nrt_hooks" fnm default v26.10.0) \
-    >"$tmp/node-draft-short-managed.json"
-  nrt_seal_refused 'a managed set the store does not state' "$tmp/node-draft-short-managed.json"
   nrt_draft v26.10.0 "$nrt_carry" "$nrt_hooks" fnm default v26.10.0 >"$tmp/node-draft.json"
+  nrt_seal_refused 'an unpinnable global installed' "$tmp/node-draft.json" "$tmp/node-linked-snapshot.jsonl"
+  assert_contains "$(cat "$nrt_root/seal-refused.log")" 'npm globals devtool cannot be reinstalled'
+  # The switch runs before any npm upgrade in the same plan: an upgrade first
+  # would change a version the carry names.
+  jq '.operations = [{type:"package-upgrade",kind:"package",id:"npm:plain",candidate_version:"3.0.0",
+    argv:["npm","install","--global","plain@3.0.0"]}] + .operations' "$tmp/node-draft.json" \
+    >"$tmp/node-draft-npm-first.json"
+  nrt_seal_refused 'an npm upgrade ordered before it' "$tmp/node-draft-npm-first.json"
+  assert_contains "$(cat "$nrt_root/seal-refused.log")" 'the Node switch must precede every npm upgrade'
+  jq '.operations += [{type:"package-upgrade",kind:"package",id:"npm:plain",candidate_version:"3.0.0",
+    argv:["npm","install","--global","plain@3.0.0"]}]' "$tmp/node-draft.json" >"$tmp/node-draft-npm-after.json"
+  nrt_cli seal-plan "$tmp/node-draft-npm-after.json" "$tmp/node-snapshot.jsonl" \
+    "$tmp/node-after-plan.json" >"$nrt_root/seal-after.log" 2>&1 || :
+  ! grep -Fq 'must precede every npm upgrade' "$nrt_root/seal-after.log" ||
+    fail "a Node switch ordered before an npm upgrade was refused for its order"
   if nrt_store_override="$nrt_root/no-store" nrt_cli seal-plan "$tmp/node-draft.json" \
     "$tmp/node-snapshot.jsonl" "$tmp/node-refused-plan.json" >/dev/null 2>&1; then
-    fail "a Node switch sealed without the store desired state"
+    fail "a Node switch sealed without the store definitions"
   fi
   jq -c 'if .kind == "package" and .id == "fnm:node" then .data.switch_hooks_unproven = ["npm:@example/svc"] else . end' \
     "$tmp/node-snapshot.jsonl" >"$tmp/node-unproven-snapshot.jsonl"
-  nrt_draft v26.10.0 "$nrt_carry" "$nrt_hooks" fnm default v26.10.0 >"$tmp/node-draft.json"
   if nrt_cli seal-plan "$tmp/node-draft.json" "$tmp/node-unproven-snapshot.jsonl" \
     "$tmp/node-unproven-plan.json" >/dev/null 2>&1; then
     fail "a Node switch sealed while a carried package's hook was unproven"
@@ -664,27 +652,13 @@ else
     fail "an installed, non-default Node version was not reported as stale"
   nrt_cli seal-plan "$tmp/node-draft.json" "$tmp/node-snapshot-2.jsonl" "$tmp/node-plan-2.json"
   nrt_plan_id=$(jq -r '.plan_id' "$tmp/node-plan-2.json")
-  # Apply re-derives the managed set from the store as it is now: a package
-  # that became a managed npm global after sealing refuses the plan.
-  cp "$nrt_store/hosts/test-host.yaml" "$nrt_root/host.yaml.sealed"
-  printf '%s\n' '  unmanaged-now-managed: enabled' >>"$nrt_store/hosts/test-host.yaml"
-  printf '%s\n' '  unmanaged-now-managed: {npm: unmanaged}' >>"$nrt_store/definitions.yaml"
-  if nrt_cli apply-plan "$tmp/node-plan-2.json" "$nrt_plan_id" "$tmp/node-changed-apply.jsonl" \
-    >"$nrt_root/changed-apply.log" 2>&1; then
-    fail "a Node switch applied although its managed set changed after sealing"
-  fi
-  grep -Fq 'the managed npm globals changed since planning' "$nrt_root/changed-apply.log" &&
-    [ "$(nrt_default)" = v26.0.0 ] ||
-    fail "a changed managed set was not refused before the switch"
-  cp "$nrt_root/host.yaml.sealed" "$nrt_store/hosts/test-host.yaml"
-  sed -i.bak '/unmanaged-now-managed/d' "$nrt_store/definitions.yaml"
 
   : >"$nrt_log"
   nrt_cli apply-plan "$tmp/node-plan-2.json" "$nrt_plan_id" "$tmp/node-apply.jsonl"
   [ "$(nrt_default)" = v26.10.0 ] || fail "the sealed switch did not move the fnm default"
   [ "$(jq -c 'select(.kind == "package" and .id == "fnm:node") | [.data.installed_version,.data.globals]' \
-    "$tmp/node-apply.jsonl")" = '["v26.10.0",{"@example/svc":"1.0.0","plain":"2.0.0"}]' ] ||
-    fail "the sealed switch post-inventory did not show the carried globals under the new default"
+    "$tmp/node-apply.jsonl")" = '["v26.10.0",{"@example/svc":"1.0.0","plain":"2.0.0","unmanaged":"0.1.0"}]' ] ||
+    fail "the sealed switch post-inventory did not show every carried global under the new default"
   [ "$(jq -r 'select(.kind == "operation" and (.id | startswith("apply:"))) | .data.operation_status' \
     "$tmp/node-apply.jsonl")" = completed ] || fail "the sealed switch did not complete"
   grep -Fq 'bin svc service node=v26.10.0' "$nrt_log" ||
@@ -707,16 +681,14 @@ else
   [ "$(jq -r 'select(.kind == "package" and .id == "npm:plain") | .data.node_version' "$tmp/node-apply.jsonl")" = \
     v26.10.0 ] || fail "the npm records did not move to the new runtime"
 
-  # --- the SSH lane: store check on the controller, snapshot checks on the worker
-  # The worker's own store is never consulted for a remote plan: here it is
-  # absent on the target side (the ssh wrapper points the remote environment
-  # at no store), and a plan the controller's store still vouches for applies.
+  # --- the SSH lane: the worker needs no store ---------------------------------
+  # The carry is proven from the worker's own fresh snapshot, and the required
+  # hooks are bound into the plan, so a target without a store applies.
   nrt_reset
   jq '.machines["test-ssh"].package_managers = ["homebrew","npm"] |
     .node_switch_hooks = {"npm:@example/svc":[["svc","service"]]}' \
     "$tmp/config.json" >"$tmp/node-ssh-config.json"
   chmod 600 "$tmp/node-ssh-config.json"
-  cp "$nrt_store/hosts/test-host.yaml" "$nrt_store/hosts/test-ssh.yaml"
   mkdir -p "$nrt_root/nostore-bin"
   printf '%s\n' '#!/usr/bin/env bash' \
     'ROUNDHOUSE_FLEET_STORE=$NRT_REMOTE_STORE exec "$NRT_REAL_SSH" "$@"' >"$nrt_root/nostore-bin/ssh"
@@ -730,22 +702,6 @@ else
   jq '.target = "test-ssh"' "$tmp/node-draft.json" >"$tmp/node-ssh-draft.json"
   nrt_ssh_cli seal-plan "$tmp/node-ssh-draft.json" "$tmp/node-ssh-snapshot.jsonl" "$tmp/node-ssh-plan.json"
   nrt_ssh_plan_id=$(jq -r '.plan_id' "$tmp/node-ssh-plan.json")
-  # The controller's store no longer vouches for the plan: refused on the
-  # controller, before any worker input (plan, worker config) is transferred.
-  # The only transfers are the controller's own read-only inventory.
-  cp "$nrt_store/hosts/test-ssh.yaml" "$nrt_root/ssh-host.yaml.sealed"
-  printf '%s\n' '  unmanaged-now-managed: enabled' >>"$nrt_store/hosts/test-ssh.yaml"
-  printf '%s\n' '  unmanaged-now-managed: {npm: unmanaged}' >>"$nrt_store/definitions.yaml"
-  : >"$SCP_COMMAND_LOG"
-  if nrt_ssh_cli apply-ssh-plan "$tmp/node-ssh-plan.json" "$nrt_ssh_plan_id" \
-    "$tmp/node-ssh-refused.jsonl" >"$nrt_root/ssh-refused.log" 2>&1; then
-    fail "an SSH Node switch applied although the controller store no longer vouches for it"
-  fi
-  grep -Fq 'the managed npm globals changed since planning' "$nrt_root/ssh-refused.log" &&
-    ! grep -Eq 'plan\.json|roundhouse-apply\.' "$SCP_COMMAND_LOG" && [ "$(nrt_default)" = v26.0.0 ] ||
-    fail "a controller-side Node check mismatch was not refused before any transfer"
-  cp "$nrt_root/ssh-host.yaml.sealed" "$nrt_store/hosts/test-ssh.yaml"
-  sed -i.bak '/unmanaged-now-managed/d' "$nrt_store/definitions.yaml"
   : >"$nrt_log"
   nrt_ssh_cli apply-ssh-plan "$tmp/node-ssh-plan.json" "$nrt_ssh_plan_id" "$tmp/node-ssh-apply.jsonl" ||
     fail "an SSH Node switch refused because the target has no store"
@@ -760,12 +716,16 @@ else
     ROUNDHOUSE_LIB_ONLY=1 . "$cli"
     jq -c 'if .kind == "package" and .id == "fnm:node" then .data.globals |= del(.plain) else . end' \
       "$tmp/node-ssh-snapshot.jsonl" >"$tmp/node-ssh-uninstalled.jsonl"
+    jq -c 'if .kind == "package" and .id == "fnm:node" then .data.globals.extra = "1.0.0" else . end' \
+      "$tmp/node-ssh-snapshot.jsonl" >"$tmp/node-ssh-extra.jsonl"
     fleet_node_snapshot_verify "$tmp/node-ssh-plan.json" "$tmp/node-ssh-snapshot.jsonl" \
       "$tmp/node-ssh-config.json" || fail "the worker rejected a carry its snapshot proves"
-    if fleet_node_snapshot_verify "$tmp/node-ssh-plan.json" "$tmp/node-ssh-uninstalled.jsonl" \
-      "$tmp/node-ssh-config.json"; then
-      fail "the worker accepted a carry its snapshot does not prove"
-    fi
+    for nrt_bad_snapshot in uninstalled extra; do
+      if fleet_node_snapshot_verify "$tmp/node-ssh-plan.json" "$tmp/node-ssh-$nrt_bad_snapshot.jsonl" \
+        "$tmp/node-ssh-config.json"; then
+        fail "the worker accepted a carry that is not the installed set ($nrt_bad_snapshot)"
+      fi
+    done
   )
 fi
 

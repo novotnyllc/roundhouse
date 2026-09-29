@@ -61,16 +61,14 @@ seal_plan_command() {
             (.argv | type == "array" and length >= 1 and length <= 8 and
               (.[0] | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
               all(.[1:][]; type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$"))))) and
-        # The desired-state managed set the carry must equal (managed ∩
-        # installed); re-derived from the store at seal and at apply.
-        (.managed | type == "array" and length <= 256 and
-          all(.[]; type == "object" and (keys == ["name","package","required"]) and
-            (.package | type == "string" and length > 0 and length <= 256) and
-            (.name | type == "string" and length <= 214 and
-              test("^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
-            (.required | type == "array" and length <= 4 and
-              all(.[]; type == "array" and length >= 1 and length <= 8 and all(.[]; type == "string")))))
-       elif has("carry") or has("hooks") or has("managed") then false
+        # The node_switch hooks the definitions require for the carried
+        # packages, derived at seal from the controller store and bound here
+        # by the plan digest; every one must appear in `hooks`.
+        (.required | type == "array" and length <= 64 and
+          all(.[]; type == "object" and (keys == ["argv","package"]) and
+            (.package | type == "string" and startswith("npm:")) and
+            (.argv | type == "array" and length >= 1 and length <= 8 and all(.[]; type == "string"))))
+       elif has("carry") or has("hooks") or has("required") then false
        else true end) and
       (if .type == "chezmoi-apply" and has("targets") then
         (.targets | type == "array" and length > 0 and length <= 16 and
@@ -118,6 +116,15 @@ seal_plan_command() {
     exit 64
   }
   fi
+  # A Node switch must run before any npm upgrade in the same plan: an npm
+  # upgrade first changes a version the switch's sealed carry names, and the
+  # switch would then refuse halfway through an already-mutated plan.
+  jq -e '(.operations | map(.id)) as $ids | ($ids | index("fnm:node")) as $switch |
+    $switch == null or all(range(0; $switch); $ids[.] | startswith("npm:") | not)' \
+    "$draft" >/dev/null || {
+    printf 'roundhouse: the Node switch must precede every npm upgrade in the same plan\n' >&2
+    exit 65
+  }
   validate_file "$snapshot"
   target=$(jq -r '.target' "$draft")
   domain=$(jq -r '.domain' "$draft")
@@ -415,20 +422,35 @@ seal_plan_command() {
       exit 65
     }
   fi
-  # A Node switch seals only when it carries the COMPLETE managed set: the
-  # one carry predicate (fleet_run_node_plan), run over the store's desired
-  # state for the target and the snapshot's globals, must hold nothing and
-  # must produce exactly the draft's managed set, carry and hooks. An empty,
-  # partial or padded carry, a missing or extra hook, and a managed set the
-  # store does not state are all refused.
+  # A Node switch seals only on the carry rule (node_switch_plan, §7.5): its
+  # carry is every global the snapshot shows installed under the current
+  # default at its exact version, less what the new Node provides itself; an
+  # unpinnable global holds it. `hooks` are exactly what the configuration
+  # declares for the carried packages and `required` exactly the node_switch
+  # hooks the store definitions require for them, each of which must be in
+  # `hooks`. (Its order before any npm upgrade is checked above.)
   if jq -e 'any(.operations[]?; .type == "package-upgrade" and .id == "fnm:node")' \
     "$draft" >/dev/null 2>&1; then
-    node_seal_globals=$(jq -cs 'first(.[] | select(.kind == "package" and .id == "fnm:node" and
-      .status == "present") | .data.globals) // null' "$snapshot")
-    node_seal_plan=$(fleet_node_store_plan "$target" "$node_seal_globals" \
+    node_seal_store=$(fleet_store_path)
+    [ -d "$node_seal_store" ] || {
+      printf 'roundhouse: a Node switch seals only against the store definitions (its hook requirements); no store at %s\n' \
+        "$node_seal_store" >&2
+      exit 65
+    }
+    node_seal_record=$(jq -cs 'first(.[] | select(.kind == "package" and .id == "fnm:node" and
+      .status == "present") | .data) // null' "$snapshot")
+    printf '%s\n' "$node_seal_record" | jq -e '(.globals | type == "object") and
+      (.installed_version | type == "string")' >/dev/null 2>&1 || {
+      printf 'roundhouse: the snapshot does not record the npm globals under the current Node default\n' >&2
+      exit 65
+    }
+    node_seal_plan=$(node_switch_plan \
+      "$(printf '%s\n' "$node_seal_record" | jq -c '.globals')" \
+      "$(printf '%s\n' "$node_seal_record" | jq -c '.globals_unpinnable // []')" \
+      "$(printf '%s\n' "$node_seal_record" | jq -r '.installed_version')" \
+      "$(fleet_definitions_load "$node_seal_store")" \
       "$(jq -c '.node_switch_hooks // {}' "$config")") || {
-      printf 'roundhouse: a Node switch seals only when the managed npm set for %s is known: the store desired state or the recorded globals are unavailable\n' \
-        "$target" >&2
+      printf 'roundhouse: could not derive the Node switch carry\n' >&2
       exit 65
     }
     node_seal_held=$(printf '%s\n' "$node_seal_plan" | jq -r '.held // empty')
@@ -438,12 +460,12 @@ seal_plan_command() {
     }
     jq -e --argjson plan "$node_seal_plan" '
       all(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node");
-        .managed == $plan.managed and .carry == $plan.carry and .hooks == $plan.hooks)
+        .carry == $plan.carry and .hooks == $plan.hooks and .required == $plan.required)
     ' "$draft" >/dev/null || {
-      printf 'roundhouse: Node switch must carry exactly the managed npm globals: managed %s, carry %s, hooks %s\n' \
-        "$(printf '%s\n' "$node_seal_plan" | jq -c '.managed')" \
+      printf 'roundhouse: a Node switch carries every installed npm global: carry %s, hooks %s, required %s\n' \
         "$(printf '%s\n' "$node_seal_plan" | jq -c '.carry')" \
-        "$(printf '%s\n' "$node_seal_plan" | jq -c '.hooks')" >&2
+        "$(printf '%s\n' "$node_seal_plan" | jq -c '.hooks')" \
+        "$(printf '%s\n' "$node_seal_plan" | jq -c '.required')" >&2
       exit 65
     }
   fi
