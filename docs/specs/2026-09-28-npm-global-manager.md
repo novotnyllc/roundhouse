@@ -458,11 +458,24 @@ argv is the marker only; the executor knows no other `fnm` shape. `managed`,
   hook are refused; so is a target with no desired state in the store, since
   its managed set is unknown. Run holds are a scheduled-run concept; the
   sealed lane has none to consult.
-- `verify-preconditions`: the `fnm:node` record digest covers the default,
-  the installed versions, the global set and the candidate, and the carry
-  rule is re-derived from the store as it stands at apply time and compared
-  again, so a definition or desired-state change since sealing refuses the
-  plan.
+- Apply-time checks, split by where their evidence lives. The plan digest
+  covers `managed`, `carry` and `hooks`, so every executor can trust the
+  sealed managed set without re-deriving it.
+  - *Snapshot-bound, on the host that executes* (every lane): the
+    `fnm:node` record digest (default, installed versions, global set,
+    candidate), and `carry` == sealed `managed` ∩ what the fresh snapshot
+    shows installed, `hooks` == what the executor's own configuration
+    declares for the carried packages, every required hook declared.
+  - *Store-backed, where the store is authoritative*: the carry rule
+    re-derived from the store and compared again, so a definition or
+    desired-state change since sealing refuses the plan. `apply-plan` (a
+    local target) and `verify-preconditions` run it on the host itself.
+    `apply-ssh-plan` runs it on the CONTROLLER, against a fresh read-only
+    inventory of the target, before the plan or worker configuration is
+    transferred; the SSH worker never reads the target's own store, which
+    may be absent or lag and is not evidence about the plan. The interop
+    lane never carries a switch: `fnm:node` does not seal for a Windows
+    target.
 - Executor: re-checks the argv marker and the hooks against its own (worker)
   configuration, then runs §7.3.
 - Post-state: `installed_version == candidate_version` and every carried

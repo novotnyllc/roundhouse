@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/apply-commands.sh",
-      "sha256": "bfffab7bf0a0a162998e599150f407a7c2cd2adf682cd7dd19b600e2f6fd11dc"
+      "sha256": "5c4a5720b620823e3fb4c35ee58c9593f91a7d2f2fe8e7eebe1b0b4c447013cc"
     },
     {
       "path": "scripts/lib/broker-posix.sh",
@@ -186,7 +186,7 @@
     },
     {
       "path": "scripts/lib/plan-verify.sh",
-      "sha256": "04a6fdc810964d6a408a6f36fcee7314955544534e42b717c062e85cef39970e"
+      "sha256": "3467b08bb2e8b21df1d526419c4a13639fa4f907c5fc2872e77533a969fbe6ac"
     },
     {
       "path": "scripts/mcp-siding-windows.ps1",
@@ -286,7 +286,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "b0a3d3953de0f1f323f3823d8d57dc7e9084c475eb4231613bcbf6b8fd3e0d92"
+      "sha256": "bbfeb9a4d825c6aa0c28b9ea0f576f049e9aef58a86c2714b0852c152d558f81"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",

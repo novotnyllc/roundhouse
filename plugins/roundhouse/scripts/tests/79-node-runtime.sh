@@ -707,6 +707,66 @@ else
   [ "$(jq -r 'select(.kind == "package" and .id == "npm:plain") | .data.node_version' "$tmp/node-apply.jsonl")" = \
     v26.10.0 ] || fail "the npm records did not move to the new runtime"
 
+  # --- the SSH lane: store check on the controller, snapshot checks on the worker
+  # The worker's own store is never consulted for a remote plan: here it is
+  # absent on the target side (the ssh wrapper points the remote environment
+  # at no store), and a plan the controller's store still vouches for applies.
+  nrt_reset
+  jq '.machines["test-ssh"].package_managers = ["homebrew","npm"] |
+    .node_switch_hooks = {"npm:@example/svc":[["svc","service"]]}' \
+    "$tmp/config.json" >"$tmp/node-ssh-config.json"
+  chmod 600 "$tmp/node-ssh-config.json"
+  cp "$nrt_store/hosts/test-host.yaml" "$nrt_store/hosts/test-ssh.yaml"
+  mkdir -p "$nrt_root/nostore-bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'ROUNDHOUSE_FLEET_STORE=$NRT_REMOTE_STORE exec "$NRT_REAL_SSH" "$@"' >"$nrt_root/nostore-bin/ssh"
+  chmod 755 "$nrt_root/nostore-bin/ssh"
+  nrt_ssh_cli() {
+    nrt_env PATH="$nrt_root/nostore-bin:$nrt_bin:$PATH" NRT_REAL_SSH="$tmp/bin/ssh" \
+      NRT_REMOTE_STORE="$nrt_root/no-store" ROUNDHOUSE_CONFIG="$tmp/node-ssh-config.json" "$cli" "$@"
+  }
+  nrt_ssh_cli collect --target test-ssh --section host --section packages \
+    --output "$tmp/node-ssh-snapshot.jsonl"
+  jq '.target = "test-ssh"' "$tmp/node-draft.json" >"$tmp/node-ssh-draft.json"
+  nrt_ssh_cli seal-plan "$tmp/node-ssh-draft.json" "$tmp/node-ssh-snapshot.jsonl" "$tmp/node-ssh-plan.json"
+  nrt_ssh_plan_id=$(jq -r '.plan_id' "$tmp/node-ssh-plan.json")
+  # The controller's store no longer vouches for the plan: refused on the
+  # controller, before any worker input (plan, worker config) is transferred.
+  # The only transfers are the controller's own read-only inventory.
+  cp "$nrt_store/hosts/test-ssh.yaml" "$nrt_root/ssh-host.yaml.sealed"
+  printf '%s\n' '  unmanaged-now-managed: enabled' >>"$nrt_store/hosts/test-ssh.yaml"
+  printf '%s\n' '  unmanaged-now-managed: {npm: unmanaged}' >>"$nrt_store/definitions.yaml"
+  : >"$SCP_COMMAND_LOG"
+  if nrt_ssh_cli apply-ssh-plan "$tmp/node-ssh-plan.json" "$nrt_ssh_plan_id" \
+    "$tmp/node-ssh-refused.jsonl" >"$nrt_root/ssh-refused.log" 2>&1; then
+    fail "an SSH Node switch applied although the controller store no longer vouches for it"
+  fi
+  grep -Fq 'the managed npm globals changed since planning' "$nrt_root/ssh-refused.log" &&
+    ! grep -Eq 'plan\.json|roundhouse-apply\.' "$SCP_COMMAND_LOG" && [ "$(nrt_default)" = v26.0.0 ] ||
+    fail "a controller-side Node check mismatch was not refused before any transfer"
+  cp "$nrt_root/ssh-host.yaml.sealed" "$nrt_store/hosts/test-ssh.yaml"
+  sed -i.bak '/unmanaged-now-managed/d' "$nrt_store/definitions.yaml"
+  : >"$nrt_log"
+  nrt_ssh_cli apply-ssh-plan "$tmp/node-ssh-plan.json" "$nrt_ssh_plan_id" "$tmp/node-ssh-apply.jsonl" ||
+    fail "an SSH Node switch refused because the target has no store"
+  [ "$(nrt_default)" = v26.10.0 ] &&
+    [ "$(jq -r 'select(.kind == "operation" and (.id | startswith("apply:"))) | .data.operation_status' \
+      "$tmp/node-ssh-apply.jsonl")" = completed ] &&
+    grep -Fq 'bin svc service node=v26.10.0' "$nrt_log" ||
+    fail "the SSH Node switch did not complete on the worker"
+  # The worker still proves the carry against its own fresh snapshot.
+  (
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+    jq -c 'if .kind == "package" and .id == "fnm:node" then .data.globals |= del(.plain) else . end' \
+      "$tmp/node-ssh-snapshot.jsonl" >"$tmp/node-ssh-uninstalled.jsonl"
+    fleet_node_snapshot_verify "$tmp/node-ssh-plan.json" "$tmp/node-ssh-snapshot.jsonl" \
+      "$tmp/node-ssh-config.json" || fail "the worker rejected a carry its snapshot proves"
+    if fleet_node_snapshot_verify "$tmp/node-ssh-plan.json" "$tmp/node-ssh-uninstalled.jsonl" \
+      "$tmp/node-ssh-config.json"; then
+      fail "the worker accepted a carry its snapshot does not prove"
+    fi
+  )
 fi
 
 # --- Windows: machine-scope Node holds instead of prompting UAC ---------------

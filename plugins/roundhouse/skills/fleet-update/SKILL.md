@@ -79,8 +79,12 @@ policy.
   top-level `node_switch_hooks` for the carried packages (for example
   `"npm:@bitkyc08/opencodex": [["ocx", "service"]]`), which must include
   every required one. An empty or partial carry, a misstated managed set, a
-  target without desired state in the store, and any hold are refused, and
-  verify-preconditions re-derives and compares again at apply.
+  target without desired state in the store, and any hold are refused. At
+  apply the executing host re-checks what its fresh snapshot proves (carry
+  == managed ∩ installed, hooks, required hooks); the store-backed
+  re-derivation runs where the store is authoritative: on the host itself
+  for `apply-plan`, and on the controller before any transfer for
+  `apply-ssh-plan` (the SSH worker never reads the target's store).
   The executor proves each hook bin under the current prefix, then runs
   `fnm install`, `fnm default`, one exact `npm install --global a@x b@y …`
   under the new node, verifies every carried version, and runs each hook by
