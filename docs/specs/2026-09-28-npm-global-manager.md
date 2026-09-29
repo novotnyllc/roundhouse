@@ -395,6 +395,17 @@ requirement is a floor.
   the recorded globals instead.
   `npm` itself is carried only when the store manages it; the npm pass that
   follows then moves it forward if the carried version is behind.
+- A switch that fails and cannot confirm the previous default restored
+  (the executor's exit 70) leaves a default nobody verified: the run reports
+  it (`hold  runtimes.node — … is unverified`), alerts
+  `node-runtime-unverified`, and skips only the npm part of that full
+  cadence's package pass (`hold  packages (npm) — Node default is
+  unverified …`). Brew, winget and the rest of the pass still run; an
+  ordinary hold, which leaves the default untouched or restored, skips
+  nothing.
+- `fleet-seed` never turns the `fnm:node` record into desired state: not
+  `packages.node` (Homebrew would read it as its `node` formula) and not
+  `runtimes.node`, which enters the store by hand.
 - Hold lines: `  hold  runtimes.node — <reason>`, for an unusable value, a
   host without an fnm default, no fnm binary, an unreachable release list, a
   failed global inventory, an undeclared required hook, or a failed switch

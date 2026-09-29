@@ -94,6 +94,8 @@ case ${1:-} in
     ;;
   default)
     [ -d "$FNM_DIR/node-versions/$2/installation" ] || exit 1
+    # Lets a fixture make the restore after a failed switch fail too.
+    [ -z "${NRT_FNM_DEFAULT_ONLY:-}" ] || [ "$2" = "$NRT_FNM_DEFAULT_ONLY" ] || exit 1
     ln -sfn "$FNM_DIR/node-versions/$2/installation" "$FNM_DIR/aliases/default"
     ;;
   *) exit 64 ;;
@@ -401,7 +403,8 @@ nrt_reset
       fleet_run_proposals() { :; }
       fleet_doctor_command() { :; }
       fleet_run_plugin_marketplaces() { :; }
-      ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json
+      brew() { printf 'brew %s\n' "$*" >>"$NRT_LOG"; }
+      ROUNDHOUSE_CONFIG=$nrt_root/${2:-local-declared}.json
       export ROUNDHOUSE_CONFIG
       fleet_run_full_pass "$nrt_root/store" nrt-host "$1" "$nrt_defs" \
         "$nrt_root/layers" "$nrt_root/full-tmp" >"$nrt_root/full-out" 2>&1
@@ -422,6 +425,51 @@ nrt_reset
     [ "$nrt_switch_line" -lt "$nrt_outdated_line" ] &&
     grep -Fq 'npm outdated --global --json node=v26.10.0' "$nrt_log" ||
     fail "the npm pass did not run after the runtime switch, under the new node"
+
+  # --- an unverified default keeps npm off it, and only npm ---------------------
+  nrt_mixed_fold='{"packages":{"svc":"enabled","plain":"enabled","brewonly":"enabled"},"package_managers":["homebrew","npm"],"runtimes":{"node":{"major":26}}}'
+  # An ordinary hold (the store requires a hook this host does not declare)
+  # leaves the default untouched: the npm pass still runs.
+  nrt_reset
+  : >"$nrt_root/full-tmp/sigholds"
+  nrt_run_full "$nrt_mixed_fold" local-undeclared
+  [ "$(nrt_default)" = v26.0.0 ] &&
+    grep -Fq 'npm outdated --global --json node=v26.0.0' "$nrt_log" &&
+    ! grep -Fq 'npm globals skipped this pass' "$nrt_root/full-out" ||
+    fail "an ordinary runtime hold skipped the npm pass"
+  # A failed switch whose restore also fails (exit 70) leaves the default
+  # unverified: no npm operation runs under it, brew still does, and the
+  # state is reported and alerted.
+  nrt_reset
+  NRT_NPM_FAIL_INSTALL=1 NRT_FNM_DEFAULT_ONLY=v26.10.0 nrt_run_full "$nrt_mixed_fold"
+  [ "$(nrt_default)" = v26.10.0 ] || fail "the unrestorable-switch fixture did not leave the default moved"
+  grep -Fq '  hold  runtimes.node — switch to v26.10.0 failed and the fnm default (v26.10.0) is unverified' \
+    "$nrt_root/full-out" &&
+    grep -Fq '  hold  packages (npm) — Node default is unverified after a failed runtime switch; npm globals skipped this pass' \
+      "$nrt_root/full-out" ||
+    fail "an unverified default was not reported"
+  ! grep -Eq 'npm (outdated|view)|bin (svc|plain)' "$nrt_log" &&
+    [ "$(grep -c 'npm install' "$nrt_log")" -eq 1 ] ||
+    fail "an npm operation ran under an unverified default"
+  grep -Fq 'brew upgrade brewonly' "$nrt_log" ||
+    fail "an unverified Node default stopped the non-npm package pass"
+  ls "$nrt_root/store/alerts/nrt-host/"*node-runtime-unverified* >/dev/null 2>&1 ||
+    fail "an unverified Node default raised no alert"
+  # The same state reached through this run's reviewed apply (exit 76 into the
+  # run's hold file) skips npm too, and the apply arm passes 76 through.
+  nrt_reset
+  nrt_status=0
+  NRT_NPM_FAIL_INSTALL=1 NRT_FNM_DEFAULT_ONLY=v27.0.0 ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
+    fleet_run_apply_item "$nrt_root/store" nrt-host "$nrt_defs" runtimes.node '{"major":27}' \
+    "homebrew npm" "$nrt_mixed_fold" >/dev/null 2>&1 || nrt_status=$?
+  [ "$nrt_status" -eq 76 ] || fail "the runtime apply arm did not report an unverified default (got $nrt_status)"
+  nrt_reset
+  printf 'runtimes.node apply status 76\n' >"$nrt_root/full-tmp/sigholds"
+  nrt_run_full "$nrt_mixed_fold"
+  ! grep -Fq 'npm outdated' "$nrt_log" && grep -Fq 'brew upgrade brewonly' "$nrt_log" &&
+    grep -Fq 'npm globals skipped this pass' "$nrt_root/full-out" ||
+    fail "an unverified default from the apply loop did not keep the npm pass off it"
+  : >"$nrt_root/full-tmp/sigholds"
 )
 
 # --- the sealed lifecycle: collect, seal, apply, post-state ---------------------

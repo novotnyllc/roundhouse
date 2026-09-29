@@ -1223,8 +1223,11 @@ fleet_run_node_converge() (
   #   full   the full cadence: also move to the newest release inside the
   #          major, which fnm never does on its own
   #
-  # Exit 0 converged (or already there), 75 held. Every hold prints a line
-  # naming the reason; nothing is ever silently skipped.
+  # Exit 0 converged (or already there), 75 held with the default untouched
+  # or restored, 76 held with the default UNVERIFIED: a switch failed and the
+  # previous default could not be confirmed restored, so nothing may run npm
+  # under it this pass. Every hold prints a line naming the reason; nothing
+  # is ever silently skipped.
   node_value=$1
   node_defs=$2
   node_fold=$3
@@ -1274,9 +1277,18 @@ fleet_run_node_converge() (
     "$(printf '%s\n' "$node_plan" | jq -c '.carry')" \
     "$(printf '%s\n' "$node_plan" | jq -c '.hooks')" 2>&1) || node_status=$?
   [ -z "$node_switch_out" ] || printf '%s\n' "$node_switch_out" | sed 's/^/        /'
-  [ "$node_status" -eq 0 ] &&
-    [ "$(node_fnm_default "$node_root" 2>/dev/null)" = "$node_target" ] ||
-    node_hold "switch to $node_target failed (see above); the fnm default is $(node_fnm_default "$node_root" 2>/dev/null || printf unknown)"
+  node_final=$(node_fnm_default "$node_root" 2>/dev/null) || node_final=
+  if ! { [ "$node_status" -eq 0 ] && [ "$node_final" = "$node_target" ]; }; then
+    # Restored (or never moved) is an ordinary hold. Anything else, including
+    # the switch's own "could not restore" (70), leaves a default nobody
+    # verified carries the managed globals.
+    if [ "$node_status" -ne 70 ] && [ "$node_final" = "$node_current" ]; then
+      node_hold "switch to $node_target failed (see above); the fnm default is still $node_current"
+    fi
+    printf '  hold  runtimes.node — switch to %s failed and the fnm default (%s) is unverified; restore it by hand\n' \
+      "$node_target" "${node_final:-unknown}"
+    exit 76
+  fi
   printf '%s\n' "$node_plan" | jq -r --arg old "$node_current" '
     select(.unmanaged | length > 0) |
     "  note  runtimes.node — unmanaged npm globals stay under \($old): \(.unmanaged | join(" "))"'
@@ -1538,7 +1550,14 @@ fleet_run_apply_item() {
       # this build has no position on, and is held rather than satisfied.
       [ "$fleet_run_name" = node ] || return 75
       [ "$(fleet_run_state_of "$5")" = enabled ] || return 70
-      fleet_run_node_converge "$5" "$3" "${7:-}" "$6" apply
+      # 76 (an unverified default) passes through, so the run can keep the
+      # full cadence's npm pass off it; every other failure is a plain hold.
+      fleet_run_node_status=0
+      fleet_run_node_converge "$5" "$3" "${7:-}" "$6" apply || fleet_run_node_status=$?
+      case $fleet_run_node_status in
+        0 | 76) return "$fleet_run_node_status" ;;
+        *) return 75 ;;
+      esac
       ;;
     agents | mcp_servers | projects)
       # The B-3 categories, NAMED rather than caught by a wildcard: no
@@ -2190,6 +2209,11 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       *)
         fleet_run_runtime_hold "$run_item" "apply status $run_status" \
           "$run_tmp/sigholds" || exit 65
+        [ "$run_status" -ne 76 ] ||
+          fleet_alert_write "$run_store" "$run_host" node-runtime-unverified \
+            node-runtime-unverified \
+            "a failed Node runtime switch left the fnm default unverified; npm globals are skipped until it is restored" \
+            "$run_item" || :
         [ "$run_status" -ne 75 ] || [ "$run_category" != packages ] ||
           fleet_alert_write "$run_store" "$run_host" package-hold \
             "package-hold-$(printf '%s' "$run_item" | tr './' '--')" \
@@ -2616,15 +2640,40 @@ fleet_run_full_pass() (
   # sees the globals under the runtime they will actually run on. The same
   # holds as every other item apply: a held or canary-waiting `runtimes.node`
   # is not touched by maintenance.
+  #
+  # One outcome stops more than itself: a switch that failed AND could not
+  # confirm the previous default restored (76, here or in this run's apply
+  # loop) leaves npm resolving to a runtime nobody verified. Only the npm part
+  # of the package pass is skipped for it; brew, winget and the rest of the
+  # full cadence still run, and an ordinary hold (the default untouched or
+  # restored) skips nothing.
+  full_npm_blocked=false
+  [ -z "$full_hold_dir" ] || [ ! -f "$full_hold_dir/sigholds" ] ||
+    ! grep -Fqx 'runtimes.node apply status 76' "$full_hold_dir/sigholds" ||
+    full_npm_blocked=true
   full_runtime=$(printf '%s\n' "$full_fold" | jq -c '(.runtimes // {}).node // empty')
   if [ -n "$full_runtime" ] &&
     [ "$(fleet_run_state_of "$full_runtime")" = enabled ] &&
     ! { [ -n "$full_hold_dir" ] &&
       fleet_run_item_is_held runtimes.node "" \
         "$full_hold_dir/sigholds" "$full_hold_dir/verdicts"; }; then
+    full_node_status=0
     fleet_run_node_converge "$full_runtime" "$full_defs" "$full_fold" \
-      "$(fleet_run_package_managers "$full_fold" "$full_host")" full </dev/null || :
+      "$(fleet_run_package_managers "$full_fold" "$full_host")" full </dev/null ||
+      full_node_status=$?
+    if [ "$full_node_status" -eq 76 ]; then
+      full_npm_blocked=true
+      fleet_alert_write "$full_store" "$full_host" node-runtime-unverified \
+        node-runtime-unverified \
+        "a failed Node runtime switch left the fnm default unverified; npm globals are skipped until it is restored" \
+        runtimes.node || :
+      fleet_journal_append "$full_store" "$full_host" \
+        "$(jq -cn --arg at "$(fleet_now)" \
+          '{item:"runtimes.node",digest:"held",outcome:"held",at:$at}')" || :
+    fi
   fi
+  [ "$full_npm_blocked" != true ] ||
+    printf '  hold  packages (npm) — Node default is unverified after a failed runtime switch; npm globals skipped this pass\n'
 
   # The fleet-update contract, as a predicate: an unpinned package is kept
   # current by this pass — that is what anyone gets by doing nothing — and a
@@ -2659,6 +2708,8 @@ fleet_run_full_pass() (
           --silent --accept-package-agreements --accept-source-agreements >/dev/null 2>&1 </dev/null || : ;;
         scoop) scoop update "$(printf '%s\n' "$full_resolved" | jq -r '.name')" >/dev/null 2>&1 </dev/null || : ;;
         npm)
+          # Never under a runtime a failed switch left unverified (above).
+          [ "$full_npm_blocked" != true ] || continue
           # Upgrade only what the registry says is behind, to that exact
           # version: a blind `@latest` reinstall twice a day is churn, and a
           # package with its own updater (one that restarts a service, say)
@@ -2813,7 +2864,14 @@ fleet_seed_command() (
         .plugins[$r.data.name] = (if ($r.data.marketplace // "") == "" then state($r)
           else {state: state($r), marketplace: $r.data.marketplace} end)
       elif $r.kind == "skill" then .skills[$r.data.name] = "enabled"
-      elif $r.kind == "package" then .packages[$r.data.name] = "enabled"
+      # The fnm runtime record (`fnm:node`) is a package record only so the
+      # sealed updates lane can carry a switch. It is never a package: seeding
+      # it would manufacture `packages.node`, which Homebrew resolves to its
+      # own `node` formula. `runtimes.node` is not seeded either; the store
+      # gains `runtimes:` by hand, once every host understands the category.
+      elif $r.kind == "package" and
+        (((($r.id // "") | startswith("fnm:")) or $r.data.manager == "fnm") | not) then
+        .packages[$r.data.name] = "enabled"
       else . end)' "$seed_tmp/snapshot.jsonl")
 
   # MACHINE TRUTH, seeded from the one file that already states it. `platform`
