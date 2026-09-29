@@ -2155,7 +2155,7 @@ function Get-NpmUpdaterPath([string]$Npm, [string]$Name, [string]$Bin) {
 
 # The Node runtime on Windows is winget's OpenJS.NodeJS (the Current line),
 # held to one major with a gating pin (`winget pin add --id OpenJS.NodeJS
-# --version 26.*`). Its record carries that pin and where node.exe lives: the
+# --version 26.*`). Its record carries that pin and the install scope: the
 # MSI installs machine-wide, and a machine-scope upgrade needs elevation, which
 # the ordinary sealed lane refuses (only the protected
 # winget.upgrade-machine-package.v1 action may carry it).
@@ -2173,19 +2173,83 @@ function Get-WingetPinFromLines([string[]]$Lines, [string]$PackageId) {
     return $null
 }
 
-function Get-NodeInstallScope([string]$NodePath) {
-    if ([string]::IsNullOrWhiteSpace($NodePath)) { return $null }
-    foreach ($Root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
-        if (-not [string]::IsNullOrWhiteSpace($Root) -and
-            $NodePath.StartsWith($Root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            return "machine"
+# The install scope comes from the package's own uninstall registration, never
+# from PATH: a per-user node earlier on PATH (fnm_multishells, Volta, a local
+# copy) says nothing about where the MSI winget manages was installed, and
+# reading it as `user` would let the ordinary lane seal a machine upgrade that
+# needs UAC. The Node.js MSI registers itself under HKLM (either registry view)
+# when machine-wide and under HKCU when per-user. Exactly one hive with a
+# registration, and no InstallLocation contradicting that hive, is the only
+# answer; anything else (both, neither, unreadable, contradictory) is $null,
+# which sealing treats as machine scope and holds.
+function Select-NodeRegistrations([object[]]$Entries) {
+    return @($Entries | Where-Object { $null -ne $_ -and [string]$_.DisplayName -ceq "Node.js" })
+}
+
+function Read-NodeUninstallRegistrations([string]$Hive, [string]$View) {
+    # Read-only. Absent Uninstall key: no registrations. Unreadable: throws.
+    $Base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]$Hive, [Microsoft.Win32.RegistryView]$View)
+    try {
+        $Key = $Base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', $false)
+        if ($null -eq $Key) { return @() }
+        try {
+            $Found = foreach ($Name in $Key.GetSubKeyNames()) {
+                $Sub = $Key.OpenSubKey($Name, $false)
+                if ($null -eq $Sub) { continue }
+                try {
+                    [pscustomobject]@{
+                        DisplayName = [string]$Sub.GetValue("DisplayName")
+                        InstallLocation = [string]$Sub.GetValue("InstallLocation")
+                    }
+                } finally { $Sub.Dispose() }
+            }
+            return @(Select-NodeRegistrations @($Found))
+        } finally { $Key.Dispose() }
+    } finally { $Base.Dispose() }
+}
+
+function Test-PathUnder([string]$Path, [string[]]$Roots) {
+    foreach ($Root in $Roots) {
+        if (-not [string]::IsNullOrWhiteSpace($Root) -and -not [string]::IsNullOrWhiteSpace($Path) -and
+            $Path.TrimEnd('\').StartsWith($Root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
         }
     }
-    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA) -and
-        $NodePath.StartsWith($env:LOCALAPPDATA.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    return $false
+}
+
+function Resolve-NodeInstallScope(
+    [scriptblock]$ReadMachine, [scriptblock]$ReadUser,
+    [string[]]$MachineRoots, [string[]]$UserRoots
+) {
+    # The fixture seam: the registry lookups arrive as scriptblocks, so the
+    # self-test never touches a real registry.
+    $ErrorActionPreference = "Stop"
+    try {
+        $Machine = @(Select-NodeRegistrations @(& $ReadMachine))
+        $User = @(Select-NodeRegistrations @(& $ReadUser))
+    } catch {
+        return $null
+    }
+    if ($Machine.Count -gt 0 -and $User.Count -eq 0) {
+        if (@($Machine | Where-Object { Test-PathUnder ([string]$_.InstallLocation) $UserRoots }).Count -gt 0) { return $null }
+        return "machine"
+    }
+    if ($User.Count -gt 0 -and $Machine.Count -eq 0) {
+        if (@($User | Where-Object { Test-PathUnder ([string]$_.InstallLocation) $MachineRoots }).Count -gt 0) { return $null }
         return "user"
     }
     return $null
+}
+
+function Get-NodeInstallScope {
+    return Resolve-NodeInstallScope {
+        Read-NodeUninstallRegistrations "LocalMachine" "Registry64"
+        Read-NodeUninstallRegistrations "LocalMachine" "Registry32"
+    } {
+        Read-NodeUninstallRegistrations "CurrentUser" "Registry64"
+    } @($env:ProgramFiles, ${env:ProgramFiles(x86)}) @($env:LOCALAPPDATA, $env:APPDATA, $env:USERPROFILE)
 }
 
 function Invoke-NodeRuntimeSelfTest {
@@ -2206,7 +2270,28 @@ function Invoke-NodeRuntimeSelfTest {
     if ($null -ne (Get-WingetPinFromLines @("There are no pins configured.") "OpenJS.NodeJS")) {
         throw "self_test_node_pin_invented"
     }
-    if ($null -ne (Get-NodeInstallScope "")) { throw "self_test_node_scope_invented" }
+    $MachineRoots = @('C:\Program Files', 'C:\Program Files (x86)')
+    $UserRoots = @('C:\Users\u\AppData\Local', 'C:\Users\u')
+    $Msi = [pscustomobject]@{ DisplayName = "Node.js"; InstallLocation = 'C:\Program Files\nodejs\' }
+    $UserMsi = [pscustomobject]@{ DisplayName = "Node.js"; InstallLocation = 'C:\Users\u\AppData\Local\Programs\nodejs\' }
+    $Unrelated = [pscustomobject]@{ DisplayName = "Node.js Tools for Visual Studio"; InstallLocation = "" }
+    $Volta = [pscustomobject]@{ DisplayName = "Volta"; InstallLocation = 'C:\Users\u\AppData\Local\Volta\' }
+    $Cases = @(
+        @{ name = "machine-only"; machine = { $Msi }; user = { $Volta }; expected = "machine" },
+        @{ name = "machine-wow64"; machine = { $Unrelated; $Msi }; user = { }; expected = "machine" },
+        @{ name = "user-only"; machine = { $Unrelated }; user = { $UserMsi }; expected = "user" },
+        @{ name = "both"; machine = { $Msi }; user = { $UserMsi }; expected = $null },
+        @{ name = "neither"; machine = { $Unrelated }; user = { $Volta }; expected = $null },
+        @{ name = "unreadable"; machine = { throw "registry_unreadable" }; user = { $UserMsi }; expected = $null },
+        @{ name = "machine-contradicted"; machine = { $UserMsi }; user = { }; expected = $null },
+        @{ name = "user-contradicted"; machine = { }; user = { $Msi }; expected = $null }
+    )
+    foreach ($Case in $Cases) {
+        $Scope = Resolve-NodeInstallScope $Case.machine $Case.user $MachineRoots $UserRoots
+        if ($Scope -cne $Case.expected) {
+            throw "self_test_node_scope_$($Case.name)_returned_$Scope"
+        }
+    }
 }
 
 if ($SelfTest) {
@@ -2321,11 +2406,9 @@ if (Test-Section "packages") {
                                 $PinLines = @(& winget pin list --id OpenJS.NodeJS --exact `
                                     --accept-source-agreements --disable-interactivity 2>$null)
                                 $PinSucceeded = $? -and ($null -eq $LASTEXITCODE -or $LASTEXITCODE -eq 0)
-                                $NodeCommand = Get-Command node -CommandType Application -ErrorAction SilentlyContinue |
-                                    Select-Object -First 1
                                 $PackageData.pin = $(if ($PinSucceeded) { Get-WingetPinFromLines $PinLines "OpenJS.NodeJS" } else { $null })
                                 $PackageData.pin_query = $(if ($PinSucceeded) { "ok" } else { "failed" })
-                                $PackageData.install_scope = Get-NodeInstallScope $(if ($null -ne $NodeCommand) { [string]$NodeCommand.Source } else { "" })
+                                $PackageData.install_scope = Get-NodeInstallScope
                                 $PackageData.line = Limit-Text (([string]$Package.Version) -split '\.')[0]
                             }
                             Add-Record -Kind "package" -Id ("winget:" + $Name) -Status "present" `

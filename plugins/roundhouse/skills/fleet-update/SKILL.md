@@ -83,7 +83,9 @@ policy.
   reported. The sealed lane moves within the current major; a major change is
   a store edit (`runtimes.node`, below). On Windows Node is winget
   `OpenJS.NodeJS`: its record carries the gating `pin` (`winget pin add --id
-  OpenJS.NodeJS --version 26.*`), `line` and `install_scope`. The MSI
+  OpenJS.NodeJS --version 26.*`), `line` and `install_scope` (read from the
+  package's HKLM/HKCU uninstall registration, never from PATH; ambiguous
+  evidence is null and treated as machine scope). The MSI
   installs machine-wide, so the ordinary lane refuses its upgrade (`hold:
   Node.js … needs elevation`); seal the protected
   `winget.upgrade-machine-package.v1` action when readiness advertises it for

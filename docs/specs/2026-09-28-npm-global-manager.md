@@ -314,8 +314,13 @@ make the record a precondition over the whole global set.
 
 Windows (`collect-windows.ps1`): the existing `winget:OpenJS.NodeJS` record
 gains `pin` (`{type:"Gating",version:"26.*"}` from `winget pin list`),
-`pin_query`, `line`, and `install_scope` (`machine` when `node.exe` is under
-Program Files, `user` under LocalAppData, otherwise null).
+`pin_query`, `line`, and `install_scope`. The scope comes from the package's
+own uninstall registration, never from PATH (a per-user `node` earlier on PATH,
+from fnm, Volta or a local copy, says nothing about the MSI winget manages): a
+`Node.js` registration under HKLM (64- or 32-bit view) and none under HKCU is
+`machine`; the reverse is `user`; both, neither, an unreadable hive, or an
+`InstallLocation` contradicting the hive is null, which sealing treats as
+machine scope.
 
 ### 7.3 The switch (`scripts/lib/node-runtime.sh`)
 

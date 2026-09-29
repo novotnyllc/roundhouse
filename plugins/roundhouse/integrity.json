@@ -62,7 +62,7 @@
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "9800237f4870c78d6a59716613b15612b8ce47fe7957d2526806ac59db76beaa"
+      "sha256": "ee6db45d40f0247b8b46d316727a9fcb81750ec3f6901d94581538209787d560"
     },
     {
       "path": "scripts/enroll-privilege-posix",
@@ -286,7 +286,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "aecef7cfc5c6e796370298cd742e1084ff2552091b1e4b8691f15cd04f573aaa"
+      "sha256": "ba3f5632d0277b46e1aa4d626a1e35a4730cf3b0be82f8ed5010348918b652ec"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",
