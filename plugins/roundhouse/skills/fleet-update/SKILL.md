@@ -1,6 +1,6 @@
 ---
 name: fleet-update
-description: Plan and explicitly apply package updates across Homebrew, APT, and winget machines. Use for fleet patching, outdated-package reports, manager-specific updates, package drift, or post-update verification.
+description: Plan and explicitly apply package updates across Homebrew, APT, winget, and global npm packages. Use for fleet patching, outdated-package reports, manager-specific updates, package drift, or post-update verification.
 ---
 
 # Fleet Update
@@ -33,6 +33,33 @@ policy.
 - winget: plan with `winget upgrade --accept-source-agreements
   --disable-interactivity`; an update request covers the planned packages
   (`--all` when the request was fleet-wide).
+- npm (global scope, any platform; list `npm` in the host's
+  `package_managers`): the collector reports `npm:<name>` records from
+  `npm ls --global --json --depth=0` and `npm outdated --global --json`, each
+  carrying the global `prefix` and `node_version` it was observed under. A
+  `package-upgrade` argv is exactly `["npm","install","--global",
+  "<name>@<candidate_version>"]`, or the package's own updater when the
+  configuration declares it under top-level `package_updaters` (for example
+  `"npm:@bitkyc08/opencodex": ["ocx", "update"]`) and the snapshot record shows
+  `updater_status: "proven"`, meaning `argv[0]` is a bin the installed package
+  declares and its global link resolves inside that package. Nothing else
+  seals. An updater takes no version, so right before it runs the executor
+  asks the registry (`npm view <name> version`) and refuses, running
+  nothing, unless `latest` still equals the sealed `candidate_version`. The
+  post-state check still requires the installed version to equal it. A
+  residual race remains: a release that lands between that check and the
+  updater's own resolution installs the newer version, and the apply then
+  reports `partial` rather than silently accepting it. Empty `npm outdated`
+  output is a failed query (npm prints `{}` itself when nothing is
+  outdated), never "all current". npm always runs through the durable npm: fnm's `default` alias first,
+  then PATH, then the fixed Homebrew/Linuxbrew/system prefixes, never an
+  `fnm_multishells` path, and always with npm's own directory first on PATH so
+  the matching `node` owns the install. On native Windows (winget
+  `OpenJS.NodeJS`) the executor resolves `npm` from PATH and an updater from
+  the prefix npm reports. npm 12 blocks dependency install scripts unless
+  `~/.npmrc` allows them (`allow-scripts[]=<package>`, written in the ini
+  array form because `npm config set` rejects it). chezmoi owns that file;
+  Roundhouse neither writes nor rewrites it.
 
 Present exact host, manager, package, current version, candidate version, and
 command. Every `package-upgrade` operation must carry the exact observed
@@ -46,7 +73,7 @@ config, plan integrity, and preconditions without executing plan text. Then
 execute only the exact argv sealed in the plan. For a local target use `"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; for SSH
 use `"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`; for native Windows with a
 `wsl_interop_via` sibling use `"$CLI" apply-interop-plan PLAN PLAN-ID OUTPUT`
-(winget upgrades run through the installed, verified `apply-windows.ps1`).
+(winget and npm upgrades run through the installed, verified `apply-windows.ps1`).
 Each recaptures trusted preflight and enforces the same executor, identity, manager-command,
 fresh-precondition, and semantic post-state checks. If an operation or
 postcondition fails, preserve the authoritative partial result emitted when
@@ -119,6 +146,27 @@ The entry drives **two cadences from one owned slot**:
 | --- | --- | --- | --- |
 | Fast | `roundhouse fleet-run --fast` | every 20 min | converge desired state: fetch, review, apply, publish |
 | Full | `roundhouse fleet-run --full` | twice a day | the fast pass plus marketplace refresh, unpinned package updates, re-seed, promotion proposals, and `fleet-doctor` |
+
+The full cadence's package pass also covers npm globals the store declares.
+A logical package reaches npm only through a definition with an `npm:` entry
+(for example `opencodex: {npm: {name: "@bitkyc08/opencodex", update: [ocx,
+update]}}`). npm never applies the default rule, and the system managers do
+not guess at a package declared for npm. The pass upgrades only what
+`npm outdated` reports behind, to that exact version, through the declared
+`update` argv when there is one and `npm install --global <name>@<version>`
+otherwise. Store content is written by every synced host, so a definition
+alone never introduces a command: the pass runs a definition's `update` only
+when this host's own `config.json` declares the identical argv under
+`package_updaters`, with the same bin check as the sealed lane. Otherwise it
+prints `hold  packages.<name> — npm updater … is not declared identically …`
+and skips that package, with no `npm install` fallback. A `version:` pin
+installs exactly and is skipped by the update pass, as with winget and APT.
+The fast pass installs an enabled npm global that is missing, then requires
+`npm ls` to list it (at the pinned version when there is one) before it
+journals `applied`. A host without a durable npm holds the item. Node itself
+(fnm's default version on POSIX, winget `OpenJS.NodeJS` on Windows) and moving
+globals across a POSIX Node upgrade are not converged yet; see
+`docs/specs/2026-09-28-npm-global-manager.md` in the Roundhouse repository.
 
 Both intervals are jittered from the host **name**, so the fleet does not
 re-synchronise on the same minute; the interval keys live in the store's

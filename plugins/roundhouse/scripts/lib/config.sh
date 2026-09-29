@@ -318,7 +318,9 @@ validate_config_file() {
       ((.groups // []) | type == "array") and
       ([.groups[]? | type == "string" and test("^[A-Za-z0-9._-]+$")] | all) and
       ((.package_managers // []) | type == "array") and
-      ([.package_managers[]? | IN("homebrew","linuxbrew","apt","winget")] | all) and
+      # npm is the global-scope Node package manager and runs on every
+      # platform; the system managers stay bound to their own platforms.
+      ([.package_managers[]? | IN("homebrew","linuxbrew","apt","winget","npm")] | all) and
       (if any(.package_managers[]?; . == "winget") then .platform == "windows" else true end) and
       (if any(.package_managers[]?; . == "apt") then (.platform == "linux" or .platform == "wsl") else true end) and
       ((.privilege_broker // null) == null or
@@ -370,6 +372,19 @@ validate_config_file() {
                 (["host","management_networks","mode","pinned_host_key_fingerprint","port","request_user"] | sort) and
               .privilege_broker.automation_transport.mode == "posix-ssh"
             end))))
+    ] | all) and
+    # The own updater of a package, as exact argv, for the sealed-plan lane:
+    # the only argv besides the fixed manager upgrade form that a package-upgrade
+    # operation may carry. npm only, and argv[0] must be a bin the package
+    # itself installs (checked against the live package at collect, seal and
+    # apply time); no shell, no flags that are not literal tokens.
+    ((.package_updaters // {}) | type == "object") and
+    ([.package_updaters // {} | to_entries[] |
+      (.key | type == "string" and length <= 218 and
+        test("^npm:(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
+      (.value | type == "array" and length >= 1 and length <= 8) and
+      (.value[0] | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+      ([.value[1:][] | type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$")] | all)
     ] | all) and
     ((.projects // {}) | type == "object") and
     ([.projects // {} | to_entries[] |
@@ -611,6 +626,8 @@ worker_config_command() (
           (.handoff_project // null)
         else null end
       ),
+      package_updaters:(if ($domain == "updates" or $domain == "inventory") then
+        (.package_updaters // {}) else {} end),
       capabilities:(if ($domain == "agents" or $domain == "inventory") then (.capabilities // {}) else {} end),
       skill_roots:(if ($domain == "agents" or $domain == "inventory") then (.skill_roots // []) else [] end),
       agent_artifacts:(if ($domain == "agents" or $domain == "inventory") then

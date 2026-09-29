@@ -752,6 +752,13 @@ manages **host-level packages**: what is installed on the machine. Per-project
 version selection is a different problem with mature tools, and pulling it in
 would trade a two-line definition for a resolver nobody asked for.
 
+*(Amendment, 2026-09-28: global npm packages are now a package manager, `npm`,
+opt-in per package through an `npm:` definition entry; see
+[`2026-09-28-npm-global-manager.md`](2026-09-28-npm-global-manager.md). That
+document's §7 proposes narrowing this exclusion so fnm can converge the single
+host-default Node. Until that amendment is accepted, the paragraph above
+stands.)*
+
 #### 5.1.3 The four agent-surface categories resolve the same way
 
 `plugins`, `skills`, `agents` and `hooks` are all agent surface, and each of the

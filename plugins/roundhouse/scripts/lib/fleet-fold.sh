@@ -567,7 +567,7 @@ fleet_pin_mechanism() {
   #            prevents a LATER upgrade of whatever is already installed
   #   (empty)  the manager cannot express it: treat exactly like `unavailable`
   case $1 in
-    winget | apt) printf 'flag\n' ;;
+    winget | apt | npm) printf 'flag\n' ;;
     homebrew | linuxbrew) printf 'formula\n' ;;
   esac
 }
@@ -620,6 +620,29 @@ fleet_resolve_package() {
   resolve_entry=$(fleet_definition_entry "$resolve_defs" packages "$resolve_name")
   [ -n "$resolve_entry" ] || resolve_entry='{}'
   resolve_detail='no package manager on this host provides it'
+  # npm is the global-scope Node manager, and it is OPT-IN PER PACKAGE: it
+  # never applies the default rule (a bare logical name is never guessed to be
+  # a registry package), and a definition that declares `npm:` names a Node
+  # global, which the system managers must not guess at either. So a declared
+  # npm entry is tried first on a host that has npm, whatever the host's list
+  # order; on a host without npm the package holds rather than falling through
+  # to `brew install <logical name>`.
+  if printf '%s\n' "$resolve_entry" |
+    jq -e '(.npm // null) != null and .npm != "unavailable"' >/dev/null 2>&1; then
+    resolve_others=
+    resolve_host_npm=false
+    for resolve_manager in "$@"; do
+      if [ "$resolve_manager" = npm ]; then
+        resolve_host_npm=true
+      else
+        resolve_others="$resolve_others $resolve_manager"
+      fi
+    done
+    if [ "$resolve_host_npm" = true ]; then
+      # shellcheck disable=SC2086 # manager names are validated plain tokens
+      set -- npm $resolve_others
+    fi
+  fi
   for resolve_manager in "$@"; do
     resolve_spec=$(printf '%s\n' "$resolve_entry" |
       jq -c --arg m "$resolve_manager" --arg n "$resolve_name" '
@@ -628,11 +651,17 @@ fleet_resolve_package() {
         # reshaped, because after the reshape `.` is the resolution and no
         # longer the definition.
         .version as $fleet_version |
+        ((.npm // null) != null and .npm != "unavailable") as $npm_declared |
         .[$m] as $entry |
         # An unknown MANAGER key is ignored by hosts that lack that manager: a
         # Windows-only scoop: entry costs the macOS hosts nothing. An absent
         # key is the default rule, not an error — the file carries exceptions.
+        # The two npm exceptions to the default rule are explained above.
         (if $entry == "unavailable" then {unavailable: true}
+         elif $entry == null and $m == "npm" then
+           {unavailable: true, detail: "npm resolves only a package whose definition declares npm"}
+         elif $entry == null and $npm_declared then
+           {unavailable: true, detail: ("declared as an npm global; " + $m + " has no entry for it")}
          elif ($entry | type) == "string" then {name: $entry, attributes: {}}
          elif ($entry | type) == "object" then
            {name: ($entry.name // $n), attributes: ($entry | del(.name, .version))}
@@ -640,10 +669,36 @@ fleet_resolve_package() {
         | .version = (($entry | objects | .version) // $fleet_version)') ||
       return 1
     if [ "$(printf '%s\n' "$resolve_spec" | jq -r '.unavailable // false')" = true ]; then
-      resolve_detail="explicitly unavailable on $resolve_manager"
+      resolve_detail=$(printf '%s\n' "$resolve_spec" |
+        jq -r --arg m "$resolve_manager" '.detail // "explicitly unavailable on \($m)"')
       continue
     fi
     resolve_concrete=$(printf '%s\n' "$resolve_spec" | jq -r '.name')
+    if [ "$resolve_manager" = npm ]; then
+      # Validated here, not at install time: a malformed registry name or
+      # updater is a definition error, and a definition error is a hold that
+      # names the package, never a failed command on some host later.
+      npm_package_name_valid "$resolve_concrete" || {
+        resolve_detail="npm name $resolve_concrete is not a valid registry package name"
+        continue
+      }
+      if printf '%s\n' "$resolve_spec" | jq -e '.attributes | has("update")' >/dev/null; then
+        resolve_update_ok=false
+        if printf '%s\n' "$resolve_spec" |
+          jq -e '.attributes.update | type == "array" and all(.[]; type == "string")' >/dev/null; then
+          resolve_update=()
+          while IFS= read -r resolve_update_arg; do
+            resolve_update+=("$resolve_update_arg")
+          done < <(printf '%s\n' "$resolve_spec" | jq -r '.attributes.update[]')
+          [ "$(printf '%s\n' "$resolve_spec" | jq '.attributes.update | length')" -eq "${#resolve_update[@]}" ] &&
+            npm_updater_argv_valid "${resolve_update[@]}" && resolve_update_ok=true
+        fi
+        [ "$resolve_update_ok" = true ] || {
+          resolve_detail="npm update for $resolve_concrete must be argv: a bin of the package and literal arguments"
+          continue
+        }
+      fi
+    fi
     resolve_version=$(printf '%s\n' "$resolve_spec" | jq -r '.version // empty')
     resolve_pin=null
     if [ -n "$resolve_version" ]; then
@@ -833,6 +888,17 @@ fleet_install_package() {
       fi
       ;;
     scoop) scoop install "$2" >/dev/null 2>&1 </dev/null ;;
+    npm)
+      # Global scope, through the durable npm and its own node (lib/npm.sh).
+      # No npm on the host is the same HOLD as any other missing manager, and
+      # the install is VERIFIED: npm must then list the package, at the pinned
+      # version when there is one.
+      npm_global_bin_dir >/dev/null 2>&1 || return 75
+      npm_global_install "$2" "${4:-}" || return 1
+      npm_install_version=$(npm_global_installed_version "$2") || return 1
+      [ -n "$npm_install_version" ] || return 1
+      [ -z "${4:-}" ] || [ "$npm_install_version" = "$4" ] || return 1
+      ;;
     # 75, not 1: a manager with no install path here is a HOLD with the
     # package-hold alert naming it, not the generic "no apply path for this
     # category" branch. apt is the live case — installing through it needs
