@@ -683,6 +683,10 @@ fleet_enroll_seed_host_facts() {
   # Re-adds must restore the roster-coherence anchor before their commit lands.
   # The remote fleet-seed later adds observed items; this small sponsor-side
   # seed is the durable machine truth already present in config.json.
+  #
+  # package_managers is deliberately NOT seeded here. Existing facts win the
+  # merge, so a sponsor-written list would permanently override the one the
+  # newcomer's own fleet-seed derives from its own config.json.
   seed_store=$1
   seed_host=$2
   seed_file="$seed_store/hosts/$seed_host.yaml"
@@ -690,7 +694,6 @@ fleet_enroll_seed_host_facts() {
     (.machines[$host] // {}) |
     {} + (if has("platform") then {platform: .platform} else {} end)
        + (if has("groups") then {groups: .groups} else {} end)
-       + (if has("package_managers") then {package_managers: .package_managers} else {} end)
   ' "$(config_path)" 2>/dev/null) || seed_facts='{}'
   [ -n "$seed_facts" ] || seed_facts='{}'
   mkdir -p "$(dirname "$seed_file")"
