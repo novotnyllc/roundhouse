@@ -2466,9 +2466,23 @@ fleet_run_full_pass() (
             jq -r --arg name "$full_npm_name" '.[$name] // empty')
           npm_version_valid "$full_npm_latest" || continue
           if printf '%s\n' "$full_resolved" | jq -e '.attributes | has("update")' >/dev/null; then
-            # The definition declared the package's own updater: exact argv,
-            # run by absolute path only once proven to be a bin of the
-            # installed package (npm_global_run_updater).
+            # The definition declared the package's own updater. Store
+            # content is written by every synced host, so a definition alone
+            # must never introduce a command: the updater runs only when THIS
+            # host's own config.json declares the identical argv under
+            # package_updaters, the same trust root the sealed lane uses.
+            # Anything else holds the package, with no npm install fallback.
+            full_npm_wanted=$(printf '%s\n' "$full_resolved" | jq -c '.attributes.update')
+            full_npm_declared=$(jq -c --arg id "npm:$full_npm_name" \
+              '(.package_updaters // {})[$id] // null' "$(config_path)" 2>/dev/null) ||
+              full_npm_declared=null
+            if [ "$full_npm_declared" != "$full_npm_wanted" ]; then
+              printf '  hold  packages.%s — npm updater %s is not declared identically in this host'"'"'s package_updaters\n' \
+                "$full_package" "$full_npm_wanted"
+              continue
+            fi
+            # Exact argv, run by absolute path only once proven to be a bin
+            # of the installed package (npm_global_run_updater).
             full_npm_update=()
             while IFS= read -r full_npm_update_arg; do
               full_npm_update+=("$full_npm_update_arg")

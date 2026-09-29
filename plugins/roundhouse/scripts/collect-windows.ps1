@@ -2256,7 +2256,9 @@ if ((Test-Section "packages") -and (@($Machine.package_managers) -contains "npm"
         $NpmCandidates = $null
         try {
             $OutdatedText = Invoke-NpmText $NpmPath @("outdated", "--global", "--json")
-            if ([string]::IsNullOrWhiteSpace($OutdatedText)) { $OutdatedText = "{}" }
+            # npm prints {} itself when nothing is outdated; empty output is a
+            # failed query, never "all current".
+            if ([string]::IsNullOrWhiteSpace($OutdatedText)) { throw "npm outdated returned nothing" }
             $Outdated = $OutdatedText | ConvertFrom-Json
             if ($null -eq $Outdated -or $null -ne $Outdated.PSObject.Properties["error"]) { throw "npm outdated failed" }
             $NpmCandidates = @{}

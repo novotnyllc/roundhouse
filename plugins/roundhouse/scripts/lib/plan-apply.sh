@@ -547,6 +547,21 @@ EOF
             printf 'roundhouse: unsafe npm upgrade argv\n' >&2
             return 64
           }
+          # A package updater takes no version argument, so it cannot be told
+          # to install the sealed candidate. Bind it the only way available:
+          # the registry must still name the sealed candidate as `latest`
+          # immediately before the updater runs, or nothing runs. The
+          # post-state check still requires installed == candidate afterwards.
+          npm_current_latest=$(npm_registry_latest "$npm_name") || {
+            printf 'roundhouse: npm registry latest for %s is unavailable; refusing the sealed updater\n' \
+              "$npm_name" >&2
+            return 69
+          }
+          [ "$npm_current_latest" = "$candidate" ] || {
+            printf 'roundhouse: npm latest for %s moved from sealed %s to %s; create a new plan\n' \
+              "$npm_name" "$candidate" "$npm_current_latest" >&2
+            return 65
+          }
           npm_global_run_updater "$npm_name" "$@"
           return
           ;;

@@ -110,14 +110,25 @@ npm_global_outdated() (
   # `{name: latest}` for every global package with a newer registry release.
   # `npm outdated` exits 1 exactly when it has something to report, so again
   # only the shape decides; an `error` object is a failed query, not "current".
+  # npm prints `{}` itself when nothing is outdated, so EMPTY output is a
+  # failed query too: reading it as "all current" would mask the failure.
   npm_outdated_json=$(npm_global_run outdated --global --json 2>/dev/null) || :
-  [ -n "$npm_outdated_json" ] || npm_outdated_json='{}'
+  [ -n "$npm_outdated_json" ] || return 1
   printf '%s\n' "$npm_outdated_json" | jq -ce '
     if type == "object" and (has("error") | not) then
       with_entries(select(.value | type == "object" and
         (.latest | type == "string") and (.current | type == "string")) |
         .value = .value.latest)
     else error("invalid npm outdated output") end' 2>/dev/null
+)
+
+npm_registry_latest() (
+  # The registry's current `latest` for one package, through the durable npm.
+  # Exactly one valid version line, or failure.
+  npm_package_name_valid "$1" || return 64
+  npm_latest_version=$(npm_global_run view "$1" version 2>/dev/null) || return 69
+  npm_version_valid "$npm_latest_version" || return 69
+  printf '%s\n' "$npm_latest_version"
 )
 
 npm_global_prefix() (

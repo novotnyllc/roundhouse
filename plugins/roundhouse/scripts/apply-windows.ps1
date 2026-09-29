@@ -771,8 +771,25 @@ function Get-NpmUpdaterPath([string]$Name, [string]$Bin) {
     throw "npm updater bin is missing from the global prefix"
 }
 
+function Assert-NpmRegistryCandidate([string]$Npm, [string]$Name, [string]$Candidate) {
+    # A package updater takes no version argument, so the only binding to the
+    # sealed candidate is that the registry still names it as latest right
+    # before the updater runs. Fail closed otherwise.
+    $Latest = ((@(& $Npm view $Name version 2>$null) | ForEach-Object { [string]$_ }) -join "`n").Trim()
+    if ($Latest -cnotmatch '^[0-9A-Za-z][0-9A-Za-z.+-]*$') {
+        throw "npm registry latest is unavailable; refusing the sealed updater"
+    }
+    if ($Latest -cne $Candidate) {
+        throw "npm latest moved from the sealed candidate; create a new plan"
+    }
+}
+
 function Invoke-NpmUpdater([object]$Operation, [string[]]$Argv) {
-    $Path = Get-NpmUpdaterPath (([string]$Operation.id).Substring(4)) $Argv[0]
+    $Name = ([string]$Operation.id).Substring(4)
+    $Npm = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $Npm -or [string]$Npm.Source -match 'fnm_multishells') { throw "Required command is unavailable: npm" }
+    Assert-NpmRegistryCandidate ([string]$Npm.Source) $Name ([string]$Operation.candidate_version)
+    $Path = Get-NpmUpdaterPath $Name $Argv[0]
     & $Path @($Argv | Select-Object -Skip 1) *> $null
     $Succeeded = $?
     $NativeExitCode = $LASTEXITCODE
@@ -1131,6 +1148,18 @@ if ($SelfTest) {
         if ((ConvertTo-CanonicalJson @(Get-ExactArgv $NpmUpdaterOperation $null $null)) -eq '["tool","update"]') {
             throw "npm unconfigured updater argv self-test failed"
         }
+        $OnWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+        $FakeNpm = Join-Path $SelfTestRoot $(if ($OnWindows) { "fake-npm.cmd" } else { "fake-npm" })
+        if ($OnWindows) {
+            Set-Content -LiteralPath $FakeNpm -Value "@echo 2.0.0" -Encoding ascii
+        } else {
+            Set-Content -LiteralPath $FakeNpm -Value "#!/bin/sh`nprintf '2.0.0\n'" -Encoding ascii
+            & chmod 755 $FakeNpm
+        }
+        Assert-NpmRegistryCandidate $FakeNpm "@example/tool" "2.0.0"
+        $MovedRejected = $false
+        try { Assert-NpmRegistryCandidate $FakeNpm "@example/tool" "1.9.0" } catch { $MovedRejected = $true }
+        if (-not $MovedRejected) { throw "npm updater registry-candidate self-test failed" }
         $RuntimeArgv = @(Get-ExactArgv ([pscustomobject]@{
             type = "agent-update"; kind = "agent_runtime"; id = "codex"
         }) $null $null)

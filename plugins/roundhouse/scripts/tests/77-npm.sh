@@ -46,6 +46,7 @@ case "$1 ${2:-}" in
   "ls --global")
     jq -c '{name:"lib",dependencies:(with_entries(.value = {version:.value}))}' "$state" ;;
   "outdated --global")
+    [ "${NPM_STUB_OUTDATED_EMPTY:-0}" != 1 ] || exit 0
     [ "${NPM_STUB_OUTDATED_FAIL:-0}" != 1 ] ||
       { printf '%s\n' '{"error":{"code":"E500","summary":"registry"}}'; exit 1; }
     jq -c --slurpfile latest "$latest" '
@@ -53,6 +54,14 @@ case "$1 ${2:-}" in
         {key, value:{current:.value, wanted:$latest[0][.key], latest:$latest[0][.key],
           dependent:"global"}}) | from_entries' "$state"
     [ "$(jq --slurpfile latest "$latest" '[to_entries[] | select($latest[0][.key] != null and $latest[0][.key] != .value)] | length' "$state")" -eq 0 ] || exit 1
+    ;;
+  "view "*)
+    [ "${3:-}" = version ] || exit 64
+    if [ -n "${NPM_STUB_VIEW_VERSION:-}" ]; then
+      printf '%s\n' "$NPM_STUB_VIEW_VERSION"
+    else
+      jq -r --arg n "$2" '.[$n]' "$latest"
+    fi
     ;;
   "install --global")
     spec=$3
@@ -158,6 +167,16 @@ nfx_reset_state
     fail "npm global inventory did not parse npm ls"
   [ "$(npm_global_outdated | jq -c .)" = '{"npm":"12.1.0","@example/tool":"2.0.0"}' ] ||
     fail "npm outdated parsing did not tolerate its exit status 1"
+  # npm prints `{}` itself when nothing is outdated; EMPTY output is a failed
+  # query and must never read as "all current".
+  if NPM_STUB_OUTDATED_EMPTY=1 npm_global_outdated >/dev/null; then
+    fail "empty npm outdated output read as 'nothing outdated'"
+  fi
+  [ "$(npm_registry_latest @example/tool)" = 2.0.0 ] ||
+    fail "the registry latest query did not read npm view"
+  if NPM_STUB_VIEW_VERSION='2.0.0 extra' npm_registry_latest @example/tool >/dev/null; then
+    fail "a malformed npm view answer was accepted as a version"
+  fi
   if NPM_STUB_OUTDATED_FAIL=1 npm_global_outdated >/dev/null; then
     fail "an npm outdated error object read as 'nothing outdated'"
   fi
@@ -237,15 +256,37 @@ nfx_reset_state
       fleet_seed_command() { :; }
       fleet_run_proposals() { :; }
       fleet_doctor_command() { :; }
+      ROUNDHOUSE_CONFIG=$3
+      export ROUNDHOUSE_CONFIG
       fleet_run_full_pass "$nfx_root/store" npm-host "$1" "$2" \
-        "$nfx_root/layers" "$nfx_root/full-tmp" >/dev/null 2>&1
+        "$nfx_root/layers" "$nfx_root/full-tmp" >"$nfx_root/full-out" 2>&1
     )
   }
   mkdir -p "$nfx_root/store" "$nfx_root/layers" "$nfx_root/full-tmp"
+  # The scheduled pass runs a definition's updater only when THIS host's own
+  # config.json declares the identical argv: store content, which every
+  # synced host can write, must never introduce a command on its own.
+  printf '%s\n' '{"version":1,"package_updaters":{"npm:@example/tool":["tool","update"]}}' \
+    >"$nfx_root/local-declared.json"
+  printf '%s\n' '{"version":1}' >"$nfx_root/local-undeclared.json"
+  printf '%s\n' '{"version":1,"package_updaters":{"npm:@example/tool":["tool","upgrade"]}}' \
+    >"$nfx_root/local-mismatched.json"
+  nfx_full_fold='{"packages":{"opencodex-fixture":"enabled","npm":"enabled","current-only":"enabled"},"package_managers":["homebrew","npm"]}'
+  nfx_full_defs='{"packages":{"opencodex-fixture":{"npm":{"name":"@example/tool","update":["tool","update"]}},"npm":{"npm":"npm"},"current-only":{"npm":"current-only"}}}'
+  for nfx_local in local-undeclared local-mismatched; do
+    nfx_reset_state
+    nfx_run_full "$nfx_full_fold" "$nfx_full_defs" "$nfx_root/$nfx_local.json"
+    ! grep -Fq 'tool update' "$nfx_log" && ! grep -Fq 'install --global @example/tool' "$nfx_log" ||
+      fail "the full cadence ran something for a store-only updater ($nfx_local)"
+    grep -Fq '  hold  packages.opencodex-fixture — npm updater ["tool","update"] is not declared identically' \
+      "$nfx_root/full-out" || fail "a store-only updater was not reported as held ($nfx_local)"
+    [ "$(jq -r '.["@example/tool"]' "$nfx_state")" = 1.0.0 ] ||
+      fail "a held store-only updater still changed the package ($nfx_local)"
+    grep -Fq 'install --global npm@12.1.0' "$nfx_log" ||
+      fail "one held updater stopped the rest of the npm pass ($nfx_local)"
+  done
   nfx_reset_state
-  nfx_run_full \
-    '{"packages":{"opencodex-fixture":"enabled","npm":"enabled","current-only":"enabled"},"package_managers":["homebrew","npm"]}' \
-    '{"packages":{"opencodex-fixture":{"npm":{"name":"@example/tool","update":["tool","update"]}},"npm":{"npm":"npm"},"current-only":{"npm":"current-only"}}}'
+  nfx_run_full "$nfx_full_fold" "$nfx_full_defs" "$nfx_root/local-declared.json"
   grep -Fq 'tool update node=' "$nfx_log" ||
     fail "the full cadence did not use the package's own updater"
   ! grep -Fq 'install --global @example/tool' "$nfx_log" ||
@@ -343,6 +384,17 @@ if nfx_cli seal-plan "$tmp/npm-updater-draft.json" "$tmp/npm-unproven-snapshot.j
   "$tmp/npm-unproven-plan.json" >/dev/null 2>&1; then
   fail "an updater sealed without collect-time proof that it is the package's own bin"
 fi
+: >"$nfx_log"
+# The updater takes no version, so the registry must still name the sealed
+# candidate as latest right before it runs; otherwise nothing runs.
+if NPM_STUB_VIEW_VERSION=2.1.0 nfx_cli apply-plan "$tmp/npm-updater-plan.json" \
+  "$nfx_updater_plan_id" "$tmp/npm-updater-moved-apply.jsonl" >/dev/null 2>&1; then
+  fail "a sealed updater ran after the registry latest moved past the candidate"
+fi
+! grep -Fq 'tool update' "$nfx_log" ||
+  fail "the updater executed although the registry latest no longer matched the candidate"
+[ "$(jq -r '.["@example/tool"]' "$nfx_state")" = 1.0.0 ] ||
+  fail "a refused sealed updater changed the package"
 : >"$nfx_log"
 nfx_cli apply-plan "$tmp/npm-updater-plan.json" "$nfx_updater_plan_id" "$tmp/npm-updater-apply.jsonl"
 grep -Fq "tool update node=$nfx_fnm/aliases/default/bin/node" "$nfx_log" ||

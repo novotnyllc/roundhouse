@@ -43,7 +43,15 @@ policy.
   `"npm:@bitkyc08/opencodex": ["ocx", "update"]`) and the snapshot record shows
   `updater_status: "proven"`, meaning `argv[0]` is a bin the installed package
   declares and its global link resolves inside that package. Nothing else
-  seals. npm always runs through the durable npm: fnm's `default` alias first,
+  seals. An updater takes no version, so right before it runs the executor
+  asks the registry (`npm view <name> version`) and refuses, running
+  nothing, unless `latest` still equals the sealed `candidate_version`. The
+  post-state check still requires the installed version to equal it. A
+  residual race remains: a release that lands between that check and the
+  updater's own resolution installs the newer version, and the apply then
+  reports `partial` rather than silently accepting it. Empty `npm outdated`
+  output is a failed query (npm prints `{}` itself when nothing is
+  outdated), never "all current". npm always runs through the durable npm: fnm's `default` alias first,
   then PATH, then the fixed Homebrew/Linuxbrew/system prefixes, never an
   `fnm_multishells` path, and always with npm's own directory first on PATH so
   the matching `node` owns the install. On native Windows (winget
@@ -145,8 +153,13 @@ A logical package reaches npm only through a definition with an `npm:` entry
 update]}}`). npm never applies the default rule, and the system managers do
 not guess at a package declared for npm. The pass upgrades only what
 `npm outdated` reports behind, to that exact version, through the declared
-`update` argv when there is one (with the same bin check as the sealed lane)
-and `npm install --global <name>@<version>` otherwise. A `version:` pin
+`update` argv when there is one and `npm install --global <name>@<version>`
+otherwise. Store content is written by every synced host, so a definition
+alone never introduces a command: the pass runs a definition's `update` only
+when this host's own `config.json` declares the identical argv under
+`package_updaters`, with the same bin check as the sealed lane. Otherwise it
+prints `hold  packages.<name> — npm updater … is not declared identically …`
+and skips that package, with no `npm install` fallback. A `version:` pin
 installs exactly and is skipped by the update pass, as with winget and APT.
 The fast pass installs an enabled npm global that is missing, then requires
 `npm ls` to list it (at the pinned version when there is one) before it

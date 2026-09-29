@@ -83,8 +83,8 @@ top-level global, `id: "npm:<name>"`:
   shape is trusted, not the exit status, because npm exits non-zero for
   extraneous or invalid trees while still printing the tree.
 - Candidates come from `npm outdated --global --json`, `latest` field. It
-  exits 1 exactly when something is outdated. An `error` object is a failed
-  query, reported as `packages:npm-updates` unavailable with `update_available:
+  exits 1 exactly when something is outdated, and prints `{}` itself when
+  nothing is. An `error` object or empty output is a failed query, reported as `packages:npm-updates` unavailable with `update_available:
   null`. It is never read as "everything current".
 - `prefix` and `node_version` are part of the record, and so part of the
   sealed precondition digest. Under fnm a Node upgrade moves every global to a
@@ -125,9 +125,23 @@ package itself installs**:
   The definition is a reviewed item (`definitions.packages.opencodex`), and a
   held definition holds its package's update.
 
-The two declarations live where each lane already keeps its trust root, the
-same split `package_managers` already has between `config.json` and store
-host facts.
+Store content is written by every synced host, so a definition cannot be the
+trust root for a command. The scheduled pass runs a definition's `update`
+only when the host's own `config.json` declares the identical argv under
+`package_updaters`, the same trust root the sealed lane uses. A store-only
+or mismatched updater holds the package (a `hold` line, no `npm install`
+fallback). The definition says which updater the fleet wants, and each
+host's local configuration decides whether that host will run it.
+
+Binding to the candidate: an updater takes no version argument, so it
+cannot be told to install the sealed `candidate_version`. Immediately
+before running a sealed updater, the executors (POSIX and `apply-windows.ps1`)
+query `npm view <name> version` through the durable npm and refuse, running
+nothing, unless it equals the sealed candidate. The post-state check still
+requires `installed_version == candidate_version`. Residual race: a release
+published between that check and the updater's own registry lookup installs
+the newer version. The post-check then fails and the apply reports
+`partial`. The state is newer than planned but never silently accepted.
 
 Grammar: 1–8 strings; `argv[0]` matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`;
 each further argument matches `^[A-Za-z0-9@=:,._/+-]{1,128}$`. There is no
@@ -179,8 +193,8 @@ npm is opt-in per package:
   `applied`. No durable npm is exit 75: held, with the package-hold alert.
 - Full pass: one `npm outdated` query per pass. Only packages it reports
   behind are touched, and each goes to that exact version, through the
-  declared `update` argv when there is one and `npm install --global
-  <name>@<version>` otherwise. The resulting version is then compared. A
+  declared `update` argv when the local configuration declares it
+  identically (2.4) and `npm install --global <name>@<version>` otherwise. The resulting version is then compared. A
   blind `@latest` reinstall twice a day would be churn, and it would bounce
   opencodex's service on every cadence.
 - DSC does not run on native Windows (the design routes it through the WSL
@@ -194,10 +208,13 @@ candidates are refused, the fixed-dir hook is inert outside the self-check),
 that npm runs under its own node, `ls`/`outdated` parsing including exit 1 and
 error objects, updater proof including a declared bin whose link leaves the
 package, resolver rules, fast-pass install and pin verification, the
-full-pass updater versus exact install versus no-op, config validation, the
-worker projection, the POSIX collector, sealing refusals, apply with a
-wrong-version post-state, apply through the updater, and the Windows collector
-under pwsh. `apply-windows.ps1 -SelfTest` covers the Windows argv allowlist.
+full-pass updater versus exact install versus no-op, a store-only or
+mismatched updater held with nothing executed, empty `npm outdated` output
+rejected, config validation, the worker projection, the POSIX collector,
+sealing refusals, apply with a wrong-version post-state, a sealed updater
+refused without executing when the registry `latest` has moved, apply through
+the updater, and the Windows collector under pwsh. `apply-windows.ps1
+-SelfTest` covers the Windows argv allowlist and the registry-candidate check.
 
 ## 6. Known limits
 
@@ -206,6 +223,9 @@ under pwsh. `apply-windows.ps1 -SelfTest` covers the Windows argv allowlist.
   the candidate. No semver comparison is attempted.
 - The Windows updater proof checks declaration plus shim existence, not link
   targets (2.4).
+- A sealed updater can still race a release published between the registry
+  check and the updater's own lookup. The post-check turns that into
+  `partial` (2.4).
 
 ## 7. Follow-up: converge the Node runtime (not implemented)
 
