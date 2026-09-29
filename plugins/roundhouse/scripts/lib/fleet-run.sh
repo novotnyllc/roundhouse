@@ -2424,6 +2424,8 @@ fleet_run_full_pass() (
   # current by this pass — that is what anyone gets by doing nothing — and a
   # `version:` key opts one package out. Skipping the pinned ones is not an
   # optimisation; running them would quietly undo the pin.
+  full_npm_queried=false
+  full_npm_outdated='{}'
   printf '%s\n' "$full_fold" | jq -r '(.packages // {}) | keys[]' |
     while IFS= read -r full_package; do
       [ -n "$full_package" ] || continue
@@ -2449,6 +2451,36 @@ fleet_run_full_pass() (
         winget) winget upgrade --id "$(printf '%s\n' "$full_resolved" | jq -r '.name')" \
           --silent --accept-package-agreements --accept-source-agreements >/dev/null 2>&1 </dev/null || : ;;
         scoop) scoop update "$(printf '%s\n' "$full_resolved" | jq -r '.name')" >/dev/null 2>&1 </dev/null || : ;;
+        npm)
+          # Upgrade only what the registry says is behind, to that exact
+          # version: a blind `@latest` reinstall twice a day is churn, and a
+          # package with its own updater (one that restarts a service, say)
+          # must not be bounced on every cadence. `npm outdated` lists only
+          # installed globals, so an absent package is left to the fast pass.
+          full_npm_name=$(printf '%s\n' "$full_resolved" | jq -r '.name')
+          if [ "$full_npm_queried" = false ]; then
+            full_npm_outdated=$(npm_global_outdated 2>/dev/null) || full_npm_outdated='{}'
+            full_npm_queried=true
+          fi
+          full_npm_latest=$(printf '%s\n' "$full_npm_outdated" |
+            jq -r --arg name "$full_npm_name" '.[$name] // empty')
+          npm_version_valid "$full_npm_latest" || continue
+          if printf '%s\n' "$full_resolved" | jq -e '.attributes | has("update")' >/dev/null; then
+            # The definition declared the package's own updater: exact argv,
+            # run by absolute path only once proven to be a bin of the
+            # installed package (npm_global_run_updater).
+            full_npm_update=()
+            while IFS= read -r full_npm_update_arg; do
+              full_npm_update+=("$full_npm_update_arg")
+            done < <(printf '%s\n' "$full_resolved" | jq -r '.attributes.update[]')
+            npm_global_run_updater "$full_npm_name" "${full_npm_update[@]}" >/dev/null 2>&1 || :
+          else
+            npm_global_install "$full_npm_name" "$full_npm_latest" || :
+          fi
+          [ "$(npm_global_installed_version "$full_npm_name")" = "$full_npm_latest" ] ||
+            printf 'roundhouse: npm global %s did not reach %s\n' \
+              "$full_npm_name" "$full_npm_latest" >&2
+          ;;
       esac
     done
 

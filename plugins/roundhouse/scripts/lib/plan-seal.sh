@@ -121,6 +121,20 @@ seal_plan_command() {
     printf 'roundhouse: auth operation is not configured for target %s\n' "$target" >&2
     exit 65
   }
+  # npm upgrades carry one of exactly two argv shapes: the exact-version
+  # global install, or the updater the configuration declares for that
+  # package (the auth-reauth precedent: configured argv, compared whole).
+  jq -e --slurpfile draft "$draft" '
+    . as $config |
+    all(($draft[0].operations // [])[];
+      if .type == "package-upgrade" and (.id | startswith("npm:")) then
+        (.argv == ["npm","install","--global",((.id | ltrimstr("npm:")) + "@" + .candidate_version)]) or
+        (($config.package_updaters[.id] // null) == .argv)
+      else true end)
+  ' "$config" >/dev/null || {
+    printf 'roundhouse: npm upgrade argv is neither the exact global install nor the configured updater\n' >&2
+    exit 65
+  }
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")
   jq -e --arg platform "$platform" '
     all(.operations[];
@@ -153,7 +167,7 @@ seal_plan_command() {
       if .domain == "updates" then
         [.operations[] |
           .type == "package-upgrade" and .kind == "package" and
-          (.id | startswith("winget:"))
+          ((.id | startswith("winget:")) or (.id | startswith("npm:")))
         ] | all
       elif .domain == "agents" then
         [.operations[] | .type == "agent-update"] | all
@@ -309,7 +323,13 @@ seal_plan_command() {
           . as $operation |
           any($records[]; .kind == $operation.kind and .id == $operation.id and
             .status == "present" and .data.candidate_version == $operation.candidate_version and
-            .data.update_available == true)
+            .data.update_available == true and
+            # A package updater must also have been proven, at collect time,
+            # to be a bin of the installed package.
+            (if ($operation.id | startswith("npm:")) and
+                $operation.argv != ["npm","install","--global",
+                  (($operation.id | ltrimstr("npm:")) + "@" + $operation.candidate_version)]
+             then .data.updater == $operation.argv else true end))
         elif .type == "agent-update" and .kind == "agent_runtime" then
           . as $operation |
           any($records[]; .kind == $operation.kind and .id == $operation.id and

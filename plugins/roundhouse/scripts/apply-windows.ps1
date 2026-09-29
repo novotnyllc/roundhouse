@@ -679,6 +679,25 @@ function Get-ExactArgv([object]$Operation, [object]$Config, [object]$Machine) {
     $Id = [string]$Operation.id
     switch ([string]$Operation.type) {
         "package-upgrade" {
+            if ($Id -cmatch "^npm:(?<name>(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*)$") {
+                # Two shapes only: the exact-version global install, or the
+                # updater the configuration declares for this package.
+                $PackageName = $Matches.name
+                if ([string]$Operation.candidate_version -cnotmatch "^[0-9A-Za-z][0-9A-Za-z.+-]*$") {
+                    throw "Invalid npm upgrade"
+                }
+                $Install = @("npm", "install", "--global", ($PackageName + "@" + [string]$Operation.candidate_version))
+                if ((ConvertTo-CanonicalJson @($Operation.argv)) -eq (ConvertTo-CanonicalJson $Install)) {
+                    return $Install
+                }
+                $Configured = $null
+                if ($null -ne $Config -and $null -ne $Config.package_updaters) {
+                    $Configured = $Config.package_updaters.PSObject.Properties |
+                        Where-Object { $_.Name -ceq $Id } | Select-Object -First 1
+                }
+                if ($null -ne $Configured) { return [string[]]@($Configured.Value) }
+                return $Install
+            }
             if ($Id -notmatch "^winget:(?<name>[A-Za-z0-9._+-]+)$") {
                 throw "Invalid winget upgrade"
             }
@@ -720,6 +739,49 @@ function Get-ExactArgv([object]$Operation, [object]$Config, [object]$Machine) {
         }
         default { throw "Unsupported Windows operation" }
     }
+}
+
+function Test-NpmUpdaterOperation([object]$Operation) {
+    if ([string]$Operation.type -ne "package-upgrade" -or [string]$Operation.id -notlike "npm:*") { return $false }
+    $Install = @("npm", "install", "--global",
+        (([string]$Operation.id).Substring(4) + "@" + [string]$Operation.candidate_version))
+    return (ConvertTo-CanonicalJson @($Operation.argv)) -ne (ConvertTo-CanonicalJson $Install)
+}
+
+function Get-NpmUpdaterPath([string]$Name, [string]$Bin) {
+    # A declared updater runs only as a bin the installed package itself
+    # declares, from the global prefix npm reports, never by PATH lookup.
+    $Npm = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $Npm -or [string]$Npm.Source -match 'fnm_multishells') { throw "Required command is unavailable: npm" }
+    $Root = ((@(& $Npm.Source root --global 2>$null) | ForEach-Object { [string]$_ }) -join "`n").Trim()
+    $Prefix = ((@(& $Npm.Source prefix --global 2>$null) | ForEach-Object { [string]$_ }) -join "`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($Root) -or [string]::IsNullOrWhiteSpace($Prefix)) {
+        throw "npm global prefix is unavailable"
+    }
+    $Manifest = Join-Path (Join-Path $Root $Name) "package.json"
+    if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { throw "npm package is not installed: $Name" }
+    $Package = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json
+    $Bins = if ($Package.bin -is [string]) { @(($Name -split '/')[-1]) }
+        elseif ($null -ne $Package.bin) { @($Package.bin.PSObject.Properties.Name) } else { @() }
+    if ($Bins -cnotcontains $Bin) { throw "npm updater is not a bin of the installed package" }
+    foreach ($Candidate in @((Join-Path $Prefix "$Bin.cmd"), (Join-Path $Prefix "$Bin.exe"),
+        (Join-Path (Join-Path $Prefix "bin") $Bin))) {
+        if (Test-Path -LiteralPath $Candidate -PathType Leaf) { return $Candidate }
+    }
+    throw "npm updater bin is missing from the global prefix"
+}
+
+function Invoke-NpmUpdater([object]$Operation, [string[]]$Argv) {
+    $Path = Get-NpmUpdaterPath (([string]$Operation.id).Substring(4)) $Argv[0]
+    & $Path @($Argv | Select-Object -Skip 1) *> $null
+    $Succeeded = $?
+    $NativeExitCode = $LASTEXITCODE
+    if (-not $Succeeded -or ($null -ne $NativeExitCode -and $NativeExitCode -ne 0)) {
+        $Failure = [InvalidOperationException]::new("Native command failed: $($Argv[0])")
+        $Failure.Data["ExitCode"] = $(if ($null -eq $NativeExitCode) { 1 } else { [int]$NativeExitCode })
+        throw $Failure
+    }
+    return $(if ($null -eq $NativeExitCode) { 0 } else { [int]$NativeExitCode })
 }
 
 function Invoke-Exact([string[]]$Argv) {
@@ -831,7 +893,7 @@ function Assert-Postcondition([object]$Operation, [object[]]$Before, [object[]]$
     switch ([string]$Operation.type) {
         "package-upgrade" {
             if ($AfterRecord[0].data.installed_version -ne [string]$Operation.candidate_version) {
-                throw "Winget did not reach the sealed candidate version"
+                throw "Package did not reach the sealed candidate version"
             }
         }
         "agent-update" {
@@ -1045,6 +1107,29 @@ if ($SelfTest) {
             "--accept-source-agreements", "--disable-interactivity")
         if ((ConvertTo-CanonicalJson $Argv) -ne (ConvertTo-CanonicalJson $Expected)) {
             throw "Winget argv self-test failed"
+        }
+        $NpmOperation = [pscustomobject]@{
+            type = "package-upgrade"; kind = "package"; id = "npm:@example/tool"
+            candidate_version = "2.0.0"; argv = @("npm", "install", "--global", "@example/tool@2.0.0")
+        }
+        $NpmArgv = @(Get-ExactArgv $NpmOperation $null $null)
+        if ((ConvertTo-CanonicalJson $NpmArgv) -ne '["npm","install","--global","@example/tool@2.0.0"]' -or
+            (Test-NpmUpdaterOperation $NpmOperation)) {
+            throw "npm install argv self-test failed"
+        }
+        $NpmUpdaterOperation = [pscustomobject]@{
+            type = "package-upgrade"; kind = "package"; id = "npm:@example/tool"
+            candidate_version = "2.0.0"; argv = @("tool", "update")
+        }
+        $NpmUpdaterConfig = [pscustomobject]@{
+            package_updaters = [pscustomobject]@{ "npm:@example/tool" = @("tool", "update") }
+        }
+        if ((ConvertTo-CanonicalJson @(Get-ExactArgv $NpmUpdaterOperation $NpmUpdaterConfig $null)) -ne
+            '["tool","update"]' -or -not (Test-NpmUpdaterOperation $NpmUpdaterOperation)) {
+            throw "npm configured updater argv self-test failed"
+        }
+        if ((ConvertTo-CanonicalJson @(Get-ExactArgv $NpmUpdaterOperation $null $null)) -eq '["tool","update"]') {
+            throw "npm unconfigured updater argv self-test failed"
         }
         $RuntimeArgv = @(Get-ExactArgv ([pscustomobject]@{
             type = "agent-update"; kind = "agent_runtime"; id = "codex"
@@ -1652,7 +1737,11 @@ foreach ($Operation in @($Plan.operations)) {
         $Record = $PreflightRecord[0]
         if ($Record.status -ne "present" -or $Record.data.update_available -ne $true -or
             $Record.data.candidate_version -ne [string]$Operation.candidate_version) {
-            throw "Winget candidate no longer matches the sealed plan"
+            throw "Package candidate no longer matches the sealed plan"
+        }
+        if ((Test-NpmUpdaterOperation $Operation) -and
+            (ConvertTo-CanonicalJson @($Record.data.updater)) -ne (ConvertTo-CanonicalJson @($Operation.argv))) {
+            throw "npm updater is no longer proven for the installed package"
         }
     }
     if ($Operation.type -eq "project-clone" -and $PreflightRecord[0].status -ne "absent") {
@@ -1693,6 +1782,8 @@ for ($Index = 0; $Index -lt @($Plan.operations).Count; $Index++) {
         }
         if ($Operation.type -eq "agent-update" -and [string]$Operation.id -like "codex:*") {
             $ExitCode = Invoke-CodexPluginHooks "update" $ExpectedArgv[3]
+        } elseif (Test-NpmUpdaterOperation $Operation) {
+            $ExitCode = Invoke-NpmUpdater $Operation $ExpectedArgv
         } else {
             $ExitCode = Invoke-Exact $ExpectedArgv
         }

@@ -525,6 +525,31 @@ EOF
           printf 'roundhouse: direct APT execution is forbidden; use a sealed broker action\n' >&2
           return 69
           ;;
+        npm:*)
+          # Two argv shapes and no others: npm's own exact-version global
+          # install, or the package's own updater exactly as configured. Both
+          # run through the durable npm and its own node (lib/npm.sh); the
+          # updater only by absolute path once it is proven to be a bin of
+          # the installed package.
+          npm_name=$package_name
+          { npm_package_name_valid "$npm_name" && npm_version_valid "$candidate"; } || {
+            printf 'roundhouse: invalid npm package upgrade\n' >&2
+            return 64
+          }
+          if [ $# -eq 4 ] && [ "$1" = npm ] && [ "$2" = install ] &&
+            [ "$3" = --global ] && [ "$4" = "$npm_name@$candidate" ]; then
+            npm_global_run install --global "$npm_name@$candidate"
+            return
+          fi
+          jq -e --arg id "$id" --slurpfile operation "$operation" '
+            (.package_updaters[$id] // null) == $operation[0].argv
+          ' "$config" >/dev/null || {
+            printf 'roundhouse: unsafe npm upgrade argv\n' >&2
+            return 64
+          }
+          npm_global_run_updater "$npm_name" "$@"
+          return
+          ;;
         *)
           printf 'roundhouse: package manager requires target-native apply\n' >&2
           return 64
