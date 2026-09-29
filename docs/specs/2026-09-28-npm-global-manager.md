@@ -385,6 +385,14 @@ requirement is a floor.
 - The carry is every **enabled** package of the fold that resolves to npm on
   this host and is installed under the current default, at its installed
   version. Unmanaged globals are left under the old version and reported.
+  An enabled package whose definition declares it an npm global (an `npm:`
+  entry that is not `unavailable`) but which does not resolve to npm on a
+  host that manages npm (a malformed name, `update:` or `node_switch:`) holds
+  the switch before anything moves: dropping it from the carry would strand
+  it and any hook it needs under the old prefix. A package with no `npm:`
+  entry, or `npm: unavailable`, is not an npm global there and never holds
+  it. The sealed lane has no fold; its carry is explicit and checked against
+  the recorded globals instead.
   `npm` itself is carried only when the store manages it; the npm pass that
   follows then moves it forward if the carried version is behind.
 - Hold lines: `  hold  runtimes.node — <reason>`, for an unusable value, a

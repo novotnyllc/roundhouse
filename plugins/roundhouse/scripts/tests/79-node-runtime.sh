@@ -259,8 +259,12 @@ nrt_reset
     "plain":{"npm":"plain"},
     "absent":{"npm":"absent-pkg"},
     "brewonly":{"homebrew":"brewonly"},
+    "npm-off":{"npm":"unavailable","homebrew":"unmanaged"},
+    "bad-name":{"npm":"../escape"},
     "bad-hook":{"npm":{"name":"plain","node_switch":["svc service"]}}}}'
-  nrt_fold='{"packages":{"svc":"enabled","plain":{"state":"enabled"},"absent":"enabled","brewonly":"enabled","off":"disabled"},"runtimes":{"node":{"major":26}}}'
+  # npm-off is enabled and installed as a global, but its definition says npm
+  # is unavailable: deliberately not an npm global, never carried, never a hold.
+  nrt_fold='{"packages":{"svc":"enabled","plain":{"state":"enabled"},"absent":"enabled","brewonly":"enabled","npm-off":"enabled","off":"disabled"},"runtimes":{"node":{"major":26}}}'
   nrt_globals_now=$(npm_global_list)
   [ "$(fleet_resolve_package "$nrt_defs" svc homebrew npm | jq -c '.attributes.node_switch')" = \
     '[["svc","service"]]' ] || fail "a declared node_switch hook did not ride through the resolver"
@@ -289,6 +293,21 @@ nrt_reset
       jq -e '.held | contains("packages.svc requires node_switch hook")' >/dev/null ||
       fail "a store-only post-switch hook did not hold the switch ($nrt_local)"
   done
+  # An enabled package declared as an npm global that does not resolve (a
+  # malformed name or node_switch) cannot be carried: it holds the switch
+  # rather than being silently left behind in the old prefix. On a host that
+  # does not manage npm it is not a carry candidate at all.
+  for nrt_bad_item in bad-name bad-hook; do
+    nrt_bad_fold=$(printf '%s\n' "$nrt_fold" | jq -c --arg p "$nrt_bad_item" '.packages[$p] = "enabled"')
+    ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
+      fleet_run_node_plan "$nrt_bad_fold" "$nrt_defs" "homebrew npm" "$nrt_globals_now" |
+      jq -e --arg p "$nrt_bad_item" '.held | startswith("packages.\($p) is declared as an npm global but does not resolve to npm on this host")' \
+      >/dev/null || fail "an unresolvable npm global did not hold the switch ($nrt_bad_item)"
+    ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
+      fleet_run_node_plan "$nrt_bad_fold" "$nrt_defs" "homebrew" "$nrt_globals_now" |
+      jq -e '.held == null and .carry == []' >/dev/null ||
+      fail "a host without npm held the switch on an npm definition ($nrt_bad_item)"
+  done
 
   # --- desired-state convergence ----------------------------------------------
   nrt_converge() {
@@ -300,6 +319,17 @@ nrt_reset
   nrt_converge local-declared '{"major":26}' apply || fail "an in-line default did not converge"
   ! grep -Eq 'fnm (install|default|list-remote)' "$nrt_log" ||
     fail "the reviewed apply touched fnm for a default already in its major"
+  # A malformed npm global in the fold holds the switch before anything moves.
+  nrt_status=0
+  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json fleet_run_node_converge '{"major":26}' \
+    "$nrt_defs" "$(printf '%s\n' "$nrt_fold" | jq -c '.packages["bad-name"] = "enabled"')" \
+    "homebrew npm" full >"$nrt_root/converge-out" 2>&1 || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v26.0.0 ] &&
+    grep -Fq '  hold  runtimes.node — packages.bad-name is declared as an npm global but does not resolve' \
+      "$nrt_root/converge-out" ||
+    fail "a switch ran while an enabled npm global could not be resolved"
+  ! grep -Eq 'fnm (install|default) |npm install' "$nrt_log" ||
+    fail "a switch held for an unresolvable npm global still installed something"
   # A store-only hook holds the switch and changes nothing.
   nrt_status=0
   nrt_converge local-undeclared '{"major":26}' full || nrt_status=$?

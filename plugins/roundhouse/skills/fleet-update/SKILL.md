@@ -217,7 +217,10 @@ only restores it after a drift (a host that must drop a fleet pin sets
 switches only when the default is outside the major or is not the pin. A
 switch carries every enabled package of the fold that resolves to npm and is
 installed under the current default, at its installed version (it never adds
-a package), then runs post-switch hooks. A definition may require hooks with
+a package), then runs post-switch hooks. An enabled package declared as an npm
+global that does not resolve to npm here (a malformed name, `update:` or
+`node_switch:`) holds the switch instead of being left behind; one with no
+`npm:` entry or `npm: unavailable` is not carried and does not hold it. A definition may require hooks with
 `node_switch:` on its npm entry (`opencodex: {npm: {name:
 "@bitkyc08/opencodex", update: [ocx, update], node_switch: [[ocx,
 service]]}}`), but only this host's `config.json` `node_switch_hooks`

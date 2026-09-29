@@ -1138,8 +1138,15 @@ fleet_run_node_plan() (
   #   hooks      [{package, argv}] — the post-switch hooks this host's own
   #              config.json declares (`node_switch_hooks`) for carried
   #              packages. Only local configuration introduces a command.
-  #   held       null, or why the switch must not run: a definition requires
-  #              a `node_switch` hook this host has not declared identically.
+  #   held       null, or why the switch must not run: an enabled package
+  #              declared as an npm global does not resolve to npm here (a
+  #              malformed npm name, `update:` or `node_switch:`), so it could
+  #              not be carried and would be stranded under the old prefix; or
+  #              a definition requires a `node_switch` hook this host has not
+  #              declared identically. A package with no `npm:` entry, one
+  #              whose `npm:` is `unavailable`, or any package on a host that
+  #              does not list npm is deliberately not an npm global here and
+  #              never holds the switch.
   #   unmanaged  globals under the current default that no enabled package
   #              manages. They stay under the old version and are reported.
   plan_fold=$1
@@ -1150,13 +1157,36 @@ fleet_run_node_plan() (
     plan_local='{}'
   [ -n "$plan_local" ] || plan_local='{}'
   plan_entries='[]'
+  plan_unresolved=
+  plan_host_npm=false
+  case " $plan_managers " in *" npm "*) plan_host_npm=true ;; esac
   while IFS= read -r plan_package; do
     [ -n "$plan_package" ] || continue
     [ "$(fleet_run_state_of "$(printf '%s\n' "$plan_fold" |
       jq -c --arg p "$plan_package" '.packages[$p]')")" = enabled ] || continue
+    # A carry candidate is an enabled package whose definition declares it an
+    # npm global, on a host that manages npm. The resolver's own predicate:
+    # an `npm:` entry that is present and not `unavailable`.
+    plan_candidate=false
+    if [ "$plan_host_npm" = true ] &&
+      fleet_definition_entry "$plan_defs" packages "$plan_package" |
+      jq -e '(.npm // null) != null and .npm != "unavailable"' >/dev/null 2>&1; then
+      plan_candidate=true
+    fi
+    plan_status=0
     # shellcheck disable=SC2086 # the host's package_managers list, in order
-    plan_resolved=$(fleet_resolve_package "$plan_defs" "$plan_package" $plan_managers) || continue
-    [ "$(printf '%s\n' "$plan_resolved" | jq -r '.manager')" = npm ] || continue
+    plan_resolved=$(fleet_resolve_package "$plan_defs" "$plan_package" $plan_managers) ||
+      plan_status=$?
+    if [ "$plan_status" -ne 0 ] ||
+      [ "$(printf '%s\n' "$plan_resolved" | jq -r '.manager // empty')" != npm ]; then
+      # Not silently dropped: a candidate that fails to resolve to npm cannot
+      # be carried, and switching anyway strands it (and any hook it needs).
+      if [ "$plan_candidate" = true ] && [ -z "$plan_unresolved" ]; then
+        plan_unresolved="packages.$plan_package is declared as an npm global but does not resolve to npm on this host ($(printf '%s\n' "$plan_resolved" |
+          jq -r '.detail // "resolved to another manager"' 2>/dev/null)); a switch would strand it under the old prefix"
+      fi
+      continue
+    fi
     plan_entries=$(printf '%s\n' "$plan_entries" | jq -c --arg logical "$plan_package" \
       --argjson resolved "$plan_resolved" \
       '. + [{logical: $logical, name: $resolved.name,
@@ -1165,17 +1195,20 @@ fleet_run_node_plan() (
 $(printf '%s\n' "$plan_fold" | jq -r '(.packages // {}) | keys[]')
 EOF
   jq -cn --argjson entries "$plan_entries" --argjson globals "$plan_globals" \
-    --argjson local "$plan_local" '
+    --argjson local "$plan_local" --arg unresolved "$plan_unresolved" '
     [$entries[] | select($globals[.name] != null)] as $managed |
     ($managed | unique_by(.name)) as $carried |
     {
       carry: [$carried[] | {name, version: $globals[.name]}],
       hooks: [$carried[] | .name as $n |
         ($local["npm:" + $n] // [])[] | {package: ("npm:" + $n), argv: .}],
-      held: (first($managed[] | . as $e |
-        ($local["npm:" + .name] // []) as $declared |
-        select(any($e.wanted[]; . as $w | any($declared[]; . == $w) | not)) |
-        "packages.\(.logical) requires node_switch hook(s) \($e.wanted | tojson) that this host'"'"'s config.json node_switch_hooks does not declare") // null),
+      held: (first(
+        (if $unresolved == "" then empty else $unresolved end),
+        ($managed[] | . as $e |
+          ($local["npm:" + .name] // []) as $declared |
+          select(any($e.wanted[]; . as $w | any($declared[]; . == $w) | not)) |
+          "packages.\(.logical) requires node_switch hook(s) \($e.wanted | tojson) that this host'"'"'s config.json node_switch_hooks does not declare")
+      ) // null),
       unmanaged: ([$globals | keys[]] - [$carried[].name])
     }'
 )
