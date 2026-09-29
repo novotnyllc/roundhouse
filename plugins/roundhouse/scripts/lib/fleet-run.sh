@@ -1109,6 +1109,23 @@ EOF
       "$skill_lock" >/dev/null 2>&1 || return 75
 )
 
+fleet_run_package_managers() {
+  # `fleet_run_package_managers FOLD HOST` — the host's managers, in order, as
+  # one space-separated line. The fold wins when it states the fact at all
+  # (PRESENCE, so an explicit `[]` stays empty). A fold without the key falls
+  # back to this host's own config.json — the same source fleet-seed copies
+  # from — because the fold is read from the published tree, and a fact the
+  # full pass seeds into the working copy only reaches it on the NEXT run.
+  # Without the fallback, the first run after upgrading still held every
+  # package as unprovidable.
+  if printf '%s\n' "$1" | jq -e 'has("package_managers")' >/dev/null 2>&1; then
+    printf '%s\n' "$1" | jq -r '(.package_managers // []) | join(" ")'
+  else
+    jq -r --arg host "$2" '(.machines[$host].package_managers // []) | join(" ")' \
+      "$(config_path)" 2>/dev/null || :
+  fi
+}
+
 fleet_run_apply_item() {
   # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
@@ -1960,8 +1977,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fleet_run_verdict_write "$run_item" "$run_digest" "$run_reason"
     run_status=0
     fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
-      "$run_value" "$(printf '%s\n' "$run_fold" |
-        jq -r '(.package_managers // []) | join(" ")')" || run_status=$?
+      "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" ||
+      run_status=$?
     case $run_status in
       0)
         # An unwritable applied/<h>.yaml is loud and narrow, never fatal: the
@@ -2442,12 +2459,13 @@ fleet_run_full_pass() (
       ! fleet_package_pinned "$full_defs" "$full_package" || continue
       # shellcheck disable=SC2046,SC2086 # the host's package_managers, in order
       full_resolved=$(fleet_resolve_package "$full_defs" "$full_package" \
-        $(printf '%s\n' "$full_fold" | jq -r '(.package_managers // []) | join(" ")')) || :
+        $(fleet_run_package_managers "$full_fold" "$full_host")) || :
       [ "$(printf '%s\n' "$full_resolved" | jq -r '.resolved')" = true ] || continue
       # `</dev/null` on each: this loop is fed by a pipeline, so its stdin is
       # the package list and a greedy manager would eat the rest of it.
-      case $(printf '%s\n' "$full_resolved" | jq -r '.manager') in
-        homebrew) brew upgrade "$(printf '%s\n' "$full_resolved" | jq -r '.name')" >/dev/null 2>&1 </dev/null || : ;;
+      full_manager=$(printf '%s\n' "$full_resolved" | jq -r '.manager')
+      case $full_manager in
+        homebrew | linuxbrew) brew upgrade "$(printf '%s\n' "$full_resolved" | jq -r '.name')" >/dev/null 2>&1 </dev/null || : ;;
         winget) winget upgrade --id "$(printf '%s\n' "$full_resolved" | jq -r '.name')" \
           --silent --accept-package-agreements --accept-source-agreements >/dev/null 2>&1 </dev/null || : ;;
         scoop) scoop update "$(printf '%s\n' "$full_resolved" | jq -r '.name')" >/dev/null 2>&1 </dev/null || : ;;
@@ -2495,6 +2513,11 @@ fleet_run_full_pass() (
             printf 'roundhouse: npm global %s did not reach %s\n' \
               "$full_npm_name" "$full_npm_latest" >&2
           ;;
+        # A manager with no user-space update path (apt needs root, and
+        # roundhouse never uses sudo) is reported, never silently skipped —
+        # the same answer fleet_install_package gives at install time.
+        *) printf '  hold  packages.%s — %s has no user-space update path\n' \
+          "$full_package" "$full_manager" ;;
       esac
     done
 
@@ -2607,6 +2630,12 @@ fleet_seed_command() (
   # carries both, validated (platform is one of macos/linux/wsl/windows and
   # every group matches the name charset), so there is nothing to infer.
   #
+  # `package_managers` is the same kind of fact: the apply path and the update
+  # pass read the host's list from the fold to resolve every package. Seeding
+  # without it left the list empty, so the resolver tried no manager and held
+  # every enabled package as "no package manager on this host can provide" —
+  # on hosts whose manager plainly provides it.
+  #
   # PRESENCE, not truthiness: a machine legitimately in no groups carries
   # `groups: []`, and dropping an empty list is not the same as having no
   # opinion. The `machine-truth` doctor row compares `.groups // null` on both
@@ -2617,6 +2646,7 @@ fleet_seed_command() (
     (.machines[$host] // {}) |
     {} + (if has("platform") then {platform: .platform} else {} end)
        + (if has("groups") then {groups: .groups} else {} end)
+       + (if has("package_managers") then {package_managers: .package_managers} else {} end)
     ' "$(config_path)" 2>/dev/null) || seed_facts='{}'
   [ -n "$seed_facts" ] || seed_facts='{}'
 
@@ -2962,8 +2992,8 @@ fleet_apply_command() (
   fleet_run_apply_item "$apply_store" "$apply_host" \
     "$(fleet_definitions_load "$apply_store")" "$apply_item" \
     "$(fleet_item_value "$apply_fold" "$apply_item")" \
-    "$(printf '%s\n' "$apply_fold" |
-      jq -r '(.package_managers // []) | join(" ")')" || apply_status=$?
+    "$(fleet_run_package_managers "$apply_fold" "$apply_host")" ||
+    apply_status=$?
   apply_now=$(fleet_now)
   case $apply_status in
     0)
