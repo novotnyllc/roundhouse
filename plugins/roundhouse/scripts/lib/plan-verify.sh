@@ -613,8 +613,17 @@ verify_preconditions_command() {
             (.package | type == "string" and startswith("npm:")) and
             (.argv | type == "array" and length >= 1 and length <= 8 and
               (.[0] | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
-              all(.[1:][]; type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$")))))
-       elif has("carry") or has("hooks") then false
+              all(.[1:][]; type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$"))))) and
+        # The desired-state managed set the carry must equal (managed ∩
+        # installed); re-derived from the store at seal and at apply.
+        (.managed | type == "array" and length <= 256 and
+          all(.[]; type == "object" and (keys == ["name","package","required"]) and
+            (.package | type == "string" and length > 0 and length <= 256) and
+            (.name | type == "string" and length <= 214 and
+              test("^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
+            (.required | type == "array" and length <= 4 and
+              all(.[]; type == "array" and length >= 1 and length <= 8 and all(.[]; type == "string")))))
+       elif has("carry") or has("hooks") or has("managed") then false
        else true end) and
       (if .type == "chezmoi-apply" and has("targets") then
         (.targets | type == "array" and length > 0 and length <= 16 and
@@ -795,6 +804,29 @@ verify_preconditions_command() {
     printf 'roundhouse: target state changed after planning; create a new plan\n' >&2
     exit 65
   }
+  # A Node switch re-derives the managed set here, from the store as it is
+  # now: a definition or desired-state change since sealing that alters what
+  # must be carried refuses the plan instead of stranding a global.
+  if jq -e 'any(.operations[]?; .type == "package-upgrade" and .id == "fnm:node")' \
+    "$plan" >/dev/null 2>&1; then
+    node_verify_globals=$(jq -cs 'first(.[] | select(.kind == "package" and .id == "fnm:node" and
+      .status == "present") | .data.globals) // null' "$snapshot")
+    node_verify_plan=$(fleet_node_store_plan "$target" "$node_verify_globals" \
+      "$(jq -c '.node_switch_hooks // {}' "$config")") || {
+      printf 'roundhouse: the managed npm set for %s is unknown (store desired state or recorded globals unavailable); a Node switch cannot verify its carry\n' \
+        "$target" >&2
+      exit 65
+    }
+    jq -e --argjson current "$node_verify_plan" '
+      $current.held == null and
+      all(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node");
+        .managed == $current.managed and .carry == $current.carry and .hooks == $current.hooks)
+    ' "$plan" >/dev/null || {
+      printf 'roundhouse: the managed npm globals changed since planning (%s); create a new plan\n' \
+        "$(printf '%s\n' "$node_verify_plan" | jq -r '.held // "managed set, carry or hooks differ"')" >&2
+      exit 65
+    }
+  fi
   jq -cn --arg plan_id "$expected_plan_id" --arg target "$target" \
     '{verified:true,plan_id:$plan_id,target:$target}'
 }

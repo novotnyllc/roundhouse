@@ -1130,6 +1130,7 @@ YAML
 {"kind":"plugin","status":"present","data":{"name":"unknown-harness","marketplace":"unknown","enabled":true}}
 {"kind":"skill","status":"present","data":{"name":"grilling"}}
 {"kind":"package","status":"present","data":{"name":"jq"}}
+{"kind":"package","id":"npm:@example/cli","status":"present","data":{"manager":"npm","name":"@example/cli","installed_version":"1.0.0"}}
 {"kind":"package","id":"fnm:node","status":"present","data":{"manager":"fnm","name":"node","installed_version":"v26.7.0","candidate_version":null,"update_available":false}}
 {"kind":"plugin","status":"absent","data":{"agent":"claude","name":"never-installed","marketplace":"x","enabled":true}}
 JSONL
@@ -1163,8 +1164,11 @@ YAML
       fail "seeding described something the snapshot reports absent"
     # The fnm runtime record is never a package (Homebrew would read
     # `packages.node` as its own `node` formula), and seeding never writes
-    # `runtimes:` either: that category enters the store by hand.
-    yq -e '.packages.jq == "enabled" and .packages.node == null and .runtimes == null' \
+    # `runtimes:` either: that category enters the store by hand. An npm
+    # global is not seeded: without an `npm:` definition it would resolve to
+    # a system manager and be owned without ever being carried by a switch.
+    yq -e '.packages.jq == "enabled" and .packages.node == null and .runtimes == null and
+      .packages["@example/cli"] == null' \
       "$run_seeded" >/dev/null ||
       fail "seeding turned the fnm runtime record into desired state"
     [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" packages.node)" ] ||

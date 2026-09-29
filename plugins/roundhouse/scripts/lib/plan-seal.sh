@@ -60,8 +60,17 @@ seal_plan_command() {
             (.package | type == "string" and startswith("npm:")) and
             (.argv | type == "array" and length >= 1 and length <= 8 and
               (.[0] | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
-              all(.[1:][]; type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$")))))
-       elif has("carry") or has("hooks") then false
+              all(.[1:][]; type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$"))))) and
+        # The desired-state managed set the carry must equal (managed ∩
+        # installed); re-derived from the store at seal and at apply.
+        (.managed | type == "array" and length <= 256 and
+          all(.[]; type == "object" and (keys == ["name","package","required"]) and
+            (.package | type == "string" and length > 0 and length <= 256) and
+            (.name | type == "string" and length <= 214 and
+              test("^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
+            (.required | type == "array" and length <= 4 and
+              all(.[]; type == "array" and length >= 1 and length <= 8 and all(.[]; type == "string")))))
+       elif has("carry") or has("hooks") or has("managed") then false
        else true end) and
       (if .type == "chezmoi-apply" and has("targets") then
         (.targets | type == "array" and length > 0 and length <= 16 and
@@ -154,22 +163,6 @@ seal_plan_command() {
       else true end)
   ' "$config" >/dev/null || {
     printf 'roundhouse: npm upgrade argv is neither the exact global install nor the configured updater\n' >&2
-    exit 65
-  }
-  # A Node switch runs exactly the post-switch hooks the configuration
-  # declares for the packages it carries, in carry order: none omitted (a
-  # forgotten service repair is the failure this exists to prevent) and none
-  # added. Configured argv compared whole, the package_updaters precedent.
-  jq -e --slurpfile draft "$draft" '
-    . as $config |
-    all(($draft[0].operations // [])[];
-      if .type == "package-upgrade" and .id == "fnm:node" then
-        .hooks == [.carry[] | .name as $n |
-          (($config.node_switch_hooks // {})["npm:" + $n] // [])[] |
-          {package: ("npm:" + $n), argv: .}]
-      else true end)
-  ' "$config" >/dev/null || {
-    printf 'roundhouse: Node switch hooks differ from the configured node_switch_hooks of the carried packages\n' >&2
     exit 65
   }
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")
@@ -419,6 +412,38 @@ seal_plan_command() {
     ' >/dev/null || {
       printf 'roundhouse: %s plan does not match an actionable observed state\n' \
         "$domain" >&2
+      exit 65
+    }
+  fi
+  # A Node switch seals only when it carries the COMPLETE managed set: the
+  # one carry predicate (fleet_run_node_plan), run over the store's desired
+  # state for the target and the snapshot's globals, must hold nothing and
+  # must produce exactly the draft's managed set, carry and hooks. An empty,
+  # partial or padded carry, a missing or extra hook, and a managed set the
+  # store does not state are all refused.
+  if jq -e 'any(.operations[]?; .type == "package-upgrade" and .id == "fnm:node")' \
+    "$draft" >/dev/null 2>&1; then
+    node_seal_globals=$(jq -cs 'first(.[] | select(.kind == "package" and .id == "fnm:node" and
+      .status == "present") | .data.globals) // null' "$snapshot")
+    node_seal_plan=$(fleet_node_store_plan "$target" "$node_seal_globals" \
+      "$(jq -c '.node_switch_hooks // {}' "$config")") || {
+      printf 'roundhouse: a Node switch seals only when the managed npm set for %s is known: the store desired state or the recorded globals are unavailable\n' \
+        "$target" >&2
+      exit 65
+    }
+    node_seal_held=$(printf '%s\n' "$node_seal_plan" | jq -r '.held // empty')
+    [ -z "$node_seal_held" ] || {
+      printf 'roundhouse: Node switch held: %s\n' "$node_seal_held" >&2
+      exit 65
+    }
+    jq -e --argjson plan "$node_seal_plan" '
+      all(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node");
+        .managed == $plan.managed and .carry == $plan.carry and .hooks == $plan.hooks)
+    ' "$draft" >/dev/null || {
+      printf 'roundhouse: Node switch must carry exactly the managed npm globals: managed %s, carry %s, hooks %s\n' \
+        "$(printf '%s\n' "$node_seal_plan" | jq -c '.managed')" \
+        "$(printf '%s\n' "$node_seal_plan" | jq -c '.carry')" \
+        "$(printf '%s\n' "$node_seal_plan" | jq -c '.hooks')" >&2
       exit 65
     }
   fi

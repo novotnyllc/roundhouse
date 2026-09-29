@@ -692,7 +692,7 @@ validate_legacy_ssh_plan_file() {
            # A Node runtime switch carries its exact globals and hooks; their
            # shapes were checked at seal time and are checked again by
            # verify-preconditions and the executor on the target.
-           exact(["argv","candidate_version","carry","hooks","id","kind","type"])
+           exact(["argv","candidate_version","carry","hooks","id","kind","managed","type"])
          elif .type == "package-upgrade" then
            exact(["argv","candidate_version","id","kind","type"])
          elif .type == "chezmoi-apply" and has("targets") then

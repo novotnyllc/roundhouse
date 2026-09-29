@@ -213,11 +213,29 @@ fleet_applied_record() {
   # never the scope that produced it: a host whose `groups:` list changes must
   # still see every previously applied item as a prune candidate and review it
   # by name (KEP-3659's failure mode).
+  #
+  # An `npm` annotation (fleet_applied_annotate_npm) survives a re-record: it
+  # is what a Node switch uses to know a global was installed for this item,
+  # and losing it on a digest change would turn a stranded global into an
+  # "unmanaged" one nobody is asked about.
   applied_file=$(fleet_applied_path "$1" "$2")
   fleet_record_write "$applied_file" \
     "$(fleet_record_read "$applied_file" '{}' | jq -c \
-      --arg item "$3" --arg digest "$4" --arg at "${5:-$(fleet_now)}" \
-      '.items[$item] = {digest: $digest, at: $at}')"
+      --arg item "$3" --arg digest "$4" --arg at "${5:-$(fleet_now)}" '
+      ((.items // {})[$item].npm // null) as $npm |
+      .items[$item] = ({digest: $digest, at: $at} +
+        (if $npm == null then {} else {npm: $npm} end))')"
+}
+
+fleet_applied_annotate_npm() {
+  # `fleet_applied_annotate_npm STORE HOST ITEM NAME` — add NAME to the npm
+  # globals ITEM was installed as. Accumulates; dropped only with the item.
+  applied_file=$(fleet_applied_path "$1" "$2")
+  [ -f "$applied_file" ] || return 0
+  fleet_record_write "$applied_file" \
+    "$(fleet_record_read "$applied_file" '{}' | jq -c --arg item "$3" --arg name "$4" '
+      if (.items // {})[$item] == null then .
+      else .items[$item].npm = ((.items[$item].npm // []) + [$name] | unique) end')"
 }
 
 fleet_applied_forget() {

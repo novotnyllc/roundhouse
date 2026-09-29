@@ -67,13 +67,20 @@ policy.
   `installed_versions`, `stale_versions` (installed, not the default),
   `globals` (the default's top-level globals) and `switch_hooks_unproven`.
   A switch is a `package-upgrade` with `id: "fnm:node"`, argv exactly
-  `["fnm","default","<candidate_version>"]`, a `carry` list
-  `[{"name","version"}]` of globals installed under the current default at
-  exactly the recorded versions, and a `hooks` list that must equal, in carry
-  order, every argv the configuration declares for those packages under
-  top-level `node_switch_hooks` (for example
-  `"npm:@bitkyc08/opencodex": [["ocx", "service"]]`). Choose the carry: every
-  managed global, normally not `npm` itself (the new Node bundles its own).
+  `["fnm","default","<candidate_version>"]`, a `managed` list
+  `[{"package","name","required"}]`, a `carry` list `[{"name","version"}]`
+  and a `hooks` list `[{"package","argv"}]`. All three are not chosen but
+  derived: seal-plan runs the one carry rule (see the full cadence below)
+  over the store's desired state for the target and the recorded `globals`,
+  and requires the draft to equal it exactly: `managed` is every enabled
+  package declared an npm global there with its required `node_switch`
+  hooks, `carry` is managed ∩ installed at the recorded versions, and
+  `hooks` is, in carry order, every argv the configuration declares under
+  top-level `node_switch_hooks` for the carried packages (for example
+  `"npm:@bitkyc08/opencodex": [["ocx", "service"]]`), which must include
+  every required one. An empty or partial carry, a misstated managed set, a
+  target without desired state in the store, and any hold are refused, and
+  verify-preconditions re-derives and compares again at apply.
   The executor proves each hook bin under the current prefix, then runs
   `fnm install`, `fnm default`, one exact `npm install --global a@x b@y …`
   under the new node, verifies every carried version, and runs each hook by
@@ -217,14 +224,20 @@ only restores it after a drift (a host that must drop a fleet pin sets
 switches only when the default is outside the major or is not the pin. A
 switch carries every enabled package of the fold that resolves to npm and is
 installed under the current default, at its installed version (it never adds
-a package), then runs post-switch hooks. An enabled package declared as an npm
-global that does not resolve to npm here (a malformed name, `update:` or
-`node_switch:`) holds the switch instead of being left behind; one with no
-`npm:` entry or `npm: unavailable` is not carried and does not hold it. A
+a package), then runs post-switch hooks. One rule governs every lane: a
+switch proceeds only when the complete set of managed npm globals is known
+with certainty and fully carried with all required hooks, and anything
+uncertain holds it, naming the item: a managed package or its definition
+held this run (signature, review, canary, apply), an npm-declared package
+that does not resolve to npm, a global `applied/` recorded for a package
+that is still installed but would not be carried, or an undeclared required
+hook. A package with no `npm:` entry, `npm: unavailable` or desired
+`disabled` is not managed and never holds it. A
 switch that fails and cannot confirm the old default restored reports the
 default as unverified, alerts `node-runtime-unverified`, and skips only the
 npm globals in that full pass. `fleet-seed` never seeds `packages.node` or
-`runtimes.node` from the runtime record. A definition may require hooks with
+`runtimes.node` from the runtime record, nor a package from an `npm:*`
+record (npm manages only through an `npm:` definition). A definition may require hooks with
 `node_switch:` on its npm entry (`opencodex: {npm: {name:
 "@bitkyc08/opencodex", update: [ocx, update], node_switch: [[ocx,
 service]]}}`), but only this host's `config.json` `node_switch_hooks`

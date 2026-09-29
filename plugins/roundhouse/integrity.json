@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/apply-commands.sh",
-      "sha256": "58198b3c6cd5d29db9e410d43effe547d1d8e85aaaa7e990dd3578ed90eea9f8"
+      "sha256": "bfffab7bf0a0a162998e599150f407a7c2cd2adf682cd7dd19b600e2f6fd11dc"
     },
     {
       "path": "scripts/lib/broker-posix.sh",
@@ -126,7 +126,7 @@
     },
     {
       "path": "scripts/lib/fleet-records.sh",
-      "sha256": "977781ff7acd3565aef48edfd671a834f6299999abe4fcceec35ebf065af7c74"
+      "sha256": "deb452533a96e6b4e19e3e94c419a79a1518dc44c52bf6daaf15b5c2362c5fcf"
     },
     {
       "path": "scripts/lib/fleet-resolve.sh",
@@ -134,7 +134,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "75958f774431ec4d4cae2da1fbd01b1d47b969e23fcfade240dd6b3a84949fe0"
+      "sha256": "aefa1a945d8d5ead0ffafe1b7324cbf3873722aa4bbbeb0d63d5b8e299799a04"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -182,11 +182,11 @@
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "b5af8b7d6ea0f345723391fdd0a71b34aa570a3b635203123cf5d0fe0149f95d"
+      "sha256": "49662aed67d273befb037b18e9b4c29181ff679285cd37273f55bafdc65abe50"
     },
     {
       "path": "scripts/lib/plan-verify.sh",
-      "sha256": "27812f6df069ae4ede9e5b93080fdbef79f0810151b9e401ae9a3da6fdf53438"
+      "sha256": "04a6fdc810964d6a408a6f36fcee7314955544534e42b717c062e85cef39970e"
     },
     {
       "path": "scripts/mcp-siding-windows.ps1",
@@ -286,7 +286,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "ffc4590e46b17c0af58095e77f66cd9c15291261d5b4ac76ddebe21ac60e5050"
+      "sha256": "b0a3d3953de0f1f323f3823d8d57dc7e9084c475eb4231613bcbf6b8fd3e0d92"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",
