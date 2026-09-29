@@ -9,7 +9,8 @@
         "development"
       ],
       "package_managers": [
-        "homebrew"
+        "homebrew",
+        "npm"
       ],
       "dev_root": "~/dev"
     },
@@ -82,6 +83,12 @@
       "wsl_interop_via": "<name-of-the-wsl-machine-on-the-same-host>",
       "physical_host": "<shared-hardware-name>"
     }
+  },
+  "package_updaters": {
+    "npm:@example/cli": [
+      "example-cli",
+      "update"
+    ]
   },
   "projects": {
     "example": {

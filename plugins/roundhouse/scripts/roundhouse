@@ -111,6 +111,8 @@ EOF
 . "$script_dir/lib/fleet-store.sh"
 # shellcheck source=lib/fleet-init.sh
 . "$script_dir/lib/fleet-init.sh"
+# shellcheck source=lib/npm.sh
+. "$script_dir/lib/npm.sh"
 # shellcheck source=lib/fleet-fold.sh
 . "$script_dir/lib/fleet-fold.sh"
 # shellcheck source=lib/fleet-records.sh

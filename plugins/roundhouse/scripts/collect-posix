@@ -8,6 +8,11 @@ snapshot_id=${3:?snapshot id required}
 sections=${4:-all}
 observed_at=${ROUNDHOUSE_OBSERVED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
 
+# The npm manager's durable-path resolution is shared with the executor and
+# the desired-state run, so all three agree on which Node owns the globals.
+# shellcheck source=lib/npm.sh
+. "$script_dir/lib/npm.sh"
+
 has_section() {
   [ "$sections" = all ] || case ",$sections," in *",$1,"*) return 0 ;; *) return 1 ;; esac
 }
@@ -2040,6 +2045,80 @@ if has_section packages; then
         else
           emit error packages:apt unavailable high '{}' '[]' \
             '[{"code":"manager_missing","severity":"warning","retryable":false,"message":"dpkg-query is not installed"}]'
+        fi
+        ;;
+      npm)
+        # Global scope only. The durable npm (lib/npm.sh) decides which Node
+        # owns the globals, and the record carries that prefix and Node
+        # version: under fnm a Node upgrade moves every global to a new
+        # prefix, so a plan sealed against the old one must not verify.
+        if npm_bin=$(npm_global_bin_dir); then
+          npm_node_version=$(PATH="$npm_bin:$PATH" "$npm_bin/node" --version 2>/dev/null </dev/null |
+            head -1 | clip) || npm_node_version=
+          npm_prefix=$(npm_global_prefix | clip) || npm_prefix=
+          npm_candidates=null
+          npm_candidate_confidence=high
+          if npm_outdated=$(npm_global_outdated); then
+            npm_candidates=$npm_outdated
+          else
+            npm_candidate_confidence=medium
+            emit error packages:npm-updates unavailable high '{}' '[]' \
+              '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"npm outdated inventory failed"}]'
+          fi
+          if npm_installed=$(npm_global_list); then
+            # A configured updater is reported only once it is proven to be
+            # a bin of the installed package itself; the executor re-proves
+            # it before running anything. An unproven one is marked on the
+            # package record rather than failing the whole inventory, and
+            # sealing refuses it.
+            npm_updaters='{}'
+            npm_unproven='{}'
+            while IFS= read -r npm_updater_entry; do
+              [ -n "$npm_updater_entry" ] || continue
+              npm_updater_name=$(printf '%s\n' "$npm_updater_entry" | jq -r '.key | sub("^npm:"; "")')
+              npm_updater_bin=$(printf '%s\n' "$npm_updater_entry" | jq -r '.value[0]')
+              printf '%s\n' "$npm_installed" | jq -e --arg name "$npm_updater_name" 'has($name)' \
+                >/dev/null || continue
+              if npm_updater_path "$npm_updater_name" "$npm_updater_bin" >/dev/null 2>&1; then
+                npm_updaters=$(printf '%s\n' "$npm_updaters" |
+                  jq -c --argjson entry "$npm_updater_entry" '. + {($entry.key): $entry.value}')
+              else
+                npm_unproven=$(printf '%s\n' "$npm_unproven" |
+                  jq -c --argjson entry "$npm_updater_entry" '. + {($entry.key): true}')
+              fi
+            done <<NPM_UPDATERS
+$(jq -c '(.package_updaters // {}) | to_entries[]' "$config")
+NPM_UPDATERS
+            printf '%s\n' "$npm_installed" | jq -c \
+              --arg schema roundhouse.inventory --argjson schema_version 1 \
+              --arg snapshot_id "$snapshot_id" --arg host_id "$host_id" \
+              --arg observed_at "$observed_at" --argjson candidates "$npm_candidates" \
+              --argjson updaters "$npm_updaters" --argjson unproven "$npm_unproven" \
+              --arg confidence "$npm_candidate_confidence" \
+              --arg prefix "$npm_prefix" --arg node_version "$npm_node_version" '
+                to_entries[] | (.key[0:8192]) as $name | (.value[0:8192]) as $version |
+                (if $candidates == null then null
+                 else (($candidates[$name] // null) | if . == null then null else .[0:8192] end) end) as $candidate |
+                {schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
+                  host_id:$host_id,kind:"package",id:(("npm:"+$name)[0:8192]),
+                  observed_at:$observed_at,status:"present",confidence:$confidence,
+                  data:{manager:"npm",name:$name,installed_version:$version,
+                    candidate_version:$candidate,
+                    update_available:(if $candidates == null then null
+                      else ($candidate != null and $candidate != $version) end),
+                    scope:"global",prefix:(if $prefix == "" then null else $prefix end),
+                    node_version:(if $node_version == "" then null else $node_version end),
+                    updater:($updaters["npm:"+$name] // null),
+                    updater_status:(if $updaters["npm:"+$name] != null then "proven"
+                      elif $unproven["npm:"+$name] == true then "unproven" else null end)},
+                  evidence:[{source:"package-manager",method:"npm-ls-global+outdated"}],errors:[]}'
+          else
+            emit error packages:npm unavailable high '{}' '[]' \
+              '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"npm global inventory failed"}]'
+          fi
+        else
+          emit error packages:npm unavailable high '{}' '[]' \
+            '[{"code":"manager_missing","severity":"warning","retryable":false,"message":"no durable npm (fnm default alias, PATH outside fnm_multishells, or a fixed Homebrew/system prefix)"}]'
         fi
         ;;
     esac

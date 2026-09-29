@@ -1628,8 +1628,21 @@ function Assert-WorkerConfig([object]$Value) {
     if (@($ConfiguredMachine.groups | Where-Object { $_ -notmatch '^[A-Za-z0-9._-]+$' }).Count -gt 0) {
         throw "Invalid machine group"
     }
-    if (@($ConfiguredMachine.package_managers | Where-Object { $_ -ne "winget" }).Count -gt 0) {
+    if (@($ConfiguredMachine.package_managers | Where-Object { $_ -cnotin @("winget", "npm") }).Count -gt 0) {
         throw "Invalid Windows package manager"
+    }
+    if ($null -ne $Value.package_updaters) {
+        foreach ($Property in $Value.package_updaters.PSObject.Properties) {
+            $UpdaterArgv = @($Property.Value)
+            if ($Property.Name -cnotmatch '^npm:(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$' -or
+                $UpdaterArgv.Count -lt 1 -or $UpdaterArgv.Count -gt 8 -or
+                [string]$UpdaterArgv[0] -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' -or
+                @($UpdaterArgv | Select-Object -Skip 1 | Where-Object {
+                    $_ -isnot [string] -or $_.Length -gt 128 -or $_ -cnotmatch '^[A-Za-z0-9@=:,._/+-]+$'
+                }).Count -gt 0) {
+                throw "Invalid package updater configuration"
+            }
+        }
     }
     if ($null -ne $ConfiguredMachine.privilege_broker) {
         $UnknownBrokerFields = @($ConfiguredMachine.privilege_broker.PSObject.Properties.Name |
@@ -2073,8 +2086,76 @@ function Get-WingetUpgradeCandidates([string[]]$Lines, [object]$Export) {
     return $Candidates
 }
 
+# npm, global scope. Windows Node comes from winget (OpenJS.NodeJS) and its
+# global prefix (%APPDATA%\npm) survives Node upgrades, so PATH resolution is
+# durable here; an fnm per-shell path is still refused, as on POSIX.
+function Get-NpmCommand {
+    $Npm = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $Npm -or [string]$Npm.Source -match 'fnm_multishells') { return $null }
+    return $Npm
+}
+
+function Resolve-NpmNode([string]$NpmPath) {
+    # The node the selected npm actually runs: npm.cmd prefers the node.exe
+    # beside itself and only then falls back to PATH. Querying PATH on its own
+    # could record a different installation, and node_version is a sealed
+    # precondition.
+    $Sibling = Join-Path (Split-Path -Parent $NpmPath) "node.exe"
+    if (Test-Path -LiteralPath $Sibling -PathType Leaf) { return $Sibling }
+    $OnPath = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $OnPath) { return [string]$OnPath.Source }
+    return $null
+}
+
+function Invoke-NpmNodeSelfTest {
+    $Root = Join-Path ([IO.Path]::GetTempPath()) ("rh-npmnode-" + [guid]::NewGuid())
+    try {
+        $NpmDir = Join-Path $Root "npm-home"
+        New-Item -ItemType Directory -Path $NpmDir -Force | Out-Null
+        $NpmCmd = Join-Path $NpmDir "npm.cmd"
+        Set-Content -LiteralPath $NpmCmd -Value "@echo off"
+        $Sibling = Join-Path $NpmDir "node.exe"
+        Set-Content -LiteralPath $Sibling -Value ""
+        if ((Resolve-NpmNode $NpmCmd) -ne $Sibling) { throw "self_test_npm_node_not_sibling" }
+        Remove-Item -LiteralPath $Sibling -Force
+        if ((Resolve-NpmNode $NpmCmd) -eq $Sibling) { throw "self_test_npm_node_missing_sibling_returned" }
+    } finally {
+        Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-NpmText([string]$Npm, [string[]]$Arguments) {
+    $Lines = @(& $Npm @Arguments 2>$null)
+    return (($Lines | ForEach-Object { [string]$_ }) -join "`n").Trim()
+}
+
+function Get-NpmPackageBins([string]$Npm, [string]$Name) {
+    $Root = Invoke-NpmText $Npm @("root", "--global")
+    if ([string]::IsNullOrWhiteSpace($Root)) { return @() }
+    $Manifest = Join-Path (Join-Path $Root $Name) "package.json"
+    if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { return @() }
+    try { $Package = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json } catch { return @() }
+    if ($Package.bin -is [string]) { return @(($Name -split '/')[-1]) }
+    if ($null -ne $Package.bin) { return @($Package.bin.PSObject.Properties.Name) }
+    return @()
+}
+
+function Get-NpmUpdaterPath([string]$Npm, [string]$Name, [string]$Bin) {
+    # The updater is honoured only as a bin the installed package declares,
+    # found in the global prefix npm itself reports.
+    if (@(Get-NpmPackageBins $Npm $Name) -cnotcontains $Bin) { return $null }
+    $Prefix = Invoke-NpmText $Npm @("prefix", "--global")
+    if ([string]::IsNullOrWhiteSpace($Prefix)) { return $null }
+    foreach ($Candidate in @((Join-Path $Prefix "$Bin.cmd"), (Join-Path $Prefix "$Bin.exe"),
+        (Join-Path (Join-Path $Prefix "bin") $Bin))) {
+        if (Test-Path -LiteralPath $Candidate -PathType Leaf) { return $Candidate }
+    }
+    return $null
+}
+
 if ($SelfTest) {
     Invoke-WindowsSftpReceiptSelfTest
+    Invoke-NpmNodeSelfTest
     exit 0
 }
 
@@ -2186,6 +2267,95 @@ if (Test-Section "packages") {
             } finally {
                 Remove-Item -LiteralPath $Temp -Force -ErrorAction SilentlyContinue
             }
+        }
+    }
+}
+
+if ((Test-Section "packages") -and (@($Machine.package_managers) -contains "npm")) {
+    $Npm = Get-NpmCommand
+    if ($null -eq $Npm) {
+        Add-Record -Kind "error" -Id "packages:npm" -Status "unavailable" -Confidence "high" -Errors @(
+            @{ code = "manager_missing"; severity = "warning"; retryable = $false; message = "npm is not installed" }
+        )
+    } else {
+        $NpmPath = [string]$Npm.Source
+        $NodePath = Resolve-NpmNode $NpmPath
+        $NodeVersion = if ($null -ne $NodePath) { Limit-Text (Invoke-NpmText $NodePath @("--version")) } else { $null }
+        $NpmPrefix = Limit-Text (Invoke-NpmText $NpmPath @("prefix", "--global"))
+        if ([string]::IsNullOrWhiteSpace($NpmPrefix)) { $NpmPrefix = $null }
+        $NpmCandidates = $null
+        try {
+            $OutdatedText = Invoke-NpmText $NpmPath @("outdated", "--global", "--json")
+            # npm prints {} itself when nothing is outdated; empty output is a
+            # failed query, never "all current".
+            if ([string]::IsNullOrWhiteSpace($OutdatedText)) { throw "npm outdated returned nothing" }
+            $Outdated = $OutdatedText | ConvertFrom-Json
+            if ($null -eq $Outdated -or $null -ne $Outdated.PSObject.Properties["error"]) { throw "npm outdated failed" }
+            $NpmCandidates = @{}
+            foreach ($Property in $Outdated.PSObject.Properties) {
+                if ($Property.Value.latest -is [string] -and $Property.Value.current -is [string]) {
+                    $NpmCandidates[[string]$Property.Name] = [string]$Property.Value.latest
+                }
+            }
+        } catch {
+            $NpmCandidates = $null
+            Add-Record -Kind "error" -Id "packages:npm-updates" -Status "unavailable" -Confidence "high" -Errors @(
+                @{ code = "candidate_query_failed"; severity = "warning"; retryable = $true; message = "npm outdated inventory failed" }
+            )
+        }
+        try {
+            $List = (Invoke-NpmText $NpmPath @("ls", "--global", "--json", "--depth=0")) | ConvertFrom-Json
+            # A fatal npm ls prints only an `error` object: a failed query, not
+            # an empty global tree.
+            if ($null -eq $List -or $null -ne $List.PSObject.Properties["error"]) { throw "npm ls failed" }
+            $Installed = @{}
+            if ($null -ne $List.dependencies) {
+                foreach ($Property in $List.dependencies.PSObject.Properties) {
+                    if ($Property.Value.version -is [string]) {
+                        $Installed[[string]$Property.Name] = [string]$Property.Value.version
+                    }
+                }
+            }
+            $Updaters = @{}
+            $Unproven = @{}
+            if ($null -ne $Config.package_updaters) {
+                foreach ($Property in $Config.package_updaters.PSObject.Properties) {
+                    $UpdaterName = ([string]$Property.Name).Substring(4)
+                    if (-not $Installed.ContainsKey($UpdaterName)) { continue }
+                    $UpdaterArgv = [string[]]@($Property.Value)
+                    if ($null -ne (Get-NpmUpdaterPath $NpmPath $UpdaterName $UpdaterArgv[0])) {
+                        $Updaters[[string]$Property.Name] = $UpdaterArgv
+                    } else {
+                        $Unproven[[string]$Property.Name] = $true
+                    }
+                }
+            }
+            foreach ($Name in @($Installed.Keys | Sort-Object)) {
+                $Version = Limit-Text $Installed[$Name]
+                $Candidate = if ($null -ne $NpmCandidates -and $NpmCandidates.ContainsKey($Name)) {
+                    Limit-Text $NpmCandidates[$Name]
+                } else { $null }
+                Add-Record -Kind "package" -Id ("npm:" + (Limit-Text $Name)) -Status "present" `
+                    -Confidence $(if ($null -ne $NpmCandidates) { "high" } else { "medium" }) -Data @{
+                    manager = "npm"
+                    name = Limit-Text $Name
+                    installed_version = $Version
+                    candidate_version = $Candidate
+                    update_available = if ($null -ne $NpmCandidates) {
+                        $null -ne $Candidate -and $Candidate -ne $Version
+                    } else { $null }
+                    scope = "global"
+                    prefix = $NpmPrefix
+                    node_version = $NodeVersion
+                    updater = $(if ($Updaters.ContainsKey("npm:" + $Name)) { $Updaters["npm:" + $Name] } else { $null })
+                    updater_status = $(if ($Updaters.ContainsKey("npm:" + $Name)) { "proven" }
+                        elseif ($Unproven.ContainsKey("npm:" + $Name)) { "unproven" } else { $null })
+                } -Evidence @(@{ source = "package-manager"; method = "npm-ls-global+outdated" })
+            }
+        } catch {
+            Add-Record -Kind "error" -Id "packages:npm" -Status "error" -Confidence "high" -Errors @(
+                @{ code = "manager_query_failed"; severity = "error"; retryable = $true; message = "npm global inventory failed" }
+            )
         }
     }
 }
