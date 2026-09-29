@@ -1200,6 +1200,19 @@ JSONC
     # package is held as unprovidable on a host whose manager provides it.
     [ "$(yq -r '(.package_managers // []) | join(",")' "$run_seeded")" = apt ] ||
       fail "seeding did not take package_managers from config.json — every package would be held"
+    # The run reads the fold from the PUBLISHED tree, so a fact seeded this run
+    # only lands next run. Until then the host's own config answers; a fold
+    # that states the fact — even as [] — still wins.
+    [ "$(ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      fleet_run_package_managers '{"packages":{}}' "$run_seed_host")" = apt ] ||
+      fail "a fold without package_managers did not fall back to config.json on the first run"
+    [ "$(ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      fleet_run_package_managers '{"package_managers":["homebrew","winget"]}' \
+      "$run_seed_host")" = "homebrew winget" ] ||
+      fail "the fold's own package_managers did not win over config.json"
+    [ -z "$(ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      fleet_run_package_managers '{"package_managers":[]}' "$run_seed_host")" ] ||
+      fail "an explicit empty package_managers in the fold was overridden by config.json"
     yq -e '.plugins.ponytail != null' "$run_seeded" >/dev/null ||
       fail "seeding the facts cost the observed surfaces"
     # A fact already in the host file WINS: someone wrote it deliberately and

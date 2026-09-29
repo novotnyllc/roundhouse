@@ -1109,6 +1109,23 @@ EOF
       "$skill_lock" >/dev/null 2>&1 || return 75
 )
 
+fleet_run_package_managers() {
+  # `fleet_run_package_managers FOLD HOST` — the host's managers, in order, as
+  # one space-separated line. The fold wins when it states the fact at all
+  # (PRESENCE, so an explicit `[]` stays empty). A fold without the key falls
+  # back to this host's own config.json — the same source fleet-seed copies
+  # from — because the fold is read from the published tree, and a fact the
+  # full pass seeds into the working copy only reaches it on the NEXT run.
+  # Without the fallback, the first run after upgrading still held every
+  # package as unprovidable.
+  if printf '%s\n' "$1" | jq -e 'has("package_managers")' >/dev/null 2>&1; then
+    printf '%s\n' "$1" | jq -r '(.package_managers // []) | join(" ")'
+  else
+    jq -r --arg host "$2" '(.machines[$host].package_managers // []) | join(" ")' \
+      "$(config_path)" 2>/dev/null || :
+  fi
+}
+
 fleet_run_apply_item() {
   # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
@@ -1960,8 +1977,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fleet_run_verdict_write "$run_item" "$run_digest" "$run_reason"
     run_status=0
     fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
-      "$run_value" "$(printf '%s\n' "$run_fold" |
-        jq -r '(.package_managers // []) | join(" ")')" || run_status=$?
+      "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" ||
+      run_status=$?
     case $run_status in
       0)
         # An unwritable applied/<h>.yaml is loud and narrow, never fatal: the
@@ -2440,7 +2457,7 @@ fleet_run_full_pass() (
       ! fleet_package_pinned "$full_defs" "$full_package" || continue
       # shellcheck disable=SC2046,SC2086 # the host's package_managers, in order
       full_resolved=$(fleet_resolve_package "$full_defs" "$full_package" \
-        $(printf '%s\n' "$full_fold" | jq -r '(.package_managers // []) | join(" ")')) || :
+        $(fleet_run_package_managers "$full_fold" "$full_host")) || :
       [ "$(printf '%s\n' "$full_resolved" | jq -r '.resolved')" = true ] || continue
       # `</dev/null` on each: this loop is fed by a pipeline, so its stdin is
       # the package list and a greedy manager would eat the rest of it.
@@ -2929,8 +2946,8 @@ fleet_apply_command() (
   fleet_run_apply_item "$apply_store" "$apply_host" \
     "$(fleet_definitions_load "$apply_store")" "$apply_item" \
     "$(fleet_item_value "$apply_fold" "$apply_item")" \
-    "$(printf '%s\n' "$apply_fold" |
-      jq -r '(.package_managers // []) | join(" ")')" || apply_status=$?
+    "$(fleet_run_package_managers "$apply_fold" "$apply_host")" ||
+    apply_status=$?
   apply_now=$(fleet_now)
   case $apply_status in
     0)
