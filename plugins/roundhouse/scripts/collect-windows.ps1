@@ -2095,6 +2095,35 @@ function Get-NpmCommand {
     return $Npm
 }
 
+function Resolve-NpmNode([string]$NpmPath) {
+    # The node the selected npm actually runs: npm.cmd prefers the node.exe
+    # beside itself and only then falls back to PATH. Querying PATH on its own
+    # could record a different installation, and node_version is a sealed
+    # precondition.
+    $Sibling = Join-Path (Split-Path -Parent $NpmPath) "node.exe"
+    if (Test-Path -LiteralPath $Sibling -PathType Leaf) { return $Sibling }
+    $OnPath = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $OnPath) { return [string]$OnPath.Source }
+    return $null
+}
+
+function Invoke-NpmNodeSelfTest {
+    $Root = Join-Path ([IO.Path]::GetTempPath()) ("rh-npmnode-" + [guid]::NewGuid())
+    try {
+        $NpmDir = Join-Path $Root "npm-home"
+        New-Item -ItemType Directory -Path $NpmDir -Force | Out-Null
+        $NpmCmd = Join-Path $NpmDir "npm.cmd"
+        Set-Content -LiteralPath $NpmCmd -Value "@echo off"
+        $Sibling = Join-Path $NpmDir "node.exe"
+        Set-Content -LiteralPath $Sibling -Value ""
+        if ((Resolve-NpmNode $NpmCmd) -ne $Sibling) { throw "self_test_npm_node_not_sibling" }
+        Remove-Item -LiteralPath $Sibling -Force
+        if ((Resolve-NpmNode $NpmCmd) -eq $Sibling) { throw "self_test_npm_node_missing_sibling_returned" }
+    } finally {
+        Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-NpmText([string]$Npm, [string[]]$Arguments) {
     $Lines = @(& $Npm @Arguments 2>$null)
     return (($Lines | ForEach-Object { [string]$_ }) -join "`n").Trim()
@@ -2126,6 +2155,7 @@ function Get-NpmUpdaterPath([string]$Npm, [string]$Name, [string]$Bin) {
 
 if ($SelfTest) {
     Invoke-WindowsSftpReceiptSelfTest
+    Invoke-NpmNodeSelfTest
     exit 0
 }
 
@@ -2249,8 +2279,8 @@ if ((Test-Section "packages") -and (@($Machine.package_managers) -contains "npm"
         )
     } else {
         $NpmPath = [string]$Npm.Source
-        $Node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        $NodeVersion = if ($null -ne $Node) { Limit-Text (Invoke-NpmText ([string]$Node.Source) @("--version")) } else { $null }
+        $NodePath = Resolve-NpmNode $NpmPath
+        $NodeVersion = if ($null -ne $NodePath) { Limit-Text (Invoke-NpmText $NodePath @("--version")) } else { $null }
         $NpmPrefix = Limit-Text (Invoke-NpmText $NpmPath @("prefix", "--global"))
         if ([string]::IsNullOrWhiteSpace($NpmPrefix)) { $NpmPrefix = $null }
         $NpmCandidates = $null

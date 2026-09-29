@@ -62,7 +62,7 @@
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "678b18b3ec49a30d5d62184a9c85d8bf6b88cc0dd1fcd18070ce644437022f7f"
+      "sha256": "52e492731890e5f7575c18cfd7c583f0a6789235139eb1dfc984a5d982a94702"
     },
     {
       "path": "scripts/enroll-privilege-posix",
