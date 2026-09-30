@@ -272,7 +272,13 @@ evidence. The worker recaptures its own trusted preflight. If an operation or
 postcondition fails, it stops the remaining operations and returns an
 authoritative partial result with fresh post-inventory whenever collection is
 still possible; validate and preserve that evidence even though the task
-failed.
+failed. The failed operation record carries `data.output_tail`: at most 20
+lines, each at most 240 characters, from the failing command's own merged
+output (or, for a failed chezmoi drift postcondition, apply's output and then
+the remaining `chezmoi status` lines), with ANSI styling, progress redraws and
+CLIXML progress stripped and every secret-shaped line replaced whole. The same
+tail, bounded to 2560 characters, ends that record's error message and the
+worker's single final stderr line. It is diagnostic text, never evidence.
 
 Codex remote control is an ordinary, interactive schema-2 lane only.
 `apply-windows.ps1` rejects semantic actions and every protected broker field,
