@@ -22,7 +22,7 @@
     },
     {
       "path": "references/codex-remote-control.md",
-      "sha256": "c0c96ea9fffd7bc7d8775c95e89118bae117c8157c1e0a948cd661e4e96476ec"
+      "sha256": "07626ebcfd1bfe5d82517c70d8e32a1983ae6f0409d9562da0a2104fe5f7222a"
     },
     {
       "path": "references/privilege-policy.default",
@@ -42,7 +42,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "f73d21cbac12b8858e9c7ad156edd23b5305675b869648110264fc21799e624b"
+      "sha256": "cd06e3f70770b046ef984b8dd9f9c8c5b1be64a96de875010d8bda936e0880de"
     },
     {
       "path": "scripts/certify-ssh-node",

@@ -831,29 +831,37 @@ function Invoke-WithNpmOnPath([string]$NpmSource, [scriptblock]$Body) {
 # explanation of why it failed, so the worker keeps a bounded, sanitized tail
 # of it: at most $OutputTailLines lines of at most $OutputTailLineLength
 # characters, ANSI styling, carriage-return progress redraws, spinner rows and
-# PowerShell CLIXML progress stripped, and any line matching a secret class
+# PowerShell CLIXML progress stripped. Redaction is a best-effort filter:
+# every line inside a PEM block, every line matching a known secret pattern,
+# and both lines of any adjacent pair whose joined text matches one, are
 # replaced whole. Nothing else is ever captured: no environment, no argv
 # beyond the sealed command name, and never the output of a command that
 # succeeded unless a later postcondition on that same operation fails.
 $OutputTailLines = 20
 $OutputTailLineLength = 240
 $OutputTailMessageLength = 2560
-$OutputTailRawLength = 1048576
+# CLIXML carries many records on one line and is scanned by one linear regex;
+# every other line is cut before the per-line expressions run.
+$OutputTailClixmlLength = 1048576
+$OutputTailRawLineLength = 65536
 $OutputTailRedacted = "[redacted: line matched a secret pattern]"
+$FailureMessageRedacted = "[redacted: message matched a secret pattern]"
 $script:LastOutputTail = [string[]]@()
 
 function Test-SecretLikeText([string]$Text) {
     # The same named classes and entropy floor as the replicated-record
     # redaction floor (lib/fleet-store.sh fleet_quote_is_secret), plus
-    # credential-shaped assignments, since tool output may echo a rendered
-    # configuration line.
-    if ($Text.Contains("-----BEGIN")) { return $true }
+    # credential-shaped assignments and URLs, since tool output may echo a
+    # rendered configuration line or a Git remote.
+    if ($Text.Length -gt $OutputTailRawLineLength) { $Text = $Text.Substring(0, $OutputTailRawLineLength) }
+    if ($Text.Contains("-----BEGIN") -or $Text.Contains("-----END")) { return $true }
     if ($Text -cmatch "eyJ[A-Za-z0-9_=-]*\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*") { return $true }
     if ($Text -cmatch "(^|[^A-Za-z0-9_-])(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_-]{8,}") {
         return $true
     }
     if ($Text -cmatch "(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9]{16,}") { return $true }
     if ($Text -cmatch "(^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}") { return $true }
+    if ($Text -match "(?i)[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@") { return $true }
     if ($Text -match "(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}") { return $true }
     if ($Text -match "(?i)(pass(word|wd)?|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|auth(orization)?)s?[""']?\s*[:=]\s*[""']?[^\s""']{4,}") {
         return $true
@@ -889,19 +897,23 @@ function ConvertFrom-ClixmlText([string]$Text) {
     return [string[]]$Lines.ToArray()
 }
 
-function ConvertTo-SafeOutputLines([object]$Item) {
+function ConvertTo-CleanOutputLines([object]$Item) {
+    # Strips styling and progress noise; redaction happens in the tail, which
+    # sees neighbouring lines.
     if ($null -eq $Item) { return [string[]]@() }
     $Text = [string]$Item
-    if ($Text.Length -gt $OutputTailRawLength) { $Text = $Text.Substring($Text.Length - $OutputTailRawLength) }
     if ($Text -match "^\s*#<\s*CLIXML\s*$") { return [string[]]@() }
     $Candidates = if ($Text.Contains("<Objs ") -or $Text -match '^\s*<Obj[ >]') {
+        if ($Text.Length -gt $OutputTailClixmlLength) { $Text = $Text.Substring(0, $OutputTailClixmlLength) }
         @(ConvertFrom-ClixmlText $Text)
     } else {
+        if ($Text.Length -gt $OutputTailRawLineLength) { $Text = $Text.Substring(0, $OutputTailRawLineLength) }
         @($Text -split "\n")
     }
-    $Safe = New-Object System.Collections.Generic.List[string]
+    $Clean = New-Object System.Collections.Generic.List[string]
     foreach ($Candidate in $Candidates) {
         $Line = [string]$Candidate
+        if ($Line.Length -gt $OutputTailRawLineLength) { $Line = $Line.Substring(0, $OutputTailRawLineLength) }
         # ANSI CSI and OSC sequences, then any other two-byte escape.
         $Line = $Line -replace "\x1b\[[0-?]*[ -/]*[@-~]", ""
         $Line = $Line -replace "\x1b\][^\x07\x1b]*(\x07|\x1b\\)?", ""
@@ -913,32 +925,93 @@ function ConvertTo-SafeOutputLines([object]$Item) {
         # error-record indentation.
         $Line = ($Line -replace "[\x00-\x1f\x7f-\x9f]", " ").TrimEnd()
         if ([string]::IsNullOrWhiteSpace($Line)) { continue }
-        # Spinner and progress-bar rows carry no diagnostic text.
-        if ($Line -match "^[\-\\|/\s▀-▟■-◿]+$" -or
-            $Line -match "^[\s▀-▟■-◿]+\s*[\d.]+\s*(%|[KMGT]?i?B\s*/\s*[\d.]+\s*[KMGT]?i?B)\s*$") {
+        # Spinner and progress-bar rows (block elements and geometric
+        # shapes) carry no diagnostic text.
+        if ($Line -match '^[\-\\|/\s\u2580-\u259F\u25A0-\u25FF]+$' -or
+            $Line -match '^[\s\u2580-\u259F\u25A0-\u25FF]+\s*[\d.]+\s*(%|[KMGT]?i?B\s*/\s*[\d.]+\s*[KMGT]?i?B)\s*$') {
             continue
         }
-        if (Test-SecretLikeText $Line) {
+        $Clean.Add($Line)
+    }
+    return [string[]]$Clean.ToArray()
+}
+
+function New-OutputTail {
+    return @{
+        Entries = [System.Collections.Generic.Queue[object]]::new()
+        InPem = $false
+        Previous = $null
+    }
+}
+
+function Add-OutputTailLine([hashtable]$Tail, [object]$Item) {
+    foreach ($Line in @(ConvertTo-CleanOutputLines $Item)) {
+        $Entry = @{ Text = $Line; Redacted = $false }
+        if ($Tail.InPem) {
+            # Everything from BEGIN through END, or to the end of the tail
+            # when the block never terminates.
+            $Entry.Redacted = $true
+            if ($Line.Contains("-----END")) { $Tail.InPem = $false }
+        } elseif ($Line.Contains("-----BEGIN")) {
+            $Entry.Redacted = $true
+            $Tail.InPem = $Line.LastIndexOf("-----END") -lt $Line.LastIndexOf("-----BEGIN")
+        } elseif (Test-SecretLikeText $Line) {
+            $Entry.Redacted = $true
+        }
+        # A secret wrapped across two lines: judge each adjacent pair whole,
+        # both unseparated (a split token) and space-joined (a split
+        # assignment), as lib/fleet-store.sh joins lines before its check.
+        # When one side already matched on its own, the other is redacted
+        # only if it is a bare fragment (no inner space) that the unseparated
+        # join still flags, so one secret line never hides the error beside it.
+        $Previous = $Tail.Previous
+        if ($null -ne $Previous -and -not ($Previous.Redacted -and $Entry.Redacted)) {
+            $Left = [string]$Previous.Text
+            if ($Left.Length -gt 4096) { $Left = $Left.Substring($Left.Length - 4096) }
+            $Right = $Line
+            if ($Right.Length -gt 4096) { $Right = $Right.Substring(0, 4096) }
+            $Tight = $Left.TrimEnd() + $Right.TrimStart()
+            if (-not $Previous.Redacted -and -not $Entry.Redacted) {
+                if ((Test-SecretLikeText $Tight) -or (Test-SecretLikeText ($Left + " " + $Right))) {
+                    $Previous.Redacted = $true
+                    $Entry.Redacted = $true
+                }
+            } else {
+                $Unredacted = if ($Previous.Redacted) { $Entry } else { $Previous }
+                if (([string]$Unredacted.Text).Trim() -match '^\S+$' -and (Test-SecretLikeText $Tight)) {
+                    $Unredacted.Redacted = $true
+                }
+            }
+        }
+        $Tail.Previous = $Entry
+        $Tail.Entries.Enqueue($Entry)
+        while ($Tail.Entries.Count -gt $OutputTailLines) { [void]$Tail.Entries.Dequeue() }
+    }
+}
+
+function Get-OutputTailLines([hashtable]$Tail) {
+    $Lines = New-Object System.Collections.Generic.List[string]
+    foreach ($Entry in $Tail.Entries) {
+        $Line = [string]$Entry.Text
+        if ($Entry.Redacted) {
             $Line = $OutputTailRedacted
         } elseif ($Line.Length -gt $OutputTailLineLength) {
             $Line = $Line.Substring(0, $OutputTailLineLength - 3) + "..."
         }
-        $Safe.Add($Line)
+        $Lines.Add($Line)
     }
-    return [string[]]$Safe.ToArray()
-}
-
-function Add-OutputTailLine([System.Collections.Generic.Queue[string]]$Tail, [object]$Item) {
-    foreach ($Line in @(ConvertTo-SafeOutputLines $Item)) {
-        $Tail.Enqueue($Line)
-        while ($Tail.Count -gt $OutputTailLines) { [void]$Tail.Dequeue() }
-    }
+    return [string[]]$Lines.ToArray()
 }
 
 function Get-OutputTail([object[]]$Items) {
-    $Tail = [System.Collections.Generic.Queue[string]]::new()
+    $Tail = New-OutputTail
     foreach ($Item in @($Items)) { Add-OutputTailLine $Tail $Item }
-    return [string[]]$Tail.ToArray()
+    return Get-OutputTailLines $Tail
+}
+
+function ConvertTo-SafeOutputLines([object]$Item) {
+    # One item, sanitized and redacted exactly as a tail would be.
+    return Get-OutputTail @(, $Item)
 }
 
 function Join-OutputTail([string[]]$Earlier, [string[]]$Later) {
@@ -990,11 +1063,11 @@ function Invoke-Captured([string]$Source, [string[]]$Arguments) {
     # redirected away from the console; only a bounded, sanitized tail of the
     # merged streams is kept, as it streams, in $script:LastOutputTail.
     $PSNativeCommandUseErrorActionPreference = $false
-    $Tail = [System.Collections.Generic.Queue[string]]::new()
+    $Tail = New-OutputTail
     $script:LastOutputTail = [string[]]@()
     & $Source @Arguments 2>&1 | ForEach-Object { Add-OutputTailLine $Tail $_ }
     $NativeExitCode = $LASTEXITCODE
-    $script:LastOutputTail = [string[]]$Tail.ToArray()
+    $script:LastOutputTail = Get-OutputTailLines $Tail
     return $NativeExitCode
 }
 
@@ -1080,7 +1153,18 @@ function Get-SafeFailureMessage([object]$ErrorRecord) {
     $Message = $Message -replace "[\x00-\x1f\x7f-\x9f]", " "
     if ($Message.Length -gt 512) { $Message = $Message.Substring(0, 512) }
     if ([string]::IsNullOrWhiteSpace($Message)) { return "Windows operation failed" }
+    if (Test-SecretLikeText $Message) { return "Windows operation failed: $FailureMessageRedacted" }
     return $Message
+}
+
+function Get-FailureLine([string]$Stage, [object]$Message) {
+    # The single stderr line the interop launcher relays. The message is
+    # checked again as a whole: it may not have been built from a tail.
+    $Line = "roundhouse: Windows apply failed at $Stage"
+    $Text = [string]$Message -replace "[\x00-\x1f\x7f-\x9f]", " "
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $Line }
+    if (Test-SecretLikeText $Text) { return "$Line`: $FailureMessageRedacted" }
+    return "$Line`: $Text"
 }
 
 function Assert-ResultPath {
@@ -1450,6 +1534,60 @@ if ($SelfTest) {
             $Kept = @(ConvertTo-SafeOutputLines $Ordinary)
             if ($Kept.Count -ne 1 -or $Kept[0] -cne $Ordinary) { throw "Ordinary output-tail self-test failed: $Ordinary" }
         }
+        foreach ($Url in @("https://git.example.com/owner/repo.git", "ssh://git@github.com/owner/repo.git")) {
+            if (@(ConvertTo-SafeOutputLines $Url)[0] -cne $Url) { throw "Ordinary URL output-tail self-test failed: $Url" }
+        }
+        foreach ($Url in @("fatal: unable to access 'https://claire:Sup3rS3cretPass@git.example.com/owner/repo.git/'",
+                "remote: https://oauth2:abc123DEF456@gitlab.example.com/group/project.git")) {
+            if (@(ConvertTo-SafeOutputLines $Url)[0] -cne $OutputTailRedacted) {
+                throw "Credential URL output-tail self-test failed: $Url"
+            }
+        }
+        # PEM blocks are redacted from BEGIN through END, then output resumes;
+        # an unterminated block is redacted to the end of the tail, even after
+        # its BEGIN line has scrolled out.
+        $Pem = @(Get-OutputTail @("before the key", "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ", "short body words", "-----END OPENSSH PRIVATE KEY-----",
+            $KnownError))
+        if (($Pem -join "`n") -cne (@("before the key", $OutputTailRedacted, $OutputTailRedacted,
+                $OutputTailRedacted, $OutputTailRedacted, $KnownError) -join "`n")) {
+            throw "PEM block output-tail self-test failed: $($Pem -join ' | ')"
+        }
+        $Unterminated = @(Get-OutputTail (@("-----BEGIN RSA PRIVATE KEY-----") + @(1..24 | ForEach-Object { "body line $_" })))
+        if ($Unterminated.Count -ne $OutputTailLines -or
+            @($Unterminated | Where-Object { $_ -cne $OutputTailRedacted }).Count -ne 0) {
+            throw "Unterminated PEM output-tail self-test failed"
+        }
+        # A secret wrapped across two lines redacts both halves, and one
+        # secret line never hides the ordinary error beside it.
+        $Wrapped = @(Get-OutputTail @("export GITHUB_TOKEN_VALUE ghp_abcd", "efghijklmnop0123", $KnownError))
+        if (($Wrapped -join "`n") -cne (@($OutputTailRedacted, $OutputTailRedacted, $KnownError) -join "`n")) {
+            throw "Wrapped-token output-tail self-test failed: $($Wrapped -join ' | ')"
+        }
+        $SplitAssignment = @(Get-OutputTail @("password:", "hunter2hunter2"))
+        if (@($SplitAssignment | Where-Object { $_ -cne $OutputTailRedacted }).Count -ne 0) {
+            throw "Split-assignment output-tail self-test failed"
+        }
+        $Continued = @(Get-OutputTail @($SecretLine, "ABCDEFGH4567", $KnownError))
+        if (($Continued -join "`n") -cne (@($OutputTailRedacted, $OutputTailRedacted, $KnownError) -join "`n")) {
+            throw "Token-continuation output-tail self-test failed: $($Continued -join ' | ')"
+        }
+        $Huge = @(ConvertTo-SafeOutputLines ("z" + (" q" * 150000)))
+        if ($Huge.Count -ne 1 -or $Huge[0].Length -ne $OutputTailLineLength) {
+            throw "Raw line cap output-tail self-test failed"
+        }
+        # The relayed stderr line and every safe failure message are checked
+        # whole, whether or not they were built from a tail.
+        $SecretMessage = "Native command failed: git; remote https://claire:Sup3rS3cretPass@git.example.com/repo.git"
+        if ((Get-FailureLine "execute" $SecretMessage) -cne
+                "roundhouse: Windows apply failed at execute: $FailureMessageRedacted" -or
+            (Get-FailureLine "verify" "Native command failed: winget (exit 1)") -cne
+                "roundhouse: Windows apply failed at verify: Native command failed: winget (exit 1)" -or
+            (Get-FailureLine "post-inventory" "") -cne "roundhouse: Windows apply failed at post-inventory" -or
+            (Get-SafeFailureMessage ([InvalidOperationException]::new("helper said token=abcd1234efgh"))) -cne
+                "Windows operation failed: $FailureMessageRedacted") {
+            throw "Final failure-message redaction self-test failed"
+        }
         $Long = @(ConvertTo-SafeOutputLines ("x " * 600))
         if ($Long.Count -ne 1 -or $Long[0].Length -ne $OutputTailLineLength -or -not $Long[0].EndsWith("...")) {
             throw "Output-tail line bound self-test failed"
@@ -1489,20 +1627,27 @@ if ($SelfTest) {
             }
             return $Path
         }
-        $FailingCommand = New-SelfTestCommand "fixture-fail" @("Applying fixture") @($SecretLine, $KnownError) 7
+        [void](New-SelfTestCommand "fixture-fail" @("Applying fixture") @($SecretLine, $KnownError) 7)
         $FailureTail = $null
+        # By name, as a sealed argv names it: a temporary path's random
+        # directory would itself trip the entropy floor.
+        $SavedPath = $env:PATH
         try {
-            [void](Invoke-Exact @($FailingCommand, "--fixture"))
+            $env:PATH = $FakeBin + [IO.Path]::PathSeparator + $SavedPath
+            [void](Invoke-Exact @("fixture-fail", "--fixture"))
         } catch {
             $FailureTail = Get-ErrorOutputTail $_
             $FailureExit = $_.Exception.Data["ExitCode"]
             $FailureDetail = Join-FailureDetail (Get-SafeFailureMessage $_) $FailureTail
+        } finally {
+            $env:PATH = $SavedPath
         }
         # stdout and stderr interleave in arrival order; each keeps its own.
         if ($null -eq $FailureTail -or $FailureExit -ne 7 -or
             @($FailureTail | Where-Object { $_ -ceq $KnownError }).Count -ne 1 -or
             @($FailureTail | Where-Object { $_ -ceq $OutputTailRedacted }).Count -ne 1 -or
-            -not $FailureDetail.Contains($KnownError) -or -not $FailureDetail.Contains("(exit 7)") -or
+            -not $FailureDetail.Contains($KnownError) -or
+            -not $FailureDetail.StartsWith("Native command failed: fixture-fail (exit 7); output tail: ") -or
             ($FailureDetail + ($FailureTail -join "`n")).Contains("ghp_") -or
             @($FailureTail | Where-Object { $_ -ceq "Applying fixture" }).Count -ne 1) {
             throw "Native failure output-tail self-test failed: $FailureDetail"
@@ -2283,10 +2428,6 @@ foreach ($Result in $OperationResults) {
 Write-Result $ResultRecords
 if ($null -ne $Failure) {
     # One line: the interop launcher relays exactly the last stderr line.
-    $FailureLine = "roundhouse: Windows apply failed at $($Failure.stage)"
-    if (-not [string]::IsNullOrWhiteSpace([string]$Failure.message)) {
-        $FailureLine += ": " + ([string]$Failure.message -replace "[\x00-\x1f\x7f-\x9f]", " ")
-    }
-    [Console]::Error.WriteLine($FailureLine)
+    [Console]::Error.WriteLine((Get-FailureLine ([string]$Failure.stage) $Failure.message))
     exit 70
 }
