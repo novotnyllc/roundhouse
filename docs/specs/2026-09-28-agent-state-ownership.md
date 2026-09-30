@@ -341,8 +341,10 @@ checks only newly fetched commits, and a refused non-fold file has no item to ho
     §7.11.2 catch-up:
     1. Find the pointer in the archive.
     2. Advance it along the archived chain by this rule, up to the checkpoint.
-    3. Adopt the new root's owner tree only if it equals that verified owner tree, or if the
-       checkpoint is signed by an owner key that the advanced pointer trusts.
+    3. Adopt the new root's owner tree only if it equals that verified owner tree, or if an owner
+       key that the advanced pointer trusts has signed **the new root's owner-tree hash itself**. An
+       owner signature on the checkpoint authenticates the checkpoint, not the replacement root's
+       bytes.
 
     Otherwise the pointer stays pinned, and the host raises a persistent alert.
 - **A non-owner write** to an owner path stops the pointer and raises a persistent alert. It
@@ -402,7 +404,12 @@ The existing `fleet_removal_cap` becomes one pure `fleet_change_cap`:
 - **At the publisher,** over this pass's local changes. Over the cap, the whole set becomes one
   pending-confirm batch, released by `fleet-confirm` or dropped by `fleet-discard`.
 - **At the receiver,** per source host, over that source's node-signed changes **not yet
-  converged on this host**.
+  converged on this host**, plus a second, cumulative count per source host over a rolling 24 h
+  window of **arrivals**.
+  - The window is kept by `max_changes_per_source_day`, default 20. Its counts survive
+    convergence, so a source can't dodge the cap by pacing one change at a time.
+  - Arrival times come from the receiver's own clock, recorded in its `store.run/`. They only size
+    a safety window and never order changes.
   - Splitting 100 removals into 100 one-item commits doesn't evade the cap.
   - Six small changes that pile up while a host sleeps count together, but they don't stay stuck:
     - Over the cap, that source's pending changes become a receiver-side pending-confirm.
@@ -426,6 +433,11 @@ The existing `fleet_removal_cap` becomes one pure `fleet_change_cap`:
 
 ### 5.1 Preferences: model defaults first
 
+- **Roundhouse replicates, it doesn't choose.** Roundhouse replicates the harness default values
+  the owner set on one machine. It never chooses a model or reasoning effort, so it doesn't
+  overlap `railyard:model-routing`, which still picks the model and effort for each dispatch
+  (`docs/agents/charter.md`). Model defaults are harness configuration, like `theme`, and syncing
+  them is a Baselines concern.
 - **How it's declared.** Preferences reuse V2's `config_files` managed-key mechanism rather than
   adding a second one:
   - `fleet/owner/synced-preferences.yaml` holds the `config_files` declarations for the agent
@@ -489,6 +501,13 @@ keys:
   own `op`, or alerts if `op` is unavailable.
 - **Values are never logged or printed.** A new secret typed on one host produces an alert asking
   the owner to store it in 1Password.
+- **A locally entered secret is never overwritten before it is captured.** When a secret key's
+  local value differs from what its `op://` reference renders, rendering of that file is **held**
+  on that host. This is the one exception to §3.3 step 6's rule that never-staged values converge.
+  - The host alerts, without the value, and asks the owner to store the new secret in 1Password.
+  - Rendering resumes once the reference renders the same value, or when the owner runs
+    `fleet-discard` for that file.
+  - The loop never captures the plaintext.
 
 ## 6. Triggers, handover, liveness
 
@@ -726,6 +745,10 @@ verbs, the token check and the task.
 | PR review (Codex) | Genesis owner pin authenticated only by possession | §4.1 owner-supplied fingerprints, sealed plan |
 | PR review (Codex) | Secret-reference mappings node-writable | §4.1 `tool-secrets.yaml`; §5.2 |
 | PR review (Codex) | Canary condition 3 vacuous at wait 0 | §3.6 later distinct verification-pass record |
+| PR review (Codex) | Re-root adopted a node-written root on a checkpoint signature | §4.1 owner signature over the new root's owner-tree hash |
+| PR review (Codex) | Rendering overwrote a locally entered secret | §5.2 hold rendering until captured |
+| PR review (Codex) | A paced publisher evaded the receiver cap | §4.2 cumulative 24 h arrival window |
+| PR review (Codex) | Model defaults vs `railyard:model-routing` | §5.1 replication, not choice |
 
 ## 10. Open decisions for the owner
 
@@ -734,6 +757,7 @@ verbs, the token check and the task.
    - Or turn it off on non-canary hosts: updates are then canary-gated, a `canary_wait_hours`
      behind.
 2. **Canary members:** which two or more hosts.
-3. **Change cap:** 5 changes or 25% per pass or commit (the existing numbers), or higher.
+3. **Change cap:** 5 changes or 25% per pass or commit (the existing numbers), or higher; and
+   `max_changes_per_source_day` (proposed 20).
 4. **Owner keys:** a 1Password SSH agent key with per-use approval, plus an offline recovery key
    (proposed).
