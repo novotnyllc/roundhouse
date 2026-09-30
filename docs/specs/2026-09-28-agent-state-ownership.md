@@ -566,7 +566,8 @@ Each phase ships alone, and none leaves the fleet worse off.
   - `fleet-schedule install`;
   - identity-gate self-repair and relative-source identity;
   - Claude uninstall for `absent`;
-  - re-seed and unanimity promotion skip agent categories;
+  - re-seed and unanimity promotion skip the agent keys (`plugins` and `skills` inside
+    `seed_desired`). Seed still writes packages, `platform` and `groups`;
   - a canary member list with two live hosts.
 - **Data:** one reviewed store commit.
   - Delete `hosts/*/99-canonical-agents.yaml` and the agent `proposals/promote-*`.
