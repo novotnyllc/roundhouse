@@ -112,6 +112,8 @@ agent_plugins:
   - Because the value is in an owner file, owner-path enforcement covers it on every receiving
     host. No node key can tombstone the loop fleet-wide.
   - Protected items are never staged.
+  - The owner-file value always wins. A fold declaration of a protected key is an item-scoped
+    detection in `fleet_run_alerts`, and it is held.
   - The `roundhouse` plugin also keeps its existing `fleet-adopt-pin` SHA containment.
 
 ### 3.3 One pass
@@ -122,7 +124,8 @@ All host-local state lives under `fleet_instance_path store.run/` (the existing
 - **pending-apply markers**;
 - the **dirty stamp**;
 - the **owner pointer** (§4.1);
-- **pending-confirm decisions**.
+- **pending-confirm decisions**;
+- the per-item **refused-publish counter** (§3.3 step 6).
 
 For each item, the baseline is the value this host last saw **agreed**: observed equal to the
 fleet value, at a commit that was fetched and is on the remote.
@@ -290,9 +293,12 @@ checks only newly fetched commits, and a refused non-fold file has no item to ho
   equals the pointer's owner tree with changes applied that are each signed by an owner key the
   pointer already trusts.
   - A commit that touches no owner path passes trivially.
-  - A merge passes when, for each owner path, its content equals that path's content in some
-    parent that has already passed. Routine reconcile merges and records merges therefore don't
-    stop it.
+  - The pointer only ever moves to a descendant of itself.
+  - A merge passes only when its owner tree equals the owner tree at the current pointer, or at a
+    passed parent that descends from the pointer, plus changes signed by owner keys the pointer
+    trusts.
+  - Routine reconcile and records merges pass, because both sides carry the pointer's owner tree.
+  - A merge that takes owner files from an older commit is a rollback, and never passes.
 - **A non-owner write** to an owner path stops the pointer and raises a persistent alert. It
   doesn't wedge the host: non-owner paths keep flowing, and owner settings freeze at the pointer.
 - **Restoring.** Only `roundhouse fleet-owner restore` resumes the pointer. It builds an owner tree
@@ -371,12 +377,22 @@ The existing `fleet_removal_cap` becomes one pure `fleet_change_cap`:
     config files. Each file is listed with its keys marked `managed`; everything else is
     `unmanaged`. Being an owner file, a node can't add a key; a key that holds a token, for
     example, can never be made to publish.
-  - The existing `fleet_config_key_collisions` validation applies unchanged.
+  - A fold `config_files` entry for any file listed in `synced-preferences.yaml` is ignored and
+    alerted, just as `policy:` is. The existing `fleet_config_key_collisions` check runs over the
+    owner declarations read at the pointer.
   - The existing co-ownership check (`fleet_config_coowned`) also applies. The handover marker
     (§6.2) is its per-key exception: chezmoi still owns the file but has released those keys.
 - **Where values live.** Values are items in a new `agent_preferences` category, in
   `fleet/agent-preferences.yaml`. That is the declaring file a local change edits (§3.1).
 - **Order.** Model defaults come first and ship before the other preferences (P2b, §8.2).
+- **Writing values is new.** Today `config_files` only reports drift, so converging preference
+  values adds a writer. Each harness's own writer does it:
+  - Codex through app-server `config/batchWrite`, so Codex's concurrent writes to `config.toml`
+    (project trust, `hooks.state`) are never lost;
+  - OpenCodex through `ocx config import`;
+  - Claude through a key-scoped `settings.json` merge under the existing sealed plan.
+
+  None of them rewrites a whole file.
 
 **Codex: `~/.codex/config.toml`, root keys only.**
 - Synced: `model`, `model_reasoning_effort`, and `review_model` where present.
@@ -631,6 +647,9 @@ verbs, the token check and the task.
 | Rev 3.2 | Protected items enforced only at the publisher | §3.2 values live in the owner file |
 | Rev 3.2 | Preference items have no category, and duplicate `config_files` | §5.1 `agent_preferences`; `config_files` managed keys |
 | Rev 3.2 | Owner working-copy edits auto-published; SSH stdin; silent refused publishes | §4.1; §6.1; §3.3 step 6 |
+| Rev 3.3 | Merge rule allowed an owner-state rollback | §4.1 descendant-only pointer |
+| Rev 3.3 | `config_files` had two sources; protected key also declared in the fold | §5.1; §3.2 |
+| Rev 3.3 | Preference value writes could clobber Codex's concurrent writes | §5.1 per-harness writers |
 
 ## 10. Open decisions for the owner
 
