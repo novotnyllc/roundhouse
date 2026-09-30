@@ -166,8 +166,12 @@ fleet value, at a commit that was fetched and is on the remote.
      - A local add: base and theirs missing, ours present.
      - **Ignored** is an explicit baseline marker, `{ignored: true, value}`. Such an item never
        publishes while ours equals the recorded value.
-       - If ours changes away from that value (for example, the extra is uninstalled), the marker
-         is dropped and nothing publishes.
+       - If ours changes to another present value (for example, the owner disables the extra),
+         the marker's value is updated and the item stays ignored. The marker is dropped, silently,
+         only when ours goes missing.
+       - **If the fleet later adds the same item** (theirs present), the ignored value serves as
+         base. If ours matches it, the item converges to theirs; otherwise it is a conflict, with a
+         conflict record. Once ours and theirs agree, an ordinary baseline replaces the marker.
        - Only `fleet-take-local` clears the marker and publishes the item.
      - Base present and theirs missing means an owner edit dropped the item. The baseline entry
        becomes ignored with the observed value, and no action is taken. It is not dropped, which
