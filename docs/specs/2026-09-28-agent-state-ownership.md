@@ -408,6 +408,8 @@ The existing `fleet_removal_cap` becomes one pure `fleet_change_cap`:
   window of **arrivals**.
   - The window is kept by `max_changes_per_source_day`, default 20. Its counts survive
     convergence, so a source can't dodge the cap by pacing one change at a time.
+  - Changes the owner released through `confirmations.yaml` stop counting toward that source's
+    window, so a release doesn't keep re-tripping it.
   - Arrival times come from the receiver's own clock, recorded in its `store.run/`. They only size
     a safety window and never order changes.
   - Splitting 100 removals into 100 one-item commits doesn't evade the cap.
@@ -501,9 +503,14 @@ keys:
   own `op`, or alerts if `op` is unavailable.
 - **Values are never logged or printed.** A new secret typed on one host produces an alert asking
   the owner to store it in 1Password.
-- **A locally entered secret is never overwritten before it is captured.** When a secret key's
-  local value differs from what its `op://` reference renders, rendering of that file is **held**
-  on that host. This is the one exception to §3.3 step 6's rule that never-staged values converge.
+- **A locally entered secret is never overwritten before it is captured.** Each host keeps a
+  host-local 0600 keyed hash of the last value the loop rendered for each secret key, never the
+  value itself.
+  - When the on-disk value differs from that hash, it was typed locally, and rendering of that
+    file is **held** on that host. This is the one exception to §3.3 step 6's rule that
+    never-staged values converge.
+  - A rotation in 1Password changes only what the reference renders, not the file, so it renders
+    normally everywhere.
   - The host alerts, without the value, and asks the owner to store the new secret in 1Password.
   - Rendering resumes once the reference renders the same value, or when the owner runs
     `fleet-discard` for that file.
