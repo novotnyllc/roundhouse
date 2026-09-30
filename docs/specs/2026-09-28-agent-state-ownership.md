@@ -1,6 +1,6 @@
 # Automatic fleet sync for agent tooling
 
-Status: **design proposal, rev 3.2** · 2026-09-30 · nothing implemented here.
+Status: **design proposal, rev 3.3** · 2026-09-30 · nothing implemented here.
 
 ## History
 
@@ -13,8 +13,9 @@ Status: **design proposal, rev 3.2** · 2026-09-30 · nothing implemented here.
   - plugin installs from any session running as code everywhere;
   - an infeasible Windows port.
 - **Rev 3** replaced the mechanism with a three-way merge over git history.
-- **Rev 3.1 and 3.2** close two rounds of Thermos findings (§9). The main changes:
-  - owner-controlled settings are read only from an owner-verified pointer;
+- **Revs 3.1–3.3** close three rounds of Thermos findings (§9). The main changes:
+  - owner-controlled settings, including the owner keys themselves, are read only from an
+    owner-verified pointer;
   - staged changes are derived, never stored;
   - held batches can be released or discarded.
 
@@ -105,10 +106,13 @@ agent_plugins:
 - **Aliases.** `fleet/owner/aliases.yaml` (for example `openai-curated` ≡ `openai-curated-remote`)
   normalizes both observations and values.
 - **Values carry state only.** No version, no SHA, and no hook trust (§3.5).
-- **Protected items.** `fleet/owner/protected.yaml` lists items that are never staged and change
-  only by owner edit. It starts with the `roundhouse` plugin and its marketplace, so the loop
-  can't uninstall itself fleet-wide. The `roundhouse` plugin also keeps its existing
-  `fleet-adopt-pin` SHA containment.
+- **Protected items.** Protected items are **declared in** `fleet/owner/protected.yaml`, and their
+  values live there, read at the owner pointer (§4.1).
+  - It starts with the `roundhouse` plugin and its marketplace.
+  - Because the value is in an owner file, owner-path enforcement covers it on every receiving
+    host. No node key can tombstone the loop fleet-wide.
+  - Protected items are never staged.
+  - The `roundhouse` plugin also keeps its existing `fleet-adopt-pin` SHA containment.
 
 ### 3.3 One pass
 
@@ -167,8 +171,12 @@ fleet value, at a commit that was fetched and is on the remote.
    - Git history is the only order.
 6. **Converge** through each harness's own commands (§3.5), with sealed plans, the precondition
    recheck and backups as today.
-   - Converge skips items with an unpublished local change or a pending-confirm decision, so the
-     owner's change isn't reverted before it publishes.
+   - Converge skips only **publishable** local changes (those §4.3 allows) and pending-confirm
+     items, so the owner's change isn't reverted before it publishes.
+   - A never-staged row still converges to the owner or fleet value. For example, a posture key
+     loosened locally is reported and put back; pinned items stay local.
+   - A publishable change that is refused for three passes in a row (for example by the redaction
+     sweep) raises an alert rather than diverging silently.
    - `fleet-discard ID` drops a pending-confirm item or batch; its items then converge to theirs.
      That is how a wiped home directory is repaired.
 7. **Re-baseline** by re-observing after the apply.
@@ -253,9 +261,9 @@ once the host reconnects.
 | File in `fleet/owner/` | Controls |
 |---|---|
 | `marketplaces.yaml` | Marketplace name → source, plus `review: per-plugin` |
-| `protected.yaml` | Items never staged (§3.2) |
+| `protected.yaml` | Protected items and their values (§3.2) |
 | `posture.yaml` | Posture keys: `skipDangerousModePermissionPrompt`, `remoteControlAtStartup`, permission rules, hooks, the Roundhouse SessionStart hook (§6.1) |
-| `synced-preferences.yaml` | The preference allowlist (§5.1) |
+| `synced-preferences.yaml` | `config_files` managed-key declarations for agent config files (§5.1) |
 | `aliases.yaml`, `tool-schemas.yaml`, `hook-trust.yaml` | As named |
 | `pins.yaml` | `pin: local` exceptions per host |
 | `policy.yaml` | The **whole** policy category, including the canary member list |
@@ -273,13 +281,29 @@ and `ephemeral`.
 
 **The owner pointer.** This is what makes owner files trustworthy with the gate as built. The gate
 checks only newly fetched commits, and a refused non-fold file has no item to hold.
-- **What it is.** Each host keeps a host-local pointer to the last commit at which `fleet/owner/**`
-  and the owner rows were owner-verified.
-- **How it advances.** Over each newly fetched commit, but only when every change that commit makes
-  to those paths is signed by an owner key trusted at its parents.
-- **Where owner files are read from.** Always at the pointer, never at head.
-- **A non-owner write** stops the pointer and raises a persistent alert, until an owner commit
-  restores those paths.
+- **What it is.** Each host keeps a host-local pointer to the last commit whose owner tree was
+  owner-verified. The owner tree is `fleet/owner/**` plus the owner rows in `trust/`.
+- **Where owner files are read from.** Always at the pointer, never at head. That includes the
+  owner key set itself: owner keys come **only from the owner rows at the pointer**, never from a
+  commit's parents, whose roster bytes may be unverified.
+- **How it advances.** The pointer moves to a newly fetched commit C only when C's owner tree
+  equals the pointer's owner tree with changes applied that are each signed by an owner key the
+  pointer already trusts.
+  - A commit that touches no owner path passes trivially.
+  - A merge passes when, for each owner path, its content equals that path's content in some
+    parent that has already passed. Routine reconcile merges and records merges therefore don't
+    stop it.
+- **A non-owner write** to an owner path stops the pointer and raises a persistent alert. It
+  doesn't wedge the host: non-owner paths keep flowing, and owner settings freeze at the pointer.
+- **Restoring.** Only `roundhouse fleet-owner restore` resumes the pointer. It builds an owner tree
+  from the pointer's tree and commits it under an owner signature. A later commit signed by some
+  key that a node-written roster row names never counts as a restore.
+- **Every owner write starts from the pointer's owner tree, never from head.** That covers
+  `fleet-confirm`, `fleet-owner restore`, and owner edits. Confirming something therefore can't
+  re-sign an attacker's pending owner-path bytes.
+- **Owner-path edits in the store working copy are never auto-published.** The reconcile step
+  refuses to describe them as a hand edit, and points the owner to the owner-signing command. A
+  node-signed publish of the owner's own edit would otherwise stop the pointer fleet-wide.
 - **Old copies of owner settings.** A `policy:` key anywhere in the general fold is ignored and
   alerted, and `fleet_policy_get` reads only the owner file at the pointer.
 
@@ -316,11 +340,16 @@ The existing `fleet_removal_cap` becomes one pure `fleet_change_cap`:
 - **Owner-signed commits are exempt.**
 - **At the publisher,** over this pass's local changes. Over the cap, the whole set becomes one
   pending-confirm batch, released by `fleet-confirm` or dropped by `fleet-discard`.
-- **At the receiver,** per incoming source commit, not per pass. So six small commits made while a
-  host slept aren't one over-cap batch. An over-cap commit becomes a receiver-side pending-confirm
-  keyed by that commit ID. It is released by the same `fleet-confirm`, which writes
-  `confirmations.yaml` so every receiver sees the release. A release confirmed at the publisher
-  writes the same entry, so receivers don't trip on it again.
+- **At the receiver,** per source host, over that source's node-signed changes **not yet
+  converged on this host**.
+  - Splitting 100 removals into 100 one-item commits doesn't evade the cap.
+  - Six small changes that pile up while a host sleeps count together, but they don't stay stuck:
+    - Over the cap, that source's pending changes become a receiver-side pending-confirm.
+    - The same `fleet-confirm` releases it, and writes `confirmations.yaml` so every receiver sees
+      the release.
+  - A release is keyed by **source host plus commit range**, or by **item key plus digest**; never
+    by bare item keys, so no release becomes a standing exemption.
+  - A batch confirmed at the publisher writes the same entry, so receivers don't trip on it again.
 
 ### 4.3 Never staged
 
@@ -336,8 +365,18 @@ The existing `fleet_removal_cap` becomes one pure `fleet_change_cap`:
 
 ### 5.1 Preferences: model defaults first
 
-`synced-preferences.yaml` lists the synced keys. Model defaults come first and ship before the
-other preferences (P2b, §8.2).
+- **How it's declared.** Preferences reuse V2's `config_files` managed-key mechanism rather than
+  adding a second one:
+  - `fleet/owner/synced-preferences.yaml` holds the `config_files` declarations for the agent
+    config files. Each file is listed with its keys marked `managed`; everything else is
+    `unmanaged`. Being an owner file, a node can't add a key; a key that holds a token, for
+    example, can never be made to publish.
+  - The existing `fleet_config_key_collisions` validation applies unchanged.
+  - The existing co-ownership check (`fleet_config_coowned`) also applies. The handover marker
+    (§6.2) is its per-key exception: chezmoi still owns the file but has released those keys.
+- **Where values live.** Values are items in a new `agent_preferences` category, in
+  `fleet/agent-preferences.yaml`. That is the declaring file a local change edits (§3.1).
+- **Order.** Model defaults come first and ship before the other preferences (P2b, §8.2).
 
 **Codex: `~/.codex/config.toml`, root keys only.**
 - Synced: `model`, `model_reasoning_effort`, and `review_model` where present.
@@ -390,7 +429,7 @@ keys:
   - macOS: `launchctl kickstart gui/$UID/com.novotnyllc.roundhouse.fleet-fast`;
   - Linux: `systemctl --user start roundhouse-fleet-fast.service`.
 - **When no GUI domain exists** (a Mac with no console login, reached over SSH), it falls back to
-  `nohup roundhouse fleet-run --fast >/dev/null 2>&1 &`.
+  `nohup roundhouse fleet-run --fast </dev/null >/dev/null 2>&1 &`.
 - **The running pass loops in-process** while the stamp has moved since the pass began, so a
   trigger that arrives mid-pass is never lost. A kickstart for a job already running is harmless.
 - **Push nudge.** After a publish that changes desired state, the existing push nudge sends this
@@ -585,6 +624,13 @@ verbs, the token check and the task.
 | Rev 3.1 | Per-file jj conflicts | §3.1 dedicated agent files |
 | Rev 3.1 | P0 prunes trip the cap | §8.2 P0 disown |
 | Rev 3.1 | Tombstone compaction stalls; floor path list; owner-class duplication; naming; hook writers; `--with-windows` | §3.4; §6.4; §4.1; §8.1; §6.1; §7 |
+| Rev 3.2 | Owner keys read from unverified parent roster; undefined restore; confirm could re-sign attacker bytes | §4.1 keys only from the pointer; `fleet-owner restore`; owner writes start from the pointer tree |
+| Rev 3.2 | Merge commits stall the pointer | §4.1 merge rule |
+| Rev 3.2 | Per-commit receiver cap can be split around; bare-key releases become exemptions | §4.2 per-source pending set; keyed releases |
+| Rev 3.2 | Converge skip lets never-staged drift (posture) persist | §3.3 step 6 |
+| Rev 3.2 | Protected items enforced only at the publisher | §3.2 values live in the owner file |
+| Rev 3.2 | Preference items have no category, and duplicate `config_files` | §5.1 `agent_preferences`; `config_files` managed keys |
+| Rev 3.2 | Owner working-copy edits auto-published; SSH stdin; silent refused publishes | §4.1; §6.1; §3.3 step 6 |
 
 ## 10. Open decisions for the owner
 
