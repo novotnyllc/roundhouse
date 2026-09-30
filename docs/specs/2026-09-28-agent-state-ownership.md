@@ -83,7 +83,8 @@ The reconciler stopped working:
   event store.
 - **The loop is the only writer.**
   - dotfiles, fleet-chezmoi and `config.json` hand over per host through the marker (§6.2).
-  - Re-seed and unanimity promotion lose their agent branches in P2, where the silent first pass
+  - Re-seed and unanimity promotion stop writing agent categories in P0, so nothing re-adds a
+    retired plugin to a layer. Their agent branches are deleted in P2, where the silent first pass
     (§3.3) replaces `fleet-seed` for agent state.
   - `fleet-accept` retires for agent items.
 
@@ -565,6 +566,7 @@ Each phase ships alone, and none leaves the fleet worse off.
   - `fleet-schedule install`;
   - identity-gate self-repair and relative-source identity;
   - Claude uninstall for `absent`;
+  - re-seed and unanimity promotion skip agent categories;
   - a canary member list with two live hosts.
 - **Data:** one reviewed store commit.
   - Delete `hosts/*/99-canonical-agents.yaml` and the agent `proposals/promote-*`.
@@ -660,6 +662,7 @@ verbs, the token check and the task.
 | Rev 3.3 | `config_files` had two sources; protected key also declared in the fold | §5.1; §3.2 |
 | Rev 3.3 | Preference value writes could clobber Codex's concurrent writes | §5.1 per-harness writers |
 | Rev 3.3 | Descendant-only pointer freezes after a V2 re-root | §4.1 re-root catch-up |
+| PR review (CodeRabbit) | Re-seed can re-add retired plugins between P0 and P2 | §3.1; §8.2 P0 |
 
 ## 10. Open decisions for the owner
 
