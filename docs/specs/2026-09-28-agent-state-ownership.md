@@ -155,8 +155,11 @@ fleet value, at a commit that was fetched and is on the remote.
    - **Conflict records.** Before a conflict converges to theirs, the host writes a conflict
      record holding the displaced local value. So `fleet-take-local ITEM` can still publish ours
      after converge has overwritten it.
-     - The record is a normal item value, so it never holds a secret: tool-config secret keys are
-       never staged (§5.2).
+     - Records are written only for items §4.3 allows to be staged. For tool config, a record
+       holds only the schema's `plain:` keys, so it never holds a secret or an owner-controlled
+       value.
+     - `fleet-take-local` publishes the recorded value as an ordinary local change, through the §4
+       gate and the change cap.
      - It is cleared by `fleet-take-local`, by `fleet-discard`, or when theirs changes again.
        Theirs changing again raises a new alert.
    - **Unmanaged** is its own state.
