@@ -164,8 +164,14 @@ fleet value, at a commit that was fetched and is on the remote.
        Theirs changing again raises a new alert.
    - **Unmanaged** is its own state.
      - A local add: base and theirs missing, ours present.
-     - Base present and theirs missing means an owner edit dropped the item. Drop it from the
-       baseline and take no action.
+     - **Ignored** is an explicit baseline marker, `{ignored: true, value}`. Such an item never
+       publishes while ours equals the recorded value.
+       - If ours changes away from that value (for example, the extra is uninstalled), the marker
+         is dropped and nothing publishes.
+       - Only `fleet-take-local` clears the marker and publishes the item.
+     - Base present and theirs missing means an owner edit dropped the item. The baseline entry
+       becomes ignored with the observed value, and no action is taken. It is not dropped, which
+       would make the next pass read it as a local add.
      - A tombstone is the value `absent`, not a missing value.
    - **Local changes are derived every pass, never stored.** Because base doesn't advance until
      agreement, an unpublished local change is re-derived on every pass. Once theirs changes that
@@ -202,11 +208,12 @@ fleet value, at a commit that was fetched and is on the remote.
 **Silent first pass.** A new host, a migrated host, or a host that lost its baseline:
 1. converges;
 2. observes;
-3. writes the baseline only where ours = theirs;
+3. writes the baseline where ours = theirs, and writes an **ignored** entry for every local extra
+   not in the fleet;
 4. publishes nothing.
 
-Local extras not in the fleet are left alone and listed in one alert, with `fleet-take-local` to
-publish them.
+Local extras are therefore left alone on every later pass too, and are listed in one alert, with
+`fleet-take-local` to publish them.
 
 **Offline.** When fetch fails, local changes aren't agreed. Converge skips them, and they publish
 once the host reconnects.
@@ -518,16 +525,24 @@ keys:
 
 ## 7. Native Windows: the operated instance
 
-iris-windows is the second instance on iris-wsl (V2 §9.2). It has its own principal, key and
-`store.run/`.
+**Roles, not names.** The operated Windows instance is any `platform: windows` machine in
+`ROUNDHOUSE_CONFIG` (or the standard config path) whose `wsl_interop_via` names a configured WSL
+machine, the *operator host*. That is the same resolution `lib/interop.sh` already uses. Its
+instance name, store and principal derive from that config entry, and nothing in the
+implementation names a concrete host. In this fleet today, the operated instance is
+`iris-windows` and the operator host is `iris-wsl`. Those names are examples, not part of the
+contract.
+
+The operated instance is the second instance on its operator host (V2 §9.2). It has its own
+principal, key and `store.run/`.
 
 - **The Windows task.** One Task Scheduler task runs *as the user, only when logged on*
   (InteractiveToken), at logon, on unlock, and every 20 minutes. It runs
   `wsl.exe -d <distro> --exec /home/<user>/.local/bin/roundhouse fleet-run --fast --with-windows`,
   using an absolute path because `--exec` gives no login shell.
-- **The iris-wsl pass comes first.** `--with-windows` then **re-executes** `roundhouse` with
-  `ROUNDHOUSE_FLEET_STORE` set to the iris-windows store, one process at a time as the seam
-  requires. Timer and nudge passes on iris-wsl never run the Windows instance. Windows has no
+- **The operator host's pass comes first.** `--with-windows` then **re-executes** `roundhouse`
+  with `ROUNDHOUSE_FLEET_STORE` set to the operated instance's store, one process at a time as the
+  seam requires. Timer and nudge passes on the operator host never run the Windows instance. Windows has no
   nudge; it catches up at the next task tick or unlock.
 - **Windows commands run from this pass's own process tree.** The Windows instance launches
   `pwsh.exe` directly over WSL interop, never over the SSH interop lane.
@@ -676,6 +691,8 @@ verbs, the token check and the task.
 | Rev 3.3 | Descendant-only pointer freezes after a V2 re-root | §4.1 re-root catch-up |
 | PR review (CodeRabbit) | Re-seed can re-add retired plugins between P0 and P2 | §3.1; §8.2 P0 |
 | PR review (CodeRabbit) | A conflict overwrote ours, so `fleet-take-local` had nothing to publish | §3.3 conflict records |
+| PR review (Codex) | Silent-pass extras and owner-dropped items would publish on the next pass | §3.3 ignored marker |
+| PR review (Codex) | Windows design bound to concrete host names | §7 roles resolved from config |
 
 ## 10. Open decisions for the owner
 
