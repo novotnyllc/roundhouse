@@ -304,7 +304,7 @@ checks only newly fetched commits, and a refused non-fold file has no item to ho
     1. Find the pointer in the archive.
     2. Advance it along the archived chain by this rule, up to the checkpoint.
     3. Adopt the new root's owner tree only if it equals that verified owner tree, or if the
-       checkpoint is owner-signed.
+       checkpoint is signed by an owner key that the advanced pointer trusts.
 
     Otherwise the pointer stays pinned, and the host raises a persistent alert.
 - **A non-owner write** to an owner path stops the pointer and raises a persistent alert. It
