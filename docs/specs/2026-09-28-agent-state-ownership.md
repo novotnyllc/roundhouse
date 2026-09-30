@@ -299,6 +299,14 @@ checks only newly fetched commits, and a refused non-fold file has no item to ho
     trusts.
   - Routine reconcile and records merges pass, because both sides carry the pointer's owner tree.
   - A merge that takes owner files from an older commit is a rollback, and never passes.
+  - **Re-root (V2 §7.11.2).** A re-root's new root descends from nothing, so the pointer joins the
+    §7.11.2 catch-up:
+    1. Find the pointer in the archive.
+    2. Advance it along the archived chain by this rule, up to the checkpoint.
+    3. Adopt the new root's owner tree only if it equals that verified owner tree, or if the
+       checkpoint is owner-signed.
+
+    Otherwise the pointer stays pinned, and the host raises a persistent alert.
 - **A non-owner write** to an owner path stops the pointer and raises a persistent alert. It
   doesn't wedge the host: non-owner paths keep flowing, and owner settings freeze at the pointer.
 - **Restoring.** Only `roundhouse fleet-owner restore` resumes the pointer. It builds an owner tree
@@ -380,7 +388,8 @@ The existing `fleet_removal_cap` becomes one pure `fleet_change_cap`:
   - A fold `config_files` entry for any file listed in `synced-preferences.yaml` is ignored and
     alerted, just as `policy:` is. The existing `fleet_config_key_collisions` check runs over the
     owner declarations read at the pointer.
-  - The existing co-ownership check (`fleet_config_coowned`) also applies. The handover marker
+  - The existing co-ownership check (`fleet_config_coowned`) also applies, running over the same
+    owner declarations at the pointer. The handover marker
     (§6.2) is its per-key exception: chezmoi still owns the file but has released those keys.
 - **Where values live.** Values are items in a new `agent_preferences` category, in
   `fleet/agent-preferences.yaml`. That is the declaring file a local change edits (§3.1).
@@ -650,6 +659,7 @@ verbs, the token check and the task.
 | Rev 3.3 | Merge rule allowed an owner-state rollback | §4.1 descendant-only pointer |
 | Rev 3.3 | `config_files` had two sources; protected key also declared in the fold | §5.1; §3.2 |
 | Rev 3.3 | Preference value writes could clobber Codex's concurrent writes | §5.1 per-harness writers |
+| Rev 3.3 | Descendant-only pointer freezes after a V2 re-root | §4.1 re-root catch-up |
 
 ## 10. Open decisions for the owner
 
