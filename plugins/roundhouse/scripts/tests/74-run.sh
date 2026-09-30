@@ -246,6 +246,26 @@ SH
         "$run_root/layers" "$run_root/package-open-tmp" >/dev/null
       grep -Fqx 'upgrade example' "$run_package_upgrade_marker" ||
         fail "full cadence package control did not run an unheld upgrade"
+      # linuxbrew is brew on Linux: it upgrades, not skips.
+      : >"$run_package_upgrade_marker"
+      fleet_run_full_pass "$run_store" vireo \
+        '{"packages":{"example":"enabled"},"package_managers":["linuxbrew"]}' \
+        '{"packages":{"example":{"linuxbrew":"example"}}}' \
+        "$run_root/layers" "$run_root/package-open-tmp" >/dev/null
+      grep -Fqx 'upgrade example' "$run_package_upgrade_marker" ||
+        fail "full cadence skipped a linuxbrew package instead of upgrading it"
+      # apt has no user-space update path: the pass says so rather than
+      # skipping silently, and runs nothing.
+      : >"$run_package_upgrade_marker"
+      run_apt_out=$(fleet_run_full_pass "$run_store" vireo \
+        '{"packages":{"example":"enabled"},"package_managers":["apt"]}' \
+        '{"packages":{"example":{"apt":"example"}}}' \
+        "$run_root/layers" "$run_root/package-open-tmp")
+      printf '%s\n' "$run_apt_out" |
+        grep -Fq 'hold  packages.example — apt has no user-space update path' ||
+        fail "full cadence silently skipped an apt package instead of reporting the hold"
+      [ ! -s "$run_package_upgrade_marker" ] ||
+        fail "full cadence ran brew for an apt-resolved package"
     )
     run_unsafe_market=$(fleet_run_plugin_marketplaces \
       '{"plugins":{"example":"enabled"}}' \
@@ -1176,6 +1196,23 @@ JSONC
       fail "seeding did not take platform from config.json — machine-truth still needs a hand-authored host file"
     [ "$(yq -r '(.groups // []) | join(",")' "$run_seeded")" = development,canary ] ||
       fail "seeding did not take groups from config.json"
+    # Without the manager list the resolver tries nothing and every enabled
+    # package is held as unprovidable on a host whose manager provides it.
+    [ "$(yq -r '(.package_managers // []) | join(",")' "$run_seeded")" = apt ] ||
+      fail "seeding did not take package_managers from config.json — every package would be held"
+    # The run reads the fold from the PUBLISHED tree, so a fact seeded this run
+    # only lands next run. Until then the host's own config answers; a fold
+    # that states the fact — even as [] — still wins.
+    [ "$(ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      fleet_run_package_managers '{"packages":{}}' "$run_seed_host")" = apt ] ||
+      fail "a fold without package_managers did not fall back to config.json on the first run"
+    [ "$(ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      fleet_run_package_managers '{"package_managers":["homebrew","winget"]}' \
+      "$run_seed_host")" = "homebrew winget" ] ||
+      fail "the fold's own package_managers did not win over config.json"
+    [ -z "$(ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      fleet_run_package_managers '{"package_managers":[]}' "$run_seed_host")" ] ||
+      fail "an explicit empty package_managers in the fold was overridden by config.json"
     yq -e '.plugins.ponytail != null' "$run_seeded" >/dev/null ||
       fail "seeding the facts cost the observed surfaces"
     # A fact already in the host file WINS: someone wrote it deliberately and
@@ -1224,7 +1261,8 @@ JSONC
       fail "fleet-seed refused a machine whose config states no facts"
     [ -f "$run_seeded" ] ||
       fail "the seed wrote a different host file than the fixture expects"
-    yq -e '.platform == null and .groups == null and .plugins.ponytail != null' \
+    yq -e '.platform == null and .groups == null and .package_managers == null and
+      .plugins.ponytail != null' \
       "$run_seeded" >/dev/null ||
       fail "an unlisted machine had facts invented for it"
     # An ABSENT field and an empty list are different answers, and the doctor
