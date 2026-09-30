@@ -274,9 +274,16 @@ once the host reconnects.
   after applying blocks promotion. There is no failover.
   - **Why condition 3 still has teeth at wait 0.** Condition 3 accepts any record at or after
     `applied_at + wait`, so with a wait of 0 the apply record would satisfy it by itself.
-    Origin-as-canary therefore requires a **later, distinct** record: the origin's completed-pass
-    record from a verification pass that it runs immediately after the apply, through the dirty
-    stamp (§6.1).
+    Origin-as-canary therefore requires a **later, distinct** record: a new journal outcome,
+    `verified {item, digest, run_id}`.
+  - **Who writes it.** The origin's next pass, which it runs immediately after the apply through
+    the dirty stamp (§6.1), writes `verified` for every item the previous pass applied that still
+    matches.
+  - **It can't be skipped.** Writing it is exempt from the §6.4 poll floor and from the heartbeat
+    throttle, so a verification pass never exits early without it.
+  - **What condition 3 then requires.** A `verified` record for the digest whose `run_id` differs
+    from that of the `applied` record. The existing `alive` heartbeat, which carries no run ID, is
+    not used.
   - A change that kills the origin's loop never produces that record, so it never promotes. The
     delay is one extra pass on the origin, which is seconds.
 - **Upstream releases use the same gate.**
