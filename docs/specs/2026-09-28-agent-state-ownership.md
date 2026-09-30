@@ -126,7 +126,8 @@ All host-local state lives under `fleet_instance_path store.run/` (the existing
 - the **dirty stamp**;
 - the **owner pointer** (§4.1);
 - **pending-confirm decisions**;
-- the per-item **refused-publish counter** (§3.3 step 6).
+- the per-item **refused-publish counter** (§3.3 step 6);
+- **conflict records**: the local value a conflict displaced (§3.3 step 3).
 
 For each item, the baseline is the value this host last saw **agreed**: observed equal to the
 fleet value, at a commit that was fetched and is on the remote.
@@ -149,8 +150,15 @@ fleet value, at a commit that was fetched and is on the remote.
    | same | changed | converge to theirs |
    | changed | same | **local change** |
    | changed | changed, and ours = theirs | nothing; advance the baseline |
-   | changed | changed, and ours ≠ theirs | **conflict**: theirs wins; alert naming both hosts; `fleet-take-local ITEM` takes ours |
+   | changed | changed, and ours ≠ theirs | **conflict**: record ours, then theirs wins; alert naming both hosts; `fleet-take-local ITEM` publishes the recorded value |
 
+   - **Conflict records.** Before a conflict converges to theirs, the host writes a conflict
+     record holding the displaced local value. So `fleet-take-local ITEM` can still publish ours
+     after converge has overwritten it.
+     - The record is a normal item value, so it never holds a secret: tool-config secret keys are
+       never staged (§5.2).
+     - It is cleared by `fleet-take-local`, by `fleet-discard`, or when theirs changes again.
+       Theirs changing again raises a new alert.
    - **Unmanaged** is its own state.
      - A local add: base and theirs missing, ours present.
      - Base present and theirs missing means an owner edit dropped the item. Drop it from the
@@ -664,6 +672,7 @@ verbs, the token check and the task.
 | Rev 3.3 | Preference value writes could clobber Codex's concurrent writes | §5.1 per-harness writers |
 | Rev 3.3 | Descendant-only pointer freezes after a V2 re-root | §4.1 re-root catch-up |
 | PR review (CodeRabbit) | Re-seed can re-add retired plugins between P0 and P2 | §3.1; §8.2 P0 |
+| PR review (CodeRabbit) | A conflict overwrote ours, so `fleet-take-local` had nothing to publish | §3.3 conflict records |
 
 ## 10. Open decisions for the owner
 
