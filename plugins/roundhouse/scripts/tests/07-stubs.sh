@@ -454,6 +454,16 @@ winget_state_version=
   winget_state_version=$(cat "$WINGET_STATE_FILE")
 case ${1:-} in
   upgrade)
+    # WINGET_UPGRADE_FAILURE (opt-in) makes an exact upgrade fail the way a
+    # real installer does: styled progress on stdout, a secret-shaped line and
+    # then the named error on stderr, and a non-zero exit.
+    if [ -n "${WINGET_UPGRADE_FAILURE:-}" ] && [ "${2:-}" = --id ]; then
+      printf '\033[32mFound Example package [Example.Package]\033[0m\n'
+      printf '  -  \r  \\  \r  |  \n'
+      printf '%s\n' 'token ghp_abcdefghijklmnopqrstuvwxyz0123' >&2
+      printf '%s\n' "$WINGET_UPGRADE_FAILURE" >&2
+      exit 1
+    fi
     if [ -n "${WINGET_STATE_FILE:-}" ] && [ "${2:-}" = --id ]; then
       while [ $# -gt 0 ]; do
         case $1 in --version) printf '%s\n' "$2" >"$WINGET_STATE_FILE"; exit 0 ;; esac
@@ -600,6 +610,8 @@ case ${1:-} in
     ;;
   --no-tty)
     [ "${2:-}" = apply ] || exit 64
+    # CHEZMOI_APPLY_STDERR (opt-in): what apply reports while it "succeeds".
+    [ -z "${CHEZMOI_APPLY_STDERR:-}" ] || printf '%s\n' "$CHEZMOI_APPLY_STDERR" >&2
     : >"$CHEZMOI_APPLY_MARKER"
     if [ "$#" -gt 2 ]; then
       [ "${3:-}" = -- ] && [ "$#" -gt 3 ] || exit 64
