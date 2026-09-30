@@ -272,6 +272,13 @@ once the host reconnects.
   `applied` for that digest is the canary evidence. `agent_canary_wait_minutes` defaults to 0.
   `fleet_canary_gate` is otherwise unchanged, including V2 condition 3: a canary that goes silent
   after applying blocks promotion. There is no failover.
+  - **Why condition 3 still has teeth at wait 0.** Condition 3 accepts any record at or after
+    `applied_at + wait`, so with a wait of 0 the apply record would satisfy it by itself.
+    Origin-as-canary therefore requires a **later, distinct** record: the origin's completed-pass
+    record from a verification pass that it runs immediately after the apply, through the dirty
+    stamp (§6.1).
+  - A change that kills the origin's loop never produces that record, so it never promotes. The
+    delay is one extra pass on the origin, which is seconds.
 - **Upstream releases use the same gate.**
   - A canary that updates a marketplace catalog journals `applied` for a synthetic item
     `upstream.<marketplace-id>`, whose digest is the catalog revision.
@@ -291,6 +298,7 @@ once the host reconnects.
 | `posture.yaml` | Posture keys: `skipDangerousModePermissionPrompt`, `remoteControlAtStartup`, permission rules, hooks, the Roundhouse SessionStart hook (§6.1) |
 | `synced-preferences.yaml` | `config_files` managed-key declarations for agent config files (§5.1) |
 | `aliases.yaml`, `tool-schemas.yaml`, `hook-trust.yaml` | As named |
+| `tool-secrets.yaml` | Each tool secret key → its `op://` reference (§5.2) |
 | `pins.yaml` | `pin: local` exceptions per host |
 | `policy.yaml` | The **whole** policy category, including the canary member list |
 | `confirmations.yaml` | Releases of pending-confirm batches and receiver holds (§4.2), by source commit ID or item keys |
@@ -345,13 +353,22 @@ checks only newly fetched commits, and a refused non-fold file has no item to ho
   alerted, and `fleet_policy_get` reads only the owner file at the pointer.
 
 **Pinning and recovery.**
-- The genesis owner keys are pinned on each host with `roundhouse fleet-owner pin`. It runs
-  interactively in a TTY and requires a signature over a fresh challenge from an owner key, so a
-  node key or an unattended agent can't pin an owner.
+- The genesis owner keys are pinned on each host with `roundhouse fleet-owner pin --fingerprint
+  SHA256:… --fingerprint SHA256:…`.
+  - **Where the fingerprints come from.** The owner supplies them from an independent record: the
+    1Password item and the offline recovery key's card. They are **never derived from the store** or
+    any other file a node key can write.
+  - **Proving possession.** The command requires a signature over a fresh challenge from a key
+    that matches one of those fingerprints, entered interactively in a TTY.
+  - **Sealed plan.** It runs as a sealed per-target plan: exact argv including the fingerprints,
+    host identity verified first, and a precondition recheck immediately before the host-local
+    pin is written.
+  - Possession alone never establishes ownership. A node key holder who inserts its own key into
+    the store can't pass, because its fingerprint isn't one the owner typed.
 - Enrolling a new host (V2 enrollment) includes the same pin step.
 - Losing one owner key: the other one rotates it.
-- Losing both: re-run `fleet-owner pin` on every host with new keys. This is documented as the
-  recovery procedure.
+- Losing both: re-run `fleet-owner pin` on every host with the new keys' fingerprints, supplied
+  the same independent way. This is documented as the recovery procedure.
 
 **Receiving hosts** hold:
 - any fleet plugin whose marketplace isn't in `marketplaces.yaml`, or whose source doesn't match it;
@@ -458,7 +475,9 @@ keys:
 - **Keys are secret by default.** A key is plain only if the schema lists it under `plain:`, such
   as `INCLUDE_SOURCES`, and plain keys sync as preferences. Keys not in the schema are reported and
   never staged.
-- **What the store holds.** Only an `op://…` reference for each secret.
+- **What the store holds.** Only an `op://…` reference for each secret. The mapping from each
+  secret key to its reference lives in owner-controlled `fleet/owner/tool-secrets.yaml`, read at
+  the owner pointer. No node can repoint a variable at a different 1Password item.
 - **Rendering.** Each host renders the file at mode 0600 through a sealed per-target plan with its
   own `op`, or alerts if `op` is unavailable.
 - **Values are never logged or printed.** A new secret typed on one host produces an alert asking
@@ -697,6 +716,9 @@ verbs, the token check and the task.
 | PR review (CodeRabbit) | A conflict overwrote ours, so `fleet-take-local` had nothing to publish | §3.3 conflict records |
 | PR review (Codex) | Silent-pass extras and owner-dropped items would publish on the next pass | §3.3 ignored marker |
 | PR review (Codex) | Windows design bound to concrete host names | §7 roles resolved from config |
+| PR review (Codex) | Genesis owner pin authenticated only by possession | §4.1 owner-supplied fingerprints, sealed plan |
+| PR review (Codex) | Secret-reference mappings node-writable | §4.1 `tool-secrets.yaml`; §5.2 |
+| PR review (Codex) | Canary condition 3 vacuous at wait 0 | §3.6 later distinct verification-pass record |
 
 ## 10. Open decisions for the owner
 
