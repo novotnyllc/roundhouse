@@ -197,7 +197,9 @@ fleet_run_marketplace_locator_filter='
   # declaration (`extraKnownMarketplaces[n]` = {source: {source, repo|url|path}})
   # or a registration (`marketplace list --json` = {source, repo, url, path}).
   # A GitHub repository is the same source spelled as `owner/repo` or as its
-  # https/ssh git URL, so all three meet on `github:owner/repo`.
+  # https/ssh git URL, so all three meet on `github:owner/repo`. The git REF
+  # (branch or tag) is part of the identity — `#stable` and `#experimental`
+  # of one repository are two sources — and no ref is the default branch.
   #
   # fleet_run_skill_source_identity (lib/fleet-run.sh) is a sibling normaliser
   # for skill sources; P1 should merge the two into one source identity.
@@ -209,11 +211,27 @@ fleet_run_marketplace_locator_filter='
       if test("^(https://|ssh://git@|git@)github[.]com[:/]") then
         "github:" + (sub("^(https://|ssh://git@|git@)github[.]com[:/]"; "") | gh)
       else "url:" + sub("[.]git$"; "") end;
-    if $kind == "github" then "github:" + (($s.repo // "") | gh)
-    elif $kind == "git" or $kind == "url" then ($s.url | url)
+    (($s.ref // "") | tostring | if . == "" then "" else "#" + . end) as $ref |
+    if $kind == "github" then "github:" + (($s.repo // "") | gh) + $ref
+    elif $kind == "git" or $kind == "url" then ($s.url | url) + $ref
     elif $kind == "directory" then "path:" + ($s.path // "")
     else "unknown:" + ($s | tojson) end;
 '
+
+fleet_run_marketplace_registered_locator() {
+  # fleet_run_marketplace_registered_locator NAME ENTRY -> the locator of the
+  # source NAME is REGISTERED from. ENTRY is its `marketplace list --json`
+  # entry; a ref the list does not show is read from the manager's own record
+  # (plugins/known_marketplaces.json), so a pinned ref is compared, not lost.
+  fleet_run_known="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/known_marketplaces.json"
+  fleet_run_known_ref=
+  [ ! -f "$fleet_run_known" ] ||
+    fleet_run_known_ref=$(jq -r --arg n "$1" '.[$n].source.ref // empty' \
+      "$fleet_run_known" 2>/dev/null) || fleet_run_known_ref=
+  printf '%s\n' "$2" | jq -r --arg ref "$fleet_run_known_ref" \
+    "$fleet_run_marketplace_locator_filter"'
+    (if (.ref // "") == "" and $ref != "" then . + {ref: $ref} else . end) | locator'
+}
 
 fleet_run_marketplace_source() {
   # fleet_run_marketplace_source NAME -> the source the user's own synced
@@ -304,9 +322,8 @@ fleet_run_marketplace_repair_once() {
         "$fleet_run_marketplace_locator_filter"'
         .extraKnownMarketplaces[$n] // empty | locator' \
         "$fleet_run_repair_settings" 2>/dev/null) || fleet_run_repair_declared=
-    fleet_run_repair_registered=$(printf '%s\n' "$fleet_run_repair_entry" | jq -r \
-      "$fleet_run_marketplace_locator_filter"' locator' 2>/dev/null) ||
-      fleet_run_repair_registered=
+    fleet_run_repair_registered=$(fleet_run_marketplace_registered_locator "$1" \
+      "$fleet_run_repair_entry") || fleet_run_repair_registered=
     if [ -n "$fleet_run_repair_declared" ] &&
       [ "$fleet_run_repair_declared" != "$fleet_run_repair_registered" ]; then
       fleet_run_repair_reason="$1 is registered from ${fleet_run_repair_registered:-an unreadable source} but declared from $fleet_run_repair_declared (a same-name repoint)"

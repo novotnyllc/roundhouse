@@ -129,6 +129,40 @@ JSON
     run_repair_identity
     grep -Fqx test-market "$run_repair_updates" ||
       fail "the declared repo spelled as its GitHub URL read as a repoint"
+    # The REF is part of the source: a marketplace declared at `stable` and
+    # registered at `experimental` (in the list, or only in the manager's own
+    # record) is a repoint; the same ref is not.
+    printf '%s\n' '{"extraKnownMarketplaces":{"test-market":{"source":{"source":"github","repo":"owner/test-market","ref":"stable"}}}}' \
+      >"$HOME/.claude/settings.json"
+    for run_ref_case in experimental:list experimental:known stable:list stable:known; do
+      run_ref=${run_ref_case%%:*}
+      rm -f "$HOME/.claude/plugins/known_marketplaces.json"
+      if [ "${run_ref_case#*:}" = list ]; then
+        printf '%s\n' "[{\"name\":\"test-market\",\"source\":\"github\",\"repo\":\"owner/test-market\",\"ref\":\"$run_ref\",\"installLocation\":\"$run_repair_checkout\"}]" \
+          >"$run_repair_markets"
+      else
+        printf '%s\n' "[{\"name\":\"test-market\",\"source\":\"github\",\"repo\":\"owner/test-market\",\"installLocation\":\"$run_repair_checkout\"}]" \
+          >"$run_repair_markets"
+        mkdir -p "$HOME/.claude/plugins"
+        printf '%s\n' "{\"test-market\":{\"source\":{\"source\":\"github\",\"repo\":\"owner/test-market\",\"ref\":\"$run_ref\"}}}" \
+          >"$HOME/.claude/plugins/known_marketplaces.json"
+      fi
+      : >"$run_repair_updates"
+      fleet_run_marketplace_repair_reset
+      run_repair_identity
+      if [ "$run_ref" = stable ]; then
+        grep -Fqx test-market "$run_repair_updates" ||
+          fail "a marketplace registered at its declared ref read as a repoint ($run_ref_case)"
+      else
+        [ ! -s "$run_repair_updates" ] ||
+          fail "a marketplace registered at another ref was refreshed ($run_ref_case)"
+        case $fleet_run_identity_reason in
+          *'#experimental'*'#stable'*'same-name repoint'*) ;;
+          *) fail "a ref repoint was not held as one ($run_ref_case): $fleet_run_identity_reason" ;;
+        esac
+      fi
+    done
+    rm -f "$HOME/.claude/plugins/known_marketplaces.json"
     mv "$run_repair_root/manifest.saved" "$run_repair_checkout/.claude-plugin/marketplace.json"
     rm -f "$HOME/.claude/settings.json"
     # Still unproven after the refresh: hold, once, and say why.
