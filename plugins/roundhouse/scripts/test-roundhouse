@@ -162,6 +162,9 @@ if want_section 77; then . "$script_dir/tests/77-npm.sh"; fi
 if want_section 78; then . "$script_dir/tests/78-fleet-parked.sh"; fi
 # shellcheck source=tests/79-node-runtime.sh
 if want_section 79; then . "$script_dir/tests/79-node-runtime.sh"; fi
+
+# shellcheck source=tests/81-publish-verbs.sh
+if want_section 81; then . "$script_dir/tests/81-publish-verbs.sh"; fi
 # shellcheck source=tests/90-jj-bootstrap.sh
 if want_section 90; then . "$script_dir/tests/90-jj-bootstrap.sh"; fi
 # shellcheck source=tests/91-jj-integrity.sh

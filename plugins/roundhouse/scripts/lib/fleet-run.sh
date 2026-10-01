@@ -4005,17 +4005,11 @@ fleet_run_wc_foreign_paths() {
   # fleet_run_wc_foreign_paths STORE HOST — the paths @ changes that are NOT
   # HOST's own records (journal/<h>/, alerts/<h>/, findings/<h>/,
   # applied/<h>.yaml, upstreams/<id>/<h>.yaml), one per line; silence when @
-  # is clean or carries only those. Exit 65 when @ cannot be read.
-  #
-  # One awk pass, never a predicate call per path: the working copy this runs
-  # against may be a half-published 46k-file compaction.
+  # is clean or carries only those. Exit 65 when @ cannot be read. Which paths
+  # are a host's own is fleet_vcs_path_owner's table, through its one-pass
+  # form fleet_vcs_host_record_filter.
   fleet_run_wc_names=$(cd "$1" && jj diff -r @ --name-only 2>/dev/null) || return 65
-  printf '%s\n' "$fleet_run_wc_names" | awk -v h="$2" '
-    $0 == "" { next }
-    index($0, "journal/" h "/") == 1 || index($0, "alerts/" h "/") == 1 ||
-      index($0, "findings/" h "/") == 1 || $0 == "applied/" h ".yaml" { next }
-    split($0, p, "/") == 3 && p[1] == "upstreams" && p[3] == h ".yaml" { next }
-    { print }'
+  printf '%s\n' "$fleet_run_wc_names" | fleet_vcs_host_record_filter "$2"
 }
 
 fleet_run_verb_begin() {

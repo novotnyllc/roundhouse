@@ -76,6 +76,28 @@ fleet_vcs_path_owner() {
   esac
 }
 
+fleet_vcs_host_record_filter() {
+  # `… | fleet_vcs_host_record_filter HOST` — stdin: store-relative paths, one
+  # per line; stdout: every path that is NOT one of HOST's own records, i.e.
+  # every path for which fleet_vcs_path_owner would NOT answer HOST. It is that
+  # table's host-keyed rows, restated as ONE awk pass for callers that hold
+  # thousands of paths (a half-published alert compaction) and cannot afford a
+  # predicate call per path; tests/81-publish-verbs.sh walks the table to keep
+  # the two in step.
+  #
+  #   journal/<h>/… alerts/<h>/… findings/<h>/…   any depth below <h>
+  #   applied/<h>.yaml                             exactly two components
+  #   upstreams/<id>/<h>.yaml                      exactly three components
+  awk -v h="$1" '
+    $0 == "" { next }
+    { n = split($0, p, "/") }
+    (p[1] == "journal" || p[1] == "alerts" || p[1] == "findings") &&
+      n >= 3 && p[2] == h && substr($0, length(p[1]) + length(h) + 3) != "" { next }
+    p[1] == "applied" && n == 2 && p[2] == h ".yaml" { next }
+    p[1] == "upstreams" && n == 3 && p[2] != "" && p[3] == h ".yaml" { next }
+    { print }'
+}
+
 fleet_vcs_path_identity_ok() {
   # fleet_vcs_path_identity_ok <store-relative-path> <principal> <hosts-file>
   #
