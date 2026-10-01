@@ -1137,8 +1137,10 @@ fleet_run_node_converge() (
   #   full   the full cadence: also move to the newest release inside the
   #          major, which fnm never does on its own
   #
-  # Exit 0 converged (or already there), 75 held with the default untouched
-  # or restored (or a switch in progress elsewhere on this host), 76 held
+  # Exit 0 converged (or already there), 73 deferred to the full cadence (a
+  # switch whose hooks failed backs off; fleet_run_apply_held), 75 held with
+  # the default untouched or restored (or a switch in progress elsewhere on
+  # this host), 76 held
   # with the default UNVERIFIED: a switch is recorded as in flight
   # (interrupted, or failed without a verified restore), so nothing may run
   # npm under the runtime. A recorded switch is handled FIRST, before any
@@ -1204,7 +1206,8 @@ fleet_run_node_converge() (
   # retries it (once per full pass).
   if [ "$node_mode" != full ] &&
     node_switch_backoff_matches "$node_target" "$node_plan_carry" "$node_plan_hooks"; then
-    node_hold "the post-switch hooks failed for this exact switch to $node_target; it is retried on the next full pass, or when the target, the carry or the hooks change"
+    printf '  hold  runtimes.node — %s\n' "the post-switch hooks failed for this exact switch to $node_target; it is retried on the next full pass, or when the target, the carry or the hooks change"
+    exit 73
   fi
   printf '  switch runtimes.node %s -> %s (carrying %s)\n' "$node_current" "$node_target" \
     "$(printf '%s\n' "$node_plan" | jq -r '[.carry[] | "\(.name)@\(.version)"] |
@@ -1487,12 +1490,13 @@ fleet_run_apply_item() {
       [ "$fleet_run_name" = node ] || return 75
       [ "$(fleet_run_state_of "$5")" = enabled ] || return 70
       # 76 (a switch recorded in flight) passes through so the run alerts it
-      # as an unverified default; every other failure is a plain hold. The
+      # as an unverified default, and 73 (a backed-off switch) so the full
+      # cadence still retries it; every other failure is a plain hold. The
       # npm pass reads the in-flight record itself.
       fleet_run_node_status=0
       fleet_run_node_converge "$5" "$3" apply || fleet_run_node_status=$?
       case $fleet_run_node_status in
-        0 | 76) return "$fleet_run_node_status" ;;
+        0 | 73 | 76) return "$fleet_run_node_status" ;;
         *) return 75 ;;
       esac
       ;;
@@ -2144,31 +2148,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
           "$run_item"
         ;;
       *)
-        fleet_run_runtime_hold "$run_item" "apply status $run_status" \
-          "$run_tmp/sigholds" || exit 65
-        [ "$run_category" != runtimes ] ||
-          fleet_run_node_alert "$run_store" "$run_host" "$run_status" "$run_item"
-        [ "$run_status" -ne 75 ] || [ "$run_category" != packages ] ||
-          fleet_alert_write "$run_store" "$run_host" package-hold \
-            "package-hold-$(printf '%s' "$run_item" | tr './' '--')" \
-            "no package manager on this host can provide $run_item" "$run_item" ||
-          :
-        # §5.1.3's one carried-over behaviour: an enabled hook this host does
-        # not trust is REPORTED by name, not silently skipped. The gate is
-        # re-read for its reason rather than the apply path returning one,
-        # because an exit status that carries prose is an exit status nobody
-        # can test.
-        [ "$run_status" -ne 75 ] || [ "$run_category" != hooks ] ||
-          fleet_alert_write "$run_store" "$run_host" enabled-but-untrusted \
-            "enabled-but-untrusted-$(printf '%s' "$run_item" | tr './' '--')" \
-            "$(fleet_hook_trust "$run_store" "$run_host" "$run_defs" \
-              "${run_item#hooks.}" || :)" "$run_item" ||
-          :
-        fleet_journal_append "$run_store" "$run_host" \
-          "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
-            '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
-        printf '  held    %s (this host could not apply it, or a gate refused)\n' \
-          "$run_item"
+        fleet_run_apply_held "$run_store" "$run_host" "$run_defs" "$run_item" \
+          "$run_category" "$run_digest" "$run_status" "$run_tmp" "$run_now" || exit 65
         ;;
     esac
   done 9<"$run_tmp/verdicts"
@@ -2444,6 +2425,48 @@ fleet_run_hold_items_into_verdicts() {
   mv -f "$fleet_run_held_verdicts" "$2"
 }
 
+fleet_run_apply_held() {
+  # fleet_run_apply_held STORE HOST DEFS ITEM CATEGORY DIGEST STATUS TMP NOW —
+  # the run loop's answer to an apply that neither applied (0) nor was
+  # satisfied (70): the run-local hold the full cadence consumes, the alert
+  # that names why, the `held` journal entry, and the line. STATUS 73 is a
+  # DEFERRAL rather than a refusal: the host can apply the item, but not
+  # now, because a Node runtime switch is in flight or backing off on it
+  # (lib/node-runtime.sh). It still journals `held`, and its hold line is
+  # distinct so the full cadence's Node step can still make the retry the
+  # backoff promises (fleet_run_full_node_runtime).
+  fleet_run_runtime_hold "$4" "apply status $7" "$8/sigholds" || return 65
+  [ "$5" != runtimes ] || fleet_run_node_alert "$1" "$2" "$7" "$4"
+  [ "$7" -ne 75 ] || [ "$5" != packages ] ||
+    fleet_alert_write "$1" "$2" package-hold \
+      "package-hold-$(printf '%s' "$4" | tr './' '--')" \
+      "no package manager on this host can provide $4" "$4" ||
+    :
+  [ "$7" -ne 73 ] || [ "$5" != packages ] ||
+    fleet_alert_write "$1" "$2" package-deferred \
+      "package-deferred-$(printf '%s' "$4" | tr './' '--')" \
+      "$4 is not installed while a Node runtime switch is in flight on this host" "$4" ||
+    :
+  # §5.1.3's one carried-over behaviour: an enabled hook this host does
+  # not trust is REPORTED by name, not silently skipped. The gate is
+  # re-read for its reason rather than the apply path returning one,
+  # because an exit status that carries prose is an exit status nobody
+  # can test.
+  [ "$7" -ne 75 ] || [ "$5" != hooks ] ||
+    fleet_alert_write "$1" "$2" enabled-but-untrusted \
+      "enabled-but-untrusted-$(printf '%s' "$4" | tr './' '--')" \
+      "$(fleet_hook_trust "$1" "$2" "$3" "${4#hooks.}" || :)" "$4" ||
+    :
+  fleet_journal_append "$1" "$2" \
+    "$(jq -cn --arg item "$4" --arg d "$6" --arg at "$9" \
+      '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
+  if [ "$7" -eq 73 ]; then
+    printf '  held    %s (deferred: a Node runtime switch is in flight or backing off on this host)\n' "$4"
+  else
+    printf '  held    %s (this host could not apply it, or a gate refused)\n' "$4"
+  fi
+}
+
 fleet_run_runtime_hold() {
   # fleet_run_runtime_hold ITEM REASON HOLDS_FILE — carry an apply-time
   # refusal into the same temporary hold surface the full cadence consumes.
@@ -2525,9 +2548,9 @@ fleet_run_node_held() {
 fleet_run_node_alert() {
   # `fleet_run_node_alert STORE HOST STATUS ITEM` — the one mapping from a
   # Node convergence status to its alert, for the fast and full cadences
-  # alike: 75 held, 76 unverified default, anything else none.
+  # alike: 73 deferred and 75 held, 76 unverified default, anything else none.
   case $3 in
-    75) fleet_run_node_held "$1" "$2" "$4" ;;
+    73 | 75) fleet_run_node_held "$1" "$2" "$4" ;;
     76) fleet_run_node_unverified "$1" "$2" ;;
   esac
 }
@@ -2544,10 +2567,18 @@ fleet_run_full_node_runtime() (
   node_full_host=$2
   node_full_runtime=$(printf '%s\n' "$3" | jq -c '(.runtimes // {}).node // empty')
   node_full_wanted=false
+  # The apply loop's DEFERRAL of a backed-off switch (apply status 73,
+  # fleet_run_apply_held) is not a refusal: this step is the retry it
+  # promises, so only the other hold lines count here.
+  node_full_holds=${5:+$5/sigholds}
+  if [ -f "${node_full_holds:-}" ]; then
+    { grep -Fvx 'runtimes.node apply status 73' "$5/sigholds" || :; } >"$5/sigholds.node"
+    node_full_holds=$5/sigholds.node
+  fi
   if [ -n "$node_full_runtime" ] &&
     [ "$(fleet_run_state_of "$node_full_runtime")" = enabled ] &&
     ! { [ -n "$5" ] &&
-      fleet_run_item_is_held runtimes.node "" "$5/sigholds" "$5/verdicts"; }; then
+      fleet_run_item_is_held runtimes.node "" "$node_full_holds" "$5/verdicts"; }; then
     node_full_wanted=true
   fi
   if [ "$node_full_wanted" != true ]; then

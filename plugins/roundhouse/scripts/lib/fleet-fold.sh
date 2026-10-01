@@ -927,8 +927,10 @@ fleet_install_package() {
       # version when there is one.
       npm_global_bin_dir >/dev/null 2>&1 || return 75
       # A Node switch recorded in flight leaves the runtime unverified (or
-      # mid-switch): no npm install runs under it (lib/node-runtime.sh).
-      [ -z "$(node_switch_marker_read)" ] || return 75
+      # mid-switch): no npm install runs under it (lib/node-runtime.sh). 73
+      # is a deferral with its own alert, not "no manager can provide it"
+      # (fleet_run_apply_held).
+      [ -z "$(node_switch_marker_read)" ] || return 73
       npm_global_install "$2" "${4:-}" || return 1
       npm_install_version=$(npm_global_installed_version "$2") || return 1
       [ -n "$npm_install_version" ] || return 1

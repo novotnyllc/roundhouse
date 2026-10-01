@@ -221,8 +221,9 @@ the updater, and the Windows collector under pwsh. `apply-windows.ps1
 that keeps its globals per prefix: version grammar and numeric ordering, the
 `runtimes.node` grammar, the release list (LTS codenames, a failed query),
 switch refusals that change nothing (a carry not installed, a hook that is not
-a bin of its package or of a carried one, shell syntax), restore of the
-default after a failed carry, a failed hook and a failed install, a
+a bin of its package or of a carried one, shell syntax), a failed carry, a
+failed install and a failed reconcile that never move the default (no `fnm
+default` call, no in-flight record), a failed hook that restores it, a
 successful switch that carries exactly the installed globals and runs the hook
 under the new node while leaving the old version and its globals intact, the
 carry and hook plan (store-only and mismatched hooks hold, host-only hooks
@@ -236,8 +237,10 @@ carry, argv, candidate or runtime id), a failed sealed switch that restores
 and reports `partial` and invalidates its plan, a completed sealed switch with
 its post-state, the switch lock and in-flight record (a recovery leaves a
 running switch alone, a stale lock is taken over, a live writer defers
-recovery, `node-switch-clear` refuses without a verified default), the
-hook-failure backoff, npm mutations refused while a switch is in flight (fast
+recovery, two contenders for a stale lock never both take it, a holder's
+start time reads the same under any TZ, `node-switch-clear` refuses without a
+verified default and clears a backoff), the hook-failure backoff (including
+the run loop deferring a backed-off switch to the same run's full pass), npm mutations refused while a switch is in flight (fast
 install, seal, apply), and, under pwsh, the Windows pin and scope record and
 the machine-scope hold. `collect-windows.ps1 -SelfTest` covers the pin parser.
 
@@ -379,8 +382,18 @@ recovery, in every lane: the scheduled run, `fleet-apply`, and a sealed
 local or SSH apply. A second switch exits 75 without touching anything; a
 recovery that finds the lock held by a live process leaves the switch alone
 (§7.5). A lock whose holder is gone (killed mid-switch) is stale and is
-taken over; the in-flight record, not the lock, says whether anything needs
-rolling back.
+taken over, under a second mutex (`node-switch.lock.break`) and only after
+re-reading that the lock still has the owner judged stale, so two contenders
+can never both take it; the in-flight record, not the lock, says whether
+anything needs rolling back. Start times are read in UTC and the C locale,
+so lanes with different `TZ` agree on whether a holder is alive.
+
+The lock does not reuse the run lock (`fleet_lock_*`) for three reasons. Its
+holder is named by PID **and start time**, so a recycled PID never looks
+like a live holder. A run must be able to recover a switch interrupted
+inside that same kind of run, which a lock held by the run itself would
+block. And `collect-posix`, which reports the record, does not source
+`fleet-store.sh`, where the run lock lives.
 
 **The in-flight record** (`node-switch-inflight.json`: `{old, target,
 carry, writer: {pid, start}}`) is host-local and outside the store. It is
@@ -404,7 +417,8 @@ it: `roundhouse node-switch-clear` takes the lock, refuses while the record's
 writer is running, and clears the record only when the CURRENT default is
 self-consistent (`node_default_verified`) and its npm globals list. It never
 clears blindly; with no fnm default or an inconsistent one it exits 65 and
-says to set one (`fnm default <version>`) first. The next run converges
+says to set one (`fnm default <version>`) first. It also clears the
+post-switch hook backoff (§7.5). The next run converges
 `runtimes.node` from that default. Hooks the interrupted switch did not
 finish are not rerun, so run them by hand if they matter.
 
@@ -496,16 +510,21 @@ requirement is a floor.
   `node-runtime-unverified`, and refuses every npm mutation while the record
   exists: the npm part of every full cadence's package pass (`hold  packages
   (npm) — Node default is unverified …`), a fast-pass install of an npm
-  package (held), and sealed `npm:*` upgrades (§7.6). Brew, winget and the
+  package (deferred, apply status 73, with its own `package-deferred` alert
+  rather than "no package manager can provide it"), and sealed `npm:*`
+  upgrades (§7.6). Brew, winget and the
   rest of the pass still run. An ordinary hold, which leaves the default
   untouched or restored, skips nothing.
 - **Backoff for a hook that keeps failing.** A failed hook restores the old
   default, and the attempt (target, carry, hooks) is recorded. The reviewed
-  apply holds that exact attempt without flipping (`hold  runtimes.node —
-  the post-switch hooks failed for this exact switch …`) until the target,
-  the carry or the hooks change; the full cadence retries it, so a fixed
-  hook is picked up at most one full interval later. A successful switch
-  clears the record. Without it, a hook that always fails would flip and
+  apply DEFERS that exact attempt without flipping (`hold  runtimes.node —
+  the post-switch hooks failed for this exact switch …`, apply status 73)
+  until the target, the carry or the hooks change. The run loop journals a
+  deferral as `held`, but records it with its own hold line, which the full
+  cadence's Node step does not count as a hold: that step is the retry, so
+  a fixed hook is picked up at most one full interval later, with or without
+  a store change. Any other hold of `runtimes.node` still stops the full
+  cadence. A successful switch, or `node-switch-clear`, clears the record. Without it, a hook that always fails would flip and
   restore the live default on every fast pass.
 - A `runtimes.node` hold that persists is not silent: every held run writes
   a `runtime-hold` alert naming the item (`runtime-hold-runtimes-node`).
@@ -652,6 +671,14 @@ its local hooks. Sealing on the target itself works too.
   argv validation (`fleet_resolve_argv_valid`); removing the unused
   `node_version_normalize`; folding the thin wrappers around `node_fnm_run`;
   and extracting the hook-proof loop in `collect-posix` into lib/npm.sh.
+  Also deferred from the final review: one PID-and-start-time lock helper
+  shared with any other host-local lock; a single mapping from recovery
+  results (0/74/75/76) to run outcomes; a `node_state_write` helper for the
+  three state files; a `node_switch_in_flight` predicate in place of the
+  `[ -n "$(node_switch_marker_read)" ]` idiom; an npm-neutral prefix for
+  `release_newer`'s home; splitting the switch state (lock, record,
+  backoff) into its own `node-switch-state.sh`; and binding the parsed value
+  once (`as $n`) in `node_runtime_spec`.
   `seal-plan` keeps its own "at most one Node switch" check in front of the
   shared operation validator, because the validator reports only "invalid
   plan draft" and the specific message is what an operator needs.

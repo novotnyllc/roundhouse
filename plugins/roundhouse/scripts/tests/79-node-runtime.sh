@@ -720,6 +720,52 @@ nrt_reset
   node_runtime_switch v26.10.0 "$nrt_carry" "$nrt_hooks" >/dev/null 2>&1 &&
     [ "$(nrt_default)" = v26.10.0 ] && [ ! -e "$nrt_lock" ] ||
     fail "a stale Node switch lock was not taken over"
+  # The holder's start time reads the same in every lane, whatever its TZ.
+  sleep 600 &
+  nrt_tz_pid=$!
+  [ -n "$(TZ=America/Los_Angeles node_process_start "$nrt_tz_pid")" ] &&
+    [ "$(TZ=America/Los_Angeles node_process_start "$nrt_tz_pid")" = \
+      "$(TZ=Asia/Kolkata node_process_start "$nrt_tz_pid")" ] &&
+    TZ=Asia/Kolkata node_process_live "$nrt_tz_pid" \
+      "$(TZ=America/Los_Angeles node_process_start "$nrt_tz_pid")" ||
+    fail "a lock holder's start time depended on the reader's TZ"
+  kill "$nrt_tz_pid" 2>/dev/null || :
+  wait "$nrt_tz_pid" 2>/dev/null || :
+  # Two contenders that both judge the same lock stale cannot both take it:
+  # the takeover re-checks the owner under its own mutex. The second one
+  # acts only after the first has taken the lock, the window in which a
+  # takeover without that re-check removes a live lock.
+  nrt_reset
+  sh -c 'exit 0' &
+  nrt_dead_pid=$!
+  wait "$nrt_dead_pid" || :
+  mkdir -p "$nrt_lock"
+  printf '%s\n%s\n' "$nrt_dead_pid" 'Thu Jan  1 00:00:00 1970' >"$nrt_lock/owner"
+  nrt_contend() {
+    (
+      nrt_contender=${BASHPID:-$(exec sh -c "$node_self_pid_sh")}
+      nrt_contend_status=0
+      ROUNDHOUSE_TEST_NODE_LOCK_DELAY=$3 node_switch_lock_take "$nrt_contender" ||
+        nrt_contend_status=$?
+      printf '%s\n' "$nrt_contend_status" >"$1"
+      # Stay alive, holding whatever was taken, until both have answered.
+      nrt_contend_wait=0
+      until [ -s "$2" ] || [ "$nrt_contend_wait" -ge 300 ]; do
+        sleep 0.1
+        nrt_contend_wait=$((nrt_contend_wait + 1))
+      done
+    ) &
+  }
+  rm -f "$nrt_root/contend-a" "$nrt_root/contend-b"
+  nrt_contend "$nrt_root/contend-a" "$nrt_root/contend-b" 0.5
+  nrt_contend_a=$!
+  nrt_contend "$nrt_root/contend-b" "$nrt_root/contend-a" 2
+  nrt_contend_b=$!
+  wait "$nrt_contend_a" || :
+  wait "$nrt_contend_b" || :
+  [ "$(sort "$nrt_root/contend-a" "$nrt_root/contend-b" | tr '\n' ' ')" = '0 75 ' ] ||
+    fail "two contenders both took a stale Node switch lock ($(cat "$nrt_root/contend-a" "$nrt_root/contend-b" | tr '\n' ' '))"
+  rm -rf "$nrt_lock" "$nrt_lock.break"
   # A lock held by a live process refuses a switch and defers a recovery;
   # so does a record whose own writer is still running.
   nrt_reset
@@ -755,8 +801,18 @@ nrt_reset
   : >"$nrt_log"
   nrt_status=0
   fleet_install_package npm plain false 3.0.0 || nrt_status=$?
-  [ "$nrt_status" -eq 75 ] && ! grep -Fq 'npm install' "$nrt_log" ||
+  [ "$nrt_status" -eq 73 ] && ! grep -Fq 'npm install' "$nrt_log" ||
     fail "a fast-pass npm install ran while a Node switch was in flight (status $nrt_status)"
+  # The run names it as a deferral, not as a package no manager provides.
+  rm -rf "$nrt_root/store/alerts"
+  : >"$nrt_root/full-tmp/sigholds"
+  fleet_run_apply_held "$nrt_root/store" nrt-host "$nrt_defs" packages.plain packages d0 73 \
+    "$nrt_root/full-tmp" 2026-10-01T00:00:00Z >"$nrt_root/deferred-out"
+  grep -Fq '  held    packages.plain (deferred: a Node runtime switch is in flight' "$nrt_root/deferred-out" &&
+    ls "$nrt_root/store/alerts/nrt-host/"*package-deferred-packages-plain* >/dev/null 2>&1 &&
+    ! ls "$nrt_root/store/alerts/nrt-host/"*package-hold* >/dev/null 2>&1 ||
+    fail "an npm install deferred by a Node switch was reported as an unprovidable package"
+  : >"$nrt_root/full-tmp/sigholds"
   rm -f "$nrt_marker"
 
   # --- a hook that keeps failing is not flipped on every fast pass ------------
@@ -770,13 +826,50 @@ nrt_reset
   : >"$nrt_log"
   nrt_status=0
   NRT_HOOK_FAIL=1 nrt_converge local-declared '{"major":27}' apply || nrt_status=$?
-  [ "$nrt_status" -eq 75 ] && ! grep -Fq 'fnm default' "$nrt_log" &&
+  [ "$nrt_status" -eq 73 ] && ! grep -Fq 'fnm default' "$nrt_log" &&
     grep -Fq 'the post-switch hooks failed for this exact switch to v27.0.0' "$nrt_root/converge-out" ||
     fail "the reviewed apply flipped the default again for a switch whose hooks keep failing"
   nrt_converge local-declared '{"major":27}' full ||
     fail "the full cadence did not retry a backed-off switch"
   [ "$(nrt_default)" = v27.0.0 ] && [ ! -e "$nrt_backoff" ] ||
     fail "a successful retry did not clear the backoff"
+  # Through the run loop itself: the apply loop DEFERS the backed-off
+  # switch (73) and records that with the loop's own hold code
+  # (fleet_run_apply_held); the full pass of the same run must still make
+  # the retry the backoff promises. A plain hold would have stopped it, and
+  # the switch would never be retried.
+  nrt_reset
+  : >"$nrt_root/full-tmp/sigholds"
+  : >"$nrt_root/full-tmp/verdicts"
+  nrt_status=0
+  NRT_HOOK_FAIL=1 ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
+    fleet_run_apply_item "$nrt_root/store" nrt-host "$nrt_defs" runtimes.node '{"major":27}' \
+    "homebrew npm" >/dev/null 2>&1 || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v26.0.0 ] && [ -e "$nrt_backoff" ] ||
+    fail "the reviewed apply of a failing switch did not restore and back off (status $nrt_status)"
+  nrt_status=0
+  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
+    fleet_run_apply_item "$nrt_root/store" nrt-host "$nrt_defs" runtimes.node '{"major":27}' \
+    "homebrew npm" >/dev/null 2>&1 || nrt_status=$?
+  [ "$nrt_status" -eq 73 ] && [ "$(nrt_default)" = v26.0.0 ] ||
+    fail "the reviewed apply did not defer a backed-off switch (status $nrt_status)"
+  fleet_run_apply_held "$nrt_root/store" nrt-host "$nrt_defs" runtimes.node runtimes d0 "$nrt_status" \
+    "$nrt_root/full-tmp" 2026-10-01T00:00:00Z >/dev/null
+  grep -Fqx 'runtimes.node apply status 73' "$nrt_root/full-tmp/sigholds" ||
+    fail "the run loop did not record the deferral"
+  nrt_run_full '{"packages":{"svc":"enabled","plain":"enabled"},"package_managers":["homebrew","npm"],"runtimes":{"node":{"major":27}}}'
+  [ "$(nrt_default)" = v27.0.0 ] && [ ! -e "$nrt_backoff" ] ||
+    fail "the full pass did not retry a switch the run loop had deferred"
+  # Any other hold of the item still stops the full pass.
+  nrt_reset
+  printf '%s\n' 'runtimes.node apply status 75' >"$nrt_root/full-tmp/sigholds"
+  nrt_run_full '{"packages":{"svc":"enabled","plain":"enabled"},"package_managers":["homebrew","npm"],"runtimes":{"node":{"major":27}}}'
+  [ "$(nrt_default)" = v26.0.0 ] || fail "the full pass switched a runtime the run loop held"
+  : >"$nrt_root/full-tmp/sigholds"
+  # node-switch-clear also clears a backoff.
+  node_switch_backoff_write v27.0.0 '[]' '[]'
+  node_switch_clear >/dev/null 2>&1 && [ ! -e "$nrt_backoff" ] ||
+    fail "node-switch-clear did not clear the post-switch hook backoff"
 
   # --- the carry runs under an npm no older than the host's -------------------
   # npm 12 honours allow-scripts; a target that bundles npm 11 is brought up to

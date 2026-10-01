@@ -366,8 +366,10 @@ node_switch_backoff_path() (
 node_process_start() (
   # `node_process_start PID` — when PID started, as ps prints it, or nothing.
   # PID and start time together name one process: a recycled PID starts
-  # at another time.
-  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' | head -1
+  # at another time. Always in UTC and the C locale: ps prints local time,
+  # and lanes whose TZ differs (launchd, an SSH worker, a shell) must read
+  # the same holder the same way.
+  TZ=UTC0 LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' | head -1
 )
 
 node_process_live() (
@@ -377,19 +379,44 @@ node_process_live() (
   [ "$(node_process_start "$1")" = "$2" ]
 )
 
+node_switch_lock_owner() (
+  # The lock's owner file as written (PID, then start time), or nothing.
+  cat "$(node_switch_lock_path)/owner" 2>/dev/null || :
+)
+
+node_switch_lock_stale() (
+  # `node_switch_lock_stale OWNER` — OWNER (node_switch_lock_owner's text)
+  # no longer holds the lock: its process is gone, or, with no owner
+  # written, the lock directory is over a minute old (a taker killed between
+  # its mkdir and its owner write). A young owner-less lock is a taker
+  # mid-write, and live.
+  node_stale_pid=$(printf '%s\n' "$1" | sed -n 1p)
+  node_stale_start=$(printf '%s\n' "$1" | sed -n 2p)
+  if [ -z "$node_stale_pid" ]; then
+    [ -n "$(find "$(node_switch_lock_path)" -maxdepth 0 -mmin +1 2>/dev/null)" ]
+    exit
+  fi
+  ! node_process_live "$node_stale_pid" "$node_stale_start"
+)
+
 node_switch_lock_take() (
   # `node_switch_lock_take PID` — take the host's one Node switch lock for
   # process PID (the caller's own subshell). mkdir is the atomic step; the
   # owner file names the holder by PID and start time. Exit 0 taken, 75 held
-  # by a live process, 1 when the state directory is unusable. A lock whose
-  # holder is gone (killed mid-switch) is stale and is taken over: the
-  # in-flight record, not the lock, says whether anything needs rolling back.
+  # by a live process, 1 when the state directory is unusable.
+  #
+  # A lock whose holder is gone (killed mid-switch) is stale and is taken
+  # over, but only under a second mutex (`.break`), re-checking under it
+  # that the lock still has the owner judged stale. Without that, two
+  # contenders that both judged it stale could both take it: the second
+  # would remove the lock the first had just created. The in-flight record,
+  # not the lock, says whether anything needs rolling back.
   node_lock=$(node_switch_lock_path)
   (umask 077 && mkdir -p "${node_lock%/*}") || exit 1
   node_lock_start=$(node_process_start "$1")
   [ -n "$node_lock_start" ] || exit 1
   node_lock_try=0
-  while [ "$node_lock_try" -lt 3 ]; do
+  while [ "$node_lock_try" -lt 50 ]; do
     node_lock_try=$((node_lock_try + 1))
     if mkdir "$node_lock" 2>/dev/null; then
       printf '%s\n%s\n' "$1" "$node_lock_start" >"$node_lock/owner" || {
@@ -398,19 +425,36 @@ node_switch_lock_take() (
       }
       exit 0
     fi
-    node_lock_owner=$(sed -n 1p "$node_lock/owner" 2>/dev/null) || node_lock_owner=
-    node_lock_owner_start=$(sed -n 2p "$node_lock/owner" 2>/dev/null) || node_lock_owner_start=
-    if [ -z "$node_lock_owner" ]; then
-      # Between another taker's mkdir and its owner write (young: live), or
-      # left by one killed in that instant (a minute old: stale).
-      [ ! -d "$node_lock" ] ||
-        [ -n "$(find "$node_lock" -maxdepth 0 -mmin +1 2>/dev/null)" ] || exit 75
-    elif node_process_live "$node_lock_owner" "$node_lock_owner_start"; then
-      exit 75
+    node_lock_seen=$(node_switch_lock_owner)
+    [ -d "$node_lock" ] || continue
+    node_switch_lock_stale "$node_lock_seen" || exit 75
+    # Test-only, inert outside the self-check: widens the window between
+    # judging the lock stale and breaking it.
+    if [ "${ROUNDHOUSE_SELFTEST:-0}" = 1 ] && [ -n "${ROUNDHOUSE_TEST_NODE_LOCK_DELAY:-}" ]; then
+      sleep "$ROUNDHOUSE_TEST_NODE_LOCK_DELAY"
     fi
-    # Stale: rename it aside (one taker wins the rename), then try again.
-    rm -rf "$node_lock.stale.$1"
-    mv "$node_lock" "$node_lock.stale.$1" 2>/dev/null && rm -rf "$node_lock.stale.$1"
+    if mkdir "$node_lock.break" 2>/dev/null; then
+      if [ -d "$node_lock" ] && [ "$(node_switch_lock_owner)" = "$node_lock_seen" ]; then
+        rm -rf "$node_lock"
+        if mkdir "$node_lock" 2>/dev/null; then
+          printf '%s\n%s\n' "$1" "$node_lock_start" >"$node_lock/owner" || {
+            rm -rf "$node_lock"
+            rmdir "$node_lock.break" 2>/dev/null || :
+            exit 1
+          }
+          rmdir "$node_lock.break" 2>/dev/null || :
+          exit 0
+        fi
+      fi
+      rmdir "$node_lock.break" 2>/dev/null || :
+    else
+      # Another contender is breaking it. A break mutex its breaker was
+      # killed holding is abandoned after a minute.
+      if [ -n "$(find "$node_lock.break" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+        rmdir "$node_lock.break" 2>/dev/null || :
+      fi
+      sleep 0.1
+    fi
   done
   exit 75
 )
@@ -511,6 +555,25 @@ node_switch_restore() (
   node_default_verified "$1" "$2" || exit 70
 )
 
+node_switch_lock_enter() {
+  # Brace function, on purpose: it runs in the CALLER's subshell, so the
+  # PID it records is the caller's and the release trap is the caller's
+  # EXIT trap. Sets node_self. Returns 0 holding the lock, 75 when a live
+  # process holds it, 69 when it cannot be taken. The one way into the lock
+  # for a switch, a recovery and node-switch-clear.
+  node_self=${BASHPID:-$(exec sh -c "$node_self_pid_sh")}
+  node_lock_status=0
+  node_switch_lock_take "$node_self" || node_lock_status=$?
+  case $node_lock_status in
+    0)
+      trap 'node_switch_lock_release "$node_self"' EXIT
+      return 0
+      ;;
+    75) return 75 ;;
+    *) return 69 ;;
+  esac
+}
+
 node_switch_recover() (
   # For a run that finds a switch in flight: restore the recorded old
   # default, verified, and clear the record, under the switch lock. Exit 0
@@ -519,15 +582,13 @@ node_switch_recover() (
   # when a switch was rolled back (the run holds; the switch is retried
   # later), 76 when it could not be (the default stays unverified).
   [ -n "$(node_switch_marker_read)" ] || exit 0
-  node_self=${BASHPID:-$(exec sh -c "$node_self_pid_sh")}
   node_recover_lock=0
-  node_switch_lock_take "$node_self" || node_recover_lock=$?
+  node_switch_lock_enter || node_recover_lock=$?
   case $node_recover_lock in
     0) ;;
     75) exit 74 ;;
     *) exit 76 ;;
   esac
-  trap 'node_switch_lock_release "$node_self"' EXIT
   node_marker=$(node_switch_marker_read)
   [ -n "$node_marker" ] || exit 0
   ! node_switch_writer_live "$node_marker" || exit 74
@@ -546,14 +607,19 @@ node_switch_clear() (
   # never clears blindly: no switch may be running, and the CURRENT default
   # must be self-consistent (node_default_verified) with its npm globals
   # listable. The next run then converges `runtimes.node` from that default.
+  # It also clears the post-switch hook backoff.
   node_marker=$(node_switch_marker_read)
   [ -n "$node_marker" ] || {
-    printf 'roundhouse: no Node switch is recorded in flight; nothing to clear\n'
+    if [ -e "$(node_switch_backoff_path)" ]; then
+      node_switch_backoff_clear
+      printf 'roundhouse: no Node switch is recorded in flight; cleared the post-switch hook backoff\n'
+    else
+      printf 'roundhouse: no Node switch is recorded in flight; nothing to clear\n'
+    fi
     exit 0
   }
-  node_self=${BASHPID:-$(exec sh -c "$node_self_pid_sh")}
   node_clear_lock=0
-  node_switch_lock_take "$node_self" || node_clear_lock=$?
+  node_switch_lock_enter || node_clear_lock=$?
   case $node_clear_lock in
     0) ;;
     75)
@@ -565,7 +631,6 @@ node_switch_clear() (
       exit 69
       ;;
   esac
-  trap 'node_switch_lock_release "$node_self"' EXIT
   node_marker=$(node_switch_marker_read)
   [ -n "$node_marker" ] || exit 0
   ! node_switch_writer_live "$node_marker" || {
@@ -590,6 +655,8 @@ node_switch_clear() (
     exit 65
   }
   node_switch_marker_clear
+  # Its backoff goes with it: the next run starts from the verified default.
+  node_switch_backoff_clear
   printf 'roundhouse: cleared the in-flight Node switch %s -> %s; the fnm default is %s (verified). Hooks that switch did not finish are not rerun: run them by hand if needed.\n' \
     "$(printf '%s\n' "$node_marker" | jq -r '.old // "?"')" \
     "$(printf '%s\n' "$node_marker" | jq -r '.target // "?"')" "$node_clear_current"
@@ -632,9 +699,8 @@ node_runtime_switch() (
   node_carry=$2
   node_hooks=$3
   node_switch_args_valid
-  node_self=${BASHPID:-$(exec sh -c "$node_self_pid_sh")}
   node_switch_lock=0
-  node_switch_lock_take "$node_self" || node_switch_lock=$?
+  node_switch_lock_enter || node_switch_lock=$?
   case $node_switch_lock in
     0) ;;
     75)
@@ -646,7 +712,6 @@ node_runtime_switch() (
       exit 69
       ;;
   esac
-  trap 'node_switch_lock_release "$node_self"' EXIT
   node_switch_preflight
   node_switch_stage
   node_switch_flip

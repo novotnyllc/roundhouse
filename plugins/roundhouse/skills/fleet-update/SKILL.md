@@ -257,10 +257,12 @@ rolled back reports the default as unverified, alerts
 npm step, fast-pass npm installs, sealed `npm:*` upgrades) until it is
 resolved. When the old version is gone for good, set a working default
 (`fnm default <version>`) and run `roundhouse node-switch-clear`: it clears
-the record only if no switch is running and the current default verifies.
-A post-switch hook that fails restores the old default, and the reviewed
-apply then holds that exact attempt instead of flipping again every fast
-pass; the full cadence retries it. A `runtimes.node` hold of any kind also
+the record (and any hook backoff) only if no switch is running and the
+current default verifies. A post-switch hook that fails restores the old
+default, and the reviewed apply then defers that exact attempt instead of
+flipping again every fast pass; the full cadence retries it, even in a run
+whose apply loop just deferred it. An npm install deferred by a switch in
+flight alerts `package-deferred`, not `package-hold`. A `runtimes.node` hold of any kind also
 alerts (`runtime-hold-runtimes-node`), so a persistent hold is visible.
 Hooks a definition requires are sealed from the sealing host's config; a
 hook only the target host declares cannot ride a plan sealed elsewhere (the
