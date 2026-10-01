@@ -138,47 +138,57 @@ fleet_liveness_alerts() {
   # those still in it, so a retired or expired member is not a silent one — is
   # checked for a published heartbeat inside `liveness_alert_hours`, which is
   # clamped to at least 2 × heartbeat_publish_hours. A host that has never
-  # journaled is skipped: enrolled-but-never-run is what fleet-doctor's
-  # enrollment rows are for, and alerting on it would fire for every host
-  # between `fleet-add` and its first pass.
+  # journaled is not silent: enrolled-but-never-run is what fleet-doctor's
+  # enrollment rows are for.
   #
-  # One alert per host per silence: store.run/liveness-alerted remembers who
-  # was already alerted, so a dead peer is one record and not one per pass; a
-  # host that comes back drops out of the memo and alerts afresh if it goes
-  # silent again. The detail names the host's LAST published heartbeat, a
-  # fixed fact, never the moving cutoff. Prints `stale <host>` per silent host.
+  # `stale-host` is a store-scoped CONDITION (lib/fleet-alerts.sh), one keyed
+  # alert per peer (`stale-host--<peer>.yaml`): this check raises it while the
+  # peer is silent and clears it the pass the peer is heard from again — and
+  # clears every one whose peer this pass no longer checks (left the roster or
+  # the enrolled hosts, or the alert was turned off). The detail names the
+  # peer's LAST published heartbeat, a fixed fact, never the moving cutoff; an
+  # alert already standing is left exactly as it is, so the unbounded read
+  # that detail needs happens once per silence, not once per pass.
+  # Prints `stale <host>` per silent host.
   liveness_hours=$(fleet_policy_int "$5" liveness_alert_hours)
-  [ "$liveness_hours" -gt 0 ] 2>/dev/null || return 0
-  liveness_floor=$(($(fleet_policy_int "$5" heartbeat_publish_hours) * 2))
-  [ "$liveness_hours" -ge "$liveness_floor" ] || liveness_hours=$liveness_floor
-  liveness_now=$(jq -rn --arg at "$6" '$at | fromdateiso8601') || return 1
-  liveness_cutoff=$(jq -rn --argjson e "$((liveness_now - liveness_hours * 3600))" \
-    '$e | todate') || return 1
-  liveness_memo=$(fleet_run_state_dir)/liveness-alerted
-  mkdir -p "$(dirname "$liveness_memo")"
-  : >"$liveness_memo.next"
-  while IFS= read -r liveness_peer; do
-    [ -n "$liveness_peer" ] && [ "$liveness_peer" != "$2" ] || continue
-    if [ -s "${4:-}" ]; then
-      awk -v p="$liveness_peer@" 'index($1, p) == 1 { found = 1 }
-        END { exit(found ? 0 : 1) }' "$4" || continue
-    fi
-    liveness_status=0
-    fleet_liveness_last_alive "$1" "$liveness_peer" "$liveness_cutoff" \
-      >/dev/null || liveness_status=$?
-    [ "$liveness_status" -eq 1 ] || continue
-    printf 'stale %s\n' "$liveness_peer"
-    if grep -Fqx "$liveness_peer" "$liveness_memo" 2>/dev/null; then
-      printf '%s\n' "$liveness_peer" >>"$liveness_memo.next"
-      continue
-    fi
-    # Only now, and only once per silence, the unbounded read for the detail.
-    liveness_last=$(fleet_liveness_last_alive "$1" "$liveness_peer") ||
-      liveness_last=
-    fleet_alert_write "$1" "$2" stale-host \
-      "stale-host-$(printf '%s' "$liveness_peer" | tr -c 'A-Za-z0-9._-' '-')" \
-      "$liveness_peer has published no heartbeat ${liveness_last:+since $liveness_last }in over ${liveness_hours}h; check its scheduled job (roundhouse fleet-schedule status) and its route to the store remote" &&
-      printf '%s\n' "$liveness_peer" >>"$liveness_memo.next"
-  done <"$3"
-  mv -f "$liveness_memo.next" "$liveness_memo"
+  liveness_checked=" "
+  liveness_dir="$1/alerts/$2"
+  if [ "$liveness_hours" -gt 0 ] 2>/dev/null; then
+    liveness_floor=$(($(fleet_policy_int "$5" heartbeat_publish_hours) * 2))
+    [ "$liveness_hours" -ge "$liveness_floor" ] || liveness_hours=$liveness_floor
+    liveness_now=$(jq -rn --arg at "$6" '$at | fromdateiso8601') || return 1
+    liveness_cutoff=$(jq -rn --argjson e "$((liveness_now - liveness_hours * 3600))" \
+      '$e | todate') || return 1
+    while IFS= read -r liveness_peer; do
+      [ -n "$liveness_peer" ] && [ "$liveness_peer" != "$2" ] || continue
+      if [ -s "${4:-}" ]; then
+        awk -v p="$liveness_peer@" 'index($1, p) == 1 { found = 1 }
+          END { exit(found ? 0 : 1) }' "$4" || continue
+      fi
+      liveness_slug=$(printf '%s' "$liveness_peer" | tr -c 'A-Za-z0-9._-' '-')
+      liveness_checked="$liveness_checked$liveness_slug "
+      liveness_status=0
+      fleet_liveness_last_alive "$1" "$liveness_peer" "$liveness_cutoff" \
+        >/dev/null || liveness_status=$?
+      if [ "$liveness_status" -ne 1 ]; then
+        fleet_alert_set "$1" "$2" stale-host "$liveness_slug" false '' || :
+        continue
+      fi
+      printf 'stale %s\n' "$liveness_peer"
+      [ ! -f "$liveness_dir/$(fleet_alert_name stale-host "$liveness_slug")" ] || continue
+      liveness_last=$(fleet_liveness_last_alive "$1" "$liveness_peer") ||
+        liveness_last=
+      fleet_alert_set "$1" "$2" stale-host "$liveness_slug" true \
+        "$liveness_peer has published no heartbeat ${liveness_last:+since $liveness_last }in over ${liveness_hours}h; check its scheduled job (roundhouse fleet-schedule status) and its route to the store remote" ||
+        :
+    done <"$3"
+  fi
+  # A standing alert for a peer this pass did not check has no condition left.
+  for liveness_file in "$liveness_dir"/stale-host--*.yaml; do
+    [ -f "$liveness_file" ] || continue
+    liveness_slug=${liveness_file##*/stale-host--}
+    liveness_slug=${liveness_slug%.yaml}
+    case $liveness_checked in *" $liveness_slug "*) continue ;; esac
+    rm -f "$liveness_file"
+  done
 }

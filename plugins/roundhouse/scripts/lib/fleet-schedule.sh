@@ -20,7 +20,7 @@
 # AN OPERATOR STOP IS FINAL TO EVERYTHING BUT `install`. A job the operator
 # disabled or unloaded, a host whose jobs were uninstalled (the opt-out
 # marker), a host that never had them: the trigger stamps and starts nothing,
-# and a pass alerts and changes nothing. Only an explicit
+# and a pass alerts (a disabled or missing job) and changes nothing. Only an explicit
 # `roundhouse fleet-schedule install` enables.
 #
 # Sourced by scripts/roundhouse; carries definitions only.
@@ -673,9 +673,6 @@ fleet_schedule_command() (
           printf 'platform: %s\ninstalled_at: %s\n' "$(fleet_schedule_platform)" \
             "$(fleet_now)" >"$(fleet_schedule_marker)"
           rm -f "$(fleet_schedule_optout_path)"
-          # A fresh install clears what the pass remembered alerting on, so a
-          # job that is disabled again later is alerted afresh.
-          rm -f "$(fleet_run_state_dir)/schedule-alerted"
           ;;
       esac
       exit "$install_status"
@@ -691,21 +688,22 @@ fleet_schedule_check() {
   # an automatic pass never enables, loads or rewrites a job. Only
   # `roundhouse fleet-schedule install` does, because a human ran it.
   #
+  # `schedule-disabled` and `schedule-missing` are store-scoped CONDITIONS
+  # (lib/fleet-alerts.sh), one keyed alert per job (`…--fleet-fast.yaml`):
+  # this check sets each while it holds and clears it the pass it ends — the
+  # job re-enabled or reinstalled, or the host opted out with
+  # `fleet-schedule uninstall`.
+  #
   # "Missing" needs evidence the host is meant to be scheduled — the install
   # marker, or the other job still present — so a host whose operator never
-  # scheduled it, or opted it out, raises nothing. A loaded-but-idle or
-  # unreachable state is not an alert either: no GUI domain over SSH is the
-  # ordinary state of a pass a trigger started.
-  #
-  # One alert per state change: store.run/schedule-alerted remembers what was
-  # already raised, so a disabled job is one record and not one per pass.
+  # scheduled it raises nothing. An UNREACHABLE scheduler (no GUI domain over
+  # SSH: the ordinary state of a pass a trigger started) decides nothing, so
+  # both alerts are left as they stand.
   case $(fleet_schedule_platform) in launchd | systemd) ;; *) return 0 ;; esac
-  [ ! -e "$(fleet_schedule_optout_path)" ] || return 0
-  check_memo=$(fleet_run_state_dir)/schedule-alerted
+  check_optout=false
+  [ ! -e "$(fleet_schedule_optout_path)" ] || check_optout=true
   check_fast=$(fleet_schedule_job_state fast)
   check_full=$(fleet_schedule_job_state full)
-  mkdir -p "$(dirname "$check_memo")" || return 0
-  : >"$check_memo.next"
   for check_mode in $fleet_schedule_modes; do
     if [ "$check_mode" = fast ]; then
       check_state=$check_fast
@@ -714,27 +712,30 @@ fleet_schedule_check() {
       check_state=$check_full
       check_other=$check_fast
     fi
-    case $check_state in
-      disabled)
-        check_kind=schedule-disabled
-        check_detail="the fleet-$check_mode scheduled job on $2 is disabled; passes will not re-enable it. Run \`roundhouse fleet-schedule install\` on $2 to re-enable it, or \`roundhouse fleet-schedule uninstall\` if it should not be scheduled"
-        ;;
-      missing)
-        [ -f "$(fleet_schedule_marker)" ] || [ "$check_other" != missing ] || continue
-        check_kind=schedule-missing
-        check_detail="the fleet-$check_mode scheduled job on $2 is missing; run \`roundhouse fleet-schedule install\` on $2"
-        ;;
-      *) continue ;;
-    esac
-    if grep -Fqx "$check_mode $check_kind" "$check_memo" 2>/dev/null; then
-      printf '%s %s\n' "$check_mode" "$check_kind" >>"$check_memo.next"
-      continue
+    [ "$check_state" != unavailable ] || [ "$check_optout" = true ] || continue
+    check_disabled=false
+    check_missing=false
+    if [ "$check_optout" != true ]; then
+      case $check_state in
+        disabled) check_disabled=true ;;
+        missing)
+          if [ -f "$(fleet_schedule_marker)" ] || [ "$check_other" != missing ]; then
+            check_missing=true
+          fi
+          ;;
+      esac
     fi
-    printf 'roundhouse: %s\n' "$check_detail" >&2
-    # Remembered only once the alert is written, so a refused write retries.
-    ! fleet_alert_write "$1" "$2" "$check_kind" "$check_kind-fleet-$check_mode" \
-      "$check_detail" ||
-      printf '%s %s\n' "$check_mode" "$check_kind" >>"$check_memo.next"
+    [ "$check_disabled" != true ] ||
+      printf 'roundhouse: the fleet-%s scheduled job is disabled; a pass never re-enables it (schedule-disabled alert)\n' \
+        "$check_mode" >&2
+    [ "$check_missing" != true ] ||
+      printf 'roundhouse: the fleet-%s scheduled job is missing (schedule-missing alert)\n' \
+        "$check_mode" >&2
+    fleet_alert_set "$1" "$2" schedule-disabled "fleet-$check_mode" "$check_disabled" \
+      "the fleet-$check_mode scheduled job on $2 is disabled; passes will not re-enable it. Run \`roundhouse fleet-schedule install\` on $2 to re-enable it, or \`roundhouse fleet-schedule uninstall\` if it should not be scheduled" ||
+      :
+    fleet_alert_set "$1" "$2" schedule-missing "fleet-$check_mode" "$check_missing" \
+      "the fleet-$check_mode scheduled job on $2 is missing; run \`roundhouse fleet-schedule install\` on $2" ||
+      :
   done
-  mv -f "$check_memo.next" "$check_memo"
 }

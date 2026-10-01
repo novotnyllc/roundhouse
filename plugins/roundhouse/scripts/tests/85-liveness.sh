@@ -123,7 +123,7 @@ if [ -n "$fleet_fixture_yq" ]; then
       /dev/null "$live_fold" "$live_now")
     [ "$live_out" = 'stale robin' ] ||
       fail "the stale-host scan did not name exactly the silent host: $live_out"
-    live_alert=$(find "$live_store/alerts/vireo" -name '*-stale-host-robin.yaml' | head -1)
+    live_alert=$(find "$live_store/alerts/vireo" -name 'stale-host--robin.yaml' | head -1)
     [ -n "$live_alert" ] || fail "no stale-host alert was written for a silent host"
     [ "$(yq -r '.kind' "$live_alert")" = stale-host ] ||
       fail "the stale-host alert has the wrong kind"
@@ -136,24 +136,28 @@ if [ -n "$fleet_fixture_yq" ]; then
     case $(yq -r '.detail' "$live_alert") in
       *"$(live_at 28)"*) fail "the stale-host detail carries the moving cutoff" ;;
     esac
-    # One alert per silence, not one per pass.
-    rm -f "$live_alert"
+    # One keyed alert per silence: the next pass leaves it exactly as it is.
+    live_before=$(cat "$live_alert")
     fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" /dev/null \
-      "$live_fold" "$live_now" >/dev/null
-    [ -z "$(find "$live_store/alerts/vireo" -name '*-stale-host-robin.yaml')" ] ||
-      fail "a host already alerted on was alerted again on the next pass"
+      "$live_fold" "$(live_at 41)" >/dev/null
+    [ "$(cat "$live_alert")" = "$live_before" ] ||
+      fail "a standing stale-host alert was rewritten by the next pass"
+    [ "$(find "$live_store/alerts/vireo" -name 'stale-host*' | grep -c .)" -eq 1 ] ||
+      fail "a silent host has more than one stale-host alert"
     # A host that never journaled is not a host that went silent.
     [ ! -d "$live_store/alerts/vireo" ] ||
       [ -z "$(find "$live_store/alerts/vireo" -name '*newbie*')" ] ||
       fail "an enrolled host that has never run was alerted as stale"
-    # robin comes back, then goes silent again: alerted afresh.
+    # robin comes back: the check CLEARS its alert (a condition, not an event).
     fleet_journal_append "$live_store" robin \
       "$(jq -cn --arg at "$(live_at 39.5)" '{outcome:"alive",at:$at}')"
     [ -z "$(fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" /dev/null \
       "$live_fold" "$live_now")" ] || fail "a host that published a fresh heartbeat still read as stale"
+    [ ! -e "$live_alert" ] || fail "a recovered host's stale-host alert was not cleared"
+    # …then goes silent again: alerted afresh.
     fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" /dev/null \
       "$live_fold" "$(live_at 52)" >/dev/null
-    [ -n "$(find "$live_store/alerts/vireo" -name '*-stale-host-robin.yaml')" ] ||
+    [ -n "$(find "$live_store/alerts/vireo" -name 'stale-host--robin.yaml')" ] ||
       fail "a host that went silent again after recovering was not alerted afresh"
     # A heartbeat on an EARLIER day file still counts inside the window: the
     # scan stops only at a day wholly before the cutoff.
@@ -169,9 +173,15 @@ if [ -n "$fleet_fixture_yq" ]; then
     # Only current roster members are checked, when the roster is readable.
     printf 'vireo@fleet.example.invalid namespaces="git" ssh-ed25519 AAAA\n' \
       >"$live_root/roster"
+    fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" /dev/null \
+      "$live_fold" "$(live_at 70)" >/dev/null
+    [ -n "$(find "$live_store/alerts/vireo" -name 'stale-host--*')" ] ||
+      fail "no stale-host alert stood before the roster probe"
     [ -z "$(fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" \
       "$live_root/roster" "$live_fold" "$(live_at 70)")" ] ||
       fail "a host that left the roster was still checked for liveness"
+    [ -z "$(find "$live_store/alerts/vireo" -name 'stale-host--*')" ] ||
+      fail "a host that left the roster kept its stale-host alert"
     # The window is never shorter than two publication windows: a 1h alert
     # over a 6h heartbeat would fire on every healthy, quiet host.
     [ -z "$(fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" /dev/null \

@@ -465,7 +465,7 @@ STUB
     : >"$SCHED_LOG"
     fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
     sched_alert=$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" \
-      -name '*-schedule-disabled-fleet-fast.yaml' 2>/dev/null | head -1)
+      -name 'schedule-disabled--fleet-fast.yaml' 2>/dev/null | head -1)
     [ -n "$sched_alert" ] || fail "a pass did not alert on an operator-disabled job"
     [ "$(yq -r '.kind' "$sched_alert")" = schedule-disabled ] ||
       fail "the disabled-job alert has the wrong kind"
@@ -473,10 +473,16 @@ STUB
       fail "a pass re-enabled or started an operator-disabled job: $(cat "$SCHED_LOG")"
     [ -e "$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-fast" ] ||
       fail "the operator's disable did not survive a pass"
-    rm -f "$sched_alert"
+    # One keyed alert while it lasts: the next pass leaves it as it is.
+    sched_before=$(cat "$sched_alert")
     fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
-    [ -z "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" -name '*-schedule-disabled-*')" ] ||
-      fail "a disabled job was alerted on again by the next pass"
+    [ "$(cat "$sched_alert")" = "$sched_before" ] ||
+      fail "a standing schedule-disabled alert was rewritten by the next pass"
+    # Unreachable (over SSH) decides nothing: the alert stands.
+    rm -f "$SCHED_STATE/gui"
+    fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
+    [ -f "$sched_alert" ] || fail "an unreachable scheduler cleared a standing alert"
+    : >"$SCHED_STATE/gui"
     # Only the operator's explicit install enables it again — and a job still
     # loaded is re-probed after the enable, never bootstrapped twice.
     : >"$SCHED_LOG"
@@ -494,12 +500,15 @@ STUB
     "$cli" fleet-schedule install >/dev/null 2>&1 || fail "re-install after disable and unload failed"
     grep -Fqx "launchctl bootstrap gui/$sched_uid $sched_fast" "$SCHED_LOG" ||
       fail "install did not load the re-enabled, unloaded job"
+    # The condition has ended: the next pass clears the alert.
+    fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
+    [ ! -e "$sched_alert" ] || fail "a re-enabled job's schedule-disabled alert was not cleared"
     # Missing, with evidence the host is scheduled: alerted.
     rm -f "$sched_full"
     fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
-    [ -n "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" -name '*-schedule-missing-fleet-full.yaml')" ] ||
+    [ -n "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" -name 'schedule-missing--fleet-full.yaml')" ] ||
       fail "a pass did not alert on a missing job"
-    [ -z "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" -name '*-schedule-*-fleet-fast.yaml')" ] ||
+    [ -z "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" -name 'schedule-*--fleet-fast.yaml')" ] ||
       fail "a pass alerted on a healthy job"
     # Uninstall removes both, unloads, and opts the host out: from then on a
     # trigger only stamps and a pass raises nothing.
@@ -519,10 +528,11 @@ STUB
     esac
     ! grep -q kickstart "$SCHED_LOG" || fail "a trigger started a job on an opted-out host"
     rm -f "$sched_fast"
-    rm -rf "$ROUNDHOUSE_FLEET_STORE/alerts"
+    [ -n "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" -name 'schedule-missing--fleet-full.yaml')" ] ||
+      fail "the missing-job alert was gone before the opt-out probe"
     fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
-    [ ! -d "$ROUNDHOUSE_FLEET_STORE/alerts" ] ||
-      fail "an opted-out host raised a schedule alert"
+    [ -z "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" -name 'schedule-*')" ] ||
+      fail "an opted-out host kept or raised a schedule alert"
     case $("$cli" fleet-schedule status) in
       *'fleet-fast: missing'*'fleet-full: missing'*'opted out'*) ;;
       *) fail "status did not report the uninstalled, opted-out jobs" ;;
@@ -580,7 +590,7 @@ STUB
     systemctl --user disable --now roundhouse-fleet-fast.timer
     : >"$SCHED_LOG"
     fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" wren 2>/dev/null
-    [ -n "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/wren" -name '*-schedule-disabled-fleet-fast.yaml')" ] ||
+    [ -n "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/wren" -name 'schedule-disabled--fleet-fast.yaml')" ] ||
       fail "a pass did not alert on an operator-disabled Linux timer"
     ! grep -Eq 'systemctl --user (enable|start|restart)' "$SCHED_LOG" ||
       fail "a pass re-enabled an operator-disabled timer: $(cat "$SCHED_LOG")"

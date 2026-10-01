@@ -69,13 +69,12 @@ if [ -n "$fleet_fixture_yq" ]; then
       fail "an alert key escaped into a subdirectory"
 
     # --- every alert kind has a lifecycle, from one table ---
-    for rec_kind in removal-cap integrity identity-unavailable uninstall-deferred; do
+    for rec_kind in removal-cap integrity identity-unavailable uninstall-deferred \
+      stale-host schedule-disabled schedule-missing; do
       [ "$(fleet_alert_lifecycle "$rec_kind")" = condition ] ||
         fail "$rec_kind is not a condition alert"
     done
-    # The loop-liveness kinds stay events until their clears land.
-    for rec_kind in lock-takeover canary-override hold never-heard-of-it \
-      stale-host schedule-disabled schedule-missing; do
+    for rec_kind in lock-takeover canary-override hold never-heard-of-it; do
       [ "$(fleet_alert_lifecycle "$rec_kind")" = event ] ||
         fail "$rec_kind is not an event alert"
     done
@@ -90,7 +89,7 @@ if [ -n "$fleet_fixture_yq" ]; then
       *) fail "the store-wide integrity hold is not a store-scoped condition" ;;
     esac
     case " $rec_item_kinds" in
-      *' removal-cap '* | *' canary-override '*)
+      *' removal-cap '* | *' canary-override '* | *' stale-host '* | *' schedule-disabled '*)
         fail "a store-scoped or event kind is swept per item: $rec_item_kinds" ;;
     esac
     # The fast name path and the jq filter agree, and an unsafe key takes jq.

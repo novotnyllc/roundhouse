@@ -132,17 +132,18 @@ roundhouse fleet-schedule uninstall        # unload and remove them
 `fleet-schedule install` is the only path that enables a job. A pass checks its
 own jobs every time and never re-enables, loads or rewrites one: a job the
 operator disabled raises a `schedule-disabled` alert, and a job that went
-missing on a host that is scheduled raises `schedule-missing`, each once per
-state change.
+missing on a host that is scheduled raises `schedule-missing`, each one keyed
+alert for as long as it lasts, cleared by the check itself once it ends.
 
 **Heartbeats.** Every pass records a host-local heartbeat
 (`store.run/alive`). The `outcome: alive` journal record is *published* at most
 every `heartbeat_publish_hours` (default 6), and always after a pass that applied
 or satisfied an item, and at a canary's evidence deadline
 (`applied_at + canary_wait_hours`), so the canary gate never waits on a
-throttled record. Every pass raises a `stale-host` alert, once per silence, for
-another enrolled host that has published no heartbeat within
-`liveness_alert_hours` (default 12). Both keys are ordinary store policy;
+throttled record. Every pass keeps one keyed `stale-host` alert per other
+enrolled host that has published no heartbeat within `liveness_alert_hours`
+(default 12, never less than twice `heartbeat_publish_hours`), naming its last
+published heartbeat, and clears it when the peer is heard from again. Both keys are ordinary store policy;
 `0` turns the throttle or the alert off.
 
 An unpinned package is kept current by the full pass — that is what anyone
@@ -199,12 +200,14 @@ from one table (`fleet_alert_lifecycle_rows` in `lib/fleet-alerts.sh`):
 
 | Lifecycle | Scope | Kinds | Ends |
 | --- | --- | --- | --- |
-| condition | store | `removal-cap`, `integrity-store-wide`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render` | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
+| condition | store | `removal-cap`, `integrity-store-wide`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render`, `stale-host` (per silent peer), `schedule-disabled` and `schedule-missing` (per job) | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
 | condition | item | `integrity`, `config-key-collision`, `chezmoi-coownership`, `package-hold`, `enabled-but-untrusted`, `record-write`, `identity-unavailable`, `uninstall-deferred`, `package-deferred`, `runtime-hold`, `node-runtime-unverified` | the end-of-pass sweep (`fleet_alert_sweep`) clears it when the pass **checked** the item and did not raise it, or when the item has left the fold; an item the pass skipped (held, waiting on its canary) keeps it; never ages |
-| event | store or item | `stale-host`, `schedule-disabled`, `schedule-missing`, `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by its latest `at` after the evidence retention window |
+| event | store or item | `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by its latest `at` after the evidence retention window |
 
-`stale-host`, `schedule-disabled` and `schedule-missing` are events until the
-loop-liveness work adds the checks that clear them; it moves them to condition.
+`stale-host` clears when the peer publishes a heartbeat again, or leaves the
+roster or the enrolled hosts; `schedule-disabled` and `schedule-missing` clear
+when the job is re-enabled or reinstalled, or the host is taken off the
+schedule with `fleet-schedule uninstall`.
 
 `rm` on the file still resolves any alert by hand; a condition alert that is
 removed while its condition holds is raised again on the next pass.
