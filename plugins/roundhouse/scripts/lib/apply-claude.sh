@@ -487,17 +487,32 @@ fleet_run_claude_cmdline_match() {
     END { exit(found ? 0 : 1) }'
 }
 
+fleet_run_state_key() {
+  # `fleet_run_state_key ITEM` -> ONE safe file-name component for a
+  # host-local record keyed by an item id. Item ids come from store content,
+  # which every synced host can write, so an id is never a path: one made only
+  # of `[A-Za-z0-9._@+-]`, not starting with `.`, is used as it is (the names
+  # existing records already have, so an open 24h deferral window survives),
+  # and anything else — a `/`, a `..`, a newline — is `sha256-<hex>` of the id.
+  case $1 in
+    '' | .* | *[!A-Za-z0-9._@+-]*)
+      printf 'sha256-%s\n' "$(printf '%s' "$1" | sha256_stream)"
+      ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 fleet_run_deferral_path() {
   # Host-local, never replicated: when this host first deferred ITEM's
   # uninstall, keyed by digest so a new tombstone value starts a new window.
-  printf '%s/deferrals/%s\n' "$(fleet_run_state_dir)" "$1"
+  printf '%s/deferrals/%s\n' "$(fleet_run_state_dir)" "$(fleet_run_state_key "$1")"
 }
 
 fleet_run_tombstone_memo_path() {
   # Host-local: the tombstone digest this host has already converged (applied
   # or satisfied). It is what lets a converged tombstone be a silent no-op on
   # every later pass instead of a fresh `satisfied` record every 20 minutes.
-  printf '%s/tombstones/%s\n' "$(fleet_run_state_dir)" "$1"
+  printf '%s/tombstones/%s\n' "$(fleet_run_state_dir)" "$(fleet_run_state_key "$1")"
 }
 
 fleet_run_uninstall_plugin() {

@@ -318,6 +318,24 @@ JSON
           "$1" '' >"$run_root/tomb-out" 2>&1 || run_status=$?
     }
     rm -rf "$(fleet_run_state_dir)/deferrals"
+    # Item ids are store content: a host-local record keyed by one is always
+    # ONE file directly under its directory, whatever the id carries. A plain
+    # id keeps its own name, so records written before this still read.
+    [ "$(fleet_run_deferral_path plugins.example@market)" = \
+      "$(fleet_run_state_dir)/deferrals/plugins.example@market" ] ||
+      fail "a plain item id no longer names its own deferral record"
+    for run_evil in 'plugins.x/../../../victim' '..' '.hidden' "$(printf 'plugins.a\nb')"; do
+      for run_evil_path in "$(fleet_run_deferral_path "$run_evil")" \
+        "$(fleet_run_tombstone_memo_path "$run_evil")"; do
+        case ${run_evil_path##*/} in
+          sha256-*) ;;
+          *) fail "an unsafe item id became a file name: $run_evil_path" ;;
+        esac
+        [ "$(dirname -- "$run_evil_path")" = "$(fleet_run_state_dir)/deferrals" ] ||
+          [ "$(dirname -- "$run_evil_path")" = "$(fleet_run_state_dir)/tombstones" ] ||
+          fail "an unsafe item id escaped its state directory: $run_evil_path"
+      done
+    done
     # A subshell, because the live-session probe is replaced per case below.
     (
     # Not installed: SATISFIED, with no manager call at all — and any deferral
