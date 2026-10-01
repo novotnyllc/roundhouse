@@ -456,6 +456,67 @@ YAML
       *) fail "a downstream host stopped waiting on an item the canary could not apply: $runjj_out" ;;
     esac
 
+    # --- §3.4: a tombstone uninstalls, inside the cap, and then goes quiet ---
+    # The scalar form, which the fold knocks out: it reaches the run only
+    # through the tombstone read, and the installed record names its one
+    # marketplace. Disabled, so the live-session deferral does not apply.
+    mkdir -p "$HOME/.claude/plugins"
+    printf '{"version":2,"plugins":{"retired@test-market":[{"scope":"user","version":"1.0.0"}]}}\n' \
+      >"$HOME/.claude/plugins/installed_plugins.json"
+    printf '{"retired@test-market":false}\n' >"$rjj/plugin-enabled.json"
+    : >"$rjj/plugin-actions"
+    runjj_dev_group() {
+      cat >"$vireo/groups/development.yaml" <<YAML
+policy:
+  canary_wait_hours: 0
+  max_removals_per_run: $1
+  max_removal_fraction: 1
+mcp_servers:
+  context7: enabled
+plugins:
+  retired: absent
+YAML
+    }
+    runjj_tomb_run() {
+      runjj vireo env CLAUDE_CONFIG_DIR="$HOME/.claude" \
+        CLAUDE_PLUGIN_ENABLED_FILE="$rjj/plugin-enabled.json" \
+        CLAUDE_PLUGIN_ACTION_LOG="$rjj/plugin-actions" "$cli" fleet-run --fast
+    }
+    runjj_tomb_count() {
+      grep -rh -A2 'item: plugins.retired' "$vireo/journal/vireo" 2>/dev/null |
+        grep -c 'outcome:' || true
+    }
+    # Over the cap, the uninstall is a removal like any other and holds.
+    runjj_dev_group 0
+    runjj_out=$(runjj_tomb_run) || fail "the capped tombstone run failed: $runjj_out"
+    case $runjj_out in
+      *'hold  plugins.retired — the removal set is over the cap'*) ;;
+      *) fail "a tombstone uninstall was not counted toward the removal cap: $runjj_out" ;;
+    esac
+    jq -e '.plugins["retired@test-market"]' "$HOME/.claude/plugins/installed_plugins.json" \
+      >/dev/null || fail "a capped tombstone uninstalled anyway"
+    runjj_dev_group 5
+    runjj_out=$(runjj_tomb_run) || fail "the tombstone run failed: $runjj_out"
+    case $runjj_out in
+      *'applied plugins.retired (uninstalled)'*) ;;
+      *) fail "the tombstone did not uninstall the plugin: $runjj_out" ;;
+    esac
+    grep -Fqx 'uninstall retired@test-market' "$rjj/plugin-actions" ||
+      fail "the tombstone did not go through claude plugin uninstall"
+    ! jq -e '.plugins["retired@test-market"]' \
+      "$HOME/.claude/plugins/installed_plugins.json" >/dev/null ||
+      fail "the uninstalled plugin is still recorded as installed"
+    grep -rh -A2 'item: plugins.retired' "$vireo/journal/vireo" |
+      grep -q 'outcome: applied' || fail "the uninstall journaled no applied record"
+    [ -z "$(fleet_applied_digest "$vireo" vireo plugins.retired)" ] ||
+      fail "a tombstone was recorded as owned in applied/"
+    # Converged: the next working pass says nothing more about it.
+    runjj_tomb_before=$(runjj_tomb_count)
+    printf '# another edit\n' >>"$vireo/fleet.yaml"
+    runjj_tomb_run >/dev/null || fail "the pass after the uninstall failed"
+    [ "$(runjj_tomb_count)" = "$runjj_tomb_before" ] ||
+      fail "a converged tombstone journaled again on the next pass"
+
     # --- §6.3: a dead holder's lock is taken over by the next run ---
     # The wedge itself: a lock a dead pre-nonce run left behind, aged far past
     # the stale threshold. The age check used to run first and refuse it
@@ -519,6 +580,6 @@ YAML
       *) fail "a second compaction was not a no-op: $runjj_out" ;;
     esac
 
-    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding, dead-holder takeover, alert compaction)\n'
+    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding, capped tombstone uninstall, dead-holder takeover, alert compaction)\n'
   ) || fail "real-jj run block failed (see the FAIL: real-jj: line above)"
 fi

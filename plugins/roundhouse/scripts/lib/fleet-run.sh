@@ -1241,6 +1241,111 @@ fleet_run_node_converge() (
   exit 0
 )
 
+# --- §3.4/§3.5 tombstones: `absent` uninstalls through the harness ----------
+
+fleet_run_tombstone_target() {
+  # fleet_run_tombstone_target DEFS NAME VALUE -> the installed user-scoped
+  # Claude plugin id a tombstone names, or nothing when it is not installed.
+  # Exit 75 when that cannot be decided: an unreadable installed_plugins.json,
+  # or an unqualified name that more than one marketplace has installed — an
+  # uninstall must name exactly one plugin or none.
+  fleet_run_tomb_market=$(printf '%s\n' "$3" | jq -r '
+    if type == "object" then (.marketplace // "") else "" end' 2>/dev/null) ||
+    fleet_run_tomb_market=
+  [ -n "$fleet_run_tomb_market" ] ||
+    fleet_run_tomb_market=$(fleet_resolve_surface "$1" plugins "$2" 2>/dev/null |
+      jq -r '.marketplace // ""' 2>/dev/null) || fleet_run_tomb_market=
+  case $2 in
+    *@*) fleet_run_tomb_id=$2 ;;
+    *) fleet_run_tomb_id=${fleet_run_tomb_market:+$2@$fleet_run_tomb_market} ;;
+  esac
+  if [ -n "$fleet_run_tomb_id" ]; then
+    fleet_run_tomb_record=$(fleet_run_installed_plugin "$fleet_run_tomb_id") || return 75
+    [ "$fleet_run_tomb_record" = '{}' ] || printf '%s\n' "$fleet_run_tomb_id"
+    return 0
+  fi
+  fleet_run_tomb_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
+  [ -f "$fleet_run_tomb_file" ] || return 0
+  fleet_run_tomb_ids=$(jq -r --arg name "$2" '
+    (.plugins // {}) | to_entries[] |
+    select((.key | split("@")[0]) == $name and
+      any((.value // [])[]; .scope == "user")) | .key' \
+    "$fleet_run_tomb_file" 2>/dev/null) || return 75
+  case $(printf '%s\n' "$fleet_run_tomb_ids" | grep -c .) in
+    0) return 0 ;;
+    1) printf '%s\n' "$fleet_run_tomb_ids" ;;
+    *) return 75 ;;
+  esac
+}
+
+fleet_run_claude_running() {
+  # Is a `claude` CLI process running on this host? The basename of `comm`
+  # (macOS reports a full path, procps a bare name), compared exactly: the
+  # desktop app is `Claude`, which loads plugins from its own sessions only.
+  ps -A -o comm= 2>/dev/null | awk '
+    { name = $0; sub(/.*\//, "", name) }
+    name == "claude" { found = 1 }
+    END { exit(found ? 0 : 1) }'
+}
+
+fleet_run_deferral_path() {
+  # Host-local, never replicated: when this host first deferred ITEM's
+  # uninstall, keyed by digest so a new tombstone value starts a new window.
+  printf '%s/deferrals/%s\n' "$(fleet_run_state_dir)" "$1"
+}
+
+fleet_run_tombstone_memo_path() {
+  # Host-local: the tombstone digest this host has already converged (applied
+  # or satisfied). It is what lets a converged tombstone be a silent no-op on
+  # every later pass instead of a fresh `satisfied` record every 20 minutes.
+  printf '%s/tombstones/%s\n' "$(fleet_run_state_dir)" "$1"
+}
+
+fleet_run_uninstall_plugin() {
+  # fleet_run_uninstall_plugin DEFS ITEM NAME VALUE — converge a Claude plugin
+  # to `absent`. Exit 0 uninstalled (verified gone from installed_plugins.json),
+  # 70 SATISFIED (not installed — here, and whether or not this host has a
+  # harness at all), 75 held.
+  #
+  # LIVE SESSIONS (§3.5). An ENABLED plugin is loaded into every running
+  # `claude` session, and pulling its files out from under one breaks it
+  # mid-task. So while a `claude` process runs, the uninstall waits — journaled
+  # `held` — for up to 24 hours from this host's FIRST deferral of this digest,
+  # then proceeds: a session that never ends must not keep a retired plugin
+  # installed forever. A disabled plugin is not loaded and goes immediately.
+  fleet_run_uninstall_target=$(fleet_run_tombstone_target "$1" "$3" "$4") || return 75
+  [ -n "$fleet_run_uninstall_target" ] || return 70
+  command -v claude >/dev/null 2>&1 || return 75
+  fleet_run_uninstall_enabled=$(fleet_run_plugin_enabled \
+    "$fleet_run_uninstall_target" true) || return 75
+  fleet_run_uninstall_deferral=$(fleet_run_deferral_path "$2")
+  if [ "$fleet_run_uninstall_enabled" != false ] && fleet_run_claude_running; then
+    fleet_run_uninstall_digest=$(printf '%s\n' "$4" | fleet_value_digest "$2")
+    fleet_run_uninstall_first=$(awk -v d="$fleet_run_uninstall_digest" \
+      '$1 == d { print $2; exit }' "$fleet_run_uninstall_deferral" 2>/dev/null)
+    case $fleet_run_uninstall_first in
+      '' | *[!0-9]*)
+        fleet_run_uninstall_first=$(date +%s)
+        mkdir -p "$(dirname "$fleet_run_uninstall_deferral")"
+        printf '%s %s\n' "$fleet_run_uninstall_digest" "$fleet_run_uninstall_first" \
+          >"$fleet_run_uninstall_deferral"
+        ;;
+    esac
+    fleet_run_uninstall_left=$((fleet_run_uninstall_first + 86400 - $(date +%s)))
+    if [ "$fleet_run_uninstall_left" -gt 0 ]; then
+      printf '  defer %s — %s is enabled and a claude session is running; uninstall waits up to %ss more\n' \
+        "$2" "$fleet_run_uninstall_target" "$fleet_run_uninstall_left"
+      return 75
+    fi
+    printf '  defer %s — the 24h live-session window has elapsed; uninstalling\n' "$2"
+  fi
+  claude plugin uninstall --scope user "$fleet_run_uninstall_target" \
+    >/dev/null 2>&1 || return 75
+  # The manager's exit status proves it ran, not that the record is gone.
+  [ "$(fleet_run_installed_plugin "$fleet_run_uninstall_target")" = '{}' ] || return 75
+  rm -f "$fleet_run_uninstall_deferral"
+}
+
 fleet_run_apply_item() {
   # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
@@ -1292,8 +1397,12 @@ fleet_run_apply_item() {
   # plugins silently DISABLED the plugin. Neither is a decision anybody made.
   # A value carrying no state at all still reads `enabled` (§4), so
   # config_files and definitions maps are unaffected.
+  #
+  # `absent` is the one further state, and only where an uninstall verb exists:
+  # a Claude plugin (§3.4's tombstone). Everywhere else it is still held.
   case $(fleet_run_state_of "$5") in
     enabled | disabled) ;;
+    absent) [ "$fleet_run_category" = plugins ] || return 75 ;;
     *) return 75 ;;
   esac
   case $fleet_run_category in
@@ -1323,6 +1432,13 @@ fleet_run_apply_item() {
           jq -r 'if .pin == "flag" then (.version // "") else "" end')"
       ;;
     plugins)
+      # A TOMBSTONE converges by uninstalling, and is SATISFIED where the
+      # plugin is not installed — asked before the harness check, because a
+      # host with no `claude` has no plugin to remove either.
+      if [ "$(fleet_run_state_of "$5")" = absent ]; then
+        fleet_run_uninstall_plugin "$3" "$4" "$fleet_run_name" "$5"
+        return $?
+      fi
       fleet_run_surface=$(fleet_resolve_surface "$3" plugins "$fleet_run_name")
       fleet_run_market=$(printf '%s\n' "$5" | jq -r '
         if type == "object" then (.marketplace // "") else "" end')
@@ -1880,6 +1996,12 @@ fleet_run_command() (
     fleet_run_export "$run_store" "$run_head" "$run_tmp/head-$run_index"
     fleet_run_item_digests "$(fleet_fold "$run_tmp/head-$run_index" "$run_host")" \
       "$run_tmp/head-$run_index" >>"$run_tmp/values"
+    # §3.4's tombstones join the item universe with their own digest. The fold
+    # knocks `absent` out, so without this a tombstoned plugin read as "gone
+    # from the layers" — a capped prune that forgot the record and uninstalled
+    # nothing — and a host that never owned it never heard of it at all.
+    fleet_run_item_digests "$(fleet_fold_tombstones "$run_tmp/head-$run_index" \
+      "$run_host" plugins)" >>"$run_tmp/values"
   done
   # The reviewed tree R. On the clean path that is the merge, and there is one
   # head. On the conflicted path it is the first head — legitimate because
@@ -1887,6 +2009,7 @@ fleet_run_command() (
   # head answers for them, and the rest are held.
   run_layers=$run_tmp/head-1
   run_fold=$(fleet_fold "$run_layers" "$run_host")
+  run_tombstones=$(fleet_fold_tombstones "$run_layers" "$run_host" plugins)
   run_defs=$(fleet_definitions_load "$run_layers")
   fleet_vcs_enrolled_hosts "$run_store" "$run_reference" >"$run_tmp/hosts"
   grep -Fqx "$run_host" "$run_tmp/hosts" || printf '%s\n' "$run_host" >>"$run_tmp/hosts"
@@ -2044,7 +2167,27 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         "$run_tmp/values" || continue
       printf '%s\n' "$run_owned"
     done >"$run_tmp/removals"
-  run_removals=$(grep -c . <"$run_tmp/removals" || true)
+  # A tombstone that would UNINSTALL something here is a genuine removal and
+  # counts toward the same cap; one that finds nothing installed changes
+  # nothing and does not. Undecidable (fleet_run_tombstone_target's 75) counts,
+  # because the cap is the direction to be wrong in.
+  printf '%s\n' "$run_fold" "$run_tombstones" | jq -r -s '
+    [.[] | (.plugins // {}) | select(type == "object") | to_entries[] |
+      select(.value == "absent" or
+        ((.value | type) == "object" and .value.state == "absent")) |
+      "plugins." + .key] | unique | .[]' >"$run_tmp/tombstones"
+  : >"$run_tmp/tombstone-removals"
+  while IFS= read -r run_tomb_item; do
+    [ -n "$run_tomb_item" ] || continue
+    ! grep -Fqx "held $run_tomb_item" "$run_tmp/verdicts" || continue
+    run_tomb_value=$(fleet_item_value "$run_fold" "$run_tomb_item")
+    [ -n "$run_tomb_value" ] ||
+      run_tomb_value=$(fleet_item_value "$run_tombstones" "$run_tomb_item")
+    run_tomb_target=$(fleet_run_tombstone_target "$run_defs" \
+      "${run_tomb_item#plugins.}" "$run_tomb_value") || run_tomb_target=undecidable
+    [ -z "$run_tomb_target" ] || printf '%s\n' "$run_tomb_item"
+  done <"$run_tmp/tombstones" >"$run_tmp/tombstone-removals"
+  run_removals=$(cat "$run_tmp/removals" "$run_tmp/tombstone-removals" | grep -c . || true)
   run_removals_ok=true
   fleet_removal_cap "$run_removals" "$(fleet_applied_count "$run_store" "$run_host")" \
     "$(fleet_policy_get "$run_fold" max_removals_per_run)" \
@@ -2107,6 +2250,34 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     run_split=$(fleet_item_split "$run_item") || continue
     run_category=$(printf '%s\n' "$run_split" | sed -n 1p)
     run_value=$(fleet_item_value "$run_fold" "$run_item")
+    [ -n "$run_value" ] || run_value=$(fleet_item_value "$run_tombstones" "$run_item")
+
+    # §3.4: a TOMBSTONE converges by uninstalling. It is never recorded in
+    # applied/ — that record means "installed and owned", and a recorded
+    # tombstone would read as a prune the day the tombstone is compacted away.
+    # A host that already converged this digest and still has nothing
+    # installed has nothing to say about it, so it says nothing.
+    run_tombstone=false
+    run_tomb_removal=false
+    if grep -Fqx "$run_item" "$run_tmp/tombstones"; then
+      run_tombstone=true
+      ! grep -Fqx "$run_item" "$run_tmp/tombstone-removals" || run_tomb_removal=true
+      if [ "$run_tomb_removal" = false ] &&
+        [ "$(cat "$(fleet_run_tombstone_memo_path "$run_item")" 2>/dev/null)" = \
+          "$run_digest" ] &&
+        [ -z "$(fleet_applied_digest "$run_store" "$run_host" "$run_item")" ]; then
+        continue
+      fi
+      if [ "$run_tomb_removal" = true ] && [ "$run_removals_ok" != true ]; then
+        printf '  hold  %s — the removal set is over the cap\n' "$run_item"
+        fleet_run_runtime_hold "$run_item" 'removal cap' "$run_tmp/sigholds" ||
+          exit 65
+        fleet_journal_append "$run_store" "$run_host" \
+          "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
+            '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
+        continue
+      fi
+    fi
 
     # §10.3's ownership table, as one function with one answer per row.
     run_in_applied=no
@@ -2151,8 +2322,10 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fi
 
     # §10.1's gate, with the liveness term. Canary hosts are not gated by
-    # themselves.
-    if [ "$run_self_canary" != true ] && [ -s "$run_tmp/canaries" ]; then
+    # themselves, and a tombstone with nothing installed here is not a change
+    # here: its `satisfied` is true whatever the canaries have seen.
+    if [ "$run_self_canary" != true ] && [ -s "$run_tmp/canaries" ] &&
+      { [ "$run_tombstone" != true ] || [ "$run_tomb_removal" = true ]; }; then
       # shellcheck disable=SC2046 # the canary set, one host per argument
       fleet_canary_gate "$run_store" "$run_item" "$run_digest" "$run_wait" \
         "$run_now" $(cat "$run_tmp/canaries") || {
@@ -2175,6 +2348,31 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
       "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" ||
       run_status=$?
+    if [ "$run_tombstone" = true ]; then
+      case $run_status in
+        0 | 70)
+          # Nothing is installed any more, so nothing is owned: a stale
+          # applied/ record goes, and the converged digest is remembered
+          # host-locally so the next pass stays silent.
+          [ -z "$(fleet_applied_digest "$run_store" "$run_host" "$run_item")" ] ||
+            fleet_applied_forget "$run_store" "$run_host" "$run_item" || :
+          mkdir -p "$(dirname "$(fleet_run_tombstone_memo_path "$run_item")")"
+          printf '%s\n' "$run_digest" >"$(fleet_run_tombstone_memo_path "$run_item")"
+          run_tomb_outcome=applied
+          [ "$run_status" -eq 0 ] || run_tomb_outcome=satisfied
+          fleet_journal_append "$run_store" "$run_host" \
+            "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
+              --arg o "$run_tomb_outcome" '{item:$item,digest:$d,outcome:$o,at:$at}')" || :
+          if [ "$run_status" -eq 0 ]; then
+            run_applied_items="$run_applied_items$run_item "
+            printf '  applied %s (uninstalled)\n' "$run_item"
+          else
+            printf '  satisfied %s (absent, and not installed here)\n' "$run_item"
+          fi
+          continue
+          ;;
+      esac
+    fi
     case $run_status in
       0)
         # An unwritable applied/<h>.yaml is loud and narrow, never fatal: the
@@ -3319,8 +3517,14 @@ fleet_apply_command() (
   apply_now=$(fleet_now)
   case $apply_status in
     0)
-      fleet_applied_record "$apply_store" "$apply_host" "$apply_item" \
-        "$apply_digest" "$apply_now"
+      # An uninstalled tombstone is no longer owned; everything else that
+      # applied is.
+      if [ "$(fleet_run_state_of "$(fleet_item_value "$apply_fold" "$apply_item")")" = absent ]; then
+        fleet_applied_forget "$apply_store" "$apply_host" "$apply_item"
+      else
+        fleet_applied_record "$apply_store" "$apply_host" "$apply_item" \
+          "$apply_digest" "$apply_now"
+      fi
       fleet_journal_append "$apply_store" "$apply_host" \
         "$(jq -cn --arg item "$apply_item" --arg d "$apply_digest" \
           --arg at "$apply_now" \

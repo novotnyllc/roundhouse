@@ -702,6 +702,117 @@ JSON
       fail "plugin state re-read accepted output from a failed list command"
     unset -f claude
 
+    # --- §3.4 tombstones: `absent` uninstalls a Claude plugin ---
+    # The tombstone set is the fold with the knockout left out, so the last
+    # layer to speak still wins: a host layer that re-adds an item is not a
+    # tombstone there, and a host-layer `absent` over a fleet `enabled` is.
+    run_tomb_layers="$run_root/tomb-layers"
+    mkdir -p "$run_tomb_layers/hosts"
+    printf 'plugins:\n  gone: absent\n  readded: absent\n  kept: enabled\n' \
+      >"$run_tomb_layers/fleet.yaml"
+    printf 'platform: macos\nplugins:\n  readded: enabled\n  local-retire: absent\n' \
+      >"$run_tomb_layers/hosts/vireo.yaml"
+    [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo plugins | jq -c '.plugins | keys')" = \
+      '["gone","local-retire"]' ] ||
+      fail "the tombstone set did not follow last-layer-wins: $(fleet_fold_tombstones "$run_tomb_layers" vireo plugins)"
+    [ "$(fleet_fold "$run_tomb_layers" vireo | jq -c '.plugins | keys')" = \
+      '["kept","readded"]' ] ||
+      fail "reading tombstones changed what the ordinary fold knocks out"
+    [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo skills)" = '{}' ] ||
+      fail "a category with no tombstones produced some"
+
+    run_tomb_installed() {
+      printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.4.0\",\"gitCommitSha\":\"$run_sha_new\"}]}}" \
+        >"$run_plugin_installed"
+    }
+    run_tomb_apply() {
+      run_status=0
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+        CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+          "$1" '' >"$run_root/tomb-out" 2>&1 || run_status=$?
+    }
+    rm -rf "$(fleet_run_state_dir)/deferrals"
+    # A subshell, because the live-session probe is replaced per case below.
+    (
+    # Not installed: SATISFIED, with no manager call at all.
+    printf '%s\n' '{"version":2,"plugins":{}}' >"$run_plugin_installed"
+    : >"$run_plugin_order_log"
+    run_tomb_apply '"absent"'
+    [ "$run_status" -eq 70 ] ||
+      fail "a tombstone for a plugin that is not installed was not satisfied (got $run_status)"
+    [ ! -s "$run_plugin_order_log" ] ||
+      fail "a satisfied tombstone ran a manager verb: $(cat "$run_plugin_order_log")"
+    # Installed and DISABLED: uninstalled immediately even with a session live.
+    run_tomb_installed
+    printf '%s\n' '{"example@test-market":false}' >"$run_plugin_enabled_file"
+    fleet_run_claude_running() { return 0; }
+    run_tomb_apply '"absent"'
+    [ "$run_status" -eq 0 ] ||
+      fail "a disabled tombstoned plugin was not uninstalled (got $run_status): $(cat "$run_root/tomb-out")"
+    grep -Fqx 'uninstall example@test-market' "$run_plugin_order_log" ||
+      fail "the uninstall did not go through the native manager"
+    [ "$(jq -c '.plugins["example@test-market"] // null' "$run_plugin_installed")" = null ] ||
+      fail "the uninstalled plugin is still in installed_plugins.json"
+    # Installed and ENABLED while a claude session runs: DEFERRED, and the
+    # window starts at the first deferral.
+    run_tomb_installed
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    : >"$run_plugin_order_log"
+    run_tomb_apply '"absent"'
+    [ "$run_status" -eq 75 ] ||
+      fail "an enabled plugin was uninstalled under a live claude session (got $run_status)"
+    grep -q 'defer plugins.example' "$run_root/tomb-out" ||
+      fail "the deferral did not say why it held: $(cat "$run_root/tomb-out")"
+    ! grep -q uninstall "$run_plugin_order_log" ||
+      fail "a deferred uninstall still reached the manager"
+    run_tomb_deferral=$(fleet_run_deferral_path plugins.example)
+    run_tomb_first=$(awk '{ print $2 }' "$run_tomb_deferral")
+    run_tomb_apply '"absent"'
+    [ "$run_status" -eq 75 ] &&
+      [ "$(awk '{ print $2 }' "$run_tomb_deferral")" = "$run_tomb_first" ] ||
+      fail "a second deferral restarted the 24h window"
+    # Past 24h from the FIRST deferral it proceeds, session or not.
+    printf '%s %s\n' "$(awk '{ print $1 }' "$run_tomb_deferral")" \
+      "$(($(date +%s) - 86401))" >"$run_tomb_deferral"
+    run_tomb_apply '"absent"'
+    [ "$run_status" -eq 0 ] ||
+      fail "the deferral did not end after 24h (got $run_status)"
+    [ ! -e "$run_tomb_deferral" ] ||
+      fail "a completed uninstall left its deferral record behind"
+    # Enabled with NO session running: immediate.
+    fleet_run_claude_running() { return 1; }
+    run_tomb_installed
+    run_tomb_apply '{"state":"absent","marketplace":"test-market"}'
+    [ "$run_status" -eq 0 ] ||
+      fail "an enabled tombstoned plugin with no live session was not uninstalled (got $run_status)"
+    # A manager that reports success and leaves the record is not an uninstall.
+    run_tomb_installed
+    CLAUDE_UNINSTALL_SKIP_RECORD=1 run_tomb_apply '"absent"'
+    [ "$run_status" -eq 75 ] ||
+      fail "an uninstall that left the record behind was accepted (got $run_status)"
+    # An unqualified tombstone names exactly one installed plugin, or holds.
+    run_status=0
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"solo@one\":[{\"scope\":\"user\",\"version\":\"1\"}],\"dup@one\":[{\"scope\":\"user\",\"version\":\"1\"}],\"dup@two\":[{\"scope\":\"user\",\"version\":\"1\"}]}}" \
+      >"$run_plugin_installed"
+    [ "$(CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_tombstone_target '{}' solo '"absent"')" = \
+      solo@one ] || fail "an unqualified tombstone did not resolve its one installed plugin"
+    CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_tombstone_target '{}' dup '"absent"' \
+      >/dev/null || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "an unqualified tombstone installed from two marketplaces did not hold"
+    [ -z "$(CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_tombstone_target '{}' never '"absent"')" ] ||
+      fail "a tombstone for a plugin installed nowhere named something"
+    ) || exit 1
+    # `absent` stays HELD where there is no uninstall verb.
+    for run_tomb_other in skills.tdd packages.jj agents.triage-bot; do
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo "$run_defs" "$run_tomb_other" \
+        '"absent"' homebrew >/dev/null 2>&1 || run_status=$?
+      [ "$run_status" -eq 75 ] ||
+        fail "$run_tomb_other at state absent was not held (got $run_status)"
+    done
+
     # A declared marketplace the harness never registered (headless hosts never
     # run Claude Code's interactive registration) is added from the user's own
     # synced declaration, and only from it.

@@ -417,6 +417,34 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
   fi
   exit 0
 fi
+if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = uninstall ] || [ "\${2:-}" = remove ]; }; then
+  # \`claude plugin uninstall --scope user ID\`: the id is the one argument
+  # that is neither an option nor an option's value.
+  shift 2
+  scope=user
+  uninstall_id=
+  while [ "\$#" -gt 0 ]; do
+    case \$1 in
+      -s | --scope) scope=\${2:-}; shift ;;
+      -*) ;;
+      *) uninstall_id=\$1 ;;
+    esac
+    shift
+  done
+  [ "\$scope" = user ] && [ -n "\$uninstall_id" ] || exit 64
+  [ -z "\${CLAUDE_PLUGIN_ACTION_LOG:-}" ] ||
+    printf '%s %s\n' uninstall "\$uninstall_id" >>"\$CLAUDE_PLUGIN_ACTION_LOG"
+  [ "\${CLAUDE_UNINSTALL_FAIL:-0}" != 1 ] || exit 1
+  if [ -z "\${CLAUDE_UNINSTALL_SKIP_RECORD:-}" ] && [ -n "\${CLAUDE_CONFIG_DIR:-}" ]; then
+    installed_file="\$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+    [ ! -f "\$installed_file" ] ||
+      jq -c --arg id "\$uninstall_id" '
+        .plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user"))) |
+        if (.plugins[\$id] | length) == 0 then del(.plugins[\$id]) else . end' \
+        "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"
+  fi
+  exit 0
+fi
 exit 64
 SH
 chmod +x "$tmp/bin/claude"

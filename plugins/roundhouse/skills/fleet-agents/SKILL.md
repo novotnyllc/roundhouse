@@ -207,6 +207,17 @@ on an `applied` record that can never be written would hold the item forever and
 buy nothing. An item a host **tried and could not apply**, or that a gate
 refused, still journals `held` and still blocks downstream.
 
+A Claude plugin whose desired state is `absent` — the scalar or
+`{state: absent}` — is a **tombstone**, and the run uninstalls it with
+`claude plugin uninstall --scope user NAME@MARKETPLACE`, verifies it is gone from
+`installed_plugins.json`, forgets any `applied/` record, and journals `applied`.
+Where it is not installed it journals `satisfied` once and then stays quiet. An
+uninstall that would remove something counts toward the removal cap like any
+other removal. An **enabled** plugin is not pulled out from under a live
+session: while a `claude` process runs the uninstall journals `held` for up to
+24 hours from this host's first deferral, then proceeds; a disabled plugin goes
+immediately. `absent` for any other category is still held.
+
 ### Rollback
 
 ```text

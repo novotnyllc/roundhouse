@@ -175,6 +175,40 @@ fleet_fold() (
   fleet_fold_files $(fleet_layer_files "$1" "$2")
 )
 
+fleet_fold_tombstones() (
+  # `fleet_fold_tombstones LAYERDIR HOST CATEGORY` — the items of CATEGORY whose
+  # effective value at HOST is the scalar `absent`, as a fold-shaped document
+  # (`{"plugins":{"x":"absent"}}`, or `{}`).
+  #
+  # §3.4's tombstone. The fold's knockout makes `absent` mean "no opinion
+  # here", which is right for every reader of desired state and is why this is
+  # a SEPARATE read rather than a change to the fold: it is the same merge with
+  # the knockout left out, so the last layer to speak still wins — a narrower
+  # layer that re-adds the item un-tombstones it, and a narrower `absent` over a
+  # wider `enabled` is a tombstone. The map form (`{state: absent}`) is not
+  # knocked out at all and already reaches the run through the ordinary fold.
+  IFS='
+'
+  set -f
+  # shellcheck disable=SC2046 # deliberate word splitting over the file list
+  set -- "$3" $(fleet_layer_files "$1" "$2")
+  tombstone_category=$1
+  shift
+  [ "$#" -gt 0 ] || {
+    printf '{}\n'
+    return
+  }
+  yq ea -o=json -I=0 '. as $layer ireduce ({};
+    . *d ($layer | with_entries(select(.value != null))
+      | (.[] | select(tag == "!!map")) |= with_entries(select(.value != null))))' \
+    "$@" | jq -c --arg c "$tombstone_category" '
+      (.[$c] // {}) as $entries |
+      if ($entries | type) != "object" then {}
+      else ($entries | with_entries(select(.value == "absent"))) as $dead |
+        if $dead == {} then {} else {($c): $dead} end
+      end'
+)
+
 fleet_item_split() {
   # `<category>.<name>` -> two lines, category then name. The split is on the
   # FIRST dot, because names carry dots freely (`~/.claude/settings.json`,
