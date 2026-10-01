@@ -804,7 +804,15 @@ JSON
     # ONE refresh per marketplace per run, however many plugins it carries.
     run_repair_identity
     [ "$(grep -c . "$run_repair_updates")" -eq 1 ] ||
-      fail "a second plugin from the same marketplace refreshed it again in one run"
+      fail "a second plugin from the same marketplace refreshed it again in one pass"
+    # …and the memo is per PASS: the next pass forgets it and tries again.
+    fleet_run_marketplace_repair_reset
+    run_repair_identity
+    [ "$(grep -c . "$run_repair_updates")" -eq 2 ] ||
+      fail "a new pass did not retry a marketplace repair an earlier pass failed"
+    cli_function_body fleet_run_command | grep -B4 'fleet_run_marketplace_repair_reset' |
+      grep -q 'review -> verdict -> apply' ||
+      fail "the repair memo is no longer reset at the start of each pass's apply step"
     printf '%s\n' "$run_repair_saved_settings" >"$HOME/.claude/settings.json"
 
     # --- §3.5 relative-source catalogs take the checkout commit as identity ---

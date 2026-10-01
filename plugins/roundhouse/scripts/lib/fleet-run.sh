@@ -2206,8 +2206,6 @@ fleet_run_command() (
   run_store=$(fleet_store_path)
   run_host=$(fleet_host_name)
   fleet_vcs_store_ready "$run_store" || exit $?
-  # One marketplace repair per marketplace per pass (fleet_run_marketplace_repair).
-  fleet_run_marketplace_repair_reset
 
   # §10.6: one run per host. The stale threshold keys on the FULL cadence and
   # never on the fast interval — a 40-minute threshold would declare a live
@@ -2474,6 +2472,10 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   fi
 
   # --- §6 step 6: review -> verdict -> apply -> applied/ -> journal ---
+  # PER PASS, not per process: one marketplace repair per marketplace per pass
+  # (fleet_run_marketplace_repair), forgotten here so a later pass in the same
+  # process retries a repair an earlier pass could not make.
+  fleet_run_marketplace_repair_reset
   run_canary_group=$(fleet_policy_get "$run_fold" canary_group)
   run_wait=$(fleet_policy_get "$run_fold" canary_wait_hours)
   fleet_run_canary_hosts "$run_layers" "$run_canary_group" "$run_tmp/hosts" \
