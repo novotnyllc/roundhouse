@@ -1239,8 +1239,12 @@ fleet_run_apply_item() {
         fleet_run_uninstall_plugin "$3" "$4" "$fleet_run_name" "$5"
         return $?
       fi
+      # A definition that does not resolve HOLDS (75). Falling through to the
+      # unqualified id here installed from the manager's DEFAULT marketplace —
+      # a same-named plugin from a source nobody declared. Empty output with
+      # status 0 is the zero-config case below, and only that is unqualified.
       fleet_run_market=$(fleet_run_plugin_market "$3" "$fleet_run_name" "$5") ||
-        fleet_run_market=
+        return 75
       # HELD, not satisfied: a host with no `claude` cannot speak to the item
       # at all, and a peer that has one still must not converge on this host's
       # inability. See the exit-code contract above.

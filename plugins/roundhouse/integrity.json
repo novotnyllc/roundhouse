@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/apply-claude.sh",
-      "sha256": "9da0e479639c02e2e591c5896d6901fedbbd01bc4dde5ae8f89e58545bdf74d0"
+      "sha256": "c955fa0d43a1b6d815f2edca28b40001f33b224d96e935474248f965913d8e26"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
@@ -150,7 +150,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "788fe0b462bc9ba6f94ca5373a51259ad93669933d2aff735326c474ad6cda0d"
+      "sha256": "a588bed0edc4c5dcb6e98e93e3f3020a3b811e3d504307a1096ef7ec5e5912c8"
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
