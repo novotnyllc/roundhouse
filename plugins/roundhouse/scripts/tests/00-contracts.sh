@@ -286,8 +286,8 @@ added'
 assert_contains "$fleet_update_text" 'it runs `roundhouse fleet-run`'
 assert_contains "$fleet_update_text" '**Absorb, never duplicate**'
 assert_contains "$fleet_update_text" 'com.novotnyllc.roundhouse.autoupdate'
-assert_contains "$fleet_update_text" 'unload and remove it in the same step that installs the
-fleet entry'
+assert_contains "$fleet_update_text" 'unload it and set it aside (renamed `.absorbed`, never deleted) in the
+same step that installs the fleet entry'
 assert_contains "$fleet_update_text" 'roundhouse fleet-run --fast'
 assert_contains "$fleet_update_text" 'roundhouse fleet-run --full'
 # All three platforms, because a scheduler section that only says "launchd"
