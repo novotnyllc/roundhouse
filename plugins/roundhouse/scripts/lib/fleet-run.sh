@@ -897,14 +897,12 @@ fleet_run_tree_digest() (
   # bytes, `.git` excluded, and the two markers Claude leaves in an installed
   # copy (`.in_use`, `.orphaned_at`), which are not plugin content.
   cd "$1" 2>/dev/null || exit 1
-  if command -v sha256sum >/dev/null 2>&1; then
-    tree_sum=sha256sum
-  else
-    tree_sum='shasum -a 256'
-  fi
-  # shellcheck disable=SC2086 # the digest tool and its flags, one word each
-  find . -name .git -prune -o -type f ! -path ./.in_use ! -path ./.orphaned_at \
-    -print0 | LC_ALL=C sort -z | xargs -0 $tree_sum 2>/dev/null | sha256_stream
+  set --
+  while IFS= read -r -d '' tree_file; do
+    set -- "$@" "$tree_file"
+  done < <(find . -name .git -prune -o -type f ! -path ./.in_use ! -path ./.orphaned_at \
+    -print0 | LC_ALL=C sort -z)
+  sha256_files "$@" | sha256_stream
 )
 
 fleet_run_relative_source_sha() {
@@ -1103,17 +1101,41 @@ fleet_run_ensure_marketplace() {
   ' >/dev/null 2>&1 || return 75
 }
 
-fleet_run_installed_plugin() {
-  # No installed-plugins file, or the plugin absent from it, means "not
-  # installed yet" — an empty identity that must proceed to install, not a
-  # hold. Only a file that fails to parse as JSON is genuinely malformed and
-  # still holds: we cannot trust its absence of the plugin in that case.
+fleet_run_installed_plugins() {
+  # The one reader of installed_plugins.json: its `plugins` map, compact. No
+  # file means nothing installed yet — `{}`, an empty identity that must
+  # proceed to install, not a hold. Only a file that fails to parse is
+  # genuinely malformed and holds (75): its silence about a plugin proves
+  # nothing.
   fleet_run_installed_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
   [ -f "$fleet_run_installed_file" ] || { printf '{}\n'; return 0; }
-  jq -c --arg id "$1" \
-    '(.plugins[$id] // []) | map(select(.scope == "user")) | (.[0] // {})' \
+  jq -e -c '(.plugins // {}) | if type == "object" then . else error("plugins") end' \
     "$fleet_run_installed_file" 2>/dev/null && return 0
   return 75
+}
+
+fleet_run_installed_plugin() {
+  # fleet_run_installed_plugin ID -> the user-scoped installed record for ID,
+  # or `{}` when it is not installed; 75 when installed_plugins.json is
+  # unreadable.
+  fleet_run_installed_map=$(fleet_run_installed_plugins) || return 75
+  printf '%s\n' "$fleet_run_installed_map" | jq -c --arg id "$1" \
+    '(.[$id] // []) | map(select(.scope == "user")) | (.[0] // {})'
+}
+
+fleet_run_plugin_market() {
+  # fleet_run_plugin_market DEFS NAME VALUE -> the marketplace a plugin item
+  # names: the value's own map-form `marketplace`, else its definitions
+  # entry's, else nothing — the zero-config form, which the harness resolves
+  # itself. Exit 75 when the definition has to be asked and does not resolve.
+  plugin_market=$(printf '%s\n' "$3" | jq -r '
+    if type == "object" then (.marketplace // "") else "" end' 2>/dev/null) ||
+    plugin_market=
+  if [ -z "$plugin_market" ]; then
+    plugin_market_surface=$(fleet_resolve_surface "$1" plugins "$2") || return 75
+    plugin_market=$(printf '%s\n' "$plugin_market_surface" | jq -r '.marketplace // ""')
+  fi
+  printf '%s\n' "$plugin_market"
 }
 
 fleet_run_plugin_enabled() {
@@ -1207,14 +1229,10 @@ fleet_run_plugin_identity_matches() {
   # marketplace is re-registered from its configured source and refreshed, and
   # the catalog is asked ONCE more before the item holds.
   fleet_run_identity_reason=
-  fleet_run_identity_surface=$(fleet_resolve_surface "$1" plugins "$2") || {
+  fleet_run_identity_market=$(fleet_run_plugin_market "$1" "$2" "$3") || {
     fleet_run_identity_reason="the plugin's definition does not resolve"
     return 75
   }
-  fleet_run_identity_market=$(printf '%s\n' "$3" | jq -r \
-    'if type == "object" then (.marketplace // "") else "" end')
-  [ -n "$fleet_run_identity_market" ] || fleet_run_identity_market=$(printf '%s\n' \
-    "$fleet_run_identity_surface" | jq -r '.marketplace // ""')
   # An unqualified plugin is resolved by the native harness, so there is no
   # marketplace SHA to compare here; the existing manager presence path stays
   # authoritative for that zero-config form.
@@ -1495,12 +1513,8 @@ fleet_run_tombstone_target() {
   # Exit 75 when that cannot be decided: an unreadable installed_plugins.json,
   # or an unqualified name that more than one marketplace has installed — an
   # uninstall must name exactly one plugin or none.
-  fleet_run_tomb_market=$(printf '%s\n' "$3" | jq -r '
-    if type == "object" then (.marketplace // "") else "" end' 2>/dev/null) ||
+  fleet_run_tomb_market=$(fleet_run_plugin_market "$1" "$2" "$3" 2>/dev/null) ||
     fleet_run_tomb_market=
-  [ -n "$fleet_run_tomb_market" ] ||
-    fleet_run_tomb_market=$(fleet_resolve_surface "$1" plugins "$2" 2>/dev/null |
-      jq -r '.marketplace // ""' 2>/dev/null) || fleet_run_tomb_market=
   case $2 in
     *@*) fleet_run_tomb_id=$2 ;;
     *) fleet_run_tomb_id=${fleet_run_tomb_market:+$2@$fleet_run_tomb_market} ;;
@@ -1510,13 +1524,11 @@ fleet_run_tombstone_target() {
     [ "$fleet_run_tomb_record" = '{}' ] || printf '%s\n' "$fleet_run_tomb_id"
     return 0
   fi
-  fleet_run_tomb_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
-  [ -f "$fleet_run_tomb_file" ] || return 0
-  fleet_run_tomb_ids=$(jq -r --arg name "$2" '
-    (.plugins // {}) | to_entries[] |
+  fleet_run_tomb_map=$(fleet_run_installed_plugins) || return 75
+  fleet_run_tomb_ids=$(printf '%s\n' "$fleet_run_tomb_map" | jq -r --arg name "$2" '
+    to_entries[] |
     select((.key | split("@")[0]) == $name and
-      any((.value // [])[]; .scope == "user")) | .key' \
-    "$fleet_run_tomb_file" 2>/dev/null) || return 75
+      any((.value // [])[]; .scope == "user")) | .key' 2>/dev/null) || return 75
   case $(printf '%s\n' "$fleet_run_tomb_ids" | grep -c .) in
     0) return 0 ;;
     1) printf '%s\n' "$fleet_run_tomb_ids" ;;
@@ -1760,11 +1772,8 @@ fleet_run_apply_item() {
         fleet_run_uninstall_plugin "$3" "$4" "$fleet_run_name" "$5"
         return $?
       fi
-      fleet_run_surface=$(fleet_resolve_surface "$3" plugins "$fleet_run_name")
-      fleet_run_market=$(printf '%s\n' "$5" | jq -r '
-        if type == "object" then (.marketplace // "") else "" end')
-      [ -n "$fleet_run_market" ] || fleet_run_market=$(printf '%s\n' \
-        "$fleet_run_surface" | jq -r '.marketplace // ""')
+      fleet_run_market=$(fleet_run_plugin_market "$3" "$fleet_run_name" "$5") ||
+        fleet_run_market=
       # HELD, not satisfied: a host with no `claude` cannot speak to the item
       # at all, and a peer that has one still must not converge on this host's
       # inability. See the exit-code contract above.

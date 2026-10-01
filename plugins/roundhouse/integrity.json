@@ -134,7 +134,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "10fcb8038649676f74db3c5bbc8b0e6b81d5db436620a6f478557dbf2f90ad1a"
+      "sha256": "f05b132a57212a5a2f9b4735a4729864a914047a28cdd2684f8a076744580fff"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -150,7 +150,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "4d3691a7475d587666d2b9e333e6aa2f58f9b88db711754861b3bd6ef36b7b7d"
+      "sha256": "0852804a10c6c852000066aec2744339d9cbab6716ab4886c573a4297ccb4f76"
     },
     {
       "path": "scripts/lib/identity.sh",

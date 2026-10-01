@@ -211,6 +211,23 @@ sha256_file() {
   fi
 }
 
+sha256_files() {
+  # `sha256_files FILE...` -> one `<sha256>  <path>` line per file, through the
+  # same tool fallback as sha256_file. Nothing for no files (sha256sum and
+  # shasum would otherwise read stdin).
+  [ "$#" -gt 0 ] || return 0
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$@"
+  else
+    for sha256_files_one do
+      printf '%s  %s\n' "$(openssl dgst -sha256 "$sha256_files_one" |
+        awk '{print tolower($NF)}')" "$sha256_files_one"
+    done
+  fi
+}
+
 sha256_stream() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum | awk '{print tolower($1)}'
