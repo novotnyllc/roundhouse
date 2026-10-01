@@ -182,7 +182,7 @@
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "85ad1b931b09b26b74859c433828a843b2520bd28c311855bad5a666fd166f61"
+      "sha256": "9b934bddd589df7bb01136d654e1c280e8f520631f3e18b12da85a9e38ccdbce"
     },
     {
       "path": "scripts/lib/plan-verify.sh",

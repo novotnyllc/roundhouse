@@ -700,6 +700,12 @@ else
     "$tmp/node-after-plan.json" >"$nrt_root/seal-after.log" 2>&1 || :
   ! grep -Fq 'must precede every npm upgrade' "$nrt_root/seal-after.log" ||
     fail "a Node switch ordered before an npm upgrade was refused for its order"
+  # A second switch after an npm upgrade would carry the pre-upgrade version.
+  jq '.operations as $sw | .operations = $sw + [{type:"package-upgrade",kind:"package",id:"npm:plain",
+    candidate_version:"3.0.0",argv:["npm","install","--global","plain@3.0.0"]}] + $sw' \
+    "$tmp/node-draft.json" >"$tmp/node-draft-two-switches.json"
+  nrt_seal_refused 'a second Node switch' "$tmp/node-draft-two-switches.json"
+  assert_contains "$(cat "$nrt_root/seal-refused.log")" 'a plan may contain at most one Node switch'
   if nrt_store_override="$nrt_root/no-store" nrt_cli seal-plan "$tmp/node-draft.json" \
     "$tmp/node-snapshot.jsonl" "$tmp/node-refused-plan.json" >/dev/null 2>&1; then
     fail "a Node switch sealed without the store definitions"

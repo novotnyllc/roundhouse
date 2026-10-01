@@ -116,6 +116,12 @@ seal_plan_command() {
     exit 64
   }
   fi
+  # One Node switch per plan: plain operation validation allows duplicate IDs,
+  # and a second switch would carry versions an earlier npm upgrade changed.
+  jq -e '[.operations[] | select(.id == "fnm:node")] | length <= 1' "$draft" >/dev/null || {
+    printf 'roundhouse: a plan may contain at most one Node switch\n' >&2
+    exit 65
+  }
   # A Node switch must run before any npm upgrade in the same plan: an npm
   # upgrade first changes a version the switch's sealed carry names, and the
   # switch would then refuse halfway through an already-mutated plan.
