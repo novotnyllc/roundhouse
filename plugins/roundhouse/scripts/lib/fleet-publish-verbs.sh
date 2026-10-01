@@ -62,7 +62,7 @@ fleet_run_verb_begin() {
 
 fleet_age_evidence_command() (
   # `roundhouse fleet-age-evidence [--dry-run]` — the full pass's evidence
-  # aging (fleet_trust_age_evidence), run by hand. `--dry-run` prints what it
+  # aging (fleet_records_age), run by hand. `--dry-run` prints what it
   # would trim and changes nothing: the first real pass after the journal
   # aging fix trims every record past retention that nothing still reads, so
   # an operator can see the counts before the scheduled pass does it. The
@@ -81,11 +81,11 @@ fleet_age_evidence_command() (
   esac
   age_verb_store=$(fleet_store_path)
   age_verb_host=$(fleet_host_name)
-  age_verb_days=$(fleet_run_retention_days "$(fleet_fold "$age_verb_store" "$age_verb_host")")
+  age_verb_days=$(fleet_records_retention_days "$(fleet_fold "$age_verb_store" "$age_verb_host")")
   if [ "$age_verb_dry" = true ]; then
     fleet_vcs_store_ready "$age_verb_store" || exit $?
     printf 'roundhouse: retention %s days\n' "$age_verb_days"
-    fleet_trust_age_evidence "$age_verb_store" "$age_verb_host" "$age_verb_days" \
+    fleet_records_age "$age_verb_store" "$age_verb_host" "$age_verb_days" \
       --dry-run || exit 65
     exit 0
   fi
@@ -93,7 +93,7 @@ fleet_age_evidence_command() (
     exit $?
   age_verb_lock=$(fleet_lock_path)
   trap 'fleet_lock_release "$age_verb_lock" "$fleet_run_verb_nonce" || :' EXIT HUP INT TERM
-  fleet_trust_age_evidence "$age_verb_store" "$age_verb_host" "$age_verb_days" ||
+  fleet_records_age "$age_verb_store" "$age_verb_host" "$age_verb_days" ||
     exit 65
   if [ "$(jj -R "$age_verb_store" log -r @ --no-graph -T 'if(empty,"y","n")')" = y ]; then
     printf 'roundhouse: nothing to publish\n'

@@ -320,7 +320,7 @@ YAML
       >"$rec_aging/alerts/vireo/lock-takeover.yaml"
     printf 'kind: some-future-kind\nat: "2001-01-01T00:00:00Z"\n' \
       >"$rec_aging/alerts/vireo/some-future-kind.yaml"
-    fleet_trust_age_evidence "$rec_aging" vireo 90 >/dev/null
+    fleet_records_age "$rec_aging" vireo 90 >/dev/null
     [ -f "$rec_aging/alerts/vireo/removal-cap.yaml" ] ||
       fail "evidence aging deleted a keyed CONDITION alert by its first-seen time"
     [ ! -f "$rec_aging/alerts/vireo/20010101T0000-removal-cap.yaml" ] ||
@@ -361,7 +361,7 @@ YAML
       fail "the fixture's canary evidence did not pass the gate to begin with"
     rec_jrevert=$(fleet_run_is_revert "$rec_jage" vireo plugins.s s1 && echo yes || echo no)
     rec_jbefore=$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)
-    rec_jdry=$(fleet_trust_age_evidence "$rec_jage" vireo 90 --dry-run) ||
+    rec_jdry=$(fleet_records_age "$rec_jage" vireo 90 --dry-run) ||
       fail "the journal aging dry run failed"
     [ "$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)" = "$rec_jbefore" ] ||
       fail "the aging dry run changed the journal"
@@ -369,7 +369,7 @@ YAML
       *'dry run'*'journal/vireo: 7 of 12 records past retention (1 day files removed, 2 rewritten)'*) ;;
       *) fail "the aging dry run did not report the trim: $rec_jdry" ;;
     esac
-    fleet_trust_age_evidence "$rec_jage" vireo 90 >/dev/null ||
+    fleet_records_age "$rec_jage" vireo 90 >/dev/null ||
       fail "journal aging failed"
     # The canary's ONLY evidence is past retention, and the downstream gate
     # still passes: its oldest and newest applied records are load-bearing.
@@ -391,7 +391,7 @@ YAML
       fail "aging removed the newest heartbeat"
     # Idempotent, and this host's own journal only.
     rec_jafter=$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)
-    case $(fleet_trust_age_evidence "$rec_jage" vireo 90) in
+    case $(fleet_records_age "$rec_jage" vireo 90) in
       *'journal/vireo: 0 of '*) ;;
       *) fail "a second aging pass found more to trim" ;;
     esac
@@ -402,7 +402,7 @@ YAML
     [ "$(yq -r 'length' "$rec_jage/journal/wren/2001-01-01.yaml")" -eq 3 ] ||
       fail "aging touched another host's journal"
     # Efficiency is structural: batched reads, one plan.
-    cli_function_body fleet_trust_age_evidence | grep -q 'fleet_records_read_dir' ||
+    cli_function_body fleet_records_age | grep -q 'fleet_records_read_dir' ||
       fail "evidence aging no longer reads its directories in batches"
 
     # --- every alert kind has a lifecycle, from one table ---

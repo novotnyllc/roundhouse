@@ -195,7 +195,7 @@ does. A record something still reads is **never** aged:
   which carry canary evidence, rule-5 times and the revert signature;
 - every `held` or `reverted` record newer than the item's oldest evidence;
 - the newest `alive` record, and the newest record of any kind;
-- `--now` overrides from the last 30 days, which doctor counts.
+- `--now` overrides from the last 30 days (`fleet_journal_override_window_days`), which doctor counts.
 
 Run `fleet-age-evidence --dry-run` before the first full pass on a new build:
 that pass trims every record past retention that nothing reads.

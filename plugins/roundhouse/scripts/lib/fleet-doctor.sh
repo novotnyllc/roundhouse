@@ -1409,19 +1409,19 @@ fleet_doctor_command() (
     fleet_doctor_row finding revert-signature "$doctor_revert"
   fi
 
-  # --- §10.8 every canary bypass in the last 30 days ---
+  # --- §10.8 every canary bypass in fleet_journal_override_window_days ---
   doctor_overrides=$(fleet_journal_entries "$doctor_store" "$doctor_host" 2>/dev/null |
-    jq -r --arg since "$(fleet_doctor_days_ago 30)" \
+    jq -r --arg since "$(fleet_doctor_days_ago "$fleet_journal_override_window_days")" \
       'select(.override == "canary" and .at >= $since) |
        "\(.at) \(.item)"' 2>/dev/null || true)
   if [ -z "$doctor_overrides" ]; then
-    fleet_doctor_row ok canary-overrides 'no --now bypass on this host in the last 30 days'
+    fleet_doctor_row ok canary-overrides "no --now bypass on this host in the last $fleet_journal_override_window_days days"
   else
     # Reported, never a finding by itself: `--now` is a legitimate,
     # journaled, bound bypass. What must never happen is that it goes
     # uncounted, because an uncounted bypass becomes routine.
     fleet_doctor_row ok canary-overrides \
-      "$(printf '%s' "$doctor_overrides" | grep -c .) in the last 30 days: $(printf '%s' "$doctor_overrides" | tr '\n' ';')"
+      "$(printf '%s' "$doctor_overrides" | grep -c .) in the last $fleet_journal_override_window_days days: $(printf '%s' "$doctor_overrides" | tr '\n' ';')"
   fi
 
   # --- rows that need the reviewed layers ---
