@@ -324,11 +324,17 @@ it makes is closed to editors, pagers and credential prompts, so a scheduled
 run can never block on a human at a machine nobody is sitting at. A local
 run-lock enforces one runner at a time per host: a second run finds the lock
 held and exits 0 without acting, which is the ordinary overlap and not a
-failure. Exit 75 is the STALE-lock refusal — a lock past two full cadences, or
-one whose `meta.json` is missing so its age cannot be read — and it names the
-recovery rather than forcing. `roundhouse fleet-unlock` releases a lock left by
-a killed run; `roundhouse fleet-lock` taken by hand also exits 75 when the lock
-is already held. Unattended runs skip protected/privileged actions — those
+failure. The holder is checked before the age: the lock records the holder's
+pid, process start time, command and a random nonce, and a lock whose holder is
+dead — the pid is gone, or now belongs to a process with a different start time
+or command — is taken over (renamed aside, verified by nonce, recreated) and
+raises a `lock-takeover` alert. A run releases the lock only while it still
+carries that run's nonce. Exit 75 is the STALE-lock refusal — a lock past two
+full cadences whose holder cannot be shown dead, or one
+whose `meta.json` is missing so its age cannot be read — and it names the
+recovery rather than forcing. `roundhouse fleet-unlock` releases a lock by hand;
+`roundhouse fleet-lock` records the calling shell as the holder and also exits
+75 when the lock is already held. Unattended runs skip protected/privileged actions — those
 stay interactive by design. Failures land in the store's own alert and journal
 records and surface in `roundhouse fleet-pending` and `roundhouse fleet-doctor`.
 

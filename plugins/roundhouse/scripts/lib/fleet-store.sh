@@ -211,15 +211,185 @@ fleet_lock_path() {
   printf '%s.lock\n' "$(fleet_store_path)"
 }
 
+fleet_lock_nonce() {
+  # 128 random bits as hex. The nonce is what makes a lock THIS acquisition's
+  # rather than whatever directory happens to sit at the path: release and
+  # takeover both compare it, and neither ever acts on the path alone.
+  od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
+}
+
+fleet_lock_proc_start() {
+  # `fleet_lock_proc_start PID` — the process's start time as `ps` prints it,
+  # whitespace-normalised, or nothing when no such process exists. `lstart` is
+  # spelled the same by BSD (macOS) and procps (Linux) ps, and it is what tells
+  # a live holder from an unrelated process that was handed the same pid.
+  # Pinned to UTC and the C locale: `lstart` is printed in the READER's zone and
+  # language, and a scheduled run and an interactive one need not share either
+  # — a mismatch there would judge a live holder dead.
+  LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null |
+    awk '{ $1 = $1; if ($0 != "") print; exit }'
+}
+
+fleet_lock_proc_command() {
+  # `fleet_lock_proc_command PID` — the process's full command line, or
+  # nothing. Host-local evidence only: it lands in the lock meta beside the
+  # store, never in a replicated record.
+  ps -o command= -p "$1" 2>/dev/null | awk '{ sub(/[[:space:]]+$/, ""); if ($0 != "") print; exit }'
+}
+
 fleet_lock_acquire() {
-  # One lock shape for every entry point: the directory is the mutex, the meta
-  # file is the evidence doctor and the stale-lock check read.
+  # `fleet_lock_acquire LOCK_DIR [HOLDER_PID]` — one lock shape for every entry
+  # point: the directory is the mutex, the meta file is the evidence doctor and
+  # the holder check read. Sets `fleet_lock_nonce_held` to this acquisition's
+  # nonce, which is the only thing `fleet_lock_release` will act on.
+  #
+  # The meta names the holder by pid, start time AND command, because a pid
+  # alone is not an identity: after a crash or reboot the same number belongs
+  # to something else, and `kill -0` cannot tell the difference. HOLDER_PID
+  # defaults to this process; `fleet-lock` passes its caller's shell, so a
+  # hand-taken lock lives exactly as long as the shell that took it.
+  #
+  # Exit 1 when the lock is held, 2 when the directory was created but its
+  # evidence could not be written: a lock nobody can identify is a lock nobody
+  # can safely release or take over, so it is removed rather than left behind.
   lock_dir=$1
+  lock_pid=${2:-$$}
+  fleet_lock_nonce_held=
   mkdir "$lock_dir" 2>/dev/null || return 1
   chmod 0700 "$lock_dir"
-  jq -S -n --arg host "$(fleet_host_name)" --argjson pid "$$" \
-    --arg started "$(fleet_now)" \
-    '{host:$host,pid:$pid,started_at:$started}' >"$lock_dir/meta.json" 2>/dev/null || true
+  lock_nonce=$(fleet_lock_nonce)
+  if [ -n "$lock_nonce" ] &&
+    jq -S -n --arg host "$(fleet_host_name)" --argjson pid "$lock_pid" \
+      --arg started "$(fleet_now)" --arg start_time "$(fleet_lock_proc_start "$lock_pid")" \
+      --arg command "$(fleet_lock_proc_command "$lock_pid")" --arg nonce "$lock_nonce" \
+      '{host:$host,pid:$pid,started_at:$started,start_time:$start_time,
+        command:$command,nonce:$nonce}' >"$lock_dir/meta.json.tmp" 2>/dev/null &&
+    mv -f "$lock_dir/meta.json.tmp" "$lock_dir/meta.json"; then
+    fleet_lock_nonce_held=$lock_nonce
+    return 0
+  fi
+  rm -rf "$lock_dir"
+  return 2
+}
+
+fleet_lock_meta_field() {
+  # `fleet_lock_meta_field LOCK_DIR FIELD` — one scalar from the lock's meta,
+  # or nothing (no meta, unparsable meta, absent field).
+  [ -f "$1/meta.json" ] || return 0
+  jq -r --arg f "$2" '.[$f] // empty | tostring' "$1/meta.json" 2>/dev/null || true
+}
+
+fleet_lock_identity() {
+  # `fleet_lock_identity LOCK_DIR` — what a takeover binds to: the nonce, or for
+  # a lock written before nonces existed, its pid and start stamp. The legacy
+  # form is what lets the first nonce-aware run recover a lock a dead pre-nonce
+  # run left behind — the exact wedge this mechanism exists for — while still
+  # refusing to move any lock it did not judge.
+  lock_identity=$(fleet_lock_meta_field "$1" nonce)
+  if [ -z "$lock_identity" ]; then
+    lock_identity_pid=$(fleet_lock_meta_field "$1" pid)
+    lock_identity_at=$(fleet_lock_meta_field "$1" started_at)
+    [ -z "$lock_identity_pid" ] || [ -z "$lock_identity_at" ] ||
+      lock_identity="legacy:$lock_identity_pid:$lock_identity_at"
+  fi
+  printf '%s\n' "$lock_identity"
+}
+
+fleet_lock_release() {
+  # `fleet_lock_release LOCK_DIR NONCE` — remove the lock ONLY when it still
+  # carries this acquisition's nonce. A run that was judged dead and taken over
+  # must not, when it finally exits, delete the live successor's lock by path.
+  [ -n "${2:-}" ] || return 0
+  [ "$(fleet_lock_meta_field "$1" nonce)" = "$2" ] || return 0
+  rm -f "$1/meta.json"
+  rmdir "$1" 2>/dev/null || :
+}
+
+fleet_lock_holder_state() {
+  # `fleet_lock_holder_state LOCK_DIR` — sets `fleet_lock_state` to `dead`,
+  # `live` or `unknown`, and `fleet_lock_judged_id` to the identity
+  # (fleet_lock_identity) the verdict is about. Globals rather than output, so
+  # the takeover that follows can use the identity: call it directly.
+  #
+  # dead     the meta names a pid on THIS host that no longer exists, or a live
+  #          pid whose start time or command is not the recorded holder's (pid
+  #          reuse after a crash or a reboot)
+  # live     the recorded holder is running right now, verified by all three
+  # unknown  nothing here can be proved either way: no readable meta, another
+  #          host's pid, a pre-nonce lock whose pid is alive, or no identity
+  #          to bind a takeover to
+  #
+  # The host name is compared because the lock lives beside a store path that
+  # a second instance root could share; a pid from another machine says
+  # nothing about this one.
+  fleet_lock_judged_id=
+  fleet_lock_state=unknown
+  lock_meta="$1/meta.json"
+  [ -f "$lock_meta" ] || return 0
+  jq -e 'type == "object"' "$lock_meta" >/dev/null 2>&1 || return 0
+  [ "$(fleet_lock_meta_field "$1" host)" = "$(fleet_host_name)" ] || return 0
+  lock_pid=$(fleet_lock_meta_field "$1" pid)
+  case $lock_pid in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  # A `ps` that cannot see THIS process cannot see anything, and reading its
+  # silence as "the holder is gone" would take over a live run's lock.
+  [ -n "$(fleet_lock_proc_start "$$")" ] || return 0
+  fleet_lock_judged_id=$(fleet_lock_identity "$1")
+  lock_now_start=$(fleet_lock_proc_start "$lock_pid")
+  lock_was_start=$(fleet_lock_meta_field "$1" start_time)
+  lock_was_command=$(fleet_lock_meta_field "$1" command)
+  if [ -z "$lock_now_start" ]; then
+    fleet_lock_state=dead
+  elif [ -z "$lock_was_start" ] || [ -z "$lock_was_command" ]; then
+    # A lock written before holders were recorded: the pid is alive and there
+    # is no evidence about whose it is, so this answer keeps the age rule.
+    fleet_lock_state=unknown
+  elif [ "$lock_now_start" != "$lock_was_start" ] ||
+    [ "$(fleet_lock_proc_command "$lock_pid")" != "$lock_was_command" ]; then
+    fleet_lock_state=dead
+  else
+    fleet_lock_state=live
+  fi
+  # A dead verdict is only actionable against an identity: the takeover proves
+  # it moved the SAME lock it judged, and without one there is nothing to prove.
+  [ "$fleet_lock_state" != dead ] || [ -n "$fleet_lock_judged_id" ] ||
+    fleet_lock_state=unknown
+}
+
+fleet_lock_takeover() {
+  # `fleet_lock_takeover LOCK_DIR JUDGED_ID [HOLDER_PID]` — replace a lock
+  # whose holder `fleet_lock_holder_state` judged dead, atomically:
+  #
+  #   1. rename the lock directory to a unique sibling (rename(2) is atomic, so
+  #      of two runs racing the same dead lock exactly one moves it);
+  #   2. verify the renamed directory carries the identity judged dead —
+  #      if a racing run already replaced it with a live lock, this run moved
+  #      THAT one, so it is put back and the takeover refused;
+  #   3. create the new lock through the ordinary acquire.
+  #
+  # Sets `fleet_lock_dead_meta` to the dead holder's meta (compact JSON) for
+  # the caller's alert, and `fleet_lock_nonce_held` through the acquire — so it
+  # is called directly, never in a command substitution. Exit 1 when the
+  # takeover was refused or lost a race.
+  fleet_lock_dead_meta=
+  [ -n "${2:-}" ] || return 1
+  lock_aside="$1.dead.$(fleet_lock_nonce)"
+  mv "$1" "$lock_aside" 2>/dev/null || return 1
+  if [ "$(fleet_lock_identity "$lock_aside")" != "$2" ]; then
+    # Never `mv` onto an existing directory: that would nest the lock inside
+    # whatever now holds the path. If the path was taken meanwhile, the moved
+    # lock stays aside and its owner's nonce release simply finds nothing.
+    [ -e "$1" ] || mv "$lock_aside" "$1" 2>/dev/null || :
+    return 1
+  fi
+  lock_dead_meta=$(jq -c '.' "$lock_aside/meta.json" 2>/dev/null || printf '{}')
+  fleet_lock_acquire "$1" "${3:-$$}" || {
+    rm -rf "$lock_aside"
+    return 1
+  }
+  rm -rf "$lock_aside"
+  fleet_lock_dead_meta=$lock_dead_meta
 }
 
 fleet_lock_age_seconds() {
@@ -236,27 +406,6 @@ fleet_lock_age_seconds() {
     'try ($at | fromdateiso8601) catch empty' 2>/dev/null || true)
   [ -n "$lock_epoch" ] || return 1
   printf '%s\n' "$(($(date +%s) - lock_epoch))"
-}
-
-fleet_lock_holder_gone() {
-  # True when the lock names a pid on THIS host that no longer exists. The pid
-  # was already being recorded and never read: staleness was time-only, so a
-  # SIGKILLed or power-cut run wedged the host for two full cadences while a
-  # slow-but-live run looked identical. `kill -0` distinguishes them in one
-  # syscall.
-  #
-  # The host name is compared because the lock lives beside a store path that
-  # a second instance root could share; a pid from another machine says
-  # nothing about this one, so it falls back to the time-only answer.
-  lock_meta="$1/meta.json"
-  [ -f "$lock_meta" ] || return 1
-  [ "$(jq -r '.host // empty' "$lock_meta" 2>/dev/null)" = "$(fleet_host_name)" ] ||
-    return 1
-  lock_pid=$(jq -r '.pid // empty' "$lock_meta" 2>/dev/null || true)
-  case $lock_pid in
-    '' | *[!0-9]*) return 1 ;;
-  esac
-  ! kill -0 "$lock_pid" 2>/dev/null
 }
 
 fleet_validate_fetch_url() {

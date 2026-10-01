@@ -1653,6 +1653,80 @@ fleet_run_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '0\n'
 }
 
+# --- §6.3 the run lock: liveness before age ------------------------------------
+
+fleet_run_lock_take() {
+  # fleet_run_lock_take STORE HOST LOCK — take the run lock for any entry point
+  # that mutates this host's store. Exit 0 acquired (`fleet_lock_nonce_held`
+  # names it), 10 held by a live run (the ordinary overlap; the caller decides
+  # whether that is success), 75 refused.
+  #
+  # THE HOLDER IS ASKED BEFORE THE CLOCK. The canary wedged for weeks on a lock
+  # a dead process left, because the age check ran first and refused it as
+  # "stale, confirm no live runner" — a question the lock's own meta could
+  # already answer. A dead holder (pid gone, or the pid now belongs to a
+  # process with a different start time or command) is taken over through
+  # `fleet_lock_takeover`'s rename-and-verify, and the takeover is alerted so
+  # the crash that left it is visible. A live holder still blocks, and the age
+  # rule still governs every lock whose holder cannot be judged.
+  fleet_run_lock_rc=0
+  fleet_lock_acquire "$3" || fleet_run_lock_rc=$?
+  case $fleet_run_lock_rc in
+    0) return 0 ;;
+    2)
+      printf 'roundhouse: could not record the run lock evidence at %s; refusing to run without it\n' \
+        "$3" >&2
+      return 75
+      ;;
+  esac
+  fleet_lock_holder_state "$3"
+  fleet_run_lock_state=$fleet_lock_state
+  if [ "$fleet_run_lock_state" = dead ]; then
+    if fleet_lock_takeover "$3" "$fleet_lock_judged_id"; then
+      fleet_run_lock_was=$(printf '%s\n' "$fleet_lock_dead_meta" |
+        jq -r '"pid \(.pid // "?") started \(.started_at // "at an unknown time")"' \
+          2>/dev/null || printf 'an unreadable holder')
+      printf 'roundhouse: took over the run lock at %s from a dead holder (%s)\n' \
+        "$3" "$fleet_run_lock_was" >&2
+      # Evidence, not a refusal: the run proceeds. The command line stays in
+      # the host-local meta and never reaches this replicated record.
+      fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
+        "took over the run lock from a dead holder ($fleet_run_lock_was); the run it belonged to did not finish" ||
+        :
+      return 0
+    fi
+    # Lost the rename race to another run, or the lock changed under the
+    # verdict: whoever holds it now is not the holder that was judged.
+    return 10
+  fi
+  fleet_run_lock_age=$(fleet_lock_age_seconds "$3" || printf '')
+  fleet_run_lock_stale=$(fleet_run_stale_after "$1" "$2")
+  # AN UNKNOWN AGE IS STALE, NOT FRESH. `fleet_lock_age_seconds` answers empty
+  # when meta.json is missing or unparsable, and reading that as "under the
+  # threshold" wedged every future run on this host silently, forever, at
+  # exit 0. It is reachable through the recovery fleet-update/SKILL.md
+  # prescribes: `fleet-unlock` removes meta.json BEFORE an rmdir that can
+  # fail. A lock directory with no evidence of a live runner is exactly the
+  # case the stale branch exists for.
+  if [ -z "$fleet_run_lock_age" ]; then
+    printf 'roundhouse: a run lock at %s is of unknown age (no readable meta.json); confirm no live runner on this host, then remove it\n' \
+      "$3" >&2
+    return 75
+  fi
+  if [ "$fleet_run_lock_age" -gt "$fleet_run_lock_stale" ]; then
+    if [ "$fleet_run_lock_state" = live ]; then
+      printf 'roundhouse: a live run (pid %s) has held the run lock at %s for %ss, past the %ss threshold; it may be hung — confirm, stop it, then remove the lock\n' \
+        "$(fleet_lock_meta_field "$3" pid)" "$3" "$fleet_run_lock_age" \
+        "$fleet_run_lock_stale" >&2
+    else
+      printf 'roundhouse: a run lock at %s is %ss old; confirm no live runner on this host, then remove it\n' \
+        "$3" "$fleet_run_lock_age" >&2
+    fi
+    return 75
+  fi
+  return 10
+}
+
 # --- the commands -------------------------------------------------------------
 
 fleet_run_command() (
@@ -1684,35 +1758,24 @@ fleet_run_command() (
   # never on the fast interval — a 40-minute threshold would declare a live
   # run's lock stale on the very next fast run.
   run_lock=$(fleet_lock_path)
-  if ! fleet_lock_acquire "$run_lock"; then
-    run_age=$(fleet_lock_age_seconds "$run_lock" || printf '')
-    run_stale=$(fleet_run_stale_after "$run_store" "$run_host")
-    # AN UNKNOWN AGE IS STALE, NOT FRESH. `fleet_lock_age_seconds` answers empty
-    # when meta.json is missing or unparsable, and reading that as "under the
-    # threshold" wedged every future run on this host silently, forever, at
-    # exit 0. It is reachable through the recovery fleet-update/SKILL.md
-    # prescribes: `fleet-unlock` removes meta.json BEFORE an rmdir that can
-    # fail. A lock directory with no evidence of a live runner is exactly the
-    # case the stale branch exists for.
-    if [ -z "$run_age" ] || [ "$run_age" -gt "$run_stale" ]; then
-      printf 'roundhouse: a run lock at %s is %s old; confirm no live runner on this host, then remove it\n' \
-        "$run_lock" "${run_age:+${run_age}s}${run_age:-of unknown age (no readable meta.json)}" >&2
-      exit 75
-    fi
-    # …and the pid the lock has always recorded, finally read: a crashed run is
-    # otherwise indistinguishable from a slow one for two full cadences.
-    if fleet_lock_holder_gone "$run_lock"; then
-      printf 'roundhouse: the run lock at %s names a pid on this host that no longer exists; release it with `roundhouse fleet-unlock`\n' \
+  run_lock_status=0
+  fleet_run_lock_take "$run_store" "$run_host" "$run_lock" || run_lock_status=$?
+  case $run_lock_status in
+    0) ;;
+    10)
+      printf 'roundhouse: another run holds %s; exiting without acting\n' \
         "$run_lock" >&2
-      exit 75
-    fi
-    printf 'roundhouse: another run holds %s; exiting without acting\n' \
-      "$run_lock" >&2
-    exit 0
-  fi
-  trap 'rm -rf "$run_lock"' EXIT HUP INT TERM
+      exit 0
+      ;;
+    *) exit "$run_lock_status" ;;
+  esac
+  # Release by NONCE, never by path: a run that was judged dead and taken over
+  # must not delete its live successor's lock when it finally exits.
+  run_lock_nonce=$fleet_lock_nonce_held
+  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce"' EXIT HUP INT TERM
   run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-fleet-run.XXXXXX")
-  trap 'rm -rf "$run_lock" "$run_tmp"' EXIT HUP INT TERM
+  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce"; rm -rf "$run_tmp"' \
+    EXIT HUP INT TERM
 
   # §8.6: the abort button for a bad local apply, captured deliberately
   # WITHOUT --ignore-working-copy (that flag suppresses the colocated
@@ -3369,13 +3432,19 @@ fleet_lock_command() (
   # The run-lock, taken by hand: one runner per host per store. A second run
   # exits 75 and STOPS rather than forcing — two convergences racing one plugin
   # cache is the failure this prevents.
+  #
+  # The recorded holder is the CALLER's shell, not this short-lived process:
+  # the lock outlives the command by design, so naming this pid would make
+  # every hand-taken lock read as a dead holder and be taken over by the next
+  # run. The lock lives until `fleet-unlock` or until that shell exits.
   require_jq
   lock=$(fleet_lock_path)
-  fleet_lock_acquire "$lock" || {
+  fleet_lock_acquire "$lock" "$PPID" || {
     printf 'roundhouse: the fleet run-lock is held: %s\n' "$lock" >&2
     exit 75
   }
-  printf 'roundhouse: fleet run-lock acquired: %s\n' "$lock"
+  printf 'roundhouse: fleet run-lock acquired: %s (held by pid %s until fleet-unlock or that shell exits)\n' \
+    "$lock" "$PPID"
 )
 
 fleet_unlock_command() (
