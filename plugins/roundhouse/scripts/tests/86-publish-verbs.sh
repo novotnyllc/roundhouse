@@ -19,18 +19,41 @@ if [ -n "$fleet_fixture_yq" ]; then
     ROUNDHOUSE_LIB_ONLY=1 . "$cli"
 
     # --- fleet_vcs_host_record_filter is fleet_vcs_path_owner, in one pass ---
-    # Walk every row of the owner table, for this host and a peer, and require
-    # the filter to keep exactly the paths the table does not give to vireo.
-    for pub_path in fleet.yaml definitions.yaml definitions/10-x.yaml \
-      fleet/agent-plugins.yaml os/macos.yaml groups/dev.yaml hosts/vireo.yaml \
-      hosts/vireo/skills.yaml lineage/1-x.yaml proposals/p.yaml \
-      trust/signers.yaml checkpoints/c.yaml joins/vireo.yaml \
-      journal/vireo/2026-08-07.yaml journal/vireo/deep/x.yaml journal/wren/d.yaml \
-      journal/vireo journal/vireo/ alerts/vireo/x.yaml alerts/wren/x.yaml \
-      alerts/vireo findings/vireo/x.yaml findings/wren/x.yaml \
-      applied/vireo.yaml applied/wren.yaml applied/vireo/x.yaml \
-      upstreams/m/vireo.yaml upstreams/m/wren.yaml upstreams/m/deep/vireo.yaml \
-      upstreams/vireo.yaml README.md .gitignore vireo; do
+    # The sample paths are GENERATED from the owner table's own case patterns:
+    # every alternative, with each `?*` filled by this host, a peer, and a
+    # deeper path on either side — so a row added to fleet_vcs_path_owner is
+    # walked here without anyone listing it. The filter must keep exactly the
+    # paths the table does not give to vireo.
+    pub_patterns=$(cli_function_body fleet_vcs_path_owner |
+      awk '{ line = line $0; if (line ~ /\\$/) { sub(/\\$/, "", line); next } }
+        # A case ARM: nothing but path-pattern characters, ending in `)`.
+        line ~ /^[[:space:]]*[A-Za-z0-9?*\/._| -]+\)[[:space:]]*$/ &&
+          line !~ /^[[:space:]]*\*\)/ {
+          sub(/\)[[:space:]]*$/, "", line); n = split(line, alt, "|")
+          for (i = 1; i <= n; i++) { gsub(/[[:space:]]/, "", alt[i]); print alt[i] }
+        }
+        { line = "" }')
+    [ "$(printf '%s\n' "$pub_patterns" | grep -c .)" -ge 17 ] ||
+      fail "the owner table's patterns could not be read: $pub_patterns"
+    pub_samples="$tmp/publish-verbs-samples"
+    mkdir -p "$(dirname "$pub_samples")"
+    : >"$pub_samples"
+    # Read, never word-split: the patterns are globs and would expand.
+    while IFS= read -r pub_pattern; do
+      for pub_fill in vireo wren vireo/deep deep/vireo; do
+        for pub_fill2 in vireo wren vireo/deep; do
+          pub_path=${pub_pattern/\?\*/$pub_fill}
+          pub_path=${pub_path//\?\*/$pub_fill2}
+          printf '%s\n' "$pub_path" >>"$pub_samples"
+        done
+      done
+    done <<EOF
+$pub_patterns
+EOF
+    printf '%s\n' README.md .gitignore vireo journal/vireo journal/vireo/ \
+      alerts/vireo applied/vireo >>"$pub_samples"
+    [ "$(grep -c . "$pub_samples")" -ge 100 ] || fail "too few generated sample paths"
+    while IFS= read -r pub_path; do
       pub_owned=no
       [ "$(fleet_vcs_path_owner "$pub_path" 2>/dev/null || true)" != vireo ] ||
         pub_owned=yes
@@ -42,6 +65,11 @@ if [ -n "$fleet_fixture_yq" ]; then
         [ "$pub_kept" = "$pub_path" ] ||
           fail "the host-record filter dropped $pub_path, which the owner table does not give vireo"
       fi
+    done <"$pub_samples"
+    # …and the walk reaches every host-keyed row, not only the shared ones.
+    for pub_row in journal/vireo/wren alerts/vireo/vireo/deep findings/wren/vireo \
+      applied/vireo.yaml applied/vireo/deep.yaml upstreams/wren/vireo.yaml; do
+      grep -Fqx "$pub_row" "$pub_samples" || fail "the generated walk missed $pub_row"
     done
 
     # --- §8.2 P0 fleet-disown --host-only: what only this host's layer wants ---

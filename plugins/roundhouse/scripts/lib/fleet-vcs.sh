@@ -82,7 +82,7 @@ fleet_vcs_host_record_filter() {
   # every path for which fleet_vcs_path_owner would NOT answer HOST. It is that
   # table's host-keyed rows, restated as ONE awk pass for callers that hold
   # thousands of paths (a half-published alert compaction) and cannot afford a
-  # predicate call per path; tests/81-publish-verbs.sh walks the table to keep
+  # predicate call per path; tests/86-publish-verbs.sh walks the table to keep
   # the two in step.
   #
   #   journal/<h>/… alerts/<h>/… findings/<h>/…   any depth below <h>
