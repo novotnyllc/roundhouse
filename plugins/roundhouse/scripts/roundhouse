@@ -65,6 +65,7 @@ Usage:
   roundhouse fleet-hold ITEM REASON
   roundhouse fleet-pending
   roundhouse fleet-alerts-compact
+  roundhouse fleet-disown [--dry-run] [--host-only] [ITEM...]
   roundhouse fleet-journal ENTRY.json|-
   roundhouse fleet-finding SLUG SUMMARY [QUOTE]
   roundhouse fleet-lock
@@ -219,6 +220,7 @@ case $command in
   fleet-hold) [ $# -eq 2 ] || usage; fleet_hold_command "$1" "$2" ;;
   fleet-pending) [ $# -eq 0 ] || usage; fleet_pending_command ;;
   fleet-alerts-compact) [ $# -eq 0 ] || usage; fleet_alerts_compact_command ;;
+  fleet-disown) [ $# -ge 1 ] || usage; fleet_disown_command "$@" ;;
   fleet-journal) [ $# -eq 1 ] || usage; fleet_journal_command "$1" ;;
   fleet-finding)
     { [ $# -ge 2 ] && [ $# -le 3 ]; } || usage

@@ -580,6 +580,62 @@ YAML
       *) fail "a second compaction was not a no-op: $runjj_out" ;;
     esac
 
-    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding, capped tombstone uninstall, dead-holder takeover, alert compaction)\n'
+    # --- §8.2 P0: fleet-disown releases host-only ownership without a prune ---
+    runjj_hostonly='config_files.~/.hostonly'
+    runjj_outcomes() {
+      for runjj_day in "$vireo/journal/vireo"/*.yaml; do
+        FLEET_ITEM=$1 yq -r '.[] | select(.item == strenv(FLEET_ITEM)) | .outcome' \
+          "$runjj_day"
+      done
+    }
+    printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\nskills:\n  ponytail-audit: enabled\nconfig_files:\n  ~/.hostonly:\n    keys:\n      a: managed\n' \
+      >"$vireo/hosts/vireo.yaml"
+    runjj vireo "$cli" fleet-run --fast >/dev/null ||
+      fail "vireo could not apply its host-only item"
+    [ -n "$(fleet_applied_digest "$vireo" vireo "$runjj_hostonly")" ] ||
+      fail "the host-only fixture item was never owned"
+    runjj_out=$(runjj vireo "$cli" fleet-disown --host-only --dry-run) ||
+      fail "fleet-disown --dry-run failed: $runjj_out"
+    case $runjj_out in
+      *"disown $runjj_hostonly "*) ;;
+      *) fail "the dry run did not select the host-only item: $runjj_out" ;;
+    esac
+    case $runjj_out in
+      *'disown config_files.~/.claude/settings.json'*)
+        fail "the dry run selected an item the fleet layer asks for: $runjj_out" ;;
+    esac
+    [ -n "$(fleet_applied_digest "$vireo" vireo "$runjj_hostonly")" ] ||
+      fail "a dry-run disown changed applied/"
+    runjj_status=0
+    runjj vireo "$cli" fleet-disown plugins.never-owned >/dev/null 2>&1 ||
+      runjj_status=$?
+    [ "$runjj_status" -eq 65 ] ||
+      fail "disowning an item this host does not own was not refused (got $runjj_status)"
+    runjj_out=$(runjj vireo "$cli" fleet-disown --host-only) ||
+      fail "fleet-disown failed: $runjj_out"
+    case $runjj_out in
+      *'published the disown'*) ;;
+      *) fail "the disown did not publish: $runjj_out" ;;
+    esac
+    [ -z "$(fleet_applied_digest "$vireo" vireo "$runjj_hostonly")" ] ||
+      fail "the disowned item is still owned"
+    [ -n "$(fleet_applied_digest "$vireo" vireo 'config_files.~/.claude/settings.json')" ] ||
+      fail "the disown released an item the fleet layer still asks for"
+    runjj_outcomes "$runjj_hostonly" | grep -qx disowned ||
+      fail "the disown journaled no disowned record"
+    [ "$(fleet_vcs_heads_local "$vireo")" = "$(fleet_vcs_head_origin "$vireo")" ] ||
+      fail "the disown is not on the remote"
+    # Retiring the host layer now changes nothing: no prune, no `reverted`.
+    printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\nskills:\n  ponytail-audit: enabled\n' \
+      >"$vireo/hosts/vireo.yaml"
+    runjj_out=$(runjj vireo "$cli" fleet-run --fast) ||
+      fail "the run after retiring the host-only item failed: $runjj_out"
+    case $runjj_out in
+      *"prune $runjj_hostonly"*) fail "a disowned item was pruned: $runjj_out" ;;
+    esac
+    ! runjj_outcomes "$runjj_hostonly" | grep -qx reverted ||
+      fail "a disowned item was journaled reverted"
+
+    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding, capped tombstone uninstall, dead-holder takeover, alert compaction, host-only disown)\n'
   ) || fail "real-jj run block failed (see the FAIL: real-jj: line above)"
 fi

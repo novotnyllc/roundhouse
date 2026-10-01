@@ -149,6 +149,8 @@ uses (first-push gate, redaction sweep, conflict guards).
 
 ```text
 roundhouse fleet-alerts-compact          # one-time: this host's stamped alerts -> one keyed file per alert
+roundhouse fleet-disown [--dry-run] [--host-only] [ITEM...]
+                                         # stop managing items without uninstalling them
 ```
 
 `fleet-alerts-compact` collapses the stamped alert files an older build wrote
@@ -156,6 +158,18 @@ roundhouse fleet-alerts-compact          # one-time: this host's stamped alerts 
 record per key. It touches only this host's own directory, leaves any file it
 cannot parse where it is, reads in batches (it is built for tens of thousands of
 files), and is idempotent — a second run finds nothing to do.
+
+`fleet-disown` removes items from `applied/<this host>.yaml` **without
+uninstalling them** and journals each one `disowned` — not `reverted`, because
+nothing was withdrawn, and outside the removal cap, because nothing is removed.
+The item becomes unmanaged: neither removed nor spread. `--host-only` selects
+every owned item that only this host's own layer asks for — owned, and absent
+from the fold of `fleet.yaml`, `os/`, `groups/` and `definitions` — which is
+the set a retired host-layer machine snapshot leaves behind; disown them
+**before** deleting that layer, or the next run reads each one as a removal.
+`--dry-run` prints the selection and changes nothing. A named item this host
+does not own is refused, and one still in the layers is disowned but reported,
+because the next run adopts it again.
 
 `fleet-finding` and `fleet-hold` pass every replicated field through the
 redaction floor, and a field that trips it is **refused rather than silently

@@ -1627,7 +1627,7 @@ printf 'verbs: the supervised item-level surface\n'
   set -eu
   for verb_name in fleet-review fleet-apply fleet-accept fleet-hold \
     fleet-pending fleet-journal fleet-finding fleet-lock fleet-unlock \
-    fleet-set-remote; do
+    fleet-set-remote fleet-alerts-compact fleet-disown; do
     grep -Fq "  roundhouse $verb_name" "$cli" ||
       fail "$verb_name is missing from the usage heredoc"
     grep -Eq "^  $verb_name\)" "$cli" ||
@@ -1637,7 +1637,8 @@ printf 'verbs: the supervised item-level surface\n'
   # malformed invocation can never reach a store at all.
   for verb_bad in 'fleet-review one two' 'fleet-apply' 'fleet-apply a b' \
     'fleet-accept' 'fleet-hold only' 'fleet-pending extra' 'fleet-lock extra' \
-    'fleet-set-remote' 'fleet-finding one'; do
+    'fleet-set-remote' 'fleet-finding one' 'fleet-alerts-compact extra' \
+    'fleet-disown' 'fleet-disown --dry-run' 'fleet-disown --bogus x'; do
     verb_status=0
     # shellcheck disable=SC2086 # the malformed argv under test
     "$cli" $verb_bad >/dev/null 2>&1 || verb_status=$?
@@ -1902,5 +1903,29 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$verb_status" -eq 75 ] && grep -q 'unknown age' "$verb_root/stale-err" ||
       fail "a lock with no meta was not refused as of unknown age (got $verb_status)"
     rmdir "$verb_lock"
+
+    # --- §8.2 P0 fleet-disown --host-only: what only this host's layer wants ---
+    mkdir -p "$verb_store/groups" "$verb_store/applied"
+    printf '%s\n' 'packages:' '  jq: enabled' >"$verb_store/groups/development.yaml"
+    printf '%s\n' 'platform: macos' 'groups: [development]' 'plugins:' \
+      '  railyard: enabled' '  snapshot-only: enabled' 'packages:' '  jq: enabled' \
+      >"$verb_store/hosts/vireo.yaml"
+    printf '%s\n' 'packages:' '  ripgrep:' '    homebrew: ripgrep' \
+      >"$verb_store/definitions.yaml"
+    rm -f "$(fleet_applied_path "$verb_store" vireo)"
+    for verb_owned in plugins.railyard plugins.snapshot-only packages.jq \
+      definitions.packages.ripgrep plugins.gone-everywhere; do
+      fleet_applied_record "$verb_store" vireo "$verb_owned" d-"$verb_owned"
+    done
+    # Only the host file asks for `railyard` and `snapshot-only`, and nothing
+    # asks for `gone-everywhere`; jq is shared through the group, and a
+    # definition comes from no host layer at all.
+    [ "$(fleet_disown_host_only "$verb_store" vireo | tr '\n' ' ')" = \
+      'plugins.gone-everywhere plugins.railyard plugins.snapshot-only ' ] ||
+      fail "the host-only selection was wrong: $(fleet_disown_host_only "$verb_store" vireo | tr '\n' ' ')"
+    printf '%s\n' 'plugins:' '  railyard: enabled' >>"$verb_store/fleet.yaml"
+    [ "$(fleet_disown_host_only "$verb_store" vireo | tr '\n' ' ')" = \
+      'plugins.gone-everywhere plugins.snapshot-only ' ] ||
+      fail "an item a shared layer also asks for was selected as host-only"
   )
 fi

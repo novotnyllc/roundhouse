@@ -166,6 +166,14 @@ YAML
     ! fleet_journal_append "$rec_store" vireo \
       "$(rec_entry plugins.x d1 wibble 2026-08-07T09:30:00Z)" 2>/dev/null ||
       fail "a journal entry with an unknown outcome was accepted"
+    # `disowned` (fleet-disown) is item-and-digest evidence like `reverted`,
+    # but an ownership fact rather than a withdrawal.
+    fleet_journal_append "$rec_store" vireo \
+      "$(rec_entry plugins.x d1 disowned 2026-08-07T09:31:00Z)" ||
+      fail "a disowned journal entry was refused"
+    ! fleet_journal_append "$rec_store" vireo \
+      "$(jq -cn '{outcome: "disowned", at: "2026-08-07T09:32:00Z"}')" 2>/dev/null ||
+      fail "a disowned entry naming no item was accepted"
 
     # NO schema keys anywhere, in the records or in the code that writes them.
     ! grep -rqE '^\s*schema(_version)?:' "$rec_store" ||
@@ -472,6 +480,16 @@ YAML
         2026-08-07T12:00:00Z canary-1 ||
         fail "a canary that later $rec_withdrawal the item still released it"
     done
+    # A canary that later DISOWNED the item withdrew nothing: the bytes were
+    # not rejected, the host only stopped managing them.
+    rec_canary_reset
+    fleet_journal_append "$rec_canary_store" canary-1 \
+      "$(rec_entry plugins.ponytail 91ac33 disowned 2026-08-06T20:00:00Z)"
+    fleet_journal_append "$rec_canary_store" canary-1 \
+      "$(jq -cn '{outcome: "alive", at: "2026-08-07T10:00:00Z"}')"
+    fleet_canary_gate "$rec_canary_store" plugins.ponytail 91ac33 24 \
+      2026-08-07T12:00:00Z canary-1 ||
+      fail "a canary's disown read as a withdrawal of its evidence"
     # (3) the two silences condition 3 exists for. A canary that applied the
     # item and was WRECKED by it satisfies (1) and (2) and must still block.
     rec_canary_reset

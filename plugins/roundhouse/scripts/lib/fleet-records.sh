@@ -154,7 +154,11 @@ fleet_journal_entry_ok() {
         all(.sides[]; (.change | type == "string") and (.host | type == "string")) and
         (.resolution | type == "string")
       elif ($o == "applied" or $o == "satisfied" or $o == "held" or
-            $o == "reverted") then
+            $o == "reverted" or $o == "disowned") then
+        # `disowned` is an OWNERSHIP record, not a value one: this host
+        # stopped managing the item (fleet-disown) and left it installed. It
+        # is not `reverted` — nothing was withdrawn, so it neither withdraws
+        # canary evidence nor reads as half of a revert signature.
         # `applied` claims only "the run refused nothing" — a weaker claim
         # than a health probe, and the design does not pretend otherwise.
         # `satisfied` is the no-op-BECAUSE-CORRECT record: the item resolved,

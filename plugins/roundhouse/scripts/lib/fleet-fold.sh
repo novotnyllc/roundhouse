@@ -175,6 +175,22 @@ fleet_fold() (
   fleet_fold_files $(fleet_layer_files "$1" "$2")
 )
 
+fleet_fold_shared() (
+  # `fleet_fold_shared LAYERDIR HOST` — HOST's fold WITHOUT its own host tier:
+  # what the fleet, its platform and its groups want for it. An item this
+  # host owns that is absent here exists only because the host's own layer
+  # (often a machine snapshot) asked for it — the set `fleet-disown
+  # --host-only` selects. The host file is still READ, because its facts pick
+  # the os/ and groups/ tiers.
+  IFS='
+'
+  set -f
+  # shellcheck disable=SC2046 # deliberate word splitting over the file list
+  fleet_fold_files $(fleet_layer_files "$1" "$2" |
+    awk -v flat="$1/hosts/$2.yaml" -v dir="$1/hosts/$2/" \
+      '$0 != flat && index($0, dir) != 1')
+)
+
 fleet_fold_tombstones() (
   # `fleet_fold_tombstones LAYERDIR HOST CATEGORY` — the items of CATEGORY whose
   # effective value at HOST is the scalar `absent`, as a fold-shaped document
