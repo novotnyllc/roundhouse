@@ -1421,8 +1421,19 @@ fleet_run_tombstone_converge() {
     0 | 70) ;;
     *) return "$tomb_status" ;;
   esac
-  [ -z "$(fleet_applied_digest "$1" "$2" "$4")" ] ||
-    fleet_applied_forget "$1" "$2" "$4" || :
+  # The ownership cleanup must SUCCEED before the post-change state is
+  # recorded: a memo and journal entry written over a failed forget would
+  # report convergence and silence the retry that the record still needs.
+  tomb_owned=$(fleet_applied_digest "$1" "$2" "$4") || {
+    printf '  held %s (applied/%s cannot be read to release its ownership)\n' "$4" "$2" >&2
+    return 75
+  }
+  if [ -n "$tomb_owned" ]; then
+    fleet_applied_forget "$1" "$2" "$4" || {
+      printf '  held %s (its applied/%s record could not be released)\n' "$4" "$2" >&2
+      return 75
+    }
+  fi
   mkdir -p "$(dirname "$(fleet_run_tombstone_memo_path "$4")")"
   printf '%s\n' "$6" >"$(fleet_run_tombstone_memo_path "$4")"
   tomb_outcome=applied

@@ -332,7 +332,12 @@ fleet_run_marketplace_source_ok() {
     fleet_run_source_declared=$(jq -r --arg n "$1" \
       "$fleet_run_marketplace_locator_filter"'
       .extraKnownMarketplaces[$n] // empty | locator' \
-      "$fleet_run_source_settings" 2>/dev/null) || fleet_run_source_declared=
+      "$fleet_run_source_settings" 2>/dev/null) || {
+      # A declaration that exists but cannot be read is NOT "not declared":
+      # verifying against nothing would accept a repointed same-name source.
+      fleet_run_repair_reason="$fleet_run_source_settings cannot be read to check $1's declared source"
+      return 75
+    }
   if [ -n "$fleet_run_source_declared" ]; then
     fleet_run_source_registered=$(fleet_run_marketplace_registered_locator "$1" \
       "$fleet_run_source_entry") || fleet_run_source_registered=

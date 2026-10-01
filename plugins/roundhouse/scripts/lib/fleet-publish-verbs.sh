@@ -198,9 +198,6 @@ fleet_disown_command() (
   # asks for (fleet_disown_host_only). `--dry-run` prints the selection and
   # changes nothing. A real disown takes the run lock and publishes, like
   # fleet-compact-alerts.
-  fleet_run_env
-  require_jq
-  require_yq
   disown_dry=false
   disown_host_only=false
   disown_named=
@@ -227,6 +224,11 @@ fleet_disown_command() (
     printf 'roundhouse: fleet-disown needs --host-only or at least one item\n' >&2
     exit 64
   }
+  # Usage is settled BEFORE any runtime dependency is probed, so a malformed
+  # invocation is a usage error (64) on every host, with or without yq.
+  fleet_run_env
+  require_jq
+  require_yq
   disown_store=$(fleet_store_path)
   disown_host=$(fleet_host_name)
   if [ "$disown_dry" = true ]; then

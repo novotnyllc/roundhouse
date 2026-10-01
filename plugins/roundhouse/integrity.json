@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/apply-claude.sh",
-      "sha256": "d27a2cf2c995b92b9dbdeb265a3997b33f1f30976939b7533fff2ea1d6d511a2"
+      "sha256": "9da0e479639c02e2e591c5896d6901fedbbd01bc4dde5ae8f89e58545bdf74d0"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
@@ -134,7 +134,7 @@
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
-      "sha256": "9328489ef97c553da534f8def7bdb372d0c1bee1c33d4c6d6b8a3b693f03eef2"
+      "sha256": "2ba27fdb37be1ec942f654f6d0583dac9fc679f3651ebfb4689c7300c9b1975a"
     },
     {
       "path": "scripts/lib/fleet-records.sh",
@@ -146,7 +146,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "7e84018383e04705db65f886a65e621df3608b4c8bae2c1835cfe75fd4d2bcfe"
+      "sha256": "0c55b6aa32f37c41aa4bd0f68505d3b582c1d1db9cd3bfe7394afbb6c2b49caf"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
