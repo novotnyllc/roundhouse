@@ -87,7 +87,9 @@ policy.
   the same carry, hooks and required hooks; no lane reads a store at apply.
   The executor proves each hook bin under the current prefix, then runs
   `fnm install`, `fnm default`, one exact `npm install --global a@x b@y …`
-  under the new node, verifies every carried version, and runs each hook by
+  under the new node, uninstalls anything else left in a previously used
+  target prefix (bundled npm/corepack excepted), verifies the set is exactly
+  the carry at its versions, and runs each hook by
   absolute path under the new node. Any failure after the default moved
   points it back at the old version and the apply reports `partial`. Old
   versions are never removed (a service may still run from one); they are

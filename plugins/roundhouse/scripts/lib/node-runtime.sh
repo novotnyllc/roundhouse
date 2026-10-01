@@ -342,10 +342,36 @@ EOF
       exit 1
     }
   fi
-  node_after=$(npm_global_list) || node_after='{}'
-  printf '%s\n' "$node_after" | jq -e --argjson carry "$node_carry" '
-    . as $after | all($carry[]; $after[.name] == .version)' >/dev/null || {
-    printf 'roundhouse: carried npm globals are not all present under %s at their versions\n' \
+  # Reconcile the target prefix to EXACTLY the carry. Old versions are kept,
+  # so the target may be a version used before, whose prefix still holds
+  # globals removed or disabled since: left there, a rollback would
+  # resurrect them. Every top-level global that is neither carried nor
+  # bundled with the target is uninstalled, then the whole set is checked.
+  node_bundled=$(node_target_bundled "$node_target")
+  node_present=$(npm_global_list_detail) || {
+    printf 'roundhouse: the npm globals under %s cannot be listed\n' "$node_target" >&2
+    node_restore || exit 70
+    exit 1
+  }
+  while IFS= read -r node_extra; do
+    [ -n "$node_extra" ] || continue
+    npm_global_run uninstall --global "$node_extra" >/dev/null 2>&1 || {
+      printf 'roundhouse: could not remove %s, left in %s by an earlier use; it is not carried\n' \
+        "$node_extra" "$node_target" >&2
+      node_restore || exit 70
+      exit 1
+    }
+  done <<EOF
+$(printf '%s\n' "$node_present" | jq -r --argjson carry "$node_carry" --argjson bundled "$node_bundled" '
+  keys[] | . as $n | select((any($carry[]; .name == $n) | not) and (any($bundled[]; . == $n) | not))')
+EOF
+  node_after=$(npm_global_list_detail) || node_after=null
+  printf '%s\n' "$node_after" | jq -e --argjson carry "$node_carry" --argjson bundled "$node_bundled" '
+    . as $after | type == "object" and
+    ([$after | keys[] | . as $n | select(any($bundled[]; . == $n) | not)] | sort) ==
+      ([$carry[].name] | sort) and
+    all($carry[]; $after[.name].version == .version)' >/dev/null || {
+    printf 'roundhouse: the npm globals under %s are not exactly the carry at its versions\n' \
       "$node_target" >&2
     node_restore || exit 70
     exit 1
@@ -379,6 +405,13 @@ node_globals_split() (
   printf '%s\n' "$1" | jq -ce '
     {globals: (with_entries(select(.value.version | type == "string") | .value = .value.version)),
      unpinnable: ([to_entries[] | select(.value.pinnable != true) | .key] | sort)}' 2>/dev/null
+)
+
+node_target_bundled() (
+  # `node_target_bundled VERSION` — the globals that Node release ships itself,
+  # as a JSON array: npm always, corepack on Node 24 and older.
+  printf '%s\n' "$1" | jq -Rc '(ltrimstr("v") | split(".")[0] | tonumber? // 0) as $major |
+    ["npm"] + (if $major < 25 then ["corepack"] else [] end)'
 )
 
 node_switch_plan() (

@@ -55,6 +55,18 @@ case "$1 ${2:-}" in
   "outdated --global")
     if [ -n "${NRT_NPM_OUTDATED:-}" ]; then printf '%s\n' "$NRT_NPM_OUTDATED"; else printf '{}\n'; fi
     ;;
+  "uninstall --global")
+    [ "${NRT_NPM_FAIL_UNINSTALL:-0}" != 1 ] || exit 1
+    shift 2
+    for name in "$@"; do
+      jq --arg n "$name" 'del(.[$n])' "$state" >"$state.next"
+      mv "$state.next" "$state"
+      for bin in $(jq -r --arg n "$name" '(.[$n] // {}) | keys[]' "$NRT_CATALOG"); do
+        rm -f "$prefix/bin/$bin"
+      done
+      rm -rf "${prefix:?}/lib/node_modules/$name"
+    done
+    ;;
   "install --global")
     [ "${NRT_NPM_FAIL_INSTALL:-0}" != 1 ] || exit 1
     shift 2
@@ -248,6 +260,28 @@ nrt_reset
     nrt_status=$?
   [ "$nrt_status" -eq 1 ] && [ "$(nrt_default)" = v26.0.0 ] ||
     fail "a failed fnm install moved the default"
+
+  # --- the switch: a retained target is reconciled to exactly the carry ------
+  # Old versions are kept, so a switch can land on a version used before. A
+  # global still in that prefix but not carried (removed or disabled since)
+  # is uninstalled; a rollback must not resurrect it.
+  nrt_carry_all='[{"name":"@example/svc","version":"1.0.0"},{"name":"plain","version":"2.0.0"},{"name":"unmanaged","version":"0.1.0"}]'
+  nrt_retain_target() {
+    nrt_env "$nrt_bin/fnm" install v26.10.0
+    nrt_env PATH="$nrt_fnm/node-versions/v26.10.0/installation/bin:$PATH" \
+      "$nrt_fnm/node-versions/v26.10.0/installation/bin/npm" install --global stale-cli@9.0.0 plain@1.0.0
+  }
+  nrt_reset
+  nrt_retain_target
+  NRT_NPM_FAIL_UNINSTALL=1 node_runtime_switch v26.10.0 "$nrt_carry_all" "$nrt_hooks" 2>/dev/null &&
+    fail "a switch that could not remove a stale global succeeded"
+  [ "$(nrt_default)" = v26.0.0 ] || fail "a failed reconcile did not restore the previous fnm default"
+  node_runtime_switch v26.10.0 "$nrt_carry_all" "$nrt_hooks" ||
+    fail "a switch to a retained version failed"
+  [ "$(nrt_default)" = v26.10.0 ] &&
+    [ "$(nrt_globals v26.10.0)" = '{"plain":"2.0.0","@example/svc":"1.0.0","unmanaged":"0.1.0"}' ] ||
+    fail "a retained target was not reconciled to exactly the carry"
+  grep -Fq 'npm uninstall --global stale-cli' "$nrt_log" || fail "the stale global was not uninstalled"
 
   # --- the switch: success --------------------------------------------------
   nrt_reset
@@ -702,9 +736,15 @@ else
   nrt_cli seal-plan "$tmp/node-draft.json" "$tmp/node-snapshot-2.jsonl" "$tmp/node-plan-2.json"
   nrt_plan_id=$(jq -r '.plan_id' "$tmp/node-plan-2.json")
 
+  # The failed attempt left v26.10.0 installed with globals in its prefix;
+  # one more that is not carried must be gone after the sealed switch.
+  nrt_env PATH="$nrt_fnm/node-versions/v26.10.0/installation/bin:$PATH" \
+    "$nrt_fnm/node-versions/v26.10.0/installation/bin/npm" install --global stale-cli@9.0.0
   : >"$nrt_log"
   nrt_cli apply-plan "$tmp/node-plan-2.json" "$nrt_plan_id" "$tmp/node-apply.jsonl"
   [ "$(nrt_default)" = v26.10.0 ] || fail "the sealed switch did not move the fnm default"
+  [ "$(jq -r '."stale-cli" // "gone"' "$nrt_fnm/node-versions/v26.10.0/installation/globals.json")" = gone ] ||
+    fail "the sealed switch left a stale global in a retained target"
   [ "$(jq -c 'select(.kind == "package" and .id == "fnm:node") | [.data.installed_version,.data.globals]' \
     "$tmp/node-apply.jsonl")" = '["v26.10.0",{"@example/svc":"1.0.0","plain":"2.0.0","unmanaged":"0.1.0"}]' ] ||
     fail "the sealed switch post-inventory did not show every carried global under the new default"

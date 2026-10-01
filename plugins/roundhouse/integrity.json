@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/apply-commands.sh",
-      "sha256": "c745eda73d726894cbbbddc322d75b6fcded1d3cb6752be8defa6b791cbffe48"
+      "sha256": "a55c2e1a254ba93a652a257fd5c84a10d11b35f584ca621c36b35ba339d6fd06"
     },
     {
       "path": "scripts/lib/broker-posix.sh",
@@ -166,7 +166,7 @@
     },
     {
       "path": "scripts/lib/node-runtime.sh",
-      "sha256": "ee31f4916dba55941f92050d2a2234488033b72c8452f05df8be0d1f0ae40697"
+      "sha256": "b7c25b51fb49491e19e95db9e95885e15d4b7d3a2318c20dd8e2d3203aab6273"
     },
     {
       "path": "scripts/lib/npm.sh",
@@ -286,7 +286,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "7819333d3954ae50dc45506e0fc02311c6da366262d6bd95409755264cde1d0e"
+      "sha256": "b004f4931318014fe2adf27b9e522893b9d91b4537a187df31d3b8f579f85cf5"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",

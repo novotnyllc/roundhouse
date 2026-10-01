@@ -342,7 +342,13 @@ the desired-state run:
 3. Require the durable npm to be the new default's own npm running under the
    new node.
 4. One exact `npm install --global a@x b@y …` through it.
-5. Require every carried package present under the new prefix at its version.
+5. Reconcile the new prefix to exactly the carry. Old versions are kept, so
+   the target may be a version used before, whose prefix still holds globals
+   removed or disabled since; left there, a rollback would resurrect them.
+   Every top-level global there that is neither carried nor bundled with the
+   target (`npm`, and `corepack` on 24 and older) is `npm uninstall
+   --global`ed, then the set must equal the carry, each at its version. A
+   listing or uninstall failure takes the same path as a failed carry.
 6. Run each hook by absolute path under the new node (re-proved under the new
    prefix first).
 
@@ -480,8 +486,10 @@ argv is the marker only; the executor knows no other `fnm` shape. `carry`,
   Windows target.
 - Executor: re-checks the argv marker and the hooks against its own (worker)
   configuration, then runs §7.3.
-- Post-state: `installed_version == candidate_version` and every carried
-  package present in the new record's `globals` at its version, or at the
+- Post-state: `installed_version == candidate_version`, the new record's
+  `globals` (less what the target bundles) are exactly the carried names with
+  nothing unpinnable left over, and every carried package is at its version,
+  or at the
   `candidate_version` of a later `npm:*` upgrade of it in the same plan
   (seal orders those after the switch). A failure
   restores the default and reports `partial`. The `npm:*` records move to the

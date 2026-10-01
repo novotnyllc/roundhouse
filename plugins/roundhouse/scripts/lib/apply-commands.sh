@@ -574,12 +574,18 @@ apply_plan_command() {
         any($records[]; .kind == $operation.kind and .id == $operation.id and
           .status == "present" and
           .data.installed_version == $operation.candidate_version and
-          # A Node switch is complete only when every carried global is
-          # present under the NEW default at its carried version, or at the
-          # candidate of a later npm upgrade of it in this same plan (seal
-          # orders every npm upgrade after the switch).
+          # A Node switch is complete only when the NEW default holds
+          # exactly the carry (plus what that release bundles, and nothing
+          # left over from an earlier use of the same version), each at its
+          # carried version or at the candidate of a later npm upgrade of it
+          # in this same plan (seal orders every npm upgrade after the switch).
           (if $operation.id == "fnm:node" then
              (.data.globals | type == "object") and
+             (($operation.candidate_version | ltrimstr("v") | split(".")[0] | tonumber? // 0) as $major |
+               (["npm"] + (if $major < 25 then ["corepack"] else [] end)) as $bundled |
+               ([.data.globals | keys[] | . as $n | select(any($bundled[]; . == $n) | not)] | sort) ==
+                 ([$operation.carry[].name] | sort) and
+               ([(.data.globals_unpinnable // ["?"])[] | . as $n | select(any($bundled[]; . == $n) | not)] == [])) and
              (.data.globals as $globals |
                all($operation.carry[]; . as $carried |
                  ([$plan[0].operations[] | select(.type == "package-upgrade" and
