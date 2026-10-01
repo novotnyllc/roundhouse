@@ -118,6 +118,11 @@ job was last seen loaded; a Linux user manager that does not linger) does it
 start a detached `nohup roundhouse fleet-run --fast` instead. A job the
 operator disabled or unloaded, a host with no job, or one taken off the
 schedule with `fleet-schedule uninstall` is stamped and nothing is started.
+On macOS the disabled flag cannot be read without a console session, so a raw
+`launchctl disable`/`bootout` is honoured over SSH only once a pass has seen
+it; `fleet-schedule uninstall` is the supported hard stop. A host still on the
+legacy single-plist job reports no fleet-fast job to `fleet-trigger` (nudges
+only stamp there) until `fleet-schedule install` runs on it.
 A pass that finds the stamp moved since it began
 converges again in-process before it releases the lock (at most three extra
 passes), so a trigger that lands mid-pass is never lost.

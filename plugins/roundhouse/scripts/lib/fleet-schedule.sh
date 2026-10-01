@@ -156,12 +156,15 @@ fleet_schedule_probe() {
           return 0
           ;;
       esac
-      if ! fleet_schedule_lingers; then
-        printf 'unavailable\n'
-      elif systemctl --user is-active --quiet "$probe_timer" 2>/dev/null; then
-        printf 'loaded\n'
-      else
+      # A timer the operator STOPPED (inactive, still enabled) is unloaded
+      # whether or not the account lingers: only an ACTIVE timer without
+      # lingering is unavailable, so a trigger never runs behind a stop.
+      if ! systemctl --user is-active --quiet "$probe_timer" 2>/dev/null; then
         printf 'unloaded\n'
+      elif ! fleet_schedule_lingers; then
+        printf 'unavailable\n'
+      else
+        printf 'loaded\n'
       fi
       ;;
     *) printf 'unavailable\n' ;;
@@ -464,6 +467,9 @@ fleet_schedule_place() {
     printf 'roundhouse: %s differs from the definition fleet-schedule writes; replacing it:\n' \
       "$1" >&2
     diff -u "$1" "$2" | sed 's/^/  /' >&2 || :
+    # Kept, never discarded: the replaced definition survives as .replaced.
+    cp "$1" "$1.replaced" 2>/dev/null &&
+      printf 'roundhouse: the previous definition is kept as %s.replaced\n' "$1" >&2 || :
   fi
   mkdir -p "$(dirname "$1")" || return 1
   cp "$2" "$1.next.$$" && chmod 0644 "$1.next.$$" && mv -f "$1.next.$$" "$1" || {
@@ -537,9 +543,11 @@ fleet_schedule_install_launchd() {
     [ "$install_has_domain" != true ] ||
       launchctl bootout "$install_domain/$(basename "$install_legacy" .plist)" \
         >/dev/null 2>&1 || :
-    mv -f "$install_legacy" "$install_legacy.absorbed" &&
-      printf 'roundhouse: absorbed the superseded %s entry (kept as %s.absorbed)\n' \
-        "$(basename "$install_legacy" .plist)" "$install_legacy"
+    install_absorbed="$install_legacy.absorbed"
+    [ ! -e "$install_absorbed" ] || install_absorbed="$install_legacy.absorbed.$(date +%Y%m%dT%H%M%S)"
+    mv "$install_legacy" "$install_absorbed" &&
+      printf 'roundhouse: absorbed the superseded %s entry (kept as %s)\n' \
+        "$(basename "$install_legacy" .plist)" "$install_absorbed"
   done
   return "$install_rc"
 }

@@ -2403,7 +2403,10 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   #
   # The off-switch is a policy key like any other, and its absence reads as
   # "on" — an accelerator you cannot turn off is a dependency.
-  if fleet_vcs_desired_changed "$run_store" "$run_pre_origin" \
+  # Measured from the head this pass FETCHED, not the one it started from: a
+  # layer edit this host only received is already on every peer's remote, so
+  # only this host's own desired-state change is worth a nudge.
+  if fleet_vcs_desired_changed "$run_store" "${run_fetched_head:-$run_pre_origin}" \
     "$(fleet_vcs_heads_local "$run_store" | head -1)"; then
     [ "$(fleet_policy_get "$run_fold" push_nudge 2>/dev/null || printf true)" = false ] ||
       fleet_run_nudge "$run_store" "$run_host" "$run_layers" \

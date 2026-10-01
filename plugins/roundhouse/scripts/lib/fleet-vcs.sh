@@ -19,14 +19,17 @@ fleet_vcs_toml_string() {
   printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
 }
 
+# The row-1 roots, once: fleet_vcs_path_owner runs per path per commit in the
+# §7.7 gate, so it reads this string instead of forking for the list.
+fleet_vcs_fleet_roots_list='fleet.yaml definitions.yaml definitions fleet os groups hosts lineage proposals trust checkpoints'
+
 fleet_vcs_fleet_roots() {
   # §7.3 row 1, as data: the top-level store entries any enrolled host may
   # author. A `.yaml` name is a single file; anything else is a directory
   # whose children are row 1. fleet_vcs_path_owner reads membership here, and
   # fleet_vcs_desired_roots derives from it — one list, so a new fleet-wide
   # layer cannot be authorised and then missed by the poll floor.
-  printf '%s\n' fleet.yaml definitions.yaml definitions fleet os groups hosts \
-    lineage proposals trust checkpoints
+  printf '%s\n' $fleet_vcs_fleet_roots_list
 }
 
 fleet_vcs_path_owner() {
@@ -56,7 +59,7 @@ fleet_vcs_path_owner() {
   # checkpointing are fleet-shared writes, which is exactly why a leaf is
   # already refused both with no separate enforcement.
   fleet_vcs_root=${1%%/*}
-  case " $(fleet_vcs_fleet_roots | tr '\n' ' ') " in
+  case " $fleet_vcs_fleet_roots_list " in
     *" $fleet_vcs_root "*)
       case $fleet_vcs_root in
         # A file root is exactly that file: `fleet.yaml/x` is not row 1.

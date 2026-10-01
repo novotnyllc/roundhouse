@@ -6,7 +6,8 @@
 #   GUARDS   run in the publish path and REFUSE — the redaction sweep over the
 #            commit range about to be pushed, and the private-remote first-push
 #            gate. A guard that only reports is a comment.
-#   DOCTOR   runs read-only and REPORTS. Every row exists because something was
+#   DOCTOR   changes no state and REPORTS (its poll-floor row's fetch writes only
+#            git objects and a private ref). Every row exists because something was
 #            observed to fail silently; a row that cannot fire is a row that
 #            was never a check.
 #

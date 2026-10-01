@@ -58,7 +58,7 @@ fleet_heartbeat_due() {
   # read as dead to its peers.
   heartbeat_now=${1:-$(date +%s)}
   fleet_heartbeat_state | jq -e --argjson now "$heartbeat_now" \
-    '((.due // 0) | numbers) <= $now' >/dev/null 2>&1
+    '([.due | numbers][0] // 0) <= $now' >/dev/null 2>&1
 }
 
 fleet_heartbeat_publish() {
@@ -189,6 +189,6 @@ fleet_liveness_alerts() {
     liveness_slug=${liveness_file##*/stale-host--}
     liveness_slug=${liveness_slug%.yaml}
     case $liveness_checked in *" $liveness_slug "*) continue ;; esac
-    rm -f "$liveness_file"
+    fleet_alert_clear "$1" "$2" stale-host "$liveness_slug" || :
   done
 }

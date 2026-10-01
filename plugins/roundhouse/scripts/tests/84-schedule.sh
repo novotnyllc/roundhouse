@@ -266,6 +266,12 @@ STUB
     rm -f "$SCHED_STATE/linger"
     "$cli" fleet-trigger --fast >/dev/null
     sched_wait_runner || fail "a non-lingering user manager did not fall back to a detached pass"
+    # …but a timer the operator STOPPED (still enabled, inactive) is a stop,
+    # lingering or not: stamp only.
+    rm -f "$SCHED_STATE/runner" "$SCHED_STATE/active.roundhouse-fleet-fast.timer"
+    "$cli" fleet-trigger --fast >/dev/null
+    sched_no_runner || fail "a stopped timer without lingering still got a detached pass"
+    : >"$SCHED_STATE/active.roundhouse-fleet-fast.timer"
     : >"$SCHED_STATE/linger"
     # No user manager: the wants link says enabled, so the fallback.
     rm -f "$SCHED_STATE/usermgr" "$SCHED_STATE/runner"
