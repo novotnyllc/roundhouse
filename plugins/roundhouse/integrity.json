@@ -162,7 +162,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "f35a6c782a8f18746e427cb38dcf466c8daf3763925a3577136a035136f11f44"
+      "sha256": "e14dcba73e87cab7000a9ce8343bce9ba26592bf19bed1a46addc21f4d16bd22"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -214,7 +214,7 @@
     },
     {
       "path": "scripts/preflight",
-      "sha256": "ece027b78daf3fd1cb7bfe83ba82cbf1d80861fcac87dfdeda5342727370237c"
+      "sha256": "e73e0dbb43bc7d3dfff0081e61af002ddf7627b9f237980a19a5aa2c7b921b5f"
     },
     {
       "path": "scripts/prepare-ssh-identity",

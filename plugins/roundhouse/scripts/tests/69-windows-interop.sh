@@ -358,7 +358,8 @@ JSON
       # stdout and stderr reach the worker on separate pipes, so only order
       # WITHIN a stream is defined: the error follows the redacted secret
       # line, and the message ends with the whole sanitized tail.
-      (.data.output_tail | index("[redacted: line matched a secret pattern]") < index($known)) and
+      (.data.output_tail | index("[redacted: line matched a secret pattern]") as $secret |
+        $secret != null and $secret < index($known)) and
       (.data.output_tail as $tail |
         .errors[0].message | endswith($tail | map(select(length > 0)) | join(" | ")))) and
     any(.[]; .kind == "operation" and .id == ("apply:" + $plan_id) and .status == "partial" and

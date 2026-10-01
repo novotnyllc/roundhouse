@@ -48,6 +48,16 @@ jobs:
             plugins/roundhouse/scripts/tests/*.sh; do
             bash -n "$unit"
           done
+          # Every section runs without registration, but shellcheck -x only
+          # reaches the ones listed in the driver's lint anchor.
+          unanchored=$(for f in plugins/roundhouse/scripts/tests/[0-9][0-9]-*.sh; do
+            grep -qxF "  # shellcheck source=tests/${f##*/}" \
+              plugins/roundhouse/scripts/test-roundhouse || printf '%s\n' "${f##*/}"
+          done)
+          if [ -n "$unanchored" ]; then
+            printf 'sections missing from the test-roundhouse lint anchor:\n%s\n' "$unanchored" >&2
+            exit 1
+          fi
           if [[ "$RUNNER_OS" == Linux ]]; then
             # -x follows the `# shellcheck source=` directives in the CLI and in
             # the self-check driver, so the sourced units and sections are
@@ -191,9 +201,13 @@ jobs:
           total=$(ROUNDHOUSE_TEST_ONLY="$only" ROUNDHOUSE_TEST_SCOPES="$scopes" \
             ROUNDHOUSE_TEST_LIST=true plugins/roundhouse/scripts/test-roundhouse |
             awk '{ s += $2 } END { print s + 0 }')
+          units=$(ROUNDHOUSE_TEST_ONLY="$only" ROUNDHOUSE_TEST_SCOPES="$scopes" \
+            ROUNDHOUSE_TEST_LIST=true plugins/roundhouse/scripts/test-roundhouse | grep -c .)
           count=$(( (total + 449) / 450 ))
           [ "$count" -ge 1 ] || count=1
           [ "$count" -le 8 ] || count=8
+          # An empty shard fails, so never ask for more shards than units.
+          [ "$count" -le "$units" ] || count=$units
           shards=$(seq 1 "$count" | jq -Rsc --arg k "$count" \
             'split("\n") | map(select(length > 0) | . + "/" + $k)')
           printf 'weight: %s -> shards: %s\n' "$total" "$shards"

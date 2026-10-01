@@ -1064,8 +1064,12 @@ cp -R "$script_dir/../." "$plugin_cache/"
 if command -v git >/dev/null 2>&1 &&
   git -C "$script_dir/.." rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   ignore_status=0
+  # Enumerate the COPY, and ask the source's ignore rules about it: under the
+  # parallel runner another section can create and remove an ignored file in
+  # the source (60 does) between the cp and this walk.
   ignored_fixture_paths=$(
-    (cd "$script_dir/.." && find . ! -type d -print | sed 's#^\./##' | git check-ignore --stdin) 2>/dev/null
+    (cd "$plugin_cache" && find . ! -type d -print | sed 's#^\./##' |
+      (cd "$script_dir/.." && git check-ignore --stdin)) 2>/dev/null
   ) || ignore_status=$?
   if [ "$ignore_status" -le 1 ] && [ -n "$ignored_fixture_paths" ]; then
     printf '%s\n' "$ignored_fixture_paths" | while IFS= read -r rel; do

@@ -249,17 +249,6 @@ sha256_stream() {
   fi
 }
 
-# One lowercase digest per line, in argument order (sha256_file, batched).
-sha256_files() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$@" | awk '{print tolower($1)}'
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$@" | awk '{print tolower($1)}'
-  else
-    openssl dgst -sha256 "$@" | awk '{print tolower($NF)}'
-  fi
-}
-
 # executor_files_fast_verify <manifest.tsv> <records.jsonl>
 # Succeeds only when EVERY listed file passes what check_private_owned_file and
 # the digest comparison in executor_status_command check one file at a time:
@@ -301,8 +290,10 @@ executor_files_fast_verify() (
     }
     END { if (bad || seen != want) exit 1 }
   ' || exit 1
-  # shellcheck disable=SC2086 # deliberate: the validated word list above
-  fast_actual=$(sha256_files $fast_paths 2>/dev/null) || exit 1
+  # sha256_file_list keeps manifest order; a short or failed listing cannot
+  # equal the expected column, so it falls back like any other anomaly.
+  fast_actual=$(cut -f 1 "$manifest" | awk '{ printf "./%s%c", $0, 0 }' |
+    sha256_file_list 2>/dev/null | awk '{ print tolower($1) }') || exit 1
   [ "$fast_actual" = "$(cut -f 2 "$manifest")" ] || exit 1
   awk -F '\t' '{ printf "{\"path\":\"%s\",\"sha256\":\"%s\"}\n", $1, $2 }' \
     "$manifest" >"$records"

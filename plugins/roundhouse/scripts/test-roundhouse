@@ -11,7 +11,8 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 # real repository, JJ_* imports a real jj identity, and the CLI's own
 # ROUNDHOUSE_* inputs (fleet store, identity, trust root, config) would select
 # live material. None of them is a suite input, so drop them before anything
-# runs; only the suite's own controls survive.
+# runs. ROUNDHOUSE_TEST_* survives: the runner's own selectors and the
+# product's self-test hooks, which 07 and the sections set themselves.
 for rh_inherited in $(compgen -e); do
   case $rh_inherited in
     ROUNDHOUSE_TEST_*|ROUNDHOUSE_REQUIRE_REAL_JJ) ;;
@@ -71,13 +72,20 @@ section_part() {
   [ "${ROUNDHOUSE_TEST_PART%%/*}" = "$1" ]
 }
 
+if [ -n "${ROUNDHOUSE_TEST_PART:-}" ]; then
+  case ${ROUNDHOUSE_TEST_ONLY:-} in
+    ''|*[!0-9]*) printf 'FAIL: ROUNDHOUSE_TEST_PART needs ROUNDHOUSE_TEST_ONLY naming one section\n' >&2
+       exit 64 ;;
+  esac
+fi
+
 # --- parallel runner -------------------------------------------------------
 # A whole-suite run is the publishing gate, and serially it took 20+ minutes.
 # Every section already stands alone over the 00/05/07 harness (CI has run
 # each one in its own job for a while), so the runner re-enters this driver
 # once per unit in a bounded worker pool. Each child is an ordinary
 # single-section (or single-scope) run with its own fixture root, HOME, TMPDIR
-# and log, so no two units share a path, a store, a lock or a process group.
+# and log, so no two units share a path, a store or a lock.
 # Output is buffered per unit and printed in section order with timings; a
 # failing unit's whole log is printed; the final PASS line keeps its meaning.
 #
@@ -93,7 +101,8 @@ section_part() {
 #                            with its log (default 1200).
 #   ROUNDHOUSE_TEST_VERBOSE  true: print every unit's log, not only failures.
 #
-# Sections are discovered from tests/NN-*.sh; nothing registers them. Header
+# Sections are discovered from tests/NN-*.sh; running needs no registration
+# (linting does: see the anchor at the end, which CI checks). Header
 # markers (first 20 lines) adjust scheduling without registering anything:
 #   # roundhouse-test: serial            run alone after the pool drains, for
 #                                        timing assertions that must not share
@@ -233,6 +242,11 @@ rh_runner() {
     done
   fi
 
+  rh_timeout=${ROUNDHOUSE_TEST_UNIT_TIMEOUT:-1200}
+  case $rh_timeout in ''|*[!0-9]*|0)
+    printf 'FAIL: ROUNDHOUSE_TEST_UNIT_TIMEOUT must be a positive integer\n' >&2
+    exit 64 ;;
+  esac
   rh_root=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-test-run.XXXXXX")
   rh_weighted_units | rh_shard "$rh_shard_i" "$rh_shard_k" >"$rh_root/plan"
 
@@ -253,14 +267,14 @@ rh_runner() {
     rh_label[rh_count]=$rh_f1 rh_kind[rh_count]=$rh_f2 rh_value[rh_count]=$rh_f3
     rh_serial[rh_count]=$rh_f4 rh_state[rh_count]=pending
   done <"$rh_root/units"
+  [ "$rh_count" -gt 0 ] || {
+    rm -rf "$rh_root"
+    printf 'FAIL: roundhouse self-check: shard %s selects no units\n' "$rh_shard_spec" >&2
+    exit 1
+  }
   rh_order=$(cut -f 1 "$rh_root/units" |
     awk 'NR == FNR { at[$0] = NR; next } { print at[$1] }' - "$rh_root/plan")
 
-  rh_timeout=${ROUNDHOUSE_TEST_UNIT_TIMEOUT:-1200}
-  case $rh_timeout in ''|*[!0-9]*|0)
-    printf 'FAIL: ROUNDHOUSE_TEST_UNIT_TIMEOUT must be a positive integer\n' >&2
-    exit 64 ;;
-  esac
   rh_started_ms=$(rh_now_ms)
   rh_shard_note=
   [ "$rh_shard_k" -eq 1 ] || rh_shard_note=", shard $rh_shard_spec"
@@ -408,7 +422,8 @@ rh_runner() {
             rh_finish "$rh_i" 125 "$(rh_now_ms)"
             return 0
           fi
-          if [ $(((rh_now - rh_t0[rh_i]) / 1000)) -ge "$rh_timeout" ]; then
+          if [ "${rh_gone[rh_i]:-}" != 1 ] &&
+            [ $(((rh_now - rh_t0[rh_i]) / 1000)) -ge "$rh_timeout" ]; then
             rh_kill_tree "$rh_p"
             printf '\nFAIL: unit exceeded ROUNDHOUSE_TEST_UNIT_TIMEOUT=%ss and was killed\n' \
               "$rh_timeout" >>"$rh_root/$rh_i/log"
@@ -442,13 +457,18 @@ rh_runner() {
     exit 1
   fi
   printf 'all %s unit(s) passed in %ss\n' "$rh_count" "$(rh_seconds "$rh_total_ms")"
-  printf 'PASS: roundhouse self-check\n'
+  # A shard is not the suite: say so on the contract line itself.
+  if [ "$rh_shard_k" -eq 1 ]; then
+    printf 'PASS: roundhouse self-check\n'
+  else
+    printf 'PASS: roundhouse self-check (shard %s only)\n' "$rh_shard_spec"
+  fi
   exit 0
 }
 
-# The runner takes any multi-unit selection outside a scope run. A single
-# selected section (each focused inner loop) and JOBS=1 keep the original
-# single-process run unchanged.
+# The runner takes any multi-unit selection outside a scope run. JOBS=1, and
+# a single selected section without a partition or parts marker, keep the
+# original single-process run unchanged.
 if [ -z "${ROUNDHOUSE_TEST_SCOPE:-}" ]; then
   rh_jobs=${ROUNDHOUSE_TEST_JOBS:-$(rh_default_jobs)}
   case $rh_jobs in ''|*[!0-9]*|0)
