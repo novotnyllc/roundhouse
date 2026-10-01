@@ -263,6 +263,16 @@ if [ -n "$fleet_fixture_yq" ]; then
       fail "a stale transition mutex blocked the release"
     [ ! -d "$verb_lock" ] && [ ! -e "$verb_lock.t" ] ||
       fail "a release behind a stale transition mutex left the lock or the mutex"
+    # A holder that stalled past the break must not remove the mutex of the
+    # transition that broke it: leave checks its own token.
+    fleet_lock_transition_enter "$verb_lock" || fail "could not enter the transition mutex"
+    printf 'someone-else\n' >"$verb_lock.t/owner"
+    fleet_lock_transition_leave "$verb_lock"
+    [ -d "$verb_lock.t" ] || fail "a stalled holder's leave removed its successor's mutex"
+    rm -rf "$verb_lock.t"
+    fleet_lock_transition_enter "$verb_lock" || fail "could not re-enter the transition mutex"
+    fleet_lock_transition_leave "$verb_lock"
+    [ ! -e "$verb_lock.t" ] || fail "the holder's own leave did not remove its mutex"
     # A PRE-NONCE lock left by a dead run — the wedge itself — is recovered too:
     # its pid and start stamp are the identity the takeover binds to.
     mkdir -p "$verb_lock"

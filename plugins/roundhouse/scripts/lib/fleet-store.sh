@@ -339,9 +339,16 @@ fleet_lock_transition_enter() {
     [ "$lock_t_tries" -lt 100 ] || return 1
     sleep 0.1
   done
+  # The holder's token: leave removes the mutex only while it is still THIS
+  # holder's, so a holder that stalled past the break cannot remove the
+  # mutex of the transition that broke it.
+  fleet_lock_transition_token="$$.${RANDOM}${RANDOM}"
+  printf '%s\n' "$fleet_lock_transition_token" >"$lock_t/owner" 2>/dev/null || :
 }
 
 fleet_lock_transition_leave() {
+  [ "$(cat "$1.t/owner" 2>/dev/null)" = "${fleet_lock_transition_token:-}" ] || return 0
+  rm -f "$1.t/owner" 2>/dev/null || :
   rmdir "$1.t" 2>/dev/null || :
 }
 
