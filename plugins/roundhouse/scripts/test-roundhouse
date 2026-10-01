@@ -166,6 +166,8 @@ if want_section 79; then . "$script_dir/tests/79-node-runtime.sh"; fi
 if want_section 80; then . "$script_dir/tests/80-alerts.sh"; fi
 # shellcheck source=tests/83-apply-claude.sh
 if want_section 83; then . "$script_dir/tests/83-apply-claude.sh"; fi
+# shellcheck source=tests/84-schedule.sh
+if want_section 84; then . "$script_dir/tests/84-schedule.sh"; fi
 # shellcheck source=tests/85-liveness.sh
 if want_section 85; then . "$script_dir/tests/85-liveness.sh"; fi
 # shellcheck source=tests/86-publish-verbs.sh

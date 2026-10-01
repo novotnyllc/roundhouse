@@ -103,6 +103,22 @@ accelerator only — it carries no data, says "go look", and the peer then runs
 its ordinary fast path with every gate. Turn it off with `push_nudge: false`
 and the fleet still converges at poll speed; nothing depends on it.
 
+**Triggers.** The nudge sends the peer `roundhouse fleet-trigger --fast` over
+SSH and returns; the pass never runs inside that channel. Every trigger does
+the same three things: touch the dirty stamp (`store.run/dirty-stamp`), start
+the scheduled job (`launchctl kickstart gui/$UID/com.novotnyllc.roundhouse.fleet-fast`
+on macOS, `systemctl --user start --no-block roundhouse-fleet-fast.service` on
+Linux), and return. With no GUI domain or user manager to start it in (a Mac
+reached over SSH with nobody at the console), or no job installed, it starts a
+detached `nohup roundhouse fleet-run --fast` instead. An operator-disabled job
+is stamped and not started. A pass that finds the stamp moved since it began
+converges again in-process before it releases the lock (at most three extra
+passes), so a trigger that lands mid-pass is never lost.
+
+```text
+roundhouse fleet-trigger [--fast|--full]   # stamp, kick the scheduled job, return
+```
+
 **Heartbeats.** Every pass records a host-local heartbeat
 (`store.run/alive`). The `outcome: alive` journal record is *published* at most
 every `heartbeat_publish_hours` (default 6), and always after a pass that applied

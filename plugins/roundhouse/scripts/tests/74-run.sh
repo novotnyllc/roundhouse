@@ -1352,8 +1352,12 @@ STUB
       fail "the nudge never reached the peer"
     ! grep -q 'rh-vireo' "$ROUNDHOUSE_NUDGE_LOG" ||
       fail "the pushing host nudged itself"
-    grep -q 'fleet-run --fast' "$ROUNDHOUSE_NUDGE_LOG" ||
+    # §6.1: the nudge is the peer's trigger, never its pass — a pass inside
+    # this ten-second channel is what the watchdog used to kill mid-apply.
+    grep -q 'fleet-trigger --fast' "$ROUNDHOUSE_NUDGE_LOG" ||
       fail "the nudge carried something other than \"go look\""
+    ! grep -q 'fleet-run' "$ROUNDHOUSE_NUDGE_LOG" ||
+      fail "the nudge still runs the peer's pass inside the SSH channel"
     grep -Fqx wren "$(fleet_run_state_dir)/nudge-unreachable" ||
       fail "an unreachable peer was not remembered for the interval"
     # Remembered for ONE interval only, so a peer that comes back is retried.

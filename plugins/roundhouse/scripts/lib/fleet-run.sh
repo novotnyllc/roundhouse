@@ -1639,7 +1639,14 @@ fleet_run_nudge_peer() {
   # review gates, canary, the lot — so a nudge from a compromised host can
   # cause exactly one thing: an early fetch of content that is signature-gated
   # anyway.
-  ssh_run "rh-$1" 'roundhouse fleet-run --fast' >/dev/null 2>&1 &
+  #
+  # §6.1: the nudge is the peer's ordinary TRIGGER, not its pass. Running the
+  # whole `fleet-run --fast` inside this channel tied the peer's pass to a
+  # ten-second SSH watchdog that killed it mid-apply; `fleet-trigger` stamps,
+  # starts the peer's own scheduled job (or a detached pass) and returns, so
+  # the pass runs under the peer's scheduler and this host waits for the
+  # handshake only.
+  ssh_run "rh-$1" 'roundhouse fleet-trigger --fast' </dev/null >/dev/null 2>&1 &
   fleet_run_nudge_pid=$!
   (
     sleep 10
@@ -1724,11 +1731,40 @@ fleet_run_command() (
   run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-fleet-run.XXXXXX")
   trap 'fleet_lock_release "$run_lock" "$run_lock_nonce" || :; rm -rf "$run_tmp"' \
     EXIT HUP INT TERM
-  # The pass's alert ledger: what each item-scoped condition check evaluated
-  # and raised, for the end-of-pass sweep (fleet_alert_sweep).
-  run_ledger=$run_tmp/alert-ledger
-  : >"$run_ledger"
+  # §6.1 stamp-and-kick. A trigger that lands while this process holds the
+  # lock starts a second run that finds the lock and exits, so the trigger
+  # rides the dirty stamp instead (lib/fleet-schedule.sh): while the stamp has
+  # moved since a pass began, the pass runs again HERE, under the same lock.
+  # Bounded — three extra passes — so a trigger storm cannot pin the lock;
+  # anything later waits for the next scheduled run. An extra pass is a FAST
+  # one, floor included: a trigger says "go look", and repeating a full
+  # pass's marketplace refresh and package updates is not looking.
+  run_extra=0
+  while :; do
+    run_stamp_seen=$(fleet_trigger_stamp_state)
+    mkdir -p "$run_tmp/pass-$run_extra"
+    # The pass's alert ledger: what each item-scoped condition check evaluated
+    # and raised, for the end-of-pass sweep (fleet_alert_sweep). PER PASS: a
+    # re-run pass that inherited the previous pass's `raised` lines would keep
+    # an alert its own check no longer raises.
+    : >"$run_tmp/pass-$run_extra/alert-ledger"
+    run_status=0
+    run_ledger="$run_tmp/pass-$run_extra/alert-ledger" \
+      run_tmp="$run_tmp/pass-$run_extra" fleet_run_pass || run_status=$?
+    [ "$run_extra" -lt 3 ] || break
+    [ "$(fleet_trigger_stamp_state)" != "$run_stamp_seen" ] || break
+    run_extra=$((run_extra + 1))
+    run_mode=fast
+    printf 'roundhouse: a trigger arrived during the pass; converging again in-process (%s of 3)\n' \
+      "$run_extra"
+  done
+  exit "$run_status"
+)
 
+fleet_run_pass() (
+  # One observe/converge pass, under fleet_run_command's lock, with its
+  # run_mode, run_store, run_host and a fresh run_tmp. A subshell, so every
+  # `exit` below ends THIS pass and hands its status back to the loop above.
   # §8.6: the abort button for a bad local apply, captured deliberately
   # WITHOUT --ignore-working-copy (that flag suppresses the colocated
   # auto-import, so restoring to the newest operation exports an empty view and
