@@ -151,8 +151,8 @@ Cleanup and autoremove are separate explicit actions.
 
 Auto-updating on a schedule uses the OS scheduler calling the CLI — no new
 daemon, database, or engine. **There is exactly one owned scheduler
-entry per host** — one job pair, fast and full, owned by
-`roundhouse fleet-schedule` — and it runs `roundhouse fleet-run`. Two local runners racing one
+entry per host**: the fast and full job pair that `roundhouse fleet-schedule`
+installs, and it runs `roundhouse fleet-run`. Two local runners racing one
 plugin cache is the failure this prevents, so a second entry is never
 added: the desired-state run **absorbs** the older autoupdate entry rather
 than being given one of its own. Marketplace refresh and package updates are
@@ -313,19 +313,27 @@ alert (and `schedule-missing` for a job that disappeared) instead.
 
 The shape per platform, all three running the same two commands:
 
+Both intervals come from the same policy the run reads
+(`fast_interval_minutes` ± `fast_jitter_minutes`, `cadence_hours` ±
+`jitter_minutes`; 20 ± 5 min and 12 h ± 90 min by default), with the offset
+seeded from the host name, so each host's jobs fire on their own stable
+minute. Re-run `install` after changing those keys.
+
 - **macOS** — two per-user launchd agents (launchd cannot run two commands
   from one), `~/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet-fast.plist`
-  (`StartInterval` 1260) and `com.novotnyllc.roundhouse.fleet-full.plist`
-  (`StartInterval` 45540), each running
+  and `com.novotnyllc.roundhouse.fleet-full.plist`, each a `StartInterval`
+  job running
   `/bin/zsh -lc 'exec "$HOME/.local/bin/roundhouse" fleet-run --fast|--full'`
   and logging to `~/Library/Logs/roundhouse-fleet-fast.log` /
   `roundhouse-fleet-full.log`. Over SSH with nobody logged in at the console
   there is no GUI domain to load into; the agents load at the next login.
 - **Linux** — a systemd **user** timer pair, each timer with its oneshot
-  service, `roundhouse-fleet-fast.timer` and `roundhouse-fleet-full.timer`, with
-  `Persistent=true` so a laptop that was asleep catches up once rather than
-  storming. A headless host needs `loginctl enable-linger` for its user
-  manager to run without a session; WSL needs systemd enabled.
+  service, `roundhouse-fleet-fast.timer` and `roundhouse-fleet-full.timer`, on
+  `OnBootSec`/`OnUnitActiveSec` monotonic intervals, so a laptop that was
+  asleep resumes its cadence at wake rather than storming. The user manager
+  must linger (`loginctl enable-linger`) for the timers to outlive a login
+  session — `install` exits 75 and names the fix when it does not — and WSL
+  needs systemd enabled.
 - **Windows** — a **per-user** scheduled task. Where the machine has a
   configured WSL sibling, register it there and drive the native side through
   the interop lane rather than registering a second native entry.

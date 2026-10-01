@@ -92,16 +92,19 @@ Two scheduled jobs per host run them, installed by
 The **poll floor** is one incremental fetch into a private ref and a tree
 compare: a fast run exits early when the desired-state paths at the fetched
 remote head (`fleet.yaml`, `definitions.yaml`, `definitions/`, `fleet/`, `os/`,
-`groups/`, `hosts/`, `trust/`) match those at the commit this host last
-converged on, and it has nothing to push, a clean `@`, no heartbeat owed and no
-item waiting on canary evidence. Peers' record commits (journal, alerts,
-`applied/`) no longer force a full pass; the floor's fetch does not move
-`main@origin`, so the next full pass still signature-gates everything that
-arrived. Jitter is seeded from the host
+`groups/`, `hosts/`, `trust/`) match those of the reference this host last
+converged from, the fetched head descends from what it converged on, and it
+has nothing to push, a clean `@`, no heartbeat owed, no item waiting on canary
+evidence and no retry owed (a failed apply, an unreadable identity, or a
+`fleet-review` verdict not yet acted on). Peers' record commits (journal,
+alerts, `applied/`) no longer force a full pass; the floor's fetch does not
+move `main@origin`, so the next full pass still signature-gates everything
+that arrived. Jitter is seeded from the host
 **name**, never the clock, so the offsets are stable and the fleet does not
 re-synchronise on the same minute. The **push nudge** is an opportunistic
 accelerator only — it carries no data, says "go look", and the peer then runs
-its ordinary fast path with every gate. Turn it off with `push_nudge: false`
+its ordinary fast path with every gate. It is sent only when the publish
+changed desired state — never for a records-only one. Turn it off with `push_nudge: false`
 and the fleet still converges at poll speed; nothing depends on it.
 
 **Triggers.** The nudge sends the peer `roundhouse fleet-trigger --fast` over
@@ -109,10 +112,13 @@ SSH and returns; the pass never runs inside that channel. Every trigger does
 the same three things: touch the dirty stamp (`store.run/dirty-stamp`), start
 the scheduled job (`launchctl kickstart gui/$UID/com.novotnyllc.roundhouse.fleet-fast`
 on macOS, `systemctl --user start --no-block roundhouse-fleet-fast.service` on
-Linux), and return. With no GUI domain or user manager to start it in (a Mac
-reached over SSH with nobody at the console), or no job installed, it starts a
-detached `nohup roundhouse fleet-run --fast` instead. An operator-disabled job
-is stamped and not started. A pass that finds the stamp moved since it began
+Linux), and return. Only when the job is known installed and enabled but its
+scheduler cannot be reached (a Mac over SSH with nobody at the console, whose
+job was last seen loaded; a Linux user manager that does not linger) does it
+start a detached `nohup roundhouse fleet-run --fast` instead. A job the
+operator disabled or unloaded, a host with no job, or one taken off the
+schedule with `fleet-schedule uninstall` is stamped and nothing is started.
+A pass that finds the stamp moved since it began
 converges again in-process before it releases the lock (at most three extra
 passes), so a trigger that lands mid-pass is never lost.
 

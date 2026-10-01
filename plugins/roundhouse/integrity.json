@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
-      "sha256": "bcf20b764128451353fe25c0e59a1251b4142b1d188130ccfc60c5eccdc297f2"
+      "sha256": "adf1e9fd21ffe13aefcfcc9acdcf2362e450fcfc1ca36499c15802a412c199d5"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -262,7 +262,7 @@
     },
     {
       "path": "skills/fleet-agents/SKILL.md",
-      "sha256": "a1b9459b6848b6cc3a2b2b8d94237461965bcd2977a443e5ce78fb51c6011022"
+      "sha256": "8105fc12bd8f4e5548dc624c3fdf70b60c6c401efd532241db3655aa0a36bb55"
     },
     {
       "path": "skills/fleet-agents/agents/openai.yaml",
@@ -306,7 +306,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "87a9b168787b775a051f13143420bf1020fa63215d28e930a8cca598c7c70e2f"
+      "sha256": "ee543fe47cc1b534a3b4c5381971ada79bd65e07263133f5d166b7af5897e624"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",

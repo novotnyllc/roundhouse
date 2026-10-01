@@ -6,9 +6,10 @@
 #
 #   1. touch the dirty stamp under store.run/;
 #   2. start the scheduled job — `launchctl kickstart` on macOS,
-#      `systemctl --user start` on Linux — or, when there is no GUI domain or
-#      user manager to start it in (a Mac reached over SSH with nobody at the
-#      console), a detached `nohup roundhouse fleet-run`;
+#      `systemctl --user start` on Linux — or, ONLY when that job is known to
+#      be installed and enabled but its GUI domain or user manager cannot be
+#      reached (a Mac over SSH with nobody at the console, a Linux user whose
+#      manager does not linger), a detached `nohup roundhouse fleet-run`;
 #   3. return.
 #
 # A trigger never runs a pass in its own process. A kickstart for a job that
@@ -16,12 +17,16 @@
 # pass re-runs in-process while the stamp has moved since that pass began
 # (fleet_run_command), so a trigger that lands mid-pass is never lost.
 #
-# An operator-disabled job is the operator's decision. A trigger stamps and
-# does NOT start it; a pass alerts on it and never re-enables it. Only an
-# explicit `roundhouse fleet-schedule install` enables.
+# AN OPERATOR STOP IS FINAL TO EVERYTHING BUT `install`. A job the operator
+# disabled or unloaded, a host whose jobs were uninstalled (the opt-out
+# marker), a host that never had them: the trigger stamps and starts nothing,
+# and a pass alerts and changes nothing. Only an explicit
+# `roundhouse fleet-schedule install` enables.
 #
 # Sourced by scripts/roundhouse; carries definitions only.
 # shellcheck shell=bash
+
+fleet_schedule_modes='fast full'
 
 fleet_schedule_platform() {
   # launchd | systemd | windows | unsupported. WSL is Linux, and gets the
@@ -40,10 +45,6 @@ fleet_schedule_label() {
   printf 'com.novotnyllc.roundhouse.fleet-%s\n' "$1"
 }
 
-fleet_schedule_plist() {
-  printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$(fleet_schedule_label "$1")"
-}
-
 fleet_schedule_unit() {
   # fast|full -> the systemd unit base name (`.service` and `.timer`).
   printf 'roundhouse-fleet-%s\n' "$1"
@@ -51,6 +52,15 @@ fleet_schedule_unit() {
 
 fleet_schedule_unit_dir() {
   printf '%s/systemd/user\n' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+fleet_schedule_def_path() {
+  # fast|full -> the file whose presence means "this job is installed": the
+  # LaunchAgent plist, or the systemd timer.
+  case $(fleet_schedule_platform) in
+    launchd) printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$(fleet_schedule_label "$1")" ;;
+    systemd) printf '%s/%s.timer\n' "$(fleet_schedule_unit_dir)" "$(fleet_schedule_unit "$1")" ;;
+  esac
 }
 
 fleet_schedule_gui_domain() {
@@ -64,55 +74,91 @@ fleet_schedule_user_manager() {
     systemctl --user show-environment >/dev/null 2>&1
 }
 
-fleet_schedule_job_state() {
-  # fleet_schedule_job_state fast|full -> one word:
+fleet_schedule_lingers() {
+  # True unless logind says this user's manager does NOT linger. Without
+  # lingering the manager — and every timer in it — dies with the last
+  # session, so a job started from an SSH session dies with that session.
+  command -v loginctl >/dev/null 2>&1 || return 0
+  schedule_linger=$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null) ||
+    return 0
+  [ "$schedule_linger" != no ]
+}
+
+fleet_schedule_state_path() {
+  printf '%s/schedule-state\n' "$(fleet_run_state_dir)"
+}
+
+fleet_schedule_optout_path() {
+  # Left by `fleet-schedule uninstall`: the operator took this host off the
+  # schedule, so nothing but `install` may start a pass here.
+  printf '%s/schedule-opted-out\n' "$(fleet_run_state_dir)"
+}
+
+fleet_schedule_marker() {
+  # Host-local evidence that fleet-schedule owns this host's jobs, which is
+  # what lets a pass tell "the operator never installed them" from "they
+  # were installed and are gone".
+  printf '%s/schedule-installed\n' "$(fleet_run_state_dir)"
+}
+
+fleet_schedule_last_state() {
+  # The last state OBSERVED for MODE (never `unavailable`), or nothing.
+  awk -v m="$1" '$1 == m { print $2; exit }' "$(fleet_schedule_state_path)" 2>/dev/null
+}
+
+fleet_schedule_probe() {
+  # fleet_schedule_probe fast|full -> one word, read-only:
   #
   #   missing      no job definition on disk
-  #   disabled     the definition exists and the operator disabled it
+  #   disabled     the operator disabled it
   #   unloaded     present and not disabled, but not loaded/active
   #   loaded       present, enabled, loaded (launchd) or active (systemd timer)
-  #   unavailable  no GUI domain / user manager to ask, so the state is unknown
-  #
-  # Read-only: this asks and never changes anything.
+  #   unavailable  installed, but there is no GUI domain / reachable, lingering
+  #                user manager to ask or to start it in. On systemd this means
+  #                ENABLED (the timers.target.wants link says so); on launchd
+  #                the enablement is unknown and the last observed state rules.
+  probe_def=$(fleet_schedule_def_path "$1")
+  [ -n "$probe_def" ] && [ -f "$probe_def" ] || {
+    printf 'missing\n'
+    return 0
+  }
   case $(fleet_schedule_platform) in
     launchd)
-      [ -f "$(fleet_schedule_plist "$1")" ] || {
-        printf 'missing\n'
-        return 0
-      }
-      job_domain=$(fleet_schedule_gui_domain)
-      launchctl print "$job_domain" >/dev/null 2>&1 || {
+      probe_domain=$(fleet_schedule_gui_domain)
+      launchctl print "$probe_domain" >/dev/null 2>&1 || {
         printf 'unavailable\n'
         return 0
       }
       # Both spellings: `=> disabled` on current macOS, `=> true` on older.
-      if launchctl print-disabled "$job_domain" 2>/dev/null |
+      if launchctl print-disabled "$probe_domain" 2>/dev/null |
         grep -Eq "\"$(fleet_schedule_label "$1")\" => (disabled|true)"; then
         printf 'disabled\n'
-      elif launchctl print "$job_domain/$(fleet_schedule_label "$1")" >/dev/null 2>&1; then
+      elif launchctl print "$probe_domain/$(fleet_schedule_label "$1")" >/dev/null 2>&1; then
         printf 'loaded\n'
       else
         printf 'unloaded\n'
       fi
       ;;
     systemd)
-      [ -f "$(fleet_schedule_unit_dir)/$(fleet_schedule_unit "$1").timer" ] || {
-        printf 'missing\n'
+      probe_timer="$(fleet_schedule_unit "$1").timer"
+      if ! fleet_schedule_user_manager; then
+        # No manager to ask: `enable` is a symlink on disk, so read that.
+        if [ -L "$(fleet_schedule_unit_dir)/timers.target.wants/$probe_timer" ]; then
+          printf 'unavailable\n'
+        else
+          printf 'disabled\n'
+        fi
         return 0
-      }
-      fleet_schedule_user_manager || {
-        printf 'unavailable\n'
-        return 0
-      }
-      job_enabled=$(systemctl --user is-enabled "$(fleet_schedule_unit "$1").timer" \
-        2>/dev/null) || :
-      case $job_enabled in
+      fi
+      case $(systemctl --user is-enabled "$probe_timer" 2>/dev/null || :) in
         disabled | masked | masked-runtime)
           printf 'disabled\n'
           return 0
           ;;
       esac
-      if systemctl --user is-active --quiet "$(fleet_schedule_unit "$1").timer" 2>/dev/null; then
+      if ! fleet_schedule_lingers; then
+        printf 'unavailable\n'
+      elif systemctl --user is-active --quiet "$probe_timer" 2>/dev/null; then
         printf 'loaded\n'
       else
         printf 'unloaded\n'
@@ -122,16 +168,40 @@ fleet_schedule_job_state() {
   esac
 }
 
+fleet_schedule_job_state() {
+  # The probe, remembered: every state actually observed is written to
+  # store.run/schedule-state, and `unavailable` never overwrites one. That
+  # memory is what lets a trigger over SSH (no GUI domain to ask) still honour
+  # an operator's disable it can no longer see.
+  job_state=$(fleet_schedule_probe "$1")
+  if [ "$job_state" != unavailable ] && [ "$(fleet_schedule_last_state "$1")" != "$job_state" ]; then
+    job_state_path=$(fleet_schedule_state_path)
+    mkdir -p "$(dirname "$job_state_path")" &&
+      { awk -v m="$1" '$1 != m' "$job_state_path" 2>/dev/null || :
+        printf '%s %s\n' "$1" "$job_state"; } >"$job_state_path.next" &&
+      mv -f "$job_state_path.next" "$job_state_path" || :
+  fi
+  printf '%s\n' "$job_state"
+}
+
+fleet_schedule_start() {
+  # Start MODE's job in its scheduler, without waiting for the pass.
+  case $(fleet_schedule_platform) in
+    launchd) launchctl kickstart "$(fleet_schedule_gui_domain)/$(fleet_schedule_label "$1")" ;;
+    systemd) systemctl --user start --no-block "$(fleet_schedule_unit "$1").service" ;;
+    *) return 1 ;;
+  esac >/dev/null 2>&1
+}
+
 # --- the dirty stamp -----------------------------------------------------------
 
 fleet_trigger_stamp_path() {
-  printf '%s/dirty-stamp\n' "$(fleet_instance_path store.run)"
+  printf '%s/dirty-stamp\n' "$(fleet_run_state_dir)"
 }
 
 fleet_trigger_stamp() {
-  # Touch the stamp. The CONTENT changes on every trigger, not only the mtime:
-  # two triggers inside one second share an mtime on a 1-second filesystem,
-  # and the running pass compares both.
+  # Touch the stamp. Its CONTENT is unique per trigger (time, pid, a random
+  # draw), so the content alone is the comparison and no mtime is read.
   trigger_stamp=$(fleet_trigger_stamp_path)
   mkdir -p "$(dirname "$trigger_stamp")" || return 1
   printf '%s %s %s\n' "$(fleet_now)" "$$" "${RANDOM:-0}" \
@@ -140,21 +210,16 @@ fleet_trigger_stamp() {
 }
 
 fleet_trigger_stamp_state() {
-  # The stamp as one comparable string: mtime and content, or `absent`.
-  trigger_stamp=$(fleet_trigger_stamp_path)
-  [ -f "$trigger_stamp" ] || {
-    printf 'absent\n'
-    return 0
-  }
-  printf '%s %s\n' "$(fleet_run_mtime "$trigger_stamp")" "$(cat "$trigger_stamp" 2>/dev/null)"
+  cat "$(fleet_trigger_stamp_path)" 2>/dev/null || printf 'absent\n'
 }
 
 # --- the kick ------------------------------------------------------------------
 
 fleet_trigger_detach() {
-  # fleet_trigger_detach fast|full REASON — the no-scheduler fallback. No
-  # `setsid`: macOS has none. `nohup` with every stream closed is what lets an
-  # SSH session that started it end without waiting on it or taking it down.
+  # fleet_trigger_detach fast|full REASON — the unreachable-scheduler
+  # fallback. No `setsid`: macOS has none. `nohup` with every stream closed is
+  # what lets an SSH session that started it end without waiting on it or
+  # taking it down.
   trigger_runner="$script_dir/roundhouse"
   if fleet_test_hook "${ROUNDHOUSE_FLEET_TRIGGER_RUNNER:-}"; then
     trigger_runner=$ROUNDHOUSE_FLEET_TRIGGER_RUNNER
@@ -164,43 +229,40 @@ fleet_trigger_detach() {
 }
 
 fleet_trigger_kick() {
-  # fleet_trigger_kick fast|full — start the scheduled job for MODE, or fall
-  # back. Returns as soon as the start is requested; never waits for a pass.
-  case $(fleet_schedule_platform) in
-    launchd)
-      trigger_target="$(fleet_schedule_gui_domain)/$(fleet_schedule_label "$1")"
-      if [ ! -f "$(fleet_schedule_plist "$1")" ]; then
-        fleet_trigger_detach "$1" "no fleet-$1 job is installed (roundhouse fleet-schedule install)"
-      elif ! launchctl print "$(fleet_schedule_gui_domain)" >/dev/null 2>&1; then
-        fleet_trigger_detach "$1" "no GUI launchd domain for this user (no console login)"
-      elif [ "$(fleet_schedule_job_state "$1")" = disabled ]; then
-        printf 'roundhouse: fleet-%s is disabled by the operator; stamped, not started (roundhouse fleet-schedule status)\n' "$1"
-      elif launchctl kickstart "$trigger_target" >/dev/null 2>&1; then
-        printf 'roundhouse: stamped and kicked %s\n' "$trigger_target"
+  # fleet_trigger_kick fast|full — start MODE's job, fall back, or decline.
+  # Returns as soon as the start is requested; never waits for a pass.
+  [ "$(fleet_schedule_platform)" != windows ] || {
+    printf 'roundhouse: fleet-trigger does not run on native Windows; the operated instance is driven from its WSL operator host\n' >&2
+    return 69
+  }
+  if [ -e "$(fleet_schedule_optout_path)" ]; then
+    printf 'roundhouse: this host was taken off the schedule (fleet-schedule uninstall); stamped, not started\n'
+    return 0
+  fi
+  case $(fleet_schedule_job_state "$1") in
+    loaded)
+      if fleet_schedule_start "$1"; then
+        printf 'roundhouse: stamped and started fleet-%s\n' "$1"
       else
-        fleet_trigger_detach "$1" "launchctl kickstart $trigger_target was refused"
+        printf 'roundhouse: the scheduler refused to start fleet-%s; stamped, the next scheduled run picks it up\n' "$1"
       fi
       ;;
-    systemd)
-      trigger_unit="$(fleet_schedule_unit "$1").service"
-      if [ ! -f "$(fleet_schedule_unit_dir)/$(fleet_schedule_unit "$1").timer" ]; then
-        fleet_trigger_detach "$1" "no fleet-$1 timer is installed (roundhouse fleet-schedule install)"
-      elif ! fleet_schedule_user_manager; then
-        fleet_trigger_detach "$1" "no systemd user manager for this user"
-      elif [ "$(fleet_schedule_job_state "$1")" = disabled ]; then
-        printf 'roundhouse: fleet-%s is disabled by the operator; stamped, not started (roundhouse fleet-schedule status)\n' "$1"
-      elif systemctl --user start --no-block "$trigger_unit" >/dev/null 2>&1; then
-        printf 'roundhouse: stamped and started %s\n' "$trigger_unit"
+    unavailable)
+      # Detached only when the job is KNOWN installed and enabled: systemd
+      # says so from its wants link; launchd from the last state observed
+      # while its domain was reachable.
+      if [ "$(fleet_schedule_platform)" = systemd ] ||
+        [ "$(fleet_schedule_last_state "$1")" = loaded ]; then
+        fleet_trigger_detach "$1" "fleet-$1 is installed and enabled but its scheduler is unreachable from here"
       else
-        fleet_trigger_detach "$1" "systemctl --user start $trigger_unit was refused"
+        printf 'roundhouse: fleet-%s cannot be reached and was not last seen running; stamped, not started\n' "$1"
       fi
       ;;
-    windows)
-      printf 'roundhouse: fleet-trigger does not run on native Windows; the operated instance is driven from its WSL operator host\n' >&2
-      return 69
+    disabled | unloaded)
+      printf 'roundhouse: fleet-%s is stopped by the operator (fleet-schedule status); stamped, not started\n' "$1"
       ;;
     *)
-      fleet_trigger_detach "$1" "no supported scheduler on $(uname -s)"
+      printf 'roundhouse: no fleet-%s job is installed (roundhouse fleet-schedule install); stamped, not started\n' "$1"
       ;;
   esac
 }
@@ -232,13 +294,17 @@ fleet_trigger_command() (
 # --- the job definitions -------------------------------------------------------
 
 fleet_schedule_interval() {
-  # The macOS StartInterval, in seconds: 21 minutes and 12 h 39 min. Not
-  # round numbers on purpose — an interval that divides the hour fires every
-  # Mac in the fleet on the same minute.
-  case $1 in
-    fast) printf '1260\n' ;;
-    *) printf '45540\n' ;;
-  esac
+  # fast|full -> the job interval in seconds, from the ONE cadence source the
+  # run itself uses (fleet_run_interval_seconds): the store's policy keys,
+  # jittered from the host NAME, so the scheduler and the policy cannot
+  # drift apart and two hosts do not fire on the same minute. The fold is the
+  # working copy's, like fleet_run_stale_after's; a store with no policy reads
+  # the built-in defaults (20 ± 5 min, 12 h ± 90 min).
+  interval_host=$(fleet_host_name 2>/dev/null) || interval_host=
+  interval_fold=$(fleet_fold "$(fleet_store_path)" "$interval_host" 2>/dev/null) ||
+    interval_fold=
+  [ -n "$interval_fold" ] || interval_fold='{}'
+  fleet_run_interval_seconds "$interval_fold" "$interval_host" "$1"
 }
 
 fleet_schedule_xml_text() {
@@ -246,10 +312,9 @@ fleet_schedule_xml_text() {
 }
 
 fleet_schedule_plist_render() {
-  # fleet_schedule_plist_render fast|full — the LaunchAgent, byte for byte the
-  # shape the fleet's hosts already carry, so `install` on a host that has it
-  # is a no-op. `$HOME` stays literal in the command (zsh expands it); the log
-  # path is absolute because launchd expands nothing.
+  # fleet_schedule_plist_render fast|full — the LaunchAgent, in the shape the
+  # fleet's hosts already carry. `$HOME` stays literal in the command (zsh
+  # expands it); the log path is absolute because launchd expands nothing.
   render_log=$(fleet_schedule_xml_text "$HOME/Library/Logs/roundhouse-fleet-$1.log")
   cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -302,31 +367,18 @@ UNIT
 }
 
 fleet_schedule_timer_render() {
-  # The same cadence as the LaunchAgents, as calendar events so Persistent=
-  # applies: a laptop that slept through a slot catches up once at wake rather
-  # than storming. FixedRandomDelay keeps each host's offset stable (seeded by
-  # systemd from the machine and unit), the jitter rule the run itself follows.
-  case $1 in
-    fast)
-      render_calendar='*:0/21'
-      render_delay=300
-      render_what='every 21 minutes'
-      ;;
-    *)
-      render_calendar='*-*-* 00,12:00:00'
-      render_delay=5400
-      render_what='twice a day'
-      ;;
-  esac
+  # Monotonic, like launchd's StartInterval and from the same interval: the
+  # first run one interval after the user manager starts, then one interval
+  # after each run began. Monotonic time does not advance while the machine
+  # sleeps, so a laptop resumes its cadence at wake rather than storming.
+  render_interval=$(fleet_schedule_interval "$1")
   cat <<UNIT
 [Unit]
-Description=roundhouse fleet-run --$1, $render_what
+Description=roundhouse fleet-run --$1 every ${render_interval}s
 
 [Timer]
-OnCalendar=$render_calendar
-RandomizedDelaySec=$render_delay
-FixedRandomDelay=true
-Persistent=true
+OnBootSec=${render_interval}s
+OnUnitActiveSec=${render_interval}s
 Unit=$(fleet_schedule_unit "$1").service
 
 [Install]
@@ -372,36 +424,24 @@ fleet_schedule_place() {
   printf 'written\n'
 }
 
-fleet_schedule_marker() {
-  # Host-local evidence that fleet-schedule owns this host's jobs, which is
-  # what lets a pass tell "the operator never installed them" from "they
-  # were installed and are gone".
-  printf '%s/schedule-installed\n' "$(fleet_instance_path store.run)"
-}
-
-fleet_schedule_legacy_labels() {
-  # The superseded entries fleet-update's absorb rule names: the old
-  # autoupdate agent and the one-plist fleet agent.
-  printf '%s\n' com.novotnyllc.roundhouse.autoupdate com.novotnyllc.roundhouse.fleet
+fleet_schedule_legacy_plists() {
+  # The superseded entries fleet-update's absorb rule names, where they exist:
+  # the old autoupdate agent and the one-plist fleet agent.
+  for legacy_label in com.novotnyllc.roundhouse.autoupdate com.novotnyllc.roundhouse.fleet; do
+    [ ! -f "$HOME/Library/LaunchAgents/$legacy_label.plist" ] ||
+      printf '%s\n' "$HOME/Library/LaunchAgents/$legacy_label.plist"
+  done
 }
 
 fleet_schedule_install_launchd() {
   install_domain=$(fleet_schedule_gui_domain)
   install_has_domain=true
   launchctl print "$install_domain" >/dev/null 2>&1 || install_has_domain=false
-  # Absorb, never duplicate (fleet-update): a host carrying an old entry beside
-  # the new pair is the double runner the one-owner rule exists to prevent.
-  for install_legacy in $(fleet_schedule_legacy_labels); do
-    install_legacy_plist="$HOME/Library/LaunchAgents/$install_legacy.plist"
-    [ -f "$install_legacy_plist" ] || continue
-    [ "$install_has_domain" != true ] ||
-      launchctl bootout "$install_domain/$install_legacy" >/dev/null 2>&1 || :
-    rm -f "$install_legacy_plist"
-    printf 'roundhouse: absorbed the superseded %s entry\n' "$install_legacy"
-  done
   install_rc=0
-  for install_mode in fast full; do
-    install_plist=$(fleet_schedule_plist "$install_mode")
+  # The new pair FIRST: a superseded entry is retired only once its
+  # replacement is on disk, so a failure here leaves the host scheduled.
+  for install_mode in $fleet_schedule_modes; do
+    install_plist=$(fleet_schedule_def_path "$install_mode")
     install_label=$(fleet_schedule_label "$install_mode")
     fleet_schedule_plist_render "$install_mode" >"$install_tmp/$install_mode.plist"
     install_result=$(fleet_schedule_place "$install_plist" \
@@ -418,13 +458,15 @@ fleet_schedule_install_launchd() {
     fi
     install_state=$(fleet_schedule_job_state "$install_mode")
     # The ONE place a disabled job is re-enabled: the operator asked for it.
+    # Re-probed afterwards, because a job can stay LOADED through a disable,
+    # and bootstrapping a loaded job is an error.
     if [ "$install_state" = disabled ]; then
       launchctl enable "$install_domain/$install_label" >/dev/null 2>&1 || {
         printf 'roundhouse: launchctl enable %s/%s failed\n' "$install_domain" "$install_label" >&2
         return 70
       }
       printf 'fleet-%s: re-enabled (it was disabled)\n' "$install_mode"
-      install_state=unloaded
+      install_state=$(fleet_schedule_job_state "$install_mode")
     fi
     if [ "$install_state" = loaded ] && [ "$install_result" = written ]; then
       launchctl bootout "$install_domain/$install_label" >/dev/null 2>&1 || :
@@ -436,8 +478,19 @@ fleet_schedule_install_launchd() {
         return 70
       }
       install_result="$install_result, loaded"
+      fleet_schedule_job_state "$install_mode" >/dev/null
     fi
     printf 'fleet-%s: %s %s\n' "$install_mode" "$install_result" "$install_plist"
+  done
+  # Absorb, never duplicate (fleet-update): only now, with the new pair in
+  # place. Renamed, not deleted, so the superseded job can be restored.
+  fleet_schedule_legacy_plists | while IFS= read -r install_legacy; do
+    [ "$install_has_domain" != true ] ||
+      launchctl bootout "$install_domain/$(basename "$install_legacy" .plist)" \
+        >/dev/null 2>&1 || :
+    mv -f "$install_legacy" "$install_legacy.absorbed" &&
+      printf 'roundhouse: absorbed the superseded %s entry (kept as %s.absorbed)\n' \
+        "$(basename "$install_legacy" .plist)" "$install_legacy"
   done
   return "$install_rc"
 }
@@ -445,7 +498,7 @@ fleet_schedule_install_launchd() {
 fleet_schedule_install_systemd() {
   install_dir=$(fleet_schedule_unit_dir)
   install_changed=false
-  for install_mode in fast full; do
+  for install_mode in $fleet_schedule_modes; do
     install_unit=$(fleet_schedule_unit "$install_mode")
     fleet_schedule_service_render "$install_mode" >"$install_tmp/$install_unit.service"
     fleet_schedule_timer_render "$install_mode" >"$install_tmp/$install_unit.timer"
@@ -466,39 +519,38 @@ fleet_schedule_install_systemd() {
     return 75
   }
   [ "$install_changed" != true ] || systemctl --user daemon-reload >/dev/null 2>&1 || :
-  for install_mode in fast full; do
+  for install_mode in $fleet_schedule_modes; do
     install_timer="$(fleet_schedule_unit "$install_mode").timer"
-    case $(fleet_schedule_job_state "$install_mode") in
-      loaded)
-        [ "$install_changed" != true ] ||
-          systemctl --user restart "$install_timer" >/dev/null 2>&1 || :
-        ;;
-      *)
-        # The ONE place a disabled timer is re-enabled: the operator asked.
-        systemctl --user enable --now "$install_timer" >/dev/null 2>&1 || {
-          printf 'roundhouse: systemctl --user enable --now %s failed\n' "$install_timer" >&2
-          return 70
-        }
-        printf 'fleet-%s: enabled and started %s\n' "$install_mode" "$install_timer"
-        ;;
-    esac
+    if [ "$(systemctl --user is-enabled "$install_timer" 2>/dev/null || :)" = enabled ] &&
+      systemctl --user is-active --quiet "$install_timer" 2>/dev/null; then
+      [ "$install_changed" != true ] ||
+        systemctl --user restart "$install_timer" >/dev/null 2>&1 || :
+    else
+      # The ONE place a disabled timer is re-enabled: the operator asked.
+      systemctl --user enable --now "$install_timer" >/dev/null 2>&1 || {
+        printf 'roundhouse: systemctl --user enable --now %s failed\n' "$install_timer" >&2
+        return 70
+      }
+      printf 'fleet-%s: enabled and started %s\n' "$install_mode" "$install_timer"
+    fi
+    fleet_schedule_job_state "$install_mode" >/dev/null
   done
+  fleet_schedule_lingers || {
+    printf 'roundhouse: the timers are enabled, but this user manager does not linger, so they stop with the last login session and triggers fall back to a detached pass; run `loginctl enable-linger %s`\n' \
+      "$(id -un)" >&2
+    return 75
+  }
 }
 
 fleet_schedule_status() {
   # One line per job: installed or missing, enabled or disabled, loaded or
   # not, and whether the definition on disk is the one `install` writes.
   status_dir=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-schedule.XXXXXX") || return 1
-  for status_mode in fast full; do
+  for status_mode in $fleet_schedule_modes; do
+    status_path=$(fleet_schedule_def_path "$status_mode")
     case $(fleet_schedule_platform) in
-      launchd)
-        status_path=$(fleet_schedule_plist "$status_mode")
-        fleet_schedule_plist_render "$status_mode" >"$status_dir/def"
-        ;;
-      *)
-        status_path="$(fleet_schedule_unit_dir)/$(fleet_schedule_unit "$status_mode").timer"
-        fleet_schedule_timer_render "$status_mode" >"$status_dir/def"
-        ;;
+      launchd) fleet_schedule_plist_render "$status_mode" >"$status_dir/def" ;;
+      *) fleet_schedule_timer_render "$status_mode" >"$status_dir/def" ;;
     esac
     status_def=
     if [ -f "$status_path" ]; then
@@ -513,48 +565,50 @@ fleet_schedule_status() {
       disabled) status_text='installed, disabled' ;;
       unloaded) status_text='installed, enabled, not loaded' ;;
       loaded) status_text='installed, enabled, loaded' ;;
-      *) status_text='installed, state unknown (no GUI domain or user manager to ask)' ;;
+      *)
+        status_last=$(fleet_schedule_last_state "$status_mode")
+        status_text="installed, scheduler unreachable (no GUI domain, or no lingering user manager); last seen ${status_last:-never}"
+        ;;
     esac
     printf 'fleet-%s: %s%s — %s\n' "$status_mode" "$status_text" "$status_def" "$status_path"
   done
+  [ ! -e "$(fleet_schedule_optout_path)" ] ||
+    printf 'this host is opted out of scheduling (fleet-schedule uninstall); triggers only stamp\n'
   rm -rf "$status_dir"
 }
 
 fleet_schedule_uninstall() {
-  case $(fleet_schedule_platform) in
-    launchd)
-      uninstall_domain=$(fleet_schedule_gui_domain)
-      for uninstall_mode in fast full; do
-        uninstall_plist=$(fleet_schedule_plist "$uninstall_mode")
-        launchctl bootout "$uninstall_domain/$(fleet_schedule_label "$uninstall_mode")" \
+  for uninstall_mode in $fleet_schedule_modes; do
+    uninstall_def=$(fleet_schedule_def_path "$uninstall_mode")
+    case $(fleet_schedule_platform) in
+      launchd)
+        launchctl bootout "$(fleet_schedule_gui_domain)/$(fleet_schedule_label "$uninstall_mode")" \
           >/dev/null 2>&1 || :
-        if [ -f "$uninstall_plist" ]; then
-          rm -f "$uninstall_plist"
-          printf 'fleet-%s: removed %s\n' "$uninstall_mode" "$uninstall_plist"
-        else
-          printf 'fleet-%s: not installed\n' "$uninstall_mode"
-        fi
-      done
-      ;;
-    systemd)
-      uninstall_dir=$(fleet_schedule_unit_dir)
-      for uninstall_mode in fast full; do
-        uninstall_unit=$(fleet_schedule_unit "$uninstall_mode")
+        uninstall_files=$uninstall_def
+        ;;
+      systemd)
         ! fleet_schedule_user_manager ||
-          systemctl --user disable --now "$uninstall_unit.timer" >/dev/null 2>&1 || :
-        if [ -f "$uninstall_dir/$uninstall_unit.timer" ] ||
-          [ -f "$uninstall_dir/$uninstall_unit.service" ]; then
-          rm -f "$uninstall_dir/$uninstall_unit.timer" "$uninstall_dir/$uninstall_unit.service"
-          printf 'fleet-%s: removed %s/%s.timer and .service\n' "$uninstall_mode" \
-            "$uninstall_dir" "$uninstall_unit"
-        else
-          printf 'fleet-%s: not installed\n' "$uninstall_mode"
-        fi
-      done
-      ! fleet_schedule_user_manager || systemctl --user daemon-reload >/dev/null 2>&1 || :
-      ;;
-  esac
-  rm -f "$(fleet_schedule_marker)"
+          systemctl --user disable --now "$(fleet_schedule_unit "$uninstall_mode").timer" \
+            >/dev/null 2>&1 || :
+        uninstall_files="$uninstall_def ${uninstall_def%.timer}.service"
+        ;;
+    esac
+    uninstall_any=false
+    for uninstall_file in $uninstall_files; do
+      [ -f "$uninstall_file" ] || continue
+      rm -f "$uninstall_file"
+      uninstall_any=true
+      printf 'fleet-%s: removed %s\n' "$uninstall_mode" "$uninstall_file"
+    done
+    [ "$uninstall_any" = true ] || printf 'fleet-%s: not installed\n' "$uninstall_mode"
+  done
+  [ "$(fleet_schedule_platform)" != systemd ] || ! fleet_schedule_user_manager ||
+    systemctl --user daemon-reload >/dev/null 2>&1 || :
+  rm -f "$(fleet_schedule_marker)" "$(fleet_schedule_state_path)"
+  # The opt-out: from here on a trigger stamps and starts nothing, and a pass
+  # raises no schedule alert, until `install` is run again.
+  mkdir -p "$(dirname "$(fleet_schedule_optout_path)")"
+  printf 'uninstalled_at: %s\n' "$(fleet_now)" >"$(fleet_schedule_optout_path)"
 }
 
 fleet_schedule_command() (
@@ -590,18 +644,22 @@ fleet_schedule_command() (
     exit 64
   }
   case $1 in
-    status)
-      fleet_schedule_status
-      ;;
-    uninstall)
-      fleet_schedule_uninstall
-      ;;
+    status) fleet_schedule_status ;;
+    uninstall) fleet_schedule_uninstall ;;
     install)
       [ -x "$HOME/.local/bin/roundhouse" ] || {
         printf 'roundhouse: %s is not installed; run `roundhouse launcher-install` first — the scheduled jobs run that shim\n' \
           "$HOME/.local/bin/roundhouse" >&2
         exit 69
       }
+      # A superseded job that WORKS is not retired for a pair that would only
+      # fail: the new jobs converge the fleet store, so it must be enrolled.
+      if [ -n "$(fleet_schedule_legacy_plists)" ] &&
+        ! fleet_vcs_store_ready "$(fleet_store_path)" >/dev/null 2>&1; then
+        printf 'roundhouse: a superseded scheduler entry is still installed (%s) and this host has no enrolled fleet store for the new jobs to converge; enroll it (roundhouse fleet-init / fleet-enroll), then re-run install. Nothing was changed.\n' \
+          "$(fleet_schedule_legacy_plists | tr '\n' ' ')" >&2
+        exit 69
+      fi
       install_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-schedule.XXXXXX") || exit 73
       trap 'rm -rf "$install_tmp"' EXIT HUP INT TERM
       install_status=0
@@ -614,9 +672,10 @@ fleet_schedule_command() (
           mkdir -p "$(dirname "$(fleet_schedule_marker)")"
           printf 'platform: %s\ninstalled_at: %s\n' "$(fleet_schedule_platform)" \
             "$(fleet_now)" >"$(fleet_schedule_marker)"
+          rm -f "$(fleet_schedule_optout_path)"
           # A fresh install clears what the pass remembered alerting on, so a
           # job that is disabled again later is alerted afresh.
-          rm -f "$(fleet_instance_path store.run)/schedule-alerted"
+          rm -f "$(fleet_run_state_dir)/schedule-alerted"
           ;;
       esac
       exit "$install_status"
@@ -634,18 +693,20 @@ fleet_schedule_check() {
   #
   # "Missing" needs evidence the host is meant to be scheduled — the install
   # marker, or the other job still present — so a host whose operator never
-  # scheduled it raises nothing. A loaded-but-idle or unknown state is not an
-  # alert either: no GUI domain over SSH is the ordinary state of a pass the
-  # nudge started.
+  # scheduled it, or opted it out, raises nothing. A loaded-but-idle or
+  # unreachable state is not an alert either: no GUI domain over SSH is the
+  # ordinary state of a pass a trigger started.
   #
   # One alert per state change: store.run/schedule-alerted remembers what was
   # already raised, so a disabled job is one record and not one per pass.
-  check_memo=$(fleet_instance_path store.run)/schedule-alerted
+  case $(fleet_schedule_platform) in launchd | systemd) ;; *) return 0 ;; esac
+  [ ! -e "$(fleet_schedule_optout_path)" ] || return 0
+  check_memo=$(fleet_run_state_dir)/schedule-alerted
   check_fast=$(fleet_schedule_job_state fast)
   check_full=$(fleet_schedule_job_state full)
   mkdir -p "$(dirname "$check_memo")" || return 0
   : >"$check_memo.next"
-  for check_mode in fast full; do
+  for check_mode in $fleet_schedule_modes; do
     if [ "$check_mode" = fast ]; then
       check_state=$check_fast
       check_other=$check_full
