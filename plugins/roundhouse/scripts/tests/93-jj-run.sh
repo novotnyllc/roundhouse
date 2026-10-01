@@ -552,13 +552,13 @@ YAML
     # Refused while the working copy carries an edit that is not a record.
     printf '# an unpublished layer edit\n' >>"$vireo/fleet.yaml"
     runjj_status=0
-    runjj_out=$(runjj vireo "$cli" fleet-alerts-compact 2>&1) || runjj_status=$?
+    runjj_out=$(runjj vireo "$cli" fleet-compact-alerts 2>&1) || runjj_status=$?
     [ "$runjj_status" -eq 65 ] ||
       fail "compaction published over an operator's unpublished layer edit (got $runjj_status): $runjj_out"
     runjj vireo "$cli" fleet-run --fast >/dev/null ||
       fail "vireo could not publish the pending layer edit"
-    runjj_out=$(runjj vireo "$cli" fleet-alerts-compact) ||
-      fail "fleet-alerts-compact failed: $runjj_out"
+    runjj_out=$(runjj vireo "$cli" fleet-compact-alerts) ||
+      fail "fleet-compact-alerts failed: $runjj_out"
     case $runjj_out in
       *'published the compaction'*) ;;
       *) fail "the compaction did not publish: $runjj_out" ;;
@@ -573,7 +573,7 @@ YAML
       fail "the compaction did not leave one keyed file per (kind, item)"
     [ -z "$(jj -R "$vireo" log -r @ --no-graph -T 'if(empty,"","dirty")')" ] ||
       fail "the compaction did not leave @ an empty child of main"
-    runjj_out=$(runjj vireo "$cli" fleet-alerts-compact) ||
+    runjj_out=$(runjj vireo "$cli" fleet-compact-alerts) ||
       fail "a second compaction failed: $runjj_out"
     case $runjj_out in
       *'nothing to publish'*) ;;

@@ -1691,7 +1691,7 @@ printf 'verbs: the supervised item-level surface\n'
   set -eu
   for verb_name in fleet-review fleet-apply fleet-accept fleet-hold \
     fleet-pending fleet-journal fleet-finding fleet-lock fleet-unlock \
-    fleet-set-remote fleet-alerts-compact fleet-disown; do
+    fleet-set-remote fleet-compact-alerts fleet-disown; do
     grep -Fq "  roundhouse $verb_name" "$cli" ||
       fail "$verb_name is missing from the usage heredoc"
     grep -Eq "^  $verb_name\)" "$cli" ||
@@ -1701,7 +1701,7 @@ printf 'verbs: the supervised item-level surface\n'
   # malformed invocation can never reach a store at all.
   for verb_bad in 'fleet-review one two' 'fleet-apply' 'fleet-apply a b' \
     'fleet-accept' 'fleet-hold only' 'fleet-pending extra' 'fleet-lock extra' \
-    'fleet-set-remote' 'fleet-finding one' 'fleet-alerts-compact extra' \
+    'fleet-set-remote' 'fleet-finding one' 'fleet-compact-alerts extra' \
     'fleet-disown' 'fleet-disown --dry-run' 'fleet-disown --bogus x' \
     'fleet-unlock --force extra'; do
     verb_status=0

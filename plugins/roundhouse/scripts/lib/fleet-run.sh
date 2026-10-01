@@ -4059,8 +4059,8 @@ fleet_run_verb_begin() {
   }
 }
 
-fleet_alerts_compact_command() (
-  # `roundhouse fleet-alerts-compact` — §6.4's one-time collapse of THIS host's
+fleet_compact_alerts_command() (
+  # `roundhouse fleet-compact-alerts` — §6.4's one-time collapse of THIS host's
   # stamped alert files (alerts/<this host>/ only) to one keyed file per
   # (kind, item), keeping the latest record each key wrote. It PUBLISHES, through
   # the same fleet_run_publish/fleet_vcs_publish path the run uses (first-push
@@ -4073,10 +4073,10 @@ fleet_alerts_compact_command() (
   require_yq
   compact_store=$(fleet_store_path)
   compact_host=$(fleet_host_name)
-  fleet_run_verb_begin "$compact_store" "$compact_host" fleet-alerts-compact ||
+  fleet_run_verb_begin "$compact_store" "$compact_host" fleet-compact-alerts ||
     exit $?
   compact_lock=$(fleet_lock_path)
-  compact_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-alerts-compact.XXXXXX")
+  compact_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-compact-alerts.XXXXXX")
   trap 'fleet_lock_release "$compact_lock" "$fleet_run_verb_nonce"; rm -rf "$compact_tmp"' \
     EXIT HUP INT TERM
   compact_counts=$(fleet_alerts_compact "$compact_store" "$compact_host" \
@@ -4123,7 +4123,7 @@ fleet_disown_command() (
   # `--host-only` selects every owned item that only this host's own layer
   # asks for (fleet_disown_host_only). `--dry-run` prints the selection and
   # changes nothing. A real disown takes the run lock and publishes, like
-  # fleet-alerts-compact.
+  # fleet-compact-alerts.
   fleet_run_env
   require_jq
   require_yq

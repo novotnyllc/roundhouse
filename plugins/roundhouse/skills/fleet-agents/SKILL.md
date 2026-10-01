@@ -134,10 +134,14 @@ Two rules make this surface safe, and neither is a formality:
 Verdicts are **host-local** (`store.run/verdicts/`) and never replicated: a
 fleet-writable verdict would put a consent-shaped artifact on a shared surface.
 Alerts have no state machine — resolving one is `rm` on the file. An alert is
-**keyed, not stamped**: one file per (kind, item) at
-`alerts/<host>/<kind>--<item>.yaml` (`<kind>.yaml` when it names no item), whose
-`at` is when it was first seen. A condition that is still true on the next pass
-rewrites nothing; only a change in what the alert says rewrites it.
+**keyed, not stamped**: one file per key at `alerts/<host>/<kind>--<key>.yaml`,
+where the key is the alert's items joined by commas, or its slug when it names
+no item; `<kind>.yaml` when that slug is the kind itself. Both parts are
+URI-encoded, so an item such as `config_files.~/.claude/settings.json` stays one
+path component (`config_files.~%2F.claude%2Fsettings.json`). The alert's `at`
+is when it was **first seen**: a condition that is still true on the next pass
+rewrites nothing, a change in what the alert says rewrites it with the same
+`at`, and keyed alerts never age out — only `rm` resolves them.
 
 ### Record maintenance and ownership
 
@@ -148,16 +152,18 @@ this host's own records, and commits through the same publish path the run
 uses (first-push gate, redaction sweep, conflict guards).
 
 ```text
-roundhouse fleet-alerts-compact          # one-time: this host's stamped alerts -> one keyed file per alert
+roundhouse fleet-compact-alerts          # one-time: this host's stamped alerts -> one keyed file per alert
 roundhouse fleet-disown [--dry-run] [--host-only] [ITEM...]
                                          # stop managing items without uninstalling them
 ```
 
-`fleet-alerts-compact` collapses the stamped alert files an older build wrote
+`fleet-compact-alerts` collapses the stamped alert files an older build wrote
 (`alerts/<this host>/<stamp>-<slug>.yaml`) to the keyed form, keeping the latest
-record per key. It touches only this host's own directory, leaves any file it
-cannot parse where it is, reads in batches (it is built for tens of thousands of
-files), and is idempotent — a second run finds nothing to do.
+record per key. **Run it once on each host** after that host has this build:
+it touches only its own host's directory (a host may not write another's
+`alerts/`), leaves any file it cannot parse where it is, reads in batches (it is
+built for tens of thousands of files), and is idempotent — a second run finds
+nothing to do.
 
 `fleet-disown` removes items from `applied/<this host>.yaml` **without
 uninstalling them** and journals each one `disowned` — not `reverted`, because
