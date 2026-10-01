@@ -308,16 +308,69 @@ fleet_lock_identity() {
   printf '%s\n' "$lock_identity"
 }
 
+fleet_lock_transition_enter() {
+  # `fleet_lock_transition_enter LOCK_DIR` — the one short mutex every lock
+  # TRANSITION runs under: a takeover's verify-then-rename (and its put-back)
+  # and a release's verify-then-remove. Without it two transitions interleave
+  # between a verify and the rename or removal it decided — a takeover could
+  # move the lock a racing takeover had just made live. Plain acquisition (the
+  # `mkdir` of the lock itself) never takes it. A `mkdir` of `LOCK_DIR.t`,
+  # retried for up to ~10s; one older than a minute belongs to a transition
+  # that crashed mid-way, and is broken — moved aside and re-checked first,
+  # so a mutex that went live meanwhile is put back, not broken. Exit 1 when it
+  # cannot be had. Every caller leaves it on every path
+  # (fleet_lock_transition_leave); its whole span is a handful of renames.
+  lock_t="$1.t"
+  lock_t_tries=0
+  while ! mkdir "$lock_t" 2>/dev/null; do
+    if [ -n "$(find "$lock_t" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+      lock_t_aside="$lock_t.broken.$$"
+      if mv "$lock_t" "$lock_t_aside" 2>/dev/null; then
+        if [ -n "$(find "$lock_t_aside" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+          rmdir "$lock_t_aside" 2>/dev/null || rm -rf "$lock_t_aside"
+        else
+          [ -e "$lock_t" ] || mv "$lock_t_aside" "$lock_t" 2>/dev/null || :
+          rm -rf "$lock_t_aside" 2>/dev/null || :
+        fi
+      fi
+      continue
+    fi
+    lock_t_tries=$((lock_t_tries + 1))
+    [ "$lock_t_tries" -lt 100 ] || return 1
+    sleep 0.1
+  done
+}
+
+fleet_lock_transition_leave() {
+  rmdir "$1.t" 2>/dev/null || :
+}
+
+fleet_lock_transition_test_pause() {
+  # Test-only, inert outside the self-check: holds a transition open so a
+  # racing one can be shown to wait for it.
+  if [ "${ROUNDHOUSE_SELFTEST:-0}" = 1 ] && [ -n "${ROUNDHOUSE_TEST_LOCK_TRANSITION_PAUSE:-}" ]; then
+    sleep "$ROUNDHOUSE_TEST_LOCK_TRANSITION_PAUSE"
+  fi
+}
+
 fleet_lock_release() {
   # `fleet_lock_release LOCK_DIR IDENTITY` — remove the lock ONLY when it still
   # carries IDENTITY (fleet_lock_identity: this acquisition's nonce, or a
   # pre-nonce lock's pid and stamp as `fleet-unlock` read them). A run that was
   # judged dead and taken over must not, when it finally exits, delete the live
-  # successor's lock by path. Exit 1 when the lock is not the one named.
+  # successor's lock by path. The verify and the removal are one transition
+  # (fleet_lock_transition_enter). Exit 1 when the lock is not the one named,
+  # or the transition mutex cannot be had (the lock then stays, and a later
+  # run judges its holder).
   [ -n "${2:-}" ] || return 1
-  [ "$(fleet_lock_identity "$1")" = "$2" ] || return 1
+  fleet_lock_transition_enter "$1" || return 1
+  if [ "$(fleet_lock_identity "$1")" != "$2" ]; then
+    fleet_lock_transition_leave "$1"
+    return 1
+  fi
   rm -f "$1/meta.json"
   rmdir "$1" 2>/dev/null || :
+  fleet_lock_transition_leave "$1"
 }
 
 fleet_lock_holder_state() {
@@ -394,21 +447,36 @@ fleet_lock_takeover() {
   # takeover was refused or lost a race.
   fleet_lock_dead_meta=
   [ -n "${2:-}" ] || return 1
+  # One transition (fleet_lock_transition_enter), and the identity is
+  # re-verified INSIDE it before anything moves: a lock a racing takeover has
+  # already made live is never renamed at all.
+  fleet_lock_transition_enter "$1" || return 1
+  if [ "$(fleet_lock_identity "$1")" != "$2" ]; then
+    fleet_lock_transition_leave "$1"
+    return 1
+  fi
   lock_aside="$1.dead.$(fleet_lock_nonce)"
-  mv "$1" "$lock_aside" 2>/dev/null || return 1
+  mv "$1" "$lock_aside" 2>/dev/null || {
+    fleet_lock_transition_leave "$1"
+    return 1
+  }
   if [ "$(fleet_lock_identity "$lock_aside")" != "$2" ]; then
     # Never `mv` onto an existing directory: that would nest the lock inside
     # whatever now holds the path. If the path was taken meanwhile, the moved
     # lock stays aside and its owner's nonce release simply finds nothing.
     [ -e "$1" ] || mv "$lock_aside" "$1" 2>/dev/null || :
+    fleet_lock_transition_leave "$1"
     return 1
   fi
   lock_dead_meta=$(jq -c '.' "$lock_aside/meta.json" 2>/dev/null || printf '{}')
   fleet_lock_acquire "$1" "${3:-$$}" || {
     rm -rf "$lock_aside"
+    fleet_lock_transition_leave "$1"
     return 1
   }
   rm -rf "$lock_aside"
+  fleet_lock_transition_test_pause
+  fleet_lock_transition_leave "$1"
   fleet_lock_dead_meta=$lock_dead_meta
 }
 

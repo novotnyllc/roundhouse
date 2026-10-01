@@ -224,6 +224,45 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$(fleet_lock_meta_field "$verb_lock" nonce)" = "$verb_racer" ] ||
       fail "a refused takeover did not put the racing run's lock back"
     fleet_lock_release "$verb_lock" "$verb_racer"
+    # LOCK TRANSITIONS ARE SERIALIZED (fleet_lock_transition_enter): a takeover
+    # holds the transition mutex until its new lock is in place, so a racing
+    # takeover of the SAME dead holder waits for it, then finds a lock it never
+    # judged and leaves it alone — it never renames the live lock aside.
+    mkdir -p "$verb_lock"
+    printf '{"host":"vireo","pid":%s,"started_at":"2000-01-01T00:00:00Z"}\n' \
+      "$verb_holder" >"$verb_lock/meta.json"
+    verb_dead_id=$(fleet_lock_identity "$verb_lock")
+    (ROUNDHOUSE_TEST_LOCK_TRANSITION_PAUSE=2 fleet_lock_takeover "$verb_lock" "$verb_dead_id") &
+    verb_first=$!
+    for verb_n in $(seq 1 50); do
+      [ ! -d "$verb_lock.t" ] || break
+      sleep 0.1
+    done
+    [ -d "$verb_lock.t" ] || fail "the first takeover never entered its transition"
+    verb_wait_start=$(date +%s)
+    ! fleet_lock_takeover "$verb_lock" "$verb_dead_id" ||
+      fail "two takeovers of one dead holder both succeeded"
+    verb_waited=$(($(date +%s) - verb_wait_start))
+    wait "$verb_first" || fail "the first takeover of a dead holder failed"
+    [ "$verb_waited" -ge 1 ] ||
+      fail "a racing takeover did not wait for the transition in progress"
+    verb_live_id=$(fleet_lock_identity "$verb_lock")
+    [ -n "$verb_live_id" ] && [ "$verb_live_id" != "$verb_dead_id" ] &&
+      [ ! -e "$verb_lock.t" ] &&
+      [ -z "$(find "$(dirname "$verb_lock")" -maxdepth 1 -name "$(basename "$verb_lock").dead.*")" ] ||
+      fail "a racing takeover disturbed the lock the first one made live"
+    fleet_lock_release "$verb_lock" "$verb_live_id" ||
+      fail "the live lock could not be released after the race"
+    # A transition mutex a crashed transition left behind is broken once it is
+    # older than a minute, so it can never wedge release or takeover.
+    fleet_lock_acquire "$verb_lock"
+    verb_racer=$fleet_lock_nonce_held
+    mkdir "$verb_lock.t"
+    touch -t 200001010000 "$verb_lock.t"
+    fleet_lock_release "$verb_lock" "$verb_racer" ||
+      fail "a stale transition mutex blocked the release"
+    [ ! -d "$verb_lock" ] && [ ! -e "$verb_lock.t" ] ||
+      fail "a release behind a stale transition mutex left the lock or the mutex"
     # A PRE-NONCE lock left by a dead run — the wedge itself — is recovered too:
     # its pid and start stamp are the identity the takeover binds to.
     mkdir -p "$verb_lock"
