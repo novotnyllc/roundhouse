@@ -150,7 +150,7 @@ from one table (`fleet_alert_lifecycle_rows` in `lib/fleet-alerts.sh`):
 
 | Lifecycle | Scope | Kinds | Ends |
 | --- | --- | --- | --- |
-| condition | store | `removal-cap`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render` | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
+| condition | store | `removal-cap`, `integrity-store-wide`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render` | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
 | condition | item | `integrity`, `config-key-collision`, `chezmoi-coownership`, `package-hold`, `enabled-but-untrusted`, `record-write`, `identity-unavailable`, `uninstall-deferred` | the end-of-pass sweep (`fleet_alert_sweep`) clears it when the pass **checked** the item and did not raise it, or when the item has left the fold; an item the pass skipped (held, waiting on its canary) keeps it; never ages |
 | event | store or item | `stale-host`, `schedule-disabled`, `schedule-missing`, `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by its latest `at` after the evidence retention window |
 

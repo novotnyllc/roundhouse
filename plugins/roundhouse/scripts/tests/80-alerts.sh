@@ -85,6 +85,10 @@ if [ -n "$fleet_fixture_yq" ]; then
       *' integrity '*' package-hold '*) ;;
       *) fail "the item-scoped condition kinds are wrong: $rec_item_kinds" ;;
     esac
+    case " $(fleet_alert_condition_kinds store | tr '\n' ' ')" in
+      *' integrity-store-wide '*) ;;
+      *) fail "the store-wide integrity hold is not a store-scoped condition" ;;
+    esac
     case " $rec_item_kinds" in
       *' removal-cap '* | *' canary-override '*)
         fail "a store-scoped or event kind is swept per item: $rec_item_kinds" ;;

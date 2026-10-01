@@ -1820,13 +1820,17 @@ fleet_run_command() (
   # be trusted, so they take the same branch materialization drift takes.
   run_full_hold=$(awk '$1 == "!hold" { $1 = ""; sub(/^ /, ""); print; exit }' \
     "$run_tmp/sigholds")
+  # The store-wide hold has a kind of its own; this clears the key older
+  # passes and fleet-compact-alerts gave it under the per-item `integrity`
+  # kind, which nothing else would ever clear or age.
+  fleet_alert_clear "$run_store" "$run_host" integrity integrity-store-wide
   if [ -n "$run_full_hold" ]; then
-    fleet_alert_set "$run_store" "$run_host" integrity integrity-store-wide true \
+    fleet_alert_set "$run_store" "$run_host" integrity-store-wide integrity-store-wide true \
       "$(printf '%s' "$run_full_hold" | head -c 300)" || :
     printf 'roundhouse: %s; holding everything (§7.7/§7.12.5)\n' "$run_full_hold" >&2
     exit 65
   fi
-  fleet_alert_set "$run_store" "$run_host" integrity integrity-store-wide false ''
+  fleet_alert_set "$run_store" "$run_host" integrity-store-wide integrity-store-wide false ''
 
   # §7.9: install the roster the ratchet derived, and compare what is already
   # installed against it. The compare is nearly free and fails in a DIFFERENT

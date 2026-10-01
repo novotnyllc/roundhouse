@@ -56,6 +56,7 @@ layer-parse            condition  store
 unknown-category       condition  store
 unknown-store-dir      condition  store
 ssh-render             condition  store
+integrity-store-wide   condition  store
 integrity              condition  item
 config-key-collision   condition  item
 chezmoi-coownership    condition  item
