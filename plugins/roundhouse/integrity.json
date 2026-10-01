@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "885bc9010fe5910da33ce364342ff131680aa8675d17d7a479c21f91741251e4"
+      "sha256": "11345c2dcfadb0f84ec77d617260a48ada2a274016a310e3bbce762d964d3c95"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "79fa2171cce6f15255e6b2e1df96155b055e13064e7d139934b6075bb1e7abfc"
+      "sha256": "6d097ecd1be9bed86bc84ba565887d10a86b92e00a105438cf3961ab1fd2a388"
     },
     {
       "path": "assets/icon.png",
@@ -22,7 +22,7 @@
     },
     {
       "path": "references/codex-remote-control.md",
-      "sha256": "c7af46481881905567d1b2d511de0e184c60168c6ee323c8207d8d1733972777"
+      "sha256": "07626ebcfd1bfe5d82517c70d8e32a1983ae6f0409d9562da0a2104fe5f7222a"
     },
     {
       "path": "references/privilege-policy.default",
@@ -42,7 +42,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "b1b72336151bd41d521d7c5b46d5389ef478e661b48e08364b80cdd844ad87ba"
+      "sha256": "cd06e3f70770b046ef984b8dd9f9c8c5b1be64a96de875010d8bda936e0880de"
     },
     {
       "path": "scripts/certify-ssh-node",
@@ -90,7 +90,7 @@
     },
     {
       "path": "scripts/interop-windows.ps1",
-      "sha256": "017b6fbd3e353657d5f960cca06dd65793e3d7a5a6d696a1af5ef7f71ebbf89d"
+      "sha256": "7049c103a64c5ca9baf944a54a4ed619bae57a1bac78c5b96e022949fe63d0a1"
     },
     {
       "path": "scripts/launcher-install",
@@ -321,5 +321,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.29"
+  "version": "0.9.30"
 }
