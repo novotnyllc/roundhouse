@@ -356,6 +356,21 @@ YAML
       fail "the peer fixture is not the original"
     [ "$(yq -r 'length' "$rec_jage/journal/wren/2001-01-01.yaml")" -eq 3 ] ||
       fail "aging touched another host's journal"
+    # An unreadable day file stops journal aging outright: the load-bearing
+    # set is decided over the whole history, so nothing is aged while any
+    # part of it is unreadable.
+    cat >"$rec_jage/journal/vireo/2001-01-05.yaml" <<'YAML'
+- {item: plugins.t, digest: t1, outcome: applied, at: "2001-01-05T00:00:00Z"}
+YAML
+    printf -- '- {item: plugins.t, outcome: held, at: "2001-01-06T00:00:00Z"\n' \
+      >"$rec_jage/journal/vireo/2001-01-06.yaml"
+    rec_jbad_before=$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)
+    if fleet_records_age "$rec_jage" vireo 90 >/dev/null 2>&1; then
+      fail "journal aging proceeded over an unreadable day file"
+    fi
+    [ "$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)" = "$rec_jbad_before" ] ||
+      fail "journal aging changed the journal while a day file was unreadable"
+    rm -f "$rec_jage/journal/vireo/2001-01-05.yaml" "$rec_jage/journal/vireo/2001-01-06.yaml"
     # Efficiency is structural: batched reads, one plan.
     cli_function_body fleet_records_age | grep -q 'fleet_records_read_dir' ||
       fail "evidence aging no longer reads its directories in batches"

@@ -114,5 +114,14 @@ EOF
     [ "$(fleet_disown_host_only "$verb_store" vireo | tr '\n' ' ')" = \
       'plugins.gone-everywhere plugins.snapshot-only ' ] ||
       fail "an item a shared layer also asks for was selected as host-only"
+    # A host file that cannot be read must abort the selection: an empty
+    # shared fold would make every owned item look host-only.
+    cp "$verb_store/hosts/vireo.yaml" "$verb_store/hosts/vireo.yaml.good"
+    printf 'platform: [unterminated\n' >"$verb_store/hosts/vireo.yaml"
+    if verb_bad=$(fleet_disown_host_only "$verb_store" vireo 2>/dev/null); then
+      fail "a malformed host file still produced a host-only selection"
+    fi
+    [ -z "$verb_bad" ] || fail "a malformed host file selected: $verb_bad"
+    mv "$verb_store/hosts/vireo.yaml.good" "$verb_store/hosts/vireo.yaml"
   )
 fi

@@ -151,13 +151,18 @@ fleet_disown_shared_fold() (
   # own layer (often a machine snapshot) asked for it — the set `fleet-disown
   # --host-only` selects. The host file is still READ, because its facts pick
   # the os/ and groups/ tiers.
+  # FAILS when the host's layer list cannot be resolved (a malformed host
+  # file): an empty fold here would make every owned item look host-only.
+  shared_layers=$(fleet_layer_files "$1" "$2") || exit 65
+  shared_layers=$(printf '%s\n' "$shared_layers" |
+    awk -v flat="$1/hosts/$2.yaml" -v dir="$1/hosts/$2/" \
+      '$0 != flat && index($0, dir) != 1')
+  [ -n "$shared_layers" ] || exit 65
   IFS='
 '
   set -f
-  # shellcheck disable=SC2046 # deliberate word splitting over the file list
-  fleet_fold_files $(fleet_layer_files "$1" "$2" |
-    awk -v flat="$1/hosts/$2.yaml" -v dir="$1/hosts/$2/" \
-      '$0 != flat && index($0, dir) != 1')
+  # shellcheck disable=SC2086 # deliberate word splitting over the file list
+  fleet_fold_files $shared_layers
 )
 
 fleet_disown_host_only() {
@@ -165,11 +170,18 @@ fleet_disown_host_only() {
   # nothing but HOST's own layer asks for: applied, and absent from the item
   # universe of the fold without the host tier (definitions items included,
   # since they come from no host layer at all). One per line, sorted.
-  LC_ALL=C comm -23 \
-    <(fleet_record_read "$(fleet_applied_path "$1" "$2")" '{}' |
-      jq -r '(.items // {}) | keys[]' | LC_ALL=C sort -u) \
-    <(fleet_run_item_digests "$(fleet_disown_shared_fold "$1" "$2")" "$1" |
-      awk '{ print $1 }' | LC_ALL=C sort -u)
+  # Each input is resolved FIRST, so a failure aborts the selection instead
+  # of being masked inside a process substitution.
+  host_only_fold=$(fleet_disown_shared_fold "$1" "$2") || {
+    printf 'roundhouse: fleet-disown --host-only cannot resolve the layers for %s; nothing selected\n' "$2" >&2
+    return 65
+  }
+  host_only_owned=$(fleet_record_read "$(fleet_applied_path "$1" "$2")" '{}' |
+    jq -r '(.items // {}) | keys[]' | LC_ALL=C sort -u) || return 65
+  host_only_wanted=$(fleet_run_item_digests "$host_only_fold" "$1" |
+    awk '{ print $1 }' | LC_ALL=C sort -u) || return 65
+  LC_ALL=C comm -23 <(printf '%s\n' "$host_only_owned" | sed '/^$/d') \
+    <(printf '%s\n' "$host_only_wanted" | sed '/^$/d')
 }
 
 fleet_disown_command() (
@@ -228,7 +240,7 @@ fleet_disown_command() (
     printf '%s' "$disown_named"
     [ "$disown_host_only" != true ] ||
       fleet_disown_host_only "$disown_store" "$disown_host"
-  )
+  ) || exit 65
   disown_selection=$(printf '%s\n' "$disown_selection" | grep . | LC_ALL=C sort -u || true)
   # A named item this host does not own has nothing to disown, and silently
   # skipping it would let a typo read as done.

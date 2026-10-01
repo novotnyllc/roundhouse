@@ -332,6 +332,12 @@ fleet_records_age() {
     fleet_records_read_dir "$age_store/journal/$age_host" "$age_work/journal" &&
       jq -s -r --arg cutoff "$age_cutoff" --arg recent "$age_recent" \
         "$fleet_journal_load_bearing_filter"'
+        # ANY unreadable day file stops journal aging outright: what is
+        # load-bearing is decided over the WHOLE history, and a withdrawal
+        # in a readable file is only safe to drop when the record it
+        # withdraws is visible too.
+        ([ .[] | select(.bad == true or (.rec | type) != "array") ] | length) as $bad |
+        if $bad > 0 then "X\tjournal\t\($bad)" else (
         [ .[] | select(.bad != true and (.rec | type) == "array") ] as $files |
         [ $files[] as $f | $f.rec | to_entries[] | {file: $f.file, i: .key, r: .value} ]
           as $all |
@@ -345,7 +351,7 @@ fleet_records_age() {
           if ($left | length) == ($mine | length) then empty
           elif ($left | length) == 0 then "D\t\($mine[0].file)"
           else "W\t\($mine[0].file)\t\($left | tojson)" end) | .[]),
-        "N\tjournal\t\($gone)\t\($all | length)"' "$age_work/journal" \
+        "N\tjournal\t\($gone)\t\($all | length)") end' "$age_work/journal" \
         >"$age_work/plan" &&
       fleet_records_read_dir "$age_store/alerts/$age_host" "$age_work/alerts" &&
       jq -s -r --arg cutoff "$age_cutoff" --arg stamped "$fleet_record_stamped_regex" \
@@ -370,6 +376,13 @@ fleet_records_age() {
   if [ "$age_rc" -ne 0 ]; then
     rm -rf "$age_work"
     printf 'roundhouse: evidence aging could not read its records; nothing aged\n' >&2
+    return 1
+  fi
+  if age_bad=$(awk -F'\t' '$1 == "X" { print $3; found = 1 } END { exit !found }' \
+    "$age_work/plan"); then
+    rm -rf "$age_work"
+    printf 'roundhouse: evidence aging found %s unreadable day file(s) in journal/%s; nothing aged until they are repaired\n' \
+      "$age_bad" "$age_host" >&2
     return 1
   fi
   age_summary=$(awk -F'\t' '
