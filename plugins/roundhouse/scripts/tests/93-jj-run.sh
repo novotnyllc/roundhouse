@@ -29,7 +29,10 @@ else
       printf 'FAIL: real-jj: %s\n' "$*" >&2
       exit 1
     }
-    PATH="$(dirname "$real_jj"):$(dirname "$real_yq"):$PATH"
+    # The ssh stub must still win when a real yq lives beside a real ssh
+    # (/usr/bin on Linux runners): a directory holding only the stub, first.
+    mkdir -p "$tmp/ssh-stub-only" && ln -sf "$tmp/bin/ssh" "$tmp/ssh-stub-only/ssh"
+    PATH="$tmp/ssh-stub-only:$(dirname "$real_jj"):$(dirname "$real_yq"):$PATH"
     export PATH
     # shellcheck source=/dev/null
     ROUNDHOUSE_LIB_ONLY=1 . "$cli"
@@ -580,7 +583,8 @@ p0jj_setup() {
   # $runjj_root/p0-NAME with a private remote, a verified posture, the fleet
   # and host layers the scenarios read, and its first run published. Defines
   # the helpers the scenarios use: runjj, runjj_lib; sets rjj and vireo.
-  PATH="$(dirname "$real_jj"):$(dirname "$real_yq"):$PATH"
+  mkdir -p "$tmp/ssh-stub-only" && ln -sf "$tmp/bin/ssh" "$tmp/ssh-stub-only/ssh"
+  PATH="$tmp/ssh-stub-only:$(dirname "$real_jj"):$(dirname "$real_yq"):$PATH"
   export PATH
   # shellcheck source=/dev/null
   ROUNDHOUSE_LIB_ONLY=1 . "$cli"
