@@ -2170,8 +2170,15 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       esac
     else
       case $run_category in
-        packages) fleet_alert_checked "$run_ledger" package-hold "$run_item" ;;
+        packages)
+          fleet_alert_checked "$run_ledger" package-hold "$run_item"
+          fleet_alert_checked "$run_ledger" package-deferred "$run_item"
+          ;;
         hooks) fleet_alert_checked "$run_ledger" enabled-but-untrusted "$run_item" ;;
+        runtimes)
+          fleet_alert_checked "$run_ledger" runtime-hold "$run_item"
+          fleet_alert_checked "$run_ledger" node-runtime-unverified "$run_item"
+          ;;
       esac
       fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
         "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" ||
@@ -2508,14 +2515,14 @@ fleet_run_apply_held() {
   # distinct so the full cadence's Node step can still make the retry the
   # backoff promises (fleet_run_full_node_runtime).
   fleet_run_runtime_hold "$4" "apply status $7" "$8/sigholds" || return 65
-  [ "$5" != runtimes ] || fleet_run_node_alert "$1" "$2" "$7" "$4"
+  [ "$5" != runtimes ] || fleet_run_node_alert "$8/alert-ledger" "$1" "$2" "$7" "$4"
   [ "$7" -ne 75 ] || [ "$5" != packages ] ||
     fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-hold \
       "package-hold-$(printf '%s' "$4" | tr './' '--')" \
       "no package manager on this host can provide $4" "$4" ||
     :
   [ "$7" -ne 73 ] || [ "$5" != packages ] ||
-    fleet_alert_write "$1" "$2" package-deferred \
+    fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-deferred \
       "package-deferred-$(printf '%s' "$4" | tr './' '--')" \
       "$4 is not installed while a Node runtime switch is in flight on this host" "$4" ||
     :
@@ -2623,29 +2630,33 @@ fleet_run_plugin_marketplaces() (
 )
 
 fleet_run_node_unverified() {
-  # `fleet_run_node_unverified STORE HOST` — the one alert for a Node switch
-  # left recorded in flight: the default is unverified and npm stays off it.
-  fleet_alert_write "$1" "$2" node-runtime-unverified node-runtime-unverified \
+  # `fleet_run_node_unverified LEDGER STORE HOST` — the one alert for a Node
+  # switch left recorded in flight: the default is unverified and npm stays
+  # off it. A condition (fleet_alert_lifecycle_rows): the end-of-pass sweep
+  # clears it once a pass checks the runtime and the record is gone.
+  fleet_alert_raise "$1" "$2" "$3" node-runtime-unverified node-runtime-unverified \
     "a Node runtime switch is recorded in flight and the old default could not be restored and verified; npm globals are skipped until it is" \
     runtimes.node || :
 }
 
 fleet_run_node_held() {
-  # `fleet_run_node_held STORE HOST ITEM` — a held `runtimes.node` is a host
-  # quietly staying off Node releases (security patches included), so it is
-  # alerted, not only printed. One kind and one slug, whatever the reason.
-  fleet_alert_write "$1" "$2" runtime-hold runtime-hold-runtimes-node \
+  # `fleet_run_node_held LEDGER STORE HOST ITEM` — a held `runtimes.node` is a
+  # host quietly staying off Node releases (security patches included), so it
+  # is alerted, not only printed. One kind and one slug, whatever the reason;
+  # a condition the end-of-pass sweep clears once a pass converges it.
+  fleet_alert_raise "$1" "$2" "$3" runtime-hold runtime-hold-runtimes-node \
     "runtimes.node is held on this host and its Node runtime is not converging; the run output names the reason" \
-    "$3" || :
+    "$4" || :
 }
 
 fleet_run_node_alert() {
-  # `fleet_run_node_alert STORE HOST STATUS ITEM` — the one mapping from a
-  # Node convergence status to its alert, for the fast and full cadences
-  # alike: 73 deferred and 75 held, 76 unverified default, anything else none.
-  case $3 in
-    73 | 75) fleet_run_node_held "$1" "$2" "$4" ;;
-    76) fleet_run_node_unverified "$1" "$2" ;;
+  # `fleet_run_node_alert LEDGER STORE HOST STATUS ITEM` — the one mapping
+  # from a Node convergence status to its alert, for the fast and full
+  # cadences alike: 73 deferred and 75 held, 76 unverified default, anything
+  # else none. The caller has already CHECKED both kinds for the item.
+  case $4 in
+    73 | 75) fleet_run_node_held "$1" "$2" "$3" "$5" ;;
+    76) fleet_run_node_unverified "$1" "$2" "$3" ;;
   esac
 }
 
@@ -2659,6 +2670,9 @@ fleet_run_full_node_runtime() (
   # only returns the host to its last verified state.
   node_full_store=$1
   node_full_host=$2
+  # The pass's alert ledger (fleet_alert_checked), beside its holds.
+  node_full_ledger=${5:+$5/alert-ledger}
+  : "${node_full_ledger:=/dev/null}"
   node_full_runtime=$(printf '%s\n' "$3" | jq -c '(.runtimes // {}).node // empty')
   node_full_wanted=false
   # The apply loop's DEFERRAL of a backed-off switch (apply status 73,
@@ -2676,19 +2690,30 @@ fleet_run_full_node_runtime() (
     node_full_wanted=true
   fi
   if [ "$node_full_wanted" != true ]; then
-    [ -n "$(node_switch_marker_read)" ] || exit 0
+    # Not converged here (held, waiting on its canary, or not desired), so
+    # only the in-flight record is checked: its alert ends with the record.
+    # A switch in progress elsewhere (74) is not checked at all.
+    if [ -z "$(node_switch_marker_read)" ]; then
+      fleet_alert_checked "$node_full_ledger" node-runtime-unverified runtimes.node
+      exit 0
+    fi
     node_full_status=0
     node_switch_recover || node_full_status=$?
+    [ "$node_full_status" -eq 74 ] ||
+      fleet_alert_checked "$node_full_ledger" node-runtime-unverified runtimes.node
     case $node_full_status in
       74) printf '  note  runtimes.node — a Node switch is in progress on this host; not touched this run\n' ;;
       75) printf '  note  runtimes.node — an interrupted switch was rolled back to its old default (verified)\n' ;;
-      76) fleet_run_node_unverified "$node_full_store" "$node_full_host" ;;
+      76) fleet_run_node_unverified "$node_full_ledger" "$node_full_store" "$node_full_host" ;;
     esac
     exit 0
   fi
+  fleet_alert_checked "$node_full_ledger" runtime-hold runtimes.node
+  fleet_alert_checked "$node_full_ledger" node-runtime-unverified runtimes.node
   node_full_status=0
   fleet_run_node_converge "$node_full_runtime" "$4" full </dev/null || node_full_status=$?
-  fleet_run_node_alert "$node_full_store" "$node_full_host" "$node_full_status" runtimes.node
+  fleet_run_node_alert "$node_full_ledger" "$node_full_store" "$node_full_host" \
+    "$node_full_status" runtimes.node
   [ "$node_full_status" -ne 76 ] ||
     fleet_journal_append "$node_full_store" "$node_full_host" \
       "$(jq -cn --arg at "$(fleet_now)" \

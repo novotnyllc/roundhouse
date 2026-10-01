@@ -263,7 +263,9 @@ default, and the reviewed apply then defers that exact attempt instead of
 flipping again every fast pass; the full cadence retries it, even in a run
 whose apply loop just deferred it. An npm install deferred by a switch in
 flight alerts `package-deferred`, not `package-hold`. A `runtimes.node` hold of any kind also
-alerts (`runtime-hold-runtimes-node`), so a persistent hold is visible.
+alerts (`alerts/<host>/runtime-hold--runtimes.node.yaml`), so a persistent hold is visible.
+These three alerts are conditions: each clears itself on the first pass that
+checks the item and finds the hold, the deferral or the in-flight record gone.
 Hooks a definition requires are sealed from the sealing host's config; a
 hook only the target host declares cannot ride a plan sealed elsewhere (the
 target refuses it), so such a host converges through its scheduled run. `fleet-seed` never seeds `packages.node` or

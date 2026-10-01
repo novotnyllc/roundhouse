@@ -65,6 +65,9 @@ enabled-but-untrusted  condition  item
 record-write           condition  item
 identity-unavailable   condition  item
 uninstall-deferred     condition  item
+package-deferred       condition  item
+runtime-hold           condition  item
+node-runtime-unverified condition item
 stale-host             event      store
 schedule-disabled      event      store
 schedule-missing       event      store
