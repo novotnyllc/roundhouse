@@ -1,7 +1,7 @@
 # npm global packages, and the Node runtime under them
 
 Status: sections 1–6 shipped in 0.9.27. Section 7 (Node runtime convergence)
-shipped in 0.9.30, with the known limit in §7.8 and the deferrals in §7.9. Section 8 (`~/.npmrc`)
+shipped in 0.9.30, with the known limits in §7.8 and the deferrals in §7.9. Section 8 (`~/.npmrc`)
 is follow-up design, not implemented.
 
 ## 1. Problem
@@ -223,10 +223,10 @@ that keeps its globals per prefix: version grammar and numeric ordering, the
 switch refusals that change nothing (a carry not installed, a hook that is not
 a bin of its package or of a carried one, shell syntax), restore of the
 default after a failed carry, a failed hook and a failed install, a
-successful switch that carries exactly the managed globals and runs the hook
+successful switch that carries exactly the installed globals and runs the hook
 under the new node while leaving the old version and its globals intact, the
 carry and hook plan (store-only and mismatched hooks hold, host-only hooks
-run, unmanaged globals reported), convergence on the reviewed apply and the
+run), convergence on the reviewed apply and the
 full cadence (in-line no-op, newest in line, exact pin both ways, a new
 major, unreachable release list, unusable value, no fnm), the category arm,
 the full cadence ordering the switch before the npm pass and skipping a held
@@ -330,35 +330,57 @@ machine scope.
 ### 7.3 The switch (`scripts/lib/node-runtime.sh`)
 
 `node_runtime_switch TARGET CARRY HOOKS` is shared by the sealed executor and
-the desired-state run:
+the desired-state run. It works in three phases, and the live default moves
+only after the target is complete.
 
-1. Validate. Every carried `{name, version}` must be installed under the
-   current default at exactly that version (the carry reproduces what exists;
-   it never introduces a package). Every hook must name a carried package and
-   be provable, under the current prefix, as a bin of it (the §2.4 proof).
-   Refusal here is exit 65 with nothing changed.
-2. `fnm install TARGET`, then `fnm default TARGET` (fnm pinned to the root with
-   `FNM_DIR`, stdin closed).
-3. Require the durable npm to be the new default's own npm running under the
-   new node.
-4. One exact `npm install --global a@x b@y …` through it.
-5. Reconcile the new prefix to exactly the carry. Old versions are kept, so
-   the target may be a version used before, whose prefix still holds globals
-   removed or disabled since; left there, a rollback would resurrect them.
-   Every top-level global there that is neither carried nor bundled with the
-   target (`npm`, and `corepack` on 24 and older) is `npm uninstall
-   --global`ed, then the set must equal the carry, each at its version. A
-   listing or uninstall failure takes the same path as a failed carry.
-6. Run each hook by absolute path under the new node (re-proved under the new
-   prefix first).
+1. **Preflight** (mutates nothing; refusal is exit 64, 65 or 69). Every
+   carried `{name, version}` must be installed under the current default at
+   exactly that version (the carry reproduces what exists; it never
+   introduces a package). Every hook must name a carried package and be
+   provable, under the current prefix, as a bin of it (the §2.4 proof). A
+   switch already recorded in flight (below) refuses.
+2. **Staging**, into the TARGET prefix through TARGET's own `node` and `npm`
+   (`npm --prefix`, TARGET's `bin` first on PATH), while the old default stays
+   live:
+   - `fnm install TARGET` (fnm pinned to the root with `FNM_DIR`, stdin
+     closed).
+   - If the old default's global `npm` is newer than the npm TARGET bundles,
+     `npm install --global npm@<installed>` into TARGET first, and carry with
+     that npm. npm 12 honours `allow-scripts` in `~/.npmrc`; an older bundled
+     npm installing the carry would run every dependency install script.
+   - One exact `npm install --global a@x b@y …`.
+   - Reconcile the TARGET prefix to exactly the carry. Old versions are kept,
+     so the target may be a version used before, whose prefix still holds
+     globals removed or disabled since; left there, a rollback would
+     resurrect them. Every top-level global there that is neither carried nor
+     bundled with the target (`npm`, and `corepack` on 24 and older) is
+     uninstalled, then the set must equal the carry, each at its version.
 
-Any failure after step 2 points `fnm default` back at the old version and
-exits 1; exit 70 means even that failed and says so. Hooks that already ran
-are not undone; the new version stays installed, so a service a hook moved
-keeps working. **No switch removes a Node version**: a running service may
-still execute from the old prefix. Old versions are reported
-(`stale_versions`, and a `note` line in the run). Removal stays the separate,
-capped decision of the storage design's §10.3.
+   Any staging failure exits 1 with the default never moved and nothing
+   recorded.
+3. **Flip.** Record the switch in flight, `fnm default TARGET`, require the
+   durable npm to be TARGET's own npm under TARGET's node, run each hook by
+   absolute path under the new node (re-proved under the new prefix first,
+   output to a temporary file so a hook that starts a daemon cannot hold the
+   caller's capture or an SSH session open), then clear the record. Any
+   failure here points `fnm default` back at the old version, verifies the
+   alias and the durable npm's node, clears the record and exits 1; exit 70
+   means the restore could not be verified, and the record stays.
+
+**The in-flight record** is host-local,
+`${XDG_STATE_HOME:-~/.local/state}/roundhouse/node-switch-inflight.json`
+(`{old, target, carry}`), outside the store. It is cleared only by a
+verified success or a verified restore, so it survives a crash, a kill or a
+lost SSH session mid-flip. While it exists the collector reports it
+(`switch_inflight` on `fnm:node`), the carry rule holds, every lane refuses a
+new switch, and the desired-state run first tries to finish the job by
+restoring the recorded old default (§7.5).
+
+Hooks that already ran are not undone; the new version stays installed, so a
+service a hook moved keeps working. **No switch removes a Node version**: a
+running service may still execute from the old prefix. Old versions are
+reported (`stale_versions`, and a `note` line in the run). Removal stays the
+separate, capped decision of the storage design's §10.3.
 
 ### 7.4 Post-switch hooks and their trust root
 
@@ -428,14 +450,22 @@ requirement is a floor.
   added state (hold files, applied-record annotations, a store re-derivation
   at apply) and left the class open. The installed set has none of those
   failure modes, needs no store, and is what the switch must preserve anyway.
-- A switch that fails and cannot confirm the previous default restored
-  (the executor's exit 70) leaves a default nobody verified: the run reports
-  it (`hold  runtimes.node — … is unverified`), alerts
-  `node-runtime-unverified`, and skips only the npm part of that full
-  cadence's package pass (`hold  packages (npm) — Node default is
-  unverified …`). Brew, winget and the rest of the pass still run; an
+- **A switch recorded in flight** (§7.3) is resolved before anything else
+  in every run that touches `runtimes.node`. The run restores the recorded
+  old default and verifies it; on success the record is cleared and the item
+  holds this run (`hold  runtimes.node — an interrupted switch was rolled
+  back …`), to be retried on a later run. When the restore cannot be
+  verified, or a switch fails and cannot confirm its restore (the executor's
+  exit 70), the default is one nobody verified: the run reports it (`hold
+  runtimes.node — … is unverified`), never reports the item applied, alerts
+  `node-runtime-unverified`, and skips the npm part of every full cadence's
+  package pass while the record exists (`hold  packages (npm) — Node default
+  is unverified …`). Brew, winget and the rest of the pass still run. An
   ordinary hold, which leaves the default untouched or restored, skips
   nothing.
+- A `runtimes.node` hold that persists is not silent: every held run writes
+  a `runtime-hold` alert for the item (`runtime-hold-runtimes-node`), which
+  the alert writer deduplicates by kind and item.
 - `fleet-seed` never turns the `fnm:node` record into desired state: not
   `packages.node` (Homebrew would read it as its `node` formula) and not
   `runtimes.node`, which enters the store by hand. Nor does it seed an `npm:*`
@@ -485,7 +515,11 @@ argv is the marker only; the executor knows no other `fnm` shape. `carry`,
   The interop lane never carries a switch: `fnm:node` does not seal for a
   Windows target.
 - Executor: re-checks the argv marker and the hooks against its own (worker)
-  configuration, then runs §7.3.
+  configuration, then runs §7.3. Seal and apply-time verification share one
+  validator for the operation's shape (`node_switch_operations_valid`: at
+  most one switch, the carry/hooks/required grammar, and those fields on no
+  other operation) and one snapshot-to-plan path
+  (`node_switch_plan_from_snapshot`), so the two cannot drift apart.
 - Post-state: `installed_version == candidate_version`, the new record's
   `globals` (less what the target bundles) are exactly the carried names with
   nothing unpinnable left over, and every carried package is at its version,
@@ -511,9 +545,9 @@ as LocalSystem through the enrolled broker within the channel its policy token
 enrolls; where readiness advertises it, that is the lane. Otherwise the answer
 is the hold, never a UAC prompt.
 
-### 7.8 Known limit: install source
+### 7.8 Known limits
 
-`globals_unpinnable` is only as good as what npm reports. npm 12 reports no
+**Install source.** `globals_unpinnable` is only as good as what npm reports. npm 12 reports no
 install source for globals: `npm ls --global --json` (with or without
 `--long`) gives no `resolved` or `integrity`, there is no hidden lockfile in
 the global `node_modules`, and installed `package.json` files carry no
@@ -531,6 +565,15 @@ rules that out. It costs network on every switch, and trees that a
 postinstall modifies (opencodex's bundled bun, for one) would never compare
 equal, so those switches would hold. Install such a global from the registry,
 or remove it before a switch, if its source matters.
+
+**Host-only hooks on a sealed remote switch.** A sealed plan binds `hooks`,
+and `seal-plan` derives them from the sealing host's `config.json`. A hook
+that only the target host declares (the WSL-only `ocx codex-shim` reinstall)
+cannot be expressed in a plan sealed elsewhere: the target's apply-time
+check derives the hooks from its own worker configuration, finds one more,
+and refuses the plan without changing anything. Such a host converges
+through the scheduled desired-state lane, which runs on the host and honours
+its local hooks. Sealing on the target itself works too.
 
 ### 7.9 Deferred
 
@@ -551,6 +594,13 @@ or remove it before a switch, if its source matters.
   check is sealed.
 - **Other runtime sources** (nvm, Volta, Homebrew `node@N` as the default) and
   other runtimes. Out of scope by the §5.1.2 amendment.
+- **Consolidation follow-ups** from the pre-push review, none a behaviour
+  change: one shared helper for the fnm root list (lib/npm.sh and
+  lib/node-runtime.sh each walk it); a single `npm ls` parser for inventory,
+  staging and post-checks; a definitions helper for the npm entry and its
+  argv validation (`fleet_resolve_argv_valid`); removing the unused
+  `node_version_normalize`; folding the thin wrappers around `node_fnm_run`;
+  and extracting the hook-proof loop in `collect-posix` into lib/npm.sh.
 
 ## 8. `~/.npmrc`: chezmoi owns it
 

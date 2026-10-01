@@ -237,10 +237,20 @@ current default at its exact version (less what the target Node provides:
 hooks. It never adds a
 package and never leaves an installed one behind, whatever the store says
 about it (disabled, renamed, held); a global it cannot reinstall by exact
-registry version (`file:`, `link:`, git) holds the switch by name. A
-switch that fails and cannot confirm the old default restored reports the
-default as unverified, alerts `node-runtime-unverified`, and skips only the
-npm globals in that full pass. `fleet-seed` never seeds `packages.node` or
+registry version (`file:`, `link:`, git) holds the switch by name. The
+carry is installed and verified in the new Node's own prefix before the
+default moves, so a failed carry never touches the live default; the npm
+that installs it is upgraded first if the host's global npm is newer than
+the one the new Node bundles. The move itself is recorded in flight
+(`~/.local/state/roundhouse/node-switch-inflight.json`) until it verifies or
+its restore does. A record left by a crash is rolled back by the next run
+(that run holds the item). One that cannot be rolled back reports the default
+as unverified, alerts `node-runtime-unverified`, and skips the npm globals on
+every full pass until it is resolved. A `runtimes.node` hold of any kind also
+alerts (`runtime-hold-runtimes-node`), so a persistent hold is visible.
+Hooks a definition requires are sealed from the sealing host's config; a
+hook only the target host declares cannot ride a plan sealed elsewhere (the
+target refuses it), so such a host converges through its scheduled run. `fleet-seed` never seeds `packages.node` or
 `runtimes.node` from the runtime record, nor a package from an `npm:*`
 record (npm manages only through an `npm:` definition). A definition may require hooks with
 `node_switch:` on its npm entry (`opencodex: {npm: {name:

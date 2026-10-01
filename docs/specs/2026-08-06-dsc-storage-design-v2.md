@@ -783,9 +783,10 @@ runtimes:
   node: {version: "26.7.0"}  # an exact pin, the same opt-out as a package version:
 ```
 
-A switch is one operation with its own failure handling (install, move the
-default, carry the managed globals at their installed versions, run declared
-post-switch hooks, verify, and restore the previous default on any failure),
+A switch is one operation with its own failure handling (install, carry every
+installed global at its installed version into the new prefix and verify it
+there, only then move the default, run declared post-switch hooks, and restore
+the previous default on any failure after the move),
 and old versions are never removed by it. The mechanics, the trust rule for
 hooks (only the host's own `config.json` introduces a command) and the
 Windows elevation boundary are in §7 of

@@ -39,6 +39,15 @@ cat >"$nrt_template/bin/npm" <<'SH'
 set -eu
 self_dir=$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd -P)
 prefix=$(dirname -- "$self_dir")
+# `--prefix P` anywhere selects P, as real npm does.
+args=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --prefix) prefix=$(CDPATH='' cd -P -- "$2" && pwd -P); shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]}"
 state=$prefix/globals.json
 [ -f "$state" ] || printf '{}\n' >"$state"
 printf 'npm %s node=%s prefix=%s\n' "$*" "$(node --version 2>/dev/null || printf none)" "$prefix" >>"$NRT_LOG"
@@ -97,6 +106,12 @@ cat >"$nrt_root/package-bin" <<'SH'
 #!/usr/bin/env bash
 printf 'bin %s %s node=%s\n' "$(basename -- "$0")" "$*" "$(node --version)" >>"$NRT_LOG"
 [ "${NRT_HOOK_FAIL:-0}" != 1 ] || exit 1
+# A service repair that starts a daemon, which keeps the hook's stdout and
+# stderr open long after the hook returns.
+if [ -n "${NRT_HOOK_DAEMON:-}" ]; then
+  sleep 30 &
+  printf '%s\n' "$!" >"$NRT_HOOK_DAEMON"
+fi
 exit 0
 SH
 cat >"$nrt_bin/fnm" <<'SH'
@@ -112,7 +127,13 @@ case ${1:-} in
   install)
     [ "${NRT_FNM_FAIL_INSTALL:-0}" != 1 ] || exit 1
     dest=$FNM_DIR/node-versions/$2/installation
-    [ -d "$dest" ] || { mkdir -p "$dest/lib/node_modules"; cp -R "$NRT_TEMPLATE/bin" "$dest/bin"; }
+    if [ ! -d "$dest" ]; then
+      mkdir -p "$dest/lib/node_modules/npm"
+      cp -R "$NRT_TEMPLATE/bin" "$dest/bin"
+      # The npm this release bundles (not a global the stub lists).
+      printf '{"name":"npm","version":"%s"}\n' "${NRT_BUNDLED_NPM:-11.0.0}" \
+        >"$dest/lib/node_modules/npm/package.json"
+    fi
     ;;
   default)
     [ -d "$FNM_DIR/node-versions/$2/installation" ] || exit 1
@@ -128,18 +149,22 @@ printf '%s\n' '{"@example/svc":{"svc":"bin/cli.js"},"plain":{"plain":"bin/cli.js
   >"$nrt_catalog"
 printf '%s\n' v24.1.0 'v24.2.0   (Krypton)' v25.0.0 v26.0.0 v26.2.0 v26.10.0 v27.0.0 'not-a-version' >"$nrt_remote"
 
+# One fixture environment, for child commands (nrt_env) and for the lib-only
+# subshell below (exported), so the two can never drift.
+nrt_vars=(FNM_DIR="$nrt_fnm" NRT_LOG="$nrt_log" NRT_REMOTE="$nrt_remote"
+  NRT_TEMPLATE="$nrt_template" NRT_CATALOG="$nrt_catalog" NRT_PACKAGE_BIN="$nrt_root/package-bin"
+  XDG_STATE_HOME="$nrt_root/state" ROUNDHOUSE_TEST_NPM_FIXED_DIRS= ROUNDHOUSE_TEST_FNM_FIXED_DIRS=)
 nrt_env() {
-  env -u XDG_DATA_HOME FNM_DIR="$nrt_fnm" NRT_LOG="$nrt_log" NRT_REMOTE="$nrt_remote" \
-    NRT_TEMPLATE="$nrt_template" NRT_CATALOG="$nrt_catalog" NRT_PACKAGE_BIN="$nrt_root/package-bin" \
-    ROUNDHOUSE_TEST_NPM_FIXED_DIRS= ROUNDHOUSE_TEST_FNM_FIXED_DIRS= \
+  env -u XDG_DATA_HOME "${nrt_vars[@]}" \
     ROUNDHOUSE_FLEET_STORE="${nrt_store_override:-$nrt_store}" PATH="$nrt_bin:$PATH" "$@"
 }
+nrt_marker="$nrt_root/state/roundhouse/node-switch-inflight.json"
 
 nrt_reset() {
   # One installed version, v26.0.0, as the default, carrying a managed
   # service package with a hook bin, a managed plain package, an unmanaged
   # global and npm itself.
-  rm -rf "$nrt_fnm"
+  rm -rf "$nrt_fnm" "$nrt_root/state"
   mkdir -p "$nrt_fnm/aliases" "$nrt_fnm/node-versions"
   : >"$nrt_log"
   nrt_env "$nrt_bin/fnm" install v26.0.0
@@ -159,16 +184,7 @@ nrt_reset
 (
   set -eu
   unset XDG_DATA_HOME
-  FNM_DIR=$nrt_fnm
-  NRT_LOG=$nrt_log
-  NRT_REMOTE=$nrt_remote
-  NRT_TEMPLATE=$nrt_template
-  NRT_CATALOG=$nrt_catalog
-  NRT_PACKAGE_BIN=$nrt_root/package-bin
-  ROUNDHOUSE_TEST_NPM_FIXED_DIRS=
-  ROUNDHOUSE_TEST_FNM_FIXED_DIRS=
-  export FNM_DIR NRT_LOG NRT_REMOTE NRT_TEMPLATE NRT_CATALOG NRT_PACKAGE_BIN \
-    ROUNDHOUSE_TEST_NPM_FIXED_DIRS ROUNDHOUSE_TEST_FNM_FIXED_DIRS
+  export "${nrt_vars[@]}"
   [ -z "$fleet_fixture_yq" ] || PATH=$fleet_fixture_path
   PATH=$nrt_bin:$PATH
   export PATH
@@ -289,7 +305,7 @@ nrt_reset
     fail "a valid Node switch failed"
   [ "$(nrt_default)" = v26.10.0 ] || fail "the switch did not move the fnm default"
   [ "$(nrt_globals v26.10.0)" = '{"@example/svc":"1.0.0","plain":"2.0.0"}' ] ||
-    fail "the switch did not carry exactly the managed globals at their versions"
+    fail "the switch did not carry exactly the installed globals at their versions"
   grep -Fq "npm install --global @example/svc@1.0.0 plain@2.0.0 node=v26.10.0" "$nrt_log" ||
     fail "the carry was not one exact install under the new node"
   grep -Fq 'bin svc service node=v26.10.0' "$nrt_log" ||
@@ -320,7 +336,8 @@ nrt_reset
     >"$nrt_root/local-mismatched.json"
   nrt_plan_for() {
     # nrt_plan_for CONFIG [GLOBALS] [UNPINNABLE] [TARGET] [DEFS]
-    node_switch_plan "${2:-$nrt_globals_now}" "${3:-[]}" "${4:-v26.10.0}" "${5:-$nrt_defs}" \
+    node_switch_plan "$(jq -cn --argjson globals "${2:-$nrt_globals_now}" --argjson unpinnable "${3:-[]}" \
+      '{globals: $globals, globals_unpinnable: $unpinnable}')" "${4:-v26.10.0}" "${5:-$nrt_defs}" \
       "$(jq -c '.node_switch_hooks // {}' "$nrt_root/$1.json")"
   }
   nrt_plan=$(nrt_plan_for local-declared)
@@ -365,7 +382,7 @@ nrt_reset
   # A global that cannot be reinstalled by exact registry version holds the
   # switch by name; it is never silently left behind.
   [ "$(NRT_NPM_LINKED=devtool node_globals_split "$(NRT_NPM_LINKED=devtool npm_global_list_detail)" |
-    jq -c '.unpinnable')" = '["devtool"]' ] ||
+    jq -c '.globals_unpinnable')" = '["devtool"]' ] ||
     fail "a file:/link global was not reported unpinnable"
   # A failed detail query is UNKNOWN, never "nothing unpinnable": it holds.
   nrt_plan_for local-declared "$nrt_globals_now" null |
@@ -531,47 +548,114 @@ nrt_reset
   # --- an unverified default keeps npm off it, and only npm ---------------------
   nrt_mixed_fold='{"packages":{"svc":"enabled","plain":"enabled","brewonly":"enabled"},"package_managers":["homebrew","npm"],"runtimes":{"node":{"major":26}}}'
   # An ordinary hold (the store requires a hook this host does not declare)
-  # leaves the default untouched: the npm pass still runs.
+  # leaves the default untouched: the npm pass still runs, and the hold is
+  # alerted (a host silently off Node releases is visible).
   nrt_reset
   : >"$nrt_root/full-tmp/sigholds"
+  rm -rf "$nrt_root/store/alerts"
   nrt_run_full "$nrt_mixed_fold" local-undeclared
   [ "$(nrt_default)" = v26.0.0 ] &&
     grep -Fq 'npm outdated --global --json node=v26.0.0' "$nrt_log" &&
     ! grep -Fq 'npm globals skipped this pass' "$nrt_root/full-out" ||
     fail "an ordinary runtime hold skipped the npm pass"
-  # A failed switch whose restore also fails (exit 70) leaves the default
-  # unverified: no npm operation runs under it, brew still does, and the
-  # state is reported and alerted.
+  ls "$nrt_root/store/alerts/nrt-host/"*runtime-hold-runtimes-node* >/dev/null 2>&1 ||
+    fail "a held runtimes.node raised no alert"
+  # A carry that fails never touches the live default: it fails while the
+  # target is staged, so nothing flips and nothing needs restoring.
   nrt_reset
-  NRT_NPM_FAIL_INSTALL=1 NRT_FNM_DEFAULT_ONLY=v26.10.0 nrt_run_full "$nrt_mixed_fold"
-  [ "$(nrt_default)" = v26.10.0 ] || fail "the unrestorable-switch fixture did not leave the default moved"
+  NRT_NPM_FAIL_INSTALL=1 nrt_run_full "$nrt_mixed_fold"
+  [ "$(nrt_default)" = v26.0.0 ] && ! grep -Fq 'fnm default v26.10.0' "$nrt_log" &&
+    [ ! -e "$nrt_marker" ] && grep -Fq 'npm outdated --global --json node=v26.0.0' "$nrt_log" ||
+    fail "a failed carry flipped the default or blocked the npm pass"
+  # A switch that fails after the flip AND cannot restore with proof stays
+  # recorded in flight: no npm operation runs under it, brew still does, and
+  # it is reported and alerted.
+  nrt_reset
+  rm -rf "$nrt_root/store/alerts"
+  NRT_HOOK_FAIL=1 NRT_FNM_DEFAULT_ONLY=v26.10.0 nrt_run_full "$nrt_mixed_fold"
+  [ "$(nrt_default)" = v26.10.0 ] && [ -e "$nrt_marker" ] ||
+    fail "the unrestorable-switch fixture did not leave the switch recorded in flight"
   grep -Fq '  hold  runtimes.node — switch to v26.10.0 failed and the fnm default (v26.10.0) is unverified' \
     "$nrt_root/full-out" &&
     grep -Fq '  hold  packages (npm) — Node default is unverified after a failed runtime switch; npm globals skipped this pass' \
       "$nrt_root/full-out" ||
     fail "an unverified default was not reported"
-  ! grep -Eq 'npm (outdated|view)|bin (svc|plain)' "$nrt_log" &&
-    [ "$(grep -c 'npm install' "$nrt_log")" -eq 1 ] ||
+  ! grep -Eq 'npm (outdated|view)' "$nrt_log" ||
     fail "an npm operation ran under an unverified default"
   grep -Fq 'brew upgrade brewonly' "$nrt_log" ||
     fail "an unverified Node default stopped the non-npm package pass"
   ls "$nrt_root/store/alerts/nrt-host/"*node-runtime-unverified* >/dev/null 2>&1 ||
     fail "an unverified Node default raised no alert"
-  # The same state reached through this run's reviewed apply (exit 76 into the
-  # run's hold file) skips npm too, and the apply arm passes 76 through.
-  nrt_reset
-  nrt_status=0
-  NRT_NPM_FAIL_INSTALL=1 NRT_FNM_DEFAULT_ONLY=v27.0.0 ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
-    fleet_run_apply_item "$nrt_root/store" nrt-host "$nrt_defs" runtimes.node '{"major":27}' \
-    "homebrew npm" "$nrt_mixed_fold" >/dev/null 2>&1 || nrt_status=$?
-  [ "$nrt_status" -eq 76 ] || fail "the runtime apply arm did not report an unverified default (got $nrt_status)"
-  nrt_reset
-  printf 'runtimes.node apply status 76\n' >"$nrt_root/full-tmp/sigholds"
+  # The next run still cannot restore: the record stays, npm stays off.
+  : >"$nrt_log"
+  NRT_FNM_DEFAULT_ONLY=v26.10.0 nrt_run_full "$nrt_mixed_fold"
+  [ -e "$nrt_marker" ] && ! grep -Fq 'npm outdated' "$nrt_log" ||
+    fail "an unrecovered switch let the next run's npm pass through"
+  # Once a restore can be proven, the next run rolls the switch back, holds,
+  # clears the record, and only then lets npm run again.
+  : >"$nrt_log"
   nrt_run_full "$nrt_mixed_fold"
-  ! grep -Fq 'npm outdated' "$nrt_log" && grep -Fq 'brew upgrade brewonly' "$nrt_log" &&
-    grep -Fq 'npm globals skipped this pass' "$nrt_root/full-out" ||
-    fail "an unverified default from the apply loop did not keep the npm pass off it"
+  [ "$(nrt_default)" = v26.0.0 ] && [ ! -e "$nrt_marker" ] &&
+    grep -Fq '  hold  runtimes.node — an interrupted switch was rolled back to its old default (verified)' \
+      "$nrt_root/full-out" &&
+    grep -Fq 'npm outdated --global --json node=v26.0.0' "$nrt_log" ||
+    fail "a recoverable in-flight switch was not rolled back with proof"
+  # An interrupted switch (killed between the flip and its verification) is
+  # never mistaken for a converged one: the default is already in its major,
+  # yet the reviewed apply holds, rolls it back, and does not report applied.
+  nrt_reset
+  nrt_env "$nrt_bin/fnm" install v26.10.0
+  nrt_env "$nrt_bin/fnm" default v26.10.0
+  node_switch_marker_write v26.0.0 v26.10.0 "$nrt_carry_all"
+  nrt_status=0
+  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
+    fleet_run_apply_item "$nrt_root/store" nrt-host "$nrt_defs" runtimes.node '{"major":26}' \
+    "homebrew npm" >"$nrt_root/interrupted-out" 2>&1 || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v26.0.0 ] && [ ! -e "$nrt_marker" ] ||
+    fail "an interrupted switch was reported converged (status $nrt_status)"
+  # Unrecoverable on the reviewed apply: 76 passes through.
+  nrt_reset
+  nrt_env "$nrt_bin/fnm" install v27.0.0
+  node_switch_marker_write v99.0.0 v27.0.0 '[]'
+  nrt_status=0
+  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
+    fleet_run_apply_item "$nrt_root/store" nrt-host "$nrt_defs" runtimes.node '{"major":27}' \
+    "homebrew npm" >/dev/null 2>&1 || nrt_status=$?
+  [ "$nrt_status" -eq 76 ] && [ "$(nrt_default)" = v26.0.0 ] ||
+    fail "the runtime apply arm did not report an unrecoverable in-flight switch (got $nrt_status)"
+  rm -f "$nrt_marker"
   : >"$nrt_root/full-tmp/sigholds"
+
+  # --- the carry runs under an npm no older than the host's -------------------
+  # npm 12 honours allow-scripts; a target that bundles npm 11 is brought up to
+  # the installed npm 12 before the carry, which then runs under it.
+  nrt_reset
+  nrt_env PATH="$nrt_fnm/aliases/default/bin:$PATH" "$nrt_fnm/aliases/default/bin/npm" \
+    install --global npm@12.0.0
+  : >"$nrt_log"
+  NRT_BUNDLED_NPM=11.0.0 node_runtime_switch v26.10.0 "$nrt_carry_all" "$nrt_hooks" ||
+    fail "a switch to a target that bundles an older npm failed"
+  nrt_npm_line=$(grep -n 'npm install --global npm@12.0.0 node=v26.10.0' "$nrt_log" | head -1 | cut -d: -f1)
+  nrt_carry_line=$(grep -n 'npm install --global @example/svc@1.0.0' "$nrt_log" | head -1 | cut -d: -f1)
+  [ -n "$nrt_npm_line" ] && [ -n "$nrt_carry_line" ] && [ "$nrt_npm_line" -lt "$nrt_carry_line" ] ||
+    fail "the target's older bundled npm was not upgraded before the carry"
+  [ "$(jq -r '.version' "$nrt_fnm/node-versions/v26.10.0/installation/lib/node_modules/npm/package.json")" = 12.0.0 ] ||
+    fail "the target prefix did not end on the host's npm"
+  # Not when the target's own npm is already as new.
+  nrt_reset
+  : >"$nrt_log"
+  NRT_BUNDLED_NPM=12.1.0 node_runtime_switch v26.10.0 "$nrt_carry_all" "$nrt_hooks" ||
+    fail "a switch to a target with a newer bundled npm failed"
+  ! grep -Fq 'install --global npm@' "$nrt_log" ||
+    fail "a target whose npm is newer was downgraded"
+
+  # --- a hook that starts a daemon does not hold the run ------------------------
+  nrt_reset
+  SECONDS=0
+  NRT_HOOK_DAEMON=$nrt_root/daemon.pid nrt_converge local-declared '{"major":26}' full ||
+    fail "a switch whose hook started a daemon did not converge"
+  [ "$SECONDS" -lt 20 ] || fail "a hook's daemon held the switch's output open (${SECONDS}s)"
+  kill "$(cat "$nrt_root/daemon.pid")" 2>/dev/null || :
 )
 
 # --- the sealed lifecycle: collect, seal, apply, post-state ---------------------
@@ -819,8 +903,14 @@ else
   nrt_ssh_cli seal-plan "$tmp/node-ssh-draft.json" "$tmp/node-ssh-snapshot.jsonl" "$tmp/node-ssh-plan.json"
   nrt_ssh_plan_id=$(jq -r '.plan_id' "$tmp/node-ssh-plan.json")
   : >"$nrt_log"
-  nrt_ssh_cli apply-ssh-plan "$tmp/node-ssh-plan.json" "$nrt_ssh_plan_id" "$tmp/node-ssh-apply.jsonl" ||
+  # The hook starts a daemon: the SSH session must still end with the switch.
+  SECONDS=0
+  NRT_HOOK_DAEMON=$nrt_root/ssh-daemon.pid \
+    nrt_ssh_cli apply-ssh-plan "$tmp/node-ssh-plan.json" "$nrt_ssh_plan_id" "$tmp/node-ssh-apply.jsonl" ||
     fail "an SSH Node switch refused because the target has no store"
+  [ "$SECONDS" -lt 20 ] || fail "a hook's daemon held the SSH session open (${SECONDS}s)"
+  [ -s "$nrt_root/ssh-daemon.pid" ] || fail "the SSH lane hook did not start its daemon"
+  kill "$(cat "$nrt_root/ssh-daemon.pid")" 2>/dev/null || :
   [ "$(nrt_default)" = v26.10.0 ] &&
     [ "$(jq -r 'select(.kind == "operation" and (.id | startswith("apply:"))) | .data.operation_status' \
       "$tmp/node-ssh-apply.jsonl")" = completed ] &&
@@ -834,12 +924,12 @@ else
       "$tmp/node-ssh-snapshot.jsonl" >"$tmp/node-ssh-uninstalled.jsonl"
     jq -c 'if .kind == "package" and .id == "fnm:node" then .data.globals.extra = "1.0.0" else . end' \
       "$tmp/node-ssh-snapshot.jsonl" >"$tmp/node-ssh-extra.jsonl"
-    fleet_node_snapshot_verify "$tmp/node-ssh-plan.json" "$tmp/node-ssh-snapshot.jsonl" \
+    node_switch_verify_snapshot "$tmp/node-ssh-plan.json" "$tmp/node-ssh-snapshot.jsonl" \
       "$tmp/node-ssh-config.json" || fail "the worker rejected a carry its snapshot proves"
     jq -c 'if .kind == "package" and .id == "fnm:node" then .data.globals_unpinnable = null else . end' \
       "$tmp/node-ssh-snapshot.jsonl" >"$tmp/node-ssh-unknown.jsonl"
     for nrt_bad_snapshot in uninstalled extra unknown; do
-      if fleet_node_snapshot_verify "$tmp/node-ssh-plan.json" "$tmp/node-ssh-$nrt_bad_snapshot.jsonl" \
+      if node_switch_verify_snapshot "$tmp/node-ssh-plan.json" "$tmp/node-ssh-$nrt_bad_snapshot.jsonl" \
         "$tmp/node-ssh-config.json"; then
         fail "the worker accepted a carry that is not the installed set ($nrt_bad_snapshot)"
       fi

@@ -2151,8 +2151,12 @@ NPM_UPDATERS
             if node_detail=$(npm_global_list_detail 2>/dev/null) &&
               node_split=$(node_globals_split "$node_detail"); then
               node_globals=$(printf '%s\n' "$node_split" | jq -c '.globals')
-              node_unpinnable=$(printf '%s\n' "$node_split" | jq -c '.unpinnable')
+              node_unpinnable=$(printf '%s\n' "$node_split" | jq -c '.globals_unpinnable')
             fi
+            # A switch recorded in flight on this host (interrupted, or failed
+            # without a verified restore): nothing seals or verifies over it.
+            node_inflight=$(node_switch_marker_read)
+            [ -n "$node_inflight" ] || node_inflight=null
             # Configured post-switch hooks, proven the same way as updaters:
             # argv[0] must be a bin of the installed package. A sealed switch
             # refuses a carried package whose hook is unproven here.
@@ -2182,7 +2186,7 @@ NODE_HOOKS
               --arg line "$node_line" --argjson installed "$node_installed_list" \
               --arg root "$node_root" --arg prefix "$node_prefix" \
               --argjson globals "$node_globals" --argjson unproven "$node_hooks_unproven" \
-              --argjson unpinnable "$node_unpinnable" '
+              --argjson unpinnable "$node_unpinnable" --argjson inflight "$node_inflight" '
                 {schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
                   host_id:$host_id,kind:"package",id:"fnm:node",observed_at:$observed_at,
                   status:"present",confidence:(if $known then "high" else "medium" end),
@@ -2194,7 +2198,7 @@ NODE_HOOKS
                     fnm_dir:($root[0:8192]),
                     prefix:(if $prefix == "" then null else $prefix end),
                     globals:$globals,
-                    globals_unpinnable:$unpinnable,
+                    globals_unpinnable:$unpinnable,switch_inflight:$inflight,
                     switch_hooks_unproven:$unproven},
                   evidence:[{source:"package-manager",method:"fnm-default-alias+list-remote"}],errors:[]}'
           fi

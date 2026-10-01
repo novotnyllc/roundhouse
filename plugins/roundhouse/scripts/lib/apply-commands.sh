@@ -555,7 +555,12 @@ apply_plan_command() {
     apply_status=partial
   fi
   validate_file "$work/post.jsonl"
+  # What the Node switch's target ships itself (node_target_bundled), for its
+  # exact-set post-check; [] when the plan has no switch.
+  node_post_bundled=$(node_target_bundled "$(jq -r 'first(.operations[] |
+    select(.type == "package-upgrade" and .id == "fnm:node") | .candidate_version) // ""' "$plan")")
   if [ "$apply_status" = completed ] && ! jq -e -n --slurpfile plan "$plan" --slurpfile before "$work/pre.jsonl" \
+    --argjson node_bundled "$node_post_bundled" \
     --slurpfile records "$work/post.jsonl" '
     def same_agent($record; $operation):
       if $operation.kind == "plugin" and
@@ -581,11 +586,11 @@ apply_plan_command() {
           # in this same plan (seal orders every npm upgrade after the switch).
           (if $operation.id == "fnm:node" then
              (.data.globals | type == "object") and
-             (($operation.candidate_version | ltrimstr("v") | split(".")[0] | tonumber? // 0) as $major |
-               (["npm"] + (if $major < 25 then ["corepack"] else [] end)) as $bundled |
-               ([.data.globals | keys[] | . as $n | select(any($bundled[]; . == $n) | not)] | sort) ==
-                 ([$operation.carry[].name] | sort) and
-               ([(.data.globals_unpinnable // ["?"])[] | . as $n | select(any($bundled[]; . == $n) | not)] == [])) and
+             (.data.globals_unpinnable | type == "array") and
+             ([.data.globals | keys[] | . as $n | select(any($node_bundled[]; . == $n) | not)] | sort) ==
+               ([$operation.carry[].name] | sort) and
+             ([.data.globals_unpinnable[] | . as $n | select(any($node_bundled[]; . == $n) | not)] == []) and
+             (.data.switch_inflight // null) == null and
              (.data.globals as $globals |
                all($operation.carry[]; . as $carried |
                  ([$plan[0].operations[] | select(.type == "package-upgrade" and

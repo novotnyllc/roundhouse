@@ -559,33 +559,6 @@ verify_privileged_preconditions_command() {
     '{verified:true,privileged:true,plan_id:$plan_id,target:$target}'
 }
 
-fleet_node_snapshot_verify() {
-  # `fleet_node_snapshot_verify PLAN SNAPSHOT CONFIG` — the Node switch check
-  # every executing host runs: the carry rule (node_switch_plan) over the
-  # fresh snapshot must hold nothing it can see (no unpinnable global) and
-  # give exactly the sealed carry and hooks, and every sealed `required` hook
-  # must be among the hooks. It needs no store: the carry is the installed
-  # set, and the definition-derived `required` list is bound by the plan
-  # digest, checked before this runs.
-  snapshot_verify_record=$(jq -cs 'first(.[] | select(.kind == "package" and .id == "fnm:node" and
-    .status == "present") | .data) // null' "$2")
-  printf '%s\n' "$snapshot_verify_record" | jq -e '(.globals | type == "object") and
-    (.installed_version | type == "string")' \
-    >/dev/null 2>&1 || return 1
-  snapshot_verify_plan=$(node_switch_plan \
-    "$(printf '%s\n' "$snapshot_verify_record" | jq -c '.globals')" \
-    "$(printf '%s\n' "$snapshot_verify_record" | jq -c '.globals_unpinnable')" \
-    "$(jq -r 'first(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node")) |
-      .candidate_version' "$1")" '{}' \
-    "$(jq -c '.node_switch_hooks // {}' "$3")") || return 1
-  jq -e --argjson current "$snapshot_verify_plan" '
-    $current.held == null and
-    all(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node");
-      . as $op | $op.carry == $current.carry and $op.hooks == $current.hooks and
-      all($op.required[]; . as $r | any($op.hooks[]; . == $r)))
-  ' "$1" >/dev/null
-}
-
 verify_preconditions_command() {
   plan=$1
   snapshot=$2
@@ -622,34 +595,6 @@ verify_preconditions_command() {
       (if .type == "package-upgrade" then
         (.candidate_version | type == "string" and length > 0)
       else true end) and
-      # A Node runtime switch (`fnm:node`, lib/node-runtime.sh) is the one
-      # package-upgrade with more than argv: the exact globals it carries and
-      # the post-switch hooks it runs. Its argv is the fixed marker
-      # `fnm default <candidate>`; the executor knows only this composite.
-      (if (.id | startswith("fnm:")) then
-        .id == "fnm:node" and .type == "package-upgrade" and
-        (.candidate_version | type == "string" and test("^v[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,6}$")) and
-        .argv == ["fnm","default",.candidate_version] and
-        (.carry | type == "array" and length <= 256 and ((map(.name) | unique | length) == length) and
-          all(.[]; type == "object" and (keys == ["name","version"]) and
-            (.name | type == "string" and length <= 214 and
-              test("^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
-            (.version | type == "string" and length <= 128 and test("^[0-9A-Za-z][0-9A-Za-z.+-]*$")))) and
-        (.hooks | type == "array" and length <= 64 and
-          all(.[]; type == "object" and (keys == ["argv","package"]) and
-            (.package | type == "string" and startswith("npm:")) and
-            (.argv | type == "array" and length >= 1 and length <= 8 and
-              (.[0] | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
-              all(.[1:][]; type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$"))))) and
-        # The node_switch hooks the definitions require for the carried
-        # packages, derived at seal from the controller store and bound here
-        # by the plan digest; every one must appear in `hooks`.
-        (.required | type == "array" and length <= 64 and
-          all(.[]; type == "object" and (keys == ["argv","package"]) and
-            (.package | type == "string" and startswith("npm:")) and
-            (.argv | type == "array" and length >= 1 and length <= 8 and all(.[]; type == "string"))))
-       elif has("carry") or has("hooks") or has("required") then false
-       else true end) and
       (if .type == "chezmoi-apply" and has("targets") then
         (.targets | type == "array" and length > 0 and length <= 16 and
           (unique | length) == length and
@@ -711,7 +656,7 @@ verify_preconditions_command() {
     (.plan_digest.algorithm == "sha256") and
     (.plan_digest.value | test("^[0-9a-f]{64}$")) and
     ([.. | strings | length <= 8192] | all)
-  ' "$plan" >/dev/null || {
+  ' "$plan" >/dev/null && node_switch_operations_valid "$plan" || {
     printf 'roundhouse: invalid apply plan\n' >&2
     exit 64
   }
@@ -830,10 +775,10 @@ verify_preconditions_command() {
     exit 65
   }
   # A Node switch: its carry must still be exactly the installed set the
-  # fresh snapshot shows, with the configured hooks (fleet_node_snapshot_verify).
+  # fresh snapshot shows, with the configured hooks (node_switch_verify_snapshot).
   if jq -e 'any(.operations[]?; .type == "package-upgrade" and .id == "fnm:node")' \
     "$plan" >/dev/null 2>&1; then
-    fleet_node_snapshot_verify "$plan" "$snapshot" "$config" || {
+    node_switch_verify_snapshot "$plan" "$snapshot" "$config" || {
       printf 'roundhouse: the Node switch carry or hooks no longer match the installed npm globals; create a new plan\n' >&2
       exit 65
     }

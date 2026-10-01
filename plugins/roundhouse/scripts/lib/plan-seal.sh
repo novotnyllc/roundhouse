@@ -42,34 +42,6 @@ seal_plan_command() {
       (if .type == "package-upgrade" then
         (.candidate_version | type == "string" and length > 0)
       else true end) and
-      # A Node runtime switch (`fnm:node`, lib/node-runtime.sh) is the one
-      # package-upgrade with more than argv: the exact globals it carries and
-      # the post-switch hooks it runs. Its argv is the fixed marker
-      # `fnm default <candidate>`; the executor knows only this composite.
-      (if (.id | startswith("fnm:")) then
-        .id == "fnm:node" and .type == "package-upgrade" and
-        (.candidate_version | type == "string" and test("^v[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,6}$")) and
-        .argv == ["fnm","default",.candidate_version] and
-        (.carry | type == "array" and length <= 256 and ((map(.name) | unique | length) == length) and
-          all(.[]; type == "object" and (keys == ["name","version"]) and
-            (.name | type == "string" and length <= 214 and
-              test("^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
-            (.version | type == "string" and length <= 128 and test("^[0-9A-Za-z][0-9A-Za-z.+-]*$")))) and
-        (.hooks | type == "array" and length <= 64 and
-          all(.[]; type == "object" and (keys == ["argv","package"]) and
-            (.package | type == "string" and startswith("npm:")) and
-            (.argv | type == "array" and length >= 1 and length <= 8 and
-              (.[0] | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
-              all(.[1:][]; type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$"))))) and
-        # The node_switch hooks the definitions require for the carried
-        # packages, derived at seal from the controller store and bound here
-        # by the plan digest; every one must appear in `hooks`.
-        (.required | type == "array" and length <= 64 and
-          all(.[]; type == "object" and (keys == ["argv","package"]) and
-            (.package | type == "string" and startswith("npm:")) and
-            (.argv | type == "array" and length >= 1 and length <= 8 and all(.[]; type == "string"))))
-       elif has("carry") or has("hooks") or has("required") then false
-       else true end) and
       (if .type == "chezmoi-apply" and has("targets") then
         (.targets | type == "array" and length > 0 and length <= 16 and
           (unique | length) == length and
@@ -130,6 +102,11 @@ seal_plan_command() {
     "$draft" >/dev/null || {
     printf 'roundhouse: the Node switch must precede every npm upgrade in the same plan\n' >&2
     exit 65
+  }
+  # The shape of a Node switch, shared with verify-preconditions.
+  node_switch_operations_valid "$draft" || {
+    printf 'roundhouse: invalid plan draft\n' >&2
+    exit 64
   }
   validate_file "$snapshot"
   target=$(jq -r '.target' "$draft")
@@ -443,21 +420,12 @@ seal_plan_command() {
         "$node_seal_store" >&2
       exit 65
     }
-    node_seal_record=$(jq -cs 'first(.[] | select(.kind == "package" and .id == "fnm:node" and
-      .status == "present") | .data) // null' "$snapshot")
-    printf '%s\n' "$node_seal_record" | jq -e '(.globals | type == "object") and
-      (.installed_version | type == "string")' >/dev/null 2>&1 || {
-      printf 'roundhouse: the snapshot does not record the npm globals under the current Node default\n' >&2
-      exit 65
-    }
-    node_seal_plan=$(node_switch_plan \
-      "$(printf '%s\n' "$node_seal_record" | jq -c '.globals')" \
-      "$(printf '%s\n' "$node_seal_record" | jq -c '.globals_unpinnable')" \
+    node_seal_plan=$(node_switch_plan_from_snapshot "$snapshot" \
       "$(jq -r 'first(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node")) |
         .candidate_version' "$draft")" \
       "$(fleet_definitions_load "$node_seal_store")" \
       "$(jq -c '.node_switch_hooks // {}' "$config")") || {
-      printf 'roundhouse: could not derive the Node switch carry\n' >&2
+      printf 'roundhouse: the snapshot does not record the npm globals under the current Node default\n' >&2
       exit 65
     }
     node_seal_held=$(printf '%s\n' "$node_seal_plan" | jq -r '.held // empty')

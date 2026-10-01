@@ -28,6 +28,25 @@
 # and none of it may be clobbered by a lookup.
 # shellcheck shell=bash
 
+# The one grammar for npm names, npm versions, a package's own command
+# (updater or post-switch hook) and a fnm Node version, as jq definitions.
+# Configuration validation, the switch plan, and seal/verify all prepend it,
+# so the shell predicates below and every jq check agree on one set of
+# regexes.
+# shellcheck disable=SC2034 # read by config.sh, node-runtime.sh and plan-*.sh
+npm_jq_grammar='
+  def npm_name_ok: type == "string" and length <= 214 and
+    test("^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$");
+  def npm_version_ok: type == "string" and length <= 128 and
+    test("^[0-9A-Za-z][0-9A-Za-z.+-]*$");
+  def npm_argv_ok: type == "array" and length >= 1 and length <= 8 and
+    all(.[]; type == "string") and
+    (.[0] | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+    all(.[1:][]; length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$"));
+  def npm_id_ok: type == "string" and startswith("npm:") and (ltrimstr("npm:") | npm_name_ok);
+  def node_version_ok: type == "string" and test("^v[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,6}$");
+'
+
 npm_package_name_valid() (
   # npm's registry grammar, optionally scoped. Bash's own regex, never grep:
   # a name must be one line, and grep matches any line of a multi-line value.
@@ -218,25 +237,67 @@ npm_global_installed_version() (
   npm_global_list | jq -r --arg name "$1" '.[$name] // empty'
 )
 
-npm_global_list_detail() (
-  # `{name: {version, pinnable}}` for every top-level global, including the
-  # ones npm_global_list drops: a global without a version, or one sourced
-  # from `file:`, `link:` or git (an `npm link`, a local tarball), cannot be
-  # reinstalled by exact registry version and is reported unpinnable, never
-  # silently left out. Same failure rules as npm_global_list.
-  npm_detail_json=$(npm_global_run ls --global --json --depth=0 2>/dev/null) || :
-  printf '%s\n' "$npm_detail_json" | jq -ce '
+npm_list_detail_parse() (
+  # `npm ls --global --json --depth=0` output on stdin -> `{name: {version,
+  # pinnable}}` for every top-level global, including the ones
+  # npm_global_list drops: a global without a version, or one sourced from
+  # `file:`, `link:` or git, cannot be reinstalled by exact registry version
+  # and is reported unpinnable, never silently left out. An error object or
+  # anything that is not the tree is a failed query.
+  jq -ce "$npm_jq_grammar"'
     if type == "object" and (has("error") | not) and
       ((.dependencies // {}) | type == "object") then
       (.dependencies // {}) | with_entries(
         select(.value | type == "object") |
+        .key as $name |
         .value = {
           version: (if (.value.version | type) == "string" then .value.version else null end),
-          pinnable: ((.value.version | type) == "string" and
-            (.value.version | test("^[0-9A-Za-z][0-9A-Za-z.+-]*$")) and
-            (.key | test("^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
+          pinnable: ((.value.version | npm_version_ok) and ($name | npm_name_ok) and
             ((.value.resolved // "") | test("^(file:|link:|git[+:]|github:|gitlab:|bitbucket:)") | not) and
             (.value.link // false) != true)
         })
     else error("invalid npm ls output") end' 2>/dev/null
+)
+
+npm_global_list_detail() (
+  # The durable npm's globals, through npm_list_detail_parse.
+  npm_detail_json=$(npm_global_run ls --global --json --depth=0 2>/dev/null) || :
+  printf '%s\n' "$npm_detail_json" | npm_list_detail_parse
+)
+
+npm_prefix_run() (
+  # `npm_prefix_run BIN_DIR PREFIX ARG...` — the npm in BIN_DIR, under the
+  # node beside it, against the global prefix PREFIX given explicitly (so no
+  # `prefix=` in an npmrc can redirect it). A Node switch stages the new
+  # version's prefix this way before that version becomes the default.
+  npm_bin=$1
+  npm_prefix=$2
+  shift 2
+  [ -x "$npm_bin/npm" ] && [ -x "$npm_bin/node" ] || exit 69
+  PATH="$npm_bin:$PATH" NO_UPDATE_NOTIFIER=1 npm_config_update_notifier=false \
+    npm_config_fund=false npm_config_audit=false \
+    exec "$npm_bin/npm" --prefix "$npm_prefix" "$@" </dev/null
+)
+
+npm_prefix_list_detail() (
+  # `npm_prefix_list_detail BIN_DIR PREFIX` — that prefix's globals, parsed
+  # the same way as the durable npm's.
+  npm_detail_json=$(npm_prefix_run "$1" "$2" ls --global --json --depth=0 2>/dev/null) || :
+  printf '%s\n' "$npm_detail_json" | npm_list_detail_parse
+)
+
+npm_release_newer() (
+  # `npm_release_newer A B` — A is a strictly newer plain release (X.Y.Z)
+  # than B. Anything else (a prerelease, a missing version) is not newer.
+  [[ $1 =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] && [[ $2 =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] ||
+    return 1
+  IFS=. read -r npm_a1 npm_a2 npm_a3 <<EOF
+$1
+EOF
+  IFS=. read -r npm_b1 npm_b2 npm_b3 <<EOF
+$2
+EOF
+  [ $((10#$npm_a1)) -ne $((10#$npm_b1)) ] && { [ $((10#$npm_a1)) -gt $((10#$npm_b1)) ]; return; }
+  [ $((10#$npm_a2)) -ne $((10#$npm_b2)) ] && { [ $((10#$npm_a2)) -gt $((10#$npm_b2)) ]; return; }
+  [ $((10#$npm_a3)) -gt $((10#$npm_b3)) ]
 )
