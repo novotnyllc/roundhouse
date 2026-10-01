@@ -647,7 +647,20 @@ two harnesses independently and refresh each available, applicable runtime.
 For Claude, compare the marketplace entry's resolved source SHA with the
 installed plugin's `gitCommitSha` as well as its version: the same version with
 new bytes is stale and must reinstall, while matching version and SHA is a
-no-op.
+no-op. A catalog entry that states no version is compared by SHA alone. A
+relative-source entry (`"source": "./plugin"`, as impeccable, last30days and
+most of `claude-plugins-official` publish) has no SHA of its own: its identity
+is the marketplace checkout's commit (git `HEAD`, or the `.gcs-sha` marker of
+an archive download), and an installed copy whose bytes are identical to the
+checkout's keeps its recorded SHA, so a marketplace commit that did not touch
+the plugin does not demand an update.
+
+The scheduled run applies the same comparison. When it cannot prove an
+installed plugin's identity — no catalog entry, or an entry with no SHA — it
+first re-registers the marketplace from its configured source (the
+`extraKnownMarketplaces` declaration, else the source already registered) and
+refreshes it, once per marketplace per run, and asks again; only then does the
+plugin hold, as `installed marketplace identity unavailable (REASON)`.
 For local execution set `TARGET_CLI="$CLI"` and verify the loaded executor. For
 SSH, use the configured alias and target login shell (`$SHELL -lc`), resolve the
 target's installed Roundhouse version from its active Codex plugin

@@ -290,7 +290,9 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = marketplace ] &&
   [ "\${3:-}" = add ]; then
   [ -z "\${CLAUDE_MARKETPLACE_ADD_LOG:-}" ] || printf '%s\n' "\$4" >>"\$CLAUDE_MARKETPLACE_ADD_LOG"
   if [ -n "\${CLAUDE_PLUGIN_MARKETPLACE_FILE:-}" ] && [ -n "\${CLAUDE_MARKETPLACE_ADD_NAME:-}" ]; then
-    jq --arg n "\$CLAUDE_MARKETPLACE_ADD_NAME" '. + [{name:\$n}]' "\$CLAUDE_PLUGIN_MARKETPLACE_FILE" \
+    jq --arg n "\$CLAUDE_MARKETPLACE_ADD_NAME" --arg loc "\${CLAUDE_MARKETPLACE_ADD_LOCATION:-}" \
+      '. + [{name:\$n} + (if \$loc == "" then {} else {installLocation:\$loc} end)]' \
+      "\$CLAUDE_PLUGIN_MARKETPLACE_FILE" \
       >"\$CLAUDE_PLUGIN_MARKETPLACE_FILE.new" && mv "\$CLAUDE_PLUGIN_MARKETPLACE_FILE.new" "\$CLAUDE_PLUGIN_MARKETPLACE_FILE"
   fi
   exit 0

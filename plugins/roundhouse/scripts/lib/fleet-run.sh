@@ -825,7 +825,8 @@ fleet_run_plugin_catalog() {
   fleet_run_catalog_entry=$(printf '%s\n' "$fleet_run_catalog_json" |
     jq -e -c --arg id "$fleet_run_catalog_id" '
       (if type == "array" then .[] else (.available // [])[] end) |
-      select((.pluginId // .id) == $id and (.source.sha // "") != "")' \
+      select((.pluginId // .id) == $id and
+        (.source | if type == "object" then (.sha // "") else "" end) != "")' \
       2>/dev/null) || fleet_run_catalog_entry=
   [ -n "$fleet_run_catalog_entry" ] && {
     printf '%s\n' "$fleet_run_catalog_entry"
@@ -849,12 +850,186 @@ fleet_run_plugin_catalog() {
        . + {pluginId: ($name + "@" + $market), marketplaceName: $market}' \
       "$fleet_run_catalog_manifest" 2>/dev/null) || continue
     [ -n "$fleet_run_catalog_entry" ] || continue
+    # A RELATIVE-SOURCE entry (`"source": "./plugin"`) lives inside the
+    # marketplace checkout itself and has no SHA of its own: its identity is
+    # the checkout's commit (§3.5). Without this every such plugin — impeccable,
+    # last30days, and most of claude-plugins-official — held forever as
+    # "identity unavailable".
+    fleet_run_catalog_rel=$(printf '%s\n' "$fleet_run_catalog_entry" |
+      jq -r 'if (.source | type) == "string" then .source else empty end')
+    if [ -n "$fleet_run_catalog_rel" ]; then
+      fleet_run_catalog_relsha=$(fleet_run_relative_source_sha \
+        "$fleet_run_catalog_location" "$fleet_run_catalog_rel" \
+        "$fleet_run_catalog_id") || fleet_run_catalog_relsha=
+      [ -z "$fleet_run_catalog_relsha" ] ||
+        fleet_run_catalog_entry=$(printf '%s\n' "$fleet_run_catalog_entry" |
+          jq -c --arg sha "$fleet_run_catalog_relsha" \
+            '.source = {source: "relative", path: .source, sha: $sha}')
+    fi
     printf '%s\n' "$fleet_run_catalog_entry"
     return 0
   done <<EOF
 $fleet_run_catalog_locations
 EOF
   return 75
+}
+
+fleet_run_marketplace_commit() {
+  # fleet_run_marketplace_commit CHECKOUT -> the commit the marketplace
+  # checkout was taken at: git HEAD for a clone, the `.gcs-sha` marker for an
+  # archive download (claude-plugins-official ships as one). Both are
+  # read-only; `rev-parse` neither fetches nor runs hooks. Git is asked only
+  # when the checkout is itself a repository: `git -C` walks UP, and an archive
+  # checkout under a versioned ~/.claude would otherwise answer with that
+  # repository's HEAD.
+  fleet_run_mcommit=
+  [ ! -e "$1/.git" ] ||
+    fleet_run_mcommit=$(git -C "$1" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null) ||
+    fleet_run_mcommit=
+  [ -n "$fleet_run_mcommit" ] || [ ! -f "$1/.gcs-sha" ] ||
+    fleet_run_mcommit=$(tr -d ' \n\r' <"$1/.gcs-sha")
+  printf '%s\n' "$fleet_run_mcommit" | grep -Eq '^[0-9a-fA-F]{40}$' || return 1
+  printf '%s\n' "$fleet_run_mcommit"
+}
+
+fleet_run_tree_digest() (
+  # fleet_run_tree_digest DIR -> one digest over every file's relative path and
+  # bytes, `.git` excluded, and the two markers Claude leaves in an installed
+  # copy (`.in_use`, `.orphaned_at`), which are not plugin content.
+  cd "$1" 2>/dev/null || exit 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    tree_sum=sha256sum
+  else
+    tree_sum='shasum -a 256'
+  fi
+  # shellcheck disable=SC2086 # the digest tool and its flags, one word each
+  find . -name .git -prune -o -type f ! -path ./.in_use ! -path ./.orphaned_at \
+    -print0 | LC_ALL=C sort -z | xargs -0 $tree_sum 2>/dev/null | sha256_stream
+)
+
+fleet_run_relative_source_sha() {
+  # fleet_run_relative_source_sha CHECKOUT REL ID -> the SHA a relative-source
+  # plugin's bytes are identified by. Normally the checkout's commit. But a
+  # marketplace moves for every commit to its repository, most of which do not
+  # touch this plugin, and the native manager does not reinstall a plugin whose
+  # version did not change — so a bare commit compare would demand an update
+  # the manager then declines, every pass, forever. When the installed copy's
+  # bytes are IDENTICAL to the checkout's, the installed SHA is still the right
+  # identity, and that is what this answers. Marketplace checkouts are shallow,
+  # so the comparison is of the bytes on disk, not of two commits' trees.
+  case $2 in
+    . | ./*) ;;
+    *) return 1 ;;
+  esac
+  fleet_run_rel_path=${2#.}
+  fleet_run_rel_path=${fleet_run_rel_path#/}
+  fleet_run_rel_path=${fleet_run_rel_path%/}
+  case /$fleet_run_rel_path/ in
+    */../* | */./*) return 1 ;;
+  esac
+  fleet_run_rel_commit=$(fleet_run_marketplace_commit "$1") || return 1
+  fleet_run_rel_installed=$(fleet_run_installed_plugin "$3" 2>/dev/null) ||
+    fleet_run_rel_installed='{}'
+  fleet_run_rel_isha=$(printf '%s\n' "$fleet_run_rel_installed" | jq -r '.gitCommitSha // empty')
+  fleet_run_rel_ipath=$(printf '%s\n' "$fleet_run_rel_installed" | jq -r '.installPath // empty')
+  if printf '%s\n' "$fleet_run_rel_isha" | grep -Eq '^[0-9a-fA-F]{40}$' &&
+    [ "$fleet_run_rel_isha" != "$fleet_run_rel_commit" ] &&
+    [ -n "$fleet_run_rel_ipath" ] && [ -d "$fleet_run_rel_ipath" ] &&
+    [ -d "$1/$fleet_run_rel_path" ]; then
+    fleet_run_rel_have=$(fleet_run_tree_digest "$fleet_run_rel_ipath") || fleet_run_rel_have=
+    fleet_run_rel_want=$(fleet_run_tree_digest "$1/$fleet_run_rel_path") || fleet_run_rel_want=x
+    if [ -n "$fleet_run_rel_have" ] && [ "$fleet_run_rel_have" = "$fleet_run_rel_want" ]; then
+      printf '%s\n' "$fleet_run_rel_isha"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$fleet_run_rel_commit"
+}
+
+fleet_run_plugin_catalog_proven() {
+  # fleet_run_plugin_catalog_proven ID -> a catalog entry that carries a
+  # resolved 40-hex source SHA. Exit 75 when there is no entry, 74 when the
+  # entry cannot prove its bytes — distinct, so a caller can say which.
+  fleet_run_proven=$(fleet_run_plugin_catalog "$1") || return 75
+  printf '%s\n' "$fleet_run_proven" | jq -r '
+    .source | if type == "object" then (.sha // "") else "" end' |
+    grep -Eq '^[0-9a-fA-F]{40}$' || return 74
+  printf '%s\n' "$fleet_run_proven"
+}
+
+fleet_run_marketplace_source() {
+  # fleet_run_marketplace_source NAME [LIST_JSON] -> the source to register a
+  # marketplace from: the user's own synced declaration first, else the source
+  # the harness already has registered under that NAME (re-registering a
+  # broken checkout from its own source changes nothing about whom it trusts).
+  # Nothing is returned that is option-shaped or carries whitespace.
+  fleet_run_msource=
+  fleet_run_msettings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+  # A declared ref (branch or tag) is kept with `#ref`, so registration
+  # resolves the revision the user pinned rather than the default branch.
+  [ ! -f "$fleet_run_msettings" ] ||
+    fleet_run_msource=$(jq -er --arg n "$1" '
+      .extraKnownMarketplaces[$n].source // empty |
+      ((.ref // "") | if . == "" then "" else "#" + . end) as $ref |
+      if .source == "github" then .repo + $ref
+      elif .source == "git" then .url + $ref
+      elif .source == "directory" then .path
+      elif .source == "url" then .url
+      else empty end
+    ' "$fleet_run_msettings" 2>/dev/null) || fleet_run_msource=
+  [ -n "$fleet_run_msource" ] || [ -z "${2:-}" ] ||
+    fleet_run_msource=$(printf '%s\n' "$2" | jq -r --arg n "$1" '
+      [(if type == "array" then .[] else (.marketplaces // [])[] end) |
+        select(.name == $n) | (.repo // .url // .path // empty)] | .[0] // empty' \
+      2>/dev/null) || fleet_run_msource=
+  case $fleet_run_msource in
+    ''|-*|*[[:space:]]*) return 75 ;;
+    *'#'*) case ${fleet_run_msource##*#} in ''|*[!A-Za-z0-9._/-]*) return 75 ;; esac ;;
+  esac
+  printf '%s\n' "$fleet_run_msource"
+}
+
+fleet_run_marketplace_repair() {
+  # fleet_run_marketplace_repair NAME — §3.5: a plugin held for "marketplace
+  # identity unavailable" re-registers and refreshes before it holds again.
+  # Registers the marketplace from its configured source when the harness does
+  # not know it (or its checkout is gone), then refreshes it, so the caller
+  # can look ONCE more. Called directly, never in a command substitution: the
+  # outcome is remembered for the rest of the run, so twenty plugins from one
+  # broken marketplace cost one refresh, not twenty.
+  case " ${fleet_run_repaired_ok:-} " in *" $1 "*) return 0 ;; esac
+  case " ${fleet_run_repaired_failed:-} " in *" $1 "*) return 75 ;; esac
+  fleet_run_repair_rc=0
+  fleet_run_marketplace_repair_once "$1" || fleet_run_repair_rc=$?
+  if [ "$fleet_run_repair_rc" -eq 0 ]; then
+    fleet_run_repaired_ok="${fleet_run_repaired_ok:-} $1"
+  else
+    fleet_run_repaired_failed="${fleet_run_repaired_failed:-} $1"
+  fi
+  return "$fleet_run_repair_rc"
+}
+
+fleet_run_marketplace_repair_once() {
+  fleet_upstream_id_valid "$1" || return 75
+  command -v claude >/dev/null 2>&1 || return 75
+  fleet_run_repair_list=$(claude plugin marketplace list --json 2>/dev/null) || return 75
+  fleet_run_repair_location=$(printf '%s\n' "$fleet_run_repair_list" | jq -r --arg n "$1" '
+    [(if type == "array" then .[] else (.marketplaces // [])[] end) |
+      select(.name == $n)] | if length == 0 then "-" else (.[0].installLocation // "") end' \
+    2>/dev/null) || return 75
+  if [ "$fleet_run_repair_location" = - ]; then
+    fleet_run_ensure_marketplace "$1" || return 75
+  elif [ -n "$fleet_run_repair_location" ] &&
+    [ ! -f "$fleet_run_repair_location/.claude-plugin/marketplace.json" ]; then
+    # Registered, but the checkout is gone or unreadable: register it again
+    # from its configured source. A refusal here is not final; the refresh
+    # below may still restore the checkout.
+    if fleet_run_repair_source=$(fleet_run_marketplace_source "$1" \
+      "$fleet_run_repair_list"); then
+      claude plugin marketplace add "$fleet_run_repair_source" >/dev/null 2>&1 || :
+    fi
+  fi
+  claude plugin marketplace update "$1" >/dev/null 2>&1 || return 75
 }
 
 fleet_run_ensure_marketplace() {
@@ -873,23 +1048,8 @@ fleet_run_ensure_marketplace() {
   ' >/dev/null 2>&1; then
     return 0
   fi
-  fleet_run_ensure_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
-  [ -f "$fleet_run_ensure_settings" ] || return 75
-  # A declared ref (branch or tag) is kept with `#ref`, so registration
-  # resolves the revision the user pinned rather than the default branch.
-  fleet_run_ensure_source=$(jq -er --arg n "$fleet_run_ensure_name" '
-    .extraKnownMarketplaces[$n].source // empty |
-    ((.ref // "") | if . == "" then "" else "#" + . end) as $ref |
-    if .source == "github" then .repo + $ref
-    elif .source == "git" then .url + $ref
-    elif .source == "directory" then .path
-    elif .source == "url" then .url
-    else empty end
-  ' "$fleet_run_ensure_settings" 2>/dev/null) || return 75
-  case $fleet_run_ensure_source in
-    ''|-*|*[[:space:]]*) return 75 ;;
-    *'#'*) case ${fleet_run_ensure_source##*#} in ''|*[!A-Za-z0-9._/-]*) return 75 ;; esac ;;
-  esac
+  fleet_run_ensure_source=$(fleet_run_marketplace_source "$fleet_run_ensure_name") ||
+    return 75
   claude plugin marketplace add "$fleet_run_ensure_source" >/dev/null 2>&1 || return 75
   claude plugin marketplace list --json 2>/dev/null | jq -e --arg n "$fleet_run_ensure_name" '
     (if type == "array" then . else (.marketplaces // []) end) | any(.[]; .name == $n)
@@ -991,8 +1151,19 @@ fleet_run_plugin_identity_matches() {
   # marketplace plugin with the user-scoped installed record before ownership
   # can turn an already-applied item into `nothing`. Return 0 for matching
   # bytes/version, 1 for a reinstall, and 75 when the manager cannot prove the
-  # identity.
-  fleet_run_identity_surface=$(fleet_resolve_surface "$1" plugins "$2") || return 75
+  # identity — with `fleet_run_identity_reason` naming which proof was missing,
+  # because "identity unavailable" on twenty plugins is not a diagnosis.
+  #
+  # SELF-REPAIR FIRST (§3.5). A catalog that has no entry, or an entry with no
+  # SHA, is most often a marketplace that was never registered on a headless
+  # host or whose checkout went stale; the hold used to be permanent. The
+  # marketplace is re-registered from its configured source and refreshed, and
+  # the catalog is asked ONCE more before the item holds.
+  fleet_run_identity_reason=
+  fleet_run_identity_surface=$(fleet_resolve_surface "$1" plugins "$2") || {
+    fleet_run_identity_reason="the plugin's definition does not resolve"
+    return 75
+  }
   fleet_run_identity_market=$(printf '%s\n' "$3" | jq -r \
     'if type == "object" then (.marketplace // "") else "" end')
   [ -n "$fleet_run_identity_market" ] || fleet_run_identity_market=$(printf '%s\n' \
@@ -1001,10 +1172,35 @@ fleet_run_plugin_identity_matches() {
   # marketplace SHA to compare here; the existing manager presence path stays
   # authoritative for that zero-config form.
   [ -n "$fleet_run_identity_market" ] || return 0
-  command -v claude >/dev/null 2>&1 || return 75
+  command -v claude >/dev/null 2>&1 || {
+    fleet_run_identity_reason='claude is not on PATH for this run'
+    return 75
+  }
   fleet_run_identity_id="$2@$fleet_run_identity_market"
-  fleet_run_identity_catalog=$(fleet_run_plugin_catalog "$fleet_run_identity_id") || return 75
-  fleet_run_identity_installed=$(fleet_run_installed_plugin "$fleet_run_identity_id") || return 75
+  fleet_run_identity_rc=0
+  fleet_run_identity_catalog=$(fleet_run_plugin_catalog_proven \
+    "$fleet_run_identity_id") || fleet_run_identity_rc=$?
+  if [ "$fleet_run_identity_rc" -ne 0 ] &&
+    fleet_run_marketplace_repair "$fleet_run_identity_market"; then
+    fleet_run_identity_rc=0
+    fleet_run_identity_catalog=$(fleet_run_plugin_catalog_proven \
+      "$fleet_run_identity_id") || fleet_run_identity_rc=$?
+  fi
+  case $fleet_run_identity_rc in
+    0) ;;
+    74)
+      fleet_run_identity_reason="the $fleet_run_identity_market catalog entry carries no source SHA, even after a refresh"
+      return 75
+      ;;
+    *)
+      fleet_run_identity_reason="no $fleet_run_identity_market catalog entry for $fleet_run_identity_id, even after re-registering and refreshing the marketplace"
+      return 75
+      ;;
+  esac
+  fleet_run_identity_installed=$(fleet_run_installed_plugin "$fleet_run_identity_id") || {
+    fleet_run_identity_reason='installed_plugins.json is unreadable'
+    return 75
+  }
   fleet_run_identity_sha=$(printf '%s\n' "$fleet_run_identity_catalog" |
     jq -r '.source.sha // empty')
   fleet_run_identity_version=$(printf '%s\n' "$fleet_run_identity_catalog" |
@@ -1013,10 +1209,12 @@ fleet_run_plugin_identity_matches() {
     jq -r '.gitCommitSha // empty')
   fleet_run_identity_installed_version=$(printf '%s\n' "$fleet_run_identity_installed" |
     jq -r '.version // empty')
-  printf '%s\n' "$fleet_run_identity_sha" |
-    grep -Eq '^[0-9a-fA-F]{40}$' || return 75
+  # A catalog entry that states no version proves identity by SHA alone: the
+  # manager then records a version of its own making (a SHA prefix), and
+  # comparing "" against it demanded a reinstall on every pass.
   [ "$fleet_run_identity_sha" = "$fleet_run_identity_installed_sha" ] &&
-    [ "$fleet_run_identity_version" = "$fleet_run_identity_installed_version" ]
+    { [ -z "$fleet_run_identity_version" ] ||
+      [ "$fleet_run_identity_version" = "$fleet_run_identity_installed_version" ]; }
 }
 
 fleet_run_skill_source_identity() {
@@ -1465,11 +1663,13 @@ fleet_run_apply_item() {
       fleet_run_plugin_mutated=false
       fleet_run_resolved_sha=
       if [ -n "$fleet_run_market" ]; then
-        # An unregistered marketplace has no catalog; register it from the
-        # declared source, then look again.
-        fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id") ||
-          { fleet_run_ensure_marketplace "$fleet_run_market" &&
-            fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id"); } || return 75
+        # A catalog that cannot prove the bytes — no entry (an unregistered
+        # or stale marketplace) or an entry with no SHA — re-registers and
+        # refreshes the marketplace, then looks ONCE more (§3.5).
+        fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id") ||
+          { fleet_run_marketplace_repair "$fleet_run_market" &&
+            fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id"); } ||
+          return 75
         fleet_run_resolved_sha=$(printf '%s\n' "$fleet_run_catalog" |
           jq -r '.source.sha // empty')
         fleet_run_resolved_version=$(printf '%s\n' "$fleet_run_catalog" |
@@ -1483,8 +1683,11 @@ fleet_run_apply_item() {
         # bytes. Hold it instead of silently trusting a version string.
         printf '%s\n' "$fleet_run_resolved_sha" |
           grep -Eq '^[0-9a-fA-F]{40}$' || return 75
+        # A catalog entry with no version is proven by its SHA alone, as in
+        # fleet_run_plugin_identity_matches.
         if [ "$fleet_run_resolved_sha" != "$fleet_run_installed_sha" ] ||
-          [ "$fleet_run_resolved_version" != "$fleet_run_installed_version" ]; then
+          { [ -n "$fleet_run_resolved_version" ] &&
+            [ "$fleet_run_resolved_version" != "$fleet_run_installed_version" ]; }; then
           # install is for the absent-record case; an existing user-scoped
           # record with stale bytes goes through the manager's own update
           # verb (the target-native refresh sequence in
@@ -1502,8 +1705,9 @@ fleet_run_apply_item() {
           fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 75
           [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // empty')" \
             = "$fleet_run_resolved_sha" ] &&
-            [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
-              = "$fleet_run_resolved_version" ] || return 75
+            { [ -z "$fleet_run_resolved_version" ] ||
+              [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
+                = "$fleet_run_resolved_version" ]; } || return 75
           if [ "$fleet_run_want_enabled" = true ]; then
             fleet_run_approve_plugin_hooks "$fleet_run_id" \
               "$fleet_run_resolved_sha" || return 75
@@ -1870,6 +2074,9 @@ fleet_run_command() (
   run_store=$(fleet_store_path)
   run_host=$(fleet_host_name)
   fleet_vcs_store_ready "$run_store" || exit $?
+  # One marketplace repair per marketplace per run (fleet_run_marketplace_repair).
+  fleet_run_repaired_ok=
+  fleet_run_repaired_failed=
 
   # §10.6: one run per host. The stale threshold keys on the FULL cadence and
   # never on the fast interval — a 40-minute threshold would declare a live
@@ -2294,10 +2501,11 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       case $run_plugin_identity_status in
         1) run_match=no ;;
         75)
-          printf '  hold  %s — installed marketplace identity unavailable\n' "$run_item"
+          printf '  hold  %s — installed marketplace identity unavailable (%s)\n' \
+            "$run_item" "${fleet_run_identity_reason:-unproven}"
           fleet_run_runtime_hold "$run_item" \
-            'installed marketplace identity unavailable' "$run_tmp/sigholds" ||
-            exit 65
+            "installed marketplace identity unavailable: ${fleet_run_identity_reason:-unproven}" \
+            "$run_tmp/sigholds" || exit 65
           fleet_journal_append "$run_store" "$run_host" \
             "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
               '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
