@@ -1641,9 +1641,11 @@ run_auth_health() {
   printf '%s' "$entry" | jq -j '.value.verify[1:][]? | . + "\u0000"' >"$args_file"
   xargs -0 "$verify_command" <"$args_file" >/dev/null 2>&1 &
   verify_pid=$!
+  # Same 10s budget as fifty 0.2s ticks, but a verifier that answers at once
+  # (the common case) is seen within milliseconds instead of a fixed 0.2s.
   ticks=0
   while kill -0 "$verify_pid" >/dev/null 2>&1; do
-    if [ "$ticks" -ge 50 ]; then
+    if [ "$ticks" -ge 69 ]; then
       kill "$verify_pid" >/dev/null 2>&1 || true
       if wait "$verify_pid" >/dev/null 2>&1; then :; fi
       auth_health_status=timeout
@@ -1651,7 +1653,7 @@ run_auth_health() {
       rm -f "$args_file"
       return
     fi
-    sleep 0.2
+    if [ "$ticks" -lt 20 ]; then sleep 0.01; else sleep 0.2; fi
     ticks=$((ticks + 1))
   done
   if wait "$verify_pid" >/dev/null 2>&1; then
@@ -2868,12 +2870,20 @@ if has_section projects; then
 fi
 
 if has_section startup; then
+  # Self-test only: the system launchd directories are host-wide state that no
+  # fixture HOME can contain, so a fixture run would otherwise inventory (and
+  # query launchd for) whatever the developer's or runner's machine happens to
+  # have installed. Never honoured outside ROUNDHOUSE_SELFTEST=1.
+  startup_system_root=
+  if [ "${ROUNDHOUSE_SELFTEST:-0}" = 1 ] && [ -n "${ROUNDHOUSE_TEST_STARTUP_SYSTEM_ROOT:-}" ]; then
+    startup_system_root=$ROUNDHOUSE_TEST_STARTUP_SYSTEM_ROOT
+  fi
   case $(uname -s 2>/dev/null || printf unknown) in
     Darwin)
       for startup_spec in \
         "launchd-user|user|$HOME/Library/LaunchAgents" \
-        "launchd-system-agent|system|/Library/LaunchAgents" \
-        "launchd-system-daemon|system|/Library/LaunchDaemons"; do
+        "launchd-system-agent|system|$startup_system_root/Library/LaunchAgents" \
+        "launchd-system-daemon|system|$startup_system_root/Library/LaunchDaemons"; do
         scheduler=${startup_spec%%|*}
         startup_remainder=${startup_spec#*|}
         scope=${startup_remainder%%|*}

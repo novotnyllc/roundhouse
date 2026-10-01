@@ -309,8 +309,10 @@ if [ -n "$fleet_fixture_yq" ]; then
       verb_status=$?
     [ "$verb_status" -eq 75 ] ||
       fail "an aged lock with an unprovable live pid was not refused (got $verb_status)"
+    # Match the age itself, not the whole line: the lock path is under a
+    # mktemp root whose random suffix can read like "9s9".
     grep -Eq ' is [0-9]+s old;' "$verb_root/stale-err" &&
-      ! grep -Eq '[0-9]+s[0-9]+' "$verb_root/stale-err" ||
+      ! grep -Eq '[0-9]+s[0-9]+s old' "$verb_root/stale-err" ||
       fail "the stale refusal does not name the age exactly once: $(cat "$verb_root/stale-err")"
     rm -f "$verb_lock/meta.json"
     verb_status=0
@@ -423,7 +425,12 @@ rjj_krl() {
   /usr/bin/ssh-keygen -q -k -f "$rjj/$rjj_krl_name" "$@"
 }
 
-if [ "$real_jj_ok" != true ]; then
+if ! section_requested 90; then
+  # Loaded only as the real-jj prerequisite of 91+: they need the probe and the
+  # fixture generators above. The subshell below leaks nothing to them, so its
+  # assertions run once, in 90's own run, not again under every later section.
+  :
+elif [ "$real_jj_ok" != true ]; then
   printf '\n'
   printf '========================================================================\n'
   printf 'NOTICE: real-jj bootstrap block skipped\n'
