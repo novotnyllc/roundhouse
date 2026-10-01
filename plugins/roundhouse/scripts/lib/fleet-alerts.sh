@@ -17,14 +17,33 @@ fleet_alert_name_filter='
   # The ONE file name an alert key maps to: (kind, items), or (kind, slug) for
   # an alert that names no item. The writer and the compaction share this
   # definition, so a compacted store and a freshly written one can never
-  # disagree about where an alert lives. `@uri` keeps the name injective and
-  # free of `/`; the cut keeps it under every filesystem NAME_MAX.
+  # disagree about where an alert lives. UNAMBIGUOUS: each item is `@uri`d on
+  # its own and only then joined with `,` (which `@uri` always escapes), so
+  # ["a,b"] and ["a","b"] are different keys, and the name is never cut here.
+  # A name over 200 characters is bounded by fleet_alert_name_bound (a prefix
+  # and the sha256 of the whole name), which jq cannot compute.
   def alert_name($kind; $slug; $items):
-    (($items // []) | map(tostring) | unique | join(",")) as $joined |
-    (if $joined == "" then $slug else $joined end) as $key |
-    (if $key == $kind then ($kind | @uri)
-     else ($kind | @uri) + "--" + ($key | @uri) end)[0:200] + ".yaml";
+    (($items // []) | map(tostring) | unique) as $list |
+    (if ($list | length) == 0 then $slug
+     elif ($list | length) == 1 then $list[0] else null end) as $raw |
+    (if ($list | length) == 0 then ($slug | @uri)
+     else ($list | map(@uri) | join(",")) end) as $key |
+    (if $raw == $kind then ($kind | @uri)
+     else ($kind | @uri) + "--" + $key end) + ".yaml";
 '
+
+fleet_alert_name_bound() {
+  # `fleet_alert_name_bound NAME.yaml` -> NAME.yaml, or — for a NAME over 200
+  # characters, which no filesystem's NAME_MAX may take — its first 150, `~`
+  # and the sha256 of the WHOLE name: bounded, and still one name per key.
+  alert_bound_base=${1%.yaml}
+  if [ "${#alert_bound_base}" -le 200 ]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s~%s.yaml\n' "$(printf '%s' "$alert_bound_base" | cut -c1-150)" \
+      "$(printf '%s' "$alert_bound_base" | sha256_stream)"
+  fi
+}
 
 # Every alert KIND: how its alert ENDS, and what it is keyed by. The ONE table
 # — fleet_alert_kinds parses it, fleet_alert_lifecycle and the aging and the
@@ -134,8 +153,10 @@ fleet_alert_name() {
     fi
     return 0
   fi
-  jq -rn --arg kind "$alert_name_kind" --arg slug "$alert_name_slug" --args \
-    "$fleet_alert_name_filter"' alert_name($kind; $slug; $ARGS.positional)' "$@"
+  alert_name_full=$(jq -rn --arg kind "$alert_name_kind" --arg slug "$alert_name_slug" \
+    --args "$fleet_alert_name_filter"' alert_name($kind; $slug; $ARGS.positional)' "$@") ||
+    return 1
+  fleet_alert_name_bound "$alert_name_full"
 }
 
 fleet_alert_clear() {
@@ -315,21 +336,38 @@ fleet_alerts_compact() {
   # the newest record per key, and emit `W<TAB>target<TAB>record` for a keeper
   # that is not already at its keyed path, `D<TAB>file` for every other member
   # of the group, and one `U<TAB>count` for the files that could not be keyed.
-  jq -s -r --arg dir "$compact_dir" --rawfile paths "$compact_work/alert-paths" \
-    --arg stamped "$fleet_record_stamped_regex" \
-    "$fleet_alert_name_filter"'
-    ($paths | split("\n") | map(select(. != ""))) as $all |
-    (map(select(.bad != true and (.rec | type == "object") and
+  compact_names="$fleet_alert_name_filter"'
+    def good_records: map(select(.bad != true and (.rec | type == "object") and
         ((.rec.kind // "") | type == "string") and (.rec.kind // "") != "" and
-        (.file | test("\n") | not))) |
-      unique_by(.file)) as $good |
-    [ $good[] |
-      (.file | split("/") | last) as $base |
+        (.file | test("\n") | not))) | unique_by(.file);
+    def record_name: (.file | split("/") | last) as $base |
       (($base | capture($stamped + "(?<slug>.+)[.]yaml$") | .slug) // null) as $slug |
       ((.rec.items // []) | if type == "array" then . else [] end) as $items |
-      (if $slug != null then alert_name(.rec.kind; $slug; $items)
-       elif ($items | length) > 0 then alert_name(.rec.kind; ""; $items)
-       else $base end) as $name |
+      if $slug != null then alert_name(.rec.kind; $slug; $items)
+      elif ($items | length) > 0 then alert_name(.rec.kind; ""; $items)
+      else $base end;
+  '
+  # The few names too long to use as they are are bounded in the shell (the
+  # digest is sha256, which jq has no way to compute), once per name.
+  compact_long_names=$(jq -s -r --arg stamped "$fleet_record_stamped_regex" "$compact_names"'
+    [good_records[] | record_name | select(length > 205)] | unique | .[]' \
+    "$compact_work/alert-records") || return 1
+  compact_long='{}'
+  while IFS= read -r compact_long_name; do
+    [ -n "$compact_long_name" ] || continue
+    compact_long=$(printf '%s\n' "$compact_long" | jq -c --arg k "$compact_long_name" \
+      --arg v "$(fleet_alert_name_bound "$compact_long_name")" '. + {($k): $v}') || return 1
+  done <<EOF
+$compact_long_names
+EOF
+  jq -s -r --arg dir "$compact_dir" --rawfile paths "$compact_work/alert-paths" \
+    --arg stamped "$fleet_record_stamped_regex" --argjson long "$compact_long" \
+    "$compact_names"'
+    ($paths | split("\n") | map(select(. != ""))) as $all |
+    good_records as $good |
+    [ $good[] |
+      (.file | split("/") | last) as $base |
+      (record_name | $long[.] // .) as $name |
       {file, rec, base: $base, target: ($dir + "/" + $name)} ] |
     # A keyed destination that EXISTS but is unreadable or not alert-shaped is
     # never overwritten: its whole group, destination and stamped records

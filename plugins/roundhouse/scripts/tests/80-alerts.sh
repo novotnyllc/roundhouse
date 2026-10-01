@@ -106,6 +106,37 @@ if [ -n "$fleet_fixture_yq" ]; then
       [ "$rec_fast" = "$rec_slow" ] ||
         fail "fleet_alert_name and the shared filter disagree: $rec_fast vs $rec_slow"
     done
+    # The key is UNAMBIGUOUS: an item holding a comma is not two items, and two
+    # long keys that share their first 200 characters are two names, each
+    # bounded under NAME_MAX.
+    [ "$(fleet_alert_name hold s 'a,b')" != "$(fleet_alert_name hold s a b)" ] ||
+      fail "the items [a,b] and [a, b] share one alert file"
+    rec_long_a="plugins.$(printf 'x%.0s' $(seq 1 220))a"
+    rec_long_b="plugins.$(printf 'x%.0s' $(seq 1 220))b"
+    rec_name_a=$(fleet_alert_name integrity s "$rec_long_a")
+    rec_name_b=$(fleet_alert_name integrity s "$rec_long_b")
+    [ "$rec_name_a" != "$rec_name_b" ] ||
+      fail "two long keys with one 200-character prefix share one alert file"
+    [ "${#rec_name_a}" -le 255 ] && [ "${#rec_name_b}" -le 255 ] ||
+      fail "a long alert key was not bounded under NAME_MAX"
+    rec_names="$tmp/records/names"
+    rm -rf "$rec_names"
+    mkdir -p "$rec_names"
+    fleet_alert_write "$rec_names" vireo integrity s 'long a' "$rec_long_a"
+    fleet_alert_write "$rec_names" vireo integrity s 'long b' "$rec_long_b"
+    [ -f "$rec_names/alerts/vireo/$rec_name_a" ] && [ -f "$rec_names/alerts/vireo/$rec_name_b" ] ||
+      fail "the writer did not land two long keys at their two names"
+    fleet_alert_clear "$rec_names" vireo integrity s "$rec_long_a"
+    [ ! -e "$rec_names/alerts/vireo/$rec_name_a" ] && [ -f "$rec_names/alerts/vireo/$rec_name_b" ] ||
+      fail "clearing one long key did not clear exactly its own file"
+    # The compaction lands a stamped long-key record where the writer would.
+    rm -rf "$rec_names" && mkdir -p "$rec_names/alerts/vireo" "$rec_names/work"
+    printf 'kind: integrity\nhost: vireo\nitems: [%s]\ndetail: stamped\nat: "2026-08-01T00:00:00Z"\n' \
+      "$rec_long_a" >"$rec_names/alerts/vireo/20260801T0000-integrity-long.yaml"
+    fleet_alerts_compact "$rec_names" vireo "$rec_names/work" >/dev/null ||
+      fail "the compaction failed on a long key"
+    [ -f "$rec_names/alerts/vireo/$rec_name_a" ] ||
+      fail "the compaction and the writer disagree about a long key's file"
     # A condition alert is CLEARED when its condition ends, and raised again
     # only if it returns.
     rec_life="$tmp/records/lifecycle"
