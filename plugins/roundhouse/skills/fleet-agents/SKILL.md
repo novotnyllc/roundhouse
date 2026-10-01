@@ -164,6 +164,8 @@ uses (first-push gate, redaction sweep, conflict guards).
 
 ```text
 roundhouse fleet-compact-alerts          # one-time: this host's stamped alerts -> one keyed file per alert
+roundhouse fleet-age-evidence [--dry-run]
+                                         # trim this host's evidence past retention, now
 roundhouse fleet-disown [--dry-run] [--host-only] [ITEM...]
                                          # stop managing items without uninstalling them
 ```
@@ -175,6 +177,22 @@ it touches only its own host's directory (a host may not write another's
 `alerts/`), leaves any file it cannot parse where it is, reads in batches (it is
 built for tens of thousands of files), and is idempotent — a second run finds
 nothing to do.
+
+`fleet-age-evidence` runs the full pass's evidence aging by hand, and
+`--dry-run` prints what it would trim without changing anything. Aging covers
+this host's own `journal/`, `alerts/` and `findings/` only. Journal records age
+one by one, by their own `at`, past `evidence_retention_days` (default 90,
+floor 7). A day file is rewritten with what remains, or removed when nothing
+does. A record something still reads is **never** aged:
+
+- the oldest and newest `applied` and `satisfied` record per (item, digest),
+  which carry canary evidence, rule-5 times and the revert signature;
+- every `held` or `reverted` record newer than the item's oldest evidence;
+- the newest `alive` record, and the newest record of any kind;
+- `--now` overrides from the last 30 days, which doctor counts.
+
+Run `fleet-age-evidence --dry-run` before the first full pass on a new build:
+that pass trims every record past retention that nothing reads.
 
 `fleet-disown` removes items from `applied/<this host>.yaml` **without
 uninstalling them** and journals each one `disowned` — not `reverted`, because

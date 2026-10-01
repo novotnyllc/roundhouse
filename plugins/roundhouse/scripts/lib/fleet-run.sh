@@ -2704,6 +2704,18 @@ fleet_run_full_node_runtime() (
   exit 0
 )
 
+fleet_run_retention_days() {
+  # fleet_run_retention_days FOLD -> the evidence retention window in days.
+  # THE WINDOW HAS A FLOOR: it is read from store content, it is not an item
+  # (no digest, no verdict, no canary gate, outside fleet_removal_cap), and
+  # its consequence is deleting evidence on every host — so a value under 7
+  # reads as 7. A non-numeric value falls back to the default rather than to
+  # the floor: a typo should keep more evidence, not less.
+  printf '%s\n' "$1" | jq -r '
+    (.evidence_retention_days // 90) as $d |
+    if ($d | type) == "number" then ([$d, 7] | max | floor) else 90 end'
+}
+
 fleet_run_full_pass() (
   # fleet_run_full_pass STORE HOST FOLD DEFS LAYERDIR TMP — everything the fast
   # run does NOT do, and the reason the fast interval can be 20 minutes:
@@ -2750,10 +2762,8 @@ fleet_run_full_pass() (
   # fleet's entire replicated evidence surface from one unreviewable scalar. A
   # non-numeric value falls back to the default rather than to the floor: a
   # typo should keep more evidence, not less.
-  fleet_trust_age_evidence "$full_store" \
-    "$(printf '%s\n' "$full_fold" | jq -r '
-      (.evidence_retention_days // 90) as $d |
-      if ($d | type) == "number" then ([$d, 7] | max | floor) else 90 end')" || :
+  fleet_trust_age_evidence "$full_store" "$full_host" \
+    "$(fleet_run_retention_days "$full_fold")" || :
 
   # §7.3a B's enrolled side: joins/ is read as a hint and NEVER trusted — the
   # address is SSH'd and the same pubkey confirmed on that machine before any

@@ -1364,7 +1364,7 @@ printf 'verbs: the supervised item-level surface\n'
   set -eu
   for verb_name in fleet-review fleet-apply fleet-accept fleet-hold \
     fleet-pending fleet-journal fleet-finding fleet-lock fleet-unlock \
-    fleet-set-remote fleet-compact-alerts fleet-disown; do
+    fleet-set-remote fleet-compact-alerts fleet-disown fleet-age-evidence; do
     grep -Fq "  roundhouse $verb_name" "$cli" ||
       fail "$verb_name is missing from the usage heredoc"
     grep -Eq "^  $verb_name\)" "$cli" ||
@@ -1376,7 +1376,7 @@ printf 'verbs: the supervised item-level surface\n'
     'fleet-accept' 'fleet-hold only' 'fleet-pending extra' 'fleet-lock extra' \
     'fleet-set-remote' 'fleet-finding one' 'fleet-compact-alerts extra' \
     'fleet-disown' 'fleet-disown --dry-run' 'fleet-disown --bogus x' \
-    'fleet-unlock --force extra'; do
+    'fleet-unlock --force extra' 'fleet-age-evidence --dry-run extra'; do
     verb_status=0
     # shellcheck disable=SC2086 # the malformed argv under test
     "$cli" $verb_bad >/dev/null 2>&1 || verb_status=$?

@@ -320,7 +320,7 @@ YAML
       >"$rec_aging/alerts/vireo/lock-takeover.yaml"
     printf 'kind: some-future-kind\nat: "2001-01-01T00:00:00Z"\n' \
       >"$rec_aging/alerts/vireo/some-future-kind.yaml"
-    fleet_trust_age_evidence "$rec_aging" 90
+    fleet_trust_age_evidence "$rec_aging" vireo 90 >/dev/null
     [ -f "$rec_aging/alerts/vireo/removal-cap.yaml" ] ||
       fail "evidence aging deleted a keyed CONDITION alert by its first-seen time"
     [ ! -f "$rec_aging/alerts/vireo/20010101T0000-removal-cap.yaml" ] ||
@@ -328,6 +328,82 @@ YAML
     [ ! -f "$rec_aging/alerts/vireo/lock-takeover.yaml" ] &&
       [ ! -f "$rec_aging/alerts/vireo/some-future-kind.yaml" ] ||
       fail "an event alert, or an unlisted kind, did not age out"
+
+    # --- §7.11.3 journal aging: per record, never what something still reads ---
+    rec_jage="$tmp/records/journal-aging"
+    rm -rf "$rec_jage"
+    mkdir -p "$rec_jage/journal/vireo" "$rec_jage/journal/wren"
+    # 2001-01: the ONLY canary evidence for plugins.p (old, applied twice), a
+    # withdrawal of nothing that matters, ordinary chatter, and liveness.
+    cat >"$rec_jage/journal/vireo/2001-01-01.yaml" <<'YAML'
+- {item: plugins.p, digest: d1, outcome: applied, at: "2001-01-01T00:00:00Z"}
+- {item: plugins.q, digest: q1, outcome: held, at: "2001-01-01T01:00:00Z"}
+- {outcome: alive, at: "2001-01-01T02:00:00Z"}
+YAML
+    cat >"$rec_jage/journal/vireo/2001-01-02.yaml" <<'YAML'
+- {item: plugins.p, digest: d1, outcome: applied, at: "2001-01-02T00:00:00Z"}
+- {item: plugins.p, digest: d1, outcome: applied, at: "2001-01-02T01:00:00Z"}
+- {outcome: alive, at: "2001-01-02T02:00:00Z"}
+YAML
+    cat >"$rec_jage/journal/vireo/2001-01-03.yaml" <<'YAML'
+- {item: plugins.r, digest: r1, outcome: held, at: "2001-01-03T00:00:00Z"}
+- {outcome: alive, at: "2001-01-03T01:00:00Z"}
+- {outcome: unreachable, source: none, at: "2001-01-03T02:00:00Z"}
+YAML
+    cat >"$rec_jage/journal/vireo/2001-01-04.yaml" <<'YAML'
+- {item: plugins.s, digest: s1, outcome: applied, at: "2001-01-04T00:00:00Z"}
+- {item: plugins.s, digest: s2, outcome: applied, at: "2001-01-04T01:00:00Z"}
+- {outcome: alive, at: "2001-01-04T02:00:00Z"}
+YAML
+    cp "$rec_jage/journal/vireo/2001-01-01.yaml" "$rec_jage/journal/wren/2001-01-01.yaml"
+    rec_jnow=$(fleet_now)
+    fleet_canary_gate "$rec_jage" plugins.p d1 24 "$rec_jnow" vireo ||
+      fail "the fixture's canary evidence did not pass the gate to begin with"
+    rec_jrevert=$(fleet_run_is_revert "$rec_jage" vireo plugins.s s1 && echo yes || echo no)
+    rec_jbefore=$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)
+    rec_jdry=$(fleet_trust_age_evidence "$rec_jage" vireo 90 --dry-run) ||
+      fail "the journal aging dry run failed"
+    [ "$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)" = "$rec_jbefore" ] ||
+      fail "the aging dry run changed the journal"
+    case $rec_jdry in
+      *'dry run'*'journal/vireo: 7 of 12 records past retention (1 day files removed, 2 rewritten)'*) ;;
+      *) fail "the aging dry run did not report the trim: $rec_jdry" ;;
+    esac
+    fleet_trust_age_evidence "$rec_jage" vireo 90 >/dev/null ||
+      fail "journal aging failed"
+    # The canary's ONLY evidence is past retention, and the downstream gate
+    # still passes: its oldest and newest applied records are load-bearing.
+    fleet_canary_gate "$rec_jage" plugins.p d1 24 "$rec_jnow" vireo ||
+      fail "aging removed the canary evidence a downstream host gates on"
+    [ "$(fleet_run_is_revert "$rec_jage" vireo plugins.s s1 && echo yes || echo no)" = \
+      "$rec_jrevert" ] || fail "aging changed the revert signature's answer"
+    # Ordinary old records are gone: the middle applied, a held with no
+    # evidence after it, the older heartbeats, the unreachable record.
+    [ "$(yq -r '[.[] | select(.item == "plugins.p")] | length' \
+      "$rec_jage/journal/vireo/2001-01-02.yaml")" -eq 1 ] ||
+      fail "aging kept the middle applied record, or lost the newest"
+    ! grep -q 'plugins.q' "$rec_jage/journal/vireo/2001-01-01.yaml" ||
+      fail "aging kept an old held record nothing reads"
+    # A day file left with nothing is removed.
+    [ ! -e "$rec_jage/journal/vireo/2001-01-03.yaml" ] ||
+      fail "a day file left empty by aging was not removed"
+    grep -q 'outcome: alive' "$rec_jage/journal/vireo/2001-01-04.yaml" ||
+      fail "aging removed the newest heartbeat"
+    # Idempotent, and this host's own journal only.
+    rec_jafter=$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)
+    case $(fleet_trust_age_evidence "$rec_jage" vireo 90) in
+      *'journal/vireo: 0 of '*) ;;
+      *) fail "a second aging pass found more to trim" ;;
+    esac
+    [ "$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)" = "$rec_jafter" ] ||
+      fail "a second aging pass changed the journal"
+    cmp -s "$rec_jage/journal/wren/2001-01-01.yaml" "$rec_jage/journal/vireo/2001-01-01.yaml" &&
+      fail "the peer fixture is not the original"
+    [ "$(yq -r 'length' "$rec_jage/journal/wren/2001-01-01.yaml")" -eq 3 ] ||
+      fail "aging touched another host's journal"
+    # Efficiency is structural: batched reads, one plan.
+    cli_function_body fleet_trust_age_evidence | grep -q 'fleet_records_read_dir' ||
+      fail "evidence aging no longer reads its directories in batches"
 
     # --- every alert kind has a lifecycle, from one table ---
     for rec_kind in removal-cap integrity identity-unavailable uninstall-deferred \
@@ -429,7 +505,8 @@ YAML
     [ "$(cat "$rec_compact_dir/integrity--plugins.ponytail.yaml")" = "$rec_alert_bytes" ] ||
       fail "the writer and the compaction disagree about an alert's key"
     # Efficiency is structural: batched yq, no per-file subprocess.
-    cli_function_body fleet_alerts_compact | grep -q 'xargs -0 -n 256 bash -c' ||
+    cli_function_body fleet_alerts_compact | grep -q 'fleet_records_read_dir' &&
+      cli_function_body fleet_records_read_dir | grep -q 'xargs -0 -n 256 bash -c' ||
       fail "the compaction no longer batches its reads"
 
     # A quote that trips the floor is REFUSED, not silently redacted: §10.4's

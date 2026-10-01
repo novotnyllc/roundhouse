@@ -212,6 +212,73 @@ fleet_journal_entries() {
   return "$journal_rc"
 }
 
+fleet_journal_load_bearing_filter='
+  # The journal records something still READS, as `"<file>\t<index>"` keys:
+  # aging may delete any other record past retention, and these never. One
+  # definition, so a new reader of the journal adds its rows HERE. Input: an
+  # array of {file, i, r}, every record of ONE host; $recent: the cut for
+  # readers with a window of their own.
+  #
+  #   evidence      the OLDEST and the NEWEST `applied` and `satisfied` per
+  #                 (item, digest): the canary gate takes its wait from the
+  #                 oldest and §8.2b rule 5 its time from the newest, and the
+  #                 revert signature (§10.8) needs "this digest was applied"
+  #   withdrawals   every `held` or `reverted` NEWER than its item'"'"'s oldest
+  #                 evidence: canary condition 2 ("nothing later withdrew it")
+  #                 and the revert signature'"'"'s "current" value read them
+  #   liveness      the newest `alive`, and the newest record of any kind:
+  #                 canary condition 3 asks for SOME record after the wait
+  #   overrides     `override` records newer than $recent: fleet-doctor counts
+  #                 the last 30 days of `--now` canary bypasses
+  def journal_load_bearing($recent):
+    map(select(.r | type == "object")) as $recs |
+    def at: (.r.at // "") | tostring;
+    ([$recs[] | select((.r.outcome == "applied" or .r.outcome == "satisfied") and
+        (.r.item | type) == "string")] |
+      group_by([.r.item, ((.r.digest // "") | tostring), .r.outcome]) |
+      map((min_by(at)), (max_by(at)))) as $evidence |
+    ($evidence | group_by(.r.item) |
+      map({key: .[0].r.item, value: (map(at) | min)}) | from_entries) as $since |
+    [$recs[] | select((.r.outcome == "held" or .r.outcome == "reverted") and
+      (.r.item | type) == "string" and $since[.r.item] != null and
+      at > $since[.r.item])] as $withdrawals |
+    ([$recs[] | select(.r.outcome == "alive")] |
+      if length == 0 then [] else [max_by(at)] end) as $alive |
+    (if ($recs | length) == 0 then [] else [$recs | max_by(at)] end) as $newest |
+    [$recs[] | select(.r.override != null and at >= $recent)] as $overrides |
+    [($evidence + $withdrawals + $alive + $newest + $overrides)[] |
+      "\(.file)\t\(.i)"] | unique;
+'
+
+fleet_records_read_dir() {
+  # `fleet_records_read_dir DIR OUT` — every `*.yaml` directly in DIR as JSON
+  # lines `{"file": PATH, "rec": DOCUMENT}` in OUT, and `{"file", "bad": true}`
+  # for a file that does not parse. Built for tens of thousands of files: one
+  # `find`, `yq` over xargs-sized batches, and a batch holding an unreadable
+  # file re-read file by file, so one bad file costs one batch. Exit 0 with an
+  # empty OUT when there is nothing to read.
+  : >"$2" || return 1
+  [ -d "$1" ] || return 0
+  records_read_list=$(mktemp "${TMPDIR:-/tmp}/roundhouse-records.XXXXXX") || return 1
+  find "$1" -mindepth 1 -maxdepth 1 -type f -name '*.yaml' -print0 \
+    >"$records_read_list" || { rm -f "$records_read_list"; return 1; }
+  # An empty list must not reach xargs: with no arguments it still runs the
+  # command once, and a `yq` with no file reads stdin.
+  if [ -s "$records_read_list" ]; then
+    # shellcheck disable=SC2016 # the inner script is bash -c's, expanded there
+    xargs -0 -n 256 bash -c '
+      yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$@" 2>/dev/null && exit 0
+      for records_file do
+        yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$records_file" 2>/dev/null ||
+          jq -cn --arg f "$records_file" "{file: \$f, bad: true}"
+      done' records <"$records_read_list" >"$2" || {
+      rm -f "$records_read_list"
+      return 1
+    }
+  fi
+  rm -f "$records_read_list"
+}
+
 # --- §10.3 applied/<host>.yaml, the ownership record --------------------------
 
 fleet_applied_path() {
@@ -489,23 +556,13 @@ fleet_alerts_compact() {
     printf '0 0 0\n'
     return 0
   }
-  find "$compact_dir" -mindepth 1 -maxdepth 1 -type f -name '*.yaml' -print0 \
-    >"$compact_work/alert-files" || return 1
-  # An empty list must not reach xargs: with no arguments it still runs the
-  # command once, and a `yq` with no file reads stdin.
-  [ -s "$compact_work/alert-files" ] || {
+  find "$compact_dir" -mindepth 1 -maxdepth 1 -type f -name '*.yaml' \
+    >"$compact_work/alert-paths" || return 1
+  [ -s "$compact_work/alert-paths" ] || {
     printf '0 0 0\n'
     return 0
   }
-  # shellcheck disable=SC2016 # the inner script is bash -c's, expanded there
-  xargs -0 -n 256 bash -c '
-    yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$@" 2>/dev/null && exit 0
-    for compact_file do
-      yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$compact_file" 2>/dev/null ||
-        jq -cn --arg f "$compact_file" "{file: \$f, bad: true}"
-    done' compact <"$compact_work/alert-files" >"$compact_work/alert-records" ||
-    return 1
-  tr '\0' '\n' <"$compact_work/alert-files" >"$compact_work/alert-paths"
+  fleet_records_read_dir "$compact_dir" "$compact_work/alert-records" || return 1
   # One pass over every record: key each file the way the writer would, keep
   # the newest record per key, and emit `W<TAB>target<TAB>record` for a keeper
   # that is not already at its keyed path, `D<TAB>file` for every other member

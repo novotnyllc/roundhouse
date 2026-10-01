@@ -1192,43 +1192,102 @@ fleet_trust_prune_expired() {
 }
 
 fleet_trust_age_evidence() {
-  # fleet_trust_age_evidence <store> <retention-days> — §7.11.3's second policy,
-  # DELIBERATELY DECOUPLED from trust checkpointing. They have different natural
-  # periods (a canary window is hours, a trust checkpoint is months) and coupling
-  # them would mean keeping evidence far too long or re-rooting far too often.
-  # Because evidence paths are never inputs to verification, aging them out is a
-  # pure `rm` with no trust reasoning attached.
+  # fleet_trust_age_evidence STORE HOST RETENTION-DAYS [--dry-run] — §7.11.3's
+  # second policy, DELIBERATELY DECOUPLED from trust checkpointing. They have
+  # different natural periods (a canary window is hours, a trust checkpoint is
+  # months) and coupling them would mean keeping evidence far too long or
+  # re-rooting far too often. Evidence paths are never inputs to verification,
+  # so aging them carries no trust reasoning — but some RECORDS are inputs to
+  # other gates, and those are never aged (fleet_journal_load_bearing_filter).
   #
-  # A keyed CONDITION alert (fleet_alert_lifecycle) is exempt: its `at` is when
-  # it was FIRST seen and is never bumped, so aging by it would delete a
-  # still-open alert, and the code that checks its condition clears it
-  # (fleet_alert_clear) when the condition ends. Event alerts, unknown kinds
-  # and every legacy stamped file (fleet_record_stamped_glob) age by `at`.
-  fleet_trust_cutoff=$(fleet_doctor_days_ago "$2")
-  for fleet_trust_edir in journal alerts findings; do
-    [ -d "$1/$fleet_trust_edir" ] || continue
-    # A here-doc rather than `find | while`: the pipeline form runs the body in
-    # a subshell, so nothing it decides can leave the loop. Nothing escapes
-    # today, but the next counter someone adds here would read zero forever.
-    while IFS= read -r fleet_trust_ef; do
-      [ -n "$fleet_trust_ef" ] || continue
-      if [ "$fleet_trust_edir" = alerts ]; then
-        # shellcheck disable=SC2254 # the stamped-name glob is a pattern on purpose
-        case ${fleet_trust_ef##*/} in
-          $fleet_record_stamped_glob) ;;
-          *)
-            [ "$(fleet_alert_lifecycle "$(yq -r '.kind // ""' "$fleet_trust_ef" \
-              2>/dev/null || true)")" != condition ] || continue
-            ;;
-        esac
-      fi
-      fleet_trust_estamp=$(yq -r '(.at // .[0].at // "") | sub("[Tt].*$"; "")' \
-        "$fleet_trust_ef" 2>/dev/null || true)
-      [ -n "$fleet_trust_estamp" ] || continue
-      [ "$fleet_trust_estamp" \< "${fleet_trust_cutoff%%T*}" ] || continue
-      rm -f "$fleet_trust_ef"
-    done <<EOF
-$(find "$1/$fleet_trust_edir" -type f -name '*.yaml' 2>/dev/null)
-EOF
-  done
+  # HOST's OWN evidence only (journal/<h>/, alerts/<h>/, findings/<h>/): those
+  # paths are §7.3 single-writer, and a host that trimmed a peer's would author
+  # a commit its peers refuse. The changes land in the working copy, so they
+  # publish through the ordinary run (or `fleet-age-evidence`).
+  #
+  #   journal   aged per RECORD by its own `at`; a day file is rewritten with
+  #             what remains, or removed when nothing does
+  #   alerts    a keyed CONDITION alert never ages (fleet_alert_lifecycle);
+  #             event alerts, unknown kinds and legacy stamped files age by `at`
+  #   findings  each file by its `at`
+  #
+  # Batched throughout: one read per directory (fleet_records_read_dir), one
+  # jq plan, one `rm` batch, and a `yq` only per day file that is rewritten.
+  # Prints one summary line; `--dry-run` prints it and changes nothing.
+  age_store=$1
+  age_host=$2
+  age_dry=false
+  [ "${4:-}" != --dry-run ] || age_dry=true
+  age_cutoff=$(fleet_doctor_days_ago "$3")
+  age_recent=$(fleet_doctor_days_ago 30)
+  age_work=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-age.XXXXXX") || return 1
+  age_rc=0
+  {
+    fleet_records_read_dir "$age_store/journal/$age_host" "$age_work/journal" &&
+      jq -s -r --arg cutoff "$age_cutoff" --arg recent "$age_recent" \
+        "$fleet_journal_load_bearing_filter"'
+        [ .[] | select(.bad != true and (.rec | type) == "array") ] as $files |
+        [ $files[] as $f | $f.rec | to_entries[] | {file: $f.file, i: .key, r: .value} ]
+          as $all |
+        ($all | journal_load_bearing($recent) |
+          map({key: ., value: true}) | from_entries) as $keep |
+        def aged: ((.r.at // "") | type) == "string" and (.r.at // "") != "" and
+          .r.at < $cutoff and ($keep["\(.file)\t\(.i)"] | not);
+        ($all | map(select(aged)) | length) as $gone |
+        ($all | group_by(.file) | map(. as $mine |
+          ($mine | map(select(aged | not)) | sort_by(.i) | map(.r)) as $left |
+          if ($left | length) == ($mine | length) then empty
+          elif ($left | length) == 0 then "D\t\($mine[0].file)"
+          else "W\t\($mine[0].file)\t\($left | tojson)" end) | .[]),
+        "N\tjournal\t\($gone)\t\($all | length)"' "$age_work/journal" \
+        >"$age_work/plan" &&
+      fleet_records_read_dir "$age_store/alerts/$age_host" "$age_work/alerts" &&
+      jq -s -r --arg cutoff "$age_cutoff" --arg stamped "$fleet_record_stamped_regex" \
+        --rawfile table <(fleet_alert_lifecycle_table) '
+        ($table | split("\n") | map(select(. != "") | split(" ") | map(select(. != ""))) |
+          map({key: .[0], value: .[1]}) | from_entries) as $life |
+        [ .[] | select(.bad != true and (.rec | type) == "object") |
+          ((.file | split("/") | last) | test($stamped)) as $legacy |
+          select($legacy or ($life[(.rec.kind // "") | tostring] // "event") != "condition") |
+          select(((.rec.at // "") | type) == "string" and (.rec.at // "") != "" and
+            .rec.at < $cutoff) | "D\t\(.file)" ] as $d |
+        ($d[]), "N\talerts\t\($d | length)\t\(length)"' "$age_work/alerts" \
+        >>"$age_work/plan" &&
+      fleet_records_read_dir "$age_store/findings/$age_host" "$age_work/findings" &&
+      jq -s -r --arg cutoff "$age_cutoff" '
+        [ .[] | select(.bad != true and (.rec | type) == "object") |
+          select(((.rec.at // "") | type) == "string" and (.rec.at // "") != "" and
+            .rec.at < $cutoff) | "D\t\(.file)" ] as $d |
+        ($d[]), "N\tfindings\t\($d | length)\t\(length)"' "$age_work/findings" \
+        >>"$age_work/plan"
+  } || age_rc=1
+  if [ "$age_rc" -ne 0 ]; then
+    rm -rf "$age_work"
+    printf 'roundhouse: evidence aging could not read its records; nothing aged\n' >&2
+    return 1
+  fi
+  age_summary=$(awk -F'\t' '
+    $1 == "N" { n[$2] = $3; t[$2] = $4 }
+    $1 == "D" && $2 ~ /\/journal\// { jd++ }
+    $1 == "W" { jw++ }
+    END {
+      printf "journal/%s: %d of %d records past retention (%d day files removed, %d rewritten); ",
+        host, n["journal"], t["journal"], jd, jw
+      printf "alerts/%s: %d of %d removed; findings/%s: %d of %d removed",
+        host, n["alerts"], t["alerts"], host, n["findings"], t["findings"]
+    }' host="$age_host" "$age_work/plan")
+  if [ "$age_dry" = true ]; then
+    printf 'roundhouse: evidence aging (dry run, nothing changed): %s\n' "$age_summary"
+    rm -rf "$age_work"
+    return 0
+  fi
+  while IFS='	' read -r age_op age_path age_left; do
+    [ "$age_op" = W ] || continue
+    fleet_record_write "$age_path" "$age_left" || age_rc=1
+  done <"$age_work/plan"
+  awk -F'\t' '$1 == "D" { print $2 }' "$age_work/plan" | tr '\n' '\0' |
+    xargs -0 rm -f || age_rc=1
+  rm -rf "$age_work"
+  printf 'roundhouse: evidence aging: %s\n' "$age_summary"
+  return "$age_rc"
 }

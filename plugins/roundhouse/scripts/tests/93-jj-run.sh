@@ -753,6 +753,35 @@ p0jj_disown() {
     fail "a disowned item was journaled reverted"
 }
 
+p0jj_aging() {
+  # --- §7.11.3: evidence aging, previewed, then published ---
+  mkdir -p "$vireo/journal/vireo"
+  cat >"$vireo/journal/vireo/2001-01-01.yaml" <<'YAML'
+- {item: plugins.q, digest: q1, outcome: held, at: "2001-01-01T01:00:00Z"}
+- {outcome: unreachable, source: none, at: "2001-01-01T02:00:00Z"}
+YAML
+  runjj vireo "$cli" fleet-run --fast >/dev/null ||
+    fail "vireo could not publish the old journal fixture"
+  runjj_out=$(runjj vireo "$cli" fleet-age-evidence --dry-run) ||
+    fail "fleet-age-evidence --dry-run failed: $runjj_out"
+  case $runjj_out in
+    *'dry run'*'journal/vireo: 2 of '*'(1 day files removed'*) ;;
+    *) fail "the aging dry run did not report the trim: $runjj_out" ;;
+  esac
+  [ -f "$vireo/journal/vireo/2001-01-01.yaml" ] || fail "the aging dry run changed the journal"
+  runjj_out=$(runjj vireo "$cli" fleet-age-evidence) ||
+    fail "fleet-age-evidence failed: $runjj_out"
+  case $runjj_out in
+    *'published the evidence aging'*) ;;
+    *) fail "the evidence aging did not publish: $runjj_out" ;;
+  esac
+  ! jj -R "$vireo" file list -r "$(fleet_vcs_head_origin "$vireo")" -T 'path ++ "\n"' |
+    grep -qx 'journal/vireo/2001-01-01.yaml' ||
+    fail "the aged day file is still on the remote"
+  grep -rhq 'outcome: alive' "$vireo/journal/vireo" ||
+    fail "aging removed the newest heartbeat"
+}
+
 p0jj_verb_refusals() {
   # fleet_run_verb_begin's refusals, against a real store: a diverged main
   # (two bookmark heads), a run holding the lock, and an unpublished layer
@@ -792,6 +821,7 @@ if [ "$real_jj_ok" = true ]; then
   p0jj_block compaction p0jj_compaction \
     'alert compaction refused over a layer edit, published, idempotent'
   p0jj_block disown p0jj_disown 'host-only disown: dry run, refusal, publish, no prune after'
+  p0jj_block aging p0jj_aging 'evidence aging previewed by --dry-run, then published'
   p0jj_block verbs p0jj_verb_refusals \
     'publishing verbs refuse a diverged main, a live lock and a foreign edit'
 fi
