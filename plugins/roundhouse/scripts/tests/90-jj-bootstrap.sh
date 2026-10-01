@@ -234,6 +234,22 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$verb_status" -eq 0 ] ||
       fail "a pre-nonce lock with a dead pid was not taken over (got $verb_status)"
     fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
+    # The PRIMITIVE reports a takeover (exit 11, with the dead holder's pid and
+    # stamp) and alerts nothing: the alert, and the stale threshold, are the
+    # run's (fleet_run_lock_take), so fleet-store.sh needs neither.
+    mkdir -p "$verb_lock"
+    printf '{"host":"vireo","pid":%s,"started_at":"2000-01-01T00:00:00Z"}\n' \
+      "$verb_holder" >"$verb_lock/meta.json"
+    rm -rf "$verb_alerts"
+    verb_status=0
+    fleet_lock_take "$verb_lock" 999999 2>/dev/null || verb_status=$?
+    [ "$verb_status" -eq 11 ] && case $fleet_lock_taken_from in *"pid $verb_holder "*) true ;; *) false ;; esac ||
+      fail "the lock primitive did not report a takeover with its dead holder (got $verb_status: $fleet_lock_taken_from)"
+    [ ! -d "$verb_alerts" ] || fail "the lock primitive wrote an alert itself"
+    fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
+    ! sed -n '/^fleet_lock_take() {/,/^}/p' "$(dirname -- "$cli")/lib/fleet-store.sh" |
+      grep -Eq 'fleet_alert_write|fleet_run_stale_after' ||
+      fail "the lock primitive reaches back into the run's alert or policy code"
     # …but a pre-nonce lock whose pid is ALIVE proves nothing about its holder,
     # so the age rule still governs it — and the refusal names the age ONCE.
     mkdir -p "$verb_lock"

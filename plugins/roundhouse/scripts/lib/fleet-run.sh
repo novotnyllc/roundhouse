@@ -1580,6 +1580,21 @@ fleet_run_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '0\n'
 }
 
+# --- §6.3 the run lock, as the run takes it ---------------------------------
+
+fleet_run_lock_take() {
+  # fleet_run_lock_take STORE HOST LOCK — fleet_lock_take with this store's
+  # stale threshold (two full cadences, fleet_run_stale_after), and the alert a
+  # takeover owes: evidence, not a refusal, so the run proceeds. Exit 0
+  # acquired (by takeover or not), 10 held by a live run, 75 refused.
+  fleet_run_lock_take_rc=0
+  fleet_lock_take "$3" "$(fleet_run_stale_after "$1" "$2")" || fleet_run_lock_take_rc=$?
+  [ "$fleet_run_lock_take_rc" -eq 11 ] || return "$fleet_run_lock_take_rc"
+  fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
+    "took over the run lock from a dead holder ($fleet_lock_taken_from); the run it belonged to did not finish" ||
+    :
+}
+
 # --- the commands -------------------------------------------------------------
 
 fleet_run_command() (
