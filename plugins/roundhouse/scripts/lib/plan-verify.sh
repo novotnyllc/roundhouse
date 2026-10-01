@@ -770,6 +770,11 @@ verify_preconditions_command() {
     printf 'roundhouse: current snapshot does not cover every planned operation\n' >&2
     exit 65
   }
+  # No npm upgrade under a Node default a switch left in flight.
+  ! node_switch_npm_blocked "$plan" "$snapshot" || {
+    printf 'roundhouse: a Node switch is recorded in flight on the target; npm upgrades are refused until it is resolved\n' >&2
+    exit 65
+  }
   [ "$(jq -r '.precondition_digest.value' "$plan")" = "$(precondition_digest "$plan" "$snapshot")" ] || {
     printf 'roundhouse: target state changed after planning; create a new plan\n' >&2
     exit 65

@@ -76,6 +76,7 @@ Usage:
   roundhouse fleet-doctor
   roundhouse launcher-install [DESTINATION] [TARGET]
   roundhouse ensure-tools
+  roundhouse node-switch-clear
 EOF
   exit 64
 }
@@ -231,5 +232,6 @@ case $command in
   fleet-doctor) [ $# -eq 0 ] || usage; fleet_doctor_command ;;
   ensure-tools) [ $# -eq 0 ] || usage; fleet_ensure_tools_command ;;
   launcher-install) launcher_install_command "$@" ;;
+  node-switch-clear) [ $# -eq 0 ] || usage; node_switch_clear ;;
   *) usage ;;
 esac

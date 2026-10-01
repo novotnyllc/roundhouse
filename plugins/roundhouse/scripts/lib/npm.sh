@@ -103,13 +103,22 @@ npm_global_bin_dir() (
   return 69
 )
 
-npm_global_run() (
-  # npm with its own node first on PATH, no stdin (these run inside `while
-  # read` loops), and none of npm's interactive or advisory chatter.
-  npm_bin=$(npm_global_bin_dir) || exit 69
-  PATH="$npm_bin:$PATH" NO_UPDATE_NOTIFIER=1 npm_config_update_notifier=false \
+npm_exec() (
+  # `npm_exec BIN_DIR ARG...` — the npm in BIN_DIR with the node beside it
+  # first on PATH, no stdin (these run inside `while read` loops), and none
+  # of npm's interactive or advisory chatter. The one npm environment, for
+  # the durable npm and for a prefix being staged alike.
+  npm_exec_bin=$1
+  shift
+  PATH="$npm_exec_bin:$PATH" NO_UPDATE_NOTIFIER=1 npm_config_update_notifier=false \
     npm_config_fund=false npm_config_audit=false \
-    exec "$npm_bin/npm" "$@" </dev/null
+    exec "$npm_exec_bin/npm" "$@" </dev/null
+)
+
+npm_global_run() (
+  # The durable npm (npm_global_bin_dir), through npm_exec.
+  npm_bin=$(npm_global_bin_dir) || exit 69
+  npm_exec "$npm_bin" "$@"
 )
 
 npm_global_list() (
@@ -274,9 +283,7 @@ npm_prefix_run() (
   npm_prefix=$2
   shift 2
   [ -x "$npm_bin/npm" ] && [ -x "$npm_bin/node" ] || exit 69
-  PATH="$npm_bin:$PATH" NO_UPDATE_NOTIFIER=1 npm_config_update_notifier=false \
-    npm_config_fund=false npm_config_audit=false \
-    exec "$npm_bin/npm" --prefix "$npm_prefix" "$@" </dev/null
+  npm_exec "$npm_bin" --prefix "$npm_prefix" "$@"
 )
 
 npm_prefix_list_detail() (
@@ -286,18 +293,24 @@ npm_prefix_list_detail() (
   printf '%s\n' "$npm_detail_json" | npm_list_detail_parse
 )
 
-npm_release_newer() (
-  # `npm_release_newer A B` — A is a strictly newer plain release (X.Y.Z)
-  # than B. Anything else (a prerelease, a missing version) is not newer.
-  [[ $1 =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] && [[ $2 =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] ||
-    return 1
-  IFS=. read -r npm_a1 npm_a2 npm_a3 <<EOF
-$1
+release_newer() (
+  # `release_newer A B` — A is a strictly newer plain release than B,
+  # compared numerically: `X.Y.Z`, with an optional leading `v` (fnm's Node
+  # spelling). The one release comparison, for Node versions and npm's own
+  # version alike. Exit 1 when A is not newer, 2 when either is not a plain
+  # release (a prerelease, a missing version), which callers read as "not
+  # newer".
+  release_a=${1#v}
+  release_b=${2#v}
+  [[ $release_a =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] &&
+    [[ $release_b =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] || return 2
+  IFS=. read -r release_a1 release_a2 release_a3 <<EOF
+$release_a
 EOF
-  IFS=. read -r npm_b1 npm_b2 npm_b3 <<EOF
-$2
+  IFS=. read -r release_b1 release_b2 release_b3 <<EOF
+$release_b
 EOF
-  [ $((10#$npm_a1)) -ne $((10#$npm_b1)) ] && { [ $((10#$npm_a1)) -gt $((10#$npm_b1)) ]; return; }
-  [ $((10#$npm_a2)) -ne $((10#$npm_b2)) ] && { [ $((10#$npm_a2)) -gt $((10#$npm_b2)) ]; return; }
-  [ $((10#$npm_a3)) -gt $((10#$npm_b3)) ]
+  [ $((10#$release_a1)) -ne $((10#$release_b1)) ] && { [ $((10#$release_a1)) -gt $((10#$release_b1)) ]; return; }
+  [ $((10#$release_a2)) -ne $((10#$release_b2)) ] && { [ $((10#$release_a2)) -gt $((10#$release_b2)) ]; return; }
+  [ $((10#$release_a3)) -gt $((10#$release_b3)) ]
 )

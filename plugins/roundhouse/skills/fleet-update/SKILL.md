@@ -88,13 +88,18 @@ policy.
   requirements unknown) are refused. At apply, the executing host (local or
   the SSH worker) re-derives the carry from its fresh snapshot and requires
   the same carry, hooks and required hooks; no lane reads a store at apply.
-  The executor proves each hook bin under the current prefix, then runs
-  `fnm install`, `fnm default`, one exact `npm install --global a@x b@y …`
-  under the new node, uninstalls anything else left in a previously used
-  target prefix (bundled npm/corepack excepted), verifies the set is exactly
-  the carry at its versions, and runs each hook by
-  absolute path under the new node. Any failure after the default moved
-  points it back at the old version and the apply reports `partial`. Old
+  The executor takes the host's Node switch lock, proves each hook bin under
+  the current prefix, and STAGES the new version before anything live
+  moves: `fnm install`, the new version's npm brought up to the host's if
+  older, one exact `npm install --global a@x b@y …` into the new prefix
+  through its own npm, anything else left in a previously used prefix
+  uninstalled (bundled npm/corepack excepted), and the set verified as
+  exactly the carry at its versions. A failure there leaves the default
+  untouched. Only then does it RECORD the switch in flight, FLIP `fnm
+  default`, verify the default, run each hook by absolute path under the new
+  node, verify the default again, and clear the record. Any failure after
+  the flip points it back at the old version and the apply reports
+  `partial`. Old
   versions are never removed (a service may still run from one); they are
   reported. The sealed lane moves within the current major; a major change is
   a store edit (`runtimes.node`, below). On Windows Node is winget
@@ -242,11 +247,20 @@ carry is installed and verified in the new Node's own prefix before the
 default moves, so a failed carry never touches the live default; the npm
 that installs it is upgraded first if the host's global npm is newer than
 the one the new Node bundles. The move itself is recorded in flight
-(`~/.local/state/roundhouse/node-switch-inflight.json`) until it verifies or
-its restore does. A record left by a crash is rolled back by the next run
-(that run holds the item). One that cannot be rolled back reports the default
-as unverified, alerts `node-runtime-unverified`, and skips the npm globals on
-every full pass until it is resolved. A `runtimes.node` hold of any kind also
+(`~/.local/state/roundhouse/node-switch-inflight.json`, a fixed path whatever
+`XDG_STATE_HOME` says) until it verifies or its restore does, and one lock
+covers every switch and every recovery, so a run never rolls back a switch
+that is still running (it holds the item instead). A record left by a crash
+is rolled back by the next run (that run holds the item). One that cannot be
+rolled back reports the default as unverified, alerts
+`node-runtime-unverified`, and refuses every npm mutation (the full pass's
+npm step, fast-pass npm installs, sealed `npm:*` upgrades) until it is
+resolved. When the old version is gone for good, set a working default
+(`fnm default <version>`) and run `roundhouse node-switch-clear`: it clears
+the record only if no switch is running and the current default verifies.
+A post-switch hook that fails restores the old default, and the reviewed
+apply then holds that exact attempt instead of flipping again every fast
+pass; the full cadence retries it. A `runtimes.node` hold of any kind also
 alerts (`runtime-hold-runtimes-node`), so a persistent hold is visible.
 Hooks a definition requires are sealed from the sealing host's config; a
 hook only the target host declares cannot ride a plan sealed elsewhere (the

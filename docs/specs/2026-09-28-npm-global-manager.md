@@ -234,8 +234,12 @@ item, config validation and the POSIX-only worker projection, the `fnm:node`
 collector record, sealing refusals (omitted, extra or unproven hooks, a wrong
 carry, argv, candidate or runtime id), a failed sealed switch that restores
 and reports `partial` and invalidates its plan, a completed sealed switch with
-its post-state, and, under pwsh, the Windows pin and scope record and the
-machine-scope hold. `collect-windows.ps1 -SelfTest` covers the pin parser.
+its post-state, the switch lock and in-flight record (a recovery leaves a
+running switch alone, a stale lock is taken over, a live writer defers
+recovery, `node-switch-clear` refuses without a verified default), the
+hook-failure backoff, npm mutations refused while a switch is in flight (fast
+install, seal, apply), and, under pwsh, the Windows pin and scope record and
+the machine-scope hold. `collect-windows.ps1 -SelfTest` covers the pin parser.
 
 ## 6. Known limits
 
@@ -358,23 +362,51 @@ only after the target is complete.
 
    Any staging failure exits 1 with the default never moved and nothing
    recorded.
-3. **Flip.** Record the switch in flight, `fnm default TARGET`, require the
-   durable npm to be TARGET's own npm under TARGET's node, run each hook by
+3. **Flip.** Record the switch in flight, `fnm default TARGET`, verify the
+   default (`node_default_verified`: the alias names TARGET, the durable npm
+   resolves through the alias, and its node is TARGET), run each hook by
    absolute path under the new node (re-proved under the new prefix first,
    output to a temporary file so a hook that starts a daemon cannot hold the
-   caller's capture or an SSH session open), then clear the record. Any
-   failure here points `fnm default` back at the old version, verifies the
-   alias and the durable npm's node, clears the record and exits 1; exit 70
-   means the restore could not be verified, and the record stays.
+   caller's capture or an SSH session open), verify the default AGAIN (nothing
+   may have moved it while the hooks ran), and only then clear the record.
+   Any failure here points `fnm default` back at the old version, verifies
+   it the same way, clears the record and exits 1; exit 70 means the restore
+   could not be verified, and the record stays.
 
-**The in-flight record** is host-local,
-`${XDG_STATE_HOME:-~/.local/state}/roundhouse/node-switch-inflight.json`
-(`{old, target, carry}`), outside the store. It is cleared only by a
-verified success or a verified restore, so it survives a crash, a kill or a
-lost SSH session mid-flip. While it exists the collector reports it
-(`switch_inflight` on `fnm:node`), the carry rule holds, every lane refuses a
-new switch, and the desired-state run first tries to finish the job by
+**One lock** (`node-switch.lock`, a directory taken with `mkdir`, its owner
+named by PID and process start time) covers a whole switch and a whole
+recovery, in every lane: the scheduled run, `fleet-apply`, and a sealed
+local or SSH apply. A second switch exits 75 without touching anything; a
+recovery that finds the lock held by a live process leaves the switch alone
+(§7.5). A lock whose holder is gone (killed mid-switch) is stale and is
+taken over; the in-flight record, not the lock, says whether anything needs
+rolling back.
+
+**The in-flight record** (`node-switch-inflight.json`: `{old, target,
+carry, writer: {pid, start}}`) is host-local and outside the store. It is
+cleared only by a verified success or a verified restore, so it survives a
+crash, a kill or a lost SSH session mid-flip. A record whose writer is still
+running is a switch in progress, never an interrupted one. While the record
+exists the collector reports it (`switch_inflight` on `fnm:node`), the carry
+rule holds, every lane refuses a new switch, every npm mutation is refused
+(§7.5, §7.6), and the desired-state run first tries to finish the job by
 restoring the recorded old default (§7.5).
+
+**Where.** The lock, the record and the backoff record (§7.5) live at one
+fixed path, `$HOME/.local/state/roundhouse/`, never under `XDG_STATE_HOME`:
+launchd, an SSH worker and an interactive shell disagree on that variable,
+and every lane must see the same record. The runtime they guard is the
+account's own fnm default, under the same `$HOME`.
+
+**A record no run can roll back** (its old version was uninstalled, or the
+file is unreadable) leaves the default unverified until a person resolves
+it: `roundhouse node-switch-clear` takes the lock, refuses while the record's
+writer is running, and clears the record only when the CURRENT default is
+self-consistent (`node_default_verified`) and its npm globals list. It never
+clears blindly; with no fnm default or an inconsistent one it exits 65 and
+says to set one (`fnm default <version>`) first. The next run converges
+`runtimes.node` from that default. Hooks the interrupted switch did not
+finish are not rerun, so run them by hand if they matter.
 
 Hooks that already ran are not undone; the new version stays installed, so a
 service a hook moved keeps working. **No switch removes a Node version**: a
@@ -451,21 +483,35 @@ requirement is a floor.
   at apply) and left the class open. The installed set has none of those
   failure modes, needs no store, and is what the switch must preserve anyway.
 - **A switch recorded in flight** (§7.3) is resolved before anything else
-  in every run that touches `runtimes.node`. The run restores the recorded
-  old default and verifies it; on success the record is cleared and the item
+  in every run that touches `runtimes.node`. A switch still in progress (the
+  lock or the record's writer is a live process) is left alone and the item
+  holds this run (`hold  runtimes.node — a Node switch is in progress on this
+  host …`). Otherwise the run restores the recorded old default and
+  verifies it; on success the record is cleared and the item
   holds this run (`hold  runtimes.node — an interrupted switch was rolled
   back …`), to be retried on a later run. When the restore cannot be
   verified, or a switch fails and cannot confirm its restore (the executor's
   exit 70), the default is one nobody verified: the run reports it (`hold
   runtimes.node — … is unverified`), never reports the item applied, alerts
-  `node-runtime-unverified`, and skips the npm part of every full cadence's
-  package pass while the record exists (`hold  packages (npm) — Node default
-  is unverified …`). Brew, winget and the rest of the pass still run. An
-  ordinary hold, which leaves the default untouched or restored, skips
-  nothing.
+  `node-runtime-unverified`, and refuses every npm mutation while the record
+  exists: the npm part of every full cadence's package pass (`hold  packages
+  (npm) — Node default is unverified …`), a fast-pass install of an npm
+  package (held), and sealed `npm:*` upgrades (§7.6). Brew, winget and the
+  rest of the pass still run. An ordinary hold, which leaves the default
+  untouched or restored, skips nothing.
+- **Backoff for a hook that keeps failing.** A failed hook restores the old
+  default, and the attempt (target, carry, hooks) is recorded. The reviewed
+  apply holds that exact attempt without flipping (`hold  runtimes.node —
+  the post-switch hooks failed for this exact switch …`) until the target,
+  the carry or the hooks change; the full cadence retries it, so a fixed
+  hook is picked up at most one full interval later. A successful switch
+  clears the record. Without it, a hook that always fails would flip and
+  restore the live default on every fast pass.
 - A `runtimes.node` hold that persists is not silent: every held run writes
-  a `runtime-hold` alert for the item (`runtime-hold-runtimes-node`), which
-  the alert writer deduplicates by kind and item.
+  a `runtime-hold` alert naming the item (`runtime-hold-runtimes-node`).
+  Repeated holds collapse into one alert once alerts are keyed by kind and
+  item (the alert-writer change merging alongside this one); until then
+  each held run writes its own.
 - `fleet-seed` never turns the `fnm:node` record into desired state: not
   `packages.node` (Homebrew would read it as its `node` formula) and not
   `runtimes.node`, which enters the store by hand. Nor does it seed an `npm:*`
@@ -506,6 +552,11 @@ argv is the marker only; the executor knows no other `fnm` shape. `carry`,
   `carry`, `hooks` and `required`. An empty, partial or padded carry, an
   omitted or extra hook, and misstated requirements are refused; so is a
   host with no store, whose hook requirements are unknown.
+- No `npm:*` upgrade seals for a snapshot whose `fnm:node` record shows a
+  switch in flight, verify-preconditions refuses one against a fresh
+  snapshot that shows it, and the executor re-checks its own record before
+  any npm upgrade (`a Node switch is recorded in flight …; npm upgrades are
+  refused until it is resolved`).
 - Apply time, on the host that executes, in every lane (local, and the SSH
   worker): the `fnm:node` record digest (default, installed versions, global
   set, candidate), then the carry rule over the fresh snapshot must give
@@ -601,6 +652,9 @@ its local hooks. Sealing on the target itself works too.
   argv validation (`fleet_resolve_argv_valid`); removing the unused
   `node_version_normalize`; folding the thin wrappers around `node_fnm_run`;
   and extracting the hook-proof loop in `collect-posix` into lib/npm.sh.
+  `seal-plan` keeps its own "at most one Node switch" check in front of the
+  shared operation validator, because the validator reports only "invalid
+  plan draft" and the specific message is what an operator needs.
 
 ## 8. `~/.npmrc`: chezmoi owns it
 

@@ -109,6 +109,12 @@ seal_plan_command() {
     exit 64
   }
   validate_file "$snapshot"
+  # No npm upgrade seals for a host whose snapshot records a Node switch in
+  # flight: its runtime is unverified or still moving.
+  ! node_switch_npm_blocked "$draft" "$snapshot" || {
+    printf 'roundhouse: a Node switch is recorded in flight on the target; npm upgrades are refused until it is resolved\n' >&2
+    exit 65
+  }
   target=$(jq -r '.target' "$draft")
   domain=$(jq -r '.domain' "$draft")
   case $domain in

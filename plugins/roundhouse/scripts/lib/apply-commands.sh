@@ -556,9 +556,12 @@ apply_plan_command() {
   fi
   validate_file "$work/post.jsonl"
   # What the Node switch's target ships itself (node_target_bundled), for its
-  # exact-set post-check; [] when the plan has no switch.
-  node_post_bundled=$(node_target_bundled "$(jq -r 'first(.operations[] |
-    select(.type == "package-upgrade" and .id == "fnm:node") | .candidate_version) // ""' "$plan")")
+  # exact-set post-check. Only a plan with a switch reads it; any other plan
+  # passes [].
+  node_post_bundled='[]'
+  node_post_target=$(jq -r 'first(.operations[] |
+    select(.type == "package-upgrade" and .id == "fnm:node") | .candidate_version) // ""' "$plan")
+  [ -z "$node_post_target" ] || node_post_bundled=$(node_target_bundled "$node_post_target")
   if [ "$apply_status" = completed ] && ! jq -e -n --slurpfile plan "$plan" --slurpfile before "$work/pre.jsonl" \
     --argjson node_bundled "$node_post_bundled" \
     --slurpfile records "$work/post.jsonl" '

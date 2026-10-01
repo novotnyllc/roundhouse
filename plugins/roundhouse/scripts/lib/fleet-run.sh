@@ -1138,12 +1138,13 @@ fleet_run_node_converge() (
   #          major, which fnm never does on its own
   #
   # Exit 0 converged (or already there), 75 held with the default untouched
-  # or restored, 76 held with the default UNVERIFIED: a switch is recorded as
-  # in flight (interrupted, or failed without a verified restore), so
-  # nothing may run npm under the runtime. A recorded switch is handled
-  # FIRST, before any "already in line" answer: an interrupted switch is
-  # never mistaken for a converged one. Every hold prints a line naming the
-  # reason; nothing is ever silently skipped.
+  # or restored (or a switch in progress elsewhere on this host), 76 held
+  # with the default UNVERIFIED: a switch is recorded as in flight
+  # (interrupted, or failed without a verified restore), so nothing may run
+  # npm under the runtime. A recorded switch is handled FIRST, before any
+  # "already in line" answer: an interrupted switch is never mistaken for a
+  # converged one. Every hold prints a line naming the reason; nothing is
+  # ever silently skipped.
   node_value=$1
   node_defs=$2
   node_mode=$3
@@ -1156,6 +1157,7 @@ fleet_run_node_converge() (
   node_switch_recover || node_recover_status=$?
   case $node_recover_status in
     0) ;;
+    74) node_hold 'a Node switch is in progress on this host (another run or an apply); not touched this run' ;;
     75) node_hold 'an interrupted switch was rolled back to its old default (verified); it is retried on a later run' ;;
     *)
       printf '  hold  runtimes.node — a switch is recorded in flight (%s) and the old default could not be restored and verified; the fnm default is unverified\n' \
@@ -1181,7 +1183,7 @@ fleet_run_node_converge() (
     [ "$node_mode" != apply ] || [ "$node_in_line" != true ] || exit 0
     node_target=$(node_fnm_remote_latest "$node_root" "$node_major") ||
       node_hold "cannot list the published Node $node_major releases"
-    if [ "$node_in_line" = true ] && ! node_version_newer "$node_target" "$node_current"; then
+    if [ "$node_in_line" = true ] && ! release_newer "$node_target" "$node_current"; then
       exit 0
     fi
   fi
@@ -1195,14 +1197,24 @@ fleet_run_node_converge() (
     node_hold 'could not compute the npm globals to carry'
   node_plan_held=$(printf '%s\n' "$node_plan" | jq -r '.held // empty')
   [ -z "$node_plan_held" ] || node_hold "$node_plan_held"
+  node_plan_carry=$(printf '%s\n' "$node_plan" | jq -c '.carry')
+  node_plan_hooks=$(printf '%s\n' "$node_plan" | jq -c '.hooks')
+  # A switch whose hooks failed is not flipped again by the reviewed apply
+  # until the target, the carry or the hooks change; the full cadence
+  # retries it (once per full pass).
+  if [ "$node_mode" != full ] &&
+    node_switch_backoff_matches "$node_target" "$node_plan_carry" "$node_plan_hooks"; then
+    node_hold "the post-switch hooks failed for this exact switch to $node_target; it is retried on the next full pass, or when the target, the carry or the hooks change"
+  fi
   printf '  switch runtimes.node %s -> %s (carrying %s)\n' "$node_current" "$node_target" \
     "$(printf '%s\n' "$node_plan" | jq -r '[.carry[] | "\(.name)@\(.version)"] |
       if length == 0 then "no npm globals" else join(" ") end')"
   node_status=0
-  node_switch_out=$(node_runtime_switch "$node_target" \
-    "$(printf '%s\n' "$node_plan" | jq -c '.carry')" \
-    "$(printf '%s\n' "$node_plan" | jq -c '.hooks')" 2>&1) || node_status=$?
+  node_switch_out=$(node_runtime_switch "$node_target" "$node_plan_carry" "$node_plan_hooks" 2>&1) ||
+    node_status=$?
   [ -z "$node_switch_out" ] || printf '%s\n' "$node_switch_out" | sed 's/^/        /'
+  [ "$node_status" -ne 75 ] ||
+    node_hold 'a Node switch is in progress on this host (another run or an apply); not touched this run'
   node_final=$(node_fnm_default "$node_root" 2>/dev/null) || node_final=
   if ! { [ "$node_status" -eq 0 ] && [ "$node_final" = "$node_target" ] &&
     [ -z "$(node_switch_marker_read)" ]; }; then
@@ -2134,9 +2146,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       *)
         fleet_run_runtime_hold "$run_item" "apply status $run_status" \
           "$run_tmp/sigholds" || exit 65
-        [ "$run_status" -ne 76 ] || fleet_run_node_unverified "$run_store" "$run_host"
-        [ "$run_status" -ne 75 ] || [ "$run_category" != runtimes ] ||
-          fleet_run_node_held "$run_store" "$run_host" "$run_item"
+        [ "$run_category" != runtimes ] ||
+          fleet_run_node_alert "$run_store" "$run_host" "$run_status" "$run_item"
         [ "$run_status" -ne 75 ] || [ "$run_category" != packages ] ||
           fleet_alert_write "$run_store" "$run_host" package-hold \
             "package-hold-$(printf '%s' "$run_item" | tr './' '--')" \
@@ -2511,6 +2522,16 @@ fleet_run_node_held() {
     "$3" || :
 }
 
+fleet_run_node_alert() {
+  # `fleet_run_node_alert STORE HOST STATUS ITEM` — the one mapping from a
+  # Node convergence status to its alert, for the fast and full cadences
+  # alike: 75 held, 76 unverified default, anything else none.
+  case $3 in
+    75) fleet_run_node_held "$1" "$2" "$4" ;;
+    76) fleet_run_node_unverified "$1" "$2" ;;
+  esac
+}
+
 fleet_run_full_node_runtime() (
   # `fleet_run_full_node_runtime STORE HOST FOLD DEFS HOLD_DIR` — the full
   # cadence's Node step. fnm never moves the default within a major on its
@@ -2534,6 +2555,7 @@ fleet_run_full_node_runtime() (
     node_full_status=0
     node_switch_recover || node_full_status=$?
     case $node_full_status in
+      74) printf '  note  runtimes.node — a Node switch is in progress on this host; not touched this run\n' ;;
       75) printf '  note  runtimes.node — an interrupted switch was rolled back to its old default (verified)\n' ;;
       76) fleet_run_node_unverified "$node_full_store" "$node_full_host" ;;
     esac
@@ -2541,15 +2563,11 @@ fleet_run_full_node_runtime() (
   fi
   node_full_status=0
   fleet_run_node_converge "$node_full_runtime" "$4" full </dev/null || node_full_status=$?
-  case $node_full_status in
-    75) fleet_run_node_held "$node_full_store" "$node_full_host" runtimes.node ;;
-    76)
-      fleet_run_node_unverified "$node_full_store" "$node_full_host"
-      fleet_journal_append "$node_full_store" "$node_full_host" \
-        "$(jq -cn --arg at "$(fleet_now)" \
-          '{item:"runtimes.node",digest:"held",outcome:"held",at:$at}')" || :
-      ;;
-  esac
+  fleet_run_node_alert "$node_full_store" "$node_full_host" "$node_full_status" runtimes.node
+  [ "$node_full_status" -ne 76 ] ||
+    fleet_journal_append "$node_full_store" "$node_full_host" \
+      "$(jq -cn --arg at "$(fleet_now)" \
+        '{item:"runtimes.node",digest:"held",outcome:"held",at:$at}')" || :
   exit 0
 )
 

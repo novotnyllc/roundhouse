@@ -109,8 +109,17 @@ printf 'bin %s %s node=%s\n' "$(basename -- "$0")" "$*" "$(node --version)" >>"$
 # A service repair that starts a daemon, which keeps the hook's stdout and
 # stderr open long after the hook returns.
 if [ -n "${NRT_HOOK_DAEMON:-}" ]; then
-  sleep 30 &
+  sleep 600 &
   printf '%s\n' "$!" >"$NRT_HOOK_DAEMON"
+fi
+# A hook still running when another run looks: it waits for a release file.
+if [ -n "${NRT_HOOK_WAIT:-}" ]; then
+  printf 'waiting\n' >"$NRT_HOOK_WAIT.started"
+  waited=0
+  until [ -e "$NRT_HOOK_WAIT" ] || [ "$waited" -ge 600 ]; do
+    sleep 0.2
+    waited=$((waited + 1))
+  done
 fi
 exit 0
 SH
@@ -153,18 +162,23 @@ printf '%s\n' v24.1.0 'v24.2.0   (Krypton)' v25.0.0 v26.0.0 v26.2.0 v26.10.0 v27
 # subshell below (exported), so the two can never drift.
 nrt_vars=(FNM_DIR="$nrt_fnm" NRT_LOG="$nrt_log" NRT_REMOTE="$nrt_remote"
   NRT_TEMPLATE="$nrt_template" NRT_CATALOG="$nrt_catalog" NRT_PACKAGE_BIN="$nrt_root/package-bin"
-  XDG_STATE_HOME="$nrt_root/state" ROUNDHOUSE_TEST_NPM_FIXED_DIRS= ROUNDHOUSE_TEST_FNM_FIXED_DIRS=)
+  XDG_STATE_HOME="$nrt_root/xdg-state" ROUNDHOUSE_TEST_NPM_FIXED_DIRS= ROUNDHOUSE_TEST_FNM_FIXED_DIRS=)
 nrt_env() {
   env -u XDG_DATA_HOME "${nrt_vars[@]}" \
     ROUNDHOUSE_FLEET_STORE="${nrt_store_override:-$nrt_store}" PATH="$nrt_bin:$PATH" "$@"
 }
-nrt_marker="$nrt_root/state/roundhouse/node-switch-inflight.json"
+# The switch state is at one fixed path under $HOME in every lane, never
+# under XDG_STATE_HOME (set above to a directory that must stay unused).
+nrt_state="$HOME/.local/state/roundhouse"
+nrt_marker="$nrt_state/node-switch-inflight.json"
+nrt_backoff="$nrt_state/node-switch-backoff.json"
+nrt_lock="$nrt_state/node-switch.lock"
 
 nrt_reset() {
   # One installed version, v26.0.0, as the default, carrying a managed
   # service package with a hook bin, a managed plain package, an unmanaged
   # global and npm itself.
-  rm -rf "$nrt_fnm" "$nrt_root/state"
+  rm -rf "$nrt_fnm" "$nrt_marker" "$nrt_backoff" "$nrt_lock"
   mkdir -p "$nrt_fnm/aliases" "$nrt_fnm/node-versions"
   : >"$nrt_log"
   nrt_env "$nrt_bin/fnm" install v26.0.0
@@ -197,9 +211,12 @@ nrt_reset
     if node_version_valid "$nrt_bad"; then fail "an invalid Node version was accepted: $nrt_bad"; fi
   done
   [ "$(node_version_normalize 26.7.0)" = v26.7.0 ] || fail "a bare Node version was not normalized"
-  node_version_newer v26.10.0 v26.2.0 || fail "Node versions compared as strings"
-  if node_version_newer v26.2.0 v26.10.0 || node_version_newer v26.2.0 v26.2.0; then
-    fail "an older or equal Node version read as newer"
+  # One release comparison for Node and npm versions alike.
+  release_newer v26.10.0 v26.2.0 || fail "Node versions compared as strings"
+  release_newer 12.0.0 11.10.3 || fail "npm versions compared as strings"
+  if release_newer v26.2.0 v26.10.0 || release_newer v26.2.0 v26.2.0 ||
+    release_newer 12.0.0-rc.1 11.0.0 || release_newer 12.0.0 ''; then
+    fail "an older, equal, prerelease or missing version read as newer"
   fi
   [ "$(node_runtime_spec '{"major":26}')" = '{"major":26,"version":null}' ] ||
     fail "a major line did not parse"
@@ -258,24 +275,34 @@ nrt_reset
     nrt_status=$?
   [ "$nrt_status" -eq 64 ] || fail "a hook argument with shell syntax was not refused"
 
-  # --- the switch: failures after the default moved restore it --------------
+  # --- the switch: staging failures never move the default -------------------
+  # The default moves only after the target is staged, so a failure before
+  # that leaves it as it was: `fnm default` never ran, nothing was recorded.
+  nrt_never_moved() {
+    [ "$(nrt_default)" = v26.0.0 ] && ! grep -Fq 'fnm default ' "$nrt_log" && [ ! -e "$nrt_marker" ]
+  }
+  : >"$nrt_log"
   nrt_status=0
   NRT_NPM_FAIL_INSTALL=1 node_runtime_switch v26.10.0 "$nrt_carry" "$nrt_hooks" 2>/dev/null ||
     nrt_status=$?
-  [ "$nrt_status" -eq 1 ] && [ "$(nrt_default)" = v26.0.0 ] ||
-    fail "a failed carry did not restore the previous fnm default"
+  [ "$nrt_status" -eq 1 ] && nrt_never_moved || fail "a failed carry moved the default (never moved)"
   ! grep -Fq 'bin svc' "$nrt_log" || fail "a hook ran after the carry failed"
+  : >"$nrt_log"
+  nrt_status=0
+  NRT_FNM_FAIL_INSTALL=1 node_runtime_switch v26.2.0 "$nrt_carry" "$nrt_hooks" 2>/dev/null ||
+    nrt_status=$?
+  [ "$nrt_status" -eq 1 ] && nrt_never_moved || fail "a failed fnm install moved the default (never moved)"
+  # A failure after the flip (a hook) restores the old default, with proof,
+  # and records the attempt so the reviewed apply does not repeat it.
   nrt_reset
   nrt_status=0
   NRT_HOOK_FAIL=1 node_runtime_switch v26.10.0 "$nrt_carry" "$nrt_hooks" 2>/dev/null ||
     nrt_status=$?
-  [ "$nrt_status" -eq 1 ] && [ "$(nrt_default)" = v26.0.0 ] ||
+  [ "$nrt_status" -eq 1 ] && [ "$(nrt_default)" = v26.0.0 ] && [ ! -e "$nrt_marker" ] ||
     fail "a failed post-switch hook did not restore the previous fnm default"
-  nrt_status=0
-  NRT_FNM_FAIL_INSTALL=1 node_runtime_switch v26.2.0 "$nrt_carry" "$nrt_hooks" 2>/dev/null ||
-    nrt_status=$?
-  [ "$nrt_status" -eq 1 ] && [ "$(nrt_default)" = v26.0.0 ] ||
-    fail "a failed fnm install moved the default"
+  node_switch_backoff_matches v26.10.0 "$nrt_carry" "$nrt_hooks" ||
+    fail "a failed post-switch hook did not record its attempt for backoff"
+  nrt_reset
 
   # --- the switch: a retained target is reconciled to exactly the carry ------
   # Old versions are kept, so a switch can land on a version used before. A
@@ -289,9 +316,10 @@ nrt_reset
   }
   nrt_reset
   nrt_retain_target
+  : >"$nrt_log"
   NRT_NPM_FAIL_UNINSTALL=1 node_runtime_switch v26.10.0 "$nrt_carry_all" "$nrt_hooks" 2>/dev/null &&
     fail "a switch that could not remove a stale global succeeded"
-  [ "$(nrt_default)" = v26.0.0 ] || fail "a failed reconcile did not restore the previous fnm default"
+  nrt_never_moved || fail "a failed reconcile moved the default (never moved)"
   node_runtime_switch v26.10.0 "$nrt_carry_all" "$nrt_hooks" ||
     fail "a switch to a retained version failed"
   [ "$(nrt_default)" = v26.10.0 ] &&
@@ -623,8 +651,132 @@ nrt_reset
     "homebrew npm" >/dev/null 2>&1 || nrt_status=$?
   [ "$nrt_status" -eq 76 ] && [ "$(nrt_default)" = v26.0.0 ] ||
     fail "the runtime apply arm did not report an unrecoverable in-flight switch (got $nrt_status)"
+  # The way out of a record no run can roll back: node-switch-clear clears
+  # it only when no switch is running and the CURRENT default is
+  # self-consistent with listable globals.
+  nrt_status=0
+  node_switch_clear >"$nrt_root/clear-out" 2>&1 || nrt_status=$?
+  [ "$nrt_status" -eq 0 ] && [ ! -e "$nrt_marker" ] &&
+    grep -Fq 'cleared the in-flight Node switch v99.0.0 -> v27.0.0; the fnm default is v26.0.0 (verified)' \
+      "$nrt_root/clear-out" ||
+    fail "node-switch-clear did not clear an unrecoverable record over a verified default (status $nrt_status)"
+  node_switch_marker_write v99.0.0 v27.0.0 '[]'
+  mv "$nrt_fnm/aliases/default" "$nrt_root/default-aside"
+  nrt_status=0
+  node_switch_clear >/dev/null 2>&1 || nrt_status=$?
+  mv "$nrt_root/default-aside" "$nrt_fnm/aliases/default"
+  [ "$nrt_status" -eq 65 ] && [ -e "$nrt_marker" ] ||
+    fail "node-switch-clear cleared a record without a verified default (status $nrt_status)"
   rm -f "$nrt_marker"
   : >"$nrt_root/full-tmp/sigholds"
+
+  # --- one lock covers a whole switch and a whole recovery ---------------------
+  # A switch still running its hooks is NOT interrupted: a recovery (from a
+  # scheduled run) leaves it alone, a second switch refuses, and the running
+  # switch then finishes with its default verified.
+  nrt_reset
+  rm -f "$nrt_root/hook-release" "$nrt_root/hook-release.started"
+  NRT_HOOK_WAIT=$nrt_root/hook-release node_runtime_switch v26.10.0 "$nrt_carry" "$nrt_hooks" \
+    >"$nrt_root/live-switch-out" 2>&1 &
+  nrt_live_pid=$!
+  nrt_waited=0
+  until [ -e "$nrt_root/hook-release.started" ] || [ "$nrt_waited" -ge 3000 ]; do
+    sleep 0.1
+    nrt_waited=$((nrt_waited + 1))
+  done
+  [ -e "$nrt_marker" ] && [ -d "$nrt_lock" ] ||
+    fail "a running switch held neither its in-flight record nor its lock"
+  nrt_status=0
+  node_switch_recover || nrt_status=$?
+  [ "$nrt_status" -eq 74 ] && [ "$(nrt_default)" = v26.10.0 ] && [ -e "$nrt_marker" ] ||
+    fail "a recovery rolled back a switch that was still running (status $nrt_status)"
+  nrt_status=0
+  ROUNDHOUSE_CONFIG=$nrt_root/local-declared.json \
+    fleet_run_apply_item "$nrt_root/store" nrt-host "$nrt_defs" runtimes.node '{"major":26}' \
+    "homebrew npm" >"$nrt_root/live-apply-out" 2>&1 || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v26.10.0 ] &&
+    grep -Fq 'a Node switch is in progress on this host' "$nrt_root/live-apply-out" ||
+    fail "a scheduled apply did not leave a running switch alone (status $nrt_status)"
+  nrt_status=0
+  node_runtime_switch v26.2.0 "$nrt_carry" "$nrt_hooks" 2>/dev/null || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] || fail "a second switch ran while another held the lock (status $nrt_status)"
+  nrt_status=0
+  node_switch_clear >/dev/null 2>&1 || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] && [ -e "$nrt_marker" ] ||
+    fail "node-switch-clear cleared the record of a running switch (status $nrt_status)"
+  : >"$nrt_root/hook-release"
+  nrt_status=0
+  wait "$nrt_live_pid" || nrt_status=$?
+  [ "$nrt_status" -eq 0 ] && [ "$(nrt_default)" = v26.10.0 ] && [ ! -e "$nrt_marker" ] &&
+    [ ! -e "$nrt_lock" ] ||
+    fail "a switch a recovery looked at did not finish verified (status $nrt_status)"
+  # A lock whose holder is gone is stale and is taken over.
+  nrt_reset
+  sh -c 'exit 0' &
+  nrt_dead_pid=$!
+  wait "$nrt_dead_pid" || :
+  mkdir -p "$nrt_lock"
+  printf '%s\n%s\n' "$nrt_dead_pid" 'Thu Jan  1 00:00:00 1970' >"$nrt_lock/owner"
+  node_runtime_switch v26.10.0 "$nrt_carry" "$nrt_hooks" >/dev/null 2>&1 &&
+    [ "$(nrt_default)" = v26.10.0 ] && [ ! -e "$nrt_lock" ] ||
+    fail "a stale Node switch lock was not taken over"
+  # A lock held by a live process refuses a switch and defers a recovery;
+  # so does a record whose own writer is still running.
+  nrt_reset
+  sleep 600 &
+  nrt_holder=$!
+  mkdir -p "$nrt_lock"
+  printf '%s\n%s\n' "$nrt_holder" "$(node_process_start "$nrt_holder")" >"$nrt_lock/owner"
+  nrt_status=0
+  node_runtime_switch v26.10.0 "$nrt_carry" "$nrt_hooks" 2>/dev/null || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v26.0.0 ] ||
+    fail "a switch ran under a lock a live process holds (status $nrt_status)"
+  node_switch_marker_write v26.0.0 v26.10.0 '[]'
+  nrt_status=0
+  node_switch_recover || nrt_status=$?
+  [ "$nrt_status" -eq 74 ] && [ -e "$nrt_marker" ] ||
+    fail "a recovery ran under a lock a live process holds (status $nrt_status)"
+  rm -rf "$nrt_lock"
+  node_switch_marker_write v26.0.0 v26.10.0 '[]' "$nrt_holder" "$(node_process_start "$nrt_holder")"
+  nrt_status=0
+  node_switch_recover || nrt_status=$?
+  [ "$nrt_status" -eq 74 ] && [ -e "$nrt_marker" ] ||
+    fail "a recovery rolled back a record whose writer is still running (status $nrt_status)"
+  kill "$nrt_holder" 2>/dev/null || :
+  wait "$nrt_holder" 2>/dev/null || :
+  nrt_status=0
+  node_switch_recover || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] && [ ! -e "$nrt_marker" ] && [ ! -e "$nrt_lock" ] ||
+    fail "a record whose writer is gone was not rolled back (status $nrt_status)"
+
+  # --- an in-flight record blocks every npm mutation ----------------------------
+  nrt_reset
+  node_switch_marker_write v26.0.0 v26.10.0 '[]'
+  : >"$nrt_log"
+  nrt_status=0
+  fleet_install_package npm plain false 3.0.0 || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] && ! grep -Fq 'npm install' "$nrt_log" ||
+    fail "a fast-pass npm install ran while a Node switch was in flight (status $nrt_status)"
+  rm -f "$nrt_marker"
+
+  # --- a hook that keeps failing is not flipped on every fast pass ------------
+  # The reviewed apply flips once, restores, and then holds that exact
+  # attempt; the full cadence retries it, and a success clears the backoff.
+  nrt_reset
+  nrt_status=0
+  NRT_HOOK_FAIL=1 nrt_converge local-declared '{"major":27}' apply || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v26.0.0 ] && [ -e "$nrt_backoff" ] ||
+    fail "a failed post-switch hook did not restore and back off (status $nrt_status)"
+  : >"$nrt_log"
+  nrt_status=0
+  NRT_HOOK_FAIL=1 nrt_converge local-declared '{"major":27}' apply || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] && ! grep -Fq 'fnm default' "$nrt_log" &&
+    grep -Fq 'the post-switch hooks failed for this exact switch to v27.0.0' "$nrt_root/converge-out" ||
+    fail "the reviewed apply flipped the default again for a switch whose hooks keep failing"
+  nrt_converge local-declared '{"major":27}' full ||
+    fail "the full cadence did not retry a backed-off switch"
+  [ "$(nrt_default)" = v27.0.0 ] && [ ! -e "$nrt_backoff" ] ||
+    fail "a successful retry did not clear the backoff"
 
   # --- the carry runs under an npm no older than the host's -------------------
   # npm 12 honours allow-scripts; a target that bundles npm 11 is brought up to
@@ -650,12 +802,21 @@ nrt_reset
     fail "a target whose npm is newer was downgraded"
 
   # --- a hook that starts a daemon does not hold the run ------------------------
+  # The daemon lives far longer than any run; the switch returning while it
+  # is still alive is the proof, whatever the load on the machine.
   nrt_reset
-  SECONDS=0
+  rm -f "$nrt_root/daemon.pid"
   NRT_HOOK_DAEMON=$nrt_root/daemon.pid nrt_converge local-declared '{"major":26}' full ||
     fail "a switch whose hook started a daemon did not converge"
-  [ "$SECONDS" -lt 20 ] || fail "a hook's daemon held the switch's output open (${SECONDS}s)"
+  [ -s "$nrt_root/daemon.pid" ] && kill -0 "$(cat "$nrt_root/daemon.pid")" 2>/dev/null ||
+    fail "a hook's daemon held the switch's output open (the switch returned only after it ended)"
   kill "$(cat "$nrt_root/daemon.pid")" 2>/dev/null || :
+
+  # Every lane sees one record: the path ignores XDG_STATE_HOME, which
+  # launchd, SSH and an interactive shell set differently.
+  [ "$(XDG_STATE_HOME=/elsewhere node_switch_marker_path)" = "$nrt_marker" ] &&
+    [ ! -e "$nrt_root/xdg-state" ] ||
+    fail "the Node switch state followed XDG_STATE_HOME"
 )
 
 # --- the sealed lifecycle: collect, seal, apply, post-state ---------------------
@@ -881,6 +1042,35 @@ else
     [ "$(jq -r '.plain' "$nrt_fnm/node-versions/v26.10.0/installation/globals.json")" = 3.0.0 ] ||
     fail "the later npm upgrade was not what the switch post-check expected"
 
+  # An npm upgrade neither applies nor seals while a Node switch is recorded
+  # in flight on its target.
+  nrt_reset
+  jq '.operations = [.operations[] | select(.id != "fnm:node")]' "$tmp/node-draft-npm-after.json" \
+    >"$tmp/node-draft-npm-only.json"
+  nrt_up_cli collect --target test-host --section host --section packages \
+    --output "$tmp/node-npm-only-snapshot.jsonl"
+  nrt_up_cli seal-plan "$tmp/node-draft-npm-only.json" "$tmp/node-npm-only-snapshot.jsonl" \
+    "$tmp/node-npm-only-plan.json" || fail "an npm-only upgrade plan did not seal"
+  mkdir -p "$nrt_state"
+  printf '%s\n' '{"old":"v26.0.0","target":"v26.10.0","carry":[]}' >"$nrt_marker"
+  : >"$nrt_log"
+  if nrt_up_cli apply-plan "$tmp/node-npm-only-plan.json" "$(jq -r '.plan_id' "$tmp/node-npm-only-plan.json")" \
+    "$tmp/node-npm-inflight-apply.jsonl" >"$nrt_root/npm-inflight-apply.log" 2>&1; then
+    fail "a sealed npm upgrade applied while a Node switch was in flight"
+  fi
+  grep -Fq 'a Node switch is recorded in flight on' "$nrt_root/npm-inflight-apply.log" &&
+    ! grep -Fq 'npm install --global plain@3.0.0' "$nrt_log" ||
+    fail "a sealed npm upgrade was not refused for a Node switch in flight"
+  nrt_up_cli collect --target test-host --section host --section packages \
+    --output "$tmp/node-inflight-snapshot.jsonl"
+  if nrt_up_cli seal-plan "$tmp/node-draft-npm-only.json" "$tmp/node-inflight-snapshot.jsonl" \
+    "$tmp/node-npm-inflight-plan.json" >"$nrt_root/npm-inflight-seal.log" 2>&1; then
+    fail "an npm upgrade sealed for a host with a Node switch in flight"
+  fi
+  assert_contains "$(cat "$nrt_root/npm-inflight-seal.log")" \
+    'a Node switch is recorded in flight on the target; npm upgrades are refused'
+  rm -f "$nrt_marker"
+
   # --- the SSH lane: the worker needs no store ---------------------------------
   # The carry is proven from the worker's own fresh snapshot, and the required
   # hooks are bound into the plan, so a target without a store applies.
@@ -903,13 +1093,14 @@ else
   nrt_ssh_cli seal-plan "$tmp/node-ssh-draft.json" "$tmp/node-ssh-snapshot.jsonl" "$tmp/node-ssh-plan.json"
   nrt_ssh_plan_id=$(jq -r '.plan_id' "$tmp/node-ssh-plan.json")
   : >"$nrt_log"
-  # The hook starts a daemon: the SSH session must still end with the switch.
-  SECONDS=0
+  # The hook starts a long-lived daemon: the SSH session must still end with
+  # the switch, while the daemon runs on.
+  rm -f "$nrt_root/ssh-daemon.pid"
   NRT_HOOK_DAEMON=$nrt_root/ssh-daemon.pid \
     nrt_ssh_cli apply-ssh-plan "$tmp/node-ssh-plan.json" "$nrt_ssh_plan_id" "$tmp/node-ssh-apply.jsonl" ||
     fail "an SSH Node switch refused because the target has no store"
-  [ "$SECONDS" -lt 20 ] || fail "a hook's daemon held the SSH session open (${SECONDS}s)"
-  [ -s "$nrt_root/ssh-daemon.pid" ] || fail "the SSH lane hook did not start its daemon"
+  [ -s "$nrt_root/ssh-daemon.pid" ] && kill -0 "$(cat "$nrt_root/ssh-daemon.pid")" 2>/dev/null ||
+    fail "a hook's daemon held the SSH session open (the apply returned only after it ended)"
   kill "$(cat "$nrt_root/ssh-daemon.pid")" 2>/dev/null || :
   [ "$(nrt_default)" = v26.10.0 ] &&
     [ "$(jq -r 'select(.kind == "operation" and (.id | startswith("apply:"))) | .data.operation_status' \

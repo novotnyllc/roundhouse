@@ -2135,7 +2135,7 @@ NPM_UPDATERS
             node_candidate_known=false
             if node_candidate=$(node_fnm_remote_latest "$node_root" "$node_line" 2>/dev/null); then
               node_candidate_known=true
-              node_version_newer "$node_candidate" "$node_default" || node_candidate=
+              release_newer "$node_candidate" "$node_default" || node_candidate=
             else
               node_candidate=
               emit error packages:fnm-updates unavailable high '{}' '[]' \

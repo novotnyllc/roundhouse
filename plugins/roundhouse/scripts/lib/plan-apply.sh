@@ -536,6 +536,12 @@ EOF
             printf 'roundhouse: invalid npm package upgrade\n' >&2
             return 64
           }
+          # Never under a Node default a switch left unverified or is
+          # still moving (this host's own record, lib/node-runtime.sh).
+          [ -z "$(node_switch_marker_read)" ] || {
+            printf 'roundhouse: a Node switch is recorded in flight on this host; npm upgrades are refused until it is resolved\n' >&2
+            return 65
+          }
           if [ $# -eq 4 ] && [ "$1" = npm ] && [ "$2" = install ] &&
             [ "$3" = --global ] && [ "$4" = "$npm_name@$candidate" ]; then
             npm_global_run install --global "$npm_name@$candidate"

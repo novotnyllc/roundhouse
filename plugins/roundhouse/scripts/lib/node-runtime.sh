@@ -45,20 +45,6 @@ node_version_major() (
   printf '%s\n' "${node_major%%.*}"
 )
 
-node_version_newer() (
-  # `node_version_newer A B` — A is strictly newer than B, numerically.
-  node_version_valid "$1" && node_version_valid "$2" || return 2
-  IFS=. read -r node_a1 node_a2 node_a3 <<EOF
-${1#v}
-EOF
-  IFS=. read -r node_b1 node_b2 node_b3 <<EOF
-${2#v}
-EOF
-  [ $((10#$node_a1)) -ne $((10#$node_b1)) ] && { [ $((10#$node_a1)) -gt $((10#$node_b1)) ]; return; }
-  [ $((10#$node_a2)) -ne $((10#$node_b2)) ] && { [ $((10#$node_a2)) -gt $((10#$node_b2)) ]; return; }
-  [ $((10#$node_a3)) -gt $((10#$node_b3)) ]
-)
-
 node_fnm_root() (
   # The fnm directory whose `default` alias is the durable npm lib/npm.sh
   # resolves: the same roots in the same order, under the same predicate, so
@@ -168,7 +154,7 @@ node_runtime_spec() (
   # newest release in that line. `version:` is the exact pin, the same opt-out
   # `version:` is for a package. Both at once must agree. A value with neither
   # is not a runtime anybody asked for, and is refused.
-  printf '%s\n' "$1" | jq -ce '
+  printf '%s\n' "$1" | jq -ce "$npm_jq_grammar"'
     def major_of: ltrimstr("v") | split(".")[0] | tonumber;
     if type != "object" then error("runtime needs major or version") else . end |
     (.major // null) as $m | (.version // null) as $v |
@@ -177,7 +163,7 @@ node_runtime_spec() (
       elif type == "string" and test("^[1-9][0-9]{0,2}$") then tonumber
       else error("invalid major") end) as $major |
     ($v | if . == null then null
-      elif type == "string" and test("^v?[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,6}$") then
+      elif type == "string" and (if startswith("v") then . else "v" + . end | node_version_ok) then
         (if startswith("v") then . else "v" + . end)
       else error("invalid version") end) as $version |
     if $major == null and $version == null then error("runtime needs major or version")
@@ -341,18 +327,99 @@ node_switch_verify_snapshot() (
   ' "$1" >/dev/null
 )
 
-# --- the interrupted-switch record ---------------------------------------------
+# --- host-local switch state: the lock, the in-flight record, the backoff -------
 #
 # A switch flips the live default only after the target prefix holds exactly
 # the carry, so the window in which the host runs a default its globals were
-# not verified for is: the flip, the hooks, and clearing this record. The
-# record is written just before the flip and removed only on verified success
-# or a verified restore. While it exists, `runtimes.node` holds (and alerts),
-# the npm pass stays off the runtime, nothing seals a new switch, and each
-# run tries a verified restore of the old default.
+# not verified for is: the flip, the hooks, and clearing the in-flight
+# record. The record is written just before the flip and removed only on
+# verified success or a verified restore. While it exists, `runtimes.node`
+# holds (and alerts), every npm mutation stays off the runtime, nothing seals
+# a new switch, and each run tries a verified restore of the old default.
+#
+# One lock covers a whole switch and a whole recovery, in every lane (the
+# scheduled run, `fleet-apply`, a sealed local or SSH apply), so a recovery
+# can never roll back a switch that is still running. The record names its
+# writer by PID and start time for the same reason.
+#
+# All of it lives at one fixed path under $HOME, never under
+# XDG_STATE_HOME: launchd, an SSH worker and an interactive shell disagree on
+# that variable, and every lane must see the same record. The runtime it
+# guards is the account's own fnm default, under the same $HOME.
+
+node_switch_state_dir() (
+  printf '%s/.local/state/roundhouse\n' "$HOME"
+)
 
 node_switch_marker_path() (
-  printf '%s/roundhouse/node-switch-inflight.json\n' "${XDG_STATE_HOME:-$HOME/.local/state}"
+  printf '%s/node-switch-inflight.json\n' "$(node_switch_state_dir)"
+)
+
+node_switch_lock_path() (
+  printf '%s/node-switch.lock\n' "$(node_switch_state_dir)"
+)
+
+node_switch_backoff_path() (
+  printf '%s/node-switch-backoff.json\n' "$(node_switch_state_dir)"
+)
+
+node_process_start() (
+  # `node_process_start PID` — when PID started, as ps prints it, or nothing.
+  # PID and start time together name one process: a recycled PID starts
+  # at another time.
+  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' | head -1
+)
+
+node_process_live() (
+  # `node_process_live PID START` — that exact process is still running.
+  [[ ${1:-} =~ ^[1-9][0-9]{0,9}$ ]] && [ -n "${2:-}" ] || exit 1
+  kill -0 "$1" 2>/dev/null || exit 1
+  [ "$(node_process_start "$1")" = "$2" ]
+)
+
+node_switch_lock_take() (
+  # `node_switch_lock_take PID` — take the host's one Node switch lock for
+  # process PID (the caller's own subshell). mkdir is the atomic step; the
+  # owner file names the holder by PID and start time. Exit 0 taken, 75 held
+  # by a live process, 1 when the state directory is unusable. A lock whose
+  # holder is gone (killed mid-switch) is stale and is taken over: the
+  # in-flight record, not the lock, says whether anything needs rolling back.
+  node_lock=$(node_switch_lock_path)
+  (umask 077 && mkdir -p "${node_lock%/*}") || exit 1
+  node_lock_start=$(node_process_start "$1")
+  [ -n "$node_lock_start" ] || exit 1
+  node_lock_try=0
+  while [ "$node_lock_try" -lt 3 ]; do
+    node_lock_try=$((node_lock_try + 1))
+    if mkdir "$node_lock" 2>/dev/null; then
+      printf '%s\n%s\n' "$1" "$node_lock_start" >"$node_lock/owner" || {
+        rm -rf "$node_lock"
+        exit 1
+      }
+      exit 0
+    fi
+    node_lock_owner=$(sed -n 1p "$node_lock/owner" 2>/dev/null) || node_lock_owner=
+    node_lock_owner_start=$(sed -n 2p "$node_lock/owner" 2>/dev/null) || node_lock_owner_start=
+    if [ -z "$node_lock_owner" ]; then
+      # Between another taker's mkdir and its owner write (young: live), or
+      # left by one killed in that instant (a minute old: stale).
+      [ ! -d "$node_lock" ] ||
+        [ -n "$(find "$node_lock" -maxdepth 0 -mmin +1 2>/dev/null)" ] || exit 75
+    elif node_process_live "$node_lock_owner" "$node_lock_owner_start"; then
+      exit 75
+    fi
+    # Stale: rename it aside (one taker wins the rename), then try again.
+    rm -rf "$node_lock.stale.$1"
+    mv "$node_lock" "$node_lock.stale.$1" 2>/dev/null && rm -rf "$node_lock.stale.$1"
+  done
+  exit 75
+)
+
+node_switch_lock_release() (
+  # `node_switch_lock_release PID` — only the holder releases.
+  node_lock=$(node_switch_lock_path)
+  [ "$(sed -n 1p "$node_lock/owner" 2>/dev/null)" = "$1" ] || exit 0
+  rm -rf "$node_lock"
 )
 
 node_switch_marker_read() (
@@ -365,12 +432,13 @@ node_switch_marker_read() (
 )
 
 node_switch_marker_write() (
-  # `node_switch_marker_write OLD TARGET CARRY`
+  # `node_switch_marker_write OLD TARGET CARRY PID START`
   node_marker=$(node_switch_marker_path)
   umask 077
   mkdir -p "${node_marker%/*}" || exit 1
-  jq -cn --arg old "$1" --arg target "$2" --argjson carry "$3" \
-    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{old:$old,target:$target,carry:$carry,at:$at}' \
+  jq -cn --arg old "$1" --arg target "$2" --argjson carry "$3" --arg pid "${4:-}" --arg start "${5:-}" \
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{old:$old,target:$target,carry:$carry,writer:{pid:$pid,start:$start},at:$at}' \
     >"$node_marker.$$" && mv -f "$node_marker.$$" "$node_marker"
 )
 
@@ -378,25 +446,91 @@ node_switch_marker_clear() (
   rm -f "$(node_switch_marker_path)"
 )
 
+node_switch_writer_live() (
+  # `node_switch_writer_live RECORD` — the process that wrote the record is
+  # still running: the switch is in progress, not interrupted.
+  node_writer_pid=$(printf '%s\n' "$1" | jq -r '.writer.pid // empty' 2>/dev/null) || exit 1
+  node_writer_start=$(printf '%s\n' "$1" | jq -r '.writer.start // empty' 2>/dev/null) || exit 1
+  node_process_live "$node_writer_pid" "$node_writer_start"
+)
+
+# A post-switch hook that always fails would otherwise flip the live default
+# and restore it on every fast pass. After a hook failure the attempt
+# (target, carry, hooks) is recorded; the reviewed apply holds that exact
+# attempt, and only the full cadence, or a change to any of the three,
+# retries it. A successful switch clears it.
+
+node_switch_backoff_write() (
+  # `node_switch_backoff_write TARGET CARRY HOOKS`
+  node_backoff=$(node_switch_backoff_path)
+  umask 077
+  mkdir -p "${node_backoff%/*}" || exit 1
+  jq -cn --arg target "$1" --argjson carry "$2" --argjson hooks "$3" \
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{target:$target,carry:$carry,hooks:$hooks,at:$at}' \
+    >"$node_backoff.$$" && mv -f "$node_backoff.$$" "$node_backoff"
+)
+
+node_switch_backoff_matches() (
+  # `node_switch_backoff_matches TARGET CARRY HOOKS` — exactly this attempt
+  # failed its hooks before.
+  node_backoff=$(node_switch_backoff_path)
+  [ -f "$node_backoff" ] || exit 1
+  jq -e --arg target "$1" --argjson carry "$2" --argjson hooks "$3" \
+    '.target == $target and .carry == $carry and .hooks == $hooks' "$node_backoff" >/dev/null 2>&1
+)
+
+node_switch_backoff_clear() (
+  rm -f "$(node_switch_backoff_path)"
+)
+
+# The PID of the calling subshell, for the lock and the record's writer.
+# BASHPID where bash has it; bash 3.2 does not, and there a command
+# substitution forks a child of the caller and `exec` turns that child into
+# sh, so sh's parent is the caller. Always written inline, never wrapped in
+# a function (a wrapper would add a process of its own).
+# shellcheck disable=SC2016 # $PPID is sh's own
+node_self_pid_sh='printf "%s\n" "$PPID"'
+
+node_default_verified() (
+  # `node_default_verified ROOT VERSION` — the fnm default is VERSION,
+  # provably: the alias names it, the durable npm resolves through the
+  # alias, and that npm's node is VERSION. The one check behind a restore, a
+  # flip and the end of a switch.
+  [ "$(node_fnm_default "$1" 2>/dev/null)" = "$2" ] || exit 1
+  node_verified_bin=$(npm_global_bin_dir 2>/dev/null) || exit 1
+  [ "$node_verified_bin" = "$1/aliases/default/bin" ] || exit 1
+  [ "$(PATH="$node_verified_bin:$PATH" "$node_verified_bin/node" --version 2>/dev/null </dev/null |
+    head -1)" = "$2" ]
+)
+
 node_switch_restore() (
   # `node_switch_restore ROOT OLD` — point the default back at OLD and prove
-  # it: the alias names OLD and the durable npm runs under OLD's node. OLD's
-  # prefix is never touched by a switch, so its globals are as they were.
+  # it. OLD's prefix is never touched by a switch, so its globals are as they
+  # were.
   node_fnm_run "$1" default "$2" >/dev/null 2>&1 || :
-  [ "$(node_fnm_default "$1" 2>/dev/null)" = "$2" ] || exit 70
-  node_restore_bin=$(npm_global_bin_dir 2>/dev/null) || exit 70
-  [ "$node_restore_bin" = "$1/aliases/default/bin" ] || exit 70
-  [ "$(PATH="$node_restore_bin:$PATH" "$node_restore_bin/node" --version 2>/dev/null </dev/null |
-    head -1)" = "$2" ] || exit 70
+  node_default_verified "$1" "$2" || exit 70
 )
 
 node_switch_recover() (
   # For a run that finds a switch in flight: restore the recorded old
-  # default, verified, and clear the record. Exit 0 when nothing is in
-  # flight, 75 when a switch was rolled back (the run holds; the switch is
-  # retried later), 76 when it could not be (the default stays unverified).
+  # default, verified, and clear the record, under the switch lock. Exit 0
+  # when nothing is in flight, 74 when a switch is in progress (the lock or
+  # the record's writer is a live process: not interrupted, left alone), 75
+  # when a switch was rolled back (the run holds; the switch is retried
+  # later), 76 when it could not be (the default stays unverified).
+  [ -n "$(node_switch_marker_read)" ] || exit 0
+  node_self=${BASHPID:-$(exec sh -c "$node_self_pid_sh")}
+  node_recover_lock=0
+  node_switch_lock_take "$node_self" || node_recover_lock=$?
+  case $node_recover_lock in
+    0) ;;
+    75) exit 74 ;;
+    *) exit 76 ;;
+  esac
+  trap 'node_switch_lock_release "$node_self"' EXIT
   node_marker=$(node_switch_marker_read)
   [ -n "$node_marker" ] || exit 0
+  ! node_switch_writer_live "$node_marker" || exit 74
   node_recover_old=$(printf '%s\n' "$node_marker" | jq -r '.old // empty')
   node_version_valid "$node_recover_old" || exit 76
   node_recover_root=$(node_fnm_root 2>/dev/null) || exit 76
@@ -405,6 +539,78 @@ node_switch_recover() (
   node_switch_marker_clear
   exit 75
 )
+
+node_switch_clear() (
+  # `roundhouse node-switch-clear` — the way out of a record no run can roll
+  # back (its old version was uninstalled, or the record is unreadable). It
+  # never clears blindly: no switch may be running, and the CURRENT default
+  # must be self-consistent (node_default_verified) with its npm globals
+  # listable. The next run then converges `runtimes.node` from that default.
+  node_marker=$(node_switch_marker_read)
+  [ -n "$node_marker" ] || {
+    printf 'roundhouse: no Node switch is recorded in flight; nothing to clear\n'
+    exit 0
+  }
+  node_self=${BASHPID:-$(exec sh -c "$node_self_pid_sh")}
+  node_clear_lock=0
+  node_switch_lock_take "$node_self" || node_clear_lock=$?
+  case $node_clear_lock in
+    0) ;;
+    75)
+      printf 'roundhouse: a Node switch is in progress on this host; nothing cleared\n' >&2
+      exit 75
+      ;;
+    *)
+      printf 'roundhouse: cannot take the Node switch lock %s\n' "$(node_switch_lock_path)" >&2
+      exit 69
+      ;;
+  esac
+  trap 'node_switch_lock_release "$node_self"' EXIT
+  node_marker=$(node_switch_marker_read)
+  [ -n "$node_marker" ] || exit 0
+  ! node_switch_writer_live "$node_marker" || {
+    printf 'roundhouse: the process that recorded the Node switch is still running; nothing cleared\n' >&2
+    exit 75
+  }
+  node_clear_root=$(node_fnm_root) || {
+    printf 'roundhouse: no fnm default Node on this host; set one (fnm default <version>) and rerun\n' >&2
+    exit 65
+  }
+  node_clear_current=$(node_fnm_default "$node_clear_root") || {
+    printf 'roundhouse: the fnm default alias does not name an installed version; set one (fnm default <version>) and rerun\n' >&2
+    exit 65
+  }
+  node_default_verified "$node_clear_root" "$node_clear_current" || {
+    printf 'roundhouse: the fnm default %s is not self-consistent (alias, durable npm and node disagree); repair it (fnm default <version>) and rerun\n' \
+      "$node_clear_current" >&2
+    exit 65
+  }
+  npm_global_list_detail >/dev/null || {
+    printf 'roundhouse: the npm globals under %s cannot be listed; nothing cleared\n' "$node_clear_current" >&2
+    exit 65
+  }
+  node_switch_marker_clear
+  printf 'roundhouse: cleared the in-flight Node switch %s -> %s; the fnm default is %s (verified). Hooks that switch did not finish are not rerun: run them by hand if needed.\n' \
+    "$(printf '%s\n' "$node_marker" | jq -r '.old // "?"')" \
+    "$(printf '%s\n' "$node_marker" | jq -r '.target // "?"')" "$node_clear_current"
+)
+
+node_switch_npm_blocked() (
+  # `node_switch_npm_blocked PLAN SNAPSHOT` — PLAN upgrades an npm global
+  # while SNAPSHOT records a Node switch in flight on its host. seal-plan and
+  # verify-preconditions refuse such a plan; the executor re-checks its own
+  # record.
+  jq -e 'any(.operations[]?; .type == "package-upgrade" and (.id | startswith("npm:")))' \
+    "$1" >/dev/null 2>&1 || exit 1
+  jq -se 'any(.[]; .kind == "package" and .id == "fnm:node" and
+    ((.data.switch_inflight // null) != null))' "$2" >/dev/null 2>&1
+)
+
+# --- the switch ------------------------------------------------------------------
+#
+# node_runtime_switch takes the lock and runs three phases. The phase
+# functions are brace functions on purpose: they run only inside
+# node_runtime_switch's subshell, share its node_* variables, and `exit` it.
 
 node_runtime_switch() (
   # `node_runtime_switch TARGET CARRY HOOKS` — make TARGET the fnm default with
@@ -418,18 +624,35 @@ node_runtime_switch() (
   #          each a bin of a carried package, already trust-checked by the
   #          caller against this host's config.json
   #
-  # Three phases. PREFLIGHT mutates nothing (exit 64/65/69). STAGING
-  # installs TARGET and makes its prefix exactly the carry, through TARGET's
-  # own node and npm, while the old default stays live (exit 1 on failure,
-  # nothing switched). Only then the FLIP: record the switch in flight, move
-  # the default, run the hooks, clear the record. A failure after the flip
-  # restores the old default (exit 1, record cleared) or, if even that cannot
-  # be verified, leaves the record and exits 70.
+  # Exit 0 switched and verified; 64 invalid input; 65 refused, nothing
+  # changed; 69 no fnm/npm here; 75 another switch holds the lock; 1 failed
+  # and the old default is live (never moved, or restored and verified); 70
+  # failed and the restore could not be verified (the record stays).
   node_target=$1
   node_carry=$2
   node_hooks=$3
+  node_switch_args_valid
+  node_self=${BASHPID:-$(exec sh -c "$node_self_pid_sh")}
+  node_switch_lock=0
+  node_switch_lock_take "$node_self" || node_switch_lock=$?
+  case $node_switch_lock in
+    0) ;;
+    75)
+      printf 'roundhouse: another Node switch is in progress on this host; not switching\n' >&2
+      exit 75
+      ;;
+    *)
+      printf 'roundhouse: cannot take the Node switch lock %s\n' "$(node_switch_lock_path)" >&2
+      exit 69
+      ;;
+  esac
+  trap 'node_switch_lock_release "$node_self"' EXIT
+  node_switch_preflight
+  node_switch_stage
+  node_switch_flip
+)
 
-  # --- preflight ----------------------------------------------------------
+node_switch_args_valid() {
   node_version_valid "$node_target" || {
     printf 'roundhouse: invalid Node target version %s\n' "$node_target" >&2
     exit 64
@@ -448,6 +671,10 @@ node_runtime_switch() (
     printf 'roundhouse: invalid Node switch hook list\n' >&2
     exit 64
   }
+}
+
+node_switch_preflight() {
+  # PREFLIGHT mutates nothing (exit 65/69).
   [ -z "$(node_switch_marker_read)" ] || {
     printf 'roundhouse: an interrupted Node switch is pending recovery; refusing another\n' >&2
     exit 65
@@ -495,8 +722,17 @@ node_runtime_switch() (
   done <<EOF
 $(printf '%s\n' "$node_hooks" | jq -r '.[] | [(.package | ltrimstr("npm:")), .argv[0]] | @tsv')
 EOF
+}
 
-  # --- staging: TARGET's prefix, through TARGET's own npm --------------------
+node_stage_fail() {
+  printf 'roundhouse: %s; nothing switched (%s stays the default)\n' "$1" "$node_old" >&2
+  exit 1
+}
+
+node_switch_stage() {
+  # STAGING installs TARGET and makes its prefix exactly the carry, through
+  # TARGET's own node and npm, while the old default stays live (exit 1 on
+  # failure, nothing switched, nothing recorded).
   node_fnm_run "$node_root" install "$node_target" >/dev/null 2>&1 &&
     [ -x "$node_root/node-versions/$node_target/installation/bin/node" ] || {
     printf 'roundhouse: fnm install %s failed; nothing switched\n' "$node_target" >&2
@@ -505,10 +741,6 @@ EOF
   node_target_prefix=$(node_fnm_prefix "$node_root" "$node_target") || exit 1
   node_target_bin=$node_target_prefix/bin
   node_bundled=$(node_target_bundled "$node_target")
-  node_stage_fail() {
-    printf 'roundhouse: %s; nothing switched (%s stays the default)\n' "$1" "$node_old" >&2
-    exit 1
-  }
   # The npm that installs the carry must not be older than the one the host
   # runs now: npm 12 honours `allow-scripts` in ~/.npmrc and an older
   # bundled npm would run every dependency install script. Bring the
@@ -516,7 +748,7 @@ EOF
   node_old_npm=$(printf '%s\n' "$node_before" | jq -r '.npm // empty')
   node_target_npm=$(jq -r '.version // empty' "$node_target_prefix/lib/node_modules/npm/package.json" \
     2>/dev/null) || node_target_npm=
-  if npm_release_newer "$node_old_npm" "$node_target_npm"; then
+  if release_newer "$node_old_npm" "$node_target_npm"; then
     npm_prefix_run "$node_target_bin" "$node_target_prefix" install --global "npm@$node_old_npm" \
       >/dev/null 2>&1 || node_stage_fail "upgrading the npm of $node_target to $node_old_npm failed"
   fi
@@ -547,32 +779,35 @@ EOF
       ([$carry[].name] | sort) and
     all($carry[]; $after[.name].version == .version)' >/dev/null ||
     node_stage_fail "the npm globals under $node_target are not exactly the carry at its versions"
+}
 
-  # --- the flip ------------------------------------------------------------
-  node_switch_fail() {
-    printf 'roundhouse: %s\n' "$1" >&2
-    if node_switch_restore "$node_root" "$node_old"; then
-      node_switch_marker_clear
-      printf 'roundhouse: fnm default restored to %s (%s stays installed)\n' \
-        "$node_old" "$node_target" >&2
-      exit 1
-    fi
-    printf 'roundhouse: could not restore the fnm default to %s; the switch stays recorded as in flight\n' \
-      "$node_old" >&2
-    exit 70
-  }
-  [ "$node_old" = "$node_target" ] || {
-    node_switch_marker_write "$node_old" "$node_target" "$node_carry" ||
+node_switch_fail() {
+  # After the flip: restore the old default, verified, and clear the record
+  # (exit 1), or leave the record when the restore cannot be verified (70).
+  printf 'roundhouse: %s\n' "$1" >&2
+  if node_switch_restore "$node_root" "$node_old"; then
+    node_switch_marker_clear
+    printf 'roundhouse: fnm default restored to %s (%s stays installed)\n' \
+      "$node_old" "$node_target" >&2
+    exit 1
+  fi
+  printf 'roundhouse: could not restore the fnm default to %s; the switch stays recorded as in flight\n' \
+    "$node_old" >&2
+  exit 70
+}
+
+node_switch_flip() {
+  # THE FLIP: record the switch in flight (with this process as its writer),
+  # move the default, prove it, run the hooks, prove the default again, and
+  # only then clear the record.
+  if [ "$node_old" != "$node_target" ]; then
+    node_switch_marker_write "$node_old" "$node_target" "$node_carry" \
+      "$node_self" "$(node_process_start "$node_self")" ||
       node_stage_fail "could not record the switch as in flight"
     node_fnm_run "$node_root" default "$node_target" >/dev/null 2>&1 ||
       node_switch_fail "fnm default $node_target failed"
-  }
-  # The durable npm must now be TARGET's own, under TARGET's node.
-  node_new_bin=$(npm_global_bin_dir 2>/dev/null) || node_new_bin=
-  [ "$(node_fnm_default "$node_root" 2>/dev/null)" = "$node_target" ] &&
-    [ "$node_new_bin" = "$node_root/aliases/default/bin" ] &&
-    [ "$(PATH="$node_new_bin:$PATH" "$node_new_bin/node" --version 2>/dev/null </dev/null |
-      head -1)" = "$node_target" ] ||
+  fi
+  node_default_verified "$node_root" "$node_target" ||
     node_switch_fail "the durable npm does not run under $node_target after the switch"
   # Hooks write to a file, never to this function's output: a hook that
   # starts a daemon (a service repair does) must not hold the caller's
@@ -591,12 +826,18 @@ EOF
     npm_global_run_updater "$node_hook_name" "${node_hook_argv[@]}" >"$node_hook_log" 2>&1 || {
       tail -n 20 "$node_hook_log" >&2 2>/dev/null || :
       rm -f "$node_hook_log"
+      # This exact attempt is not retried by the reviewed apply (backoff).
+      node_switch_backoff_write "$node_target" "$node_carry" "$node_hooks" || :
       node_switch_fail "post-switch hook $(printf '%s\n' "$node_hook" | jq -c '.argv') for $node_hook_name failed"
     }
   done <<EOF
 $(printf '%s\n' "$node_hooks" | jq -c '.[]')
 EOF
   rm -f "$node_hook_log"
+  # Nothing may have moved the default while the hooks ran.
+  node_default_verified "$node_root" "$node_target" ||
+    node_switch_fail "the fnm default moved off $node_target while the switch ran"
   node_switch_marker_clear
+  node_switch_backoff_clear
   exit 0
-)
+}
