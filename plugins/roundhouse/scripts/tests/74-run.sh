@@ -193,6 +193,7 @@ JSON
       fail "fallback catalog reapplied an already-matching plugin"
     run_marketplace_update_marker="$run_root/marketplace-updates"
     : >"$run_marketplace_update_marker"
+    mkdir -p "$run_root/full-tmp"
     (
       fleet_trust_prune_expired() { :; }
       fleet_records_age() { :; }
