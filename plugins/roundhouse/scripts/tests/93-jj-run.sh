@@ -606,6 +606,16 @@ YAML
     esac
     [ -n "$(fleet_applied_digest "$vireo" vireo "$runjj_hostonly")" ] ||
       fail "a dry-run disown changed applied/"
+    # An owned item that is TOMBSTONED is not left installed: the dry run says
+    # its tombstone will uninstall it.
+    fleet_applied_record "$vireo" vireo plugins.retired d-retired
+    runjj_out=$(runjj vireo "$cli" fleet-disown --dry-run plugins.retired) ||
+      fail "the tombstoned disown dry run failed: $runjj_out"
+    case $runjj_out in
+      *'will be uninstalled by its tombstone'*) ;;
+      *) fail "the dry run did not say a tombstoned item will be uninstalled: $runjj_out" ;;
+    esac
+    fleet_applied_forget "$vireo" vireo plugins.retired
     runjj_status=0
     runjj vireo "$cli" fleet-disown plugins.never-owned >/dev/null 2>&1 ||
       runjj_status=$?

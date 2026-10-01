@@ -3390,11 +3390,16 @@ EOF
 
 fleet_seed_command() (
   # `roundhouse fleet-seed` — §10.2/§12. Discovery writes this host's OWN
-  # `hosts/<name>.yaml` and `applied/<host>.yaml` to match what is installed,
-  # so the first convergence after seeding is a no-op BY CONSTRUCTION. That is
-  # the safety property worth paying for: a seeding pass that treated the
-  # larger host as truth would install 83 skills someone deliberately kept off
-  # a machine, and the reverse mistake deletes 83.
+  # `hosts/<name>.yaml` and `applied/<host>.yaml` to match what is installed —
+  # for PACKAGES, so the first convergence after seeding is a no-op for them
+  # BY CONSTRUCTION. That is the safety property worth paying for: a seeding
+  # pass that treated the larger host as truth would install 83 packages
+  # someone deliberately kept off a machine, and the reverse mistake deletes 83.
+  #
+  # Agent items (`plugins`, `skills`) are NOT seeded (§8.2 P0): a newly seeded
+  # host therefore ADOPTS the fleet's plugins and skills on its first run —
+  # reviewed and applied like any change — rather than snapshotting its own
+  # into its host layer, where they overrode every change made anywhere else.
   #
   # It writes into the WORKING COPY and stops — no describe, no bookmark move,
   # no push. The next run's promote gate parses what it wrote and publishes it
@@ -3403,9 +3408,9 @@ fleet_seed_command() (
   # this: fleet-init, fleet-enroll, fleet-seed, hand-edit fleet.yaml,
   # fleet-doctor.
   #
-  # Re-seeding UPSERTS and never removes: a skill uninstalled between seeds is
-  # a convergence decision for the run to report by name, not something seeding
-  # silently drops.
+  # Re-seeding UPSERTS and never removes: a package uninstalled between seeds
+  # is a convergence decision for the run to report by name, not something
+  # seeding silently drops.
   fleet_run_env
   require_jq
   require_yq
@@ -4137,19 +4142,31 @@ EOF
   }
   disown_count=$(printf '%s\n' "$disown_selection" | grep -c . || true)
   if [ "$disown_dry" = true ]; then
-    printf 'roundhouse: would disown %s item(s) from applied/%s.yaml (left installed, no longer managed):\n' \
+    printf 'roundhouse: would disown %s item(s) from applied/%s.yaml (no longer managed; left installed unless tombstoned):\n' \
       "$disown_count" "$disown_host"
   else
-    printf 'roundhouse: disowning %s item(s) from applied/%s.yaml (left installed, no longer managed):\n' \
+    printf 'roundhouse: disowning %s item(s) from applied/%s.yaml (no longer managed; left installed unless tombstoned):\n' \
       "$disown_count" "$disown_host"
   fi
-  disown_universe=$(fleet_run_item_digests \
-    "$(fleet_fold "$disown_store" "$disown_host")" "$disown_store" | awk '{ print $1 }')
+  disown_fold=$(fleet_fold "$disown_store" "$disown_host")
+  disown_universe=$(fleet_run_item_digests "$disown_fold" "$disown_store" |
+    awk '{ print $1 }')
+  # A tombstoned item is not left installed for long: disowning forgets the
+  # record, and the tombstone still uninstalls what it finds.
+  disown_tombstoned=$(printf '%s\n' "$disown_fold" \
+    "$(fleet_fold_tombstones "$disown_store" "$disown_host" plugins)" | jq -r -s '
+      [.[] | (.plugins // {}) | select(type == "object") | to_entries[] |
+        select(.value == "absent" or
+          ((.value | type) == "object" and .value.state == "absent")) |
+        "plugins." + .key] | unique | .[]')
   while IFS= read -r disown_item; do
     [ -n "$disown_item" ] || continue
     disown_note=
-    ! printf '%s\n' "$disown_universe" | grep -Fqx -- "$disown_item" ||
+    if printf '%s\n' "$disown_tombstoned" | grep -Fqx -- "$disown_item"; then
+      disown_note='  (tombstoned: it will be uninstalled by its tombstone)'
+    elif printf '%s\n' "$disown_universe" | grep -Fqx -- "$disown_item"; then
       disown_note='  (still in the layers: the next run adopts it again)'
+    fi
     printf '  disown %s %s%s\n' "$disown_item" \
       "$(fleet_applied_digest "$disown_store" "$disown_host" "$disown_item")" "$disown_note"
   done <<EOF
