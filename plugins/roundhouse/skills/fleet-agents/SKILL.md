@@ -96,6 +96,16 @@ accelerator only — it carries no data, says "go look", and the peer then runs
 its ordinary fast path with every gate. Turn it off with `push_nudge: false`
 and the fleet still converges at poll speed; nothing depends on it.
 
+**Heartbeats.** Every pass records a host-local heartbeat
+(`store.run/alive`). The `outcome: alive` journal record is *published* at most
+every `heartbeat_publish_hours` (default 6), and always after a pass that applied
+or satisfied an item, and at a canary's evidence deadline
+(`applied_at + canary_wait_hours`), so the canary gate never waits on a
+throttled record. Every pass raises a `stale-host` alert, once per silence, for
+another enrolled host that has published no heartbeat within
+`liveness_alert_hours` (default 12). Both keys are ordinary store policy;
+`0` turns the throttle or the alert off.
+
 An unpinned package is kept current by the full pass — that is what anyone
 gets by doing nothing. A `version:` key in `definitions.yaml` opts one
 package out, and the full pass skips it rather than quietly undoing the pin.

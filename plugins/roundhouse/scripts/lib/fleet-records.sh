@@ -671,6 +671,8 @@ canary_group canary
 canary_wait_hours 24
 max_removals_per_run 5
 max_removal_fraction 0.25
+heartbeat_publish_hours 6
+liveness_alert_hours 12
 EOF
 }
 

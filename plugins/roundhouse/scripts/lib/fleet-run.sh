@@ -152,10 +152,15 @@ fleet_run_poll_floor() {
   # has nothing to pull and nothing to push and has applied nothing, so on the
   # three conditions alone it would sit idle until the remote happened to
   # move. The marker is the reference this host last completed a run against.
+  #
+  # And a fifth: no published heartbeat is owed (§6.3). The heartbeat is
+  # published only by a pass that reaches the end, so a floor that exited
+  # while one was due would make a quiet host read as dead to every peer.
   [ "$fleet_run_remote" = "$fleet_run_local" ] &&
     [ -z "$fleet_run_pending" ] && [ -z "$fleet_run_dirty" ] &&
     [ "$(cat "$(fleet_run_state_dir)/converged" 2>/dev/null)" = \
-      "$(fleet_vcs_heads_local "$1")" ]
+      "$(fleet_vcs_heads_local "$1")" ] &&
+    ! fleet_heartbeat_due
 }
 
 fleet_run_prune_empty() {
@@ -1697,6 +1702,7 @@ fleet_run_command() (
   # object transfer, no commit, no push. The full fetch runs only when the ids
   # differ.
   if [ "$run_mode" = fast ] && fleet_run_poll_floor "$run_store"; then
+    fleet_heartbeat_local "$(fleet_now)" || :
     printf 'roundhouse: nothing to pull, nothing to push, clean working copy — one ls-remote round trip, no fetch (§6.1a)\n'
     printf 'roundhouse: starting operation %s\n' "$run_op"
     exit 0
@@ -1952,6 +1958,9 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   ! grep -Fqx "$run_host" "$run_tmp/canaries" || run_self_canary=true
   run_now=$(fleet_now)
   run_applied_items=
+  # Any `applied` or `satisfied` record this pass — the evidence §10.1 reads,
+  # and the one thing that always publishes a heartbeat with it (§6.3).
+  run_applied_any=false
 
   # §10.3's removal set, capped BEFORE any removal applies: ONE tagged list,
   # `prune ITEM` (owned, gone from the layers) and `uninstall ITEM` (a
@@ -2218,6 +2227,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
           "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
             '{item:$item,digest:$d,outcome:"applied",at:$at}')" || :
         run_applied_items="$run_applied_items$run_item "
+        run_applied_any=true
         printf '  applied %s\n' "$run_item"
         ;;
       70)
@@ -2232,6 +2242,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         fleet_journal_append "$run_store" "$run_host" \
           "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
             '{item:$item,digest:$d,outcome:"satisfied",at:$at}')" || :
+        run_applied_any=true
         printf '  satisfied %s (no state-alignment verb for this category)\n' \
           "$run_item"
         ;;
@@ -2254,10 +2265,24 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   fleet_alert_sweep "$run_store" "$run_host" "$run_ledger"
 
   # §10.1 condition 3's heartbeat: a canary that applies an item, is wrecked by
-  # it and stops journaling otherwise satisfies conditions 1 and 2. One record
-  # per completed run is what makes silence visible.
-  fleet_journal_append "$run_store" "$run_host" \
-    "$(jq -cn --arg at "$(fleet_now)" '{outcome:"alive",at:$at}')" || :
+  # it and stops journaling otherwise satisfies conditions 1 and 2. A record
+  # per completed run is what makes silence visible — host-local on every
+  # pass, and PUBLISHED only when §6.3's throttle, an apply, or a canary
+  # evidence deadline calls for it (lib/fleet-liveness.sh). Publishing it on
+  # every pass was a record commit per host per pass, which is what defeated
+  # every peer's poll floor.
+  run_alive_at=$(fleet_now)
+  fleet_heartbeat_local "$run_alive_at" || :
+  # §6.3's other half: a peer with no published heartbeat inside
+  # `liveness_alert_hours` is alerted on, from this store's journal alone.
+  fleet_liveness_alerts "$run_store" "$run_host" "$run_tmp/hosts" \
+    "$run_tmp/reviewed-roster" "$run_fold" "$run_alive_at" |
+    while read -r _ run_silent; do
+      printf 'roundhouse: %s has published no heartbeat within liveness_alert_hours (stale-host alert)\n' \
+        "$run_silent" >&2
+    done || :
+  fleet_heartbeat_publish "$run_store" "$run_host" "$run_alive_at" "$run_fold" \
+    "$run_self_canary" "$run_applied_any" || :
 
   # §8.4: while a conflict is open the host is locally converging and
   # PUBLICATION-SILENT — the same state it is in when offline.

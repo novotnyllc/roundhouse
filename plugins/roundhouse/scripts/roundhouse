@@ -135,6 +135,8 @@ EOF
 . "$script_dir/lib/apply-claude.sh"
 # shellcheck source=lib/fleet-publish-verbs.sh
 . "$script_dir/lib/fleet-publish-verbs.sh"
+# shellcheck source=lib/fleet-liveness.sh
+. "$script_dir/lib/fleet-liveness.sh"
 # shellcheck source=lib/fleet-run.sh
 . "$script_dir/lib/fleet-run.sh"
 # shellcheck source=lib/fleet-doctor.sh
