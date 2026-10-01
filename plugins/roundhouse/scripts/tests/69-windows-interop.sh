@@ -327,6 +327,42 @@ JSON
     fail "interop partial apply evidence was not preserved"
   interop_stage_clean apply-partial
 
+  # A failing native command names its own error: the controller log and the
+  # failed operation record carry a bounded, sanitized tail of its output,
+  # with styling and progress redraws stripped and secret-shaped lines
+  # redacted. Exit code and partial-apply contract are unchanged.
+  interop_known_error='Register-ScheduledTask : Access is denied.'
+  if WINGET_UPGRADE_FAILURE="$interop_known_error" ROUNDHOUSE_CONFIG="$interop_config" \
+    "$interop_cli" apply-interop-plan "$tmp/interop-plan.json" "$interop_plan_id" \
+    "$tmp/interop-failed-result.jsonl" 2>"$tmp/interop-failed.err"; then
+    fail "interop apply reported success although the native command failed"
+  else
+    interop_rc=$?
+  fi
+  [ "$interop_rc" -eq 70 ] || fail "interop execute failure did not exit 70 (got $interop_rc)"
+  assert_contains "$(cat "$tmp/interop-failed.err")" 'native Windows worker reported a partial apply'
+  assert_contains "$(cat "$tmp/interop-failed.err")" \
+    'Windows apply failed at execute: Native command failed: winget (exit 1); output tail:'
+  assert_contains "$(cat "$tmp/interop-failed.err")" "$interop_known_error"
+  assert_contains "$(cat "$tmp/interop-failed.err")" 'Found Example package [Example.Package]'
+  assert_contains "$(cat "$tmp/interop-failed.err")" '[redacted: line matched a secret pattern]'
+  ! grep -q 'ghp_' "$tmp/interop-failed.err" "$tmp/interop-failed-result.jsonl" ||
+    fail "a secret-shaped line from the failing command reached the controller"
+  ! LC_ALL=C grep -q "$(printf '\033')" "$tmp/interop-failed.err" ||
+    fail "ANSI styling from the failing command reached the controller log"
+  jq -e -s --arg plan_id "$interop_plan_id" --arg known "$interop_known_error" '
+    any(.[]; .kind == "operation" and .id == ("apply:" + $plan_id + ":0") and
+      .status == "error" and .data.phase == "execute" and .data.exit_code == 1 and
+      (.data.output_tail | type == "array" and length <= 20 and index($known) != null and
+        all(.[]; type == "string" and length <= 240)) and
+      (.errors[0].message | endswith($known))) and
+    any(.[]; .kind == "operation" and .id == ("apply:" + $plan_id) and .status == "partial" and
+      .data.phase == "execute" and (.errors[0].message | contains($known)))
+  ' "$tmp/interop-failed-result.jsonl" >/dev/null ||
+    fail "the failed operation record did not carry the sanitized output tail"
+  [ ! -e "$WINGET_STATE_FILE" ] || fail "a failed interop upgrade converged the package"
+  interop_stage_clean apply-execute-failure
+
   # Success requires the worker's matching final record.
   ROUNDHOUSE_CONFIG="$interop_config" "$interop_cli" apply-interop-plan "$tmp/interop-plan.json" \
     "$interop_plan_id" "$tmp/interop-apply-result.jsonl" ||
@@ -341,5 +377,42 @@ JSON
   ' "$tmp/interop-apply-result.jsonl" >/dev/null ||
     fail "interop apply result lacked the bound completion record or post-state"
   interop_stage_clean apply
+
+  # A chezmoi apply that exits 0 but leaves drift reports why: what apply
+  # itself printed, then the read-only `chezmoi status` lines still drifting.
+  cat >"$tmp/interop-chezmoi-draft.json" <<'JSON'
+{"domain":"chezmoi","target":"test-windows","operations":[{"type":"chezmoi-apply","kind":"chezmoi_state","id":"live","argv":["chezmoi","--no-tty","apply"]}]}
+JSON
+  CHEZMOI_STATUS_DRIFT=1 ROUNDHOUSE_CONFIG="$interop_config" "$interop_cli" collect \
+    --target test-windows --section chezmoi --output "$tmp/interop-chezmoi-snapshot.jsonl" ||
+    fail "interop chezmoi planning inventory did not complete"
+  ROUNDHOUSE_CONFIG="$interop_config" "$interop_cli" seal-plan "$tmp/interop-chezmoi-draft.json" \
+    "$tmp/interop-chezmoi-snapshot.jsonl" "$tmp/interop-chezmoi-plan.json" ||
+    fail "a Windows chezmoi apply plan did not seal over the interop lane"
+  interop_chezmoi_plan_id=$(jq -r '.plan_id' "$tmp/interop-chezmoi-plan.json")
+  sleep 1
+  interop_chezmoi_note='chezmoi: warning: .chezmoiscripts/run_onchange_after_10-register-task.ps1: skipped by fixture'
+  if CHEZMOI_STATUS_DRIFT=1 CHEZMOI_APPLY_STDERR="$interop_chezmoi_note" \
+    ROUNDHOUSE_CONFIG="$interop_config" "$interop_cli" apply-interop-plan \
+    "$tmp/interop-chezmoi-plan.json" "$interop_chezmoi_plan_id" \
+    "$tmp/interop-chezmoi-result.jsonl" 2>"$tmp/interop-chezmoi.err"; then
+    fail "interop chezmoi apply reported success although drift remained"
+  else
+    interop_rc=$?
+  fi
+  [ "$interop_rc" -eq 70 ] || fail "interop chezmoi drift did not exit 70 (got $interop_rc)"
+  assert_contains "$(cat "$tmp/interop-chezmoi.err")" \
+    'Windows apply failed at verify: Chezmoi still reports drift after apply; output tail:'
+  assert_contains "$(cat "$tmp/interop-chezmoi.err")" "$interop_chezmoi_note"
+  assert_contains "$(cat "$tmp/interop-chezmoi.err")" '|  M .zshrc'
+  jq -e -s --arg plan_id "$interop_chezmoi_plan_id" --arg note "$interop_chezmoi_note" '
+    any(.[]; .kind == "operation" and .id == ("apply:" + $plan_id + ":0") and
+      .data.phase == "verify" and .data.operation_status == "failed" and
+      .data.output_tail == [$note, " M .zshrc"]) and
+    any(.[]; .kind == "operation" and .id == ("apply:" + $plan_id) and .status == "partial" and
+      .data.phase == "verify")
+  ' "$tmp/interop-chezmoi-result.jsonl" >/dev/null ||
+    fail "the chezmoi drift record did not carry the apply output and remaining status"
+  interop_stage_clean apply-chezmoi-drift
   unset WINGET_STATE_FILE INTEROP_WINDOWS_HOME ROUNDHOUSE_INTEROP_ROOT ROUNDHOUSE_INTEROP_PWSH
 fi
