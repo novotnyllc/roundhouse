@@ -64,6 +64,264 @@ mkdir -p "$bootstrap_root"
     fail "the store scaffold still writes an identity marker file (§7.5)"
 )
 
+# --- §6.3 the run lock: holder, nonce, takeover, release ---
+# No jj: pure file and process logic, so it runs wherever the fold does (the
+# stale threshold reads the store's policy through yq).
+if [ -n "$fleet_fixture_yq" ]; then
+  (
+    set -eu
+    PATH=$fleet_fixture_path
+    export PATH
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+    verb_root="$bootstrap_root/lock"
+    verb_store="$verb_root/store"
+    mkdir -p "$verb_store/hosts"
+    ROUNDHOUSE_FLEET_STORE=$verb_store
+    HOME="$verb_root/home"
+    export ROUNDHOUSE_FLEET_STORE HOME
+    mkdir -p "$HOME"
+    fleet_record_write "$(fleet_identity_path)" '{"name":"vireo"}'
+    printf '%s\n' 'policy:' '  canary_group: canary' >"$verb_store/fleet.yaml"
+    fleet_lock_command >/dev/null || fail "the run lock could not be taken by hand"
+    # A hand-taken lock is `manual`, and is NEVER judged dead: its recorded pid
+    # is a shell that may exit a second later, and a run that took it over
+    # would publish the operator's half-done edits. The age rule governs it.
+    [ "$(fleet_lock_meta_field "$(fleet_lock_path)" manual)" = true ] ||
+      fail "a hand-taken lock was not marked manual"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$(fleet_lock_path)" 2>/dev/null ||
+      verb_status=$?
+    [ "$verb_status" -eq 10 ] ||
+      fail "a hand-taken lock was not honoured as held (got $verb_status)"
+    jq -c '.pid = 999999' "$(fleet_lock_path)/meta.json" >"$verb_root/manual-meta" &&
+      mv "$verb_root/manual-meta" "$(fleet_lock_path)/meta.json"
+    fleet_lock_holder_state "$(fleet_lock_path)"
+    [ "$fleet_lock_state" = unknown ] ||
+      fail "a hand-taken lock whose shell is gone was judged $fleet_lock_state"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$(fleet_lock_path)" 2>/dev/null ||
+      verb_status=$?
+    [ "$verb_status" -eq 10 ] ||
+      fail "a run took over a hand-taken lock whose shell had exited (got $verb_status)"
+    fleet_unlock_command >/dev/null
+    [ ! -d "$(fleet_lock_path)" ] || fail "fleet-unlock did not release a hand-taken lock"
+    # fleet-unlock REFUSES a verified-live run's lock unless forced.
+    sleep 300 &
+    verb_live_run=$!
+    fleet_lock_acquire "$(fleet_lock_path)" "$verb_live_run"
+    verb_status=0
+    fleet_unlock_command >/dev/null 2>&1 || verb_status=$?
+    [ "$verb_status" -eq 75 ] && [ -d "$(fleet_lock_path)" ] ||
+      fail "fleet-unlock released a verified-live run's lock (got $verb_status)"
+    fleet_unlock_command --force >/dev/null ||
+      fail "fleet-unlock --force did not release a live run's lock"
+    [ ! -d "$(fleet_lock_path)" ] || fail "fleet-unlock --force left the lock"
+    kill "$verb_live_run" 2>/dev/null || :
+    wait "$verb_live_run" 2>/dev/null || :
+    # fleet-unlock releases BY IDENTITY: a lock with no meta carries nothing to
+    # protect and goes; one whose meta cannot be read needs --force.
+    mkdir -p "$(fleet_lock_path)"
+    fleet_unlock_command >/dev/null || fail "fleet-unlock refused an evidence-less lock directory"
+    [ ! -d "$(fleet_lock_path)" ] || fail "fleet-unlock left an evidence-less lock directory"
+    mkdir -p "$(fleet_lock_path)"
+    printf ':::not json\n' >"$(fleet_lock_path)/meta.json"
+    verb_status=0
+    fleet_unlock_command >/dev/null 2>&1 || verb_status=$?
+    [ "$verb_status" -eq 75 ] && [ -d "$(fleet_lock_path)" ] ||
+      fail "fleet-unlock released a lock whose meta it could not read (got $verb_status)"
+    fleet_unlock_command --force >/dev/null ||
+      fail "fleet-unlock --force did not release an unreadable lock"
+    [ ! -d "$(fleet_lock_path)" ] || fail "fleet-unlock --force left an unreadable lock"
+
+    # --- §6.3 lock liveness: the holder is asked before the clock ---
+    verb_lock=$(fleet_lock_path)
+    verb_alerts="$verb_store/alerts/vireo"
+    verb_lock_holder() {
+      # A real process to name as the holder: alive until killed, with a start
+      # time and command `ps` can read back.
+      sleep 300 &
+      verb_holder=$!
+    }
+    verb_lock_holder
+    fleet_lock_acquire "$verb_lock" "$verb_holder" ||
+      fail "the lock could not be taken for a fixture holder"
+    verb_first_nonce=$fleet_lock_nonce_held
+    [ -n "$verb_first_nonce" ] &&
+      [ "$(fleet_lock_meta_field "$verb_lock" nonce)" = "$verb_first_nonce" ] ||
+      fail "the lock meta did not record this acquisition's nonce"
+    for verb_field in host pid start_time command nonce; do
+      [ -n "$(fleet_lock_meta_field "$verb_lock" "$verb_field")" ] ||
+        fail "the lock meta does not record the holder's $verb_field"
+    done
+    # A LIVE matching holder still blocks, whatever its age.
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>/dev/null || verb_status=$?
+    [ "$verb_status" -eq 10 ] ||
+      fail "a live holder did not block the run (got $verb_status)"
+    # PID REUSE: the same pid, but not the process that took the lock.
+    jq -c '.start_time = "Thu Jan  1 00:00:00 1970"' "$verb_lock/meta.json" \
+      >"$verb_root/reused-meta" && mv "$verb_root/reused-meta" "$verb_lock/meta.json"
+    rm -rf "$verb_alerts"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>"$verb_root/takeover-err" ||
+      verb_status=$?
+    [ "$verb_status" -eq 0 ] ||
+      fail "a reused pid with a different start time was not taken over (got $verb_status)"
+    [ "$(fleet_lock_meta_field "$verb_lock" nonce)" = "$fleet_lock_nonce_held" ] &&
+      [ "$fleet_lock_nonce_held" != "$verb_first_nonce" ] ||
+      fail "the takeover did not recreate the lock under a new nonce"
+    [ "$(fleet_lock_meta_field "$verb_lock" pid)" = "$$" ] ||
+      fail "the taken-over lock does not name the new holder"
+    grep -q 'took over the run lock' "$verb_root/takeover-err" ||
+      fail "the takeover was not reported"
+    grep -rqs 'kind: lock-takeover' "$verb_alerts" ||
+      fail "the takeover raised no alert"
+    ! grep -rqs 'sleep 300' "$verb_alerts" ||
+      fail "the dead holder's command line reached a replicated record"
+    [ -z "$(find "$(dirname "$verb_lock")" -maxdepth 1 -name "$(basename "$verb_lock").dead.*")" ] ||
+      fail "the takeover left the dead lock beside the live one"
+    # RELEASE IS BY NONCE: the dead run, exiting late, must not remove its
+    # successor's lock by path.
+    ! fleet_lock_release "$verb_lock" "$verb_first_nonce" ||
+      fail "a stale nonce reported releasing the successor's lock"
+    [ -d "$verb_lock" ] ||
+      fail "a stale nonce released the successor's lock"
+    fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
+    [ ! -d "$verb_lock" ] || fail "the holding nonce did not release its own lock"
+    # The start time does not depend on the READER's zone or locale: a
+    # scheduled run and an interactive one need not share either, and a
+    # mismatch there would take over a live run's lock.
+    fleet_lock_acquire "$verb_lock" "$verb_holder"
+    TZ=Pacific/Kiritimati LC_ALL=C fleet_lock_holder_state "$verb_lock"
+    [ "$fleet_lock_state" = live ] ||
+      fail "a reader in another time zone judged a live holder $fleet_lock_state"
+    rm -rf "$verb_lock"
+    # A different COMMAND at the same pid and start time is not the holder either.
+    fleet_lock_acquire "$verb_lock" "$verb_holder"
+    jq -c '.command = "something else entirely"' "$verb_lock/meta.json" \
+      >"$verb_root/command-meta" && mv "$verb_root/command-meta" "$verb_lock/meta.json"
+    fleet_lock_holder_state "$verb_lock"
+    [ "$fleet_lock_state" = dead ] ||
+      fail "a pid running a different command read as the live holder ($fleet_lock_state)"
+    rm -rf "$verb_lock"
+    # A pid that is GONE is dead, and the takeover is immediate rather than two
+    # cadences later.
+    fleet_lock_acquire "$verb_lock" "$verb_holder"
+    kill "$verb_holder" 2>/dev/null || :
+    wait "$verb_holder" 2>/dev/null || :
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>/dev/null || verb_status=$?
+    [ "$verb_status" -eq 0 ] ||
+      fail "a lock whose holder pid is gone was not taken over (got $verb_status)"
+    fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
+    # The rename-and-verify step: a lock that is no longer the one judged dead
+    # (a racing run replaced it) is put back untouched and the takeover refused.
+    fleet_lock_acquire "$verb_lock"
+    verb_racer=$fleet_lock_nonce_held
+    ! fleet_lock_takeover "$verb_lock" not-the-judged-nonce ||
+      fail "a takeover moved a lock whose nonce it never judged"
+    [ "$(fleet_lock_meta_field "$verb_lock" nonce)" = "$verb_racer" ] ||
+      fail "a refused takeover did not put the racing run's lock back"
+    fleet_lock_release "$verb_lock" "$verb_racer"
+    # LOCK TRANSITIONS ARE SERIALIZED (fleet_lock_transition_enter): a takeover
+    # holds the transition mutex until its new lock is in place, so a racing
+    # takeover of the SAME dead holder waits for it, then finds a lock it never
+    # judged and leaves it alone — it never renames the live lock aside.
+    mkdir -p "$verb_lock"
+    printf '{"host":"vireo","pid":%s,"started_at":"2000-01-01T00:00:00Z"}\n' \
+      "$verb_holder" >"$verb_lock/meta.json"
+    verb_dead_id=$(fleet_lock_identity "$verb_lock")
+    (ROUNDHOUSE_TEST_LOCK_TRANSITION_PAUSE=2 fleet_lock_takeover "$verb_lock" "$verb_dead_id") &
+    verb_first=$!
+    for verb_n in $(seq 1 50); do
+      [ ! -d "$verb_lock.t" ] || break
+      sleep 0.1
+    done
+    [ -d "$verb_lock.t" ] || fail "the first takeover never entered its transition"
+    verb_wait_start=$(date +%s)
+    ! fleet_lock_takeover "$verb_lock" "$verb_dead_id" ||
+      fail "two takeovers of one dead holder both succeeded"
+    verb_waited=$(($(date +%s) - verb_wait_start))
+    wait "$verb_first" || fail "the first takeover of a dead holder failed"
+    [ "$verb_waited" -ge 1 ] ||
+      fail "a racing takeover did not wait for the transition in progress"
+    verb_live_id=$(fleet_lock_identity "$verb_lock")
+    [ -n "$verb_live_id" ] && [ "$verb_live_id" != "$verb_dead_id" ] &&
+      [ ! -e "$verb_lock.t" ] &&
+      [ -z "$(find "$(dirname "$verb_lock")" -maxdepth 1 -name "$(basename "$verb_lock").dead.*")" ] ||
+      fail "a racing takeover disturbed the lock the first one made live"
+    fleet_lock_release "$verb_lock" "$verb_live_id" ||
+      fail "the live lock could not be released after the race"
+    # A transition mutex a crashed transition left behind is broken once it is
+    # older than a minute, so it can never wedge release or takeover.
+    fleet_lock_acquire "$verb_lock"
+    verb_racer=$fleet_lock_nonce_held
+    mkdir "$verb_lock.t"
+    touch -t 200001010000 "$verb_lock.t"
+    fleet_lock_release "$verb_lock" "$verb_racer" ||
+      fail "a stale transition mutex blocked the release"
+    [ ! -d "$verb_lock" ] && [ ! -e "$verb_lock.t" ] ||
+      fail "a release behind a stale transition mutex left the lock or the mutex"
+    # A holder that stalled past the break must not remove the mutex of the
+    # transition that broke it: leave checks its own token.
+    fleet_lock_transition_enter "$verb_lock" || fail "could not enter the transition mutex"
+    printf 'someone-else\n' >"$verb_lock.t/owner"
+    fleet_lock_transition_leave "$verb_lock"
+    [ -d "$verb_lock.t" ] || fail "a stalled holder's leave removed its successor's mutex"
+    rm -rf "$verb_lock.t"
+    fleet_lock_transition_enter "$verb_lock" || fail "could not re-enter the transition mutex"
+    fleet_lock_transition_leave "$verb_lock"
+    [ ! -e "$verb_lock.t" ] || fail "the holder's own leave did not remove its mutex"
+    # A PRE-NONCE lock left by a dead run — the wedge itself — is recovered too:
+    # its pid and start stamp are the identity the takeover binds to.
+    mkdir -p "$verb_lock"
+    printf '{"host":"vireo","pid":%s,"started_at":"2000-01-01T00:00:00Z"}\n' \
+      "$verb_holder" >"$verb_lock/meta.json"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>/dev/null || verb_status=$?
+    [ "$verb_status" -eq 0 ] ||
+      fail "a pre-nonce lock with a dead pid was not taken over (got $verb_status)"
+    fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
+    # The PRIMITIVE reports a takeover (exit 11, with the dead holder's pid and
+    # stamp) and alerts nothing: the alert, and the stale threshold, are the
+    # run's (fleet_run_lock_take), so fleet-store.sh needs neither.
+    mkdir -p "$verb_lock"
+    printf '{"host":"vireo","pid":%s,"started_at":"2000-01-01T00:00:00Z"}\n' \
+      "$verb_holder" >"$verb_lock/meta.json"
+    rm -rf "$verb_alerts"
+    verb_status=0
+    fleet_lock_take "$verb_lock" 999999 2>/dev/null || verb_status=$?
+    [ "$verb_status" -eq 11 ] && case $fleet_lock_taken_from in *"pid $verb_holder "*) true ;; *) false ;; esac ||
+      fail "the lock primitive did not report a takeover with its dead holder (got $verb_status: $fleet_lock_taken_from)"
+    [ ! -d "$verb_alerts" ] || fail "the lock primitive wrote an alert itself"
+    fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
+    ! sed -n '/^fleet_lock_take() {/,/^}/p' "$(dirname -- "$cli")/lib/fleet-store.sh" |
+      grep -Eq 'fleet_alert_write|fleet_run_stale_after' ||
+      fail "the lock primitive reaches back into the run's alert or policy code"
+    # …but a pre-nonce lock whose pid is ALIVE proves nothing about its holder,
+    # so the age rule still governs it — and the refusal names the age ONCE.
+    mkdir -p "$verb_lock"
+    printf '{"host":"vireo","pid":%s,"started_at":"2000-01-01T00:00:00Z"}\n' "$$" \
+      >"$verb_lock/meta.json"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>"$verb_root/stale-err" ||
+      verb_status=$?
+    [ "$verb_status" -eq 75 ] ||
+      fail "an aged lock with an unprovable live pid was not refused (got $verb_status)"
+    grep -Eq ' is [0-9]+s old;' "$verb_root/stale-err" &&
+      ! grep -Eq '[0-9]+s[0-9]+' "$verb_root/stale-err" ||
+      fail "the stale refusal does not name the age exactly once: $(cat "$verb_root/stale-err")"
+    rm -f "$verb_lock/meta.json"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>"$verb_root/stale-err" ||
+      verb_status=$?
+    [ "$verb_status" -eq 75 ] && grep -q 'unknown age' "$verb_root/stale-err" ||
+      fail "a lock with no meta was not refused as of unknown age (got $verb_status)"
+    rmdir "$verb_lock"
+  ) || exit 1
+fi
+
 # --- real jj: bootstrap ordering, the pins, and enrollment ---
 # Everything below can only be falsified by real tools: §3.3's brick case is a
 # claim about what jj 0.44 does when signing config precedes the certificate,

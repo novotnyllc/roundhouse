@@ -270,7 +270,7 @@ nfx_reset_state
   nfx_run_full() {
     (
       fleet_trust_prune_expired() { :; }
-      fleet_trust_age_evidence() { :; }
+      fleet_records_age() { :; }
       fleet_enroll_process_joins() { :; }
       fleet_seed_command() { :; }
       fleet_run_proposals() { :; }

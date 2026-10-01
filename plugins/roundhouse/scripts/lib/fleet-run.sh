@@ -810,105 +810,6 @@ fleet_config_drift() {
     done
 }
 
-fleet_run_plugin_catalog() {
-  # The source SHA is the byte identity; the catalog version remains useful
-  # for the ordinary release advance but is never sufficient by itself.
-  # Claude 2.1.229's `--available` view omits plugins already installed on the
-  # host, so use it when it has a SHA and fall back to the installed
-  # marketplace manifest when it does not. Older managers that fail the
-  # `--available` command still reach the manifest path.
-  fleet_run_catalog_id=$1
-  fleet_run_catalog_name=${fleet_run_catalog_id%@*}
-  fleet_run_catalog_market=${fleet_run_catalog_id##*@}
-  fleet_run_catalog_json=$(claude plugin list --available --json 2>/dev/null) ||
-    fleet_run_catalog_json=
-  fleet_run_catalog_entry=$(printf '%s\n' "$fleet_run_catalog_json" |
-    jq -e -c --arg id "$fleet_run_catalog_id" '
-      (if type == "array" then .[] else (.available // [])[] end) |
-      select((.pluginId // .id) == $id and (.source.sha // "") != "")' \
-      2>/dev/null) || fleet_run_catalog_entry=
-  [ -n "$fleet_run_catalog_entry" ] && {
-    printf '%s\n' "$fleet_run_catalog_entry"
-    return 0
-  }
-
-  fleet_run_marketplaces=$(claude plugin marketplace list --json 2>/dev/null) ||
-    return 75
-  fleet_run_catalog_locations=$(printf '%s\n' "$fleet_run_marketplaces" |
-    jq -r --arg market "$fleet_run_catalog_market" '
-      (if type == "array" then .[] else (.marketplaces // [])[] end) |
-      select(.name == $market) | .installLocation // empty' 2>/dev/null) ||
-    return 75
-  while IFS= read -r fleet_run_catalog_location; do
-    [ -n "$fleet_run_catalog_location" ] || continue
-    fleet_run_catalog_manifest="$fleet_run_catalog_location/.claude-plugin/marketplace.json"
-    [ -f "$fleet_run_catalog_manifest" ] || continue
-    fleet_run_catalog_entry=$(jq -e -c \
-      --arg name "$fleet_run_catalog_name" --arg market "$fleet_run_catalog_market" \
-      '.plugins[]? | select(.name == $name) |
-       . + {pluginId: ($name + "@" + $market), marketplaceName: $market}' \
-      "$fleet_run_catalog_manifest" 2>/dev/null) || continue
-    [ -n "$fleet_run_catalog_entry" ] || continue
-    printf '%s\n' "$fleet_run_catalog_entry"
-    return 0
-  done <<EOF
-$fleet_run_catalog_locations
-EOF
-  return 75
-}
-
-fleet_run_ensure_marketplace() {
-  # fleet_run_ensure_marketplace NAME — register a declared marketplace that
-  # the harness does not know yet. Claude Code registers the synced
-  # extraKnownMarketplaces only on an interactive trusted start, so on a host
-  # driven headlessly a declared marketplace can stay unregistered forever and
-  # every install from it holds. The source comes only from the user's own
-  # synced declaration; nothing is registered that the settings do not name.
-  fleet_run_ensure_name=$1
-  fleet_upstream_id_valid "$fleet_run_ensure_name" || return 75
-  command -v claude >/dev/null 2>&1 || return 75
-  fleet_run_ensure_list=$(claude plugin marketplace list --json 2>/dev/null) || return 75
-  if printf '%s\n' "$fleet_run_ensure_list" | jq -e --arg n "$fleet_run_ensure_name" '
-    (if type == "array" then . else (.marketplaces // []) end) | any(.[]; .name == $n)
-  ' >/dev/null 2>&1; then
-    return 0
-  fi
-  fleet_run_ensure_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
-  [ -f "$fleet_run_ensure_settings" ] || return 75
-  # A declared ref (branch or tag) is kept with `#ref`, so registration
-  # resolves the revision the user pinned rather than the default branch.
-  fleet_run_ensure_source=$(jq -er --arg n "$fleet_run_ensure_name" '
-    .extraKnownMarketplaces[$n].source // empty |
-    ((.ref // "") | if . == "" then "" else "#" + . end) as $ref |
-    if .source == "github" then .repo + $ref
-    elif .source == "git" then .url + $ref
-    elif .source == "directory" then .path
-    elif .source == "url" then .url
-    else empty end
-  ' "$fleet_run_ensure_settings" 2>/dev/null) || return 75
-  case $fleet_run_ensure_source in
-    ''|-*|*[[:space:]]*) return 75 ;;
-    *'#'*) case ${fleet_run_ensure_source##*#} in ''|*[!A-Za-z0-9._/-]*) return 75 ;; esac ;;
-  esac
-  claude plugin marketplace add "$fleet_run_ensure_source" >/dev/null 2>&1 || return 75
-  claude plugin marketplace list --json 2>/dev/null | jq -e --arg n "$fleet_run_ensure_name" '
-    (if type == "array" then . else (.marketplaces // []) end) | any(.[]; .name == $n)
-  ' >/dev/null 2>&1 || return 75
-}
-
-fleet_run_installed_plugin() {
-  # No installed-plugins file, or the plugin absent from it, means "not
-  # installed yet" — an empty identity that must proceed to install, not a
-  # hold. Only a file that fails to parse as JSON is genuinely malformed and
-  # still holds: we cannot trust its absence of the plugin in that case.
-  fleet_run_installed_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
-  [ -f "$fleet_run_installed_file" ] || { printf '{}\n'; return 0; }
-  jq -c --arg id "$1" \
-    '(.plugins[$id] // []) | map(select(.scope == "user")) | (.[0] // {})' \
-    "$fleet_run_installed_file" 2>/dev/null && return 0
-  return 75
-}
-
 fleet_run_plugin_enabled() {
   # State verbs reject no-ops; verify one strict user-scoped manager row.
   # A bare id can resolve to more than one marketplace, which is not proof.
@@ -984,39 +885,6 @@ fleet_run_approve_plugin_hooks() {
   ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
     "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
     >/dev/null || return 75
-}
-
-fleet_run_plugin_identity_matches() {
-  # fleet_run_plugin_identity_matches DEFS NAME VALUE — compare a resolved
-  # marketplace plugin with the user-scoped installed record before ownership
-  # can turn an already-applied item into `nothing`. Return 0 for matching
-  # bytes/version, 1 for a reinstall, and 75 when the manager cannot prove the
-  # identity.
-  fleet_run_identity_surface=$(fleet_resolve_surface "$1" plugins "$2") || return 75
-  fleet_run_identity_market=$(printf '%s\n' "$3" | jq -r \
-    'if type == "object" then (.marketplace // "") else "" end')
-  [ -n "$fleet_run_identity_market" ] || fleet_run_identity_market=$(printf '%s\n' \
-    "$fleet_run_identity_surface" | jq -r '.marketplace // ""')
-  # An unqualified plugin is resolved by the native harness, so there is no
-  # marketplace SHA to compare here; the existing manager presence path stays
-  # authoritative for that zero-config form.
-  [ -n "$fleet_run_identity_market" ] || return 0
-  command -v claude >/dev/null 2>&1 || return 75
-  fleet_run_identity_id="$2@$fleet_run_identity_market"
-  fleet_run_identity_catalog=$(fleet_run_plugin_catalog "$fleet_run_identity_id") || return 75
-  fleet_run_identity_installed=$(fleet_run_installed_plugin "$fleet_run_identity_id") || return 75
-  fleet_run_identity_sha=$(printf '%s\n' "$fleet_run_identity_catalog" |
-    jq -r '.source.sha // empty')
-  fleet_run_identity_version=$(printf '%s\n' "$fleet_run_identity_catalog" |
-    jq -r '.version // empty')
-  fleet_run_identity_installed_sha=$(printf '%s\n' "$fleet_run_identity_installed" |
-    jq -r '.gitCommitSha // empty')
-  fleet_run_identity_installed_version=$(printf '%s\n' "$fleet_run_identity_installed" |
-    jq -r '.version // empty')
-  printf '%s\n' "$fleet_run_identity_sha" |
-    grep -Eq '^[0-9a-fA-F]{40}$' || return 75
-  [ "$fleet_run_identity_sha" = "$fleet_run_identity_installed_sha" ] &&
-    [ "$fleet_run_identity_version" = "$fleet_run_identity_installed_version" ]
 }
 
 fleet_run_skill_source_identity() {
@@ -1292,8 +1160,12 @@ fleet_run_apply_item() {
   # plugins silently DISABLED the plugin. Neither is a decision anybody made.
   # A value carrying no state at all still reads `enabled` (§4), so
   # config_files and definitions maps are unaffected.
+  #
+  # `absent` is the one further state, and only where an uninstall verb exists:
+  # a Claude plugin (§3.4's tombstone). Everywhere else it is still held.
   case $(fleet_run_state_of "$5") in
     enabled | disabled) ;;
+    absent) [ "$fleet_run_category" = plugins ] || return 75 ;;
     *) return 75 ;;
   esac
   case $fleet_run_category in
@@ -1323,11 +1195,15 @@ fleet_run_apply_item() {
           jq -r 'if .pin == "flag" then (.version // "") else "" end')"
       ;;
     plugins)
-      fleet_run_surface=$(fleet_resolve_surface "$3" plugins "$fleet_run_name")
-      fleet_run_market=$(printf '%s\n' "$5" | jq -r '
-        if type == "object" then (.marketplace // "") else "" end')
-      [ -n "$fleet_run_market" ] || fleet_run_market=$(printf '%s\n' \
-        "$fleet_run_surface" | jq -r '.marketplace // ""')
+      # A TOMBSTONE converges by uninstalling, and is SATISFIED where the
+      # plugin is not installed — asked before the harness check, because a
+      # host with no `claude` has no plugin to remove either.
+      if [ "$(fleet_run_state_of "$5")" = absent ]; then
+        fleet_run_uninstall_plugin "$3" "$4" "$fleet_run_name" "$5"
+        return $?
+      fi
+      fleet_run_market=$(fleet_run_plugin_market "$3" "$fleet_run_name" "$5") ||
+        fleet_run_market=
       # HELD, not satisfied: a host with no `claude` cannot speak to the item
       # at all, and a peer that has one still must not converge on this host's
       # inability. See the exit-code contract above.
@@ -1349,11 +1225,16 @@ fleet_run_apply_item() {
       fleet_run_plugin_mutated=false
       fleet_run_resolved_sha=
       if [ -n "$fleet_run_market" ]; then
-        # An unregistered marketplace has no catalog; register it from the
-        # declared source, then look again.
-        fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id") ||
-          { fleet_run_ensure_marketplace "$fleet_run_market" &&
-            fleet_run_catalog=$(fleet_run_plugin_catalog "$fleet_run_id"); } || return 75
+        # A catalog that cannot prove the bytes — no entry (an unregistered
+        # or stale marketplace) or an entry with no SHA — re-registers and
+        # refreshes the marketplace, then looks ONCE more (§3.5).
+        # ...and a catalog is only accepted from the marketplace's declared
+        # source: a same-name repoint holds (fleet_run_marketplace_source_ok).
+        fleet_run_marketplace_source_ok "$fleet_run_market" || return 75
+        fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id") ||
+          { fleet_run_marketplace_repair "$fleet_run_market" &&
+            fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id"); } ||
+          return 75
         fleet_run_resolved_sha=$(printf '%s\n' "$fleet_run_catalog" |
           jq -r '.source.sha // empty')
         fleet_run_resolved_version=$(printf '%s\n' "$fleet_run_catalog" |
@@ -1367,8 +1248,11 @@ fleet_run_apply_item() {
         # bytes. Hold it instead of silently trusting a version string.
         printf '%s\n' "$fleet_run_resolved_sha" |
           grep -Eq '^[0-9a-fA-F]{40}$' || return 75
+        # A catalog entry with no version is proven by its SHA alone, as in
+        # fleet_run_plugin_identity_matches (lib/apply-claude.sh).
         if [ "$fleet_run_resolved_sha" != "$fleet_run_installed_sha" ] ||
-          [ "$fleet_run_resolved_version" != "$fleet_run_installed_version" ]; then
+          { [ -n "$fleet_run_resolved_version" ] &&
+            [ "$fleet_run_resolved_version" != "$fleet_run_installed_version" ]; }; then
           # install is for the absent-record case; an existing user-scoped
           # record with stale bytes goes through the manager's own update
           # verb (the target-native refresh sequence in
@@ -1386,8 +1270,9 @@ fleet_run_apply_item() {
           fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 75
           [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // empty')" \
             = "$fleet_run_resolved_sha" ] &&
-            [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
-              = "$fleet_run_resolved_version" ] || return 75
+            { [ -z "$fleet_run_resolved_version" ] ||
+              [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
+                = "$fleet_run_resolved_version" ]; } || return 75
           if [ "$fleet_run_want_enabled" = true ]; then
             fleet_run_approve_plugin_hooks "$fleet_run_id" \
               "$fleet_run_resolved_sha" || return 75
@@ -1519,10 +1404,76 @@ fleet_run_apply_item() {
   esac
 }
 
+# --- §3.4/§3.5 tombstones: `absent` uninstalls through the harness ----------
+
+fleet_run_tombstone_converge() {
+  # fleet_run_tombstone_converge STORE HOST DEFS ITEM VALUE DIGEST AT — THE one
+  # path a tombstone converges through, for the run and for `fleet-apply`
+  # alike: uninstall (fleet_run_uninstall_plugin, through the apply layer),
+  # then — when nothing is installed any more, 0 or 70 — forget any applied/
+  # record (nothing installed is nothing owned, and a recorded tombstone would
+  # read as a prune the day it is compacted away), remember the converged
+  # digest host-locally so later passes stay silent, and journal `applied` or
+  # `satisfied`. Returns the apply status; a 75 is the caller's to hold.
+  tomb_status=0
+  fleet_run_apply_item "$1" "$2" "$3" "$4" "$5" '' || tomb_status=$?
+  case $tomb_status in
+    0 | 70) ;;
+    *) return "$tomb_status" ;;
+  esac
+  # The ownership cleanup must SUCCEED before the post-change state is
+  # recorded: a memo and journal entry written over a failed forget would
+  # report convergence and silence the retry that the record still needs.
+  tomb_owned=$(fleet_applied_digest "$1" "$2" "$4") || {
+    printf '  held %s (applied/%s cannot be read to release its ownership)\n' "$4" "$2" >&2
+    return 75
+  }
+  if [ -n "$tomb_owned" ]; then
+    fleet_applied_forget "$1" "$2" "$4" || {
+      printf '  held %s (its applied/%s record could not be released)\n' "$4" "$2" >&2
+      return 75
+    }
+  fi
+  mkdir -p "$(dirname "$(fleet_run_tombstone_memo_path "$4")")"
+  printf '%s\n' "$6" >"$(fleet_run_tombstone_memo_path "$4")"
+  tomb_outcome=applied
+  [ "$tomb_status" -eq 0 ] || tomb_outcome=satisfied
+  fleet_journal_append "$1" "$2" \
+    "$(jq -cn --arg item "$4" --arg d "$6" --arg at "$7" --arg o "$tomb_outcome" \
+      '{item:$item,digest:$d,outcome:$o,at:$at}')" || :
+  if [ "$tomb_status" -eq 0 ]; then
+    printf '  applied %s (uninstalled)\n' "$4"
+  else
+    printf '  satisfied %s (absent, and not installed here)\n' "$4"
+  fi
+  return "$tomb_status"
+}
+
+fleet_run_desired() {
+  # fleet_run_desired LAYERDIR HOST -> the fold, plus the plugin tombstones its
+  # knockout removed: every ITEM this host has an opinion on, with its value.
+  # The run reads item values and digests from this, and so do the supervised
+  # verbs, so `fleet-review`, `fleet-apply` and the run all see a scalar
+  # `absent` tombstone the same way. The plain fold stays what every reader of
+  # desired STATE wants — policy, package managers, the alert detections.
+  printf '%s\n' "$(fleet_fold "$1" "$2")" \
+    "$(fleet_fold_tombstones "$1" "$2" plugins)" | jq -c -s '.[0] * .[1]'
+}
+
+fleet_run_tombstone_items() {
+  # fleet_run_tombstone_items DESIRED -> every `plugins.<name>` whose desired
+  # value is a tombstone: the scalar `absent` or `{state: absent}`.
+  printf '%s\n' "$1" | jq -r '
+    [(.plugins // {}) | select(type == "object") | to_entries[] |
+      select(.value == "absent" or
+        ((.value | type) == "object" and .value.state == "absent")) |
+      "plugins." + .key] | unique | .[]'
+}
+
 # --- §5/§10.4 the alert surface -----------------------------------------------
 
 fleet_run_alerts() {
-  # fleet_run_alerts STORE HOST FOLD LAYERDIR — every detection predicate lane
+  # fleet_run_alerts STORE HOST FOLD LAYERDIR LEDGER — every detection predicate lane
   # A landed, wired to the one writer. Each of these is a condition that would
   # otherwise converge something this reader does not understand.
   #
@@ -1533,27 +1484,37 @@ fleet_run_alerts() {
   # PRINTS the holds it detected and the caller acts on them: `!hold <reason>`
   # for the two §7.7 store-wide rows, `<item> <reason>` for a collision, which
   # is a refusal of that config file's widening and not of the store.
+  #
+  # Every kind here is a CONDITION alert (fleet_alert_lifecycle_rows): the
+  # store-wide checks set or clear theirs (fleet_alert_set), and the per-file
+  # collisions are checked and raised into the pass's LEDGER for the
+  # end-of-pass sweep (fleet_alert_sweep).
   fleet_run_unknown=$(fleet_unknown_categories "$3" | tr '\n' ' ')
-  [ -z "${fleet_run_unknown% }" ] || {
-    fleet_alert_write "$1" "$2" unknown-category unknown-category \
-      "top-level keys that are neither a category nor a host fact: ${fleet_run_unknown% }" ||
-      :
+  fleet_run_alert_on=false
+  [ -z "${fleet_run_unknown% }" ] || fleet_run_alert_on=true
+  fleet_alert_set "$1" "$2" unknown-category unknown-category "$fleet_run_alert_on" \
+    "top-level keys that are neither a category nor a host fact: ${fleet_run_unknown% }" ||
+    :
+  [ -z "${fleet_run_unknown% }" ] ||
     printf '!hold %s\n' \
       "top-level keys that are neither a category nor a host fact: ${fleet_run_unknown% }"
-  }
   # The real tree, not the exported layers: an unrecognised directory is one
   # nothing folded, so a dir-filtered export can never see it.
   fleet_run_unknown=$(fleet_unknown_layer_dirs "$1" | tr '\n' ' ')
-  [ -z "${fleet_run_unknown% }" ] || {
-    fleet_alert_write "$1" "$2" unknown-store-dir unknown-store-dir \
-      "unrecognised store directories: ${fleet_run_unknown% }" || :
-    printf '!hold %s\n' \
-      "unrecognised store directories: ${fleet_run_unknown% }"
-  }
+  fleet_run_alert_on=false
+  [ -z "${fleet_run_unknown% }" ] || fleet_run_alert_on=true
+  fleet_alert_set "$1" "$2" unknown-store-dir unknown-store-dir "$fleet_run_alert_on" \
+    "unrecognised store directories: ${fleet_run_unknown% }" || :
+  [ -z "${fleet_run_unknown% }" ] ||
+    printf '!hold %s\n' "unrecognised store directories: ${fleet_run_unknown% }"
+  # Both collision checks scan the whole fold: every config file is CHECKED.
+  fleet_alert_checked "$5" config-key-collision '*'
+  fleet_alert_checked "$5" chezmoi-coownership '*'
   fleet_config_key_collisions "$3" |
     while IFS=$(printf '\t') read -r fleet_run_file fleet_run_key; do
       [ -n "$fleet_run_file" ] || continue
-      fleet_alert_write "$1" "$2" config-key-collision config-key-collision \
+      fleet_alert_raise "$5" "$1" "$2" config-key-collision \
+        config-key-collision \
         "$fleet_run_file: managed key $fleet_run_key collides with a never namespace" \
         "config_files.$fleet_run_file" || :
       printf 'config_files.%s managed key %s collides with a never namespace\n' \
@@ -1562,7 +1523,8 @@ fleet_run_alerts() {
   fleet_config_coowned "$3" |
     while IFS=$(printf '\t') read -r fleet_run_file fleet_run_key; do
       [ -n "$fleet_run_file" ] || continue
-      fleet_alert_write "$1" "$2" chezmoi-coownership chezmoi-coownership \
+      fleet_alert_raise "$5" "$1" "$2" chezmoi-coownership \
+        chezmoi-coownership \
         "$fleet_run_file: managed key $fleet_run_key is also written by chezmoi" \
         "config_files.$fleet_run_file" || :
     done
@@ -1571,15 +1533,16 @@ fleet_run_alerts() {
 # --- §6 step 6 and §6.1(b): publication and the nudge -------------------------
 
 fleet_run_publish() {
-  # fleet_run_publish STORE HOST SESSION INTENT ITEMS — describe, move the
-  # bookmark, push, and land @ on the published commit.
+  # fleet_run_publish STORE HOST SESSION INTENT ITEMS [SUBJECT] — describe, move
+  # the bookmark, push, and land @ on the published commit. SUBJECT defaults to
+  # the run's own `converge on HOST`; a supervised verb names what it did.
   #
   # NEVER a bare `jj new -m ''` here. `jj git push` leaves an empty UNDESCRIBED
   # working-copy commit of its own; naming the target is what makes @ a child
   # of the bookmark instead of a child of that leftover, and it is the line
   # that keeps §8.1's invariant true between runs.
   if [ "$(jj -R "$1" log -r @ --no-graph -T 'if(empty,"y","n")')" = n ]; then
-    jj -R "$1" describe -r @ -m "converge on $2
+    jj -R "$1" describe -r @ -m "${6:-converge on $2}
 
 $(fleet_vcs_trailers "$2" "$3" "$4" "$5")" >/dev/null
     jj -R "$1" bookmark set main \
@@ -1653,6 +1616,21 @@ fleet_run_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '0\n'
 }
 
+# --- §6.3 the run lock, as the run takes it ---------------------------------
+
+fleet_run_lock_take() {
+  # fleet_run_lock_take STORE HOST LOCK — fleet_lock_take with this store's
+  # stale threshold (two full cadences, fleet_run_stale_after), and the alert a
+  # takeover owes: evidence, not a refusal, so the run proceeds. Exit 0
+  # acquired (by takeover or not), 10 held by a live run, 75 refused.
+  fleet_run_lock_take_rc=0
+  fleet_lock_take "$3" "$(fleet_run_stale_after "$1" "$2")" || fleet_run_lock_take_rc=$?
+  [ "$fleet_run_lock_take_rc" -eq 11 ] || return "$fleet_run_lock_take_rc"
+  fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
+    "took over the run lock from a dead holder ($fleet_lock_taken_from); the run it belonged to did not finish" ||
+    :
+}
+
 # --- the commands -------------------------------------------------------------
 
 fleet_run_command() (
@@ -1684,35 +1662,28 @@ fleet_run_command() (
   # never on the fast interval — a 40-minute threshold would declare a live
   # run's lock stale on the very next fast run.
   run_lock=$(fleet_lock_path)
-  if ! fleet_lock_acquire "$run_lock"; then
-    run_age=$(fleet_lock_age_seconds "$run_lock" || printf '')
-    run_stale=$(fleet_run_stale_after "$run_store" "$run_host")
-    # AN UNKNOWN AGE IS STALE, NOT FRESH. `fleet_lock_age_seconds` answers empty
-    # when meta.json is missing or unparsable, and reading that as "under the
-    # threshold" wedged every future run on this host silently, forever, at
-    # exit 0. It is reachable through the recovery fleet-update/SKILL.md
-    # prescribes: `fleet-unlock` removes meta.json BEFORE an rmdir that can
-    # fail. A lock directory with no evidence of a live runner is exactly the
-    # case the stale branch exists for.
-    if [ -z "$run_age" ] || [ "$run_age" -gt "$run_stale" ]; then
-      printf 'roundhouse: a run lock at %s is %s old; confirm no live runner on this host, then remove it\n' \
-        "$run_lock" "${run_age:+${run_age}s}${run_age:-of unknown age (no readable meta.json)}" >&2
-      exit 75
-    fi
-    # …and the pid the lock has always recorded, finally read: a crashed run is
-    # otherwise indistinguishable from a slow one for two full cadences.
-    if fleet_lock_holder_gone "$run_lock"; then
-      printf 'roundhouse: the run lock at %s names a pid on this host that no longer exists; release it with `roundhouse fleet-unlock`\n' \
+  run_lock_status=0
+  fleet_run_lock_take "$run_store" "$run_host" "$run_lock" || run_lock_status=$?
+  case $run_lock_status in
+    0) ;;
+    10)
+      printf 'roundhouse: another run holds %s; exiting without acting\n' \
         "$run_lock" >&2
-      exit 75
-    fi
-    printf 'roundhouse: another run holds %s; exiting without acting\n' \
-      "$run_lock" >&2
-    exit 0
-  fi
-  trap 'rm -rf "$run_lock"' EXIT HUP INT TERM
+      exit 0
+      ;;
+    *) exit "$run_lock_status" ;;
+  esac
+  # Release by NONCE, never by path: a run that was judged dead and taken over
+  # must not delete its live successor's lock when it finally exits.
+  run_lock_nonce=$fleet_lock_nonce_held
+  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce" || :' EXIT HUP INT TERM
   run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-fleet-run.XXXXXX")
-  trap 'rm -rf "$run_lock" "$run_tmp"' EXIT HUP INT TERM
+  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce" || :; rm -rf "$run_tmp"' \
+    EXIT HUP INT TERM
+  # The pass's alert ledger: what each item-scoped condition check evaluated
+  # and raised, for the end-of-pass sweep (fleet_alert_sweep).
+  run_ledger=$run_tmp/alert-ledger
+  : >"$run_ledger"
 
   # §8.6: the abort button for a bad local apply, captured deliberately
   # WITHOUT --ignore-working-copy (that flag suppresses the colocated
@@ -1748,9 +1719,9 @@ fleet_run_command() (
   if [ -n "$run_fetched_head" ]; then
     if run_catchup=$(fleet_trust_catch_up "$run_store" "$run_fetched_head") &&
       [ -z "$run_catchup" ]; then
-      :
+      fleet_alert_set "$run_store" "$run_host" rollback rollback false ''
     else
-      fleet_alert_write "$run_store" "$run_host" rollback rollback \
+      fleet_alert_set "$run_store" "$run_host" rollback rollback true \
         "refusing the fetched head: $(printf '%s' "${run_catchup:-reviewed-ref is not an ancestor of the fetched head}" | head -c 300)" ||
         :
       printf 'roundhouse: %s; holding everything and alerting (§7.11.2/§7.12.3)\n' \
@@ -1782,7 +1753,7 @@ fleet_run_command() (
     # path, and a failure refuses to PROMOTE rather than refusing to converge.
     run_broken=$(fleet_run_promote_gate "$run_store") || run_broken=${run_broken:-x}
     if [ -n "${run_broken:-}" ]; then
-      fleet_alert_write "$run_store" "$run_host" layer-parse layer-parse \
+      fleet_alert_set "$run_store" "$run_host" layer-parse layer-parse true \
         "refusing to promote; converging from the last good main: $(printf '%s' "$run_broken" | head -c 300)" ||
         :
       run_reference=$(fleet_vcs_head_origin "$run_store")
@@ -1792,6 +1763,7 @@ fleet_run_command() (
         exit 65
       }
     else
+      fleet_alert_set "$run_store" "$run_host" layer-parse layer-parse false ''
       run_out=$(fleet_vcs_reconcile "$run_store" "$run_host" "scheduled/agent" \
         "$run_mode convergence") || exit $?
       run_state=${run_out%% *}
@@ -1814,7 +1786,13 @@ fleet_run_command() (
   for run_head in $run_heads; do
     run_index=$((run_index + 1))
     fleet_run_export "$run_store" "$run_head" "$run_tmp/head-$run_index"
-    fleet_run_item_digests "$(fleet_fold "$run_tmp/head-$run_index" "$run_host")" \
+    # The item universe is the DESIRED document (fleet_run_desired), so §3.4's
+    # tombstones join it with their own digest. The fold knocks `absent` out,
+    # and from it alone a tombstoned plugin read as "gone from the layers" — a
+    # capped prune that forgot the record and uninstalled nothing — and a host
+    # that never owned it never heard of it at all.
+    fleet_run_item_digests \
+      "$(fleet_run_desired "$run_tmp/head-$run_index" "$run_host")" \
       "$run_tmp/head-$run_index" >>"$run_tmp/values"
   done
   # The reviewed tree R. On the clean path that is the merge, and there is one
@@ -1822,7 +1800,11 @@ fleet_run_command() (
   # §8.3 only converges items whose value is IDENTICAL at every head, so any
   # head answers for them, and the rest are held.
   run_layers=$run_tmp/head-1
+  # Two readings of R, merged ONCE: `run_desired` for item values (tombstones
+  # included), `run_fold` for desired state — policy, package managers and the
+  # detections — which a tombstone is not.
   run_fold=$(fleet_fold "$run_layers" "$run_host")
+  run_desired=$(fleet_run_desired "$run_layers" "$run_host")
   run_defs=$(fleet_definitions_load "$run_layers")
   fleet_vcs_enrolled_hosts "$run_store" "$run_reference" >"$run_tmp/hosts"
   grep -Fqx "$run_host" "$run_tmp/hosts" || printf '%s\n' "$run_host" >>"$run_tmp/hosts"
@@ -1852,12 +1834,17 @@ fleet_run_command() (
   # be trusted, so they take the same branch materialization drift takes.
   run_full_hold=$(awk '$1 == "!hold" { $1 = ""; sub(/^ /, ""); print; exit }' \
     "$run_tmp/sigholds")
+  # The store-wide hold has a kind of its own; this clears the key older
+  # passes and fleet-compact-alerts gave it under the per-item `integrity`
+  # kind, which nothing else would ever clear or age.
+  fleet_alert_clear "$run_store" "$run_host" integrity integrity-store-wide
   if [ -n "$run_full_hold" ]; then
-    fleet_alert_write "$run_store" "$run_host" integrity integrity-store-wide \
+    fleet_alert_set "$run_store" "$run_host" integrity-store-wide integrity-store-wide true \
       "$(printf '%s' "$run_full_hold" | head -c 300)" || :
     printf 'roundhouse: %s; holding everything (§7.7/§7.12.5)\n' "$run_full_hold" >&2
     exit 65
   fi
+  fleet_alert_set "$run_store" "$run_host" integrity-store-wide integrity-store-wide false ''
 
   # §7.9: install the roster the ratchet derived, and compare what is already
   # installed against it. The compare is nearly free and fails in a DIFFERENT
@@ -1879,8 +1866,8 @@ fleet_run_command() (
     # converged on. Take the same branch the drift compare below takes.
     if ! fleet_trust_materialize "$run_store" "$run_reference"; then
       run_reference_short=${run_reference:0:12}
-      fleet_alert_write "$run_store" "$run_host" materialization \
-        materialization-refused \
+      fleet_alert_set "$run_store" "$run_host" materialization \
+        materialization-refused true \
         "materialization refused for commit[$run_reference_short] (abbreviated commit id): a roster generation rollback or a non-descendant head (§7.12.3); holding everything" ||
         :
       printf 'roundhouse: materialization refused (§7.12.3); holding everything (§7.9)\n' >&2
@@ -1889,15 +1876,17 @@ fleet_run_command() (
     fleet_trust_privileged >/dev/null 2>&1 ||
       printf 'roundhouse: no privileged materialization lane; the roster is same-user writable, which buys no persistence protection past revocation (§7.9)\n' >&2
     [ -z "$run_drift" ] || {
-      fleet_alert_write "$run_store" "$run_host" materialization materialization \
+      fleet_alert_set "$run_store" "$run_host" materialization materialization true \
         "$(printf '%s' "$run_drift" | head -c 300)" || :
       printf 'roundhouse: %s; holding everything (§7.9)\n' "$run_drift" >&2
       exit 65
     }
+    fleet_alert_set "$run_store" "$run_host" materialization materialization-refused false ''
+    fleet_alert_set "$run_store" "$run_host" materialization materialization false ''
   fi
 
   fleet_run_alerts "$run_store" "$run_host" "$run_fold" "$run_layers" \
-    >"$run_tmp/detections"
+    "$run_ledger" >"$run_tmp/detections"
   run_full_hold=$(awk '$1 == "!hold" { $1 = ""; sub(/^ /, ""); print; exit }' \
     "$run_tmp/detections")
   if [ -n "$run_full_hold" ]; then
@@ -1919,13 +1908,15 @@ fleet_run_command() (
   # does not exist.
   mkdir -p "$HOME/.ssh/config.d"
   chmod 700 "$HOME/.ssh" 2>/dev/null || :
+  run_ssh_failed=false
   if fleet_ssh_config_render "$run_layers" "$HOME/.ssh/config.d/roundhouse" \
     2>/dev/null; then
     fleet_run_ssh_include || :
   else
-    fleet_alert_write "$run_store" "$run_host" ssh-render ssh-render \
-      'a host field failed validation; no ssh config was rendered (§5)' || :
+    run_ssh_failed=true
   fi
+  fleet_alert_set "$run_store" "$run_host" ssh-render ssh-render "$run_ssh_failed" \
+    'a host field failed validation; no ssh config was rendered (§5)' || :
 
   # --- §8.2b: the run's own agent resolves, in the same run ---
   run_resolved_items=
@@ -1949,6 +1940,10 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   fi
 
   # --- §6 step 6: review -> verdict -> apply -> applied/ -> journal ---
+  # PER PASS, not per process: one marketplace repair per marketplace per pass
+  # (fleet_run_marketplace_repair), forgotten here so a later pass in the same
+  # process retries a repair an earlier pass could not make.
+  fleet_run_marketplace_repair_reset
   run_canary_group=$(fleet_policy_get "$run_fold" canary_group)
   run_wait=$(fleet_policy_get "$run_fold" canary_wait_hours)
   fleet_run_canary_hosts "$run_layers" "$run_canary_group" "$run_tmp/hosts" \
@@ -1958,10 +1953,12 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   run_now=$(fleet_now)
   run_applied_items=
 
-  # §10.3's removal set, capped BEFORE any removal applies. Over the cap the
-  # ENTIRE set holds — neither term catches a one-line deletion, and nothing
-  # should: that is a legitimate edit, and its defence is apply-time review
-  # naming the item.
+  # §10.3's removal set, capped BEFORE any removal applies: ONE tagged list,
+  # `prune ITEM` (owned, gone from the layers) and `uninstall ITEM` (a
+  # tombstone with something installed here), and one over-cap rule
+  # (fleet_run_removals_over). Over the cap a tag's ENTIRE set holds — neither
+  # term catches a one-line deletion, and nothing should: that is a legitimate
+  # edit, and its defence is apply-time review naming the item.
   : >"$run_tmp/removals"
   fleet_record_read "$(fleet_applied_path "$run_store" "$run_host")" '{}' |
     jq -r '(.items // {}) | keys[]' |
@@ -1978,28 +1975,44 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       # prune it with a false `outcome: reverted` record.
       ! awk -v i="$run_owned" '$1 == i { found = 1 } END { exit(found ? 0 : 1) }' \
         "$run_tmp/values" || continue
-      printf '%s\n' "$run_owned"
+      printf 'prune %s\n' "$run_owned"
     done >"$run_tmp/removals"
-  run_removals=$(grep -c . <"$run_tmp/removals" || true)
-  run_removals_ok=true
-  fleet_removal_cap "$run_removals" "$(fleet_applied_count "$run_store" "$run_host")" \
-    "$(fleet_policy_get "$run_fold" max_removals_per_run)" \
-    "$(fleet_policy_get "$run_fold" max_removal_fraction)" >/dev/null ||
-    run_removals_ok=false
-  if [ "$run_removals_ok" != true ]; then
-    fleet_alert_write "$run_store" "$run_host" removal-cap removal-cap \
-      "$run_removals removals exceed the cap; the entire removal set is held" || :
-    : >"$run_tmp/removals"
-  fi
-  while IFS= read -r run_owned; do
+  # A tombstone that would UNINSTALL something here is a genuine removal and
+  # joins the list; one that finds nothing installed changes nothing and does
+  # not. Undecidable (fleet_run_tombstone_target's 75) joins it, because the
+  # cap is the direction to be wrong in.
+  fleet_run_tombstone_items "$run_desired" >"$run_tmp/tombstones"
+  while IFS= read -r run_tomb_item; do
+    [ -n "$run_tomb_item" ] || continue
+    ! grep -Fqx "held $run_tomb_item" "$run_tmp/verdicts" || continue
+    run_tomb_value=$(fleet_item_value "$run_desired" "$run_tomb_item")
+    run_tomb_target=$(fleet_run_tombstone_target "$run_defs" \
+      "${run_tomb_item#plugins.}" "$run_tomb_value") || run_tomb_target=undecidable
+    [ -z "$run_tomb_target" ] || printf 'uninstall %s\n' "$run_tomb_item"
+  done <"$run_tmp/tombstones" >>"$run_tmp/removals"
+  run_removals_held=$(fleet_run_removals_over "$run_tmp/removals" \
+    "$(fleet_applied_count "$run_store" "$run_host")" "$run_fold")
+  run_cap_over=false
+  [ -z "$run_removals_held" ] || run_cap_over=true
+  fleet_alert_set "$run_store" "$run_host" removal-cap removal-cap "$run_cap_over" \
+    "over the removal cap, held whole: $(printf '%s\n' "$run_removals_held" |
+      awk '{ n[$1]++ } END { for (t in n) printf "%s%d %s", (s++ ? ", " : ""), n[t], t }')" ||
+    :
+  run_uninstalls_ok=true
+  ! printf '%s\n' "$run_removals_held" | grep -q '^uninstall ' || run_uninstalls_ok=false
+  printf '%s\n' "$run_removals_held" | grep -q '^prune ' ||
+    awk '$1 == "prune" { sub(/^prune /, ""); print }' "$run_tmp/removals" |
+    while IFS= read -r run_owned; do
     [ -n "$run_owned" ] || continue
     printf '  prune %s (in applied/, gone from the layers)\n' "$run_owned"
     fleet_applied_forget "$run_store" "$run_host" "$run_owned"
     fleet_journal_append "$run_store" "$run_host" \
       "$(jq -cn --arg item "$run_owned" --arg at "$run_now" \
         '{item:$item,digest:"absent",outcome:"reverted",at:$at}')" || :
-  done <"$run_tmp/removals"
+  done
 
+  # The pass's whole item set, for the sweep's retired-item rule.
+  awk 'NF >= 2 { print $2 }' "$run_tmp/verdicts" | fleet_alert_items "$run_ledger"
   # THE VERDICT LIST IS READ ON FD 9, not on stdin. This loop's body runs
   # `brew`, `claude` and `git clone`; measured, one greedy child consumed the
   # rest of the list and silently cut a four-item run to one.
@@ -2015,9 +2028,10 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fi
     run_hold=$(awk -v item="$run_item" '$1 == item { $1 = ""; print; exit }' \
       "$run_tmp/sigholds")
+    fleet_alert_checked "$run_ledger" integrity "$run_item"
     if [ -n "$run_hold" ]; then
       printf '  hold  %s —%s\n' "$run_item" "$run_hold"
-      fleet_alert_write "$run_store" "$run_host" integrity \
+      fleet_alert_raise "$run_ledger" "$run_store" "$run_host" integrity \
         "integrity-$(printf '%s' "$run_item" | tr './' '--')" \
         "$run_item held:$run_hold" "$run_item" || :
       fleet_journal_append "$run_store" "$run_host" \
@@ -2042,7 +2056,34 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
 
     run_split=$(fleet_item_split "$run_item") || continue
     run_category=$(printf '%s\n' "$run_split" | sed -n 1p)
-    run_value=$(fleet_item_value "$run_fold" "$run_item")
+    run_value=$(fleet_item_value "$run_desired" "$run_item")
+
+    # §3.4: a TOMBSTONE converges by uninstalling. It is never recorded in
+    # applied/ — that record means "installed and owned", and a recorded
+    # tombstone would read as a prune the day the tombstone is compacted away.
+    # A host that already converged this digest and still has nothing
+    # installed has nothing to say about it, so it says nothing.
+    run_tombstone=false
+    run_tomb_removal=false
+    if grep -Fqx "$run_item" "$run_tmp/tombstones"; then
+      run_tombstone=true
+      ! grep -Fqx "uninstall $run_item" "$run_tmp/removals" || run_tomb_removal=true
+      if [ "$run_tomb_removal" = false ] &&
+        [ "$(cat "$(fleet_run_tombstone_memo_path "$run_item")" 2>/dev/null)" = \
+          "$run_digest" ] &&
+        [ -z "$(fleet_applied_digest "$run_store" "$run_host" "$run_item")" ]; then
+        continue
+      fi
+      if [ "$run_tomb_removal" = true ] && [ "$run_uninstalls_ok" != true ]; then
+        printf '  hold  %s — the removal set is over the cap\n' "$run_item"
+        fleet_run_runtime_hold "$run_item" 'removal cap' "$run_tmp/sigholds" ||
+          exit 65
+        fleet_journal_append "$run_store" "$run_host" \
+          "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
+            '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
+        continue
+      fi
+    fi
 
     # §10.3's ownership table, as one function with one answer per row.
     run_in_applied=no
@@ -2054,15 +2095,21 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     if [ "$run_category" = plugins ] && [ "$run_in_applied" = yes ] &&
       [ "$run_match" = yes ]; then
       run_plugin_identity_status=0
+      fleet_alert_checked "$run_ledger" identity-unavailable "$run_item"
       fleet_run_plugin_identity_matches "$run_defs" "${run_item#plugins.}" \
         "$run_value" || run_plugin_identity_status=$?
       case $run_plugin_identity_status in
         1) run_match=no ;;
         75)
-          printf '  hold  %s — installed marketplace identity unavailable\n' "$run_item"
+          printf '  hold  %s — installed marketplace identity unavailable (%s)\n' \
+            "$run_item" "${fleet_run_identity_reason:-unproven}"
           fleet_run_runtime_hold "$run_item" \
-            'installed marketplace identity unavailable' "$run_tmp/sigholds" ||
-            exit 65
+            "installed marketplace identity unavailable: ${fleet_run_identity_reason:-unproven}" \
+            "$run_tmp/sigholds" || exit 65
+          fleet_alert_raise "$run_ledger" "$run_store" "$run_host" \
+            identity-unavailable identity-unavailable \
+            "$(printf '%s' "installed marketplace identity unavailable: ${fleet_run_identity_reason:-unproven}" | head -c 380)" \
+            "$run_item" || :
           fleet_journal_append "$run_store" "$run_host" \
             "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
               '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
@@ -2087,8 +2134,10 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fi
 
     # §10.1's gate, with the liveness term. Canary hosts are not gated by
-    # themselves.
-    if [ "$run_self_canary" != true ] && [ -s "$run_tmp/canaries" ]; then
+    # themselves, and a tombstone with nothing installed here is not a change
+    # here: its `satisfied` is true whatever the canaries have seen.
+    if [ "$run_self_canary" != true ] && [ -s "$run_tmp/canaries" ] &&
+      { [ "$run_tombstone" != true ] || [ "$run_tomb_removal" = true ]; }; then
       # shellcheck disable=SC2046 # the canary set, one host per argument
       fleet_canary_gate "$run_store" "$run_item" "$run_digest" "$run_wait" \
         "$run_now" $(cat "$run_tmp/canaries") || {
@@ -2108,20 +2157,59 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     printf '  review %s  %s  %s\n' "$run_item" "${run_value:-<none>}" "$run_digest"
     fleet_run_verdict_write "$run_item" "$run_digest" "$run_reason"
     run_status=0
-    fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
-      "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" ||
-      run_status=$?
+    if [ "$run_tombstone" = true ]; then
+      fleet_alert_checked "$run_ledger" uninstall-deferred "$run_item"
+      fleet_run_tombstone_converge "$run_store" "$run_host" "$run_defs" \
+        "$run_item" "$run_value" "$run_digest" "$run_now" || run_status=$?
+      # A live-session deferral is a condition with a record of its own; the
+      # alert stands while the record does, and says which side of the 24h
+      # window it is on.
+      if [ "$run_status" -eq 75 ] && [ -f "$(fleet_run_deferral_path "$run_item")" ]; then
+        run_defer_first=$(awk '{ print $2; exit }' "$(fleet_run_deferral_path "$run_item")")
+        case $run_defer_first in '' | *[!0-9]*) run_defer_first=0 ;; esac
+        if [ "$((run_defer_first + 86400))" -gt "$(date +%s)" ]; then
+          run_defer_detail="$run_item is enabled and a claude session is running; its uninstall waits up to 24h from the first deferral"
+        else
+          run_defer_detail="$run_item: the 24h live-session window has passed and the uninstall still fails; it is retried every pass"
+        fi
+        fleet_alert_raise "$run_ledger" "$run_store" "$run_host" \
+          uninstall-deferred uninstall-deferred "$run_defer_detail" "$run_item" || :
+      fi
+      case $run_status in
+        0)
+          run_applied_items="$run_applied_items$run_item "
+          continue
+          ;;
+        70) continue ;;
+      esac
+    else
+      case $run_category in
+        packages)
+          fleet_alert_checked "$run_ledger" package-hold "$run_item"
+          fleet_alert_checked "$run_ledger" package-deferred "$run_item"
+          ;;
+        hooks) fleet_alert_checked "$run_ledger" enabled-but-untrusted "$run_item" ;;
+        runtimes)
+          fleet_alert_checked "$run_ledger" runtime-hold "$run_item"
+          fleet_alert_checked "$run_ledger" node-runtime-unverified "$run_item"
+          ;;
+      esac
+      fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
+        "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" ||
+        run_status=$?
+    fi
     case $run_status in
       0)
         # An unwritable applied/<h>.yaml is loud and narrow, never fatal: the
         # record refuses rather than truncating (fleet_record_write), and a
         # bare call under `set -e` would abort the run mid-apply instead of
         # narrowing what is applicable.
+        fleet_alert_checked "$run_ledger" record-write "$run_item"
         fleet_applied_record "$run_store" "$run_host" "$run_item" "$run_digest" \
           "$run_now" || {
           printf 'roundhouse: could not record %s in applied/%s.yaml; the item is applied but unowned\n' \
             "$run_item" "$run_host" >&2
-          fleet_alert_write "$run_store" "$run_host" record-write \
+          fleet_alert_raise "$run_ledger" "$run_store" "$run_host" record-write \
             "record-write-$(printf '%s' "$run_item" | tr './' '--')" \
             "applied/$run_host.yaml could not be updated for $run_item" \
             "$run_item" || :
@@ -2159,6 +2247,11 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fleet_run_full_pass "$run_store" "$run_host" "$run_fold" "$run_defs" \
       "$run_layers" "$run_tmp"
   fi
+
+  # The end of the pass: every item-scoped CONDITION alert whose item this
+  # pass checked and did not raise has ended (fleet_alert_sweep, over the
+  # table's item-scoped kinds). An item the pass skipped keeps its alert.
+  fleet_alert_sweep "$run_store" "$run_host" "$run_ledger"
 
   # §10.1 condition 3's heartbeat: a canary that applies an item, is wrecked by
   # it and stops journaling otherwise satisfies conditions 1 and 2. One record
@@ -2436,14 +2529,14 @@ fleet_run_apply_held() {
   # distinct so the full cadence's Node step can still make the retry the
   # backoff promises (fleet_run_full_node_runtime).
   fleet_run_runtime_hold "$4" "apply status $7" "$8/sigholds" || return 65
-  [ "$5" != runtimes ] || fleet_run_node_alert "$1" "$2" "$7" "$4"
+  [ "$5" != runtimes ] || fleet_run_node_alert "$8/alert-ledger" "$1" "$2" "$7" "$4"
   [ "$7" -ne 75 ] || [ "$5" != packages ] ||
-    fleet_alert_write "$1" "$2" package-hold \
+    fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-hold \
       "package-hold-$(printf '%s' "$4" | tr './' '--')" \
       "no package manager on this host can provide $4" "$4" ||
     :
   [ "$7" -ne 73 ] || [ "$5" != packages ] ||
-    fleet_alert_write "$1" "$2" package-deferred \
+    fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-deferred \
       "package-deferred-$(printf '%s' "$4" | tr './' '--')" \
       "$4 is not installed while a Node runtime switch is in flight on this host" "$4" ||
     :
@@ -2453,7 +2546,7 @@ fleet_run_apply_held() {
   # because an exit status that carries prose is an exit status nobody
   # can test.
   [ "$7" -ne 75 ] || [ "$5" != hooks ] ||
-    fleet_alert_write "$1" "$2" enabled-but-untrusted \
+    fleet_alert_raise "$8/alert-ledger" "$1" "$2" enabled-but-untrusted \
       "enabled-but-untrusted-$(printf '%s' "$4" | tr './' '--')" \
       "$(fleet_hook_trust "$1" "$2" "$3" "${4#hooks.}" || :)" "$4" ||
     :
@@ -2465,6 +2558,28 @@ fleet_run_apply_held() {
   else
     printf '  held    %s (this host could not apply it, or a gate refused)\n' "$4"
   fi
+}
+
+fleet_run_removals_over() {
+  # fleet_run_removals_over REMOVALS APPLIED_COUNT FOLD -> the tagged lines of
+  # the removal list that are OVER the cap, one per line (silence when within
+  # it). The one over-cap rule both tags share, applied per tag, so a tag
+  # over its cap holds whole and the other tag is untouched:
+  #
+  #   prune      fleet_removal_cap's two terms, as always: forgetting owned
+  #              items is sized against how much this host owns.
+  #   uninstall  max_removals_per_run alone. A tombstone uninstalls software
+  #              this host may never have owned, so `applied × fraction` says
+  #              nothing about its blast radius — and on a host that owns
+  #              little it would hold every tombstone forever.
+  removals_over_prunes=$(grep -c '^prune ' "$1" || true)
+  removals_over_uninstalls=$(grep -c '^uninstall ' "$1" || true)
+  fleet_removal_cap "$removals_over_prunes" "$2" \
+    "$(fleet_policy_get "$3" max_removals_per_run)" \
+    "$(fleet_policy_get "$3" max_removal_fraction)" >/dev/null ||
+    grep '^prune ' "$1"
+  [ "$removals_over_uninstalls" -le "$(fleet_policy_int "$3" max_removals_per_run)" ] ||
+    grep '^uninstall ' "$1"
 }
 
 fleet_run_runtime_hold() {
@@ -2529,29 +2644,33 @@ fleet_run_plugin_marketplaces() (
 )
 
 fleet_run_node_unverified() {
-  # `fleet_run_node_unverified STORE HOST` — the one alert for a Node switch
-  # left recorded in flight: the default is unverified and npm stays off it.
-  fleet_alert_write "$1" "$2" node-runtime-unverified node-runtime-unverified \
+  # `fleet_run_node_unverified LEDGER STORE HOST` — the one alert for a Node
+  # switch left recorded in flight: the default is unverified and npm stays
+  # off it. A condition (fleet_alert_lifecycle_rows): the end-of-pass sweep
+  # clears it once a pass checks the runtime and the record is gone.
+  fleet_alert_raise "$1" "$2" "$3" node-runtime-unverified node-runtime-unverified \
     "a Node runtime switch is recorded in flight and the old default could not be restored and verified; npm globals are skipped until it is" \
     runtimes.node || :
 }
 
 fleet_run_node_held() {
-  # `fleet_run_node_held STORE HOST ITEM` — a held `runtimes.node` is a host
-  # quietly staying off Node releases (security patches included), so it is
-  # alerted, not only printed. One kind and one slug, whatever the reason.
-  fleet_alert_write "$1" "$2" runtime-hold runtime-hold-runtimes-node \
+  # `fleet_run_node_held LEDGER STORE HOST ITEM` — a held `runtimes.node` is a
+  # host quietly staying off Node releases (security patches included), so it
+  # is alerted, not only printed. One kind and one slug, whatever the reason;
+  # a condition the end-of-pass sweep clears once a pass converges it.
+  fleet_alert_raise "$1" "$2" "$3" runtime-hold runtime-hold-runtimes-node \
     "runtimes.node is held on this host and its Node runtime is not converging; the run output names the reason" \
-    "$3" || :
+    "$4" || :
 }
 
 fleet_run_node_alert() {
-  # `fleet_run_node_alert STORE HOST STATUS ITEM` — the one mapping from a
-  # Node convergence status to its alert, for the fast and full cadences
-  # alike: 73 deferred and 75 held, 76 unverified default, anything else none.
-  case $3 in
-    73 | 75) fleet_run_node_held "$1" "$2" "$4" ;;
-    76) fleet_run_node_unverified "$1" "$2" ;;
+  # `fleet_run_node_alert LEDGER STORE HOST STATUS ITEM` — the one mapping
+  # from a Node convergence status to its alert, for the fast and full
+  # cadences alike: 73 deferred and 75 held, 76 unverified default, anything
+  # else none. The caller has already CHECKED both kinds for the item.
+  case $4 in
+    73 | 75) fleet_run_node_held "$1" "$2" "$3" "$5" ;;
+    76) fleet_run_node_unverified "$1" "$2" "$3" ;;
   esac
 }
 
@@ -2565,6 +2684,9 @@ fleet_run_full_node_runtime() (
   # only returns the host to its last verified state.
   node_full_store=$1
   node_full_host=$2
+  # The pass's alert ledger (fleet_alert_checked), beside its holds.
+  node_full_ledger=${5:+$5/alert-ledger}
+  : "${node_full_ledger:=/dev/null}"
   node_full_runtime=$(printf '%s\n' "$3" | jq -c '(.runtimes // {}).node // empty')
   node_full_wanted=false
   # The apply loop's DEFERRAL of a backed-off switch (apply status 73,
@@ -2582,19 +2704,30 @@ fleet_run_full_node_runtime() (
     node_full_wanted=true
   fi
   if [ "$node_full_wanted" != true ]; then
-    [ -n "$(node_switch_marker_read)" ] || exit 0
+    # Not converged here (held, waiting on its canary, or not desired), so
+    # only the in-flight record is checked: its alert ends with the record.
+    # A switch in progress elsewhere (74) is not checked at all.
+    if [ -z "$(node_switch_marker_read)" ]; then
+      fleet_alert_checked "$node_full_ledger" node-runtime-unverified runtimes.node
+      exit 0
+    fi
     node_full_status=0
     node_switch_recover || node_full_status=$?
+    [ "$node_full_status" -eq 74 ] ||
+      fleet_alert_checked "$node_full_ledger" node-runtime-unverified runtimes.node
     case $node_full_status in
       74) printf '  note  runtimes.node — a Node switch is in progress on this host; not touched this run\n' ;;
       75) printf '  note  runtimes.node — an interrupted switch was rolled back to its old default (verified)\n' ;;
-      76) fleet_run_node_unverified "$node_full_store" "$node_full_host" ;;
+      76) fleet_run_node_unverified "$node_full_ledger" "$node_full_store" "$node_full_host" ;;
     esac
     exit 0
   fi
+  fleet_alert_checked "$node_full_ledger" runtime-hold runtimes.node
+  fleet_alert_checked "$node_full_ledger" node-runtime-unverified runtimes.node
   node_full_status=0
   fleet_run_node_converge "$node_full_runtime" "$4" full </dev/null || node_full_status=$?
-  fleet_run_node_alert "$node_full_store" "$node_full_host" "$node_full_status" runtimes.node
+  fleet_run_node_alert "$node_full_ledger" "$node_full_store" "$node_full_host" \
+    "$node_full_status" runtimes.node
   [ "$node_full_status" -ne 76 ] ||
     fleet_journal_append "$node_full_store" "$node_full_host" \
       "$(jq -cn --arg at "$(fleet_now)" \
@@ -2623,10 +2756,17 @@ fleet_run_full_pass() (
     full_result=unavailable
     if command -v claude >/dev/null 2>&1; then
       full_result=failed
-      # `update` cannot refresh a marketplace that was never registered.
+      # `update` cannot refresh a marketplace that was never registered, and
+      # never refreshes one registered from another source than the declared
+      # one: that would pull whatever the new source serves under the name.
       fleet_run_ensure_marketplace "$full_upstream" >/dev/null 2>&1 || :
-      ! claude plugin marketplace update "$full_upstream" >/dev/null 2>&1 ||
-        full_result=ok
+      if fleet_run_marketplace_source_ok "$full_upstream"; then
+        ! claude plugin marketplace update "$full_upstream" >/dev/null 2>&1 ||
+          full_result=ok
+      else
+        full_result=held
+        printf '  hold  marketplace %s — %s\n' "$full_upstream" "$fleet_run_repair_reason"
+      fi
     fi
     fleet_upstream_write "$full_store" "$full_upstream" "$full_host" "$full_result" || :
   done
@@ -2641,17 +2781,9 @@ fleet_run_full_pass() (
   # still exists. Evidence retention carries no trust reasoning at all, because
   # evidence paths are never inputs to verification.
   fleet_trust_prune_expired "$full_store/$fleet_trust_roster_file" || :
-  # THE RETENTION WINDOW HAS A FLOOR. It is read from store content, it is not
-  # an item (no digest, no verdict, no canary gate, outside fleet_removal_cap),
-  # and its consequence is `rm -f` across journal/, alerts/ and findings/ on
-  # every host on the 12 h cadence — so `evidence_retention_days: 0` wipes the
-  # fleet's entire replicated evidence surface from one unreviewable scalar. A
-  # non-numeric value falls back to the default rather than to the floor: a
-  # typo should keep more evidence, not less.
-  fleet_trust_age_evidence "$full_store" \
-    "$(printf '%s\n' "$full_fold" | jq -r '
-      (.evidence_retention_days // 90) as $d |
-      if ($d | type) == "number" then ([$d, 7] | max | floor) else 90 end')" || :
+  # The retention window has a floor: fleet_records_retention_days.
+  fleet_records_age "$full_store" "$full_host" \
+    "$(fleet_records_retention_days "$full_fold")" || :
 
   # §7.3a B's enrolled side: joins/ is read as a hint and NEVER trusted — the
   # address is SSH'd and the same pubkey confirmed on that machine before any
@@ -2789,6 +2921,10 @@ fleet_run_proposals() (
   done <"$proposal_tmp/hosts"
   LC_ALL=C sort -u "$proposal_tmp/items" | while IFS= read -r proposal_item; do
     [ -n "$proposal_item" ] || continue
+    # §8.2 P0: agent items are not promoted. Unanimity across machine
+    # snapshots is how a plugin every host happened to have installed became a
+    # fleet-wide want that no removal on any one host could undo.
+    case $proposal_item in plugins.* | skills.*) continue ;; esac
     proposal_values=$(while IFS= read -r proposal_peer; do
       [ -n "$proposal_peer" ] || continue
       jq -cn --arg host "$proposal_peer" --argjson value \
@@ -2813,11 +2949,16 @@ EOF
 
 fleet_seed_command() (
   # `roundhouse fleet-seed` — §10.2/§12. Discovery writes this host's OWN
-  # `hosts/<name>.yaml` and `applied/<host>.yaml` to match what is installed,
-  # so the first convergence after seeding is a no-op BY CONSTRUCTION. That is
-  # the safety property worth paying for: a seeding pass that treated the
-  # larger host as truth would install 83 skills someone deliberately kept off
-  # a machine, and the reverse mistake deletes 83.
+  # `hosts/<name>.yaml` and `applied/<host>.yaml` to match what is installed —
+  # for PACKAGES, so the first convergence after seeding is a no-op for them
+  # BY CONSTRUCTION. That is the safety property worth paying for: a seeding
+  # pass that treated the larger host as truth would install 83 packages
+  # someone deliberately kept off a machine, and the reverse mistake deletes 83.
+  #
+  # Agent items (`plugins`, `skills`) are NOT seeded (§8.2 P0): a newly seeded
+  # host therefore ADOPTS the fleet's plugins and skills on its first run —
+  # reviewed and applied like any change — rather than snapshotting its own
+  # into its host layer, where they overrode every change made anywhere else.
   #
   # It writes into the WORKING COPY and stops — no describe, no bookmark move,
   # no push. The next run's promote gate parses what it wrote and publishes it
@@ -2826,9 +2967,9 @@ fleet_seed_command() (
   # this: fleet-init, fleet-enroll, fleet-seed, hand-edit fleet.yaml,
   # fleet-doctor.
   #
-  # Re-seeding UPSERTS and never removes: a skill uninstalled between seeds is
-  # a convergence decision for the run to report by name, not something seeding
-  # silently drops.
+  # Re-seeding UPSERTS and never removes: a package uninstalled between seeds
+  # is a convergence decision for the run to report by name, not something
+  # seeding silently drops.
   fleet_run_env
   require_jq
   require_yq
@@ -2878,6 +3019,14 @@ fleet_seed_command() (
           $r.data.manager == "fnm" or $r.data.manager == "npm") | not) then
         .packages[$r.data.name] = "enabled"
       else . end)' "$seed_tmp/snapshot.jsonl")
+  # §3.1/§8.2 P0: RE-SEED NO LONGER WRITES THE AGENT KEYS. A seed snapshots
+  # whatever this machine has installed into its own host layer, the narrowest
+  # one, so every re-seed re-added a plugin the fleet had retired and
+  # overrode every change made anywhere else. `plugins` and `skills` are
+  # dropped here, after the reducer, and nothing else is: packages and the
+  # host facts below seed exactly as before, and an agent entry already in the
+  # host file is left alone (re-seed upserts, it never removes).
+  seed_desired=$(printf '%s\n' "$seed_desired" | jq -c 'del(.plugins, .skills)')
 
   # MACHINE TRUTH, seeded from the one file that already states it. `platform`
   # and `groups` are host FACTS rather than desired items — the fold reads them
@@ -3216,7 +3365,7 @@ fleet_review_command() (
   review_store=$(fleet_store_path)
   review_host=$(fleet_host_name)
   review_digest=$(fleet_item_digest \
-    "$(fleet_fold "$review_store" "$review_host")" "$review_item") || {
+    "$(fleet_run_desired "$review_store" "$review_host")" "$review_item") || {
     printf 'roundhouse: no layer carries %s for %s\n' "$review_item" "$review_host" >&2
     exit 65
   }
@@ -3236,7 +3385,7 @@ fleet_apply_command() (
   apply_item=$1
   apply_store=$(fleet_store_path)
   apply_host=$(fleet_host_name)
-  apply_fold=$(fleet_fold "$apply_store" "$apply_host")
+  apply_fold=$(fleet_run_desired "$apply_store" "$apply_host")
   apply_digest=$(fleet_item_digest "$apply_fold" "$apply_item") || {
     printf 'roundhouse: no layer carries %s for %s\n' "$apply_item" "$apply_host" >&2
     exit 65
@@ -3247,12 +3396,29 @@ fleet_apply_command() (
     exit 65
   }
   apply_status=0
-  fleet_run_apply_item "$apply_store" "$apply_host" \
-    "$(fleet_definitions_load "$apply_store")" "$apply_item" \
-    "$(fleet_item_value "$apply_fold" "$apply_item")" \
-    "$(fleet_run_package_managers "$apply_fold" "$apply_host")" ||
-    apply_status=$?
   apply_now=$(fleet_now)
+  apply_value=$(fleet_item_value "$apply_fold" "$apply_item")
+  case $apply_item in
+    plugins.*)
+      if [ "$(fleet_run_state_of "$apply_value")" = absent ]; then
+        fleet_run_tombstone_converge "$apply_store" "$apply_host" \
+          "$(fleet_definitions_load "$apply_store")" "$apply_item" "$apply_value" \
+          "$apply_digest" "$apply_now" || apply_status=$?
+        case $apply_status in
+          0 | 70)
+            printf 'roundhouse: %s converged to absent at %s (working copy only — the next run publishes it)\n' \
+              "$apply_item" "$apply_digest"
+            exit 0
+            ;;
+        esac
+      fi
+      ;;
+  esac
+  [ "$apply_status" -ne 0 ] ||
+    fleet_run_apply_item "$apply_store" "$apply_host" \
+      "$(fleet_definitions_load "$apply_store")" "$apply_item" "$apply_value" \
+      "$(fleet_run_package_managers "$apply_fold" "$apply_host")" ||
+    apply_status=$?
   case $apply_status in
     0)
       fleet_applied_record "$apply_store" "$apply_host" "$apply_item" \
@@ -3369,19 +3535,77 @@ fleet_lock_command() (
   # The run-lock, taken by hand: one runner per host per store. A second run
   # exits 75 and STOPS rather than forcing — two convergences racing one plugin
   # cache is the failure this prevents.
+  #
+  # The lock is marked `manual`: it outlives this command by design, and no
+  # process stands for the operator holding it, so it is never judged dead and
+  # taken over. It is NEVER released automatically either: a forgotten hand
+  # lock makes every run exit 0 ("another run holds") until it passes the
+  # stale age, and exit 75 (the stale refusal) from then on, until
+  # `fleet-unlock` releases it.
   require_jq
   lock=$(fleet_lock_path)
-  fleet_lock_acquire "$lock" || {
+  fleet_lock_acquire "$lock" "$PPID" manual || {
     printf 'roundhouse: the fleet run-lock is held: %s\n' "$lock" >&2
     exit 75
   }
-  printf 'roundhouse: fleet run-lock acquired: %s\n' "$lock"
+  printf 'roundhouse: fleet run-lock acquired by hand: %s (held until fleet-unlock)\n' "$lock"
 )
 
 fleet_unlock_command() (
+  # `roundhouse fleet-unlock [--force]` — release the run lock by hand. A lock
+  # whose holder is a VERIFIED-LIVE run (pid, start time and command all match,
+  # and not hand-taken) is a run in progress, and removing its lock lets a
+  # second run race it; that is refused unless `--force` says so explicitly.
+  # Everything else — a hand-taken lock, a dead or unjudgeable holder — goes.
+  #
+  # The release is by IDENTITY, read in the same breath as the holder check:
+  # the lock judged here is the only one removed, so a run that took the lock
+  # between the check and the release keeps it. A lock with no meta at all
+  # carries nothing to protect and its empty directory goes; one whose meta
+  # cannot be read needs `--force`.
+  require_jq
+  unlock_force=false
+  case ${1:-} in
+    '') ;;
+    --force) unlock_force=true ;;
+    *)
+      printf 'roundhouse: unknown fleet-unlock option: %s\n' "$1" >&2
+      exit 64
+      ;;
+  esac
   unlock=$(fleet_lock_path)
-  rm -f "$unlock/meta.json"
-  [ ! -d "$unlock" ] || rmdir "$unlock"
+  [ -d "$unlock" ] || {
+    printf 'roundhouse: no fleet run-lock is held\n'
+    exit 0
+  }
+  unlock_id=$(fleet_lock_identity "$unlock")
+  if [ "$unlock_force" != true ]; then
+    fleet_lock_holder_state "$unlock"
+    [ "$fleet_lock_state" != live ] || {
+      printf 'roundhouse: a live run (pid %s) holds %s; refusing to release it (use --force to override)\n' \
+        "$(fleet_lock_meta_field "$unlock" pid)" "$unlock" >&2
+      exit 75
+    }
+  fi
+  if [ -n "$unlock_id" ]; then
+    fleet_lock_release "$unlock" "$unlock_id" || {
+      printf 'roundhouse: %s changed while it was being released (another run took it); nothing released\n' \
+        "$unlock" >&2
+      exit 75
+    }
+  elif [ ! -e "$unlock/meta.json" ]; then
+    rmdir "$unlock" 2>/dev/null || {
+      printf 'roundhouse: %s holds files other than its meta; remove it by hand\n' "$unlock" >&2
+      exit 75
+    }
+  elif [ "$unlock_force" = true ]; then
+    rm -f "$unlock/meta.json"
+    rmdir "$unlock" 2>/dev/null || :
+  else
+    printf 'roundhouse: %s has an unreadable meta.json; confirm no live runner, then release it with --force\n' \
+      "$unlock" >&2
+    exit 75
+  fi
   printf 'roundhouse: fleet run-lock released\n'
 )
 

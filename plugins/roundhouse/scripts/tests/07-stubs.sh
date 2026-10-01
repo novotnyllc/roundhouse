@@ -290,7 +290,9 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = marketplace ] &&
   [ "\${3:-}" = add ]; then
   [ -z "\${CLAUDE_MARKETPLACE_ADD_LOG:-}" ] || printf '%s\n' "\$4" >>"\$CLAUDE_MARKETPLACE_ADD_LOG"
   if [ -n "\${CLAUDE_PLUGIN_MARKETPLACE_FILE:-}" ] && [ -n "\${CLAUDE_MARKETPLACE_ADD_NAME:-}" ]; then
-    jq --arg n "\$CLAUDE_MARKETPLACE_ADD_NAME" '. + [{name:\$n}]' "\$CLAUDE_PLUGIN_MARKETPLACE_FILE" \
+    jq --arg n "\$CLAUDE_MARKETPLACE_ADD_NAME" --arg loc "\${CLAUDE_MARKETPLACE_ADD_LOCATION:-}" \
+      '. + [{name:\$n} + (if \$loc == "" then {} else {installLocation:\$loc} end)]' \
+      "\$CLAUDE_PLUGIN_MARKETPLACE_FILE" \
       >"\$CLAUDE_PLUGIN_MARKETPLACE_FILE.new" && mv "\$CLAUDE_PLUGIN_MARKETPLACE_FILE.new" "\$CLAUDE_PLUGIN_MARKETPLACE_FILE"
   fi
   exit 0
@@ -414,6 +416,38 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
         '.plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user")) + [\$rec])' \
         "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"
     fi
+  fi
+  exit 0
+fi
+if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = uninstall ] || [ "\${2:-}" = remove ]; }; then
+  # \`claude plugin uninstall --scope user --keep-data ID\`: the id is the one
+  # argument that is neither an option nor an option's value. --keep-data is
+  # REQUIRED: without it the real manager deletes the plugin's data directory,
+  # which no rollback restores.
+  shift 2
+  scope=user
+  uninstall_id=
+  keep_data=false
+  while [ "\$#" -gt 0 ]; do
+    case \$1 in
+      -s | --scope) scope=\${2:-}; shift ;;
+      --keep-data) keep_data=true ;;
+      -*) ;;
+      *) uninstall_id=\$1 ;;
+    esac
+    shift
+  done
+  [ "\$scope" = user ] && [ -n "\$uninstall_id" ] && [ "\$keep_data" = true ] || exit 64
+  [ -z "\${CLAUDE_PLUGIN_ACTION_LOG:-}" ] ||
+    printf '%s %s\n' uninstall "\$uninstall_id" >>"\$CLAUDE_PLUGIN_ACTION_LOG"
+  [ "\${CLAUDE_UNINSTALL_FAIL:-0}" != 1 ] || exit 1
+  if [ -z "\${CLAUDE_UNINSTALL_SKIP_RECORD:-}" ] && [ -n "\${CLAUDE_CONFIG_DIR:-}" ]; then
+    installed_file="\$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+    [ ! -f "\$installed_file" ] ||
+      jq -c --arg id "\$uninstall_id" '
+        .plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user"))) |
+        if (.plugins[\$id] | length) == 0 then del(.plugins[\$id]) else . end' \
+        "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"
   fi
   exit 0
 fi

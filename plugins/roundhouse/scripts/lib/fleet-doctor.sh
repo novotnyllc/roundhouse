@@ -90,7 +90,20 @@ fleet_sweep_range() {
       # `jj diff --name-only` refuses -T and prints paths relative to the
       # CALLER's directory, so it runs with cwd INSIDE the store or every name
       # comes back absolute. Measured on jj 0.44.
-      (cd "$1" && jj diff -r "$sweep_commit" --name-only 2>/dev/null) |
+      #
+      # A path this commit DELETES carries no content here: whatever it held
+      # was swept in the commit that wrote it (the per-commit walk above sees
+      # create-then-delete), or is already on the remote. Skipping deletions
+      # is what keeps a 46k-file alert compaction from costing one `jj file
+      # show` per removed file; `--summary` marks them `D`, and one awk pass
+      # drops them from the name list (`--name-only` alone names a deletion
+      # and a rename target alike).
+      (cd "$1" && {
+        jj diff -r "$sweep_commit" --summary 2>/dev/null |
+          awk '/^D / { print "D\t" substr($0, 3) }'
+        jj diff -r "$sweep_commit" --name-only 2>/dev/null |
+          awk '{ print "N\t" $0 }'
+      }) | awk -F'\t' '$1 == "D" { gone[$2] = 1; next } !($2 in gone) { print $2 }' |
         while IFS= read -r sweep_path; do
           case $sweep_path in
             findings/?* | alerts/?*) ;;
@@ -1319,18 +1332,29 @@ fleet_doctor_command() (
     fleet_doctor_row ok run-lock "no lock held; stale threshold ${doctor_stale}s (two full cadences)"
   else
     doctor_age=$(fleet_lock_age_seconds "$doctor_lock" || printf '')
+    # The same holder verdict the run takes the lock by (fleet_lock_holder_state),
+    # so this row and the run never disagree about whose lock it is.
+    fleet_lock_holder_state "$doctor_lock"
     # An unknown age is a FINDING, not "held for unknowns, under the
     # threshold". A lock whose meta.json is missing or unparsable carries no
     # evidence of a live runner, and reading it as fresh made this row print
     # `ok` about the exact state that wedges every future run.
-    if [ -z "$doctor_age" ]; then
+    if [ "$fleet_lock_state" = dead ]; then
+      fleet_doctor_row finding run-lock \
+        "$doctor_lock is held by a dead holder (pid $(fleet_lock_meta_field "$doctor_lock" pid)); the next run takes it over and alerts"
+    elif [ -z "$doctor_age" ]; then
       fleet_doctor_row finding run-lock \
         "$doctor_lock has no readable meta.json, so its age is unknown; confirm no live runner, then remove it"
+    elif [ "$doctor_age" -gt "$doctor_stale" ] && [ "$fleet_lock_state" = live ]; then
+      fleet_doctor_row finding run-lock \
+        "$doctor_lock has been held by a live run (pid $(fleet_lock_meta_field "$doctor_lock" pid)) for ${doctor_age}s, past the ${doctor_stale}s threshold; it may be hung"
     elif [ "$doctor_age" -gt "$doctor_stale" ]; then
       fleet_doctor_row finding run-lock \
         "$doctor_lock is ${doctor_age}s old, past the ${doctor_stale}s threshold; confirm no live runner, then remove it"
+    elif [ "$(fleet_lock_meta_field "$doctor_lock" manual)" = true ]; then
+      fleet_doctor_row ok run-lock "taken by hand ${doctor_age}s ago, under the ${doctor_stale}s threshold; release it with fleet-unlock"
     else
-      fleet_doctor_row ok run-lock "held for ${doctor_age}s, under the ${doctor_stale}s threshold"
+      fleet_doctor_row ok run-lock "held for ${doctor_age}s by a ${fleet_lock_state} holder, under the ${doctor_stale}s threshold"
     fi
   fi
 
@@ -1385,19 +1409,19 @@ fleet_doctor_command() (
     fleet_doctor_row finding revert-signature "$doctor_revert"
   fi
 
-  # --- §10.8 every canary bypass in the last 30 days ---
+  # --- §10.8 every canary bypass in fleet_journal_override_window_days ---
   doctor_overrides=$(fleet_journal_entries "$doctor_store" "$doctor_host" 2>/dev/null |
-    jq -r --arg since "$(fleet_doctor_days_ago 30)" \
+    jq -r --arg since "$(fleet_doctor_days_ago "$fleet_journal_override_window_days")" \
       'select(.override == "canary" and .at >= $since) |
        "\(.at) \(.item)"' 2>/dev/null || true)
   if [ -z "$doctor_overrides" ]; then
-    fleet_doctor_row ok canary-overrides 'no --now bypass on this host in the last 30 days'
+    fleet_doctor_row ok canary-overrides "no --now bypass on this host in the last $fleet_journal_override_window_days days"
   else
     # Reported, never a finding by itself: `--now` is a legitimate,
     # journaled, bound bypass. What must never happen is that it goes
     # uncounted, because an uncounted bypass becomes routine.
     fleet_doctor_row ok canary-overrides \
-      "$(printf '%s' "$doctor_overrides" | grep -c .) in the last 30 days: $(printf '%s' "$doctor_overrides" | tr '\n' ';')"
+      "$(printf '%s' "$doctor_overrides" | grep -c .) in the last $fleet_journal_override_window_days days: $(printf '%s' "$doctor_overrides" | tr '\n' ';')"
   fi
 
   # --- rows that need the reviewed layers ---

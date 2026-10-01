@@ -166,11 +166,20 @@ YAML
     ! fleet_journal_append "$rec_store" vireo \
       "$(rec_entry plugins.x d1 wibble 2026-08-07T09:30:00Z)" 2>/dev/null ||
       fail "a journal entry with an unknown outcome was accepted"
+    # `disowned` (fleet-disown) is item-and-digest evidence like `reverted`,
+    # but an ownership fact rather than a withdrawal.
+    fleet_journal_append "$rec_store" vireo \
+      "$(rec_entry plugins.x d1 disowned 2026-08-07T09:31:00Z)" ||
+      fail "a disowned journal entry was refused"
+    ! fleet_journal_append "$rec_store" vireo \
+      "$(jq -cn '{outcome: "disowned", at: "2026-08-07T09:32:00Z"}')" 2>/dev/null ||
+      fail "a disowned entry naming no item was accepted"
 
     # NO schema keys anywhere, in the records or in the code that writes them.
     ! grep -rqE '^\s*schema(_version)?:' "$rec_store" ||
       fail "a replicated record carries a schema key"
-    ! grep -vE '^ *#' "$(dirname -- "$cli")/lib/fleet-records.sh" |
+    ! grep -hvE '^ *#' "$(dirname -- "$cli")/lib/fleet-records.sh" \
+      "$(dirname -- "$cli")/lib/fleet-alerts.sh" |
       grep -qE '(^|[^a-z_])schema(_version)?:' ||
       fail "the records unit emits a schema key"
 
@@ -225,17 +234,178 @@ YAML
     fleet_removal_cap 1 100 5 0.25 >/dev/null ||
       fail "a one-line deletion was held by a blast-radius cap"
 
-    # --- §5 alerts, §10.4 findings, and the redaction floor ---
-    fleet_alert_write "$rec_store" vireo unsigned-edit unsigned-hand-edit \
-      'Commit 6705e1a3 carries no SSH signature.' plugins.impeccable ||
-      fail "a clean alert was refused"
-    rec_alert=$(find "$rec_store/alerts/vireo" -name '*-unsigned-hand-edit.yaml' | head -1)
-    [ -n "$rec_alert" ] ||
-      fail "the alert was not written under alerts/<host>/<stamp>-<slug>.yaml"
-    [ "$(yq -r '.kind' "$rec_alert")" = unsigned-edit ] &&
-      [ "$(yq -r '.items[0]' "$rec_alert")" = plugins.impeccable ] ||
-      fail "the alert did not carry its kind and the items it holds"
+    # --- one tagged removal list, one over-cap rule, applied per tag ---
+    # Prunes keep both terms; tombstone uninstalls are capped by count alone
+    # (a host that owns little must not hold every tombstone forever), and a
+    # tag over its cap holds whole without touching the other tag.
+    rec_removals="$tmp/records/removals"
+    printf 'prune plugins.a\nprune plugins.b\nuninstall plugins.t1\nuninstall plugins.t2\n' \
+      >"$rec_removals"
+    [ -z "$(fleet_run_removals_over "$rec_removals" 8 \
+      '{"policy":{"max_removals_per_run":5,"max_removal_fraction":0.25}}')" ] ||
+      fail "a removal set within both caps was held"
+    # 2 owned × 0.25 = 0: the prunes hold, the uninstalls (2 <= 5) do not.
+    [ "$(fleet_run_removals_over "$rec_removals" 2 \
+      '{"policy":{"max_removals_per_run":5,"max_removal_fraction":0.25}}' | tr '\n' ' ')" = \
+      'prune plugins.a prune plugins.b ' ] ||
+      fail "the fraction term held tombstone uninstalls, or failed to hold the prunes"
+    # max 1: both tags are over, each held whole.
+    [ "$(fleet_run_removals_over "$rec_removals" 100 \
+      '{"policy":{"max_removals_per_run":1,"max_removal_fraction":1}}' | grep -c .)" -eq 4 ] ||
+      fail "a tag over the per-run count was not held whole"
+    printf 'prune plugins.a\nuninstall plugins.t1\nuninstall plugins.t2\n' >"$rec_removals"
+    [ "$(fleet_run_removals_over "$rec_removals" 100 \
+      '{"policy":{"max_removals_per_run":1,"max_removal_fraction":1}}' | tr '\n' ' ')" = \
+      'uninstall plugins.t1 uninstall plugins.t2 ' ] ||
+      fail "over-cap tombstones cleared a prune set that was within its own cap"
 
+    # --- §7.11.3 alert aging (the alert shapes are section 80) ---
+    # Evidence aging leaves a KEYED alert alone: its `at` is first-seen and
+    # never bumped, so aging by it would delete a still-open condition. The
+    # legacy stamped form still ages.
+    rec_aging="$tmp/records/aging"
+    rm -rf "$rec_aging"
+    mkdir -p "$rec_aging/alerts/vireo"
+    printf 'kind: removal-cap\nat: "2001-01-01T00:00:00Z"\n' \
+      >"$rec_aging/alerts/vireo/removal-cap.yaml"
+    printf 'kind: removal-cap\nat: "2001-01-01T00:00:00Z"\n' \
+      >"$rec_aging/alerts/vireo/20010101T0000-removal-cap.yaml"
+    # An EVENT alert, keyed or not, and a kind no table lists still age.
+    printf 'kind: lock-takeover\nat: "2001-01-01T00:00:00Z"\n' \
+      >"$rec_aging/alerts/vireo/lock-takeover.yaml"
+    printf 'kind: some-future-kind\nat: "2001-01-01T00:00:00Z"\n' \
+      >"$rec_aging/alerts/vireo/some-future-kind.yaml"
+    fleet_records_age "$rec_aging" vireo 90 >/dev/null
+    [ -f "$rec_aging/alerts/vireo/removal-cap.yaml" ] ||
+      fail "evidence aging deleted a keyed CONDITION alert by its first-seen time"
+    [ ! -f "$rec_aging/alerts/vireo/20010101T0000-removal-cap.yaml" ] ||
+      fail "evidence aging stopped aging stamped alerts"
+    [ ! -f "$rec_aging/alerts/vireo/lock-takeover.yaml" ] &&
+      [ ! -f "$rec_aging/alerts/vireo/some-future-kind.yaml" ] ||
+      fail "an event alert, or an unlisted kind, did not age out"
+
+    # --- §7.11.3 journal aging: per record, never what something still reads ---
+    rec_jage="$tmp/records/journal-aging"
+    rm -rf "$rec_jage"
+    mkdir -p "$rec_jage/journal/vireo" "$rec_jage/journal/wren"
+    # 2001-01: the ONLY canary evidence for plugins.p (old, applied twice), a
+    # withdrawal of nothing that matters, ordinary chatter, and liveness.
+    cat >"$rec_jage/journal/vireo/2001-01-01.yaml" <<'YAML'
+- {item: plugins.p, digest: d1, outcome: applied, at: "2001-01-01T00:00:00Z"}
+- {item: plugins.q, digest: q1, outcome: held, at: "2001-01-01T01:00:00Z"}
+- {outcome: alive, at: "2001-01-01T02:00:00Z"}
+YAML
+    cat >"$rec_jage/journal/vireo/2001-01-02.yaml" <<'YAML'
+- {item: plugins.p, digest: d1, outcome: applied, at: "2001-01-02T00:00:00Z"}
+- {item: plugins.p, digest: d1, outcome: applied, at: "2001-01-02T01:00:00Z"}
+- {outcome: alive, at: "2001-01-02T02:00:00Z"}
+YAML
+    cat >"$rec_jage/journal/vireo/2001-01-03.yaml" <<'YAML'
+- {item: plugins.r, digest: r1, outcome: held, at: "2001-01-03T00:00:00Z"}
+- {outcome: alive, at: "2001-01-03T01:00:00Z"}
+- {outcome: unreachable, source: none, at: "2001-01-03T02:00:00Z"}
+YAML
+    cat >"$rec_jage/journal/vireo/2001-01-04.yaml" <<'YAML'
+- {item: plugins.s, digest: s1, outcome: applied, at: "2001-01-04T00:00:00Z"}
+- {item: plugins.s, digest: s2, outcome: applied, at: "2001-01-04T01:00:00Z"}
+- {outcome: alive, at: "2001-01-04T02:00:00Z"}
+YAML
+    cp "$rec_jage/journal/vireo/2001-01-01.yaml" "$rec_jage/journal/wren/2001-01-01.yaml"
+    rec_jnow=$(fleet_now)
+    fleet_canary_gate "$rec_jage" plugins.p d1 24 "$rec_jnow" vireo ||
+      fail "the fixture's canary evidence did not pass the gate to begin with"
+    rec_jrevert=$(fleet_run_is_revert "$rec_jage" vireo plugins.s s1 && echo yes || echo no)
+    rec_jbefore=$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)
+    rec_jdry=$(fleet_records_age "$rec_jage" vireo 90 --dry-run) ||
+      fail "the journal aging dry run failed"
+    [ "$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)" = "$rec_jbefore" ] ||
+      fail "the aging dry run changed the journal"
+    case $rec_jdry in
+      *'dry run'*'journal/vireo: 7 of 12 records past retention (1 day files removed, 2 rewritten)'*) ;;
+      *) fail "the aging dry run did not report the trim: $rec_jdry" ;;
+    esac
+    fleet_records_age "$rec_jage" vireo 90 >/dev/null ||
+      fail "journal aging failed"
+    # The canary's ONLY evidence is past retention, and the downstream gate
+    # still passes: its oldest and newest applied records are load-bearing.
+    fleet_canary_gate "$rec_jage" plugins.p d1 24 "$rec_jnow" vireo ||
+      fail "aging removed the canary evidence a downstream host gates on"
+    [ "$(fleet_run_is_revert "$rec_jage" vireo plugins.s s1 && echo yes || echo no)" = \
+      "$rec_jrevert" ] || fail "aging changed the revert signature's answer"
+    # Ordinary old records are gone: the middle applied, a held with no
+    # evidence after it, the older heartbeats, the unreachable record.
+    [ "$(yq -r '[.[] | select(.item == "plugins.p")] | length' \
+      "$rec_jage/journal/vireo/2001-01-02.yaml")" -eq 1 ] ||
+      fail "aging kept the middle applied record, or lost the newest"
+    ! grep -q 'plugins.q' "$rec_jage/journal/vireo/2001-01-01.yaml" ||
+      fail "aging kept an old held record nothing reads"
+    # A day file left with nothing is removed.
+    [ ! -e "$rec_jage/journal/vireo/2001-01-03.yaml" ] ||
+      fail "a day file left empty by aging was not removed"
+    grep -q 'outcome: alive' "$rec_jage/journal/vireo/2001-01-04.yaml" ||
+      fail "aging removed the newest heartbeat"
+    # Idempotent, and this host's own journal only.
+    rec_jafter=$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)
+    case $(fleet_records_age "$rec_jage" vireo 90) in
+      *'journal/vireo: 0 of '*) ;;
+      *) fail "a second aging pass found more to trim" ;;
+    esac
+    [ "$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)" = "$rec_jafter" ] ||
+      fail "a second aging pass changed the journal"
+    cmp -s "$rec_jage/journal/wren/2001-01-01.yaml" "$rec_jage/journal/vireo/2001-01-01.yaml" &&
+      fail "the peer fixture is not the original"
+    [ "$(yq -r 'length' "$rec_jage/journal/wren/2001-01-01.yaml")" -eq 3 ] ||
+      fail "aging touched another host's journal"
+    # An unreadable day file stops journal aging outright: the load-bearing
+    # set is decided over the whole history, so nothing is aged while any
+    # part of it is unreadable.
+    cat >"$rec_jage/journal/vireo/2001-01-05.yaml" <<'YAML'
+- {item: plugins.t, digest: t1, outcome: applied, at: "2001-01-05T00:00:00Z"}
+YAML
+    printf -- '- {item: plugins.t, outcome: held, at: "2001-01-06T00:00:00Z"\n' \
+      >"$rec_jage/journal/vireo/2001-01-06.yaml"
+    rec_jbad_before=$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)
+    if fleet_records_age "$rec_jage" vireo 90 >/dev/null 2>&1; then
+      fail "journal aging proceeded over an unreadable day file"
+    fi
+    [ "$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)" = "$rec_jbad_before" ] ||
+      fail "journal aging changed the journal while a day file was unreadable"
+    rm -f "$rec_jage/journal/vireo/2001-01-05.yaml" "$rec_jage/journal/vireo/2001-01-06.yaml"
+    # A batch that holds one unreadable file is re-read file by file, and the
+    # records yq printed before it failed are NOT kept as well: each file is
+    # read once, and aging counts and removes each record once.
+    rec_batch="$tmp/records/batch"
+    rm -rf "$rec_batch"
+    mkdir -p "$rec_batch/findings/vireo"
+    for rec_n in 1 2 3 4 5 6; do
+      printf 'summary: old %s\nat: "2001-01-01T00:00:00Z"\n' "$rec_n" \
+        >"$rec_batch/findings/vireo/a$rec_n.yaml"
+    done
+    printf 'summary: [unterminated\n' >"$rec_batch/findings/vireo/m-bad.yaml"
+    fleet_records_read_dir "$rec_batch/findings/vireo" "$rec_batch/read"
+    [ "$(grep -c . "$rec_batch/read")" -eq 7 ] &&
+      [ -z "$(jq -r '.file' "$rec_batch/read" | sort | uniq -d)" ] ||
+      fail "a batch with one unreadable file was read twice: $(grep -c . "$rec_batch/read") lines for 7 files"
+    case $(fleet_records_age "$rec_batch" vireo 90 2>&1) in
+      *'findings/vireo: 6 of 7 removed'*) ;;
+      *) fail "aging a batch with one unreadable file miscounted its records" ;;
+    esac
+    [ "$(find "$rec_batch/findings/vireo" -name '*.yaml' | grep -c .)" -eq 1 ] &&
+      [ -f "$rec_batch/findings/vireo/m-bad.yaml" ] ||
+      fail "aging removed an unreadable finding, or kept an aged one"
+    # The window comes from policy.evidence_retention_days, floored at 7.
+    [ "$(fleet_records_retention_days '{"policy":{"evidence_retention_days":30}}')" = 30 ] ||
+      fail "retention did not read policy.evidence_retention_days"
+    [ "$(fleet_records_retention_days '{"policy":{"evidence_retention_days":2}}')" = 7 ] ||
+      fail "retention below the floor was not raised to 7"
+    [ "$(fleet_records_retention_days '{"evidence_retention_days":30}')" = 90 ] ||
+      fail "a root-level retention key was read instead of policy"
+    [ "$(fleet_records_retention_days '{}')" = 90 ] || fail "retention default is not 90"
+    # Efficiency is structural: batched reads, one plan.
+    cli_function_body fleet_records_age | grep -q 'fleet_records_read_dir' ||
+      fail "evidence aging no longer reads its directories in batches"
+
+    # --- §10.4 the redaction floor, on alerts and findings alike ---
     # A quote that trips the floor is REFUSED, not silently redacted: §10.4's
     # own remedy explicitly cannot un-publish.
     for rec_secret in 'token ghp_abcdefghijklmnopqrstuvwxyz0123' \
@@ -389,6 +559,16 @@ YAML
         2026-08-07T12:00:00Z canary-1 ||
         fail "a canary that later $rec_withdrawal the item still released it"
     done
+    # A canary that later DISOWNED the item withdrew nothing: the bytes were
+    # not rejected, the host only stopped managing them.
+    rec_canary_reset
+    fleet_journal_append "$rec_canary_store" canary-1 \
+      "$(rec_entry plugins.ponytail 91ac33 disowned 2026-08-06T20:00:00Z)"
+    fleet_journal_append "$rec_canary_store" canary-1 \
+      "$(jq -cn '{outcome: "alive", at: "2026-08-07T10:00:00Z"}')"
+    fleet_canary_gate "$rec_canary_store" plugins.ponytail 91ac33 24 \
+      2026-08-07T12:00:00Z canary-1 ||
+      fail "a canary's disown read as a withdrawal of its evidence"
     # (3) the two silences condition 3 exists for. A canary that applied the
     # item and was WRECKED by it satisfies (1) and (2) and must still block.
     rec_canary_reset

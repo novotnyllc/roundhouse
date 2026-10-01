@@ -575,6 +575,18 @@ $(docjj_lib fleet_vcs_trailers vireo interactive/human 'leak fixture' -)" >/dev/
     docjj_doctor >/dev/null
     docjj_row_fires run-lock
     rm -rf "$docjj_lock"
+    # …and a FRESH lock whose holder is dead: the same verdict the run takes it
+    # over by, reported rather than read as "held, under the threshold".
+    sleep 1 &
+    docjj_dead=$!
+    wait "$docjj_dead" 2>/dev/null || :
+    mkdir -p "$docjj_lock"
+    jq -cn --arg pid "$docjj_dead" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{host:"vireo",pid:($pid|tonumber),started_at:$at,start_time:"Thu Jan  1 00:00:00 1970",
+        command:"bash roundhouse fleet-run",nonce:"deadbeef"}' >"$docjj_lock/meta.json"
+    docjj_doctor >/dev/null
+    docjj_row_fires run-lock
+    rm -rf "$docjj_lock"
 
     # jj#9571: a raw `git push` from the colocated repo bypasses every guard in
     # fleet_vcs_publish, and jj's own refusal is not self-enforcing. Comparing

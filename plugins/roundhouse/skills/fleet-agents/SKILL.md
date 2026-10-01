@@ -133,7 +133,84 @@ Two rules make this surface safe, and neither is a formality:
 
 Verdicts are **host-local** (`store.run/verdicts/`) and never replicated: a
 fleet-writable verdict would put a consent-shaped artifact on a shared surface.
-Alerts have no state machine — resolving one is `rm` on the file.
+Alerts have no state machine — resolving one is `rm` on the file. An alert is
+**keyed, not stamped**: one file per key at `alerts/<host>/<kind>--<key>.yaml`,
+where the key is the alert's items joined by commas, or its slug when it names
+no item; `<kind>.yaml` when that slug is the kind itself. Both parts are
+URI-encoded, so an item such as `config_files.~/.claude/settings.json` stays one
+path component (`config_files.~%2F.claude%2Fsettings.json`). For a
+**condition** alert, `at` is when it was **first seen**: a condition that is
+still true on the next pass rewrites nothing, and a change in what the alert
+says rewrites it with the same `at`. An **event** alert takes `at` from its
+**latest** occurrence: each raise rewrites it, so it ages from the last time
+it happened.
+
+How an alert ENDS depends on its kind, and what it is keyed by on its scope,
+from one table (`fleet_alert_lifecycle_rows` in `lib/fleet-alerts.sh`):
+
+| Lifecycle | Scope | Kinds | Ends |
+| --- | --- | --- | --- |
+| condition | store | `removal-cap`, `integrity-store-wide`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render` | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
+| condition | item | `integrity`, `config-key-collision`, `chezmoi-coownership`, `package-hold`, `enabled-but-untrusted`, `record-write`, `identity-unavailable`, `uninstall-deferred`, `package-deferred`, `runtime-hold`, `node-runtime-unverified` | the end-of-pass sweep (`fleet_alert_sweep`) clears it when the pass **checked** the item and did not raise it, or when the item has left the fold; an item the pass skipped (held, waiting on its canary) keeps it; never ages |
+| event | store or item | `stale-host`, `schedule-disabled`, `schedule-missing`, `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by its latest `at` after the evidence retention window |
+
+`stale-host`, `schedule-disabled` and `schedule-missing` are events until the
+loop-liveness work adds the checks that clear them; it moves them to condition.
+
+`rm` on the file still resolves any alert by hand; a condition alert that is
+removed while its condition holds is raised again on the next pass.
+
+### Record maintenance and ownership
+
+Three verbs that **publish** rather than stopping at the working copy, because
+their whole effect is on replicated records. Each takes the run lock, refuses
+while `main` is diverged or while the working copy carries anything other than
+this host's own records, and commits through the same publish path the run
+uses (first-push gate, redaction sweep, conflict guards).
+
+```text
+roundhouse fleet-compact-alerts          # one-time: this host's stamped alerts -> one keyed file per alert
+roundhouse fleet-age-evidence [--dry-run]
+                                         # trim this host's evidence past retention, now
+roundhouse fleet-disown [--dry-run] [--host-only] [ITEM...]
+                                         # stop managing items without uninstalling them
+```
+
+`fleet-compact-alerts` collapses the stamped alert files an older build wrote
+(`alerts/<this host>/<stamp>-<slug>.yaml`) to the keyed form, keeping the latest
+record per key. **Run it once on each host** after that host has this build:
+it touches only its own host's directory (a host may not write another's
+`alerts/`), leaves any file it cannot parse where it is, reads in batches (it is
+built for tens of thousands of files), and is idempotent — a second run finds
+nothing to do.
+
+`fleet-age-evidence` runs the full pass's evidence aging by hand, and
+`--dry-run` prints what it would trim without changing anything. Aging covers
+this host's own `journal/`, `alerts/` and `findings/` only. Journal records age
+one by one, by their own `at`, past `evidence_retention_days` (default 90,
+floor 7). A day file is rewritten with what remains, or removed when nothing
+does. A record something still reads is **never** aged:
+
+- the oldest and newest `applied` and `satisfied` record per (item, digest),
+  which carry canary evidence, rule-5 times and the revert signature;
+- every `held` or `reverted` record newer than the item's oldest evidence;
+- the newest `alive` record, and the newest record of any kind;
+- `--now` overrides from the last 30 days (`fleet_journal_override_window_days`), which doctor counts.
+
+Run `fleet-age-evidence --dry-run` before the first full pass on a new build:
+that pass trims every record past retention that nothing reads.
+
+`fleet-disown` removes items from `applied/<this host>.yaml` **without
+uninstalling them** and journals each one `disowned` — not `reverted`, because
+nothing was withdrawn, and outside the removal cap, because nothing is removed.
+The item becomes unmanaged: neither removed nor spread. `--host-only` selects
+every owned item that only this host's own layer asks for — owned, and absent
+from the fold of `fleet.yaml`, `os/`, `groups/` and `definitions` — which is
+the set a retired host-layer machine snapshot leaves behind; disown them
+**before** deleting that layer, or the next run reads each one as a removal.
+`--dry-run` prints the selection and changes nothing. A named item this host
+does not own is refused, and one still in the layers is disowned but reported,
+because the next run adopts it again.
 
 `fleet-finding` and `fleet-hold` pass every replicated field through the
 redaction floor, and a field that trips it is **refused rather than silently
@@ -150,6 +227,13 @@ the two ordinary edits for you — write the value at the target layer, drop it
 from each host file that carried it — and **the item's digest is unchanged by
 construction**, so no host re-reviews anything. Promotion moves *where* a value
 is written, never *what* it is.
+
+Neither re-seeding nor promotion writes the agent keys. Seeding skips `plugins`
+and `skills` (packages, `platform`, `groups` and `package_managers` seed as
+before), and promotion never proposes a `plugins.*` or `skills.*` item: a
+machine snapshot in the narrowest layer re-added every retired plugin and
+overrode every change made anywhere else. Agent items are edited in the layer
+that declares them.
 
 ### Conflicts, and who resolves them
 
@@ -184,6 +268,17 @@ the one non-`applied` outcome the canary gate accepts as evidence — gating pee
 on an `applied` record that can never be written would hold the item forever and
 buy nothing. An item a host **tried and could not apply**, or that a gate
 refused, still journals `held` and still blocks downstream.
+
+A Claude plugin whose desired state is `absent` — the scalar or
+`{state: absent}` — is a **tombstone**, and the run uninstalls it with
+`claude plugin uninstall --scope user --keep-data NAME@MARKETPLACE`, verifies it is gone from
+`installed_plugins.json`, forgets any `applied/` record, and journals `applied`.
+Where it is not installed it journals `satisfied` once and then stays quiet. An
+uninstall that would remove something counts toward the removal cap like any
+other removal. An **enabled** plugin is not pulled out from under a live
+session: while a `claude` process runs the uninstall journals `held` for up to
+24 hours from this host's first deferral, then proceeds; a disabled plugin goes
+immediately. `absent` for any other category is still held.
 
 ### Rollback
 
@@ -277,8 +372,8 @@ roundhouse fleet-set-remote <url>  # adds origin. fleet-init creates the store
                                # ADDS a missing one.
 roundhouse fleet-verify-remote # REQUIRED before the first push
 roundhouse fleet-seed          # discovery -> hosts/<name>.yaml + applied/<name>.yaml,
-                               # including this machine's platform and groups
-                               # from config.json — no hand-authored facts
+                               # packages plus this machine's platform and groups
+                               # from config.json — never plugins or skills
 $EDITOR fleet.yaml             # lift the commonalities
 roundhouse fleet-doctor        # every check must pass before host 2
 roundhouse fleet-run --fast    # the first convergence
@@ -607,7 +702,26 @@ two harnesses independently and refresh each available, applicable runtime.
 For Claude, compare the marketplace entry's resolved source SHA with the
 installed plugin's `gitCommitSha` as well as its version: the same version with
 new bytes is stale and must reinstall, while matching version and SHA is a
-no-op.
+no-op. A catalog entry that states no version is compared by SHA alone. A
+relative-source entry (`"source": "./plugin"`, as impeccable, last30days and
+most of `claude-plugins-official` publish) has no SHA of its own: its identity
+is the marketplace checkout's commit (git `HEAD`, or the `.gcs-sha` marker of
+an archive download), and an installed copy whose bytes are identical to the
+checkout's keeps its recorded SHA, so a marketplace commit that did not touch
+the plugin does not demand an update.
+
+The scheduled run applies the same comparison. When it cannot prove an
+installed plugin's identity — no catalog entry, or an entry with no SHA — it
+first repairs the marketplace, once per marketplace per pass, and asks again;
+only then does the plugin hold, as
+`installed marketplace identity unavailable (REASON)`. An unregistered
+marketplace is registered from its `extraKnownMarketplaces` declaration. A
+registered one is refreshed (`claude plugin marketplace update`) from its own
+registered source and is never re-added: every `claude plugin marketplace add`
+declares the marketplace in some settings scope (`--scope user|project|local`,
+and no flag only registers), so a re-add would write a declaration this host
+never made. A registered source that differs from the declared one is a
+same-name repoint and holds without a refresh.
 For local execution set `TARGET_CLI="$CLI"` and verify the loaded executor. For
 SSH, use the configured alias and target login shell (`$SHELL -lc`), resolve the
 target's installed Roundhouse version from its active Codex plugin

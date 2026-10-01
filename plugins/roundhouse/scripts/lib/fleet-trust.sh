@@ -1190,29 +1190,3 @@ fleet_trust_prune_expired() {
              (((.value.valid_before | tostring)) > strenv(FLEET_TRUST_NOW)))))
   ' "$1"
 }
-
-fleet_trust_age_evidence() {
-  # fleet_trust_age_evidence <store> <retention-days> — §7.11.3's second policy,
-  # DELIBERATELY DECOUPLED from trust checkpointing. They have different natural
-  # periods (a canary window is hours, a trust checkpoint is months) and coupling
-  # them would mean keeping evidence far too long or re-rooting far too often.
-  # Because evidence paths are never inputs to verification, aging them out is a
-  # pure `rm` with no trust reasoning attached.
-  fleet_trust_cutoff=$(fleet_doctor_days_ago "$2")
-  for fleet_trust_edir in journal alerts findings; do
-    [ -d "$1/$fleet_trust_edir" ] || continue
-    # A here-doc rather than `find | while`: the pipeline form runs the body in
-    # a subshell, so nothing it decides can leave the loop. Nothing escapes
-    # today, but the next counter someone adds here would read zero forever.
-    while IFS= read -r fleet_trust_ef; do
-      [ -n "$fleet_trust_ef" ] || continue
-      fleet_trust_estamp=$(yq -r '(.at // .[0].at // "") | sub("[Tt].*$"; "")' \
-        "$fleet_trust_ef" 2>/dev/null || true)
-      [ -n "$fleet_trust_estamp" ] || continue
-      [ "$fleet_trust_estamp" \< "${fleet_trust_cutoff%%T*}" ] || continue
-      rm -f "$fleet_trust_ef"
-    done <<EOF
-$(find "$1/$fleet_trust_edir" -type f -name '*.yaml' 2>/dev/null)
-EOF
-  done
-}

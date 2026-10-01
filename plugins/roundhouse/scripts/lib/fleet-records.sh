@@ -87,6 +87,10 @@ fleet_record_stamp() {
   date -u +%Y%m%dT%H%M
 }
 
+# The STAMPED file name (`<YYYYMMDDTHHMM>-<slug>.yaml`) — every finding, and
+# every alert an older build wrote — defined once for compaction and aging.
+fleet_record_stamped_regex='^[0-9]{8}T[0-9]{4}-'
+
 # --- §10.4 the redaction floor ------------------------------------------------
 
 fleet_replicated_cap=400
@@ -154,7 +158,11 @@ fleet_journal_entry_ok() {
         all(.sides[]; (.change | type == "string") and (.host | type == "string")) and
         (.resolution | type == "string")
       elif ($o == "applied" or $o == "satisfied" or $o == "held" or
-            $o == "reverted") then
+            $o == "reverted" or $o == "disowned") then
+        # `disowned` is an OWNERSHIP record, not a value one: this host
+        # stopped managing the item (fleet-disown) and left it installed. It
+        # is not `reverted` — nothing was withdrawn, so it neither withdraws
+        # canary evidence nor reads as half of a revert signature.
         # `applied` claims only "the run refused nothing" — a weaker claim
         # than a health probe, and the design does not pretend otherwise.
         # `satisfied` is the no-op-BECAUSE-CORRECT record: the item resolved,
@@ -200,6 +208,217 @@ fleet_journal_entries() {
     yq -o=json -I=0 '(. // []) | .[]' "$journal_file" 2>/dev/null || journal_rc=1
   done
   return "$journal_rc"
+}
+
+# How far back fleet-doctor counts `--now` canary bypasses, in days; aging
+# keeps every `override` record inside it. One value for both, so the reader's
+# window and the records it needs cannot drift apart.
+fleet_journal_override_window_days=30
+
+fleet_journal_load_bearing_filter='
+  # The journal records something still READS, as `"<file>\t<index>"` keys:
+  # aging may delete any other record past retention, and these never. One
+  # definition, so a new reader of the journal adds its rows HERE. Input: an
+  # array of {file, i, r}, every record of ONE host; $recent: the cut for
+  # readers with a window of their own.
+  #
+  #   evidence      the OLDEST and the NEWEST `applied` and `satisfied` per
+  #                 (item, digest): the canary gate takes its wait from the
+  #                 oldest and §8.2b rule 5 its time from the newest, and the
+  #                 revert signature (§10.8) needs "this digest was applied"
+  #   withdrawals   every `held` or `reverted` NEWER than its item'"'"'s oldest
+  #                 evidence: canary condition 2 ("nothing later withdrew it")
+  #                 and the revert signature'"'"'s "current" value read them
+  #   liveness      the newest `alive`, and the newest record of any kind:
+  #                 canary condition 3 asks for SOME record after the wait
+  #   overrides     `override` records newer than $recent: fleet-doctor counts
+  #                 the `--now` canary bypasses of the last
+  #                 fleet_journal_override_window_days
+  def journal_load_bearing($recent):
+    map(select(.r | type == "object")) as $recs |
+    def at: (.r.at // "") | tostring;
+    ([$recs[] | select((.r.outcome == "applied" or .r.outcome == "satisfied") and
+        (.r.item | type) == "string")] |
+      group_by([.r.item, ((.r.digest // "") | tostring), .r.outcome]) |
+      map((min_by(at)), (max_by(at)))) as $evidence |
+    ($evidence | group_by(.r.item) |
+      map({key: .[0].r.item, value: (map(at) | min)}) | from_entries) as $since |
+    [$recs[] | select((.r.outcome == "held" or .r.outcome == "reverted") and
+      (.r.item | type) == "string" and $since[.r.item] != null and
+      at > $since[.r.item])] as $withdrawals |
+    ([$recs[] | select(.r.outcome == "alive")] |
+      if length == 0 then [] else [max_by(at)] end) as $alive |
+    (if ($recs | length) == 0 then [] else [$recs | max_by(at)] end) as $newest |
+    [$recs[] | select(.r.override != null and at >= $recent)] as $overrides |
+    [($evidence + $withdrawals + $alive + $newest + $overrides)[] |
+      "\(.file)\t\(.i)"] | unique;
+'
+
+fleet_records_read_dir() {
+  # `fleet_records_read_dir DIR OUT` — every `*.yaml` directly in DIR as JSON
+  # lines `{"file": PATH, "rec": DOCUMENT}` in OUT, and `{"file", "bad": true}`
+  # for a file that does not parse. Built for tens of thousands of files: one
+  # `find`, `yq` over xargs-sized batches, and a batch holding an unreadable
+  # file re-read file by file, so one bad file costs one batch. Exit 0 with an
+  # empty OUT when there is nothing to read.
+  : >"$2" || return 1
+  [ -d "$1" ] || return 0
+  records_read_list=$(mktemp "${TMPDIR:-/tmp}/roundhouse-records.XXXXXX") || return 1
+  find "$1" -mindepth 1 -maxdepth 1 -type f -name '*.yaml' -print0 \
+    >"$records_read_list" || { rm -f "$records_read_list"; return 1; }
+  # An empty list must not reach xargs: with no arguments it still runs the
+  # command once, and a `yq` with no file reads stdin.
+  if [ -s "$records_read_list" ]; then
+    # shellcheck disable=SC2016 # the inner script is bash -c's, expanded there
+    # A batch's output is BUFFERED and emitted only when its yq succeeds: yq
+    # prints every record before the bad one first, so streaming it and then
+    # re-reading the batch file by file would emit those records twice.
+    xargs -0 -n 256 bash -c '
+      if records_out=$(yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$@" 2>/dev/null); then
+        [ -z "$records_out" ] || printf "%s\n" "$records_out"
+        exit 0
+      fi
+      for records_file do
+        if records_out=$(yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$records_file" 2>/dev/null); then
+          [ -z "$records_out" ] || printf "%s\n" "$records_out"
+        else
+          jq -cn --arg f "$records_file" "{file: \$f, bad: true}"
+        fi
+      done' records <"$records_read_list" >"$2" || {
+      rm -f "$records_read_list"
+      return 1
+    }
+  fi
+  rm -f "$records_read_list"
+}
+
+fleet_records_retention_days() {
+  # fleet_records_retention_days FOLD -> the evidence retention window in days,
+  # from `policy.evidence_retention_days` (V2's policy block).
+  # THE WINDOW HAS A FLOOR: it is read from store content, it is not an item
+  # (no digest, no verdict, no canary gate, outside fleet_removal_cap), and
+  # its consequence is deleting evidence on every host — so a value under 7
+  # reads as 7 (`evidence_retention_days: 0` would otherwise wipe the fleet's
+  # replicated evidence from one unreviewable scalar). A non-numeric value
+  # falls back to the default rather than to the floor: a typo should keep
+  # more evidence, not less.
+  printf '%s\n' "$1" | jq -r '
+    (.policy.evidence_retention_days // 90) as $d |
+    if ($d | type) == "number" then ([$d, 7] | max | floor) else 90 end'
+}
+
+fleet_records_age() {
+  # fleet_records_age STORE HOST RETENTION-DAYS [--dry-run] — §7.11.3's
+  # second policy, DELIBERATELY DECOUPLED from trust checkpointing. They have
+  # different natural periods (a canary window is hours, a trust checkpoint is
+  # months) and coupling them would mean keeping evidence far too long or
+  # re-rooting far too often. Evidence paths are never inputs to verification,
+  # so aging them carries no trust reasoning — but some RECORDS are inputs to
+  # other gates, and those are never aged (fleet_journal_load_bearing_filter).
+  #
+  # HOST's OWN evidence only (journal/<h>/, alerts/<h>/, findings/<h>/): those
+  # paths are §7.3 single-writer, and a host that trimmed a peer's would author
+  # a commit its peers refuse. The changes land in the working copy, so they
+  # publish through the ordinary run (or `fleet-age-evidence`).
+  #
+  #   journal   aged per RECORD by its own `at`; a day file is rewritten with
+  #             what remains, or removed when nothing does
+  #   alerts    a keyed CONDITION alert never ages (fleet_alert_lifecycle);
+  #             event alerts, unknown kinds and legacy stamped files age by `at`
+  #   findings  each file by its `at`
+  #
+  # Batched throughout: one read per directory (fleet_records_read_dir), one
+  # jq plan, one `rm` batch, and a `yq` only per day file that is rewritten.
+  # Prints one summary line; `--dry-run` prints it and changes nothing.
+  age_store=$1
+  age_host=$2
+  age_dry=false
+  [ "${4:-}" != --dry-run ] || age_dry=true
+  age_cutoff=$(fleet_doctor_days_ago "$3")
+  age_recent=$(fleet_doctor_days_ago "$fleet_journal_override_window_days")
+  age_work=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-age.XXXXXX") || return 1
+  age_rc=0
+  {
+    fleet_records_read_dir "$age_store/journal/$age_host" "$age_work/journal" &&
+      jq -s -r --arg cutoff "$age_cutoff" --arg recent "$age_recent" \
+        "$fleet_journal_load_bearing_filter"'
+        # ANY unreadable day file stops journal aging outright: what is
+        # load-bearing is decided over the WHOLE history, and a withdrawal
+        # in a readable file is only safe to drop when the record it
+        # withdraws is visible too.
+        ([ .[] | select(.bad == true or (.rec | type) != "array") ] | length) as $bad |
+        if $bad > 0 then "X\tjournal\t\($bad)" else (
+        [ .[] | select(.bad != true and (.rec | type) == "array") ] as $files |
+        [ $files[] as $f | $f.rec | to_entries[] | {file: $f.file, i: .key, r: .value} ]
+          as $all |
+        ($all | journal_load_bearing($recent) |
+          map({key: ., value: true}) | from_entries) as $keep |
+        def aged: ((.r.at // "") | type) == "string" and (.r.at // "") != "" and
+          .r.at < $cutoff and ($keep["\(.file)\t\(.i)"] | not);
+        ($all | map(select(aged)) | length) as $gone |
+        ($all | group_by(.file) | map(. as $mine |
+          ($mine | map(select(aged | not)) | sort_by(.i) | map(.r)) as $left |
+          if ($left | length) == ($mine | length) then empty
+          elif ($left | length) == 0 then "D\t\($mine[0].file)"
+          else "W\t\($mine[0].file)\t\($left | tojson)" end) | .[]),
+        "N\tjournal\t\($gone)\t\($all | length)") end' "$age_work/journal" \
+        >"$age_work/plan" &&
+      fleet_records_read_dir "$age_store/alerts/$age_host" "$age_work/alerts" &&
+      jq -s -r --arg cutoff "$age_cutoff" --arg stamped "$fleet_record_stamped_regex" \
+        --arg conditions "$(fleet_alert_condition_kinds)" '
+        ($conditions | split("\n") | map(select(. != "")) |
+          map({key: ., value: true}) | from_entries) as $condition |
+        [ .[] | select(.bad != true and (.rec | type) == "object") |
+          ((.file | split("/") | last) | test($stamped)) as $legacy |
+          select($legacy or ($condition[(.rec.kind // "") | tostring] | not)) |
+          select(((.rec.at // "") | type) == "string" and (.rec.at // "") != "" and
+            .rec.at < $cutoff) | "D\t\(.file)" ] as $d |
+        ($d[]), "N\talerts\t\($d | length)\t\(length)"' "$age_work/alerts" \
+        >>"$age_work/plan" &&
+      fleet_records_read_dir "$age_store/findings/$age_host" "$age_work/findings" &&
+      jq -s -r --arg cutoff "$age_cutoff" '
+        [ .[] | select(.bad != true and (.rec | type) == "object") |
+          select(((.rec.at // "") | type) == "string" and (.rec.at // "") != "" and
+            .rec.at < $cutoff) | "D\t\(.file)" ] as $d |
+        ($d[]), "N\tfindings\t\($d | length)\t\(length)"' "$age_work/findings" \
+        >>"$age_work/plan"
+  } || age_rc=1
+  if [ "$age_rc" -ne 0 ]; then
+    rm -rf "$age_work"
+    printf 'roundhouse: evidence aging could not read its records; nothing aged\n' >&2
+    return 1
+  fi
+  if age_bad=$(awk -F'\t' '$1 == "X" { print $3; found = 1 } END { exit !found }' \
+    "$age_work/plan"); then
+    rm -rf "$age_work"
+    printf 'roundhouse: evidence aging found %s unreadable day file(s) in journal/%s; nothing aged until they are repaired\n' \
+      "$age_bad" "$age_host" >&2
+    return 1
+  fi
+  age_summary=$(awk -F'\t' '
+    $1 == "N" { n[$2] = $3; t[$2] = $4 }
+    $1 == "D" && $2 ~ /\/journal\// { jd++ }
+    $1 == "W" { jw++ }
+    END {
+      printf "journal/%s: %d of %d records past retention (%d day files removed, %d rewritten); ",
+        host, n["journal"], t["journal"], jd, jw
+      printf "alerts/%s: %d of %d removed; findings/%s: %d of %d removed",
+        host, n["alerts"], t["alerts"], host, n["findings"], t["findings"]
+    }' host="$age_host" "$age_work/plan")
+  if [ "$age_dry" = true ]; then
+    printf 'roundhouse: evidence aging (dry run, nothing changed): %s\n' "$age_summary"
+    rm -rf "$age_work"
+    return 0
+  fi
+  while IFS='	' read -r age_op age_path age_left; do
+    [ "$age_op" = W ] || continue
+    fleet_record_write "$age_path" "$age_left" || age_rc=1
+  done <"$age_work/plan"
+  awk -F'\t' '$1 == "D" { print $2 }' "$age_work/plan" | tr '\n' '\0' |
+    xargs -0 rm -f || age_rc=1
+  rm -rf "$age_work"
+  printf 'roundhouse: evidence aging: %s\n' "$age_summary"
+  return "$age_rc"
 }
 
 # --- §10.3 applied/<host>.yaml, the ownership record --------------------------
@@ -275,7 +494,7 @@ fleet_removal_cap() {
   [ "$1" -le "$cap_effective" ] || return 75
 }
 
-# --- §5 alerts and §10.4 findings ---------------------------------------------
+# --- §10.4 findings (the alerts are lib/fleet-alerts.sh) ----------------------
 
 fleet_prose_shorten_commit_ids() {
   prose_text=$1
@@ -307,25 +526,6 @@ fleet_prose_shorten_commit_ids() {
       }')
   done
   printf '%s\n' "$prose_text"
-}
-
-fleet_alert_write() {
-  # `fleet_alert_write STORE HOST KIND SLUG DETAIL [ITEM...]`. Resolution is
-  # `rm` on the file. There is no state machine.
-  alert_store=$1
-  alert_host=$2
-  alert_kind=$3
-  alert_slug=$4
-  alert_detail=$5
-  shift 5
-  alert_detail=$(fleet_prose_shorten_commit_ids "$alert_detail" "$alert_store")
-  fleet_replicated_text_ok "$alert_detail" || return 1
-  fleet_record_write \
-    "$alert_store/alerts/$alert_host/$(fleet_record_stamp)-$alert_slug.yaml" \
-    "$(jq -cn --arg kind "$alert_kind" --arg host "$alert_host" \
-      --arg detail "$alert_detail" --arg at "$(fleet_now)" --args \
-      '{kind: $kind, host: $host, items: $ARGS.positional, detail: $detail, at: $at}' \
-      "$@")"
 }
 
 fleet_finding_write() {

@@ -532,7 +532,7 @@ nrt_reset
   nrt_run_full() {
     (
       fleet_trust_prune_expired() { :; }
-      fleet_trust_age_evidence() { :; }
+      fleet_records_age() { :; }
       fleet_enroll_process_joins() { :; }
       fleet_seed_command() { :; }
       fleet_run_proposals() { :; }
@@ -586,8 +586,17 @@ nrt_reset
     grep -Fq 'npm outdated --global --json node=v26.0.0' "$nrt_log" &&
     ! grep -Fq 'npm globals skipped this pass' "$nrt_root/full-out" ||
     fail "an ordinary runtime hold skipped the npm pass"
-  ls "$nrt_root/store/alerts/nrt-host/"*runtime-hold-runtimes-node* >/dev/null 2>&1 ||
+  [ -f "$nrt_root/store/alerts/nrt-host/runtime-hold--runtimes.node.yaml" ] ||
     fail "a held runtimes.node raised no alert"
+  # A condition alert: the end-of-pass sweep clears it once a pass checks the
+  # runtime and converges it.
+  nrt_reset
+  : >"$nrt_root/full-tmp/alert-ledger"
+  nrt_run_full "$nrt_mixed_fold"
+  [ "$(nrt_default)" = v26.10.0 ] || fail "the clean fixture did not converge runtimes.node"
+  fleet_alert_sweep "$nrt_root/store" nrt-host "$nrt_root/full-tmp/alert-ledger"
+  [ ! -e "$nrt_root/store/alerts/nrt-host/runtime-hold--runtimes.node.yaml" ] ||
+    fail "a converged runtimes.node kept its runtime-hold alert"
   # A carry that fails never touches the live default: it fails while the
   # target is staged, so nothing flips and nothing needs restoring.
   nrt_reset
@@ -612,7 +621,7 @@ nrt_reset
     fail "an npm operation ran under an unverified default"
   grep -Fq 'brew upgrade brewonly' "$nrt_log" ||
     fail "an unverified Node default stopped the non-npm package pass"
-  ls "$nrt_root/store/alerts/nrt-host/"*node-runtime-unverified* >/dev/null 2>&1 ||
+  [ -f "$nrt_root/store/alerts/nrt-host/node-runtime-unverified--runtimes.node.yaml" ] ||
     fail "an unverified Node default raised no alert"
   # The next run still cannot restore: the record stays, npm stays off.
   : >"$nrt_log"
@@ -809,7 +818,7 @@ nrt_reset
   fleet_run_apply_held "$nrt_root/store" nrt-host "$nrt_defs" packages.plain packages d0 73 \
     "$nrt_root/full-tmp" 2026-10-01T00:00:00Z >"$nrt_root/deferred-out"
   grep -Fq '  held    packages.plain (deferred: a Node runtime switch is in flight' "$nrt_root/deferred-out" &&
-    ls "$nrt_root/store/alerts/nrt-host/"*package-deferred-packages-plain* >/dev/null 2>&1 &&
+    [ -f "$nrt_root/store/alerts/nrt-host/package-deferred--packages.plain.yaml" ] &&
     ! ls "$nrt_root/store/alerts/nrt-host/"*package-hold* >/dev/null 2>&1 ||
     fail "an npm install deferred by a Node switch was reported as an unprovidable package"
   : >"$nrt_root/full-tmp/sigholds"
