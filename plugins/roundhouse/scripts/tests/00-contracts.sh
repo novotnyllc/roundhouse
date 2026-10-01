@@ -292,7 +292,9 @@ assert_contains "$fleet_update_text" 'roundhouse fleet-run --fast'
 assert_contains "$fleet_update_text" 'roundhouse fleet-run --full'
 # All three platforms, because a scheduler section that only says "launchd"
 # leaves two thirds of this fleet with nothing scheduled.
-assert_contains "$fleet_update_text" 'com.novotnyllc.roundhouse.fleet.plist'
+assert_contains "$fleet_update_text" 'com.novotnyllc.roundhouse.fleet-fast.plist'
+assert_contains "$fleet_update_text" 'com.novotnyllc.roundhouse.fleet-full.plist'
+assert_contains "$fleet_update_text" 'roundhouse fleet-schedule install'
 assert_contains "$fleet_update_text" 'systemd **user** timer pair'
 assert_contains "$fleet_update_text" 'per-user** scheduled task'
 case $fleet_update_text in

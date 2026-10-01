@@ -81,7 +81,8 @@ marked `unmanaged` are not compared, not reported, and not read.
 
 ### The two cadences
 
-One scheduled entry per host runs both (see `roundhouse:fleet-update`):
+Two scheduled jobs per host run them, installed by
+`roundhouse fleet-schedule install` (see `roundhouse:fleet-update`):
 
 | | Command | Default | Does |
 | --- | --- | --- | --- |
@@ -117,7 +118,16 @@ passes), so a trigger that lands mid-pass is never lost.
 
 ```text
 roundhouse fleet-trigger [--fast|--full]   # stamp, kick the scheduled job, return
+roundhouse fleet-schedule install          # write and load this host's two jobs (idempotent)
+roundhouse fleet-schedule status           # installed / enabled / loaded, and whether the definition matches
+roundhouse fleet-schedule uninstall        # unload and remove them
 ```
+
+`fleet-schedule install` is the only path that enables a job. A pass checks its
+own jobs every time and never re-enables, loads or rewrites one: a job the
+operator disabled raises a `schedule-disabled` alert, and a job that went
+missing on a host that is scheduled raises `schedule-missing`, each once per
+state change.
 
 **Heartbeats.** Every pass records a host-local heartbeat
 (`store.run/alive`). The `outcome: alive` journal record is *published* at most

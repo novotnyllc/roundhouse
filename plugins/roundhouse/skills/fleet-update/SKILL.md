@@ -151,7 +151,8 @@ Cleanup and autoremove are separate explicit actions.
 
 Auto-updating on a schedule uses the OS scheduler calling the CLI — no new
 daemon, database, or engine. **There is exactly one owned scheduler
-entry per host**, and it runs `roundhouse fleet-run`. Two local runners racing one
+entry per host** — one job pair, fast and full, owned by
+`roundhouse fleet-schedule` — and it runs `roundhouse fleet-run`. Two local runners racing one
 plugin cache is the failure this prevents, so a second entry is never
 added: the desired-state run **absorbs** the older autoupdate entry rather
 than being given one of its own. Marketplace refresh and package updates are
@@ -289,25 +290,46 @@ Both intervals are jittered from the host **name**, so the fleet does not
 re-synchronise on the same minute; the interval keys live in the store's
 policy block, not on the machine being governed.
 
-The calling workflow installs the entry on request. **Absorb, never duplicate**:
-if `com.novotnyllc.roundhouse.autoupdate` (or its systemd/Task Scheduler
-equivalent) exists, unload and remove it in the same step that installs the
-fleet entry. A host carrying both is the exact double-runner this rule exists
-to prevent.
+The calling workflow installs the entry on request, on the host itself, after
+`roundhouse launcher-install` (the jobs run that `~/.local/bin/roundhouse`
+shim):
+
+```bash
+roundhouse fleet-schedule install     # write and load both jobs; idempotent
+roundhouse fleet-schedule status      # installed / enabled / loaded, definition matches or differs
+roundhouse fleet-schedule uninstall   # unload and remove both
+```
+
+`install` matches a job that already exists: an identical definition is left
+alone (not rewritten, not reloaded); a differing one is reported with its diff,
+then replaced and reloaded. **Absorb, never duplicate**: if
+`com.novotnyllc.roundhouse.autoupdate` or the older one-plist
+`com.novotnyllc.roundhouse.fleet` (or a systemd/Task Scheduler equivalent)
+exists, unload and remove it in the same step that installs the
+fleet entry; `install` does this for both macOS labels. A host carrying both
+is the exact double-runner this rule exists to prevent. `install` is also the only thing that enables a job: a scheduled pass
+never re-enables one an operator disabled, it raises a `schedule-disabled`
+alert (and `schedule-missing` for a job that disappeared) instead.
 
 The shape per platform, all three running the same two commands:
 
-- **macOS** — one per-user launchd agent,
-  `~/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist`, with two
-  `StartCalendarInterval`/`StartInterval` slots (or two agents only if the
-  scheduler cannot express both in one).
-- **Linux** — a systemd **user** timer pair,
-  `roundhouse-fleet-fast.timer` and `roundhouse-fleet-full.timer`, with
+- **macOS** — two per-user launchd agents (launchd cannot run two commands
+  from one), `~/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet-fast.plist`
+  (`StartInterval` 1260) and `com.novotnyllc.roundhouse.fleet-full.plist`
+  (`StartInterval` 45540), each running
+  `/bin/zsh -lc 'exec "$HOME/.local/bin/roundhouse" fleet-run --fast|--full'`
+  and logging to `~/Library/Logs/roundhouse-fleet-fast.log` /
+  `roundhouse-fleet-full.log`. Over SSH with nobody logged in at the console
+  there is no GUI domain to load into; the agents load at the next login.
+- **Linux** — a systemd **user** timer pair, each timer with its oneshot
+  service, `roundhouse-fleet-fast.timer` and `roundhouse-fleet-full.timer`, with
   `Persistent=true` so a laptop that was asleep catches up once rather than
-  storming.
+  storming. A headless host needs `loginctl enable-linger` for its user
+  manager to run without a session; WSL needs systemd enabled.
 - **Windows** — a **per-user** scheduled task. Where the machine has a
   configured WSL sibling, register it there and drive the native side through
   the interop lane rather than registering a second native entry.
+  `fleet-schedule` does not manage native Windows.
 
 ```bash
 roundhouse fleet-run --fast    # the fast slot

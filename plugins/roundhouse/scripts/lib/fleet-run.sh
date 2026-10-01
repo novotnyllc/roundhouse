@@ -1778,6 +1778,11 @@ fleet_run_pass() (
   # own fetch lands in a private ref and does not move main@origin.)
   run_pre_origin=$(fleet_vcs_head_origin "$run_store")
 
+  # §6.1: this host's own scheduled jobs. A disabled or missing job is ALERTED,
+  # never re-enabled — only `fleet-schedule install`, run by a human, enables.
+  # Before the floor, so the alert it writes is published by this very pass.
+  fleet_schedule_check "$run_store" "$run_host" || :
+
   # §6.1(a)/§6.4. One incremental fetch, a tree-id compare, exit — no fold, no
   # reconcile, no commit, no push. The convergence pass runs only when desired
   # state moved or a local condition says there is work.

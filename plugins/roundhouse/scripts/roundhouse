@@ -59,6 +59,7 @@ Usage:
   roundhouse fleet-explain [HOST] ITEM
   roundhouse fleet-run [--fast|--full]
   roundhouse fleet-trigger [--fast|--full]
+  roundhouse fleet-schedule install|status|uninstall
   roundhouse fleet-seed
   roundhouse fleet-review ITEM pass|hold REASON
   roundhouse fleet-apply ITEM
@@ -226,6 +227,7 @@ case $command in
   fleet-explain) [ $# -ge 1 ] && [ $# -le 2 ] || usage; fleet_explain_command "$@" ;;
   fleet-run) [ $# -le 1 ] || usage; fleet_run_command "$@" ;;
   fleet-trigger) [ $# -le 1 ] || usage; fleet_trigger_command "$@" ;;
+  fleet-schedule) [ $# -eq 1 ] || usage; fleet_schedule_command "$1" ;;
   fleet-seed) [ $# -eq 0 ] || usage; fleet_seed_command ;;
   fleet-review) [ $# -eq 3 ] || usage; fleet_review_command "$1" "$2" "$3" ;;
   fleet-apply) [ $# -eq 1 ] || usage; fleet_apply_command "$1" ;;
