@@ -305,6 +305,22 @@ YAML
     [ "$(find "$rec_store/alerts/vireo" -mindepth 1 -type d | grep -c . || true)" -eq 0 ] ||
       fail "an alert key escaped into a subdirectory"
 
+    # Evidence aging leaves a KEYED alert alone: its `at` is first-seen and
+    # never bumped, so aging by it would delete a still-open condition. The
+    # legacy stamped form still ages.
+    rec_aging="$tmp/records/aging"
+    rm -rf "$rec_aging"
+    mkdir -p "$rec_aging/alerts/vireo"
+    printf 'kind: removal-cap\nat: "2001-01-01T00:00:00Z"\n' \
+      >"$rec_aging/alerts/vireo/removal-cap.yaml"
+    printf 'kind: removal-cap\nat: "2001-01-01T00:00:00Z"\n' \
+      >"$rec_aging/alerts/vireo/20010101T0000-removal-cap.yaml"
+    fleet_trust_age_evidence "$rec_aging" 90
+    [ -f "$rec_aging/alerts/vireo/removal-cap.yaml" ] ||
+      fail "evidence aging deleted a keyed (open) alert by its first-seen time"
+    [ ! -f "$rec_aging/alerts/vireo/20010101T0000-removal-cap.yaml" ] ||
+      fail "evidence aging stopped aging stamped alerts"
+
     # --- §6.4 the one-time compaction of the stamped form ---
     rec_compact="$tmp/records/compact"
     rm -rf "$rec_compact"

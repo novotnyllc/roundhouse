@@ -1198,6 +1198,12 @@ fleet_trust_age_evidence() {
   # them would mean keeping evidence far too long or re-rooting far too often.
   # Because evidence paths are never inputs to verification, aging them out is a
   # pure `rm` with no trust reasoning attached.
+  #
+  # A KEYED alert (alerts/<h>/<kind>--<key>.yaml) is exempt. It is an open
+  # condition, not an event: its `at` is when it was FIRST seen and is never
+  # bumped, so aging by it would delete a still-open alert at 90 days. It is
+  # resolved the documented way, `rm` on the file. Only the legacy stamped
+  # form (`<YYYYMMDDTHHMM>-<slug>.yaml`) ages.
   fleet_trust_cutoff=$(fleet_doctor_days_ago "$2")
   for fleet_trust_edir in journal alerts findings; do
     [ -d "$1/$fleet_trust_edir" ] || continue
@@ -1206,6 +1212,12 @@ fleet_trust_age_evidence() {
     # today, but the next counter someone adds here would read zero forever.
     while IFS= read -r fleet_trust_ef; do
       [ -n "$fleet_trust_ef" ] || continue
+      if [ "$fleet_trust_edir" = alerts ]; then
+        case ${fleet_trust_ef##*/} in
+          [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9]-*) ;;
+          *) continue ;;
+        esac
+      fi
       fleet_trust_estamp=$(yq -r '(.at // .[0].at // "") | sub("[Tt].*$"; "")' \
         "$fleet_trust_ef" 2>/dev/null || true)
       [ -n "$fleet_trust_estamp" ] || continue
