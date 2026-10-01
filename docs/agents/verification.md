@@ -60,7 +60,8 @@ plugin changes.
    bounded worker pool: each section is its own child run with its own
    fixture root, `HOME`, `TMPDIR` and log, printed in section order with its
    time; a failing section's whole log is printed and the run exits nonzero.
-   `ROUNDHOUSE_TEST_JOBS` sets the pool size (default: performance cores);
+   `ROUNDHOUSE_TEST_JOBS` sets the pool size (default: performance cores plus
+   half the efficiency cores on Apple silicon, otherwise the CPU count);
    `ROUNDHOUSE_TEST_JOBS=1` is the original single-process serial run, and so
    is any run that selects a single section. `ROUNDHOUSE_TEST_ONLY` selects
    section numbers; sections at or after 90 load 90's real-jj definitions as
@@ -72,7 +73,9 @@ plugin changes.
    (run alone after the pool drains, for timing assertions) or
    `# roundhouse-test: partition=SCOPE...` (run as those scopes, which must
    together hold every default assertion; section 68 uses this for its five
-   plan scopes). A new section also belongs in the driver's shellcheck lint
+   plan scopes) or `# roundhouse-test: parts=N` (run as N units, each with
+   `ROUNDHOUSE_TEST_PART=I/N`; the section guards its independent blocks with
+   `section_part I`, as 93 does). A new section also belongs in the driver's shellcheck lint
    anchor, so `shellcheck -x` analyses it; it runs whether listed or not.
    `ROUNDHOUSE_TEST_SHARD=I/K` runs CI's shard I of K locally, and
    `ROUNDHOUSE_TEST_LIST=true` prints the selected units and weights.

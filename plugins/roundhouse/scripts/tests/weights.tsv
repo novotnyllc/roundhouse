@@ -26,10 +26,14 @@
 77-npm	33
 78-fleet-parked	4
 79-node-runtime	131
+80-alerts	9
+83-apply-claude	15
+86-publish-verbs	9
 90-jj-bootstrap	15
 91-jj-integrity	50
 92-jj-reconcile	19
-93-jj-run	156
+93-jj-run#1	178
+93-jj-run#2	178
 94-jj-doctor	197
 95-jj-trustd	20
 96-u20-chezmoi-absent	24

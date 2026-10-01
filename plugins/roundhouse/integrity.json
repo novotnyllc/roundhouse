@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "5f487b98ccf4b4d6e67d30eb4e783fd2d39918ea2ac47ab0ef58630332ca636d"
+      "sha256": "2479022573501963dc10e268bbb008a4cf5151c58cc611d645e95dac8cdfc06a"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "36954c5ead0c1a21ca8ae86938cf3946f5ceabf21b179c9b19169dee5b4b9f53"
+      "sha256": "8cc0ea26e0d90425a3f18d9d873969b0ff6f95118a6cc492aa91bbfb89bdb124"
     },
     {
       "path": "assets/icon.png",
@@ -58,7 +58,7 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "242f5021d1b50b989060629e2b079770b8da22c3ad52aecc54531870414c4aee"
+      "sha256": "57aaf6583f6349bcdf766a7b49e9a63e74c20a6cf3c79a942dbc9c4a1f9932ba"
     },
     {
       "path": "scripts/collect-windows.ps1",
@@ -66,7 +66,7 @@
     },
     {
       "path": "scripts/enroll-privilege-posix",
-      "sha256": "032b09bc61618ee72a61ffbf95faf0fa4e21237000a3e9e27a1219c43a53af07"
+      "sha256": "9a9ca677ec4087b265c8fb5cb3a8528e9a05d76bc2672e851256756ec49b5f0e"
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
@@ -150,7 +150,7 @@
     },
     {
       "path": "scripts/lib/fleet-store.sh",
-      "sha256": "89dc588461bc88097af2259a42fd72c3d29ae3b81c5d5afd0699629eabcee466"
+      "sha256": "b74d8a9c2ab05cbbbadc12ef1af9add7bb13f6c2291ed3802503ab6ec24928de"
     },
     {
       "path": "scripts/lib/fleet-trust.sh",
@@ -162,7 +162,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "f5c28be1e4eb2071286de25f67168cb3f994ef95368dab339c007437d84ea10b"
+      "sha256": "f35a6c782a8f18746e427cb38dcf466c8daf3763925a3577136a035136f11f44"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -174,7 +174,7 @@
     },
     {
       "path": "scripts/lib/inventory.sh",
-      "sha256": "718a473bd3e3d40c66fdf34fb61419a67d3d969bee3ae7eace49b1e91deec5b8"
+      "sha256": "b196f20e4263646a495a04afd75c1fb0c799fc9ca2bfbea4d0017770047733de"
     },
     {
       "path": "scripts/lib/node-runtime.sh",
@@ -333,5 +333,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.31"
+  "version": "0.9.34"
 }

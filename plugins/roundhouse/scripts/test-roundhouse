@@ -62,6 +62,15 @@ section_requested() {
   case " $ROUNDHOUSE_TEST_ONLY " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
 
+# True when this run owns part $1 of a section split by a `parts=N` marker:
+# always, unless the runner started this child for one part
+# (ROUNDHOUSE_TEST_PART=I/N). A split section guards each independent block
+# with this; code outside every guard runs in each part.
+section_part() {
+  [ -n "${ROUNDHOUSE_TEST_PART:-}" ] || return 0
+  [ "${ROUNDHOUSE_TEST_PART%%/*}" = "$1" ]
+}
+
 # --- parallel runner -------------------------------------------------------
 # A whole-suite run is the publishing gate, and serially it took 20+ minutes.
 # Every section already stands alone over the 00/05/07 harness (CI has run
@@ -72,7 +81,7 @@ section_requested() {
 # Output is buffered per unit and printed in section order with timings; a
 # failing unit's whole log is printed; the final PASS line keeps its meaning.
 #
-#   ROUNDHOUSE_TEST_JOBS     worker count (default: performance cores). 1 keeps
+#   ROUNDHOUSE_TEST_JOBS     worker count (default: rh_default_jobs). 1 keeps
 #                            the original single-process serial run.
 #   ROUNDHOUSE_TEST_SCOPES   ROUNDHOUSE_TEST_SCOPE runs to add as units ("all"
 #                            = every scope CI runs).
@@ -91,7 +100,10 @@ section_requested() {
 #                                        the machine;
 #   # roundhouse-test: partition=S1 S2.. run as these scopes instead of as one
 #                                        unit; together they must cover every
-#                                        default assertion of the section.
+#                                        default assertion of the section;
+#   # roundhouse-test: parts=N           run as N units, part I with
+#                                        ROUNDHOUSE_TEST_PART=I/N; the section
+#                                        guards each block with section_part.
 # Unit weights (seconds, for longest-first scheduling and shard balance) live
 # in tests/weights.tsv; an unlisted unit is assumed heavy and starts early.
 rh_now_ms() {
@@ -108,7 +120,14 @@ rh_seconds() {
 }
 
 rh_default_jobs() {
+  # Apple silicon: every performance core plus half the efficiency cores. The
+  # units are fork/exec- and I/O-bound shell, so efficiency cores still carry
+  # real work, and measured wall time kept falling past the P-core count.
   rh_cores=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || true)
+  rh_ecores=$(sysctl -n hw.perflevel1.physicalcpu 2>/dev/null || true)
+  case $rh_cores in ''|*[!0-9]*) ;; *)
+    case $rh_ecores in ''|*[!0-9]*) ;; *) rh_cores=$((rh_cores + rh_ecores / 2)) ;; esac ;;
+  esac
   case $rh_cores in ''|*[!0-9]*|0)
     rh_cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || true) ;;
   esac
@@ -138,7 +157,16 @@ rh_units() {
     rh_serial=0
     if sed -n '1,20p' "$rh_file" | grep -qx '# roundhouse-test: serial'; then rh_serial=1; fi
     rh_partition=$(rh_marker "$rh_file" partition=)
-    if [ -n "$rh_partition" ]; then
+    rh_parts=$(rh_marker "$rh_file" parts=)
+    case $rh_parts in ''|*[!0-9]*) rh_parts=1 ;; esac
+    if [ "$rh_parts" -gt 1 ]; then
+      rh_part=1
+      while [ "$rh_part" -le "$rh_parts" ]; do
+        printf '%s#%s\tpart\t%s:%s/%s\t%s\n' "$rh_base" "$rh_part" "$rh_n" "$rh_part" \
+          "$rh_parts" "$rh_serial"
+        rh_part=$((rh_part + 1))
+      done
+    elif [ -n "$rh_partition" ]; then
       for rh_scope in $rh_partition; do
         printf 'scope:%s\tscope\t%s\t%s\n' "$rh_scope" "$rh_scope" "$rh_serial"
       done
@@ -298,12 +326,15 @@ rh_runner() {
     : >"$rh_root/$rh_u/log"
     (
       unset ROUNDHOUSE_TEST_ONLY ROUNDHOUSE_TEST_SCOPE ROUNDHOUSE_TEST_SCOPES \
-        ROUNDHOUSE_TEST_TIER ROUNDHOUSE_TEST_SHARD ROUNDHOUSE_TEST_LIST
-      if [ "${rh_kind[rh_u]}" = section ]; then
-        export ROUNDHOUSE_TEST_ONLY="${rh_value[rh_u]}"
-      else
-        export ROUNDHOUSE_TEST_SCOPE="${rh_value[rh_u]}"
-      fi
+        ROUNDHOUSE_TEST_TIER ROUNDHOUSE_TEST_SHARD ROUNDHOUSE_TEST_LIST ROUNDHOUSE_TEST_PART
+      case ${rh_kind[rh_u]} in
+        section) export ROUNDHOUSE_TEST_ONLY="${rh_value[rh_u]}" ;;
+        part)
+          export ROUNDHOUSE_TEST_ONLY="${rh_value[rh_u]%%:*}"
+          export ROUNDHOUSE_TEST_PART="${rh_value[rh_u]#*:}"
+          ;;
+        *) export ROUNDHOUSE_TEST_SCOPE="${rh_value[rh_u]}" ;;
+      esac
       rh_unit_rc=0
       ROUNDHOUSE_TEST_JOBS=1 TMPDIR="$rh_root/$rh_u/tmp" HOME="$rh_root/$rh_u/home" \
         "$script_dir/test-roundhouse" >>"$rh_root/$rh_u/log" 2>&1 </dev/null 7>&- ||

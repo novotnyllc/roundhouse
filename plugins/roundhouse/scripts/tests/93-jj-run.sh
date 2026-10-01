@@ -7,6 +7,9 @@
 # tests/90-jj-bootstrap.sh, whose key/roster/KRL fixture generator and real-jj
 # gate this section reuses; not a standalone test file.
 # shellcheck shell=bash
+#
+# Part 1 is the two-host story; part 2 the independent one-host scenarios.
+# roundhouse-test: parts=2
 
 runjj_root="$tmp/fleet-run-jj"
 mkdir -p "$runjj_root"
@@ -20,7 +23,7 @@ if [ "$real_jj_ok" != true ]; then
   printf '  §6 propagation, §8.2b resolution and §10.8 rollback are UNVERIFIED.\n'
   printf '========================================================================\n'
   printf '\n'
-else
+elif section_part 1; then
   printf 'real-jj: §6 propagation, §8.2b resolution, §10.8 rollback (jj %s)\n' \
     "$real_jj_version"
   (
@@ -815,7 +818,7 @@ p0jj_verb_refusals() {
   [ ! -d "$runjj_lock" ] || fail "the foreign-edit refusal left its lock behind"
 }
 
-if [ "$real_jj_ok" = true ]; then
+if [ "$real_jj_ok" = true ] && section_part 2; then
   p0jj_block tombstone p0jj_tombstone 'capped tombstone uninstall, then silent'
   p0jj_block takeover p0jj_takeover 'dead-holder lock takeover, alerted and published'
   p0jj_block compaction p0jj_compaction \

@@ -61,10 +61,14 @@ collect_command() {
     }
   fi
   observed=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  snapshot_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
   config_digest=$(sha256_file "$config")
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  # Second + pid alone repeat when one process collects twice within a second
+  # (launcher-install plans, then re-inventories, in-process), and apply then
+  # refuses the pair as not distinct. The private directory's unique suffix
+  # separates them.
+  snapshot_id=$(date -u +%Y%m%dT%H%M%SZ)-$$-${tmp##*.}
   records="$tmp/records.jsonl"
   jq -cn \
     --arg schema "$schema" --argjson schema_version "$schema_version" \
