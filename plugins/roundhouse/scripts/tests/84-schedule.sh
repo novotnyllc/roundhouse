@@ -288,11 +288,20 @@ STUB
     (
       # The pass itself is stubbed: what is under test is the loop around it.
       fleet_vcs_store_ready() { return 0; }
+      fleet_vcs_op_id() {
+        printf 'op\n' >>"$sched_root/op-calls"
+        printf 'op-fixture\n'
+      }
       fleet_host_name() { printf 'vireo\n'; }
       sched_calls="$sched_root/pass-calls"
       fleet_run_pass() (
         printf '%s %s\n' "$run_mode" "$run_tmp" >>"$sched_calls"
         [ -d "$run_tmp" ] || exit 70
+        # PER PASS: a fresh, empty alert ledger inside this pass's run_tmp,
+        # whatever the previous pass wrote to its own.
+        [ "$run_ledger" = "$run_tmp/alert-ledger" ] && [ -f "$run_ledger" ] &&
+          [ ! -s "$run_ledger" ] || exit 71
+        printf 'raised\tx\ty\n' >>"$run_ledger"
         sched_n=$(grep -c . "$sched_calls")
         # Triggers "arrive" during the first SCHED_TRIGGERS passes.
         [ "$sched_n" -gt "${SCHED_TRIGGERS:-0}" ] || fleet_trigger_stamp
@@ -311,6 +320,15 @@ STUB
       [ "$(cut -d' ' -f2 "$sched_calls" | LC_ALL=C sort -u | grep -c .)" -eq 4 ] ||
         fail "the in-process passes shared one scratch directory"
       [ ! -e "$(fleet_lock_path)" ] || fail "the looping run left its lock behind"
+      # PER RUN: one starting operation, the abort point for every pass.
+      : >"$sched_root/op-calls"
+      : >"$sched_calls"
+      SCHED_TRIGGERS=9
+      fleet_run_command --fast >/dev/null || fail "the four-pass run failed"
+      [ "$(grep -c . "$sched_root/op-calls")" -eq 1 ] ||
+        fail "a four-pass run captured $(grep -c . "$sched_root/op-calls") starting operations, not one"
+      [ "$(cat "$(fleet_run_state_dir)/starting-operation")" = op-fixture ] ||
+        fail "the run did not record its starting operation"
       # A trigger re-runs a FULL pass as a fast one: "go look", not "redo the
       # marketplace refresh and package updates".
       : >"$sched_calls"

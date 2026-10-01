@@ -1724,61 +1724,28 @@ fleet_run_command() (
   run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-fleet-run.XXXXXX")
   trap 'fleet_lock_release "$run_lock" "$run_lock_nonce" || :; rm -rf "$run_tmp"' \
     EXIT HUP INT TERM
-  # §6.1 stamp-and-kick. A trigger that lands while this process holds the
-  # lock starts a second run that finds the lock and exits, so the trigger
-  # rides the dirty stamp instead (lib/fleet-schedule.sh): while the stamp has
-  # moved since a pass began, the pass runs again HERE, under the same lock.
-  # Bounded — three extra passes — so a trigger storm cannot pin the lock;
-  # anything later waits for the next scheduled run. An extra pass is a FAST
-  # one, floor included: a trigger says "go look", and repeating a full
-  # pass's marketplace refresh and package updates is not looking.
-  #
-  # Each pass runs with errexit ON. `fleet_run_pass || …` would switch it off
-  # for the whole body — every unguarded failure in the pass would then fall
-  # through instead of ending it. The run's status is the WORST of its
-  # passes: a later clean pass does not launder an earlier hold.
-  run_extra=0
-  run_status=0
-  while :; do
-    run_stamp_seen=$(fleet_trigger_stamp_state)
-    mkdir -p "$run_tmp/pass-$run_extra"
-    # The pass's alert ledger: what each item-scoped condition check evaluated
-    # and raised, for the end-of-pass sweep (fleet_alert_sweep). PER PASS: a
-    # re-run pass that inherited the previous pass's `raised` lines would keep
-    # an alert its own check no longer raises.
-    : >"$run_tmp/pass-$run_extra/alert-ledger"
-    set +e
-    (
-      set -e
-      run_ledger="$run_tmp/pass-$run_extra/alert-ledger"
-      run_tmp="$run_tmp/pass-$run_extra"
-      fleet_run_pass
-    )
-    run_pass_status=$?
-    set -e
-    [ "$run_pass_status" -le "$run_status" ] || run_status=$run_pass_status
-    [ "$run_extra" -lt 3 ] || break
-    [ "$(fleet_trigger_stamp_state)" != "$run_stamp_seen" ] || break
-    run_extra=$((run_extra + 1))
-    run_mode=fast
-    printf 'roundhouse: a trigger arrived during the pass; converging again in-process (%s of 3)\n' \
-      "$run_extra"
-  done
-  exit "$run_status"
-)
-
-fleet_run_pass() (
-  # One observe/converge pass, under fleet_run_command's lock, with its
-  # run_mode, run_store, run_host and a fresh run_tmp. A subshell, so every
-  # `exit` below ends THIS pass and hands its status back to the loop above.
-  # §8.6: the abort button for a bad local apply, captured deliberately
-  # WITHOUT --ignore-working-copy (that flag suppresses the colocated
-  # auto-import, so restoring to the newest operation exports an empty view and
-  # deletes the bookmarks outright).
+  # §8.6: the abort button for a bad local apply, captured ONCE per run,
+  # before its first pass and deliberately WITHOUT --ignore-working-copy (that
+  # flag suppresses the colocated auto-import, so restoring to the newest
+  # operation exports an empty view and deletes the bookmarks outright). One
+  # run is one abort point however many in-process passes it makes: restoring
+  # it undoes them all, which is what an operator aborting "this run" means.
   run_op=$(fleet_vcs_op_id "$run_store")
   mkdir -p "$(fleet_run_state_dir)"
   printf '%s\n' "$run_op" >"$(fleet_run_state_dir)/starting-operation"
 
+  # §6.1: the pass, and its in-process re-runs while triggers land mid-pass.
+  fleet_trigger_converge fleet_run_pass
+)
+
+fleet_run_pass() (
+  # One observe/converge pass, under fleet_run_command's lock, run by
+  # fleet_trigger_converge. PER RUN, from the caller: run_mode (fast on a
+  # re-run), run_store, run_host, run_lock and its nonce, run_op. PER PASS: a
+  # fresh run_tmp and run_ledger (the alert ledger the end-of-pass sweep
+  # reads), the marketplace repair memo (reset below), and everything this
+  # body computes. A subshell, so every `exit` below ends THIS pass and hands
+  # its status back to the loop.
   # Captured BEFORE any fetch: what arrives is what §7.7 has to gate, and after
   # the fetch there is no other way to tell new from known. (The poll floor's
   # own fetch lands in a private ref and does not move main@origin.)

@@ -291,6 +291,55 @@ fleet_trigger_command() (
   fleet_trigger_kick "$trigger_mode"
 )
 
+# --- the running pass's re-loop -------------------------------------------------
+
+fleet_trigger_converge() {
+  # fleet_trigger_converge PASS-FUNCTION — run one pass, then again in-process
+  # while the dirty stamp moved since that pass began. Called by
+  # fleet_run_command under its lock, with its run_tmp and run_mode.
+  #
+  # A trigger that lands while a pass holds the lock starts a second run that
+  # finds the lock and exits, so the trigger rides the stamp instead. Bounded —
+  # three extra passes — so a trigger storm cannot pin the lock; anything later
+  # waits for the next scheduled run. An extra pass is a FAST one, floor
+  # included: a trigger says "go look", and repeating a full pass's
+  # marketplace refresh and package updates is not looking.
+  #
+  # Each pass gets its own run_tmp and its own alert ledger: a re-run pass that
+  # inherited the previous pass's `raised` lines would keep an alert its own
+  # check no longer raises. Each pass runs with errexit ON — `PASS || …` would
+  # switch it off for the whole body — and the return status is the WORST of
+  # the passes, so a later clean pass does not launder an earlier hold.
+  converge_root=$run_tmp
+  converge_extra=0
+  converge_status=0
+  converge_errexit=false
+  case $- in *e*) converge_errexit=true ;; esac
+  while :; do
+    converge_seen=$(fleet_trigger_stamp_state)
+    mkdir -p "$converge_root/pass-$converge_extra"
+    : >"$converge_root/pass-$converge_extra/alert-ledger"
+    set +e
+    (
+      set -e
+      run_tmp="$converge_root/pass-$converge_extra"
+      run_ledger="$run_tmp/alert-ledger"
+      "$1"
+    )
+    converge_pass_status=$?
+    [ "$converge_errexit" != true ] || set -e
+    [ "$converge_pass_status" -le "$converge_status" ] ||
+      converge_status=$converge_pass_status
+    [ "$converge_extra" -lt 3 ] || break
+    [ "$(fleet_trigger_stamp_state)" != "$converge_seen" ] || break
+    converge_extra=$((converge_extra + 1))
+    run_mode=fast
+    printf 'roundhouse: a trigger arrived during the pass; converging again in-process (%s of 3)\n' \
+      "$converge_extra"
+  done
+  return "$converge_status"
+}
+
 # --- the job definitions -------------------------------------------------------
 
 fleet_schedule_interval() {

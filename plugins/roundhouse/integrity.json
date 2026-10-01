@@ -150,11 +150,11 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "55066b65588bebe4804d1b792024dc06542164513b74d7fcd97c767aae3fb91a"
+      "sha256": "788fe0b462bc9ba6f94ca5373a51259ad93669933d2aff735326c474ad6cda0d"
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
-      "sha256": "06a1e4ba1e501ca285c452c136f31f1491f078cee71048133b007411e9d865fa"
+      "sha256": "6ca6aa5fc21c69df96aa14db2a145e97f6c74930c869cba767224a43a873da29"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
