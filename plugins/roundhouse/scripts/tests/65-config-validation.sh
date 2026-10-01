@@ -361,7 +361,7 @@ assert_contains "$json" '"origin":"ssh://github.com/owner/example.git"'
   fail "Codex saved-project readiness was not recorded"
 [ "$(jq -r 'select(.kind == "operation") | .data.task_id' "$tmp/enriched.jsonl")" = task-opaque-id ] ||
   fail "Codex task correlation was not recorded"
-sleep 1
+t_next_second
 "$cli" record-codex-readiness "$tmp/snapshot.jsonl" "$tmp/codex-readiness.json" "$tmp/enriched-2.jsonl"
 "$cli" compare "$tmp/enriched.jsonl" "$tmp/enriched-2.jsonl" >"$tmp/enriched-compare.json"
 [ "$(jq 'length' "$tmp/enriched-compare.json")" -eq 0 ] ||

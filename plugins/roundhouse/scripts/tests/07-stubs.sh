@@ -857,6 +857,17 @@ export SHELL="$tmp/bin/login-shell"
 export REAL_GIT="$real_git"
 export GIT_CLONE_FIXTURE="$tmp/clone-example.git"
 export GIT_PULL_MARKER="$tmp/git-pull-executed"
+# Host-wide scheduler state is not fixture state: keep the collector off the
+# real /Library launchd directories (and launchd queries about them) and off
+# the real user crontab, which no fake HOME can hide.
+export ROUNDHOUSE_TEST_STARTUP_SYSTEM_ROOT="$tmp/startup-system-root"
+cat >"$tmp/bin/crontab" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = -l ] || exit 64
+printf 'crontab: no crontab for fixture\n' >&2
+exit 1
+SH
+chmod +x "$tmp/bin/crontab"
 
 printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"
 approve_result=$(CODEX_HOOK_SCENARIO=approve \
@@ -1130,7 +1141,7 @@ if [ -z "${ROUNDHOUSE_TEST_SCOPE:-}" ] &&
   # A second capture a second later: identical inventory, different timestamps
   # and run IDs. 65 compares the pair to prove that difference is not reported
   # as drift, and 68 needs a recapture distinct from the planning snapshot.
-  sleep 1
+  t_next_second
   "$cli" collect --target test-host --section all --output "$tmp/snapshot-2.jsonl"
 
   # Codex readiness metadata: 65 enriches snapshots with it and probes the

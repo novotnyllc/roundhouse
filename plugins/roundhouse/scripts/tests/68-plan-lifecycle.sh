@@ -4,6 +4,10 @@
 # Sourced by scripts/test-roundhouse in a fixed order; not a
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
+#
+# The parallel runner runs this section as its five plan scopes, which
+# together hold every default assertion (see the scope guards at the end):
+# roundhouse-test: partition=plan-packages plan-agents plan-projects plan-chezmoi plan-auth
 
 # CI selects complete domain lifecycles. A manual section/default run keeps
 # their original order and shared state. Scope runs get a fresh 00/05/07 root;
@@ -16,7 +20,7 @@ plan_fixture_snapshot() {
 plan_fixture_recapture() {
   plan_fixture_snapshot
   if [ ! -f "$tmp/snapshot-2.jsonl" ]; then
-    sleep 1
+    t_next_second
     "$cli" collect --target test-host --section all --output "$tmp/snapshot-2.jsonl"
   fi
 }
@@ -890,7 +894,7 @@ rm -rf "$external_upstream_repo" "$external_path"
 
 plan_auth_contracts() {
 "$cli" collect --target test-host --section auth --output "$tmp/auth-plan-snapshot.jsonl"
-sleep 1
+t_next_second
 "$cli" collect --target test-host --section auth --output "$tmp/auth-current-snapshot.jsonl"
 cat >"$tmp/auth-plan-draft.json" <<'JSON'
 {
@@ -926,7 +930,7 @@ if find "$tmp/home" -name '.roundhouse-auth*' -print -quit | grep -q .; then
 fi
 
 "$cli" collect --target test-host --section auth --output "$tmp/auth-rollback-plan-snapshot.jsonl"
-sleep 1
+t_next_second
 "$cli" collect --target test-host --section auth --output "$tmp/auth-rollback-current-snapshot.jsonl"
 "$cli" seal-plan "$tmp/auth-plan-draft.json" "$tmp/auth-rollback-plan-snapshot.jsonl" "$tmp/auth-rollback-plan.json"
 auth_rollback_plan_id=$(jq -r '.plan_id' "$tmp/auth-rollback-plan.json")

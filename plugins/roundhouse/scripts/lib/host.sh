@@ -249,6 +249,65 @@ sha256_stream() {
   fi
 }
 
+# One lowercase digest per line, in argument order (sha256_file, batched).
+sha256_files() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@" | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$@" | awk '{print tolower($1)}'
+  else
+    openssl dgst -sha256 "$@" | awk '{print tolower($NF)}'
+  fi
+}
+
+# executor_files_fast_verify <manifest.tsv> <records.jsonl>
+# Succeeds only when EVERY listed file passes what check_private_owned_file and
+# the digest comparison in executor_status_command check one file at a time:
+# a regular non-symlink file, owned by the current user, not group/world
+# writable, hashing to its listed digest. Only then does it write the same
+# {path,sha256} records. Any other outcome returns nonzero and the caller runs
+# the per-file loop, so this can only ever save time, never change a verdict.
+executor_files_fast_verify() (
+  manifest=$1
+  records=$2
+  fast_user=$(id -un) || exit 1
+  fast_paths=
+  fast_count=0
+  while IFS="$(printf '\t')" read -r relative expected; do
+    # The manifest grammar (validated before this runs) is [A-Za-z0-9._/-],
+    # so a plain word list is exact; "./" keeps a leading '-' from reading as
+    # an option to stat or the hash tool.
+    case $relative in ''|*[!A-Za-z0-9._/-]*) exit 1 ;; esac
+    [ -f "$plugin_root/$relative" ] && [ ! -L "$plugin_root/$relative" ] || exit 1
+    fast_paths="$fast_paths ./$relative"
+    fast_count=$((fast_count + 1))
+  done <"$manifest"
+  [ "$fast_count" -gt 0 ] || exit 1
+  cd "$plugin_root" || exit 1
+  # GNU first: BSD stat rejects -c outright, while GNU `stat -f` is a
+  # FILESYSTEM report that must never be read as file metadata.
+  # shellcheck disable=SC2086 # deliberate: the validated word list above
+  fast_stat=$(stat -c '%a %U' $fast_paths 2>/dev/null) ||
+    fast_stat=$(stat -f '%Lp %Su' $fast_paths 2>/dev/null) || exit 1
+  printf '%s\n' "$fast_stat" | awk -v user="$fast_user" -v want="$fast_count" '
+    {
+      mode = $1
+      owner = $0
+      sub(/^[^ ]* /, "", owner)
+      if (owner != user || length(mode) < 3) { bad = 1; exit }
+      permissions = substr(mode, length(mode) - 2)
+      if (substr(permissions, 2, 2) ~ /[2367]/) { bad = 1; exit }
+      seen++
+    }
+    END { if (bad || seen != want) exit 1 }
+  ' || exit 1
+  # shellcheck disable=SC2086 # deliberate: the validated word list above
+  fast_actual=$(sha256_files $fast_paths 2>/dev/null) || exit 1
+  [ "$fast_actual" = "$(cut -f 2 "$manifest")" ] || exit 1
+  awk -F '\t' '{ printf "{\"path\":\"%s\",\"sha256\":\"%s\"}\n", $1, $2 }' \
+    "$manifest" >"$records"
+)
+
 check_safe_owned_directory() {
   check_safe_owned_path "$1" "$2" directory
 }
@@ -300,19 +359,29 @@ executor_status_command() (
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-executor.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   : >"$tmp/files.jsonl"
-  while IFS="$(printf '\t')" read -r relative expected; do
-    path=$plugin_root/$relative
-    check_private_owned_file "$path" "executor file $relative"
-    actual=$(sha256_file "$path")
-    [ "$actual" = "$expected" ] || {
-      printf 'roundhouse: executor integrity mismatch: %s\n' "$relative" >&2
-      exit 65
-    }
-    jq -cn --arg path "$relative" --arg sha256 "$actual" \
-      '{path:$path,sha256:$sha256}' >>"$tmp/files.jsonl"
-  done <<EOF
-$(jq -r '.files[] | [.path,.sha256] | @tsv' "$integrity")
-EOF
+  jq -r '.files[] | [.path,.sha256] | @tsv' "$integrity" >"$tmp/manifest.tsv"
+  # Fast path: the per-file loop below forks ~15 processes per shipped file
+  # (owner, mode, hash, record), which made every seal, apply and verify pay
+  # seconds of pure process startup. Batch the same three checks into one
+  # owner/mode stat and one hash pass. It may only ever ACCEPT: any anomaly at
+  # all - a missing or non-regular file, a stat or hash failure, an unexpected
+  # owner or mode, a digest mismatch - falls through to the original loop,
+  # which re-checks every file in manifest order and reports exactly what it
+  # always did.
+  if ! executor_files_fast_verify "$tmp/manifest.tsv" "$tmp/files.jsonl"; then
+    : >"$tmp/files.jsonl"
+    while IFS="$(printf '\t')" read -r relative expected; do
+      path=$plugin_root/$relative
+      check_private_owned_file "$path" "executor file $relative"
+      actual=$(sha256_file "$path")
+      [ "$actual" = "$expected" ] || {
+        printf 'roundhouse: executor integrity mismatch: %s\n' "$relative" >&2
+        exit 65
+      }
+      jq -cn --arg path "$relative" --arg sha256 "$actual" \
+        '{path:$path,sha256:$sha256}' >>"$tmp/files.jsonl"
+    done <"$tmp/manifest.tsv"
+  fi
 
   # Hashing what the manifest lists proves nothing about what the manifest
   # OMITS: an unlisted file under scripts/ would ship unhashed and unverified.

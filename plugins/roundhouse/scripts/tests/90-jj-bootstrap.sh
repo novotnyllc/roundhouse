@@ -423,7 +423,12 @@ rjj_krl() {
   /usr/bin/ssh-keygen -q -k -f "$rjj/$rjj_krl_name" "$@"
 }
 
-if [ "$real_jj_ok" != true ]; then
+if ! section_requested 90; then
+  # Loaded only as the real-jj prerequisite of 91+: they need the probe and the
+  # fixture generators above. The subshell below leaks nothing to them, so its
+  # assertions run once, in 90's own run, not again under every later section.
+  :
+elif [ "$real_jj_ok" != true ]; then
   printf '\n'
   printf '========================================================================\n'
   printf 'NOTICE: real-jj bootstrap block skipped\n'

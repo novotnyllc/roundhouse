@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   actionlint:
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -23,6 +24,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
+    timeout-minutes: 10
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -89,6 +91,7 @@ jobs:
   # both on Linux and macOS. Other helpers still get one job per host OS.
   helpers:
     name: helpers (${{ matrix.os }}, ${{ matrix.fixture.helper }}, ${{ matrix.fixture.platform || 'self-test' }})
+    timeout-minutes: 15
     needs: select
     if: needs.select.outputs.helpers != '[]'
     strategy:
@@ -132,19 +135,22 @@ jobs:
           set -eu
           plugins/roundhouse/scripts/${{ matrix.fixture.helper }} self-test
 
-  # Which test sections does THIS change actually require? Measured motivation:
-  # the preamble (00/05/07) is ~3s and most sections are single-digit seconds,
-  # while the serial suite was 16.8 min on macOS — so the cost is a few heavy
-  # sections that most changes do not touch.
+  # Which test sections does THIS change actually require? select-sections is
+  # fail-safe: an unmapped path, or no input at all, selects everything. Adding
+  # a rule makes CI faster; forgetting one only makes it slower, never blinder.
   #
-  # select-sections is fail-safe: an unmapped path, or no input at all, selects
-  # everything. Adding a rule makes CI faster; forgetting one only makes it
-  # slower, never blinder.
+  # The selected sections and scopes are then split into weight-balanced
+  # shards (tests/weights.tsv), each run by the parallel runner in one job.
+  # One job per section and per scope used to mean ~60 macOS jobs per run, and
+  # the account's macOS runner concurrency, not the tests, set the wall clock:
+  # PR runs queued in waves for 13-16 minutes.
   select:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
-      sections: ${{ steps.pick.outputs.sections }}
+      only: ${{ steps.pick.outputs.only }}
       scopes: ${{ steps.pick.outputs.scopes }}
+      shards: ${{ steps.pick.outputs.shards }}
       helpers: ${{ steps.pick.outputs.helpers }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -154,65 +160,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          every() {
-            for f in plugins/roundhouse/scripts/tests/*.sh; do
-              n=$(basename "$f" | cut -d- -f1)
-              case "$n" in 00|05|07) continue ;; esac
-              printf '%s\n' "$n"
-            done | sort -u
-          }
-
           if [ '${{ github.event_name }}' = pull_request ]; then
             base='${{ github.event.pull_request.base.sha }}'
             head='${{ github.event.pull_request.head.sha }}'
             changed=$(git diff --name-only "$base" "$head")
             printf 'changed paths:\n%s\n' "$changed"
             picked=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections)
+            scopes=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections --scopes)
+            helpers=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections --helpers)
           else
             picked=all
-          fi
-
-          if [ "$picked" = all ]; then
-            picked=$(printf '00\n05\n07\n'; every)
-          fi
-          printf 'selected: %s\n' "$(printf '%s' "$picked" | tr '\n' ' ')"
-
-          # Section 68 is covered by the five plan scopes. Filter it even for
-          # targeted selections, so CI never repeats their serial composite.
-          json=$(printf '%s\n' "$picked" | grep -vE '^(|68)$' | sort -u |
-            awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
-          echo "sections=$json" >> "$GITHUB_OUTPUT"
-
-          # Most scopes invoke contracts absent from an ordinary section run.
-          # The plan scopes instead partition section 68, including on main's
-          # full selection. Derive the complete list from the source guards.
-          if [ '${{ github.event_name }}' = pull_request ]; then
-            scopes=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections --scopes)
-          else
             scopes=all
+            helpers=$(printf '%s\n' '' | plugins/roundhouse/scripts/select-sections --helpers)
           fi
-          if [ "$scopes" = all ]; then
-            scopes=$(grep -ho 'ROUNDHOUSE_TEST_SCOPE:-}" != [a-z0-9-]*' \
-              plugins/roundhouse/scripts/tests/*.sh | sed 's/.*!= //' |
-              grep -v '^u2-contracts$' | sort -u)
-          fi
-          # u2-contracts remains a manual composite. Its nine independent
-          # scopes cover every case without duplicating the serial long job.
-          printf 'scopes: %s\n' "$(printf '%s' "$scopes" | tr '\n' ' ')"
-          # No implicated scope is a legitimate answer (docs-only changes), and
-          # grep exits 1 on no match, which under `set -o pipefail` would abort
-          # the job instead of emitting an empty matrix for `scoped` to skip.
-          sjson=$(printf '%s\n' "$scopes" | { grep -v '^$' || true; } | sort -u |
-            awk 'BEGIN{printf "["} {printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
-          echo "scopes=$sjson" >> "$GITHUB_OUTPUT"
+
+          # ROUNDHOUSE_TEST_ONLY: empty runs every section. Section 68 carries
+          # a partition marker, so the runner runs it as its five plan scopes,
+          # and de-duplicates them against any plan scope selected below.
+          if [ "$picked" = all ]; then only=''; else only=$(printf '%s' "$picked" | tr '\n' ' '); fi
+          # ROUNDHOUSE_TEST_SCOPES: "all" is every scope from the source
+          # guards except the manual u2-contracts composite, which only
+          # repeats nine of them.
+          scopes=$(printf '%s' "$scopes" | tr '\n' ' ')
+          printf 'sections: %s\nscopes: %s\n' "${only:-all}" "${scopes:-none}"
+          echo "only=$only" >> "$GITHUB_OUTPUT"
+          echo "scopes=$scopes" >> "$GITHUB_OUTPUT"
+
+          # Enough shards that each holds ~450 weighted seconds: with the
+          # pool on the runner's cores that is ~3 minutes, plus setup.
+          total=$(ROUNDHOUSE_TEST_ONLY="$only" ROUNDHOUSE_TEST_SCOPES="$scopes" \
+            ROUNDHOUSE_TEST_LIST=true plugins/roundhouse/scripts/test-roundhouse |
+            awk '{ s += $2 } END { print s + 0 }')
+          count=$(( (total + 449) / 450 ))
+          [ "$count" -ge 1 ] || count=1
+          [ "$count" -le 8 ] || count=8
+          shards=$(seq 1 "$count" | jq -Rsc --arg k "$count" \
+            'split("\n") | map(select(length > 0) | . + "/" + $k)')
+          printf 'weight: %s -> shards: %s\n' "$total" "$shards"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
 
           # Only enrollment expands into two fixture-platform entries. Keep
           # the selector's helper names unchanged for local callers.
-          if [ '${{ github.event_name }}' = pull_request ]; then
-            helpers=$(printf '%s\n' "$changed" | plugins/roundhouse/scripts/select-sections --helpers)
-          else
-            helpers=$(printf '%s\n' '' | plugins/roundhouse/scripts/select-sections --helpers)
-          fi
           printf 'helpers: %s\n' "$(printf '%s' "$helpers" | tr '\n' ' ')"
           hjson=$(printf '%s\n' "$helpers" | jq -Rsc '
             split("\n") | map(select(length > 0)) | unique |
@@ -221,15 +209,18 @@ jobs:
             else {helper:., platform:""} end)')
           echo "helpers=$hjson" >> "$GITHUB_OUTPUT"
 
-  # One job per section, on every event. Wall time is the ~3s preamble plus the
-  # slowest SELECTED section, never the sum of all of them.
+  # One job per shard per OS, on every event. Each runs its shard's sections
+  # and scopes through the parallel runner, which prints every unit's timing
+  # and a failing unit's whole log, and kills a unit that hangs.
   sections:
+    name: sections (${{ matrix.os }}, ${{ matrix.shard }})
     needs: select
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        section: ${{ fromJSON(needs.select.outputs.sections) }}
+        shard: ${{ fromJSON(needs.select.outputs.shards) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -259,6 +250,7 @@ jobs:
           printf 'could not install openssh-server\n' >&2
           exit 1
       - name: Install jj and yq for the real-jj sections
+        timeout-minutes: 3
         shell: bash
         run: |
           set -eu
@@ -286,61 +278,25 @@ jobs:
           sudo install -m 0755 /tmp/yq /usr/local/bin/yq
           jj --version
           yq --version
-      - name: Section ${{ matrix.section }}
+      - name: Shard ${{ matrix.shard }}
         shell: bash
         env:
-          ROUNDHOUSE_TEST_ONLY: ${{ matrix.section }}
+          ROUNDHOUSE_TEST_ONLY: ${{ needs.select.outputs.only }}
+          ROUNDHOUSE_TEST_SCOPES: ${{ needs.select.outputs.scopes }}
+          ROUNDHOUSE_TEST_SHARD: ${{ matrix.shard }}
+          # Fail a hung unit with its log well inside the job timeout, rather
+          # than losing every buffered log to a cancelled job.
+          ROUNDHOUSE_TEST_UNIT_TIMEOUT: '600'
           # Travels with the suite. Without it a real-jj section prints a NOTICE
           # and PASSES, so moving the suite here without this flag would have
           # silently stopped verifying the store's repository half.
           ROUNDHOUSE_REQUIRE_REAL_JJ: 'true'
-        run: plugins/roundhouse/scripts/test-roundhouse
-
-  scoped:
-    needs: select
-    if: needs.select.outputs.scopes != '[]'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        scope: ${{ fromJSON(needs.select.outputs.scopes) }}
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Install OpenSSH server for scope validation
-        if: runner.os == 'Linux'
-        # Bounded and skippable. apt-get here is an UNBOUNDED external
-        # dependency sitting in the critical path of every Linux job: when a
-        # mirror stalls it has held jobs past eight minutes doing nothing, which
-        # no amount of test scoping can fix. The runner image usually ships
-        # sshd already, so the common case now touches the network not at all.
-        timeout-minutes: 4
-        shell: bash
-        run: |
-          set -eu
-          if command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ]; then
-            printf 'sshd already present; skipping apt\n'
-            exit 0
-          fi
-          for attempt in 1 2; do
-            if sudo apt-get update && \
-               sudo apt-get install -y --no-install-recommends openssh-server; then
-              exit 0
-            fi
-            printf 'apt attempt %s failed; retrying\n' "$attempt" >&2
-            sleep 5
-          done
-          printf 'could not install openssh-server\n' >&2
-          exit 1
-      - name: Run scoped fixture suite
-        shell: bash
-        env:
-          ROUNDHOUSE_TEST_SCOPE: ${{ matrix.scope }}
         run: |
           chmod -R go-w plugins/roundhouse
           plugins/roundhouse/scripts/test-roundhouse
 
   windows:
+    timeout-minutes: 15
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -407,13 +363,14 @@ jobs:
           }
 
   # Single stable required-status-check context for main's branch protection.
-  # A matrix exposes one context per cell (and `scoped` fans out per suite), so
+  # A matrix exposes one context per cell (`sections` fans out per shard), so
   # there is no fixed name to require; this gate collapses every job's result
   # into one context. Require `ci-ok` in protection instead of the volatile
   # per-cell contexts — adding or renaming a scope never desyncs the rule.
   ci-ok:
-    needs: [actionlint, posix, helpers, select, sections, scoped, windows]
+    needs: [actionlint, posix, helpers, select, sections, windows]
     if: always()
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - name: All required jobs succeeded
@@ -421,18 +378,17 @@ jobs:
         env:
           # Named individually rather than join(needs.*.result): a positional
           # list cannot say WHICH job skipped, and "some job skipped" is not a
-          # verdict. Only two jobs may legitimately skip.
+          # verdict. Only helpers may legitimately skip.
           ACTIONLINT: ${{ needs.actionlint.result }}
           POSIX: ${{ needs.posix.result }}
           SELECT: ${{ needs.select.result }}
           SECTIONS: ${{ needs.sections.result }}
           WINDOWS: ${{ needs.windows.result }}
-          SCOPED: ${{ needs.scoped.result }}
           HELPERS: ${{ needs.helpers.result }}
         run: |
           set -euo pipefail
-          printf 'actionlint=%s posix=%s select=%s sections=%s windows=%s scoped=%s helpers=%s\n' \
-            "$ACTIONLINT" "$POSIX" "$SELECT" "$SECTIONS" "$WINDOWS" "$SCOPED" "$HELPERS"
+          printf 'actionlint=%s posix=%s select=%s sections=%s windows=%s helpers=%s\n' \
+            "$ACTIONLINT" "$POSIX" "$SELECT" "$SECTIONS" "$WINDOWS" "$HELPERS"
 
           # These run on every event and must SUCCEED. A skip here means the
           # gate stopped gating, which is worse than a red build because it is
@@ -445,13 +401,10 @@ jobs:
             esac
           done
 
-          # These two are change-scoped and skip when nothing implicates them:
-          # no contract scope, no helper self-test. Success or skipped only -
-          # never failure or cancellation.
-          for pair in "scoped:$SCOPED" "helpers:$HELPERS"; do
-            case ${pair#*:} in
-              success|skipped) ;;
-              *) printf '%s did not succeed (got %s)\n' "${pair%%:*}" "${pair#*:}" >&2; exit 1 ;;
-            esac
-          done
+          # Helpers are change-scoped and skip when nothing implicates them.
+          # Success or skipped only - never failure or cancellation.
+          case $HELPERS in
+            success|skipped) ;;
+            *) printf 'helpers did not succeed (got %s)\n' "$HELPERS" >&2; exit 1 ;;
+          esac
           printf 'all required jobs succeeded\n'

@@ -1,0 +1,56 @@
+# Scheduling weights for scripts/test-roundhouse's parallel runner: seconds
+# per unit, measured in a six-worker run on an Apple-silicon Mac. They order
+# the worker pool (heaviest first) and balance ROUNDHOUSE_TEST_SHARD, nothing
+# else: a stale or missing entry costs wall time, never coverage, and an
+# unlisted unit counts as heavy (120). Refresh from a run's timing lines.
+# unit<TAB>seconds
+00-harness	3
+10-u2-broker	3
+12-u2-enrollment	3
+14-u2-collector	3
+20-u1	7
+30-u4	3
+40-u5	3
+50-macos-privilege	3
+60-executor-windows	32
+65-config-validation	96
+67-windows-collector	134
+69-windows-interop	59
+70-fold	7
+71-definitions	8
+72-records	9
+73-ladder	5
+74-run	33
+75-guards	32
+76-mcp-siding	13
+77-npm	33
+78-fleet-parked	4
+79-node-runtime	131
+90-jj-bootstrap	15
+91-jj-integrity	50
+92-jj-reconcile	19
+93-jj-run	156
+94-jj-doctor	197
+95-jj-trustd	20
+96-u20-chezmoi-absent	24
+97-jj-reenrollment	31
+scope:chezmoi-fixture	4
+scope:macos-privilege-contracts	13
+scope:plan-agents	92
+scope:plan-auth	20
+scope:plan-chezmoi	69
+scope:plan-packages	35
+scope:plan-projects	38
+scope:u1-characterization	9
+scope:u1-contracts	37
+scope:u2-broker-contracts	50
+scope:u2-collector-contracts	162
+scope:u2-enrollment-preparation-contracts	158
+scope:u2-enrollment-recovery-contracts	118
+scope:u2-enrollment-rollback-contracts	115
+scope:u2-revocation-recovery-contracts	137
+scope:u2-revocation-rollback-contracts	204
+scope:u2-upgrade-confirmation-contracts	132
+scope:u2-upgrade-rollback-contracts	156
+scope:u4-contracts	88
+scope:u5-contracts	33

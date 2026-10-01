@@ -1,14 +1,19 @@
 # Verification
 
 `.github/workflows/validate.yml` checks POSIX syntax/integrity in `posix`,
-ordinary sections in `sections`, scoped contracts in `scoped`, and helper
-self-tests in `helpers`, each on ubuntu-latest and macos-latest. `select`
-uses `scripts/select-sections` and its `--scopes`/`--helpers` modes to choose
-PR coverage from changed paths; main pushes select everything. Unknown inputs within the tested surface
-fall back to full coverage. Unrelated changes need no extra scopes or helpers.
+the fixture suite in `sections`, and helper self-tests in `helpers`, each on
+ubuntu-latest and macos-latest. `select` uses `scripts/select-sections` and
+its `--scopes`/`--helpers` modes to choose PR coverage from changed paths;
+main pushes select everything. Unknown inputs within the tested surface fall
+back to full coverage. Unrelated changes need no extra scopes or helpers.
+`select` then splits the chosen sections and scopes into weight-balanced
+shards (`scripts/tests/weights.tsv`, about 450 weighted seconds each, at most
+eight), and each `sections` job runs one shard through the parallel runner.
 The workflow also runs `actionlint`, native `windows` checks, and the stable
-`ci-ok` gate over all results. Reproduce the relevant gates locally before
-pushing plugin changes.
+`ci-ok` gate over all results. Every job has a `timeout-minutes`, and the
+runner fails a hung unit with its log after `ROUNDHOUSE_TEST_UNIT_TIMEOUT`
+seconds, well inside it. Reproduce the relevant gates locally before pushing
+plugin changes.
 
 ## POSIX gates
 
@@ -49,32 +54,49 @@ pushing plugin changes.
    exactly `name` and `description`, both non-empty, with `name` equal to its
    directory name.
 6. **Fixture suite** — `plugins/roundhouse/scripts/test-roundhouse` remains
-   the full manual release gate. CI uses `ROUNDHOUSE_TEST_ONLY` to run selected
-   section numbers independently over the shared `00/05/07` harness. Sections
-   at or after 90 also load the real-jj bootstrap prerequisite. Group- or
-   world-writable plugin files fail strict-permission checks; use
-   `chmod -R go-w plugins/roundhouse` locally, as the scoped CI jobs do.
+   the full manual release gate and must end with
+   `PASS: roundhouse self-check`. It discovers sections from
+   `scripts/tests/NN-*.sh` (nothing registers them) and runs them in a
+   bounded worker pool: each section is its own child run with its own
+   fixture root, `HOME`, `TMPDIR` and log, printed in section order with its
+   time; a failing section's whole log is printed and the run exits nonzero.
+   `ROUNDHOUSE_TEST_JOBS` sets the pool size (default: performance cores);
+   `ROUNDHOUSE_TEST_JOBS=1` is the original single-process serial run, and so
+   is any run that selects a single section. `ROUNDHOUSE_TEST_ONLY` selects
+   section numbers; sections at or after 90 load 90's real-jj definitions as
+   a prerequisite, while 90's own assertions run only when 90 is selected.
+   Group- or world-writable plugin files fail strict-permission checks; use
+   `chmod -R go-w plugins/roundhouse` locally, as CI does.
+
+   A section header (first 20 lines) can carry `# roundhouse-test: serial`
+   (run alone after the pool drains, for timing assertions) or
+   `# roundhouse-test: partition=SCOPE...` (run as those scopes, which must
+   together hold every default assertion; section 68 uses this for its five
+   plan scopes). A new section also belongs in the driver's shellcheck lint
+   anchor, so `shellcheck -x` analyses it; it runs whether listed or not.
+   `ROUNDHOUSE_TEST_SHARD=I/K` runs CI's shard I of K locally, and
+   `ROUNDHOUSE_TEST_LIST=true` prints the selected units and weights.
 7. **Scoped fixture suites** — re-enter the same driver with
    `ROUNDHOUSE_TEST_SCOPE`. Most scopes invoke contract bodies that the default
    suite only defines, so gate 6 does not replace them. `select` derives the
    full scope list from source guards, excluding the manual `u2-contracts`
-   composite; `scoped` runs each selected scope on both platforms. Discover
-   and run the complete scope set locally with:
+   composite, and the shards run them on both platforms. Run the complete
+   scope set locally, in parallel, with:
 
    ```sh
-   for scope in $(grep -ho 'ROUNDHOUSE_TEST_SCOPE:-}" != [a-z0-9-]*' \
-       plugins/roundhouse/scripts/tests/*.sh | awk '{ print $NF }' | \
-       grep -v '^u2-contracts$' | sort -u); do
-     ROUNDHOUSE_TEST_SCOPE="$scope" plugins/roundhouse/scripts/test-roundhouse
-   done
+   ROUNDHOUSE_TEST_ONLY=00 ROUNDHOUSE_TEST_SCOPES=all \
+     plugins/roundhouse/scripts/test-roundhouse
    ```
+
+   `ROUNDHOUSE_TEST_SCOPES=all` beside the default selection runs exactly what
+   CI runs. A single `ROUNDHOUSE_TEST_SCOPE=NAME` run is unchanged.
 
    Five scopes partition ordinary section 68: `plan-packages`, `plan-agents`,
    `plan-projects`, `plan-chezmoi`, and `plan-auth`. Each starts with only
    `00/05/07/68` and explicitly builds its snapshot/readiness prerequisites.
-   CI selects all five whenever section 68 is required and omits the serial
-   68 job. `ROUNDHOUSE_TEST_ONLY=68` and the default manual suite retain every
-   original assertion in the original lifecycle order.
+   Section 68's partition marker makes the parallel runner (and so CI) run
+   the five instead of the serial composite; `ROUNDHOUSE_TEST_JOBS=1` keeps
+   every original assertion in the original lifecycle order.
 
    Each U2 scope builds fresh keys, signed bundles, and native command fixtures.
    Enrollment preparation covers preview binding, collisions, and interrupted
@@ -97,10 +119,10 @@ pushing plugin changes.
    `ROUNDHOUSE_TEST_SCOPE=u2-contracts` still runs the complete U2 sequence
    manually; CI excludes that composite alias to avoid repeating the nine scopes.
    Each scoped invocation owns a fresh fixture root; running another scope
-   first is not a prerequisite. CI parallelizes them rather than running the
-   complete local loop serially.
+   first is not a prerequisite, which is what lets the runner and CI shard
+   them freely.
 
-Linux helper, section, and scope jobs install `openssh-server` only if `sshd`
+Linux helper and section jobs install `openssh-server` only if `sshd`
 is absent, with bounded retries.
 
 The `sections` jobs install pinned `jj` 0.44.0 and `yq` 4.44.3 and set

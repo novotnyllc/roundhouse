@@ -649,21 +649,14 @@ fleet_quote_is_secret() {
   # newline — `eyJ…\n…` — evaded every pattern, and an embedded NUL truncated
   # the match; collapsing newlines to spaces and stripping NUL makes the whole
   # quote one line so a split token is seen whole.
-  quote_text=$(printf '%s' "$1" | tr -d '\000' | tr '\n' ' ')
+  # (A shell string cannot hold NUL, so only the newlines need collapsing.
+  # This runs for every replicated field of every sweep, so it stays in-shell.)
+  quote_text=${1//$'\n'/ }
   case $quote_text in *'-----BEGIN'*) return 0 ;; esac
+  # The named classes, one grep: a JWT; GitHub/GitLab/Slack tokens (`ghr_` is a
+  # real GitHub prefix and was once missing); OpenAI-style `sk-`; AWS `AKIA`.
   if printf '%s' "$quote_text" |
-    grep -qE 'eyJ[A-Za-z0-9_=-]*\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*'; then
-    return 0
-  fi
-  # `ghr_` is a real GitHub token prefix and was missing from the alternation.
-  if printf '%s' "$quote_text" |
-    grep -qE '(^|[^A-Za-z0-9_-])(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_-]{8,}'; then
-    return 0
-  fi
-  if printf '%s' "$quote_text" | grep -qE '(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9]{16,}'; then
-    return 0
-  fi
-  if printf '%s' "$quote_text" | grep -qE '(^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}'; then
+    grep -qE 'eyJ[A-Za-z0-9_=-]*\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*|(^|[^A-Za-z0-9_-])(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_-]{8,}|(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9]{16,}|(^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}'; then
     return 0
   fi
   # Bounded entropy heuristic: one 32+ run of `[A-Za-z0-9_]`. Neither `/` nor
@@ -692,6 +685,8 @@ fleet_quote_is_secret() {
   # `grep -oE` yields maximal runs, so each token below is a WHOLE token — a
   # secret that merely opens with 40 hex arrives as one longer run and is
   # accounted for as itself.
+  # A 32+ run needs 32+ characters; most fields are shorter and stop here.
+  [ "${#quote_text}" -ge 32 ] || return 1
   quote_hits=$(printf '%s' "$quote_text" | grep -oE '[A-Za-z0-9_]{32,}' |
     awk '(/[0-9]/ && /[A-Za-z]/) || (/[a-z]/ && /[A-Z]/) { print }')
   [ -n "$quote_hits" ] || return 1

@@ -252,7 +252,7 @@ JSON
     fail "the interop lane relaxed the native Windows operation restrictions"
   fi
   interop_plan_id=$(jq -r '.plan_id' "$tmp/interop-plan.json")
-  sleep 1
+  t_next_second
 
   # A tampered sealed plan or a wrong confirmation never reaches the target.
   jq '.operations[0].candidate_version = "3.0.0"' "$tmp/interop-plan.json" >"$tmp/interop-tampered-plan.json"
@@ -355,7 +355,12 @@ JSON
       .status == "error" and .data.phase == "execute" and .data.exit_code == 1 and
       (.data.output_tail | type == "array" and length <= 20 and index($known) != null and
         all(.[]; type == "string" and length <= 240)) and
-      (.errors[0].message | endswith($known))) and
+      # stdout and stderr reach the worker on separate pipes, so only order
+      # WITHIN a stream is defined: the error follows the redacted secret
+      # line, and the message ends with the whole sanitized tail.
+      (.data.output_tail | index("[redacted: line matched a secret pattern]") < index($known)) and
+      (.data.output_tail as $tail |
+        .errors[0].message | endswith($tail | map(select(length > 0)) | join(" | ")))) and
     any(.[]; .kind == "operation" and .id == ("apply:" + $plan_id) and .status == "partial" and
       .data.phase == "execute" and (.errors[0].message | contains($known)))
   ' "$tmp/interop-failed-result.jsonl" >/dev/null ||
@@ -390,7 +395,7 @@ JSON
     "$tmp/interop-chezmoi-snapshot.jsonl" "$tmp/interop-chezmoi-plan.json" ||
     fail "a Windows chezmoi apply plan did not seal over the interop lane"
   interop_chezmoi_plan_id=$(jq -r '.plan_id' "$tmp/interop-chezmoi-plan.json")
-  sleep 1
+  t_next_second
   interop_chezmoi_note='chezmoi: warning: .chezmoiscripts/run_onchange_after_10-register-task.ps1: skipped by fixture'
   if CHEZMOI_STATUS_DRIFT=1 CHEZMOI_APPLY_STDERR="$interop_chezmoi_note" \
     ROUNDHOUSE_CONFIG="$interop_config" "$interop_cli" apply-interop-plan \
