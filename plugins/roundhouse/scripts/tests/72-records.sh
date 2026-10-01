@@ -259,23 +259,23 @@ YAML
       fail "over-cap tombstones cleared a prune set that was within its own cap"
 
     # --- §5 alerts, §10.4 findings, and the redaction floor ---
-    fleet_alert_write "$rec_store" vireo unsigned-edit unsigned-hand-edit \
+    fleet_alert_write "$rec_store" vireo integrity unsigned-hand-edit \
       'Commit 6705e1a3 carries no SSH signature.' plugins.impeccable ||
       fail "a clean alert was refused"
-    rec_alert="$rec_store/alerts/vireo/unsigned-edit--plugins.impeccable.yaml"
+    rec_alert="$rec_store/alerts/vireo/integrity--plugins.impeccable.yaml"
     [ -f "$rec_alert" ] ||
       fail "the alert was not written under alerts/<host>/<kind>--<item>.yaml"
-    [ "$(yq -r '.kind' "$rec_alert")" = unsigned-edit ] &&
+    [ "$(yq -r '.kind' "$rec_alert")" = integrity ] &&
       [ "$(yq -r '.items[0]' "$rec_alert")" = plugins.impeccable ] ||
       fail "the alert did not carry its kind and the items it holds"
 
-    # §6.4: KEYED, NOT STAMPED. The same condition on the next pass is the same
+    # §6.4: KEYED, NOT STAMPED. The same CONDITION on the next pass is the same
     # alert — one path per (kind, item), and no rewrite when only the clock
     # moved. The stamped form put a new file in every commit for every standing
     # condition, which is how one store reached ~46k alert files.
     yq -i '.at = "2026-01-01T00:00:00Z"' "$rec_alert"
     rec_alert_bytes=$(cat "$rec_alert")
-    fleet_alert_write "$rec_store" vireo unsigned-edit unsigned-hand-edit \
+    fleet_alert_write "$rec_store" vireo integrity unsigned-hand-edit \
       'Commit 6705e1a3 carries no SSH signature.' plugins.impeccable ||
       fail "re-raising an unchanged alert was refused"
     [ "$(cat "$rec_alert")" = "$rec_alert_bytes" ] ||
@@ -283,7 +283,7 @@ YAML
     [ "$(find "$rec_store/alerts/vireo" -name '*impeccable*' | grep -c .)" -eq 1 ] ||
       fail "re-raising an alert wrote a second file for the same key"
     # A changed DETAIL is a rewrite, and the first-seen time survives it.
-    fleet_alert_write "$rec_store" vireo unsigned-edit unsigned-hand-edit \
+    fleet_alert_write "$rec_store" vireo integrity unsigned-hand-edit \
       'Commit 6705e1a3 and one more carry no SSH signature.' plugins.impeccable
     [ "$(yq -r '.detail' "$rec_alert")" = \
       'Commit 6705e1a3 and one more carry no SSH signature.' ] ||
@@ -406,15 +406,26 @@ YAML
       fail "evidence aging no longer reads its directories in batches"
 
     # --- every alert kind has a lifecycle, from one table ---
-    for rec_kind in removal-cap integrity identity-unavailable uninstall-deferred \
-      stale-host schedule-disabled schedule-missing; do
+    for rec_kind in removal-cap integrity identity-unavailable uninstall-deferred; do
       [ "$(fleet_alert_lifecycle "$rec_kind")" = condition ] ||
         fail "$rec_kind is not a condition alert"
     done
-    for rec_kind in lock-takeover canary-override hold never-heard-of-it; do
+    # The loop-liveness kinds stay events until their clears land.
+    for rec_kind in lock-takeover canary-override hold never-heard-of-it \
+      stale-host schedule-disabled schedule-missing; do
       [ "$(fleet_alert_lifecycle "$rec_kind")" = event ] ||
         fail "$rec_kind is not an event alert"
     done
+    # The sweep's kinds come from the table's scope column.
+    rec_item_kinds=$(fleet_alert_condition_kinds item | tr '\n' ' ')
+    case " $rec_item_kinds" in
+      *' integrity '*' package-hold '*) ;;
+      *) fail "the item-scoped condition kinds are wrong: $rec_item_kinds" ;;
+    esac
+    case " $rec_item_kinds" in
+      *' removal-cap '* | *' canary-override '*)
+        fail "a store-scoped or event kind is swept per item: $rec_item_kinds" ;;
+    esac
     # The fast name path and the jq filter agree, and an unsafe key takes jq.
     for rec_args in 'removal-cap removal-cap' 'integrity integrity-plugins-x plugins.x' \
       'config-key-collision c config_files.~/.a/b' 'k s plugins.x@m' 'k s a b'; do
@@ -452,14 +463,65 @@ YAML
       'config_files.~/.claude/settings.json'
     [ -z "$(find "$rec_life/alerts/vireo" -name 'config-key-collision*')" ] ||
       fail "fleet_alert_clear did not find an encoded key"
-    # The run's sweep clears the per-item alerts this pass did not raise.
-    fleet_alert_write "$rec_life" vireo package-hold package-hold-packages-rg \
-      'no package manager on this host can provide packages.rg' packages.rg
-    printf 'package-hold\tpackages.jq\n' >"$rec_life/raised"
-    fleet_run_alert_sweep "$rec_life" vireo "$rec_life/raised" package-hold
-    [ -f "$rec_life/alerts/vireo/package-hold--packages.jq.yaml" ] &&
-      [ ! -e "$rec_life/alerts/vireo/package-hold--packages.rg.yaml" ] ||
-      fail "the sweep did not keep the raised alert and clear the ended one"
+    # One call per store-wide check: true raises, false clears.
+    fleet_alert_set "$rec_life" vireo removal-cap removal-cap true 'over the cap' ||
+      fail "fleet_alert_set true failed"
+    [ -f "$rec_life/alerts/vireo/removal-cap.yaml" ] ||
+      fail "fleet_alert_set true did not raise"
+    fleet_alert_set "$rec_life" vireo removal-cap removal-cap false '' ||
+      fail "fleet_alert_set false failed"
+    [ ! -e "$rec_life/alerts/vireo/removal-cap.yaml" ] ||
+      fail "fleet_alert_set false did not clear"
+    # The end-of-pass sweep clears ONLY what the pass evaluated and did not
+    # raise: jq raised again (kept), rg checked clean (cleared), fd skipped by
+    # the pass (kept, though not raised), and an item gone from the pass's
+    # item set entirely (cleared: no condition left to hold).
+    rec_ledger="$rec_life/ledger"
+    : >"$rec_ledger"
+    for rec_item in rg fd gone; do
+      fleet_alert_write "$rec_life" vireo package-hold "package-hold-packages-$rec_item" \
+        "no package manager on this host can provide packages.$rec_item" \
+        "packages.$rec_item"
+    done
+    printf '%s\n' packages.jq packages.rg packages.fd | fleet_alert_items "$rec_ledger"
+    fleet_alert_raise "$rec_ledger" "$rec_life" vireo package-hold package-hold-packages-jq \
+      'no package manager on this host can provide packages.jq' packages.jq
+    fleet_alert_checked "$rec_ledger" package-hold packages.rg
+    fleet_alert_sweep "$rec_life" vireo "$rec_ledger"
+    [ -f "$rec_life/alerts/vireo/package-hold--packages.jq.yaml" ] ||
+      fail "the sweep cleared an alert the pass raised"
+    [ ! -e "$rec_life/alerts/vireo/package-hold--packages.rg.yaml" ] ||
+      fail "the sweep kept an alert whose condition the pass checked clean"
+    [ -f "$rec_life/alerts/vireo/package-hold--packages.fd.yaml" ] ||
+      fail "the sweep cleared an alert for an item the pass skipped"
+    [ ! -e "$rec_life/alerts/vireo/package-hold--packages.gone.yaml" ] ||
+      fail "the sweep kept an alert for an item retired from the fold"
+    # A whole-fold check marks every item of its kind checked.
+    fleet_alert_write "$rec_life" vireo chezmoi-coownership chezmoi-coownership \
+      'co-owned' 'config_files.~/.a'
+    fleet_alert_checked "$rec_ledger" chezmoi-coownership '*'
+    fleet_alert_sweep "$rec_life" vireo "$rec_ledger"
+    [ -z "$(find "$rec_life/alerts/vireo" -name 'chezmoi-coownership*')" ] ||
+      fail "a whole-fold check did not sweep its ended alert"
+    # A condition keeps its first-seen `at`; an event takes its latest.
+    (
+      fleet_now() { printf '2026-09-01T00:00:00Z\n'; }
+      fleet_alert_write "$rec_life" vireo package-hold package-hold-packages-at \
+        'held' packages.at
+      fleet_alert_write "$rec_life" vireo canary-override canary-override \
+        'bypassed' plugins.x
+    )
+    (
+      fleet_now() { printf '2026-09-20T00:00:00Z\n'; }
+      fleet_alert_write "$rec_life" vireo package-hold package-hold-packages-at \
+        'held' packages.at
+      fleet_alert_write "$rec_life" vireo canary-override canary-override \
+        'bypassed' plugins.x
+    )
+    [ "$(yq -r '.at' "$rec_life/alerts/vireo/package-hold--packages.at.yaml")" = \
+      2026-09-01T00:00:00Z ] || fail "a re-raised condition lost its first-seen at"
+    [ "$(yq -r '.at' "$rec_life/alerts/vireo/canary-override--plugins.x.yaml")" = \
+      2026-09-20T00:00:00Z ] || fail "a re-raised event did not take its latest at"
 
     # --- §6.4 the one-time compaction of the stamped form ---
     rec_compact="$tmp/records/compact"

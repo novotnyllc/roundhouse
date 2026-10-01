@@ -88,9 +88,7 @@ fleet_record_stamp() {
 }
 
 # The STAMPED file name (`<YYYYMMDDTHHMM>-<slug>.yaml`) — every finding, and
-# every alert an older build wrote — as a shell `case` glob and as a regular
-# expression, defined once for compaction and evidence aging alike.
-fleet_record_stamped_glob='[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9]-*'
+# every alert an older build wrote — defined once for compaction and aging.
 fleet_record_stamped_regex='^[0-9]{8}T[0-9]{4}-'
 
 # --- §10.4 the redaction floor ------------------------------------------------
@@ -399,53 +397,84 @@ fleet_alert_name_filter='
      else ($kind | @uri) + "--" + ($key | @uri) end)[0:200] + ".yaml";
 '
 
-fleet_alert_lifecycle_table() {
-  # Every alert KIND, and how its alert ENDS. One table, read by
-  # fleet_alert_lifecycle (aging) and documented in fleet-agents/SKILL.md.
-  #
-  #   condition  raised while a condition holds; the code that checks the
-  #              condition calls fleet_alert_clear when it no longer holds, and
-  #              the alert never ages (its `at` is first-seen, never bumped)
-  #   event      a one-off notice; ages out by `at` after the evidence
-  #              retention window
-  #
-  # A kind not listed here — a legacy kind, or one a newer build raises — is
-  # an EVENT: aging is the safe way for a notice nobody clears to end.
-  cat <<'EOF'
-removal-cap            condition
-integrity              condition
-materialization        condition
-rollback               condition
-layer-parse            condition
-unknown-category       condition
-unknown-store-dir      condition
-config-key-collision   condition
-chezmoi-coownership    condition
-ssh-render             condition
-package-hold           condition
-enabled-but-untrusted  condition
-record-write           condition
-identity-unavailable   condition
-uninstall-deferred     condition
-stale-host             condition
-schedule-disabled      condition
-schedule-missing       condition
-lock-takeover          event
-canary-override        event
-conflict               event
-hold                   event
-store-moved            event
-remote-posture         event
-bootstrap-seed         event
-join-unverified        event
-roster-change          event
+# Every alert KIND: how its alert ENDS, and what it is keyed by. The ONE table
+# — fleet_alert_kinds parses it, fleet_alert_lifecycle and the aging and the
+# end-of-pass sweep read it through that, and fleet-agents/SKILL.md documents
+# it.
+#
+#   lifecycle  condition  raised while a condition holds; the check clears it
+#                         when the condition no longer holds, and it never ages
+#                         (its `at` is first-seen, never bumped)
+#              event      a notice; every raise stamps `at` = now, and it ages
+#                         out by that latest occurrence after retention
+#   scope      item       one alert per item: cleared by the end-of-pass sweep
+#                         (fleet_alert_sweep) when the pass CHECKED the item and
+#                         did not raise it
+#              store      one alert for the store: the check sets or clears it
+#                         itself (fleet_alert_set)
+#
+# A kind not listed — a legacy kind, or one a newer build raises — is an
+# EVENT: aging is the safe way for a notice nobody clears to end.
+#
+# `stale-host`, `schedule-disabled` and `schedule-missing` belong to
+# claude/p0-loop-liveness, which flips them to condition when it adds their
+# clears; until then they are events, so they age rather than linger.
+fleet_alert_lifecycle_rows='
+removal-cap            condition  store
+materialization        condition  store
+rollback               condition  store
+layer-parse            condition  store
+unknown-category       condition  store
+unknown-store-dir      condition  store
+ssh-render             condition  store
+integrity              condition  item
+config-key-collision   condition  item
+chezmoi-coownership    condition  item
+package-hold           condition  item
+enabled-but-untrusted  condition  item
+record-write           condition  item
+identity-unavailable   condition  item
+uninstall-deferred     condition  item
+stale-host             event      store
+schedule-disabled      event      store
+schedule-missing       event      store
+lock-takeover          event      store
+canary-override        event      item
+conflict               event      item
+hold                   event      item
+store-moved            event      store
+remote-posture         event      store
+bootstrap-seed         event      store
+join-unverified        event      store
+roster-change          event      store
+'
+
+fleet_alert_kinds() {
+  # fleet_alert_kinds LIFECYCLE [SCOPE] -> the table's kinds with that
+  # lifecycle (and scope), one per line. The table's only parser, and pure
+  # shell: it is asked once per alert written.
+  while read -r alert_kinds_kind alert_kinds_life alert_kinds_scope; do
+    [ -n "$alert_kinds_kind" ] || continue
+    [ "$alert_kinds_life" = "$1" ] || continue
+    [ -z "${2:-}" ] || [ "$alert_kinds_scope" = "$2" ] || continue
+    printf '%s\n' "$alert_kinds_kind"
+  done <<EOF
+$fleet_alert_lifecycle_rows
 EOF
+}
+
+fleet_alert_condition_kinds() {
+  # fleet_alert_condition_kinds [SCOPE] -> the CONDITION kinds (of SCOPE).
+  fleet_alert_kinds condition "$@"
 }
 
 fleet_alert_lifecycle() {
   # fleet_alert_lifecycle KIND -> `condition` or `event` (the default).
-  fleet_alert_lifecycle_table | awk -v k="$1" '
-    $1 == k { print $2; found = 1; exit } END { if (!found) print "event" }'
+  if fleet_alert_condition_kinds | grep -Fqx -- "$1"; then
+    printf 'condition\n'
+  else
+    printf 'event\n'
+  fi
 }
 
 fleet_alert_name() {
@@ -493,6 +522,83 @@ fleet_alert_clear() {
   rm -f "$alert_clear_dir/$alert_clear_name"
 }
 
+fleet_alert_set() {
+  # `fleet_alert_set STORE HOST KIND SLUG true|false DETAIL [ITEM...]` — a check
+  # reports its condition: `true` raises (fleet_alert_write), `false` clears
+  # (fleet_alert_clear) the same keyed alert. One call per check, so no check
+  # can raise without the matching clear.
+  case $5 in
+    true)
+      alert_set_store=$1 alert_set_host=$2 alert_set_kind=$3 alert_set_slug=$4
+      alert_set_detail=$6
+      shift 6
+      fleet_alert_write "$alert_set_store" "$alert_set_host" "$alert_set_kind" \
+        "$alert_set_slug" "$alert_set_detail" "$@"
+      ;;
+    false)
+      alert_set_store=$1 alert_set_host=$2 alert_set_kind=$3 alert_set_slug=$4
+      shift 6
+      fleet_alert_clear "$alert_set_store" "$alert_set_host" "$alert_set_kind" \
+        "$alert_set_slug" "$@"
+      ;;
+    *) return 64 ;;
+  esac
+}
+
+fleet_alert_checked() {
+  # `fleet_alert_checked LEDGER KIND ITEM` — this pass EVALUATED the condition
+  # behind KIND for ITEM; ITEM `*` says one whole-fold check evaluated every
+  # item. Only a checked item's alert may be swept: an item the pass skipped (a
+  # hold, a canary wait, a cap) keeps whatever it had.
+  printf 'checked\t%s\t%s\n' "$2" "$3" >>"$1"
+}
+
+fleet_alert_items() {
+  # `fleet_alert_items LEDGER < ITEMS` — the pass's whole item set, one per
+  # line. An item-scoped alert whose item is in NO pass's set any more (retired
+  # from the fold) has no condition left to hold, so the sweep clears it too.
+  awk 'length { printf "item\t%s\n", $0 }' >>"$1"
+}
+
+fleet_alert_raise() {
+  # `fleet_alert_raise LEDGER STORE HOST KIND SLUG DETAIL ITEM` — an
+  # item-scoped alert whose condition holds: written, and noted in the pass's
+  # LEDGER as both checked and raised.
+  printf 'checked\t%s\t%s\nraised\t%s\t%s\n' "$4" "$7" "$4" "$7" >>"$1"
+  shift
+  fleet_alert_write "$@"
+}
+
+fleet_alert_sweep() {
+  # `fleet_alert_sweep STORE HOST LEDGER` — the end of a pass: clear every one
+  # of this host's alerts of an item-scoped CONDITION kind whose item the pass
+  # checked (or retired from its item set, fleet_alert_items) and did not
+  # raise. Free when there are none: a glob, no subprocess per kind without
+  # alerts.
+  alert_sweep_store=$1
+  alert_sweep_host=$2
+  alert_sweep_ledger=$3
+  [ -f "$alert_sweep_ledger" ] || return 0
+  alert_sweep_has_items=false
+  ! grep -q "^$(printf 'item\t')" "$alert_sweep_ledger" || alert_sweep_has_items=true
+  for alert_sweep_kind in $(fleet_alert_condition_kinds item); do
+    for alert_sweep_file in "$alert_sweep_store/alerts/$alert_sweep_host/$alert_sweep_kind"--*.yaml; do
+      [ -f "$alert_sweep_file" ] || continue
+      alert_sweep_item=$(yq -r '.items[0] // ""' "$alert_sweep_file" 2>/dev/null) || continue
+      [ -n "$alert_sweep_item" ] || continue
+      grep -Fqx -e "$(printf 'checked\t%s\t%s' "$alert_sweep_kind" "$alert_sweep_item")" \
+        -e "$(printf 'checked\t%s\t*' "$alert_sweep_kind")" "$alert_sweep_ledger" || {
+        [ "$alert_sweep_has_items" = true ] &&
+          ! grep -Fqx -- "$(printf 'item\t%s' "$alert_sweep_item")" "$alert_sweep_ledger"
+      } || continue
+      ! grep -Fqx -- "$(printf 'raised\t%s\t%s' "$alert_sweep_kind" "$alert_sweep_item")" \
+        "$alert_sweep_ledger" || continue
+      fleet_alert_clear "$alert_sweep_store" "$alert_sweep_host" "$alert_sweep_kind" \
+        "$alert_sweep_kind" "$alert_sweep_item"
+    done
+  done
+}
+
 fleet_alert_write() {
   # `fleet_alert_write STORE HOST KIND SLUG DETAIL [ITEM...]`. Resolution is
   # `rm` on the file. There is no state machine.
@@ -502,10 +608,12 @@ fleet_alert_write() {
   # item), rewritten only when what it says changes. The stamped-per-write
   # form put a new file in every published commit for every standing
   # condition — one store reached ~46k alert files, every one of them signed,
-  # pushed, verified by every peer and aged by a per-file pass. `at` is the
-  # FIRST time this alert was seen and is kept across rewrites; nothing bumps
-  # a last-seen field, because that would be the same churn under another
-  # name.
+  # pushed, verified by every peer and aged by a per-file pass. For a
+  # CONDITION, `at` is the FIRST time it was seen and is kept across rewrites,
+  # and an unchanged raise writes nothing; nothing bumps a last-seen field,
+  # because that would be the same churn under another name. An EVENT is a
+  # notice that happened again: each raise writes `at` = now, so it ages from
+  # its latest occurrence (fleet_alert_lifecycle_rows).
   alert_store=$1
   alert_host=$2
   alert_kind=$3
@@ -520,7 +628,10 @@ fleet_alert_write() {
     "$@") || return 1
   alert_name=$(fleet_alert_name "$alert_kind" "$alert_slug" "$@") || return 1
   alert_file="$alert_store/alerts/$alert_host/$alert_name"
-  if [ -f "$alert_file" ]; then
+  # An EVENT is stamped with its LATEST occurrence, so it ages from the last
+  # time it happened; only a condition keeps its first-seen `at` and skips an
+  # unchanged rewrite.
+  if [ -f "$alert_file" ] && [ "$(fleet_alert_lifecycle "$alert_kind")" = condition ]; then
     # An unreadable prior (a conflicted or hand-mangled file) is replaced
     # whole; a readable one decides whether there is anything to write.
     alert_prior=$(fleet_record_read "$alert_file" '{}' 2>/dev/null) || alert_prior=

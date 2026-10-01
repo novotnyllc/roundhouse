@@ -138,18 +138,24 @@ Alerts have no state machine — resolving one is `rm` on the file. An alert is
 where the key is the alert's items joined by commas, or its slug when it names
 no item; `<kind>.yaml` when that slug is the kind itself. Both parts are
 URI-encoded, so an item such as `config_files.~/.claude/settings.json` stays one
-path component (`config_files.~%2F.claude%2Fsettings.json`). The alert's `at`
-is when it was **first seen**: a condition that is still true on the next pass
-rewrites nothing, and a change in what the alert says rewrites it with the same
-`at`.
+path component (`config_files.~%2F.claude%2Fsettings.json`). For a
+**condition** alert, `at` is when it was **first seen**: a condition that is
+still true on the next pass rewrites nothing, and a change in what the alert
+says rewrites it with the same `at`. An **event** alert takes `at` from its
+**latest** occurrence: each raise rewrites it, so it ages from the last time
+it happened.
 
-How an alert ENDS depends on its kind, from one table
-(`fleet_alert_lifecycle_table` in `lib/fleet-records.sh`):
+How an alert ENDS depends on its kind, and what it is keyed by on its scope,
+from one table (`fleet_alert_lifecycle_rows` in `lib/fleet-records.sh`):
 
-| Lifecycle | Kinds | Ends |
-| --- | --- | --- |
-| condition | `removal-cap`, `integrity`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `config-key-collision`, `chezmoi-coownership`, `ssh-render`, `package-hold`, `enabled-but-untrusted`, `record-write`, `identity-unavailable`, `uninstall-deferred`, `stale-host`, `schedule-disabled`, `schedule-missing` | the check that raised it clears it (`fleet_alert_clear`) on the first pass its condition no longer holds; never ages |
-| event | `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by `at` after the evidence retention window |
+| Lifecycle | Scope | Kinds | Ends |
+| --- | --- | --- | --- |
+| condition | store | `removal-cap`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render` | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
+| condition | item | `integrity`, `config-key-collision`, `chezmoi-coownership`, `package-hold`, `enabled-but-untrusted`, `record-write`, `identity-unavailable`, `uninstall-deferred` | the end-of-pass sweep (`fleet_alert_sweep`) clears it when the pass **checked** the item and did not raise it, or when the item has left the fold; an item the pass skipped (held, waiting on its canary) keeps it; never ages |
+| event | store or item | `stale-host`, `schedule-disabled`, `schedule-missing`, `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by its latest `at` after the evidence retention window |
+
+`stale-host`, `schedule-disabled` and `schedule-missing` are events until the
+loop-liveness work adds the checks that clear them; it moves them to condition.
 
 `rm` on the file still resolves any alert by hand; a condition alert that is
 removed while its condition holds is raised again on the next pass.

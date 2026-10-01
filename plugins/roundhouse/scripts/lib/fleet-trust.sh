@@ -1243,12 +1243,12 @@ fleet_trust_age_evidence() {
         >"$age_work/plan" &&
       fleet_records_read_dir "$age_store/alerts/$age_host" "$age_work/alerts" &&
       jq -s -r --arg cutoff "$age_cutoff" --arg stamped "$fleet_record_stamped_regex" \
-        --rawfile table <(fleet_alert_lifecycle_table) '
-        ($table | split("\n") | map(select(. != "") | split(" ") | map(select(. != ""))) |
-          map({key: .[0], value: .[1]}) | from_entries) as $life |
+        --arg conditions "$(fleet_alert_condition_kinds)" '
+        ($conditions | split("\n") | map(select(. != "")) |
+          map({key: ., value: true}) | from_entries) as $condition |
         [ .[] | select(.bad != true and (.rec | type) == "object") |
           ((.file | split("/") | last) | test($stamped)) as $legacy |
-          select($legacy or ($life[(.rec.kind // "") | tostring] // "event") != "condition") |
+          select($legacy or ($condition[(.rec.kind // "") | tostring] | not)) |
           select(((.rec.at // "") | type) == "string" and (.rec.at // "") != "" and
             .rec.at < $cutoff) | "D\t\(.file)" ] as $d |
         ($d[]), "N\talerts\t\($d | length)\t\(length)"' "$age_work/alerts" \
