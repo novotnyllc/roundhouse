@@ -200,6 +200,20 @@ YAML
     ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
       fail "the poll floor exited while an item waited on canary evidence"
     rm -f "$rjj/vireo/store.run/canary-waiting"
+    # …and so is a retry owed: a failed apply or transiently unreadable gate
+    # input, or a host-local verdict nothing on the remote carries.
+    : >"$rjj/vireo/store.run/retry-owed"
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor exited while a retry was owed"
+    rm -f "$rjj/vireo/store.run/retry-owed"
+    runjj vireo "$cli" fleet-review hooks.commit-guard hold 'probe' >/dev/null ||
+      fail "fleet-review could not record a verdict"
+    [ -e "$rjj/vireo/store.run/retry-owed" ] ||
+      fail "a host-local fleet-review verdict did not make the next pass owed"
+    rm -f "$rjj/vireo/store.run/retry-owed" "$rjj/vireo/store.run/verdicts/hooks.commit-guard.yaml"
+    # The comparison base is the converged REFERENCE's desired state.
+    [ -s "$rjj/vireo/store.run/converged-desired" ] ||
+      fail "the publishing pass recorded no converged desired-state digest"
     runjj_lib vireo fleet_run_poll_floor "$vireo" ||
       fail "the poll floor did not exit on a settled store after the probes"
     # 2. a dirty @ is work to publish, even with an unchanged remote.
@@ -486,16 +500,23 @@ YAML
     runjj_lib vireo fleet_run_poll_floor "$vireo" ||
       fail "vireo was not settled at the poll floor before the record-only probe"
     runjj_converged=$(cat "$rjj/vireo/store.run/converged")
-    runjj wren "$cli" fleet-run --fast >/dev/null ||
+    runjj_nudges="$rjj/nudges.log"
+    : >"$runjj_nudges"
+    SSH_COMMAND_LOG=$runjj_nudges runjj wren "$cli" fleet-run --fast >/dev/null ||
       fail "wren could not publish its record-only pass"
+    # §6.1: a records-only publish nudges nobody — two hosts waiting on one
+    # canary would otherwise nudge each other every pass for the whole wait.
+    ! grep -q 'fleet-trigger' "$runjj_nudges" ||
+      fail "a records-only publish nudged a peer"
     runjj_remote=$("$REAL_GIT" -C "$vireo" ls-remote origin refs/heads/main |
       awk '{ print $1; exit }')
     [ "$runjj_remote" != "$runjj_converged" ] ||
       fail "wren's pass published nothing, so the record-only probe proves nothing"
+    # shellcheck disable=SC2046 # the desired-state roots, one pathspec each
     [ -z "$("$REAL_GIT" -C "$vireo" fetch --quiet --refmap= origin \
       "+refs/heads/main:refs/selfcheck/probe" 2>&1 && "$REAL_GIT" -C "$vireo" \
       diff --name-only "$runjj_converged" refs/selfcheck/probe -- \
-      fleet.yaml definitions.yaml definitions fleet os groups hosts trust)" ] ||
+      $(fleet_vcs_desired_roots))" ] ||
       fail "wren's probe commit touched desired state, so it is not record-only"
     runjj_origin_before=$(fleet_vcs_head_origin "$vireo")
     runjj_out=$(runjj vireo "$cli" fleet-run --fast) ||
@@ -509,8 +530,13 @@ YAML
     # A desired-state change from a peer DOES defeat it, and the next pass
     # converges on it.
     printf '# a peer edit to a shared layer\n' >>"$wren/groups/development.yaml"
-    runjj wren "$cli" fleet-run --fast >/dev/null ||
+    # The fixture ssh cannot reach a real peer, so an earlier nudge may have
+    # parked vireo in the one-interval unreachable memo; clear it.
+    rm -f "$rjj/wren/store.run/nudge-unreachable"
+    SSH_COMMAND_LOG=$runjj_nudges runjj wren "$cli" fleet-run --fast >/dev/null ||
       fail "wren could not publish its layer edit"
+    grep -q 'rh-vireo.*fleet-trigger --fast' "$runjj_nudges" ||
+      fail "a publish that changed desired state nudged nobody"
     ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
       fail "the poll floor exited past a peer's layer edit"
     runjj vireo "$cli" fleet-run --fast >/dev/null ||
@@ -520,6 +546,26 @@ YAML
     runjj vireo "$cli" fleet-run --fast >/dev/null || :
     runjj_lib vireo fleet_run_poll_floor "$vireo" ||
       fail "vireo did not settle at the poll floor after converging"
+
+    # A fetched head that does not descend from what this host converged on
+    # is a re-root or a rollback: the full pass's archive check, never the
+    # floor's to sit out. (Last, because it rewrites the shared remote.)
+    runjj_orphan="$rjj/orphan"
+    "$REAL_GIT" init -q -b main "$runjj_orphan"
+    for runjj_root in $(fleet_vcs_desired_roots); do
+      [ ! -e "$vireo/$runjj_root" ] || cp -R "$vireo/$runjj_root" "$runjj_orphan/"
+    done
+    "$REAL_GIT" -C "$runjj_orphan" add -A
+    "$REAL_GIT" -C "$runjj_orphan" -c user.name=x -c user.email=x@example.invalid \
+      -c commit.gpgsign=false commit -qm 'unrelated history'
+    # Same desired state, so only the ancestry check can refuse it.
+    [ "$(fleet_vcs_desired_digest "$runjj_orphan" HEAD)" = \
+      "$(cat "$rjj/vireo/store.run/converged-desired")" ] ||
+      fail "the unrelated head differs in desired state, so it does not isolate the ancestry check"
+    "$REAL_GIT" -C "$runjj_orphan" push -q --force "$rjj/remote.git" main:main ||
+      fail "could not stage an unrelated remote head"
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor exited on a remote head that does not descend from the converged one"
 
     printf 'real-jj: OK (poll floor states incl. record-only peers, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding)\n'
   ) || fail "real-jj run block failed (see the FAIL: real-jj: line above)"

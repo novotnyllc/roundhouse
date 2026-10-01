@@ -19,11 +19,22 @@ fleet_vcs_toml_string() {
   printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
 }
 
+fleet_vcs_fleet_roots() {
+  # §7.3 row 1, as data: the top-level store entries any enrolled host may
+  # author. A `.yaml` name is a single file; anything else is a directory
+  # whose children are row 1. fleet_vcs_path_owner reads membership here, and
+  # fleet_vcs_desired_roots derives from it — one list, so a new fleet-wide
+  # layer cannot be authorised and then missed by the poll floor.
+  printf '%s\n' fleet.yaml definitions.yaml definitions fleet os groups hosts \
+    lineage proposals trust checkpoints
+}
+
 fleet_vcs_path_owner() {
   # §7.3's path->identity table, as one function over a store-relative path.
   #
   #   `*`      row 1 — any `<h>@<domain>` where `<h>` has a hosts/ entry:
-  #            the shared layers, definitions.yaml, lineage/, proposals/.
+  #            the roots fleet_vcs_fleet_roots lists — the shared layers,
+  #            definitions.yaml, lineage/, proposals/, trust/, checkpoints/.
   #            definitions.yaml belongs HERE and not in row 2: it is a
   #            fleet-shared layer like any other, and the reserved
   #            `definitions.` item prefix is about item identity (§5.1), not
@@ -44,15 +55,27 @@ fleet_vcs_path_owner() {
   # `trust/signers.yaml` and `checkpoints/` are row 1: sponsoring and
   # checkpointing are fleet-shared writes, which is exactly why a leaf is
   # already refused both with no separate enforcement.
+  fleet_vcs_root=${1%%/*}
+  case " $(fleet_vcs_fleet_roots | tr '\n' ' ') " in
+    *" $fleet_vcs_root "*)
+      case $fleet_vcs_root in
+        # A file root is exactly that file: `fleet.yaml/x` is not row 1.
+        *.yaml) [ "$1" = "$fleet_vcs_root" ] || return 1 ;;
+        # A directory root needs a child: bare `hosts` is not row 1.
+        *)
+          case $1 in
+            "$fleet_vcs_root"/?*) ;;
+            *) return 1 ;;
+          esac
+          ;;
+      esac
+      [ "$fleet_vcs_root" != definitions ] || fleet_definitions_file_path "$1" ||
+        return 1
+      printf '*\n'
+      return 0
+      ;;
+  esac
   case $1 in
-    fleet.yaml | definitions.yaml | fleet/?* | os/?* | groups/?* | hosts/?* | \
-      lineage/?* | proposals/?* | trust/?* | checkpoints/?*)
-      printf '*\n'
-      ;;
-    definitions/?*)
-      fleet_definitions_file_path "$1" || return 1
-      printf '*\n'
-      ;;
     joins/?*.yaml)
       printf '+\n'
       ;;
@@ -99,28 +122,32 @@ fleet_vcs_host_record_filter() {
 }
 
 fleet_vcs_desired_roots() {
-  # §6.4's desired-state paths: row 1 of the table above MINUS lineage/,
+  # §6.4's desired-state paths: fleet_vcs_fleet_roots MINUS lineage/,
   # proposals/ and checkpoints/ — fleet-shared writes, but history and
   # suggestions rather than state anything converges on. trust/ stays in: a
-  # roster change is desired state (it decides whose layers apply). One list,
-  # kept beside the table it is derived from; tests/85-liveness.sh walks the
-  # table path by path and fails if a row-1 root is missing here, so a new
-  # fleet-wide layer cannot leave the poll floor blind to it.
-  printf '%s\n' fleet.yaml definitions.yaml definitions fleet os groups hosts trust
+  # roster change is desired state (it decides whose layers apply).
+  fleet_vcs_fleet_roots | grep -vxE 'lineage|proposals|checkpoints'
 }
 
 fleet_vcs_desired_digest() {
-  # fleet_vcs_desired_digest <store> <commit> -> one `<root> <object-id>` line
-  # per desired-state root, `-` for a root the commit does not carry. Git
-  # object ids are content addresses, so equal output IS byte-identical
-  # desired state, whatever records (journal/, alerts/, applied/, …) the two
-  # commits otherwise differ by. A read of objects already on disk: no ref
-  # moves and nothing is fetched here.
-  for fleet_vcs_root in $(fleet_vcs_desired_roots); do
-    fleet_vcs_object=$(git -C "$1" rev-parse --verify --quiet \
-      "$2:$fleet_vcs_root" 2>/dev/null) || fleet_vcs_object=-
-    printf '%s %s\n' "$fleet_vcs_root" "${fleet_vcs_object:--}"
-  done
+  # fleet_vcs_desired_digest <store> <commit> -> the tree entries of the
+  # desired-state roots at <commit>, one `git ls-tree` line each (an absent
+  # root has no line). Git object ids are content addresses, so equal output
+  # IS byte-identical desired state, whatever records (journal/, alerts/,
+  # applied/, …) the two commits otherwise differ by. Fails when <commit> is
+  # not on disk. Reads objects only: no ref moves and nothing is fetched.
+  # shellcheck disable=SC2046 # the root list, one pathspec per word
+  git -C "$1" ls-tree "$2" -- $(fleet_vcs_desired_roots)
+}
+
+fleet_vcs_desired_changed() {
+  # fleet_vcs_desired_changed <store> <from> <to> — true when desired state
+  # differs between the two commits, or <from> is empty or unreadable (a
+  # never-fetched store has no "before", so everything is new).
+  [ -n "$2" ] || return 0
+  fleet_vcs_desired_from=$(fleet_vcs_desired_digest "$1" "$2" 2>/dev/null) || return 0
+  fleet_vcs_desired_to=$(fleet_vcs_desired_digest "$1" "$3" 2>/dev/null) || return 0
+  [ "$fleet_vcs_desired_from" != "$fleet_vcs_desired_to" ]
 }
 
 fleet_vcs_path_identity_ok() {
@@ -659,6 +686,26 @@ fleet_vcs_archive_fetch() {
   [ "$2" = origin ] || return 0
   git -C "$1" fetch "$2" \
     '+refs/roundhouse/archive/*:refs/roundhouse/archive/*' >/dev/null 2>&1
+}
+
+fleet_vcs_floor_ref=refs/roundhouse/poll-floor/main
+
+fleet_vcs_floor_fetch() {
+  # fleet_vcs_floor_fetch <store> — §6.4's incremental fetch: the remote's
+  # main, objects only, into a PRIVATE ref, printing the fetched commit id.
+  # The poll floor and doctor's poll-floor row both go through here.
+  #
+  # The fetch moves NO jj-visible ref, and that is load-bearing:
+  # refs/roundhouse/ is outside what jj imports, so main@origin stays where
+  # the last full pass left it, and that pass's successor still signature-
+  # gates every commit that arrived since (§7.7). `--refmap=` is NOT optional:
+  # without it git also "opportunistically" updates refs/remotes/origin/main
+  # through the colocated repo's configured refspec, jj imports that as a
+  # moved main@origin, fast-forwards the tracked local bookmark — and the
+  # commits the floor skipped would never be gated.
+  git -C "$1" fetch --quiet --no-tags --refmap= origin \
+    "+refs/heads/main:$fleet_vcs_floor_ref" >/dev/null 2>&1 || return 1
+  git -C "$1" rev-parse --verify --quiet "$fleet_vcs_floor_ref^{commit}" 2>/dev/null
 }
 
 fleet_vcs_fetch() {

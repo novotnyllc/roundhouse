@@ -128,8 +128,6 @@ fleet_run_stale_after() {
 
 # --- §6.1(a)/§6.4 the poll floor ---------------------------------------------
 
-fleet_run_poll_floor_ref=refs/roundhouse/poll-floor/main
-
 fleet_run_poll_floor() {
   # Exit 0 when there is genuinely nothing to do, with the reason in
   # $fleet_run_floor_note for the caller to print.
@@ -138,25 +136,22 @@ fleet_run_poll_floor() {
   # floor used to compare main@origin with `git ls-remote`, so every peer's
   # records commit — a journal line, an alert, an applied/ update, which every
   # pass of every host produced — forced a full pass on every other host. The
-  # floor now fetches the remote head into a private ref and compares the
-  # desired-state trees there with those at the commit this host last
-  # converged on. Records-only commits leave those trees byte-identical, so
-  # they no longer defeat the floor; any change to a layer, definitions or
-  # trust/ does.
+  # floor now fetches the remote head into a private ref (fleet_vcs_floor_fetch,
+  # which moves no jj-visible ref) and compares the desired-state trees there
+  # with those of the reference this host last CONVERGED FROM. Records-only
+  # commits leave those trees byte-identical, so they no longer defeat the
+  # floor; any change to a layer, definitions or trust/ does.
   #
-  # The fetch moves NO jj-visible ref: refs/roundhouse/ is outside what jj
-  # imports, so main@origin stays where the last full pass left it. That is
-  # load-bearing. The full pass captures main@origin BEFORE its own fetch and
-  # signature-gates exactly the range that arrived since (§7.7); a floor that
-  # advanced main@origin would let the commits it skipped fall out of that
-  # range forever. git is otherwise read-only here: no commit, no push.
+  # The base is the converged REFERENCE (store.run/converged-desired), not the
+  # published head: a full pass's maintenance half (re-seed, joins, trust
+  # prune) edits layers AFTER it applied, and comparing against the head
+  # would read those unapplied edits as already converged.
   fleet_run_floor_note=
   # The local conditions first — they are free, and any one of them is work.
   #
-  # Nothing to push, and a clean working copy: rev 5 checked only the remote,
-  # so a host with a committed-but-unpushed edit and an unchanged remote
-  # exited immediately and its own edit sat unpublished. `present()` so a
-  # never-fetched store answers empty instead of erroring.
+  # Nothing to push, and a clean working copy: a host with a committed-but-
+  # unpushed edit and an unchanged remote must not exit and leave its own edit
+  # unpublished. `present()` so a never-fetched store answers empty.
   fleet_run_pending=$(jj -R "$1" log \
     -r 'present(main@origin)..heads(bookmarks(exact:"main"))' \
     --no-graph -T 'commit_id ++ "\n"')
@@ -166,34 +161,32 @@ fleet_run_poll_floor() {
   # Converged at this point: what makes this a PROPAGATION check rather than a
   # convergence one. A host that just cloned has nothing to pull and nothing
   # to push and has applied nothing, so without the marker it would sit idle.
-  # It is also the comparison base below: the commit this host last completed
-  # a published run against.
   fleet_run_converged=$(cat "$(fleet_run_state_dir)/converged" 2>/dev/null) ||
     return 1
   [ -n "$fleet_run_converged" ] &&
     [ "$fleet_run_converged" = "$(fleet_vcs_heads_local "$1")" ] || return 1
-  git -C "$1" cat-file -e "$fleet_run_converged^{commit}" 2>/dev/null || return 1
+  [ -s "$(fleet_run_state_dir)/converged-desired" ] || return 1
   # No published heartbeat owed (§6.3): only a pass that reaches the end
   # publishes one, so a floor that exited while one was due would make a quiet
   # host read as dead to every peer.
   ! fleet_heartbeat_due || return 1
-  # No item waiting on canary evidence. That evidence arrives as RECORDS —
-  # exactly what this floor now ignores — so a host waiting on it must keep
-  # re-reading the canary journals until the wait is over.
+  # No item waiting on canary evidence — that evidence arrives as RECORDS,
+  # exactly what this floor ignores — and no retry owed: an apply that failed
+  # or a gate whose input was transiently unavailable must be re-attempted,
+  # and a host-local `fleet-review` verdict must be acted on, though nothing
+  # on the remote moved.
   [ ! -e "$(fleet_run_state_dir)/canary-waiting" ] || return 1
+  [ ! -e "$(fleet_run_state_dir)/retry-owed" ] || return 1
 
-  # The incremental fetch: objects only, into the private ref. `--refmap=` is
-  # NOT optional: without it git also "opportunistically" updates
-  # refs/remotes/origin/main through the colocated repo's configured refspec,
-  # jj imports that as a moved main@origin, fast-forwards the tracked local
-  # bookmark — and the pass this floor skipped would never gate those commits.
-  git -C "$1" fetch --quiet --no-tags --refmap= origin \
-    "+refs/heads/main:$fleet_run_poll_floor_ref" >/dev/null 2>&1 || return 1
-  fleet_run_fetched=$(git -C "$1" rev-parse --verify --quiet \
-    "$fleet_run_poll_floor_ref^{commit}" 2>/dev/null) || return 1
+  fleet_run_fetched=$(fleet_vcs_floor_fetch "$1") || return 1
   [ -n "$fleet_run_fetched" ] || return 1
-  [ "$(fleet_vcs_desired_digest "$1" "$fleet_run_fetched")" = \
-    "$(fleet_vcs_desired_digest "$1" "$fleet_run_converged")" ] || return 1
+  # A fetched head that does not descend from what this host converged on is
+  # a re-root or a rollback: that is the full pass's archive check to make
+  # (§7.11.2), never something to sit out at the floor.
+  git -C "$1" merge-base --is-ancestor "$fleet_run_converged" \
+    "$fleet_run_fetched" 2>/dev/null || return 1
+  [ "$(fleet_vcs_desired_digest "$1" "$fleet_run_fetched" 2>/dev/null)" = \
+    "$(cat "$(fleet_run_state_dir)/converged-desired")" ] || return 1
   if [ "$fleet_run_fetched" = "$fleet_run_converged" ]; then
     fleet_run_floor_note='nothing new on the remote'
   else
@@ -1739,7 +1732,13 @@ fleet_run_command() (
   # anything later waits for the next scheduled run. An extra pass is a FAST
   # one, floor included: a trigger says "go look", and repeating a full
   # pass's marketplace refresh and package updates is not looking.
+  #
+  # Each pass runs with errexit ON. `fleet_run_pass || …` would switch it off
+  # for the whole body — every unguarded failure in the pass would then fall
+  # through instead of ending it. The run's status is the WORST of its
+  # passes: a later clean pass does not launder an earlier hold.
   run_extra=0
+  run_status=0
   while :; do
     run_stamp_seen=$(fleet_trigger_stamp_state)
     mkdir -p "$run_tmp/pass-$run_extra"
@@ -1748,9 +1747,16 @@ fleet_run_command() (
     # re-run pass that inherited the previous pass's `raised` lines would keep
     # an alert its own check no longer raises.
     : >"$run_tmp/pass-$run_extra/alert-ledger"
-    run_status=0
-    run_ledger="$run_tmp/pass-$run_extra/alert-ledger" \
-      run_tmp="$run_tmp/pass-$run_extra" fleet_run_pass || run_status=$?
+    set +e
+    (
+      set -e
+      run_ledger="$run_tmp/pass-$run_extra/alert-ledger"
+      run_tmp="$run_tmp/pass-$run_extra"
+      fleet_run_pass
+    )
+    run_pass_status=$?
+    set -e
+    [ "$run_pass_status" -le "$run_status" ] || run_status=$run_pass_status
     [ "$run_extra" -lt 3 ] || break
     [ "$(fleet_trigger_stamp_state)" != "$run_stamp_seen" ] || break
     run_extra=$((run_extra + 1))
@@ -2046,6 +2052,9 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   # Set when an item waits on canary evidence; the poll floor will not exit
   # while one does, because that evidence arrives as records (§6.4).
   run_canary_waiting=false
+  # Set by a runtime or transient hold (an apply that failed, an identity that
+  # could not be read): retried next pass even if the remote never moves.
+  run_retry_owed=false
 
   # §10.3's removal set, capped BEFORE any removal applies: ONE tagged list,
   # `prune ITEM` (owned, gone from the layers) and `uninstall ITEM` (a
@@ -2195,6 +2204,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       case $run_plugin_identity_status in
         1) run_match=no ;;
         75)
+          run_retry_owed=true
           printf '  hold  %s — installed marketplace identity unavailable (%s)\n' \
             "$run_item" "${fleet_run_identity_reason:-unproven}"
           fleet_run_runtime_hold "$run_item" \
@@ -2333,16 +2343,27 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
           "$run_item"
         ;;
       *)
+        # A FAILED apply owes a retry next pass. 75 is not a failure: it is a
+        # standing "this host cannot" (no manager provides the package, a hook
+        # it does not trust), which only a change elsewhere resolves — the
+        # full cadence re-reads it, and the floor need not stay open for it.
+        [ "$run_status" -eq 75 ] || run_retry_owed=true
         fleet_run_apply_held "$run_store" "$run_host" "$run_defs" "$run_item" \
           "$run_category" "$run_digest" "$run_status" "$run_tmp" "$run_now" || exit 65
         ;;
     esac
   done 9<"$run_tmp/verdicts"
-  if [ "$run_canary_waiting" = true ]; then
-    : >"$(fleet_run_state_dir)/canary-waiting"
-  else
-    rm -f "$(fleet_run_state_dir)/canary-waiting"
-  fi
+  for run_marker in canary-waiting retry-owed; do
+    case $run_marker in
+      canary-waiting) run_marker_set=$run_canary_waiting ;;
+      *) run_marker_set=$run_retry_owed ;;
+    esac
+    if [ "$run_marker_set" = true ]; then
+      : >"$(fleet_run_state_dir)/$run_marker"
+    else
+      rm -f "$(fleet_run_state_dir)/$run_marker"
+    fi
+  done
 
   # --- the full cadence's maintenance half ---
   if [ "$run_mode" = full ]; then
@@ -2373,7 +2394,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         "$run_silent" >&2
     done || :
   fleet_heartbeat_publish "$run_store" "$run_host" "$run_alive_at" "$run_fold" \
-    "$run_self_canary" "$run_applied_any" || :
+    "$run_self_canary" "$run_applied_any" "$run_wait" || :
 
   # §8.4: while a conflict is open the host is locally converging and
   # PUBLICATION-SILENT — the same state it is in when offline.
@@ -2396,15 +2417,27 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   fi
   fleet_run_publish "$run_store" "$run_host" scheduled/agent \
     "$run_mode convergence" "${run_applied_items:--}" || exit $?
-  # The poll floor's fourth condition: this host has converged at this
-  # reference, so the next run may honestly short-circuit.
+  # The poll floor's converged-here condition and its comparison base: the
+  # head this host now sits on, and the desired state of the reference it
+  # converged FROM (fleet_run_poll_floor says why it is not the head's).
   fleet_vcs_heads_local "$run_store" >"$(fleet_run_state_dir)/converged"
+  fleet_vcs_desired_digest "$run_store" "$run_reference" \
+    >"$(fleet_run_state_dir)/converged-desired" 2>/dev/null ||
+    rm -f "$(fleet_run_state_dir)/converged-desired"
   printf 'roundhouse: published; starting operation %s\n' "$run_op"
+  # §6.1: nudge only when this publish moved DESIRED STATE past what arrived
+  # at the start of the pass. A records-only publish is not news a peer needs
+  # pushed to it — and two hosts waiting on the same canary would otherwise
+  # nudge each other every pass for the whole wait.
+  #
   # The off-switch is a policy key like any other, and its absence reads as
   # "on" — an accelerator you cannot turn off is a dependency.
-  [ "$(fleet_policy_get "$run_fold" push_nudge 2>/dev/null || printf true)" = false ] ||
-    fleet_run_nudge "$run_store" "$run_host" "$run_layers" \
-      "$(fleet_run_interval_seconds "$run_fold" "$run_host" fast)" || :
+  if fleet_vcs_desired_changed "$run_store" "$run_pre_origin" \
+    "$(fleet_vcs_heads_local "$run_store" | head -1)"; then
+    [ "$(fleet_policy_get "$run_fold" push_nudge 2>/dev/null || printf true)" = false ] ||
+      fleet_run_nudge "$run_store" "$run_host" "$run_layers" \
+        "$(fleet_run_interval_seconds "$run_fold" "$run_host" fast)" || :
+  fi
 )
 
 fleet_run_resolve_conflict() (
@@ -3487,6 +3520,9 @@ fleet_review_command() (
   }
   fleet_run_verdict_write "$review_item" "$review_digest" "$review_reason" \
     human "$review_verdict"
+  # A host-local verdict is news nothing on the remote carries, so the poll
+  # floor must not sit it out: the next pass acts on it.
+  : >"$(fleet_run_state_dir)/retry-owed"
   printf 'roundhouse: %s %s at %s\n' "$review_item" "$review_verdict" "$review_digest"
 )
 

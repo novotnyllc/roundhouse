@@ -155,9 +155,12 @@ fleet_posture_get() {
 }
 
 fleet_remote_url() {
-  # jj-native, because §8.4 admits exactly two read-only git calls
-  # (`ls-remote`, `verify-commit`) and `git remote get-url` is neither. The
-  # rule was applied to the symlink row and not to this one; it applies here.
+  # jj-native, because §8.4 bans git writes to the store (`git push`,
+  # `git commit`) and keeps every other git call to a short, named list —
+  # `verify-commit`, the archive and poll-floor fetches into private
+  # refs/roundhouse/ refs, and object reads — and `git remote get-url` is not
+  # on it. The rule was applied to the symlink row and not to this one; it
+  # applies here.
   jj -R "$1" git remote list 2>/dev/null |
     awk -v want="${2:-origin}" '$1 == want { print $2; exit }'
 }
@@ -1297,19 +1300,22 @@ fleet_doctor_command() (
       'every commit in the push range carries the §5 trailer block' \
       'a run that stops writing trailers degrades every future conflict to an escalation'
 
-  # --- §6.1(a) the poll floor is the propagation mechanism ---
+  # --- §6.1(a)/§6.4 the poll floor is the propagation mechanism ---
+  # Probed through the floor's OWN fetch (fleet_vcs_floor_fetch), so this row
+  # fails exactly when the floor would: objects into a private ref, no
+  # jj-visible ref moved.
   if [ -z "$(fleet_remote_url "$doctor_store")" ]; then
     fleet_doctor_row ok poll-floor 'no origin remote configured; nothing to poll'
   else
-    doctor_ls=$(git -C "$doctor_store" ls-remote origin refs/heads/main 2>/dev/null |
-      awk 'NR == 1 { print $1; exit }') || doctor_ls=
-    if [ -z "$doctor_ls" ] && [ -n "$doctor_origin" ]; then
+    doctor_floor=$(fleet_vcs_floor_fetch "$doctor_store") || doctor_floor=
+    if [ -z "$doctor_floor" ] && [ -n "$doctor_origin" ]; then
       fleet_doctor_row finding poll-floor \
-        'ls-remote answered nothing while main@origin exists; the fleet degrades to the 12h cadence silently'
-    elif [ -n "$doctor_ls" ] && [ -n "$doctor_origin" ] && [ "$doctor_ls" != "$doctor_origin" ]; then
-      fleet_doctor_row ok poll-floor "remote is ahead of main@origin ($doctor_ls)"
+        "the poll floor's incremental fetch fails while main@origin exists; every fast pass will run in full"
+    elif [ -n "$doctor_floor" ] && [ -n "$doctor_origin" ] &&
+      [ "$doctor_floor" != "$doctor_origin" ]; then
+      fleet_doctor_row ok poll-floor "the floor's fetch reaches the remote, which is ahead of main@origin ($doctor_floor)"
     else
-      fleet_doctor_row ok poll-floor "ls-remote is comparable to main@origin"
+      fleet_doctor_row ok poll-floor "the floor's fetch reaches the remote"
     fi
   fi
 
