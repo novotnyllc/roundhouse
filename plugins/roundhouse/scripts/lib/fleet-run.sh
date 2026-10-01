@@ -957,12 +957,30 @@ fleet_run_plugin_catalog_proven() {
   printf '%s\n' "$fleet_run_proven"
 }
 
+fleet_run_marketplace_locator_filter='
+  # One comparable string for a marketplace source, from either shape: a
+  # declaration (`extraKnownMarketplaces[n]` = {source: {source, repo|url|path}})
+  # or a registration (`marketplace list --json` = {source, repo, url, path}).
+  # A GitHub repository is the same source spelled as `owner/repo` or as its
+  # https/ssh git URL, so all three meet on `github:owner/repo`.
+  def locator:
+    (if (.source | type) == "object" then .source else . end) as $s |
+    ($s.source // "") as $kind |
+    def gh: ascii_downcase | sub("[.]git$"; "") | sub("/$"; "");
+    def url: (. // "") | sub("/$"; "") |
+      if test("^(https://|ssh://git@|git@)github[.]com[:/]") then
+        "github:" + (sub("^(https://|ssh://git@|git@)github[.]com[:/]"; "") | gh)
+      else "url:" + sub("[.]git$"; "") end;
+    if $kind == "github" then "github:" + (($s.repo // "") | gh)
+    elif $kind == "git" or $kind == "url" then ($s.url | url)
+    elif $kind == "directory" then "path:" + ($s.path // "")
+    else "unknown:" + ($s | tojson) end;
+'
+
 fleet_run_marketplace_source() {
-  # fleet_run_marketplace_source NAME [LIST_JSON] -> the source to register a
-  # marketplace from: the user's own synced declaration first, else the source
-  # the harness already has registered under that NAME (re-registering a
-  # broken checkout from its own source changes nothing about whom it trusts).
-  # Nothing is returned that is option-shaped or carries whitespace.
+  # fleet_run_marketplace_source NAME -> the source the user's own synced
+  # declaration (`extraKnownMarketplaces`) registers NAME from. Nothing is
+  # returned that is option-shaped or carries whitespace.
   fleet_run_msource=
   fleet_run_msettings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
   # A declared ref (branch or tag) is kept with `#ref`, so registration
@@ -977,11 +995,6 @@ fleet_run_marketplace_source() {
       elif .source == "url" then .url
       else empty end
     ' "$fleet_run_msettings" 2>/dev/null) || fleet_run_msource=
-  [ -n "$fleet_run_msource" ] || [ -z "${2:-}" ] ||
-    fleet_run_msource=$(printf '%s\n' "$2" | jq -r --arg n "$1" '
-      [(if type == "array" then .[] else (.marketplaces // [])[] end) |
-        select(.name == $n) | (.repo // .url // .path // empty)] | .[0] // empty' \
-      2>/dev/null) || fleet_run_msource=
   case $fleet_run_msource in
     ''|-*|*[[:space:]]*) return 75 ;;
     *'#'*) case ${fleet_run_msource##*#} in ''|*[!A-Za-z0-9._/-]*) return 75 ;; esac ;;
@@ -997,36 +1010,70 @@ fleet_run_marketplace_repair() {
   # can look ONCE more. Called directly, never in a command substitution: the
   # outcome is remembered for the rest of the run, so twenty plugins from one
   # broken marketplace cost one refresh, not twenty.
+  # A refusal's reason (`fleet_run_repair_reason`) is remembered with it.
+  fleet_run_repair_reason=
   case " ${fleet_run_repaired_ok:-} " in *" $1 "*) return 0 ;; esac
-  case " ${fleet_run_repaired_failed:-} " in *" $1 "*) return 75 ;; esac
+  case " ${fleet_run_repaired_failed:-} " in
+    *" $1 "*)
+      fleet_run_repair_reason=$(printf '%s\n' "${fleet_run_repaired_reasons:-}" |
+        awk -v n="$1" '$1 == n { sub(/^[^ ]* /, ""); print; exit }')
+      return 75
+      ;;
+  esac
   fleet_run_repair_rc=0
   fleet_run_marketplace_repair_once "$1" || fleet_run_repair_rc=$?
   if [ "$fleet_run_repair_rc" -eq 0 ]; then
     fleet_run_repaired_ok="${fleet_run_repaired_ok:-} $1"
   else
     fleet_run_repaired_failed="${fleet_run_repaired_failed:-} $1"
+    [ -z "$fleet_run_repair_reason" ] ||
+      fleet_run_repaired_reasons="${fleet_run_repaired_reasons:-}$1 $fleet_run_repair_reason
+"
   fi
   return "$fleet_run_repair_rc"
 }
 
+fleet_run_marketplace_repair_reset() {
+  # Forget every repair outcome: called at the start of each pass, so a later
+  # pass in the same process retries a repair an earlier one could not make.
+  fleet_run_repaired_ok=
+  fleet_run_repaired_failed=
+  fleet_run_repaired_reasons=
+}
+
 fleet_run_marketplace_repair_once() {
+  # An UNREGISTERED name is registered from its declaration (ensure). A
+  # REGISTERED one is refreshed from its own registered source and never
+  # re-added: every `claude plugin marketplace add` declares the marketplace
+  # somewhere (`--scope user|project|local`; there is no flag that only
+  # registers), so re-adding would write a declaration this host never made.
+  # A registered source that is not the declared one is a same-name REPOINT,
+  # and is held rather than refreshed — refreshing it would pull whatever the
+  # new source serves under the old name.
+  fleet_run_repair_reason=
   fleet_upstream_id_valid "$1" || return 75
   command -v claude >/dev/null 2>&1 || return 75
   fleet_run_repair_list=$(claude plugin marketplace list --json 2>/dev/null) || return 75
-  fleet_run_repair_location=$(printf '%s\n' "$fleet_run_repair_list" | jq -r --arg n "$1" '
+  fleet_run_repair_entry=$(printf '%s\n' "$fleet_run_repair_list" | jq -c --arg n "$1" '
     [(if type == "array" then .[] else (.marketplaces // [])[] end) |
-      select(.name == $n)] | if length == 0 then "-" else (.[0].installLocation // "") end' \
-    2>/dev/null) || return 75
-  if [ "$fleet_run_repair_location" = - ]; then
+      select(.name == $n)] | .[0] // empty' 2>/dev/null) || return 75
+  if [ -z "$fleet_run_repair_entry" ]; then
     fleet_run_ensure_marketplace "$1" || return 75
-  elif [ -n "$fleet_run_repair_location" ] &&
-    [ ! -f "$fleet_run_repair_location/.claude-plugin/marketplace.json" ]; then
-    # Registered, but the checkout is gone or unreadable: register it again
-    # from its configured source. A refusal here is not final; the refresh
-    # below may still restore the checkout.
-    if fleet_run_repair_source=$(fleet_run_marketplace_source "$1" \
-      "$fleet_run_repair_list"); then
-      claude plugin marketplace add "$fleet_run_repair_source" >/dev/null 2>&1 || :
+  else
+    fleet_run_repair_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+    fleet_run_repair_declared=
+    [ ! -f "$fleet_run_repair_settings" ] ||
+      fleet_run_repair_declared=$(jq -r --arg n "$1" \
+        "$fleet_run_marketplace_locator_filter"'
+        .extraKnownMarketplaces[$n] // empty | locator' \
+        "$fleet_run_repair_settings" 2>/dev/null) || fleet_run_repair_declared=
+    fleet_run_repair_registered=$(printf '%s\n' "$fleet_run_repair_entry" | jq -r \
+      "$fleet_run_marketplace_locator_filter"' locator' 2>/dev/null) ||
+      fleet_run_repair_registered=
+    if [ -n "$fleet_run_repair_declared" ] &&
+      [ "$fleet_run_repair_declared" != "$fleet_run_repair_registered" ]; then
+      fleet_run_repair_reason="$1 is registered from ${fleet_run_repair_registered:-an unreadable source} but declared from $fleet_run_repair_declared (a same-name repoint)"
+      return 75
     fi
   fi
   claude plugin marketplace update "$1" >/dev/null 2>&1 || return 75
@@ -1178,6 +1225,7 @@ fleet_run_plugin_identity_matches() {
   }
   fleet_run_identity_id="$2@$fleet_run_identity_market"
   fleet_run_identity_rc=0
+  fleet_run_repair_reason=
   fleet_run_identity_catalog=$(fleet_run_plugin_catalog_proven \
     "$fleet_run_identity_id") || fleet_run_identity_rc=$?
   if [ "$fleet_run_identity_rc" -ne 0 ] &&
@@ -1189,11 +1237,11 @@ fleet_run_plugin_identity_matches() {
   case $fleet_run_identity_rc in
     0) ;;
     74)
-      fleet_run_identity_reason="the $fleet_run_identity_market catalog entry carries no source SHA, even after a refresh"
+      fleet_run_identity_reason=${fleet_run_repair_reason:-"the $fleet_run_identity_market catalog entry carries no source SHA, even after a refresh"}
       return 75
       ;;
     *)
-      fleet_run_identity_reason="no $fleet_run_identity_market catalog entry for $fleet_run_identity_id, even after re-registering and refreshing the marketplace"
+      fleet_run_identity_reason=${fleet_run_repair_reason:-"no $fleet_run_identity_market catalog entry for $fleet_run_identity_id, even after re-registering and refreshing the marketplace"}
       return 75
       ;;
   esac
@@ -2107,9 +2155,8 @@ fleet_run_command() (
   run_store=$(fleet_store_path)
   run_host=$(fleet_host_name)
   fleet_vcs_store_ready "$run_store" || exit $?
-  # One marketplace repair per marketplace per run (fleet_run_marketplace_repair).
-  fleet_run_repaired_ok=
-  fleet_run_repaired_failed=
+  # One marketplace repair per marketplace per pass (fleet_run_marketplace_repair).
+  fleet_run_marketplace_repair_reset
 
   # §10.6: one run per host. The stale threshold keys on the FULL cadence and
   # never on the fast interval — a 40-minute threshold would declare a live

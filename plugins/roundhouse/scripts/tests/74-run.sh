@@ -738,7 +738,7 @@ JSON
     printf '[]\n' >"$run_repair_markets"
     : >"$run_repair_adds"
     : >"$run_repair_updates"
-    fleet_run_repaired_ok= fleet_run_repaired_failed=
+    fleet_run_marketplace_repair_reset
     run_repair_identity
     [ "$run_identity_status" -eq 0 ] ||
       fail "an unregistered marketplace was not repaired before the identity hold (got $run_identity_status: $fleet_run_identity_reason)"
@@ -746,19 +746,46 @@ JSON
       fail "the repair did not register the marketplace from its configured source"
     grep -Fqx test-market "$run_repair_updates" ||
       fail "the repair did not refresh the marketplace"
-    # Registered but its checkout is gone: registered again from its OWN
-    # source, then refreshed.
-    rm -f "$HOME/.claude/settings.json"
+    # Registered (here with its checkout gone): refreshed from its OWN
+    # registered source, and never re-added — every `marketplace add` writes a
+    # declaration, and this host did not make one.
     printf '%s\n' "[{\"name\":\"test-market\",\"source\":\"github\",\"repo\":\"owner/test-market\",\"installLocation\":\"$run_repair_root/gone\"}]" \
       >"$run_repair_markets"
     : >"$run_repair_adds"
     : >"$run_repair_updates"
-    fleet_run_repaired_ok= fleet_run_repaired_failed=
+    fleet_run_marketplace_repair_reset
     run_repair_identity
-    [ "$run_identity_status" -eq 0 ] ||
-      fail "a marketplace whose checkout was gone was not re-registered and resolved (got $run_identity_status)"
-    [ "$(cat "$run_repair_adds")" = owner/test-market ] ||
-      fail "a broken checkout was not re-registered from the registered source"
+    [ "$run_identity_status" -eq 75 ] ||
+      fail "a marketplace whose checkout stayed gone resolved anyway (got $run_identity_status)"
+    [ ! -s "$run_repair_adds" ] ||
+      fail "a registered marketplace was re-added, writing a declaration: $(cat "$run_repair_adds")"
+    grep -Fqx test-market "$run_repair_updates" ||
+      fail "a registered marketplace was not refreshed from its registered source"
+    # The same NAME registered from a DIFFERENT source than the declaration is
+    # a repoint: held, not refreshed, and the hold says so. The declared repo
+    # spelled as its GitHub URL is the same source and is not a repoint.
+    printf '%s\n' "[{\"name\":\"test-market\",\"source\":\"github\",\"repo\":\"attacker/test-market\",\"installLocation\":\"$run_repair_checkout\"}]" \
+      >"$run_repair_markets"
+    printf '%s\n' "{\"available\":[]}" >"$run_plugin_missing_catalog"
+    mv "$run_repair_checkout/.claude-plugin/marketplace.json" "$run_repair_root/manifest.saved"
+    : >"$run_repair_updates"
+    fleet_run_marketplace_repair_reset
+    run_repair_identity
+    [ "$run_identity_status" -eq 75 ] ||
+      fail "a same-name repoint was repaired (got $run_identity_status)"
+    case $fleet_run_identity_reason in
+      *'same-name repoint'*) ;;
+      *) fail "the repoint hold did not say why: $fleet_run_identity_reason" ;;
+    esac
+    [ ! -s "$run_repair_updates" ] || fail "a repointed marketplace was refreshed"
+    printf '%s\n' "[{\"name\":\"test-market\",\"source\":\"git\",\"url\":\"https://github.com/Owner/test-market.git\",\"installLocation\":\"$run_repair_checkout\"}]" \
+      >"$run_repair_markets"
+    fleet_run_marketplace_repair_reset
+    run_repair_identity
+    grep -Fqx test-market "$run_repair_updates" ||
+      fail "the declared repo spelled as its GitHub URL read as a repoint"
+    mv "$run_repair_root/manifest.saved" "$run_repair_checkout/.claude-plugin/marketplace.json"
+    rm -f "$HOME/.claude/settings.json"
     # Still unproven after the refresh: hold, once, and say why.
     printf '%s\n' "[{\"name\":\"test-market\",\"installLocation\":\"$run_repair_checkout\"}]" \
       >"$run_repair_markets"
@@ -766,7 +793,7 @@ JSON
 {"name":"test-market","plugins":[{"name":"example","version":"1.2.3","source":{"source":"git","url":"https://example.invalid/roundhouse.git"}}]}
 JSON
     : >"$run_repair_updates"
-    fleet_run_repaired_ok= fleet_run_repaired_failed=
+    fleet_run_marketplace_repair_reset
     run_repair_identity
     [ "$run_identity_status" -eq 75 ] ||
       fail "a catalog entry that stays SHA-less after a refresh did not hold (got $run_identity_status)"
@@ -813,7 +840,7 @@ JSON
       CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_rel_markets" CLAUDE_CONFIG_DIR="$HOME/.claude" \
       fleet_run_plugin_catalog rel@rel-market | jq -r '.source.sha')" = "$run_rel_head" ] ||
       fail "a relative-source catalog entry did not take the checkout commit as its SHA"
-    fleet_run_repaired_ok= fleet_run_repaired_failed=
+    fleet_run_marketplace_repair_reset
     run_rel_installed "$run_rel_head" "$run_repair_root/nowhere"
     run_rel_identity
     [ "$run_identity_status" -eq 0 ] ||
@@ -852,7 +879,7 @@ JSON
     run_rel_identity
     [ "$run_identity_status" -eq 0 ] ||
       fail "a version-less catalog entry demanded a reinstall over a matching SHA (got $run_identity_status)"
-    fleet_run_repaired_ok= fleet_run_repaired_failed=
+    fleet_run_marketplace_repair_reset
 
     # --- the live-session probe reads the COMMAND LINE ---
     # An npm-installed claude is `node …/cli.js` with comm `node`, so comm

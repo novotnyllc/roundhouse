@@ -671,10 +671,16 @@ the plugin does not demand an update.
 
 The scheduled run applies the same comparison. When it cannot prove an
 installed plugin's identity — no catalog entry, or an entry with no SHA — it
-first re-registers the marketplace from its configured source (the
-`extraKnownMarketplaces` declaration, else the source already registered) and
-refreshes it, once per marketplace per run, and asks again; only then does the
-plugin hold, as `installed marketplace identity unavailable (REASON)`.
+first repairs the marketplace, once per marketplace per pass, and asks again;
+only then does the plugin hold, as
+`installed marketplace identity unavailable (REASON)`. An unregistered
+marketplace is registered from its `extraKnownMarketplaces` declaration. A
+registered one is refreshed (`claude plugin marketplace update`) from its own
+registered source and is never re-added: every `claude plugin marketplace add`
+declares the marketplace in some settings scope (`--scope user|project|local`,
+and no flag only registers), so a re-add would write a declaration this host
+never made. A registered source that differs from the declared one is a
+same-name repoint and holds without a refresh.
 For local execution set `TARGET_CLI="$CLI"` and verify the loaded executor. For
 SSH, use the configured alias and target login shell (`$SHELL -lc`), resolve the
 target's installed Roundhouse version from its active Codex plugin
