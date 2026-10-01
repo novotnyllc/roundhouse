@@ -285,7 +285,15 @@ STUB
     : >"$SCHED_STATE/linger"
     mkdir -p "$sched_units/timers.target.wants"
     : >"$sched_units/roundhouse-fleet-fast.timer"
+    # A timer whose service is gone is a MISSING job: it fires into nothing.
     : >"$SCHED_STATE/enabled.roundhouse-fleet-fast.timer"
+    : >"$SCHED_STATE/active.roundhouse-fleet-fast.timer"
+    case $("$cli" fleet-trigger --fast) in
+      *'no fleet-fast job is installed'*) ;;
+      *) fail "a timer without its service was not treated as a missing job" ;;
+    esac
+    ! grep -q 'start --no-block' "$SCHED_LOG" || fail "the trigger started a job whose service is missing"
+    : >"$sched_units/roundhouse-fleet-fast.service"
     : >"$SCHED_STATE/active.roundhouse-fleet-fast.timer"
     ln -s ../roundhouse-fleet-fast.timer "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer"
     "$cli" fleet-trigger --fast >/dev/null
@@ -669,6 +677,23 @@ STUB
       *'fleet-fast: installed, enabled, loaded, definition matches'*) ;;
       *) fail "the Linux status did not report a healthy timer" ;;
     esac
+    # Status renders and compares the SERVICE too, not only the timer: a
+    # hand-edited service differs, and a missing one is a missing job.
+    cp "$sched_units/roundhouse-fleet-fast.service" "$sched_root/fast.service.saved"
+    printf 'ExecStartPre=/bin/true\n' >>"$sched_units/roundhouse-fleet-fast.service"
+    case $("$cli" fleet-schedule status) in
+      *'fleet-fast: installed, enabled, loaded, definition differs from what install writes (roundhouse-fleet-fast.service)'*) ;;
+      *) fail "status did not report a hand-edited service: $("$cli" fleet-schedule status)" ;;
+    esac
+    rm -f "$sched_units/roundhouse-fleet-fast.service"
+    case $("$cli" fleet-schedule status) in
+      *'fleet-fast: missing, definition incomplete (roundhouse-fleet-fast.service absent)'*) ;;
+      *) fail "status did not report a missing service as a missing job: $("$cli" fleet-schedule status)" ;;
+    esac
+    [ "$(fleet_schedule_probe fast)" = missing ] ||
+      fail "the probe did not treat a missing service as a missing job"
+    cp "$sched_root/fast.service.saved" "$sched_units/roundhouse-fleet-fast.service"
+    fleet_schedule_job_state fast >/dev/null
     # Without lingering, the timers die with the session: a PREFLIGHT, so
     # install says so and writes and enables nothing.
     rm -f "$SCHED_STATE/linger"

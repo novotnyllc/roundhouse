@@ -63,6 +63,41 @@ fleet_schedule_def_path() {
   esac
 }
 
+fleet_schedule_def_paths() {
+  # fast|full -> EVERY file the job is made of, one per line: the plist, or
+  # the systemd `.service` and its `.timer`. A job missing any of them is
+  # missing — a timer whose service is gone fires into nothing.
+  case $(fleet_schedule_platform) in
+    launchd) fleet_schedule_def_path "$1" ;;
+    systemd)
+      printf '%s/%s.service\n' "$(fleet_schedule_unit_dir)" "$(fleet_schedule_unit "$1")"
+      fleet_schedule_def_path "$1"
+      ;;
+  esac
+}
+
+fleet_schedule_render() {
+  # fleet_schedule_render MODE PATH — what `install` writes at PATH, one of
+  # MODE's fleet_schedule_def_paths.
+  case $2 in
+    *.plist) fleet_schedule_plist_render "$1" ;;
+    *.service) fleet_schedule_service_render "$1" ;;
+    *.timer) fleet_schedule_timer_render "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+fleet_schedule_defs_present() {
+  # True when every one of MODE's definition files exists.
+  defs_present_list=$(fleet_schedule_def_paths "$1")
+  [ -n "$defs_present_list" ] || return 1
+  while IFS= read -r defs_present_path; do
+    [ -f "$defs_present_path" ] || return 1
+  done <<EOF_DEFS
+$defs_present_list
+EOF_DEFS
+}
+
 fleet_schedule_gui_domain() {
   printf 'gui/%s\n' "$(id -u)"
 }
@@ -125,7 +160,8 @@ fleet_schedule_last_state() {
 fleet_schedule_probe() {
   # fleet_schedule_probe fast|full -> one word, read-only:
   #
-  #   missing      no job definition on disk
+  #   missing      a job definition is not on disk (the plist; on systemd the
+  #                `.timer` OR its `.service`)
   #   disabled     the operator disabled it
   #   unloaded     present and not disabled, but not loaded/active
   #   loaded       present, enabled, loaded (launchd) or active (systemd timer)
@@ -133,8 +169,7 @@ fleet_schedule_probe() {
   #                user manager to ask or to start it in. On systemd this means
   #                ENABLED (the timers.target.wants link says so); on launchd
   #                the enablement is unknown and the last observed state rules.
-  probe_def=$(fleet_schedule_def_path "$1")
-  [ -n "$probe_def" ] && [ -f "$probe_def" ] || {
+  fleet_schedule_defs_present "$1" || {
     printf 'missing\n'
     return 0
   }
@@ -652,21 +687,41 @@ fleet_schedule_install_systemd() {
 fleet_schedule_status() {
   # One line per job: installed or missing, enabled or disabled, loaded or
   # not, and whether the definition on disk is the one `install` writes.
+  #
+  # Every file the job is made of is rendered and compared — on systemd both
+  # the `.timer` and its `.service` — so a hand-edited or missing service
+  # never hides behind a matching timer.
   status_dir=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-schedule.XXXXXX") || return 1
   for status_mode in $fleet_schedule_modes; do
-    status_path=$(fleet_schedule_def_path "$status_mode")
-    case $(fleet_schedule_platform) in
-      launchd) fleet_schedule_plist_render "$status_mode" >"$status_dir/def" ;;
-      *) fleet_schedule_timer_render "$status_mode" >"$status_dir/def" ;;
-    esac
-    status_def=
-    if [ -f "$status_path" ]; then
-      if fleet_schedule_same "$status_path" "$status_dir/def"; then
-        status_def=', definition matches'
-      else
-        status_def=', definition differs from what install writes'
+    status_paths=$(fleet_schedule_def_paths "$status_mode")
+    status_present=0
+    status_absent=
+    status_differs=
+    while IFS= read -r status_path; do
+      [ -n "$status_path" ] || continue
+      if [ ! -f "$status_path" ]; then
+        status_absent="$status_absent ${status_path##*/}"
+        continue
       fi
+      status_present=$((status_present + 1))
+      fleet_schedule_render "$status_mode" "$status_path" >"$status_dir/def"
+      fleet_schedule_same "$status_path" "$status_dir/def" ||
+        status_differs="$status_differs ${status_path##*/}"
+    done <<EOF_STATUS
+$status_paths
+EOF_STATUS
+    status_def=
+    if [ "$status_present" -gt 0 ]; then
+      if [ -n "$status_differs" ]; then
+        status_def=", definition differs from what install writes (${status_differs# })"
+      elif [ -z "$status_absent" ]; then
+        status_def=', definition matches'
+      fi
+      [ -z "$status_absent" ] ||
+        status_def="$status_def, definition incomplete (${status_absent# } absent)"
     fi
+    status_path=$(printf '%s\n' "$status_paths" |
+      awk 'NR > 1 { printf " and " } { printf "%s", $0 } END { print "" }')
     case $(fleet_schedule_job_state "$status_mode") in
       missing) status_text='missing' ;;
       disabled) status_text='installed, disabled' ;;
