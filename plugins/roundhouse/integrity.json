@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/apply-claude.sh",
-      "sha256": "5a81e5821ab5cfb9585c0070ffef5571754507aa18201ddd770d35b6be04e7b1"
+      "sha256": "1c8a223239c4d5d2ac8f667905db1d43f0acec11125728a5751505f006a5608c"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
@@ -158,7 +158,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "0852804a10c6c852000066aec2744339d9cbab6716ab4886c573a4297ccb4f76"
+      "sha256": "5b91273162f2d3dc8e038c3e0ce3ad3fee79fcbda898034c71aef8f6ef5b2b1d"
     },
     {
       "path": "scripts/lib/identity.sh",

@@ -211,20 +211,21 @@ sha256_file() {
   fi
 }
 
-sha256_files() {
-  # `sha256_files FILE...` -> one `<sha256>  <path>` line per file, through the
-  # same tool fallback as sha256_file. Nothing for no files (sha256sum and
-  # shasum would otherwise read stdin).
-  [ "$#" -gt 0 ] || return 0
+sha256_file_list() {
+  # `… -print0 | sha256_file_list` — stdin: NUL-separated file paths; stdout:
+  # one `<sha256> <path>` line per file, through the same tool fallback as
+  # sha256_file. BATCH-SAFE: the paths go through `xargs -0`, never one
+  # argument list, so a large tree cannot hit "Argument list too long" — and
+  # xargs' own status (123 when any batch fails) is this function's, so a
+  # hashing failure is never silent. An empty list hashes nothing; whether
+  # that means anything is the caller's question.
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$@"
+    xargs -0 sha256sum --
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$@"
+    xargs -0 shasum -a 256 --
   else
-    for sha256_files_one do
-      printf '%s  %s\n' "$(openssl dgst -sha256 "$sha256_files_one" |
-        awk '{print tolower($NF)}')" "$sha256_files_one"
-    done
+    # `-r`: the coreutils `<hash> *<path>` form, one line per file.
+    xargs -0 openssl dgst -sha256 -r
   fi
 }
 

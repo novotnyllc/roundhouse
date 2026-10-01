@@ -96,13 +96,20 @@ fleet_run_tree_digest() (
   # fleet_run_tree_digest DIR -> one digest over every file's relative path and
   # bytes, `.git` excluded, and the two markers Claude leaves in an installed
   # copy (`.in_use`, `.orphaned_at`), which are not plugin content.
+  #
+  # Exit non-zero rather than answer a digest it cannot stand behind: an
+  # unreadable directory, a tree with no files at all, or any hashing failure
+  # (`pipefail`, and sha256_file_list keeps xargs' status). Two trees that both
+  # failed would otherwise hash to the same empty digest and read as identical
+  # bytes — and identical bytes is what lets an installed copy skip an update.
+  set -o pipefail
   cd "$1" 2>/dev/null || exit 1
-  set --
-  while IFS= read -r -d '' tree_file; do
-    set -- "$@" "$tree_file"
-  done < <(find . -name .git -prune -o -type f ! -path ./.in_use ! -path ./.orphaned_at \
-    -print0 | LC_ALL=C sort -z)
-  sha256_files "$@" | sha256_stream
+  tree_list=$(mktemp "${TMPDIR:-/tmp}/roundhouse-tree.XXXXXX") || exit 1
+  trap 'rm -f "$tree_list"' EXIT
+  find . -name .git -prune -o -type f ! -path ./.in_use ! -path ./.orphaned_at \
+    -print0 | LC_ALL=C sort -z >"$tree_list" || exit 1
+  [ -s "$tree_list" ] || exit 1
+  sha256_file_list <"$tree_list" | sha256_stream
 )
 
 fleet_run_relative_source_sha() {

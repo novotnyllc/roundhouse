@@ -38,13 +38,14 @@ if [ -n "$fleet_fixture_yq" ]; then
     export CLAUDE_PLUGIN_ACTION_LOG="$run_plugin_order_log"
 
     # The tree digest's file hasher (host.sh) answers one line per file, in
-    # the same form whichever tool the host has.
+    # the same form whichever tool the host has, and takes its list on stdin.
     printf 'one\n' >"$run_root/hash-a"
     printf 'two\n' >"$run_root/hash-b"
-    [ "$(sha256_files "$run_root/hash-a" "$run_root/hash-b" | awk '{ print $1 }' | tr '\n' ' ')" = \
+    [ "$(printf '%s\0' "$run_root/hash-a" "$run_root/hash-b" | sha256_file_list |
+      awk '{ print $1 }' | tr '\n' ' ')" = \
       "$(sha256_file "$run_root/hash-a") $(sha256_file "$run_root/hash-b") " ] ||
-      fail "sha256_files did not hash each file the way sha256_file does"
-    [ -z "$(sha256_files </dev/null)" ] || fail "sha256_files with no files read stdin"
+      fail "sha256_file_list did not hash each file the way sha256_file does"
+    [ -z "$(sha256_file_list </dev/null)" ] || fail "sha256_file_list with no files hashed stdin"
 
     # --- §3.5 identity self-repair: re-register and refresh before holding ---
     # The hold this replaces was permanent: a marketplace never registered on a
@@ -209,6 +210,58 @@ JSON
     run_rel_identity
     [ "$run_identity_status" -eq 0 ] ||
       fail "identical relative-source bytes under an older checkout commit failed the gate (got $run_identity_status)"
+    # A tree too big for one argument list is hashed in BATCHES, and gives the
+    # same digest as one batch: xargs is stubbed to two files per call, and
+    # the tool is counted.
+    run_rel_big="$run_repair_root/rel-big"
+    rm -rf "$run_rel_big"
+    mkdir -p "$run_rel_big/sub"
+    for run_rel_n in 1 2 3 4 5 6 7; do
+      printf 'file %s\n' "$run_rel_n" >"$run_rel_big/sub/f$run_rel_n"
+    done
+    run_rel_one=$(fleet_run_tree_digest "$run_rel_big") ||
+      fail "the tree digest failed on a plain tree"
+    run_rel_stubs="$run_repair_root/hash-stubs"
+    mkdir -p "$run_rel_stubs"
+    run_rel_real_xargs=$(command -v xargs)
+    printf '#!/bin/sh\nexec %s -n 2 "$@"\n' "$run_rel_real_xargs" >"$run_rel_stubs/xargs"
+    run_rel_real_shasum=$(command -v shasum || command -v sha256sum)
+    case $run_rel_real_shasum in
+      */shasum) run_rel_tool='-a 256' ;;
+      *) run_rel_tool= ;;
+    esac
+    printf '#!/bin/sh\necho call >>"%s"\n[ "${ROUNDHOUSE_TEST_HASH_FAIL:-0}" != 1 ] || exit 1\nexec %s %s "$@"\n' \
+      "$run_repair_root/hash-calls" "$run_rel_real_shasum" "$run_rel_tool" \
+      >"$run_rel_stubs/sha256sum"
+    chmod +x "$run_rel_stubs/xargs" "$run_rel_stubs/sha256sum"
+    : >"$run_repair_root/hash-calls"
+    [ "$(PATH="$run_rel_stubs:$PATH" fleet_run_tree_digest "$run_rel_big")" = \
+      "$(cd "$run_rel_big" && find . -type f -print0 | LC_ALL=C sort -z |
+        PATH="$run_rel_stubs:$PATH" sha256_file_list | sha256_stream)" ] ||
+      fail "a batched tree digest differed from hashing the same list"
+    [ "$(grep -c . "$run_repair_root/hash-calls")" -ge 4 ] ||
+      fail "the tree was not hashed in batches ($(grep -c . "$run_repair_root/hash-calls") calls)"
+    [ -n "$run_rel_one" ] || fail "the tree digest was empty"
+    # A hasher that FAILS is a failed digest, never an empty one — two failed
+    # digests used to compare equal and read as identical bytes.
+    run_status=0
+    ROUNDHOUSE_TEST_HASH_FAIL=1 PATH="$run_rel_stubs:$PATH" \
+      fleet_run_tree_digest "$run_rel_big" >/dev/null || run_status=$?
+    [ "$run_status" -ne 0 ] || fail "a failing hasher produced a tree digest"
+    run_status=0
+    mkdir -p "$run_repair_root/rel-empty"
+    fleet_run_tree_digest "$run_repair_root/rel-empty" >/dev/null || run_status=$?
+    [ "$run_status" -ne 0 ] || fail "a tree with no files produced a digest"
+    # …so a sabotaged hasher over IDENTICAL bytes is a mismatch, not a match.
+    run_identity_status=0
+    ROUNDHOUSE_TEST_HASH_FAIL=1 PATH="$run_rel_stubs:$PATH" \
+      CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
+      CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_rel_markets" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_plugin_identity_matches \
+      "$run_rel_defs" rel '{"state":"enabled","marketplace":"rel-market"}' ||
+      run_identity_status=$?
+    [ "$run_identity_status" -eq 1 ] ||
+      fail "identical bytes under a failing hasher read as a match (got $run_identity_status)"
     printf 'changed\n' >>"$run_rel_checkout/plugin/SKILL.md"
     run_rel_identity
     [ "$run_identity_status" -eq 1 ] ||
