@@ -68,15 +68,16 @@ if [ -n "$fleet_fixture_yq" ]; then
     # --- a canary owes a record at applied_at + canary_wait_hours ---
     # §10.1 condition 3 needs a record dated at or after that instant; a
     # throttled canary would otherwise leave downstream waiting up to a window.
-    live_canary_fold='{"policy":{"canary_wait_hours":3}}'
-    fleet_heartbeat_publish "$live_store" vireo "$(live_at 9)" "$live_canary_fold" true true
+    # The wait is the gate's own, passed in — the fold's value is ignored.
+    live_canary_fold='{"policy":{"canary_wait_hours":99}}'
+    fleet_heartbeat_publish "$live_store" vireo "$(live_at 9)" "$live_canary_fold" true true 3
     [ "$(live_alive_count)" -eq 4 ] || fail "the canary's applying pass published no heartbeat"
-    fleet_heartbeat_publish "$live_store" vireo "$(live_at 11)" "$live_canary_fold" true false
+    fleet_heartbeat_publish "$live_store" vireo "$(live_at 11)" "$live_canary_fold" true false 3
     [ "$(live_alive_count)" -eq 4 ] ||
       fail "the canary published before its evidence deadline with nothing to say"
     fleet_heartbeat_due "$(jq -rn --arg at "$(live_at 12)" '$at | fromdateiso8601')" ||
       fail "the canary's evidence deadline did not make a heartbeat due (it would wait 6h)"
-    fleet_heartbeat_publish "$live_store" vireo "$(live_at 12)" "$live_canary_fold" true false
+    fleet_heartbeat_publish "$live_store" vireo "$(live_at 12)" "$live_canary_fold" true false 3
     [ "$(live_alive_count)" -eq 5 ] ||
       fail "the canary did not publish at its evidence deadline"
     [ "$(fleet_heartbeat_state | jq -r '.deadlines | length')" -eq 0 ] ||
@@ -84,7 +85,7 @@ if [ -n "$fleet_fixture_yq" ]; then
     ! fleet_heartbeat_due "$(jq -rn --arg at "$(live_at 13)" '$at | fromdateiso8601')" ||
       fail "a heartbeat was still owed after the deadline was met"
     # A NON-canary owes nobody: applying records no deadline.
-    fleet_heartbeat_publish "$live_store" vireo "$(live_at 14)" "$live_canary_fold" false true
+    fleet_heartbeat_publish "$live_store" vireo "$(live_at 14)" "$live_canary_fold" false true 3
     [ "$(fleet_heartbeat_state | jq -r '.deadlines | length')" -eq 0 ] ||
       fail "a non-canary host recorded a canary evidence deadline"
     # A zero window turns the throttle off rather than dividing by it.
@@ -95,15 +96,15 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$(live_alive_count)" -eq $((live_before + 2)) ] ||
       fail "heartbeat_publish_hours: 0 did not publish on every pass"
     # Lost state is "owed now", never "silent forever".
-    printf 'not json\n' >"$(fleet_instance_path store.run)/heartbeat.json"
+    printf 'not json\n' >"$(fleet_run_state_dir)/heartbeat.json"
     fleet_heartbeat_due "$(jq -rn --arg at "$(live_at 15)" '$at | fromdateiso8601')" ||
       fail "an unreadable heartbeat state did not read as due"
 
     # The host-local heartbeat is every pass, and it never enters the store.
     fleet_heartbeat_local "$(live_at 16)"
-    [ "$(jq -r '.at' "$(fleet_instance_path store.run)/alive")" = "$(live_at 16)" ] ||
+    [ "$(jq -r '.at' "$(fleet_run_state_dir)/alive")" = "$(live_at 16)" ] ||
       fail "the host-local heartbeat was not written"
-    case $(fleet_instance_path store.run) in
+    case $(fleet_run_state_dir) in
       "$live_store"/*) fail "the host-local heartbeat lives inside the replicated store" ;;
     esac
 
@@ -126,6 +127,15 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ -n "$live_alert" ] || fail "no stale-host alert was written for a silent host"
     [ "$(yq -r '.kind' "$live_alert")" = stale-host ] ||
       fail "the stale-host alert has the wrong kind"
+    # The detail is a FIXED fact — robin's last published heartbeat — never
+    # the moving cutoff, so the same silence always reads the same.
+    case $(yq -r '.detail' "$live_alert") in
+      *"since $(live_at 27) "*) ;;
+      *) fail "the stale-host detail does not name the last heartbeat: $(yq -r '.detail' "$live_alert")" ;;
+    esac
+    case $(yq -r '.detail' "$live_alert") in
+      *"$(live_at 28)"*) fail "the stale-host detail carries the moving cutoff" ;;
+    esac
     # One alert per silence, not one per pass.
     rm -f "$live_alert"
     fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" /dev/null \
@@ -162,6 +172,11 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ -z "$(fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" \
       "$live_root/roster" "$live_fold" "$(live_at 70)")" ] ||
       fail "a host that left the roster was still checked for liveness"
+    # The window is never shorter than two publication windows: a 1h alert
+    # over a 6h heartbeat would fire on every healthy, quiet host.
+    [ -z "$(fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" /dev/null \
+      '{"policy":{"liveness_alert_hours":1}}' "$(live_at 50)")" ] ||
+      fail "a liveness window under 2 x heartbeat_publish_hours was not clamped"
     # …and the knob turns it off.
     [ -z "$(fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" /dev/null \
       '{"policy":{"liveness_alert_hours":0}}' "$(live_at 70)")" ] ||

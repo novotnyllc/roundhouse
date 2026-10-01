@@ -143,7 +143,9 @@ fleet_journal_entry_ok() {
     (.at | type == "string") and
     (.outcome as $o |
       if $o == "alive" then
-        # A run-level heartbeat: no item, written once per completed run.
+        # A run-level heartbeat: no item. Published at most every
+        # heartbeat_publish_hours, after an applying pass, and at the canary
+        # evidence deadline (lib/fleet-liveness.sh); host-local otherwise.
         (has("item") | not)
       elif $o == "unreachable" then
         # §6/convergence.md: the remote was unreachable this run, so the host
@@ -200,11 +202,21 @@ fleet_journal_entries() {
   # clean off the surviving files while the withdrawal sat unreadable. The
   # entries that DO parse are still emitted (a caller that only reports wants
   # them), but a non-zero return tells the gate its evidence is partial.
+  #
+  # `fleet_journal_entries STORE HOST [SINCE-DAY]`: with SINCE-DAY
+  # (`YYYY-MM-DD`), only the day files dated on or after it. Day files are
+  # named by their records' own date, so that is every record that can be
+  # that recent, read without parsing the host's whole history.
   journal_dir="$1/journal/$2"
   [ -d "$journal_dir" ] || return 0
   journal_rc=0
   for journal_file in "$journal_dir"/*.yaml; do
     [ -f "$journal_file" ] || continue
+    if [ -n "${3:-}" ]; then
+      journal_day=$(basename "$journal_file" .yaml)
+      [ "$(printf '%s\n%s\n' "$journal_day" "$3" | LC_ALL=C sort | head -1)" = "$3" ] ||
+        continue
+    fi
     yq -o=json -I=0 '(. // []) | .[]' "$journal_file" 2>/dev/null || journal_rc=1
   done
   return "$journal_rc"
