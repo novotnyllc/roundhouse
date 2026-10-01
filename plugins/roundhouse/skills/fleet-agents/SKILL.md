@@ -162,7 +162,7 @@ removed while its condition holds is raised again on the next pass.
 
 ### Record maintenance and ownership
 
-Two verbs that **publish** rather than stopping at the working copy, because
+Three verbs that **publish** rather than stopping at the working copy, because
 their whole effect is on replicated records. Each takes the run lock, refuses
 while `main` is diverged or while the working copy carries anything other than
 this host's own records, and commits through the same publish path the run
@@ -271,7 +271,7 @@ refused, still journals `held` and still blocks downstream.
 
 A Claude plugin whose desired state is `absent` — the scalar or
 `{state: absent}` — is a **tombstone**, and the run uninstalls it with
-`claude plugin uninstall --scope user NAME@MARKETPLACE`, verifies it is gone from
+`claude plugin uninstall --scope user --keep-data NAME@MARKETPLACE`, verifies it is gone from
 `installed_plugins.json`, forgets any `applied/` record, and journals `applied`.
 Where it is not installed it journals `satisfied` once and then stays quiet. An
 uninstall that would remove something counts toward the removal cap like any

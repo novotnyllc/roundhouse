@@ -293,7 +293,8 @@ fleet_records_read_dir() {
 }
 
 fleet_records_retention_days() {
-  # fleet_records_retention_days FOLD -> the evidence retention window in days.
+  # fleet_records_retention_days FOLD -> the evidence retention window in days,
+  # from `policy.evidence_retention_days` (V2's policy block).
   # THE WINDOW HAS A FLOOR: it is read from store content, it is not an item
   # (no digest, no verdict, no canary gate, outside fleet_removal_cap), and
   # its consequence is deleting evidence on every host — so a value under 7
@@ -302,7 +303,7 @@ fleet_records_retention_days() {
   # falls back to the default rather than to the floor: a typo should keep
   # more evidence, not less.
   printf '%s\n' "$1" | jq -r '
-    (.evidence_retention_days // 90) as $d |
+    (.policy.evidence_retention_days // 90) as $d |
     if ($d | type) == "number" then ([$d, 7] | max | floor) else 90 end'
 }
 

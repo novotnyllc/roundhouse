@@ -393,6 +393,14 @@ YAML
     [ "$(find "$rec_batch/findings/vireo" -name '*.yaml' | grep -c .)" -eq 1 ] &&
       [ -f "$rec_batch/findings/vireo/m-bad.yaml" ] ||
       fail "aging removed an unreadable finding, or kept an aged one"
+    # The window comes from policy.evidence_retention_days, floored at 7.
+    [ "$(fleet_records_retention_days '{"policy":{"evidence_retention_days":30}}')" = 30 ] ||
+      fail "retention did not read policy.evidence_retention_days"
+    [ "$(fleet_records_retention_days '{"policy":{"evidence_retention_days":2}}')" = 7 ] ||
+      fail "retention below the floor was not raised to 7"
+    [ "$(fleet_records_retention_days '{"evidence_retention_days":30}')" = 90 ] ||
+      fail "a root-level retention key was read instead of policy"
+    [ "$(fleet_records_retention_days '{}')" = 90 ] || fail "retention default is not 90"
     # Efficiency is structural: batched reads, one plan.
     cli_function_body fleet_records_age | grep -q 'fleet_records_read_dir' ||
       fail "evidence aging no longer reads its directories in batches"
