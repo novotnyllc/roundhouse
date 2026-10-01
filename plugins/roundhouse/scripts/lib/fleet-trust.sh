@@ -1199,11 +1199,11 @@ fleet_trust_age_evidence() {
   # Because evidence paths are never inputs to verification, aging them out is a
   # pure `rm` with no trust reasoning attached.
   #
-  # A KEYED alert (alerts/<h>/<kind>--<key>.yaml) is exempt. It is an open
-  # condition, not an event: its `at` is when it was FIRST seen and is never
-  # bumped, so aging by it would delete a still-open alert at 90 days. It is
-  # resolved the documented way, `rm` on the file. Only the legacy stamped
-  # form (`<YYYYMMDDTHHMM>-<slug>.yaml`) ages.
+  # A keyed CONDITION alert (fleet_alert_lifecycle) is exempt: its `at` is when
+  # it was FIRST seen and is never bumped, so aging by it would delete a
+  # still-open alert, and the code that checks its condition clears it
+  # (fleet_alert_clear) when the condition ends. Event alerts, unknown kinds
+  # and every legacy stamped file (fleet_record_stamped_glob) age by `at`.
   fleet_trust_cutoff=$(fleet_doctor_days_ago "$2")
   for fleet_trust_edir in journal alerts findings; do
     [ -d "$1/$fleet_trust_edir" ] || continue
@@ -1213,9 +1213,13 @@ fleet_trust_age_evidence() {
     while IFS= read -r fleet_trust_ef; do
       [ -n "$fleet_trust_ef" ] || continue
       if [ "$fleet_trust_edir" = alerts ]; then
+        # shellcheck disable=SC2254 # the stamped-name glob is a pattern on purpose
         case ${fleet_trust_ef##*/} in
-          [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9]-*) ;;
-          *) continue ;;
+          $fleet_record_stamped_glob) ;;
+          *)
+            [ "$(fleet_alert_lifecycle "$(yq -r '.kind // ""' "$fleet_trust_ef" \
+              2>/dev/null || true)")" != condition ] || continue
+            ;;
         esac
       fi
       fleet_trust_estamp=$(yq -r '(.at // .[0].at // "") | sub("[Tt].*$"; "")' \

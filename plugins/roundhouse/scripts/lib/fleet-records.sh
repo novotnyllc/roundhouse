@@ -87,6 +87,12 @@ fleet_record_stamp() {
   date -u +%Y%m%dT%H%M
 }
 
+# The STAMPED file name (`<YYYYMMDDTHHMM>-<slug>.yaml`) — every finding, and
+# every alert an older build wrote — as a shell `case` glob and as a regular
+# expression, defined once for compaction and evidence aging alike.
+fleet_record_stamped_glob='[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9]-*'
+fleet_record_stamped_regex='^[0-9]{8}T[0-9]{4}-'
+
 # --- §10.4 the redaction floor ------------------------------------------------
 
 fleet_replicated_cap=400
@@ -326,6 +332,100 @@ fleet_alert_name_filter='
      else ($kind | @uri) + "--" + ($key | @uri) end)[0:200] + ".yaml";
 '
 
+fleet_alert_lifecycle_table() {
+  # Every alert KIND, and how its alert ENDS. One table, read by
+  # fleet_alert_lifecycle (aging) and documented in fleet-agents/SKILL.md.
+  #
+  #   condition  raised while a condition holds; the code that checks the
+  #              condition calls fleet_alert_clear when it no longer holds, and
+  #              the alert never ages (its `at` is first-seen, never bumped)
+  #   event      a one-off notice; ages out by `at` after the evidence
+  #              retention window
+  #
+  # A kind not listed here — a legacy kind, or one a newer build raises — is
+  # an EVENT: aging is the safe way for a notice nobody clears to end.
+  cat <<'EOF'
+removal-cap            condition
+integrity              condition
+materialization        condition
+rollback               condition
+layer-parse            condition
+unknown-category       condition
+unknown-store-dir      condition
+config-key-collision   condition
+chezmoi-coownership    condition
+ssh-render             condition
+package-hold           condition
+enabled-but-untrusted  condition
+record-write           condition
+identity-unavailable   condition
+uninstall-deferred     condition
+stale-host             condition
+schedule-disabled      condition
+schedule-missing       condition
+lock-takeover          event
+canary-override        event
+conflict               event
+hold                   event
+store-moved            event
+remote-posture         event
+bootstrap-seed         event
+join-unverified        event
+roster-change          event
+EOF
+}
+
+fleet_alert_lifecycle() {
+  # fleet_alert_lifecycle KIND -> `condition` or `event` (the default).
+  fleet_alert_lifecycle_table | awk -v k="$1" '
+    $1 == k { print $2; found = 1; exit } END { if (!found) print "event" }'
+}
+
+fleet_alert_name() {
+  # fleet_alert_name KIND SLUG [ITEM...] -> the keyed file name an alert lives
+  # at (fleet_alert_name_filter). The common case — one item, or none, made of
+  # characters `@uri` leaves alone — is answered without a jq call, because
+  # fleet_alert_clear asks it for every item of every pass.
+  alert_name_kind=$1
+  alert_name_slug=$2
+  shift 2
+  alert_name_key=
+  case $# in
+    0) alert_name_key=$alert_name_slug ;;
+    1) alert_name_key=$1 ;;
+  esac
+  case $alert_name_kind in '' | *[!A-Za-z0-9._~-]*) alert_name_key= ;; esac
+  case $alert_name_key in *[!A-Za-z0-9._~-]*) alert_name_key= ;; esac
+  if [ -n "$alert_name_key" ] && [ "${#alert_name_kind}" -lt 90 ] &&
+    [ "${#alert_name_key}" -lt 90 ]; then
+    if [ "$alert_name_key" = "$alert_name_kind" ]; then
+      printf '%s.yaml\n' "$alert_name_kind"
+    else
+      printf '%s--%s.yaml\n' "$alert_name_kind" "$alert_name_key"
+    fi
+    return 0
+  fi
+  jq -rn --arg kind "$alert_name_kind" --arg slug "$alert_name_slug" --args \
+    "$fleet_alert_name_filter"' alert_name($kind; $slug; $ARGS.positional)' "$@"
+}
+
+fleet_alert_clear() {
+  # `fleet_alert_clear STORE HOST KIND SLUG [ITEM...]` — the condition behind a
+  # CONDITION alert no longer holds: remove its keyed file, if there is one.
+  # The same arguments the raise passed, so the same path. Costs nothing when
+  # no alert of KIND exists, which is the steady state.
+  alert_clear_dir="$1/alerts/$2"
+  alert_clear_kind=$3
+  for alert_clear_probe in "$alert_clear_dir/$alert_clear_kind".yaml \
+    "$alert_clear_dir/$alert_clear_kind"--*.yaml; do
+    [ -e "$alert_clear_probe" ] && break
+  done
+  [ -e "$alert_clear_probe" ] || return 0
+  shift 2
+  alert_clear_name=$(fleet_alert_name "$@") || return 0
+  rm -f "$alert_clear_dir/$alert_clear_name"
+}
+
 fleet_alert_write() {
   # `fleet_alert_write STORE HOST KIND SLUG DETAIL [ITEM...]`. Resolution is
   # `rm` on the file. There is no state machine.
@@ -351,8 +451,7 @@ fleet_alert_write() {
     --arg detail "$alert_detail" --arg at "$(fleet_now)" --args \
     '{kind: $kind, host: $host, items: $ARGS.positional, detail: $detail, at: $at}' \
     "$@") || return 1
-  alert_name=$(printf '%s\n' "$alert_record" | jq -r --arg slug "$alert_slug" \
-    "$fleet_alert_name_filter"' alert_name(.kind; $slug; .items)') || return 1
+  alert_name=$(fleet_alert_name "$alert_kind" "$alert_slug" "$@") || return 1
   alert_file="$alert_store/alerts/$alert_host/$alert_name"
   if [ -f "$alert_file" ]; then
     # An unreadable prior (a conflicted or hand-mangled file) is replaced
@@ -412,6 +511,7 @@ fleet_alerts_compact() {
   # that is not already at its keyed path, `D<TAB>file` for every other member
   # of the group, and one `U<TAB>count` for the files that could not be keyed.
   jq -s -r --arg dir "$compact_dir" --rawfile paths "$compact_work/alert-paths" \
+    --arg stamped "$fleet_record_stamped_regex" \
     "$fleet_alert_name_filter"'
     ($paths | split("\n") | map(select(. != ""))) as $all |
     (map(select(.bad != true and (.rec | type == "object") and
@@ -420,7 +520,7 @@ fleet_alerts_compact() {
       unique_by(.file)) as $good |
     [ $good[] |
       (.file | split("/") | last) as $base |
-      (($base | capture("^[0-9]{8}T[0-9]{4}-(?<slug>.+)[.]yaml$") | .slug) // null) as $slug |
+      (($base | capture($stamped + "(?<slug>.+)[.]yaml$") | .slug) // null) as $slug |
       ((.rec.items // []) | if type == "array" then . else [] end) as $items |
       (if $slug != null then alert_name(.rec.kind; $slug; $items)
        elif ($items | length) > 0 then alert_name(.rec.kind; ""; $items)

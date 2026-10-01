@@ -586,6 +586,8 @@ YAML
   esac
   jq -e '.plugins["retired@test-market"]' "$HOME/.claude/plugins/installed_plugins.json" \
     >/dev/null || fail "a capped tombstone uninstalled anyway"
+  [ -f "$vireo/alerts/vireo/removal-cap.yaml" ] ||
+    fail "the capped run raised no removal-cap alert"
   runjj_dev_group 5
   runjj_out=$(runjj_tomb_run) || fail "the tombstone run failed: $runjj_out"
   case $runjj_out in
@@ -594,6 +596,9 @@ YAML
   esac
   grep -Fqx 'uninstall retired@test-market' "$rjj/plugin-actions" ||
     fail "the tombstone did not go through claude plugin uninstall"
+  # The cap no longer holds anything, so its CONDITION alert is cleared.
+  [ ! -e "$vireo/alerts/vireo/removal-cap.yaml" ] ||
+    fail "the removal-cap alert outlived its condition"
   ! jq -e '.plugins["retired@test-market"]' \
     "$HOME/.claude/plugins/installed_plugins.json" >/dev/null ||
     fail "the uninstalled plugin is still recorded as installed"

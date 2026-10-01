@@ -315,11 +315,75 @@ YAML
       >"$rec_aging/alerts/vireo/removal-cap.yaml"
     printf 'kind: removal-cap\nat: "2001-01-01T00:00:00Z"\n' \
       >"$rec_aging/alerts/vireo/20010101T0000-removal-cap.yaml"
+    # An EVENT alert, keyed or not, and a kind no table lists still age.
+    printf 'kind: lock-takeover\nat: "2001-01-01T00:00:00Z"\n' \
+      >"$rec_aging/alerts/vireo/lock-takeover.yaml"
+    printf 'kind: some-future-kind\nat: "2001-01-01T00:00:00Z"\n' \
+      >"$rec_aging/alerts/vireo/some-future-kind.yaml"
     fleet_trust_age_evidence "$rec_aging" 90
     [ -f "$rec_aging/alerts/vireo/removal-cap.yaml" ] ||
-      fail "evidence aging deleted a keyed (open) alert by its first-seen time"
+      fail "evidence aging deleted a keyed CONDITION alert by its first-seen time"
     [ ! -f "$rec_aging/alerts/vireo/20010101T0000-removal-cap.yaml" ] ||
       fail "evidence aging stopped aging stamped alerts"
+    [ ! -f "$rec_aging/alerts/vireo/lock-takeover.yaml" ] &&
+      [ ! -f "$rec_aging/alerts/vireo/some-future-kind.yaml" ] ||
+      fail "an event alert, or an unlisted kind, did not age out"
+
+    # --- every alert kind has a lifecycle, from one table ---
+    for rec_kind in removal-cap integrity identity-unavailable uninstall-deferred \
+      stale-host schedule-disabled schedule-missing; do
+      [ "$(fleet_alert_lifecycle "$rec_kind")" = condition ] ||
+        fail "$rec_kind is not a condition alert"
+    done
+    for rec_kind in lock-takeover canary-override hold never-heard-of-it; do
+      [ "$(fleet_alert_lifecycle "$rec_kind")" = event ] ||
+        fail "$rec_kind is not an event alert"
+    done
+    # The fast name path and the jq filter agree, and an unsafe key takes jq.
+    for rec_args in 'removal-cap removal-cap' 'integrity integrity-plugins-x plugins.x' \
+      'config-key-collision c config_files.~/.a/b' 'k s plugins.x@m' 'k s a b'; do
+      # shellcheck disable=SC2086 # the argument vector under test
+      set -- $rec_args
+      rec_fast=$(fleet_alert_name "$@")
+      rec_kind=$1 rec_slug=$2
+      shift 2
+      rec_slow=$(jq -rn --arg kind "$rec_kind" --arg slug "$rec_slug" --args \
+        "$fleet_alert_name_filter"' alert_name($kind; $slug; $ARGS.positional)' "$@")
+      [ "$rec_fast" = "$rec_slow" ] ||
+        fail "fleet_alert_name and the shared filter disagree: $rec_fast vs $rec_slow"
+    done
+    # A condition alert is CLEARED when its condition ends, and raised again
+    # only if it returns.
+    rec_life="$tmp/records/lifecycle"
+    rm -rf "$rec_life"
+    mkdir -p "$rec_life"
+    fleet_alert_write "$rec_life" vireo package-hold package-hold-packages-jq \
+      'no package manager on this host can provide packages.jq' packages.jq
+    [ -f "$rec_life/alerts/vireo/package-hold--packages.jq.yaml" ] ||
+      fail "the condition alert was not raised"
+    fleet_alert_clear "$rec_life" vireo package-hold package-hold-packages-jq packages.jq
+    [ ! -e "$rec_life/alerts/vireo/package-hold--packages.jq.yaml" ] ||
+      fail "fleet_alert_clear left the alert behind"
+    fleet_alert_clear "$rec_life" vireo package-hold package-hold-packages-jq packages.jq ||
+      fail "clearing an alert that is not there failed"
+    fleet_alert_write "$rec_life" vireo package-hold package-hold-packages-jq \
+      'no package manager on this host can provide packages.jq' packages.jq
+    [ -f "$rec_life/alerts/vireo/package-hold--packages.jq.yaml" ] ||
+      fail "a returning condition was not raised again"
+    fleet_alert_write "$rec_life" vireo config-key-collision config-key-collision \
+      'collides' 'config_files.~/.claude/settings.json'
+    fleet_alert_clear "$rec_life" vireo config-key-collision config-key-collision \
+      'config_files.~/.claude/settings.json'
+    [ -z "$(find "$rec_life/alerts/vireo" -name 'config-key-collision*')" ] ||
+      fail "fleet_alert_clear did not find an encoded key"
+    # The run's sweep clears the per-item alerts this pass did not raise.
+    fleet_alert_write "$rec_life" vireo package-hold package-hold-packages-rg \
+      'no package manager on this host can provide packages.rg' packages.rg
+    printf 'package-hold\tpackages.jq\n' >"$rec_life/raised"
+    fleet_run_alert_sweep "$rec_life" vireo "$rec_life/raised" package-hold
+    [ -f "$rec_life/alerts/vireo/package-hold--packages.jq.yaml" ] &&
+      [ ! -e "$rec_life/alerts/vireo/package-hold--packages.rg.yaml" ] ||
+      fail "the sweep did not keep the raised alert and clear the ended one"
 
     # --- §6.4 the one-time compaction of the stamped form ---
     rec_compact="$tmp/records/compact"

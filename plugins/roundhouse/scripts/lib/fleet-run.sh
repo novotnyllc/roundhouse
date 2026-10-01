@@ -1470,7 +1470,12 @@ fleet_run_alerts() {
   # PRINTS the holds it detected and the caller acts on them: `!hold <reason>`
   # for the two §7.7 store-wide rows, `<item> <reason>` for a collision, which
   # is a refusal of that config file's widening and not of the store.
+  #
+  # Every kind here is a CONDITION alert (fleet_alert_lifecycle_table): each
+  # check clears its alert when it no longer holds.
   fleet_run_unknown=$(fleet_unknown_categories "$3" | tr '\n' ' ')
+  [ -n "${fleet_run_unknown% }" ] ||
+    fleet_alert_clear "$1" "$2" unknown-category unknown-category
   [ -z "${fleet_run_unknown% }" ] || {
     fleet_alert_write "$1" "$2" unknown-category unknown-category \
       "top-level keys that are neither a category nor a host fact: ${fleet_run_unknown% }" ||
@@ -1481,16 +1486,20 @@ fleet_run_alerts() {
   # The real tree, not the exported layers: an unrecognised directory is one
   # nothing folded, so a dir-filtered export can never see it.
   fleet_run_unknown=$(fleet_unknown_layer_dirs "$1" | tr '\n' ' ')
+  [ -n "${fleet_run_unknown% }" ] ||
+    fleet_alert_clear "$1" "$2" unknown-store-dir unknown-store-dir
   [ -z "${fleet_run_unknown% }" ] || {
     fleet_alert_write "$1" "$2" unknown-store-dir unknown-store-dir \
       "unrecognised store directories: ${fleet_run_unknown% }" || :
     printf '!hold %s\n' \
       "unrecognised store directories: ${fleet_run_unknown% }"
   }
+  fleet_run_raised=$(mktemp "${TMPDIR:-/tmp}/roundhouse-raised.XXXXXX") || return 0
   fleet_config_key_collisions "$3" |
     while IFS=$(printf '\t') read -r fleet_run_file fleet_run_key; do
       [ -n "$fleet_run_file" ] || continue
-      fleet_alert_write "$1" "$2" config-key-collision config-key-collision \
+      fleet_run_alert_raise "$fleet_run_raised" "$1" "$2" config-key-collision \
+        config-key-collision \
         "$fleet_run_file: managed key $fleet_run_key collides with a never namespace" \
         "config_files.$fleet_run_file" || :
       printf 'config_files.%s managed key %s collides with a never namespace\n' \
@@ -1499,10 +1508,45 @@ fleet_run_alerts() {
   fleet_config_coowned "$3" |
     while IFS=$(printf '\t') read -r fleet_run_file fleet_run_key; do
       [ -n "$fleet_run_file" ] || continue
-      fleet_alert_write "$1" "$2" chezmoi-coownership chezmoi-coownership \
+      fleet_run_alert_raise "$fleet_run_raised" "$1" "$2" chezmoi-coownership \
+        chezmoi-coownership \
         "$fleet_run_file: managed key $fleet_run_key is also written by chezmoi" \
         "config_files.$fleet_run_file" || :
     done
+  fleet_run_alert_sweep "$1" "$2" "$fleet_run_raised" \
+    config-key-collision chezmoi-coownership
+  rm -f "$fleet_run_raised"
+}
+
+fleet_run_alert_raise() {
+  # fleet_run_alert_raise RAISED STORE HOST KIND SLUG DETAIL ITEM — raise a
+  # per-item CONDITION alert and note it in RAISED, so fleet_run_alert_sweep
+  # clears every alert of that kind the same pass did NOT raise: the condition
+  # ended, or the item left the layers.
+  printf '%s\t%s\n' "$4" "$7" >>"$1"
+  shift
+  fleet_alert_write "$@"
+}
+
+fleet_run_alert_sweep() {
+  # fleet_run_alert_sweep STORE HOST RAISED KIND... — clear (fleet_alert_clear)
+  # each of this host's per-item alerts of each KIND whose item RAISED does
+  # not list. Free when there are none: a glob, no subprocess.
+  alert_sweep_store=$1
+  alert_sweep_host=$2
+  alert_sweep_raised=$3
+  shift 3
+  for alert_sweep_kind in "$@"; do
+    for alert_sweep_file in "$alert_sweep_store/alerts/$alert_sweep_host/$alert_sweep_kind"--*.yaml; do
+      [ -f "$alert_sweep_file" ] || continue
+      alert_sweep_item=$(yq -r '.items[0] // ""' "$alert_sweep_file" 2>/dev/null) || continue
+      [ -n "$alert_sweep_item" ] || continue
+      ! grep -Fqx -- "$(printf '%s\t%s' "$alert_sweep_kind" "$alert_sweep_item")" \
+        "$alert_sweep_raised" 2>/dev/null || continue
+      fleet_alert_clear "$alert_sweep_store" "$alert_sweep_host" "$alert_sweep_kind" \
+        "$alert_sweep_kind" "$alert_sweep_item"
+    done
+  done
 }
 
 # --- §6 step 6 and §6.1(b): publication and the nudge -------------------------
@@ -1690,7 +1734,7 @@ fleet_run_command() (
   if [ -n "$run_fetched_head" ]; then
     if run_catchup=$(fleet_trust_catch_up "$run_store" "$run_fetched_head") &&
       [ -z "$run_catchup" ]; then
-      :
+      fleet_alert_clear "$run_store" "$run_host" rollback rollback
     else
       fleet_alert_write "$run_store" "$run_host" rollback rollback \
         "refusing the fetched head: $(printf '%s' "${run_catchup:-reviewed-ref is not an ancestor of the fetched head}" | head -c 300)" ||
@@ -1734,6 +1778,7 @@ fleet_run_command() (
         exit 65
       }
     else
+      fleet_alert_clear "$run_store" "$run_host" layer-parse layer-parse
       run_out=$(fleet_vcs_reconcile "$run_store" "$run_host" "scheduled/agent" \
         "$run_mode convergence") || exit $?
       run_state=${run_out%% *}
@@ -1810,6 +1855,7 @@ fleet_run_command() (
     printf 'roundhouse: %s; holding everything (§7.7/§7.12.5)\n' "$run_full_hold" >&2
     exit 65
   fi
+  fleet_alert_clear "$run_store" "$run_host" integrity integrity-store-wide
 
   # §7.9: install the roster the ratchet derived, and compare what is already
   # installed against it. The compare is nearly free and fails in a DIFFERENT
@@ -1846,6 +1892,8 @@ fleet_run_command() (
       printf 'roundhouse: %s; holding everything (§7.9)\n' "$run_drift" >&2
       exit 65
     }
+    fleet_alert_clear "$run_store" "$run_host" materialization materialization-refused
+    fleet_alert_clear "$run_store" "$run_host" materialization materialization
   fi
 
   fleet_run_alerts "$run_store" "$run_host" "$run_fold" "$run_layers" \
@@ -1874,6 +1922,7 @@ fleet_run_command() (
   if fleet_ssh_config_render "$run_layers" "$HOME/.ssh/config.d/roundhouse" \
     2>/dev/null; then
     fleet_run_ssh_include || :
+    fleet_alert_clear "$run_store" "$run_host" ssh-render ssh-render
   else
     fleet_alert_write "$run_store" "$run_host" ssh-render ssh-render \
       'a host field failed validation; no ssh config was rendered (§5)' || :
@@ -1913,6 +1962,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   ! grep -Fqx "$run_host" "$run_tmp/canaries" || run_self_canary=true
   run_now=$(fleet_now)
   run_applied_items=
+  : >"$run_tmp/raised"
 
   # §10.3's removal set, capped BEFORE any removal applies: ONE tagged list,
   # `prune ITEM` (owned, gone from the layers) and `uninstall ITEM` (a
@@ -1953,6 +2003,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   done <"$run_tmp/tombstones" >>"$run_tmp/removals"
   run_removals_held=$(fleet_run_removals_over "$run_tmp/removals" \
     "$(fleet_applied_count "$run_store" "$run_host")" "$run_fold")
+  [ -n "$run_removals_held" ] ||
+    fleet_alert_clear "$run_store" "$run_host" removal-cap removal-cap
   [ -z "$run_removals_held" ] ||
     fleet_alert_write "$run_store" "$run_host" removal-cap removal-cap \
       "over the removal cap, held whole: $(printf '%s\n' "$run_removals_held" |
@@ -1988,7 +2040,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       "$run_tmp/sigholds")
     if [ -n "$run_hold" ]; then
       printf '  hold  %s —%s\n' "$run_item" "$run_hold"
-      fleet_alert_write "$run_store" "$run_host" integrity \
+      fleet_run_alert_raise "$run_tmp/raised" "$run_store" "$run_host" integrity \
         "integrity-$(printf '%s' "$run_item" | tr './' '--')" \
         "$run_item held:$run_hold" "$run_item" || :
       fleet_journal_append "$run_store" "$run_host" \
@@ -2062,6 +2114,10 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
           fleet_run_runtime_hold "$run_item" \
             "installed marketplace identity unavailable: ${fleet_run_identity_reason:-unproven}" \
             "$run_tmp/sigholds" || exit 65
+          fleet_run_alert_raise "$run_tmp/raised" "$run_store" "$run_host" \
+            identity-unavailable identity-unavailable \
+            "$(printf '%s' "installed marketplace identity unavailable: ${fleet_run_identity_reason:-unproven}" | head -c 380)" \
+            "$run_item" || :
           fleet_journal_append "$run_store" "$run_host" \
             "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
               '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
@@ -2112,6 +2168,13 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     if [ "$run_tombstone" = true ]; then
       fleet_run_tombstone_converge "$run_store" "$run_host" "$run_defs" \
         "$run_item" "$run_value" "$run_digest" "$run_now" || run_status=$?
+      # A live-session deferral is a condition with a record of its own; the
+      # alert stands while the record does.
+      [ "$run_status" -ne 75 ] || [ ! -f "$(fleet_run_deferral_path "$run_item")" ] ||
+        fleet_run_alert_raise "$run_tmp/raised" "$run_store" "$run_host" \
+          uninstall-deferred uninstall-deferred \
+          "$run_item is enabled and a claude session is running; its uninstall waits up to 24h from the first deferral" \
+          "$run_item" || :
       case $run_status in
         0)
           run_applied_items="$run_applied_items$run_item "
@@ -2134,7 +2197,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
           "$run_now" || {
           printf 'roundhouse: could not record %s in applied/%s.yaml; the item is applied but unowned\n' \
             "$run_item" "$run_host" >&2
-          fleet_alert_write "$run_store" "$run_host" record-write \
+          fleet_run_alert_raise "$run_tmp/raised" "$run_store" "$run_host" record-write \
             "record-write-$(printf '%s' "$run_item" | tr './' '--')" \
             "applied/$run_host.yaml could not be updated for $run_item" \
             "$run_item" || :
@@ -2166,6 +2229,10 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         ;;
     esac
   done 9<"$run_tmp/verdicts"
+  # The per-item CONDITION alerts this pass did not raise have ended.
+  fleet_run_alert_sweep "$run_store" "$run_host" "$run_tmp/raised" \
+    integrity identity-unavailable uninstall-deferred record-write package-hold \
+    enabled-but-untrusted
 
   # --- the full cadence's maintenance half ---
   if [ "$run_mode" = full ]; then
@@ -2451,7 +2518,7 @@ fleet_run_apply_held() {
   fleet_run_runtime_hold "$4" "apply status $7" "$8/sigholds" || return 65
   [ "$5" != runtimes ] || fleet_run_node_alert "$1" "$2" "$7" "$4"
   [ "$7" -ne 75 ] || [ "$5" != packages ] ||
-    fleet_alert_write "$1" "$2" package-hold \
+    fleet_run_alert_raise "$8/raised" "$1" "$2" package-hold \
       "package-hold-$(printf '%s' "$4" | tr './' '--')" \
       "no package manager on this host can provide $4" "$4" ||
     :
@@ -2466,7 +2533,7 @@ fleet_run_apply_held() {
   # because an exit status that carries prose is an exit status nobody
   # can test.
   [ "$7" -ne 75 ] || [ "$5" != hooks ] ||
-    fleet_alert_write "$1" "$2" enabled-but-untrusted \
+    fleet_run_alert_raise "$8/raised" "$1" "$2" enabled-but-untrusted \
       "enabled-but-untrusted-$(printf '%s' "$4" | tr './' '--')" \
       "$(fleet_hook_trust "$1" "$2" "$3" "${4#hooks.}" || :)" "$4" ||
     :

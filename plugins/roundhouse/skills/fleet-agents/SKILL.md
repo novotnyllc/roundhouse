@@ -140,8 +140,19 @@ no item; `<kind>.yaml` when that slug is the kind itself. Both parts are
 URI-encoded, so an item such as `config_files.~/.claude/settings.json` stays one
 path component (`config_files.~%2F.claude%2Fsettings.json`). The alert's `at`
 is when it was **first seen**: a condition that is still true on the next pass
-rewrites nothing, a change in what the alert says rewrites it with the same
-`at`, and keyed alerts never age out — only `rm` resolves them.
+rewrites nothing, and a change in what the alert says rewrites it with the same
+`at`.
+
+How an alert ENDS depends on its kind, from one table
+(`fleet_alert_lifecycle_table` in `lib/fleet-records.sh`):
+
+| Lifecycle | Kinds | Ends |
+| --- | --- | --- |
+| condition | `removal-cap`, `integrity`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `config-key-collision`, `chezmoi-coownership`, `ssh-render`, `package-hold`, `enabled-but-untrusted`, `record-write`, `identity-unavailable`, `uninstall-deferred`, `stale-host`, `schedule-disabled`, `schedule-missing` | the check that raised it clears it (`fleet_alert_clear`) on the first pass its condition no longer holds; never ages |
+| event | `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by `at` after the evidence retention window |
+
+`rm` on the file still resolves any alert by hand; a condition alert that is
+removed while its condition holds is raised again on the next pass.
 
 ### Record maintenance and ownership
 
