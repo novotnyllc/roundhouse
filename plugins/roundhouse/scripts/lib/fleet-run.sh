@@ -2385,10 +2385,12 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   run_now=$(fleet_now)
   run_applied_items=
 
-  # §10.3's removal set, capped BEFORE any removal applies. Over the cap the
-  # ENTIRE set holds — neither term catches a one-line deletion, and nothing
-  # should: that is a legitimate edit, and its defence is apply-time review
-  # naming the item.
+  # §10.3's removal set, capped BEFORE any removal applies: ONE tagged list,
+  # `prune ITEM` (owned, gone from the layers) and `uninstall ITEM` (a
+  # tombstone with something installed here), and one over-cap rule
+  # (fleet_run_removals_over). Over the cap a tag's ENTIRE set holds — neither
+  # term catches a one-line deletion, and nothing should: that is a legitimate
+  # edit, and its defence is apply-time review naming the item.
   : >"$run_tmp/removals"
   fleet_record_read "$(fleet_applied_path "$run_store" "$run_host")" '{}' |
     jq -r '(.items // {}) | keys[]' |
@@ -2405,18 +2407,17 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       # prune it with a false `outcome: reverted` record.
       ! awk -v i="$run_owned" '$1 == i { found = 1 } END { exit(found ? 0 : 1) }' \
         "$run_tmp/values" || continue
-      printf '%s\n' "$run_owned"
+      printf 'prune %s\n' "$run_owned"
     done >"$run_tmp/removals"
   # A tombstone that would UNINSTALL something here is a genuine removal and
-  # counts toward the same cap; one that finds nothing installed changes
-  # nothing and does not. Undecidable (fleet_run_tombstone_target's 75) counts,
-  # because the cap is the direction to be wrong in.
+  # joins the list; one that finds nothing installed changes nothing and does
+  # not. Undecidable (fleet_run_tombstone_target's 75) joins it, because the
+  # cap is the direction to be wrong in.
   printf '%s\n' "$run_fold" "$run_tombstones" | jq -r -s '
     [.[] | (.plugins // {}) | select(type == "object") | to_entries[] |
       select(.value == "absent" or
         ((.value | type) == "object" and .value.state == "absent")) |
       "plugins." + .key] | unique | .[]' >"$run_tmp/tombstones"
-  : >"$run_tmp/tombstone-removals"
   while IFS= read -r run_tomb_item; do
     [ -n "$run_tomb_item" ] || continue
     ! grep -Fqx "held $run_tomb_item" "$run_tmp/verdicts" || continue
@@ -2425,27 +2426,27 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       run_tomb_value=$(fleet_item_value "$run_tombstones" "$run_tomb_item")
     run_tomb_target=$(fleet_run_tombstone_target "$run_defs" \
       "${run_tomb_item#plugins.}" "$run_tomb_value") || run_tomb_target=undecidable
-    [ -z "$run_tomb_target" ] || printf '%s\n' "$run_tomb_item"
-  done <"$run_tmp/tombstones" >"$run_tmp/tombstone-removals"
-  run_removals=$(cat "$run_tmp/removals" "$run_tmp/tombstone-removals" | grep -c . || true)
-  run_removals_ok=true
-  fleet_removal_cap "$run_removals" "$(fleet_applied_count "$run_store" "$run_host")" \
-    "$(fleet_policy_get "$run_fold" max_removals_per_run)" \
-    "$(fleet_policy_get "$run_fold" max_removal_fraction)" >/dev/null ||
-    run_removals_ok=false
-  if [ "$run_removals_ok" != true ]; then
+    [ -z "$run_tomb_target" ] || printf 'uninstall %s\n' "$run_tomb_item"
+  done <"$run_tmp/tombstones" >>"$run_tmp/removals"
+  run_removals_held=$(fleet_run_removals_over "$run_tmp/removals" \
+    "$(fleet_applied_count "$run_store" "$run_host")" "$run_fold")
+  [ -z "$run_removals_held" ] ||
     fleet_alert_write "$run_store" "$run_host" removal-cap removal-cap \
-      "$run_removals removals exceed the cap; the entire removal set is held" || :
-    : >"$run_tmp/removals"
-  fi
-  while IFS= read -r run_owned; do
+      "over the removal cap, held whole: $(printf '%s\n' "$run_removals_held" |
+        awk '{ n[$1]++ } END { for (t in n) printf "%s%d %s", (s++ ? ", " : ""), n[t], t }')" ||
+    :
+  run_uninstalls_ok=true
+  ! printf '%s\n' "$run_removals_held" | grep -q '^uninstall ' || run_uninstalls_ok=false
+  printf '%s\n' "$run_removals_held" | grep -q '^prune ' ||
+    awk '$1 == "prune" { sub(/^prune /, ""); print }' "$run_tmp/removals" |
+    while IFS= read -r run_owned; do
     [ -n "$run_owned" ] || continue
     printf '  prune %s (in applied/, gone from the layers)\n' "$run_owned"
     fleet_applied_forget "$run_store" "$run_host" "$run_owned"
     fleet_journal_append "$run_store" "$run_host" \
       "$(jq -cn --arg item "$run_owned" --arg at "$run_now" \
         '{item:$item,digest:"absent",outcome:"reverted",at:$at}')" || :
-  done <"$run_tmp/removals"
+  done
 
   # THE VERDICT LIST IS READ ON FD 9, not on stdin. This loop's body runs
   # `brew`, `claude` and `git clone`; measured, one greedy child consumed the
@@ -2501,14 +2502,14 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     run_tomb_removal=false
     if grep -Fqx "$run_item" "$run_tmp/tombstones"; then
       run_tombstone=true
-      ! grep -Fqx "$run_item" "$run_tmp/tombstone-removals" || run_tomb_removal=true
+      ! grep -Fqx "uninstall $run_item" "$run_tmp/removals" || run_tomb_removal=true
       if [ "$run_tomb_removal" = false ] &&
         [ "$(cat "$(fleet_run_tombstone_memo_path "$run_item")" 2>/dev/null)" = \
           "$run_digest" ] &&
         [ -z "$(fleet_applied_digest "$run_store" "$run_host" "$run_item")" ]; then
         continue
       fi
-      if [ "$run_tomb_removal" = true ] && [ "$run_removals_ok" != true ]; then
+      if [ "$run_tomb_removal" = true ] && [ "$run_uninstalls_ok" != true ]; then
         printf '  hold  %s — the removal set is over the cap\n' "$run_item"
         fleet_run_runtime_hold "$run_item" 'removal cap' "$run_tmp/sigholds" ||
           exit 65
@@ -2968,6 +2969,28 @@ fleet_run_apply_held() {
   else
     printf '  held    %s (this host could not apply it, or a gate refused)\n' "$4"
   fi
+}
+
+fleet_run_removals_over() {
+  # fleet_run_removals_over REMOVALS APPLIED_COUNT FOLD -> the tagged lines of
+  # the removal list that are OVER the cap, one per line (silence when within
+  # it). The one over-cap rule both tags share, applied per tag, so a tag
+  # over its cap holds whole and the other tag is untouched:
+  #
+  #   prune      fleet_removal_cap's two terms, as always: forgetting owned
+  #              items is sized against how much this host owns.
+  #   uninstall  max_removals_per_run alone. A tombstone uninstalls software
+  #              this host may never have owned, so `applied × fraction` says
+  #              nothing about its blast radius — and on a host that owns
+  #              little it would hold every tombstone forever.
+  removals_over_prunes=$(grep -c '^prune ' "$1" || true)
+  removals_over_uninstalls=$(grep -c '^uninstall ' "$1" || true)
+  fleet_removal_cap "$removals_over_prunes" "$2" \
+    "$(fleet_policy_get "$3" max_removals_per_run)" \
+    "$(fleet_policy_get "$3" max_removal_fraction)" >/dev/null ||
+    grep '^prune ' "$1"
+  [ "$removals_over_uninstalls" -le "$(fleet_policy_int "$3" max_removals_per_run)" ] ||
+    grep '^uninstall ' "$1"
 }
 
 fleet_run_runtime_hold() {

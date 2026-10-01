@@ -233,6 +233,31 @@ YAML
     fleet_removal_cap 1 100 5 0.25 >/dev/null ||
       fail "a one-line deletion was held by a blast-radius cap"
 
+    # --- one tagged removal list, one over-cap rule, applied per tag ---
+    # Prunes keep both terms; tombstone uninstalls are capped by count alone
+    # (a host that owns little must not hold every tombstone forever), and a
+    # tag over its cap holds whole without touching the other tag.
+    rec_removals="$tmp/records/removals"
+    printf 'prune plugins.a\nprune plugins.b\nuninstall plugins.t1\nuninstall plugins.t2\n' \
+      >"$rec_removals"
+    [ -z "$(fleet_run_removals_over "$rec_removals" 8 \
+      '{"policy":{"max_removals_per_run":5,"max_removal_fraction":0.25}}')" ] ||
+      fail "a removal set within both caps was held"
+    # 2 owned × 0.25 = 0: the prunes hold, the uninstalls (2 <= 5) do not.
+    [ "$(fleet_run_removals_over "$rec_removals" 2 \
+      '{"policy":{"max_removals_per_run":5,"max_removal_fraction":0.25}}' | tr '\n' ' ')" = \
+      'prune plugins.a prune plugins.b ' ] ||
+      fail "the fraction term held tombstone uninstalls, or failed to hold the prunes"
+    # max 1: both tags are over, each held whole.
+    [ "$(fleet_run_removals_over "$rec_removals" 100 \
+      '{"policy":{"max_removals_per_run":1,"max_removal_fraction":1}}' | grep -c .)" -eq 4 ] ||
+      fail "a tag over the per-run count was not held whole"
+    printf 'prune plugins.a\nuninstall plugins.t1\nuninstall plugins.t2\n' >"$rec_removals"
+    [ "$(fleet_run_removals_over "$rec_removals" 100 \
+      '{"policy":{"max_removals_per_run":1,"max_removal_fraction":1}}' | tr '\n' ' ')" = \
+      'uninstall plugins.t1 uninstall plugins.t2 ' ] ||
+      fail "over-cap tombstones cleared a prune set that was within its own cap"
+
     # --- §5 alerts, §10.4 findings, and the redaction floor ---
     fleet_alert_write "$rec_store" vireo unsigned-edit unsigned-hand-edit \
       'Commit 6705e1a3 carries no SSH signature.' plugins.impeccable ||
