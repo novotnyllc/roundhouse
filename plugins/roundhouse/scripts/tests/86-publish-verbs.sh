@@ -81,6 +81,17 @@ EOF
     mkdir -p "$HOME"
     fleet_record_write "$(fleet_identity_path)" '{"name":"vireo"}'
     printf '%s\n' 'policy:' '  canary_group: canary' >"$verb_store/fleet.yaml"
+    # The shared fold (fleet_fold_shared) is the host's fold without its own
+    # tier — its facts still pick the os/ and groups/ tiers.
+    pub_mid="$tmp/publish-verbs/shared"
+    mkdir -p "$pub_mid/hosts" "$pub_mid/groups"
+    printf 'platform: macos\ngroups: [dev]\npackages:\n  host-only: enabled\n' \
+      >"$pub_mid/hosts/vireo.yaml"
+    printf 'packages:\n  from-group: enabled\n' >"$pub_mid/groups/dev.yaml"
+    [ "$(fleet_fold_shared "$pub_mid" vireo | jq -c '.packages | keys')" = '["from-group"]' ] ||
+      fail "the shared fold kept the host tier, or lost the group the host's facts select"
+    [ "$(fleet_fold "$pub_mid" vireo | jq -c '.packages | keys')" = '["from-group","host-only"]' ] ||
+      fail "the ordinary fold lost a tier"
     mkdir -p "$verb_store/groups" "$verb_store/applied"
     printf '%s\n' 'packages:' '  jq: enabled' >"$verb_store/groups/development.yaml"
     printf '%s\n' 'platform: macos' 'groups: [development]' 'plugins:' \

@@ -460,10 +460,10 @@ fi
 grep -qE '^  fleet-explain\)' "$cli" ||
   fail "fleet-explain is not dispatched by the entrypoint"
 
-# --- the fold's two READERS beside the fold itself: tombstones and the shared
-# layers. Both reuse the fold's own merge step and tier list.
+# --- the fold's tombstone READER beside the fold itself: it reuses the fold's
+# own merge step and tier list.
 if [ -n "$fleet_fixture_yq" ]; then
-  printf 'fold: tombstone and shared-layer readers\n'
+  printf 'fold: the tombstone reader\n'
   (
     set -eu
     PATH=$fleet_fixture_path
@@ -505,14 +505,5 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$(fleet_fold "$run_mid" vireo | jq -c '.plugins.x // "gone"')" = '"gone"' ] &&
       [ "$(fleet_fold_tombstones "$run_mid" vireo plugins | jq -c '.plugins.x')" = '"absent"' ] ||
       fail "an absent over a wider map was not knocked out of the fold and read as a tombstone"
-    # The shared fold is the host's fold without its own tier — its facts
-    # still pick the os/ and groups/ tiers.
-    printf 'platform: macos\ngroups: [dev]\npackages:\n  host-only: enabled\n' \
-      >"$run_mid/hosts/vireo.yaml"
-    printf 'packages:\n  from-group: enabled\n' >"$run_mid/groups/dev.yaml"
-    [ "$(fleet_fold_shared "$run_mid" vireo | jq -c '.packages | keys')" = '["from-group"]' ] ||
-      fail "the shared fold kept the host tier, or lost the group the host's facts select"
-    [ "$(fleet_fold "$run_mid" vireo | jq -c '.packages | keys')" = '["from-group","host-only"]' ] ||
-      fail "the ordinary fold lost a tier"
   )
 fi

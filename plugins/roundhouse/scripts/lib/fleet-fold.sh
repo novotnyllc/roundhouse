@@ -67,16 +67,10 @@ fleet_fold_merge_program='. as $layer ireduce ({};
     | (.[] | select(tag == "!!map")) |= with_entries(select(.value != null))))'
 fleet_fold_absent_program='(.[] | select(tag == "!!map")) |= with_entries(select(.value != "absent"))'
 fleet_fold_program="($fleet_fold_merge_program) | $fleet_fold_absent_program"
-# The whole merge rule, in two steps: the MERGE (every layer, low to high) and
-# then the `absent` KNOCKOUT. They are separate so the tombstone reader
-# (fleet_fold_tombstones) can run the identical merge and read what the
-# knockout would remove, rather than keeping a hand copy that could drift.
-#
-# Knocking out once at the END is the same as after every layer, because an
-# `absent` is a SCALAR: a narrower layer that speaks again replaces it whole
-# (`*d` never merges a map into a scalar), so the last layer to speak wins in
-# both readings — `enabled` over `absent` is enabled, `absent` over anything
-# is absent.
+# The merge rule, in two steps — MERGE, then the `absent` KNOCKOUT — so the
+# tombstone reader runs the identical merge instead of a hand copy. Knocking
+# out once at the end equals knocking out per layer: `absent` is a scalar, and
+# a narrower layer that speaks again replaces it whole.
 #
 #   the first |=  the NULL DROP, applied to the incoming layer BEFORE it
 #           merges. §4:416 — a null item value is "no opinion at this layer;
@@ -185,35 +179,14 @@ fleet_fold() (
   fleet_fold_files $(fleet_layer_files "$1" "$2")
 )
 
-fleet_fold_shared() (
-  # `fleet_fold_shared LAYERDIR HOST` — HOST's fold WITHOUT its own host tier:
-  # what the fleet, its platform and its groups want for it. An item this
-  # host owns that is absent here exists only because the host's own layer
-  # (often a machine snapshot) asked for it — the set `fleet-disown
-  # --host-only` selects. The host file is still READ, because its facts pick
-  # the os/ and groups/ tiers.
-  IFS='
-'
-  set -f
-  # shellcheck disable=SC2046 # deliberate word splitting over the file list
-  fleet_fold_files $(fleet_layer_files "$1" "$2" |
-    awk -v flat="$1/hosts/$2.yaml" -v dir="$1/hosts/$2/" \
-      '$0 != flat && index($0, dir) != 1')
-)
-
 fleet_fold_tombstones() (
   # `fleet_fold_tombstones LAYERDIR HOST CATEGORY` — the items of CATEGORY whose
   # effective value at HOST is the scalar `absent`, as a fold-shaped document
   # (`{"plugins":{"x":"absent"}}`, or `{}`).
   #
-  # §3.4's tombstone. The fold's knockout makes `absent` mean "no opinion
-  # here", which is right for every reader of desired state and is why this is
-  # a SEPARATE read rather than a change to the fold: it is the fold's own
-  # merge step (fleet_fold_merge_program) without the knockout, so the last
-  # layer to speak still wins — a narrower layer that re-adds the item
-  # un-tombstones it, and a narrower `absent` over a wider `enabled` is a
-  # tombstone. The map form (`{state: absent}`) is not knocked out at all and
-  # already reaches the run through the ordinary fold.
+  # §3.4. A SEPARATE read, because the knockout is right for every reader of
+  # desired state: the fold's own merge step without it, so the last layer to
+  # speak still wins. `{state: absent}` is never knocked out at all.
   IFS='
 '
   set -f
@@ -221,12 +194,9 @@ fleet_fold_tombstones() (
   set -- "$3" $(fleet_layer_files "$1" "$2")
   tombstone_category=$1
   shift
-  [ "$#" -gt 0 ] || {
-    printf '{}\n'
-    return
-  }
-  yq ea -o=json -I=0 "$fleet_fold_merge_program" \
-    "$@" | jq -c --arg c "$tombstone_category" '
+  [ "$#" -gt 0 ] || { printf '{}\n'; return; }
+  yq ea -o=json -I=0 "$fleet_fold_merge_program" "$@" |
+    jq -c --arg c "$tombstone_category" '
       (.[$c] // {}) as $entries |
       if ($entries | type) != "object" then {}
       else ($entries | with_entries(select(.value == "absent"))) as $dead |
