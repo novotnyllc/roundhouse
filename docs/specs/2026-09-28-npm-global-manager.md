@@ -313,6 +313,9 @@ token of each line; `--filter`/`--sort` are not relied on. A failed query is
 make the record a precondition over the whole global set, and
 `globals_unpinnable` names the globals a switch could not reinstall by exact
 registry version (`file:`, `link:` or git sourced, or without a version).
+Both come from one `npm ls`, so they cannot disagree; when it fails both are
+null, which means unknown, and the carry rule holds on unknown rather than
+reading it as "none unpinnable".
 
 Windows (`collect-windows.ps1`): the existing `winget:OpenJS.NodeJS` record
 gains `pin` (`{type:"Gating",version:"26.*"}` from `winget pin list`),
@@ -398,7 +401,8 @@ requirement is a floor.
     version cannot be installed, the carry fails, the default is restored,
     and the switch holds. `npm` comes from the new Node; the npm pass that
     follows moves a store-managed npm forward.
-  - *Holds*: a global that cannot be reinstalled by exact registry version
+  - *Holds*: an unknown unpinnable set (the inventory detail failed), a
+    global that cannot be reinstalled by exact registry version
     (`file:`, `link:`, git, no version; the switch names it instead of
     stranding it), a malformed `node_switch` on a definition of a carried
     package, and a required hook the host has not declared.

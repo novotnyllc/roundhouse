@@ -410,8 +410,14 @@ node_switch_plan() (
   # host's config.json (HOOKS, `node_switch_hooks`) declares for the carried
   # packages, in carry order, and is what runs. A required hook that is not
   # declared, or a malformed `node_switch` on a carried package, holds.
+  #
+  # UNPINNABLE that is not a list (null: the detail query failed) is unknown,
+  # and unknown holds: carrying a linked global by version would fetch a
+  # same-named registry package instead of the linked copy.
   jq -cn --argjson globals "$1" --argjson unpinnable "$2" --arg target "$3" \
     --argjson defs "$4" --argjson local "$5" '
+    ($unpinnable | type == "array") as $detail_known |
+    (if $detail_known then $unpinnable else [] end) as $unpinnable |
     def argv_ok: type == "array" and length >= 1 and length <= 8 and
       all(.[]; type == "string") and
       (.[0] | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
@@ -446,6 +452,8 @@ node_switch_plan() (
       required: $required,
       hooks: $hooks,
       held: (first(
+        (if $detail_known then empty else
+          "which npm globals cannot be reinstalled by exact registry version is unknown (the global inventory detail is unavailable); a switch could carry a linked global as a registry package" end),
         ([$unpinnable[] | select(provided(.) | not)] | unique |
           select(length > 0) |
           "npm globals \(join(" ")) cannot be reinstalled by exact registry version (file:, link:, git or no version); a switch would strand them: reinstall them from the registry or remove them"),

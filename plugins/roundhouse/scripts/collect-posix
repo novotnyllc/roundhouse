@@ -2141,11 +2141,16 @@ NPM_UPDATERS
               emit error packages:fnm-updates unavailable high '{}' '[]' \
                 '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"fnm list-remote inventory failed"}]'
             fi
-            # Globals a switch cannot reinstall by exact registry version
-            # (file:, link:, git, no version). A switch holds on them.
-            node_unpinnable='[]'
+            # The global set a switch would carry, and the globals it cannot
+            # reinstall by exact registry version (file:, link:, git, no
+            # version), from ONE `npm ls`, so the two can never disagree. A
+            # failed query is UNKNOWN (both null), never "none unpinnable":
+            # sealing and the switch hold on it.
+            node_globals=null
+            node_unpinnable=null
             if node_detail=$(npm_global_list_detail 2>/dev/null) &&
               node_split=$(node_globals_split "$node_detail"); then
+              node_globals=$(printf '%s\n' "$node_split" | jq -c '.globals')
               node_unpinnable=$(printf '%s\n' "$node_split" | jq -c '.unpinnable')
             fi
             # Configured post-switch hooks, proven the same way as updaters:
@@ -2176,7 +2181,7 @@ NODE_HOOKS
               --arg candidate "$node_candidate" --argjson known "$node_candidate_known" \
               --arg line "$node_line" --argjson installed "$node_installed_list" \
               --arg root "$node_root" --arg prefix "$node_prefix" \
-              --arg globals "${npm_installed:-}" --argjson unproven "$node_hooks_unproven" \
+              --argjson globals "$node_globals" --argjson unproven "$node_hooks_unproven" \
               --argjson unpinnable "$node_unpinnable" '
                 {schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
                   host_id:$host_id,kind:"package",id:"fnm:node",observed_at:$observed_at,
@@ -2188,7 +2193,7 @@ NODE_HOOKS
                     stale_versions:($installed - [$default]),
                     fnm_dir:($root[0:8192]),
                     prefix:(if $prefix == "" then null else $prefix end),
-                    globals:(if $globals == "" then null else ($globals | fromjson) end),
+                    globals:$globals,
                     globals_unpinnable:$unpinnable,
                     switch_hooks_unproven:$unproven},
                   evidence:[{source:"package-manager",method:"fnm-default-alias+list-remote"}],errors:[]}'

@@ -570,11 +570,11 @@ fleet_node_snapshot_verify() {
   snapshot_verify_record=$(jq -cs 'first(.[] | select(.kind == "package" and .id == "fnm:node" and
     .status == "present") | .data) // null' "$2")
   printf '%s\n' "$snapshot_verify_record" | jq -e '(.globals | type == "object") and
-    ((.globals_unpinnable // []) | type == "array") and (.installed_version | type == "string")' \
+    (.installed_version | type == "string")' \
     >/dev/null 2>&1 || return 1
   snapshot_verify_plan=$(node_switch_plan \
     "$(printf '%s\n' "$snapshot_verify_record" | jq -c '.globals')" \
-    "$(printf '%s\n' "$snapshot_verify_record" | jq -c '.globals_unpinnable // []')" \
+    "$(printf '%s\n' "$snapshot_verify_record" | jq -c '.globals_unpinnable')" \
     "$(jq -r 'first(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node")) |
       .candidate_version' "$1")" '{}' \
     "$(jq -c '.node_switch_hooks // {}' "$3")") || return 1

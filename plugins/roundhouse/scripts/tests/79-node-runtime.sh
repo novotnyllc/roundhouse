@@ -46,6 +46,8 @@ case "$1 ${2:-}" in
   "prefix --global") printf '%s\n' "$prefix" ;;
   "root --global") printf '%s/lib/node_modules\n' "$prefix" ;;
   "ls --global")
+    [ "${NRT_NPM_LS_FAIL:-0}" != 1 ] ||
+      { printf '%s\n' '{"error":{"code":"ENOTDIR","summary":"prefix is not a directory"}}'; exit 1; }
     # NRT_NPM_LINKED adds an `npm link`ed global: file:-resolved, not
     # reinstallable by registry version.
     jq -c --arg linked "${NRT_NPM_LINKED:-}" '{name:"lib",dependencies:(with_entries(.value = {version:.value}) +
@@ -331,6 +333,10 @@ nrt_reset
   [ "$(NRT_NPM_LINKED=devtool node_globals_split "$(NRT_NPM_LINKED=devtool npm_global_list_detail)" |
     jq -c '.unpinnable')" = '["devtool"]' ] ||
     fail "a file:/link global was not reported unpinnable"
+  # A failed detail query is UNKNOWN, never "nothing unpinnable": it holds.
+  nrt_plan_for local-declared "$nrt_globals_now" null |
+    jq -e '.held | startswith("which npm globals cannot be reinstalled by exact registry version is unknown")' \
+    >/dev/null || fail "an unknown unpinnable set did not hold the switch"
   nrt_plan_for local-declared "$nrt_globals_now" '["devtool"]' |
     jq -e '.held | startswith("npm globals devtool cannot be reinstalled by exact registry version")' \
     >/dev/null || fail "an unpinnable global did not hold the switch"
@@ -352,6 +358,13 @@ nrt_reset
     grep -Fq '  hold  runtimes.node — npm globals devtool cannot be reinstalled' "$nrt_root/converge-out" &&
     ! grep -Eq 'fnm (install|default) |npm install' "$nrt_log" ||
     fail "a switch ran while a linked global could not be carried"
+  # A failed global inventory holds the switch before anything moves.
+  nrt_status=0
+  NRT_NPM_LS_FAIL=1 nrt_converge local-declared '{"major":26}' full || nrt_status=$?
+  [ "$nrt_status" -eq 75 ] && [ "$(nrt_default)" = v26.0.0 ] &&
+    grep -Fq '  hold  runtimes.node — the npm global inventory under v26.0.0 failed' "$nrt_root/converge-out" &&
+    ! grep -Eq 'fnm (install|default) |npm install' "$nrt_log" ||
+    fail "a switch ran while the global inventory was unknown"
   # A store-only hook holds the switch and changes nothing.
   nrt_status=0
   nrt_converge local-undeclared '{"major":26}' full || nrt_status=$?
@@ -627,6 +640,19 @@ else
   nrt_draft v26.10.0 "$nrt_carry" "$nrt_hooks" fnm default v26.10.0 >"$tmp/node-draft.json"
   nrt_seal_refused 'an unpinnable global installed' "$tmp/node-draft.json" "$tmp/node-linked-snapshot.jsonl"
   assert_contains "$(cat "$nrt_root/seal-refused.log")" 'npm globals devtool cannot be reinstalled'
+  # A collector whose global inventory failed records the set as unknown
+  # (null), never as empty; a snapshot that knows the globals but not which
+  # are unpinnable neither seals nor verifies.
+  NRT_NPM_LS_FAIL=1 nrt_cli collect --target test-host --section host --section packages \
+    --output "$tmp/node-lsfail-snapshot.jsonl" >/dev/null 2>&1 || :
+  [ ! -s "$tmp/node-lsfail-snapshot.jsonl" ] ||
+    [ "$(jq -c 'select(.kind == "package" and .id == "fnm:node") | [.data.globals,.data.globals_unpinnable]' \
+      "$tmp/node-lsfail-snapshot.jsonl")" = '[null,null]' ] ||
+    fail "a failed global inventory was recorded as known"
+  jq -c 'if .kind == "package" and .id == "fnm:node" then .data.globals_unpinnable = null else . end' \
+    "$tmp/node-snapshot.jsonl" >"$tmp/node-unknown-snapshot.jsonl"
+  nrt_seal_refused 'an unknown unpinnable set' "$tmp/node-draft.json" "$tmp/node-unknown-snapshot.jsonl"
+  assert_contains "$(cat "$nrt_root/seal-refused.log")" 'which npm globals cannot be reinstalled by exact registry version is unknown'
   # The switch runs before any npm upgrade in the same plan: an upgrade first
   # would change a version the carry names.
   jq '.operations = [{type:"package-upgrade",kind:"package",id:"npm:plain",candidate_version:"3.0.0",
@@ -764,7 +790,9 @@ else
       "$tmp/node-ssh-snapshot.jsonl" >"$tmp/node-ssh-extra.jsonl"
     fleet_node_snapshot_verify "$tmp/node-ssh-plan.json" "$tmp/node-ssh-snapshot.jsonl" \
       "$tmp/node-ssh-config.json" || fail "the worker rejected a carry its snapshot proves"
-    for nrt_bad_snapshot in uninstalled extra; do
+    jq -c 'if .kind == "package" and .id == "fnm:node" then .data.globals_unpinnable = null else . end' \
+      "$tmp/node-ssh-snapshot.jsonl" >"$tmp/node-ssh-unknown.jsonl"
+    for nrt_bad_snapshot in uninstalled extra unknown; do
       if fleet_node_snapshot_verify "$tmp/node-ssh-plan.json" "$tmp/node-ssh-$nrt_bad_snapshot.jsonl" \
         "$tmp/node-ssh-config.json"; then
         fail "the worker accepted a carry that is not the installed set ($nrt_bad_snapshot)"

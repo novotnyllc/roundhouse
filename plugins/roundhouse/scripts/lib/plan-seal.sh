@@ -446,7 +446,7 @@ seal_plan_command() {
     }
     node_seal_plan=$(node_switch_plan \
       "$(printf '%s\n' "$node_seal_record" | jq -c '.globals')" \
-      "$(printf '%s\n' "$node_seal_record" | jq -c '.globals_unpinnable // []')" \
+      "$(printf '%s\n' "$node_seal_record" | jq -c '.globals_unpinnable')" \
       "$(jq -r 'first(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node")) |
         .candidate_version' "$draft")" \
       "$(fleet_definitions_load "$node_seal_store")" \
