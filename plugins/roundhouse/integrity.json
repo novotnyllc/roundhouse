@@ -118,7 +118,7 @@
     },
     {
       "path": "scripts/lib/fleet-alerts.sh",
-      "sha256": "9ad3da06461e83bb403daa016e5fe768e97c603dbd22a24e69b82b10a9ba8780"
+      "sha256": "ce29083db4d165079381d5b6e3a1e0135d360d503dd4537a635e0b7ca9e90252"
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",

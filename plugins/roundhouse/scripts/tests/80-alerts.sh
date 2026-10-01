@@ -244,6 +244,27 @@ if [ -n "$fleet_fixture_yq" ]; then
       fail "the compaction touched another host's alerts"
     [ "$(fleet_alerts_compact "$rec_compact/store" vireo "$rec_compact/work")" = '0 0 1' ] ||
       fail "a second compaction was not a no-op"
+    # A keyed DESTINATION that exists but cannot be read (a jj conflict) or is
+    # not alert-shaped is never overwritten, and its stamped group stays too.
+    rec_cdest="$tmp/records/compact-dest"
+    rm -rf "$rec_cdest"
+    mkdir -p "$rec_cdest/store/alerts/vireo" "$rec_cdest/work"
+    rec_cdest_dir="$rec_cdest/store/alerts/vireo"
+    printf '<<<<<<< Conflict 1 of 1\n: : not yaml\n' >"$rec_cdest_dir/rollback.yaml"
+    printf -- '- not\n- an alert\n' >"$rec_cdest_dir/layer-parse.yaml"
+    for rec_n in 1 2; do
+      for rec_kind in rollback layer-parse; do
+        printf 'kind: %s\nhost: vireo\nitems: []\ndetail: d%s\nat: "2026-08-0%sT00:00:00Z"\n' \
+          "$rec_kind" "$rec_n" "$rec_n" >"$rec_cdest_dir/2026080${rec_n}T0000-$rec_kind.yaml"
+      done
+    done
+    rec_cdest_before=$(cat "$rec_cdest_dir/rollback.yaml" "$rec_cdest_dir/layer-parse.yaml")
+    fleet_alerts_compact "$rec_cdest/store" vireo "$rec_cdest/work" >/dev/null ||
+      fail "the compaction failed over an unusable destination"
+    [ "$(cat "$rec_cdest_dir/rollback.yaml" "$rec_cdest_dir/layer-parse.yaml")" = "$rec_cdest_before" ] ||
+      fail "the compaction overwrote an unreadable or non-alert keyed destination"
+    [ "$(find "$rec_cdest_dir" -name '2026080?T0000-*' | grep -c .)" -eq 4 ] ||
+      fail "the compaction removed the stamped records of a group it could not land"
     # Compaction and the writer agree on the key, so the next raise of a
     # compacted condition finds its file and writes nothing.
     rec_alert_bytes=$(cat "$rec_compact_dir/integrity--plugins.ponytail.yaml")

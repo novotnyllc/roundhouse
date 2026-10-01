@@ -331,7 +331,12 @@ fleet_alerts_compact() {
        elif ($items | length) > 0 then alert_name(.rec.kind; ""; $items)
        else $base end) as $name |
       {file, rec, base: $base, target: ($dir + "/" + $name)} ] |
+    # A keyed destination that EXISTS but is unreadable or not alert-shaped is
+    # never overwritten: its whole group, destination and stamped records
+    # alike, is left exactly where it is.
+    ($all - ($good | map(.file))) as $unusable |
     group_by(.target) |
+    map(select(.[0].target as $t | any($unusable[]; . == $t) | not)) |
     (.[] | max_by([((.rec.at // "") | tostring), .base]) as $keep |
       (if $keep.file != $keep.target
        then "W\t\($keep.target)\t\($keep.rec | tojson)" else empty end),
