@@ -1625,6 +1625,48 @@ fleet_run_uninstall_plugin() {
   rm -f "$fleet_run_uninstall_deferral"
 }
 
+fleet_run_tombstone_converge() {
+  # fleet_run_tombstone_converge STORE HOST DEFS ITEM VALUE DIGEST AT — THE one
+  # path a tombstone converges through, for the run and for `fleet-apply`
+  # alike: uninstall (fleet_run_uninstall_plugin, through the apply layer),
+  # then — when nothing is installed any more, 0 or 70 — forget any applied/
+  # record (nothing installed is nothing owned, and a recorded tombstone would
+  # read as a prune the day it is compacted away), remember the converged
+  # digest host-locally so later passes stay silent, and journal `applied` or
+  # `satisfied`. Returns the apply status; a 75 is the caller's to hold.
+  tomb_status=0
+  fleet_run_apply_item "$1" "$2" "$3" "$4" "$5" '' || tomb_status=$?
+  case $tomb_status in
+    0 | 70) ;;
+    *) return "$tomb_status" ;;
+  esac
+  [ -z "$(fleet_applied_digest "$1" "$2" "$4")" ] ||
+    fleet_applied_forget "$1" "$2" "$4" || :
+  mkdir -p "$(dirname "$(fleet_run_tombstone_memo_path "$4")")"
+  printf '%s\n' "$6" >"$(fleet_run_tombstone_memo_path "$4")"
+  tomb_outcome=applied
+  [ "$tomb_status" -eq 0 ] || tomb_outcome=satisfied
+  fleet_journal_append "$1" "$2" \
+    "$(jq -cn --arg item "$4" --arg d "$6" --arg at "$7" --arg o "$tomb_outcome" \
+      '{item:$item,digest:$d,outcome:$o,at:$at}')" || :
+  if [ "$tomb_status" -eq 0 ]; then
+    printf '  applied %s (uninstalled)\n' "$4"
+  else
+    printf '  satisfied %s (absent, and not installed here)\n' "$4"
+  fi
+  return "$tomb_status"
+}
+
+fleet_run_desired() {
+  # fleet_run_desired LAYERDIR HOST -> the fold, plus the plugin tombstones its
+  # knockout removed. What the SUPERVISED verbs resolve an item against, so
+  # `fleet-review` and `fleet-apply` see a scalar `absent` tombstone the same
+  # way the run does (the run keeps the two documents apart, because the fold
+  # alone is what every other reader of desired state wants).
+  printf '%s\n' "$(fleet_fold "$1" "$2")" \
+    "$(fleet_fold_tombstones "$1" "$2" plugins)" | jq -c -s '.[0] * .[1]'
+}
+
 fleet_run_apply_item() {
   # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
@@ -2634,33 +2676,20 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     printf '  review %s  %s  %s\n' "$run_item" "${run_value:-<none>}" "$run_digest"
     fleet_run_verdict_write "$run_item" "$run_digest" "$run_reason"
     run_status=0
-    fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
-      "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" ||
-      run_status=$?
     if [ "$run_tombstone" = true ]; then
+      fleet_run_tombstone_converge "$run_store" "$run_host" "$run_defs" \
+        "$run_item" "$run_value" "$run_digest" "$run_now" || run_status=$?
       case $run_status in
-        0 | 70)
-          # Nothing is installed any more, so nothing is owned: a stale
-          # applied/ record goes, and the converged digest is remembered
-          # host-locally so the next pass stays silent.
-          [ -z "$(fleet_applied_digest "$run_store" "$run_host" "$run_item")" ] ||
-            fleet_applied_forget "$run_store" "$run_host" "$run_item" || :
-          mkdir -p "$(dirname "$(fleet_run_tombstone_memo_path "$run_item")")"
-          printf '%s\n' "$run_digest" >"$(fleet_run_tombstone_memo_path "$run_item")"
-          run_tomb_outcome=applied
-          [ "$run_status" -eq 0 ] || run_tomb_outcome=satisfied
-          fleet_journal_append "$run_store" "$run_host" \
-            "$(jq -cn --arg item "$run_item" --arg d "$run_digest" --arg at "$run_now" \
-              --arg o "$run_tomb_outcome" '{item:$item,digest:$d,outcome:$o,at:$at}')" || :
-          if [ "$run_status" -eq 0 ]; then
-            run_applied_items="$run_applied_items$run_item "
-            printf '  applied %s (uninstalled)\n' "$run_item"
-          else
-            printf '  satisfied %s (absent, and not installed here)\n' "$run_item"
-          fi
+        0)
+          run_applied_items="$run_applied_items$run_item "
           continue
           ;;
+        70) continue ;;
       esac
+    else
+      fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
+        "$run_value" "$(fleet_run_package_managers "$run_fold" "$run_host")" ||
+        run_status=$?
     fi
     case $run_status in
       0)
@@ -3806,7 +3835,7 @@ fleet_review_command() (
   review_store=$(fleet_store_path)
   review_host=$(fleet_host_name)
   review_digest=$(fleet_item_digest \
-    "$(fleet_fold "$review_store" "$review_host")" "$review_item") || {
+    "$(fleet_run_desired "$review_store" "$review_host")" "$review_item") || {
     printf 'roundhouse: no layer carries %s for %s\n' "$review_item" "$review_host" >&2
     exit 65
   }
@@ -3826,7 +3855,7 @@ fleet_apply_command() (
   apply_item=$1
   apply_store=$(fleet_store_path)
   apply_host=$(fleet_host_name)
-  apply_fold=$(fleet_fold "$apply_store" "$apply_host")
+  apply_fold=$(fleet_run_desired "$apply_store" "$apply_host")
   apply_digest=$(fleet_item_digest "$apply_fold" "$apply_item") || {
     printf 'roundhouse: no layer carries %s for %s\n' "$apply_item" "$apply_host" >&2
     exit 65
@@ -3837,22 +3866,33 @@ fleet_apply_command() (
     exit 65
   }
   apply_status=0
-  fleet_run_apply_item "$apply_store" "$apply_host" \
-    "$(fleet_definitions_load "$apply_store")" "$apply_item" \
-    "$(fleet_item_value "$apply_fold" "$apply_item")" \
-    "$(fleet_run_package_managers "$apply_fold" "$apply_host")" ||
-    apply_status=$?
   apply_now=$(fleet_now)
+  apply_value=$(fleet_item_value "$apply_fold" "$apply_item")
+  case $apply_item in
+    plugins.*)
+      if [ "$(fleet_run_state_of "$apply_value")" = absent ]; then
+        fleet_run_tombstone_converge "$apply_store" "$apply_host" \
+          "$(fleet_definitions_load "$apply_store")" "$apply_item" "$apply_value" \
+          "$apply_digest" "$apply_now" || apply_status=$?
+        case $apply_status in
+          0 | 70)
+            printf 'roundhouse: %s converged to absent at %s (working copy only — the next run publishes it)\n' \
+              "$apply_item" "$apply_digest"
+            exit 0
+            ;;
+        esac
+      fi
+      ;;
+  esac
+  [ "$apply_status" -ne 0 ] ||
+    fleet_run_apply_item "$apply_store" "$apply_host" \
+      "$(fleet_definitions_load "$apply_store")" "$apply_item" "$apply_value" \
+      "$(fleet_run_package_managers "$apply_fold" "$apply_host")" ||
+    apply_status=$?
   case $apply_status in
     0)
-      # An uninstalled tombstone is no longer owned; everything else that
-      # applied is.
-      if [ "$(fleet_run_state_of "$(fleet_item_value "$apply_fold" "$apply_item")")" = absent ]; then
-        fleet_applied_forget "$apply_store" "$apply_host" "$apply_item"
-      else
-        fleet_applied_record "$apply_store" "$apply_host" "$apply_item" \
-          "$apply_digest" "$apply_now"
-      fi
+      fleet_applied_record "$apply_store" "$apply_host" "$apply_item" \
+        "$apply_digest" "$apply_now"
       fleet_journal_append "$apply_store" "$apply_host" \
         "$(jq -cn --arg item "$apply_item" --arg d "$apply_digest" \
           --arg at "$apply_now" \

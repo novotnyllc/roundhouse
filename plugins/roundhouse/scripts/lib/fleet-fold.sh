@@ -62,11 +62,21 @@ fleet_definitions_file_path() {
   esac
 }
 
-fleet_fold_program='. as $layer ireduce ({};
-  (. *d ($layer | with_entries(select(.value != null))
-    | (.[] | select(tag == "!!map")) |= with_entries(select(.value != null))))
-  | (.[] | select(tag == "!!map")) |= with_entries(select(.value != "absent")))'
-# The whole merge rule, and the reason it is one expression:
+fleet_fold_merge_program='. as $layer ireduce ({};
+  . *d ($layer | with_entries(select(.value != null))
+    | (.[] | select(tag == "!!map")) |= with_entries(select(.value != null))))'
+fleet_fold_absent_program='(.[] | select(tag == "!!map")) |= with_entries(select(.value != "absent"))'
+fleet_fold_program="($fleet_fold_merge_program) | $fleet_fold_absent_program"
+# The whole merge rule, in two steps: the MERGE (every layer, low to high) and
+# then the `absent` KNOCKOUT. They are separate so the tombstone reader
+# (fleet_fold_tombstones) can run the identical merge and read what the
+# knockout would remove, rather than keeping a hand copy that could drift.
+#
+# Knocking out once at the END is the same as after every layer, because an
+# `absent` is a SCALAR: a narrower layer that speaks again replaces it whole
+# (`*d` never merges a map into a scalar), so the last layer to speak wins in
+# both readings — `enabled` over `absent` is enabled, `absent` over anything
+# is absent.
 #
 #   the first |=  the NULL DROP, applied to the incoming layer BEFORE it
 #           merges. §4:416 — a null item value is "no opinion at this layer;
@@ -92,8 +102,8 @@ fleet_fold_program='. as $layer ireduce ({};
 #           a null nested inside a config_files value is data.
 #   *d      map+map deep merge, anything else replaced whole by the higher
 #           layer, a null document contributing nothing — §4, verbatim.
-#   the second |=  the `absent` knockout, applied AFTER EACH LAYER and scoped
-#           to exactly <category>.<item>. Never a recursive del(.. ==
+#   the knockout  fleet_fold_absent_program, applied to the merged result and
+#           scoped to exactly <category>.<item>. Never a recursive del(.. ==
 #           "absent"): a legitimate string "absent" nested inside a
 #           config_files value is data and must survive. `select(tag ==
 #           "!!map")` skips the host file's scalar and sequence facts
@@ -198,11 +208,12 @@ fleet_fold_tombstones() (
   #
   # §3.4's tombstone. The fold's knockout makes `absent` mean "no opinion
   # here", which is right for every reader of desired state and is why this is
-  # a SEPARATE read rather than a change to the fold: it is the same merge with
-  # the knockout left out, so the last layer to speak still wins — a narrower
-  # layer that re-adds the item un-tombstones it, and a narrower `absent` over a
-  # wider `enabled` is a tombstone. The map form (`{state: absent}`) is not
-  # knocked out at all and already reaches the run through the ordinary fold.
+  # a SEPARATE read rather than a change to the fold: it is the fold's own
+  # merge step (fleet_fold_merge_program) without the knockout, so the last
+  # layer to speak still wins — a narrower layer that re-adds the item
+  # un-tombstones it, and a narrower `absent` over a wider `enabled` is a
+  # tombstone. The map form (`{state: absent}`) is not knocked out at all and
+  # already reaches the run through the ordinary fold.
   IFS='
 '
   set -f
@@ -214,9 +225,7 @@ fleet_fold_tombstones() (
     printf '{}\n'
     return
   }
-  yq ea -o=json -I=0 '. as $layer ireduce ({};
-    . *d ($layer | with_entries(select(.value != null))
-      | (.[] | select(tag == "!!map")) |= with_entries(select(.value != null))))' \
+  yq ea -o=json -I=0 "$fleet_fold_merge_program" \
     "$@" | jq -c --arg c "$tombstone_category" '
       (.[$c] // {}) as $entries |
       if ($entries | type) != "object" then {}

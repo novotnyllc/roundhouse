@@ -1773,6 +1773,27 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$verb_status" -eq 65 ] || fail "a stale pass verdict authorised an apply"
     fleet_review_command plugins.railyard pass 'reviewed by hand' >/dev/null
 
+    # --- fleet-apply converges a SCALAR tombstone through the same path the
+    # run uses (fleet_run_tombstone_converge): the fold knocks `absent` out,
+    # so review and apply resolve it through fleet_run_desired.
+    printf '%s\n' 'plugins:' '  retired-by-hand: absent' >"$verb_store/fleet.yaml.tomb"
+    cat "$verb_store/fleet.yaml" "$verb_store/fleet.yaml.tomb" >"$verb_store/fleet.yaml.new"
+    mv "$verb_store/fleet.yaml.new" "$verb_store/fleet.yaml"
+    rm -f "$verb_store/fleet.yaml.tomb"
+    fleet_review_command plugins.retired-by-hand pass 'retire it' >/dev/null ||
+      fail "a scalar tombstone could not be reviewed"
+    verb_out=$(CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_apply_command plugins.retired-by-hand) ||
+      fail "fleet-apply refused a reviewed scalar tombstone: $verb_out"
+    case $verb_out in
+      *'satisfied plugins.retired-by-hand'*'converged to absent'*) ;;
+      *) fail "fleet-apply did not converge the tombstone through the shared path: $verb_out" ;;
+    esac
+    [ -n "$(cat "$(fleet_run_tombstone_memo_path plugins.retired-by-hand)" 2>/dev/null)" ] ||
+      fail "fleet-apply's tombstone left no converged-digest memo"
+    fleet_journal_entries "$verb_store" vireo |
+      jq -e -s 'any(.[]; .item == "plugins.retired-by-hand" and .outcome == "satisfied")' >/dev/null ||
+      fail "fleet-apply's tombstone journaled no satisfied record"
+
     # --- fleet-accept: a promotion moves WHERE a value lives, never what it is
     fleet_record_write "$verb_store/proposals/promote-skills-tdd.yaml" \
       '{"proposes":"move","item":"skills.tdd","value":"enabled",
