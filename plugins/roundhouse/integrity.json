@@ -162,7 +162,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "1db504092a982d00e6cf36e78766e3a0c420f6df51cad043dc8b62f036098f72"
+      "sha256": "f5c28be1e4eb2071286de25f67168cb3f994ef95368dab339c007437d84ea10b"
     },
     {
       "path": "scripts/lib/identity.sh",

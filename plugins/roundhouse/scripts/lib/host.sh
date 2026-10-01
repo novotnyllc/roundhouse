@@ -217,17 +217,26 @@ sha256_file_list() {
   # sha256_file. BATCH-SAFE: the paths go through `xargs -0`, never one
   # argument list, so a large tree cannot hit "Argument list too long" — and
   # xargs' own status (123 when any batch fails) is this function's, so a
-  # hashing failure is never silent. `-r`: GNU xargs otherwise runs the hasher
-  # once on empty input, which hashes stdin. An empty list hashes nothing; whether
-  # that means anything is the caller's question.
+  # hashing failure is never silent. An EMPTY list hashes nothing: GNU xargs
+  # would otherwise run the hasher once on stdin, and `-r` is not portable to
+  # every BSD xargs, so the list is buffered and an empty one returns here.
+  sha_list=$(mktemp "${TMPDIR:-/tmp}/roundhouse-sha-list.XXXXXX") || return 1
+  cat >"$sha_list" || { rm -f "$sha_list"; return 1; }
+  if [ ! -s "$sha_list" ]; then
+    rm -f "$sha_list"
+    return 0
+  fi
+  sha_rc=0
   if command -v sha256sum >/dev/null 2>&1; then
-    xargs -0 -r sha256sum --
+    xargs -0 sha256sum -- <"$sha_list" || sha_rc=$?
   elif command -v shasum >/dev/null 2>&1; then
-    xargs -0 -r shasum -a 256 --
+    xargs -0 shasum -a 256 -- <"$sha_list" || sha_rc=$?
   else
     # `-r`: the coreutils `<hash> *<path>` form, one line per file.
-    xargs -0 -r openssl dgst -sha256 -r
+    xargs -0 openssl dgst -sha256 -r <"$sha_list" || sha_rc=$?
   fi
+  rm -f "$sha_list"
+  return "$sha_rc"
 }
 
 sha256_stream() {
