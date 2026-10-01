@@ -1571,15 +1571,16 @@ fleet_run_alerts() {
 # --- §6 step 6 and §6.1(b): publication and the nudge -------------------------
 
 fleet_run_publish() {
-  # fleet_run_publish STORE HOST SESSION INTENT ITEMS — describe, move the
-  # bookmark, push, and land @ on the published commit.
+  # fleet_run_publish STORE HOST SESSION INTENT ITEMS [SUBJECT] — describe, move
+  # the bookmark, push, and land @ on the published commit. SUBJECT defaults to
+  # the run's own `converge on HOST`; a supervised verb names what it did.
   #
   # NEVER a bare `jj new -m ''` here. `jj git push` leaves an empty UNDESCRIBED
   # working-copy commit of its own; naming the target is what makes @ a child
   # of the bookmark instead of a child of that leftover, and it is the line
   # that keeps §8.1's invariant true between runs.
   if [ "$(jj -R "$1" log -r @ --no-graph -T 'if(empty,"y","n")')" = n ]; then
-    jj -R "$1" describe -r @ -m "converge on $2
+    jj -R "$1" describe -r @ -m "${6:-converge on $2}
 
 $(fleet_vcs_trailers "$2" "$3" "$4" "$5")" >/dev/null
     jj -R "$1" bookmark set main \
@@ -3426,6 +3427,100 @@ fleet_accept_command() (
   rm -f "$accept_file"
   printf 'roundhouse: %s now lives in %s (working copy only — the next run publishes it)\n' \
     "$accept_item" "$accept_to"
+)
+
+fleet_run_wc_foreign_paths() {
+  # fleet_run_wc_foreign_paths STORE HOST — the paths @ changes that are NOT
+  # HOST's own records (journal/<h>/, alerts/<h>/, findings/<h>/,
+  # applied/<h>.yaml, upstreams/<id>/<h>.yaml), one per line; silence when @
+  # is clean or carries only those. Exit 65 when @ cannot be read.
+  #
+  # One awk pass, never a predicate call per path: the working copy this runs
+  # against may be a half-published 46k-file compaction.
+  fleet_run_wc_names=$(cd "$1" && jj diff -r @ --name-only 2>/dev/null) || return 65
+  printf '%s\n' "$fleet_run_wc_names" | awk -v h="$2" '
+    $0 == "" { next }
+    index($0, "journal/" h "/") == 1 || index($0, "alerts/" h "/") == 1 ||
+      index($0, "findings/" h "/") == 1 || $0 == "applied/" h ".yaml" { next }
+    split($0, p, "/") == 3 && p[1] == "upstreams" && p[3] == h ".yaml" { next }
+    { print }'
+}
+
+fleet_run_verb_begin() {
+  # fleet_run_verb_begin STORE HOST VERB — the preamble of a supervised verb
+  # that PUBLISHES rather than leaving its write for the next run: the store
+  # is this fleet's, main is one head, the run lock is this verb's, and @
+  # carries nothing but this host's own records — so the commit it publishes
+  # says what the verb did and nothing an operator was still editing. Sets
+  # `fleet_run_verb_nonce` for the caller's release trap.
+  fleet_vcs_store_ready "$1" || return $?
+  [ "$(fleet_vcs_heads_local "$1" | grep -c .)" -eq 1 ] || {
+    printf 'roundhouse: main is diverged; reconcile before %s (§8.2)\n' "$3" >&2
+    return 65
+  }
+  fleet_run_verb_rc=0
+  fleet_run_lock_take "$1" "$2" "$(fleet_lock_path)" || fleet_run_verb_rc=$?
+  case $fleet_run_verb_rc in
+    0) ;;
+    10)
+      printf 'roundhouse: a run holds %s; %s waits for it — retry when it finishes\n' \
+        "$(fleet_lock_path)" "$3" >&2
+      return 75
+      ;;
+    *) return "$fleet_run_verb_rc" ;;
+  esac
+  fleet_run_verb_nonce=$fleet_lock_nonce_held
+  fleet_run_verb_foreign=$(fleet_run_wc_foreign_paths "$1" "$2") || {
+    fleet_lock_release "$(fleet_lock_path)" "$fleet_run_verb_nonce"
+    printf 'roundhouse: could not read the working copy; %s refused\n' "$3" >&2
+    return 65
+  }
+  [ -z "$fleet_run_verb_foreign" ] || {
+    fleet_lock_release "$(fleet_lock_path)" "$fleet_run_verb_nonce"
+    printf 'roundhouse: the working copy carries unpublished edits (%s); run `roundhouse fleet-run` first so this commit carries only %s\n' \
+      "$(printf '%s\n' "$fleet_run_verb_foreign" | head -3 | tr '\n' ' ' | sed 's/ $//')" \
+      "$3" >&2
+    return 65
+  }
+}
+
+fleet_alerts_compact_command() (
+  # `roundhouse fleet-alerts-compact` — §6.4's one-time collapse of THIS host's
+  # stamped alert files (alerts/<this host>/ only) to one keyed file per
+  # (kind, item), keeping the latest record each key wrote. It PUBLISHES, through
+  # the same fleet_run_publish/fleet_vcs_publish path the run uses (first-push
+  # gate, redaction sweep, conflict guards), because the point is to take the
+  # deletions off every peer's tree, and it holds the run lock while it works.
+  # Idempotent: a second invocation finds one file per key and publishes
+  # nothing.
+  fleet_run_env
+  require_jq
+  require_yq
+  compact_store=$(fleet_store_path)
+  compact_host=$(fleet_host_name)
+  fleet_run_verb_begin "$compact_store" "$compact_host" fleet-alerts-compact ||
+    exit $?
+  compact_lock=$(fleet_lock_path)
+  compact_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-alerts-compact.XXXXXX")
+  trap 'fleet_lock_release "$compact_lock" "$fleet_run_verb_nonce"; rm -rf "$compact_tmp"' \
+    EXIT HUP INT TERM
+  compact_counts=$(fleet_alerts_compact "$compact_store" "$compact_host" \
+    "$compact_tmp") || {
+    printf 'roundhouse: alert compaction failed; nothing published\n' >&2
+    exit 65
+  }
+  # shellcheck disable=SC2086 # three counts, one per word
+  set -- $compact_counts
+  printf 'roundhouse: alerts/%s: %s keyed file(s) written, %s file(s) removed, %s left in place (unreadable or not alert-shaped)\n' \
+    "$compact_host" "${1:-0}" "${2:-0}" "${3:-0}"
+  if [ "$(jj -R "$compact_store" log -r @ --no-graph -T 'if(empty,"y","n")')" = y ]; then
+    printf 'roundhouse: nothing to publish\n'
+    exit 0
+  fi
+  fleet_run_publish "$compact_store" "$compact_host" interactive/human \
+    "compact alerts/$compact_host to one file per alert (§6.4)" - \
+    "compact alerts on $compact_host" || exit $?
+  printf 'roundhouse: published the compaction\n'
 )
 
 fleet_lock_command() (

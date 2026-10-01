@@ -133,7 +133,29 @@ Two rules make this surface safe, and neither is a formality:
 
 Verdicts are **host-local** (`store.run/verdicts/`) and never replicated: a
 fleet-writable verdict would put a consent-shaped artifact on a shared surface.
-Alerts have no state machine — resolving one is `rm` on the file.
+Alerts have no state machine — resolving one is `rm` on the file. An alert is
+**keyed, not stamped**: one file per (kind, item) at
+`alerts/<host>/<kind>--<item>.yaml` (`<kind>.yaml` when it names no item), whose
+`at` is when it was first seen. A condition that is still true on the next pass
+rewrites nothing; only a change in what the alert says rewrites it.
+
+### Record maintenance and ownership
+
+Two verbs that **publish** rather than stopping at the working copy, because
+their whole effect is on replicated records. Each takes the run lock, refuses
+while `main` is diverged or while the working copy carries anything other than
+this host's own records, and commits through the same publish path the run
+uses (first-push gate, redaction sweep, conflict guards).
+
+```text
+roundhouse fleet-alerts-compact          # one-time: this host's stamped alerts -> one keyed file per alert
+```
+
+`fleet-alerts-compact` collapses the stamped alert files an older build wrote
+(`alerts/<this host>/<stamp>-<slug>.yaml`) to the keyed form, keeping the latest
+record per key. It touches only this host's own directory, leaves any file it
+cannot parse where it is, reads in batches (it is built for tens of thousands of
+files), and is idempotent — a second run finds nothing to do.
 
 `fleet-finding` and `fleet-hold` pass every replicated field through the
 redaction floor, and a field that trips it is **refused rather than silently

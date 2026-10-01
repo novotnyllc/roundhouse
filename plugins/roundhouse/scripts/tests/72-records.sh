@@ -229,12 +229,95 @@ YAML
     fleet_alert_write "$rec_store" vireo unsigned-edit unsigned-hand-edit \
       'Commit 6705e1a3 carries no SSH signature.' plugins.impeccable ||
       fail "a clean alert was refused"
-    rec_alert=$(find "$rec_store/alerts/vireo" -name '*-unsigned-hand-edit.yaml' | head -1)
-    [ -n "$rec_alert" ] ||
-      fail "the alert was not written under alerts/<host>/<stamp>-<slug>.yaml"
+    rec_alert="$rec_store/alerts/vireo/unsigned-edit--plugins.impeccable.yaml"
+    [ -f "$rec_alert" ] ||
+      fail "the alert was not written under alerts/<host>/<kind>--<item>.yaml"
     [ "$(yq -r '.kind' "$rec_alert")" = unsigned-edit ] &&
       [ "$(yq -r '.items[0]' "$rec_alert")" = plugins.impeccable ] ||
       fail "the alert did not carry its kind and the items it holds"
+
+    # §6.4: KEYED, NOT STAMPED. The same condition on the next pass is the same
+    # alert — one path per (kind, item), and no rewrite when only the clock
+    # moved. The stamped form put a new file in every commit for every standing
+    # condition, which is how one store reached ~46k alert files.
+    yq -i '.at = "2026-01-01T00:00:00Z"' "$rec_alert"
+    rec_alert_bytes=$(cat "$rec_alert")
+    fleet_alert_write "$rec_store" vireo unsigned-edit unsigned-hand-edit \
+      'Commit 6705e1a3 carries no SSH signature.' plugins.impeccable ||
+      fail "re-raising an unchanged alert was refused"
+    [ "$(cat "$rec_alert")" = "$rec_alert_bytes" ] ||
+      fail "an unchanged alert was rewritten (a last-seen bump is the same churn)"
+    [ "$(find "$rec_store/alerts/vireo" -name '*impeccable*' | grep -c .)" -eq 1 ] ||
+      fail "re-raising an alert wrote a second file for the same key"
+    # A changed DETAIL is a rewrite, and the first-seen time survives it.
+    fleet_alert_write "$rec_store" vireo unsigned-edit unsigned-hand-edit \
+      'Commit 6705e1a3 and one more carry no SSH signature.' plugins.impeccable
+    [ "$(yq -r '.detail' "$rec_alert")" = \
+      'Commit 6705e1a3 and one more carry no SSH signature.' ] ||
+      fail "a changed alert was not rewritten"
+    [ "$(yq -r '.at' "$rec_alert")" = 2026-01-01T00:00:00Z ] ||
+      fail "rewriting a changed alert lost its first-seen time"
+    # No item: the slug is the key, and kind == slug is just the kind.
+    fleet_alert_write "$rec_store" vireo removal-cap removal-cap '7 removals'
+    [ -f "$rec_store/alerts/vireo/removal-cap.yaml" ] ||
+      fail "an item-less alert whose slug is its kind was not keyed by the kind"
+    fleet_alert_write "$rec_store" vireo materialization materialization-refused 'refused'
+    [ -f "$rec_store/alerts/vireo/materialization--materialization-refused.yaml" ] ||
+      fail "two item-less alerts of one kind collapsed into one file"
+    # An item that carries `/` and `@` is encoded into ONE path component.
+    fleet_alert_write "$rec_store" vireo config-key-collision config-key-collision \
+      'collides' 'config_files.~/.claude/settings.json'
+    [ -f "$rec_store/alerts/vireo/config-key-collision--config_files.~%2F.claude%2Fsettings.json.yaml" ] ||
+      fail "an item with a path separator did not land in one encoded file name"
+    [ "$(find "$rec_store/alerts/vireo" -mindepth 1 -type d | grep -c . || true)" -eq 0 ] ||
+      fail "an alert key escaped into a subdirectory"
+
+    # --- §6.4 the one-time compaction of the stamped form ---
+    rec_compact="$tmp/records/compact"
+    rm -rf "$rec_compact"
+    mkdir -p "$rec_compact/store/alerts/vireo" "$rec_compact/store/alerts/wren" \
+      "$rec_compact/work"
+    rec_compact_dir="$rec_compact/store/alerts/vireo"
+    for rec_n in 1 2 3; do
+      printf 'kind: integrity\nhost: vireo\nitems: [plugins.ponytail]\ndetail: held %s\nat: "2026-08-0%sT00:00:00Z"\n' \
+        "$rec_n" "$rec_n" >"$rec_compact_dir/2026080${rec_n}T0000-integrity-plugins-ponytail.yaml"
+      printf 'kind: removal-cap\nhost: vireo\nitems: []\ndetail: %s removals\nat: "2026-08-0%sT00:00:00Z"\n' \
+        "$rec_n" "$rec_n" >"$rec_compact_dir/2026080${rec_n}T0000-removal-cap.yaml"
+    done
+    # A keyed file already written by the new writer joins its group.
+    printf 'kind: removal-cap\nhost: vireo\nitems: []\ndetail: 9 removals\nat: "2026-08-09T00:00:00Z"\n' \
+      >"$rec_compact_dir/removal-cap.yaml"
+    printf '<<<<<<< Conflict 1 of 1\n: : not yaml\n' \
+      >"$rec_compact_dir/20260801T0000-broken.yaml"
+    printf 'kind: integrity\nhost: wren\nitems: []\ndetail: a peer\nat: "2026-08-01T00:00:00Z"\n' \
+      >"$rec_compact/store/alerts/wren/20260801T0000-integrity.yaml"
+    rec_counts=$(fleet_alerts_compact "$rec_compact/store" vireo "$rec_compact/work") ||
+      fail "the alert compaction failed"
+    [ "$rec_counts" = '1 6 1' ] ||
+      fail "the compaction did not write one keyed file, remove six and leave one: $rec_counts"
+    [ "$(yq -r '.detail' "$rec_compact_dir/integrity--plugins.ponytail.yaml")" = 'held 3' ] ||
+      fail "the compaction did not keep the latest record for the key"
+    [ "$(yq -r '.detail' "$rec_compact_dir/removal-cap.yaml")" = '9 removals' ] ||
+      fail "the compaction displaced a newer keyed record with an older stamped one"
+    [ -z "$(find "$rec_compact_dir" -name '2026080?T0000-*' ! -name '*-broken.yaml')" ] ||
+      fail "stamped alert files survived the compaction"
+    [ -f "$rec_compact_dir/20260801T0000-broken.yaml" ] ||
+      fail "the compaction deleted a file it could not read"
+    [ -f "$rec_compact/store/alerts/wren/20260801T0000-integrity.yaml" ] ||
+      fail "the compaction touched another host's alerts"
+    [ "$(fleet_alerts_compact "$rec_compact/store" vireo "$rec_compact/work")" = '0 0 1' ] ||
+      fail "a second compaction was not a no-op"
+    # Compaction and the writer agree on the key, so the next raise of a
+    # compacted condition finds its file and writes nothing.
+    rec_alert_bytes=$(cat "$rec_compact_dir/integrity--plugins.ponytail.yaml")
+    ROUNDHOUSE_FLEET_STORE="$rec_compact/store" \
+      fleet_alert_write "$rec_compact/store" vireo integrity \
+      integrity-plugins-ponytail 'held 3' plugins.ponytail
+    [ "$(cat "$rec_compact_dir/integrity--plugins.ponytail.yaml")" = "$rec_alert_bytes" ] ||
+      fail "the writer and the compaction disagree about an alert's key"
+    # Efficiency is structural: batched yq, no per-file subprocess.
+    cli_function_body fleet_alerts_compact | grep -q 'xargs -0 -n 256 bash -c' ||
+      fail "the compaction no longer batches its reads"
 
     # A quote that trips the floor is REFUSED, not silently redacted: §10.4's
     # own remedy explicitly cannot un-publish.

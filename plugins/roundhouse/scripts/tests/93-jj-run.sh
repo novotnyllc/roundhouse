@@ -456,6 +456,69 @@ YAML
       *) fail "a downstream host stopped waiting on an item the canary could not apply: $runjj_out" ;;
     esac
 
-    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding)\n'
+    # --- §6.3: a dead holder's lock is taken over by the next run ---
+    # The wedge itself: a lock a dead pre-nonce run left behind, aged far past
+    # the stale threshold. The age check used to run first and refuse it
+    # forever; the holder check runs first now.
+    runjj_lock="$rjj/vireo/store.lock"
+    sleep 1 &
+    runjj_dead=$!
+    wait "$runjj_dead" 2>/dev/null || :
+    mkdir -p "$runjj_lock"
+    printf '{"host":"vireo","pid":%s,"started_at":"2000-01-01T00:00:00Z"}\n' \
+      "$runjj_dead" >"$runjj_lock/meta.json"
+    runjj_out=$(runjj vireo "$cli" fleet-run --fast 2>&1) ||
+      fail "a run refused a lock whose holder is dead: $runjj_out"
+    case $runjj_out in
+      *'took over the run lock'*) ;;
+      *) fail "the takeover was not reported: $runjj_out" ;;
+    esac
+    [ ! -d "$runjj_lock" ] ||
+      fail "the run did not release the lock it took over"
+    jj -R "$vireo" file list -r "$(fleet_vcs_heads_local "$vireo")" \
+      -T 'path ++ "\n"' | grep -qx 'alerts/vireo/lock-takeover.yaml' ||
+      fail "the takeover alert was not published"
+
+    # --- §6.4: the one-time alert compaction, published ---
+    runjj_alerts="$vireo/alerts/vireo"
+    for runjj_n in $(seq 1 40); do
+      printf 'kind: integrity\nhost: vireo\nitems: [plugins.p%s]\ndetail: held %s\nat: "2026-08-%02dT00:00:00Z"\n' \
+        "$((runjj_n % 4))" "$runjj_n" "$((runjj_n % 28 + 1))" \
+        >"$runjj_alerts/202608$(printf %02d $((runjj_n % 28 + 1)))T00$(printf %02d "$runjj_n")-integrity-p$runjj_n.yaml"
+    done
+    runjj vireo "$cli" fleet-run --fast >/dev/null ||
+      fail "vireo could not publish the stamped alert fixture"
+    # Refused while the working copy carries an edit that is not a record.
+    printf '# an unpublished layer edit\n' >>"$vireo/fleet.yaml"
+    runjj_status=0
+    runjj_out=$(runjj vireo "$cli" fleet-alerts-compact 2>&1) || runjj_status=$?
+    [ "$runjj_status" -eq 65 ] ||
+      fail "compaction published over an operator's unpublished layer edit (got $runjj_status): $runjj_out"
+    runjj vireo "$cli" fleet-run --fast >/dev/null ||
+      fail "vireo could not publish the pending layer edit"
+    runjj_out=$(runjj vireo "$cli" fleet-alerts-compact) ||
+      fail "fleet-alerts-compact failed: $runjj_out"
+    case $runjj_out in
+      *'published the compaction'*) ;;
+      *) fail "the compaction did not publish: $runjj_out" ;;
+    esac
+    [ "$(fleet_vcs_heads_local "$vireo")" = "$(fleet_vcs_head_origin "$vireo")" ] ||
+      fail "the compaction is not on the remote"
+    runjj_tree=$(jj -R "$vireo" file list -r "$(fleet_vcs_head_origin "$vireo")" \
+      -T 'path ++ "\n"')
+    ! printf '%s\n' "$runjj_tree" | grep -Eq '^alerts/vireo/[0-9]{8}T[0-9]{4}-' ||
+      fail "stamped alert files survived the published compaction"
+    [ "$(printf '%s\n' "$runjj_tree" | grep -c '^alerts/vireo/integrity--plugins\.p')" -eq 4 ] ||
+      fail "the compaction did not leave one keyed file per (kind, item)"
+    [ -z "$(jj -R "$vireo" log -r @ --no-graph -T 'if(empty,"","dirty")')" ] ||
+      fail "the compaction did not leave @ an empty child of main"
+    runjj_out=$(runjj vireo "$cli" fleet-alerts-compact) ||
+      fail "a second compaction failed: $runjj_out"
+    case $runjj_out in
+      *'nothing to publish'*) ;;
+      *) fail "a second compaction was not a no-op: $runjj_out" ;;
+    esac
+
+    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding, dead-holder takeover, alert compaction)\n'
   ) || fail "real-jj run block failed (see the FAIL: real-jj: line above)"
 fi

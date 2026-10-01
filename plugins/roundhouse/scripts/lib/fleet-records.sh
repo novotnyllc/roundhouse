@@ -309,9 +309,32 @@ fleet_prose_shorten_commit_ids() {
   printf '%s\n' "$prose_text"
 }
 
+fleet_alert_name_filter='
+  # The ONE file name an alert key maps to: (kind, items), or (kind, slug) for
+  # an alert that names no item. The writer and the compaction share this
+  # definition, so a compacted store and a freshly written one can never
+  # disagree about where an alert lives. `@uri` keeps the name injective and
+  # free of `/`; the cut keeps it under every filesystem NAME_MAX.
+  def alert_name($kind; $slug; $items):
+    (($items // []) | map(tostring) | unique | join(",")) as $joined |
+    (if $joined == "" then $slug else $joined end) as $key |
+    (if $key == $kind then ($kind | @uri)
+     else ($kind | @uri) + "--" + ($key | @uri) end)[0:200] + ".yaml";
+'
+
 fleet_alert_write() {
   # `fleet_alert_write STORE HOST KIND SLUG DETAIL [ITEM...]`. Resolution is
   # `rm` on the file. There is no state machine.
+  #
+  # KEYED, NOT STAMPED. An alert is a condition, and a condition that is still
+  # true on the next pass is the same alert: one deterministic path per (kind,
+  # item), rewritten only when what it says changes. The stamped-per-write
+  # form put a new file in every published commit for every standing
+  # condition — one store reached ~46k alert files, every one of them signed,
+  # pushed, verified by every peer and aged by a per-file pass. `at` is the
+  # FIRST time this alert was seen and is kept across rewrites; nothing bumps
+  # a last-seen field, because that would be the same churn under another
+  # name.
   alert_store=$1
   alert_host=$2
   alert_kind=$3
@@ -320,12 +343,103 @@ fleet_alert_write() {
   shift 5
   alert_detail=$(fleet_prose_shorten_commit_ids "$alert_detail" "$alert_store")
   fleet_replicated_text_ok "$alert_detail" || return 1
-  fleet_record_write \
-    "$alert_store/alerts/$alert_host/$(fleet_record_stamp)-$alert_slug.yaml" \
-    "$(jq -cn --arg kind "$alert_kind" --arg host "$alert_host" \
-      --arg detail "$alert_detail" --arg at "$(fleet_now)" --args \
-      '{kind: $kind, host: $host, items: $ARGS.positional, detail: $detail, at: $at}' \
-      "$@")"
+  alert_record=$(jq -cn --arg kind "$alert_kind" --arg host "$alert_host" \
+    --arg detail "$alert_detail" --arg at "$(fleet_now)" --args \
+    '{kind: $kind, host: $host, items: $ARGS.positional, detail: $detail, at: $at}' \
+    "$@") || return 1
+  alert_name=$(printf '%s\n' "$alert_record" | jq -r --arg slug "$alert_slug" \
+    "$fleet_alert_name_filter"' alert_name(.kind; $slug; .items)') || return 1
+  alert_file="$alert_store/alerts/$alert_host/$alert_name"
+  if [ -f "$alert_file" ]; then
+    # An unreadable prior (a conflicted or hand-mangled file) is replaced
+    # whole; a readable one decides whether there is anything to write.
+    alert_prior=$(fleet_record_read "$alert_file" '{}' 2>/dev/null) || alert_prior=
+    if [ -n "$alert_prior" ]; then
+      printf '%s\n' "$alert_record" | jq -e --argjson prior "$alert_prior" '
+        def body: del(.at) | .items = ((.items // []) | sort);
+        ($prior | type == "object") and ($prior | body) == body' >/dev/null 2>&1 &&
+        return 0
+      alert_record=$(printf '%s\n' "$alert_record" | jq -c --argjson prior "$alert_prior" '
+        .at = (if ($prior | type == "object") and (($prior.at // "") | type == "string")
+               and ($prior.at // "") != "" then $prior.at else .at end)') || return 1
+    fi
+  fi
+  fleet_record_write "$alert_file" "$alert_record"
+}
+
+fleet_alerts_compact() {
+  # `fleet_alerts_compact STORE HOST WORKDIR` -> `<written> <removed>
+  # <unreadable>`. The one-time collapse of a host's stamped alert files to
+  # the keyed form: one file per (kind, item), holding the LATEST record that
+  # key ever wrote. HOST's own directory only — alerts/<h>/ is §7.3
+  # single-writer, and compacting a peer's would be a forged edit.
+  #
+  # BUILT FOR ~46k FILES: one `find`, `yq` over xargs-sized batches, one `jq`
+  # for the grouping and one `rm` batch. A per-file `yq` is how the store got
+  # slow in the first place. A batch that contains an unreadable file is
+  # re-read file by file so one bad file costs one batch, not the run; an
+  # unreadable file is left exactly where it is — nothing deletes evidence it
+  # could not read.
+  compact_dir=$1/alerts/$2
+  compact_work=$3
+  [ -d "$compact_dir" ] || {
+    printf '0 0 0\n'
+    return 0
+  }
+  find "$compact_dir" -mindepth 1 -maxdepth 1 -type f -name '*.yaml' -print0 \
+    >"$compact_work/alert-files" || return 1
+  # An empty list must not reach xargs: with no arguments it still runs the
+  # command once, and a `yq` with no file reads stdin.
+  [ -s "$compact_work/alert-files" ] || {
+    printf '0 0 0\n'
+    return 0
+  }
+  # shellcheck disable=SC2016 # the inner script is bash -c's, expanded there
+  xargs -0 -n 256 bash -c '
+    yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$@" 2>/dev/null && exit 0
+    for compact_file do
+      yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$compact_file" 2>/dev/null ||
+        jq -cn --arg f "$compact_file" "{file: \$f, bad: true}"
+    done' compact <"$compact_work/alert-files" >"$compact_work/alert-records" ||
+    return 1
+  tr '\0' '\n' <"$compact_work/alert-files" >"$compact_work/alert-paths"
+  # One pass over every record: key each file the way the writer would, keep
+  # the newest record per key, and emit `W<TAB>target<TAB>record` for a keeper
+  # that is not already at its keyed path, `D<TAB>file` for every other member
+  # of the group, and one `U<TAB>count` for the files that could not be keyed.
+  jq -s -r --arg dir "$compact_dir" --rawfile paths "$compact_work/alert-paths" \
+    "$fleet_alert_name_filter"'
+    ($paths | split("\n") | map(select(. != ""))) as $all |
+    (map(select(.bad != true and (.rec | type == "object") and
+        ((.rec.kind // "") | type == "string") and (.rec.kind // "") != "" and
+        (.file | test("\n") | not))) |
+      unique_by(.file)) as $good |
+    [ $good[] |
+      (.file | split("/") | last) as $base |
+      (($base | capture("^[0-9]{8}T[0-9]{4}-(?<slug>.+)[.]yaml$") | .slug) // null) as $slug |
+      ((.rec.items // []) | if type == "array" then . else [] end) as $items |
+      (if $slug != null then alert_name(.rec.kind; $slug; $items)
+       elif ($items | length) > 0 then alert_name(.rec.kind; ""; $items)
+       else $base end) as $name |
+      {file, rec, base: $base, target: ($dir + "/" + $name)} ] |
+    group_by(.target) |
+    (.[] | max_by([((.rec.at // "") | tostring), .base]) as $keep |
+      (if $keep.file != $keep.target
+       then "W\t\($keep.target)\t\($keep.rec | tojson)" else empty end),
+      (.[] | select(.file != .target) | "D\t\(.file)")),
+    "U\t\(($all - ($good | map(.file))) | length)"
+    ' "$compact_work/alert-records" >"$compact_work/alert-plan" || return 1
+  compact_written=0
+  while IFS='	' read -r compact_op compact_path compact_rec; do
+    [ "$compact_op" = W ] || continue
+    fleet_record_write "$compact_path" "$compact_rec" || return 1
+    compact_written=$((compact_written + 1))
+  done <"$compact_work/alert-plan"
+  awk -F'\t' '$1 == "D" { print $2 }' "$compact_work/alert-plan" |
+    tr '\n' '\0' | xargs -0 rm -f || return 1
+  printf '%s %s %s\n' "$compact_written" \
+    "$(awk -F'\t' '$1 == "D"' "$compact_work/alert-plan" | grep -c . || true)" \
+    "$(awk -F'\t' '$1 == "U" { print $2 }' "$compact_work/alert-plan")"
 }
 
 fleet_finding_write() {

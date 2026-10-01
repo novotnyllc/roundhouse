@@ -90,7 +90,20 @@ fleet_sweep_range() {
       # `jj diff --name-only` refuses -T and prints paths relative to the
       # CALLER's directory, so it runs with cwd INSIDE the store or every name
       # comes back absolute. Measured on jj 0.44.
-      (cd "$1" && jj diff -r "$sweep_commit" --name-only 2>/dev/null) |
+      #
+      # A path this commit DELETES carries no content here: whatever it held
+      # was swept in the commit that wrote it (the per-commit walk above sees
+      # create-then-delete), or is already on the remote. Skipping deletions
+      # is what keeps a 46k-file alert compaction from costing one `jj file
+      # show` per removed file; `--summary` marks them `D`, and one awk pass
+      # drops them from the name list (`--name-only` alone names a deletion
+      # and a rename target alike).
+      (cd "$1" && {
+        jj diff -r "$sweep_commit" --summary 2>/dev/null |
+          awk '/^D / { print "D\t" substr($0, 3) }'
+        jj diff -r "$sweep_commit" --name-only 2>/dev/null |
+          awk '{ print "N\t" $0 }'
+      }) | awk -F'\t' '$1 == "D" { gone[$2] = 1; next } !($2 in gone) { print $2 }' |
         while IFS= read -r sweep_path; do
           case $sweep_path in
             findings/?* | alerts/?*) ;;
