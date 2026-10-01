@@ -854,6 +854,25 @@ JSON
       fail "a version-less catalog entry demanded a reinstall over a matching SHA (got $run_identity_status)"
     fleet_run_repaired_ok= fleet_run_repaired_failed=
 
+    # --- the live-session probe reads the COMMAND LINE ---
+    # An npm-installed claude is `node …/cli.js` with comm `node`, so comm
+    # alone missed every such session (comm still covers the native binary,
+    # including the desktop-bundled copy whose path has spaces). Only
+    # argv[0]/argv[1] count, so a process that merely names claude does not.
+    for run_claude_line in \
+      '/Users/x/.local/bin/claude --resume' 'claude' \
+      'node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js' \
+      'node /Users/x/.npm-global/bin/claude -p hi'; do
+      printf '%s\n' "$run_claude_line" | fleet_run_claude_cmdline_match ||
+        fail "a running claude CLI was not recognised: $run_claude_line"
+    done
+    for run_claude_line in '/Applications/Claude.app/Contents/MacOS/Claude' \
+      'grep claude' 'awk { exe == "claude" }' 'node /srv/app/server.js claude' \
+      'vim /tmp/claude-notes'; do
+      ! printf '%s\n' "$run_claude_line" | fleet_run_claude_cmdline_match ||
+        fail "something that is not the claude CLI read as one: $run_claude_line"
+    done
+
     # --- §3.4 tombstones: `absent` uninstalls a Claude plugin ---
     # The tombstone set is the fold with the knockout left out, so the last
     # layer to speak still wins: a host layer that re-adds an item is not a
@@ -887,12 +906,17 @@ JSON
     rm -rf "$(fleet_run_state_dir)/deferrals"
     # A subshell, because the live-session probe is replaced per case below.
     (
-    # Not installed: SATISFIED, with no manager call at all.
+    # Not installed: SATISFIED, with no manager call at all — and any deferral
+    # window for it is over.
     printf '%s\n' '{"version":2,"plugins":{}}' >"$run_plugin_installed"
     : >"$run_plugin_order_log"
+    mkdir -p "$(fleet_run_state_dir)/deferrals"
+    printf 'stale 1\n' >"$(fleet_run_deferral_path plugins.example)"
     run_tomb_apply '"absent"'
     [ "$run_status" -eq 70 ] ||
       fail "a tombstone for a plugin that is not installed was not satisfied (got $run_status)"
+    [ ! -e "$(fleet_run_deferral_path plugins.example)" ] ||
+      fail "a satisfied tombstone left its deferral record behind"
     [ ! -s "$run_plugin_order_log" ] ||
       fail "a satisfied tombstone ran a manager verb: $(cat "$run_plugin_order_log")"
     # Installed and DISABLED: uninstalled immediately even with a session live.
@@ -903,7 +927,7 @@ JSON
     [ "$run_status" -eq 0 ] ||
       fail "a disabled tombstoned plugin was not uninstalled (got $run_status): $(cat "$run_root/tomb-out")"
     grep -Fqx 'uninstall example@test-market' "$run_plugin_order_log" ||
-      fail "the uninstall did not go through the native manager"
+      fail "the uninstall did not go through the native manager (with --keep-data)"
     [ "$(jq -c '.plugins["example@test-market"] // null' "$run_plugin_installed")" = null ] ||
       fail "the uninstalled plugin is still in installed_plugins.json"
     # Installed and ENABLED while a claude session runs: DEFERRED, and the
@@ -924,6 +948,19 @@ JSON
     [ "$run_status" -eq 75 ] &&
       [ "$(awk '{ print $2 }' "$run_tomb_deferral")" = "$run_tomb_first" ] ||
       fail "a second deferral restarted the 24h window"
+    # A deferral record that cannot be written HOLDS rather than restarting
+    # the window on every pass.
+    # (A FILE where the directory should be: unwritable even for root.)
+    run_tomb_dir=$(dirname "$run_tomb_deferral")
+    mv "$run_tomb_dir" "$run_tomb_dir.saved"
+    : >"$run_tomb_dir"
+    run_tomb_apply '"absent"'
+    rm -f "$run_tomb_dir"
+    mv "$run_tomb_dir.saved" "$run_tomb_dir"
+    [ "$run_status" -eq 75 ] && grep -q 'cannot be written' "$run_root/tomb-out" ||
+      fail "an unwritable deferral record did not hold (got $run_status): $(cat "$run_root/tomb-out")"
+    ! grep -q uninstall "$run_plugin_order_log" ||
+      fail "an unwritable deferral record let the uninstall through"
     # Past 24h from the FIRST deferral it proceeds, session or not.
     printf '%s %s\n' "$(awk '{ print $1 }' "$run_tomb_deferral")" \
       "$(($(date +%s) - 86401))" >"$run_tomb_deferral"

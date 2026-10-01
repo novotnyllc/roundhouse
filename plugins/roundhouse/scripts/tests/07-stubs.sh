@@ -420,20 +420,24 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
   exit 0
 fi
 if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = uninstall ] || [ "\${2:-}" = remove ]; }; then
-  # \`claude plugin uninstall --scope user ID\`: the id is the one argument
-  # that is neither an option nor an option's value.
+  # \`claude plugin uninstall --scope user --keep-data ID\`: the id is the one
+  # argument that is neither an option nor an option's value. --keep-data is
+  # REQUIRED: without it the real manager deletes the plugin's data directory,
+  # which no rollback restores.
   shift 2
   scope=user
   uninstall_id=
+  keep_data=false
   while [ "\$#" -gt 0 ]; do
     case \$1 in
       -s | --scope) scope=\${2:-}; shift ;;
+      --keep-data) keep_data=true ;;
       -*) ;;
       *) uninstall_id=\$1 ;;
     esac
     shift
   done
-  [ "\$scope" = user ] && [ -n "\$uninstall_id" ] || exit 64
+  [ "\$scope" = user ] && [ -n "\$uninstall_id" ] && [ "\$keep_data" = true ] || exit 64
   [ -z "\${CLAUDE_PLUGIN_ACTION_LOG:-}" ] ||
     printf '%s %s\n' uninstall "\$uninstall_id" >>"\$CLAUDE_PLUGIN_ACTION_LOG"
   [ "\${CLAUDE_UNINSTALL_FAIL:-0}" != 1 ] || exit 1

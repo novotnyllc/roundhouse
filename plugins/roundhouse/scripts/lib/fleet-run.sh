@@ -1477,12 +1477,30 @@ fleet_run_tombstone_target() {
 }
 
 fleet_run_claude_running() {
-  # Is a `claude` CLI process running on this host? The basename of `comm`
-  # (macOS reports a full path, procps a bare name), compared exactly: the
-  # desktop app is `Claude`, which loads plugins from its own sessions only.
+  # Is a `claude` CLI process running on this host? Asked twice, because each
+  # view misses one install: `comm` names the native binary even when its path
+  # carries spaces (the desktop-bundled copy), but an npm-installed `claude` is
+  # `node …/cli.js` and its comm is `node` — only the command line shows that.
   ps -A -o comm= 2>/dev/null | awk '
     { name = $0; sub(/.*\//, "", name) }
-    name == "claude" { found = 1 }
+    name == "claude" { found = 1; exit }
+    END { exit(found ? 0 : 1) }' && return 0
+  ps -A -ww -o command= 2>/dev/null | fleet_run_claude_cmdline_match
+}
+
+fleet_run_claude_cmdline_match() {
+  # stdin: command lines, one per process. Exit 0 when one of them is the
+  # Claude Code CLI: argv[0] whose basename is exactly `claude` (the native
+  # install and its symlink), or a `node` whose script is a `claude`
+  # executable or the `@anthropic-ai/claude-code` package. Only argv[0] and
+  # argv[1] are read, so a process that merely MENTIONS claude in its
+  # arguments (this awk program, a grep) never matches — and the desktop app,
+  # `Claude`, which loads plugins in its own sessions only, does not either.
+  awk '
+    { exe = $1; sub(/.*\//, "", exe) }
+    exe == "claude" { found = 1; exit }
+    exe ~ /^node([0-9.]*)?$/ &&
+      ($2 ~ /(^|\/)claude$/ || $2 ~ /\/@anthropic-ai\/claude-code\//) { found = 1; exit }
     END { exit(found ? 0 : 1) }'
 }
 
@@ -1511,22 +1529,37 @@ fleet_run_uninstall_plugin() {
   # `held` — for up to 24 hours from this host's FIRST deferral of this digest,
   # then proceeds: a session that never ends must not keep a retired plugin
   # installed forever. A disabled plugin is not loaded and goes immediately.
+  #
+  # `--keep-data`: the native uninstall otherwise deletes the plugin's
+  # persistent data directory (~/.claude/plugins/data/<id>/), and
+  # `fleet-rollback` restores the plugin, never that data.
+  fleet_run_uninstall_deferral=$(fleet_run_deferral_path "$2")
   fleet_run_uninstall_target=$(fleet_run_tombstone_target "$1" "$3" "$4") || return 75
-  [ -n "$fleet_run_uninstall_target" ] || return 70
+  [ -n "$fleet_run_uninstall_target" ] || {
+    # Gone already, by whatever route: a deferral window for it is over too.
+    rm -f "$fleet_run_uninstall_deferral"
+    return 70
+  }
   command -v claude >/dev/null 2>&1 || return 75
   fleet_run_uninstall_enabled=$(fleet_run_plugin_enabled \
     "$fleet_run_uninstall_target" true) || return 75
-  fleet_run_uninstall_deferral=$(fleet_run_deferral_path "$2")
   if [ "$fleet_run_uninstall_enabled" != false ] && fleet_run_claude_running; then
     fleet_run_uninstall_digest=$(printf '%s\n' "$4" | fleet_value_digest "$2")
     fleet_run_uninstall_first=$(awk -v d="$fleet_run_uninstall_digest" \
       '$1 == d { print $2; exit }' "$fleet_run_uninstall_deferral" 2>/dev/null)
     case $fleet_run_uninstall_first in
       '' | *[!0-9]*)
+        # The window is only as good as this record. If it cannot be written,
+        # every pass would be a "first" deferral and the 24h would never end;
+        # hold instead, and say so.
         fleet_run_uninstall_first=$(date +%s)
-        mkdir -p "$(dirname "$fleet_run_uninstall_deferral")"
-        printf '%s %s\n' "$fleet_run_uninstall_digest" "$fleet_run_uninstall_first" \
-          >"$fleet_run_uninstall_deferral"
+        { mkdir -p "$(dirname "$fleet_run_uninstall_deferral")" &&
+          printf '%s %s\n' "$fleet_run_uninstall_digest" "$fleet_run_uninstall_first" \
+            >"$fleet_run_uninstall_deferral"; } 2>/dev/null || {
+          printf '  hold  %s — the live-session deferral record %s cannot be written\n' \
+            "$2" "$fleet_run_uninstall_deferral"
+          return 75
+        }
         ;;
     esac
     fleet_run_uninstall_left=$((fleet_run_uninstall_first + 86400 - $(date +%s)))
@@ -1537,7 +1570,7 @@ fleet_run_uninstall_plugin() {
     fi
     printf '  defer %s — the 24h live-session window has elapsed; uninstalling\n' "$2"
   fi
-  claude plugin uninstall --scope user "$fleet_run_uninstall_target" \
+  claude plugin uninstall --scope user --keep-data "$fleet_run_uninstall_target" \
     >/dev/null 2>&1 || return 75
   # The manager's exit status proves it ran, not that the record is gone.
   [ "$(fleet_run_installed_plugin "$fleet_run_uninstall_target")" = '{}' ] || return 75
