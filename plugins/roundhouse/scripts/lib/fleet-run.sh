@@ -1109,61 +1109,6 @@ fleet_run_node_converge() (
   exit 0
 )
 
-# --- §3.4/§3.5 tombstones: `absent` uninstalls through the harness ----------
-
-fleet_run_tombstone_converge() {
-  # fleet_run_tombstone_converge STORE HOST DEFS ITEM VALUE DIGEST AT — THE one
-  # path a tombstone converges through, for the run and for `fleet-apply`
-  # alike: uninstall (fleet_run_uninstall_plugin, through the apply layer),
-  # then — when nothing is installed any more, 0 or 70 — forget any applied/
-  # record (nothing installed is nothing owned, and a recorded tombstone would
-  # read as a prune the day it is compacted away), remember the converged
-  # digest host-locally so later passes stay silent, and journal `applied` or
-  # `satisfied`. Returns the apply status; a 75 is the caller's to hold.
-  tomb_status=0
-  fleet_run_apply_item "$1" "$2" "$3" "$4" "$5" '' || tomb_status=$?
-  case $tomb_status in
-    0 | 70) ;;
-    *) return "$tomb_status" ;;
-  esac
-  [ -z "$(fleet_applied_digest "$1" "$2" "$4")" ] ||
-    fleet_applied_forget "$1" "$2" "$4" || :
-  mkdir -p "$(dirname "$(fleet_run_tombstone_memo_path "$4")")"
-  printf '%s\n' "$6" >"$(fleet_run_tombstone_memo_path "$4")"
-  tomb_outcome=applied
-  [ "$tomb_status" -eq 0 ] || tomb_outcome=satisfied
-  fleet_journal_append "$1" "$2" \
-    "$(jq -cn --arg item "$4" --arg d "$6" --arg at "$7" --arg o "$tomb_outcome" \
-      '{item:$item,digest:$d,outcome:$o,at:$at}')" || :
-  if [ "$tomb_status" -eq 0 ]; then
-    printf '  applied %s (uninstalled)\n' "$4"
-  else
-    printf '  satisfied %s (absent, and not installed here)\n' "$4"
-  fi
-  return "$tomb_status"
-}
-
-fleet_run_desired() {
-  # fleet_run_desired LAYERDIR HOST -> the fold, plus the plugin tombstones its
-  # knockout removed: every ITEM this host has an opinion on, with its value.
-  # The run reads item values and digests from this, and so do the supervised
-  # verbs, so `fleet-review`, `fleet-apply` and the run all see a scalar
-  # `absent` tombstone the same way. The plain fold stays what every reader of
-  # desired STATE wants — policy, package managers, the alert detections.
-  printf '%s\n' "$(fleet_fold "$1" "$2")" \
-    "$(fleet_fold_tombstones "$1" "$2" plugins)" | jq -c -s '.[0] * .[1]'
-}
-
-fleet_run_tombstone_items() {
-  # fleet_run_tombstone_items DESIRED -> every `plugins.<name>` whose desired
-  # value is a tombstone: the scalar `absent` or `{state: absent}`.
-  printf '%s\n' "$1" | jq -r '
-    [(.plugins // {}) | select(type == "object") | to_entries[] |
-      select(.value == "absent" or
-        ((.value | type) == "object" and .value.state == "absent")) |
-      "plugins." + .key] | unique | .[]'
-}
-
 fleet_run_apply_item() {
   # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
@@ -1301,7 +1246,7 @@ fleet_run_apply_item() {
         printf '%s\n' "$fleet_run_resolved_sha" |
           grep -Eq '^[0-9a-fA-F]{40}$' || return 75
         # A catalog entry with no version is proven by its SHA alone, as in
-        # fleet_run_plugin_identity_matches.
+        # fleet_run_plugin_identity_matches (lib/apply-claude.sh).
         if [ "$fleet_run_resolved_sha" != "$fleet_run_installed_sha" ] ||
           { [ -n "$fleet_run_resolved_version" ] &&
             [ "$fleet_run_resolved_version" != "$fleet_run_installed_version" ]; }; then
@@ -1454,6 +1399,61 @@ fleet_run_apply_item() {
       return 75
       ;;
   esac
+}
+
+# --- §3.4/§3.5 tombstones: `absent` uninstalls through the harness ----------
+
+fleet_run_tombstone_converge() {
+  # fleet_run_tombstone_converge STORE HOST DEFS ITEM VALUE DIGEST AT — THE one
+  # path a tombstone converges through, for the run and for `fleet-apply`
+  # alike: uninstall (fleet_run_uninstall_plugin, through the apply layer),
+  # then — when nothing is installed any more, 0 or 70 — forget any applied/
+  # record (nothing installed is nothing owned, and a recorded tombstone would
+  # read as a prune the day it is compacted away), remember the converged
+  # digest host-locally so later passes stay silent, and journal `applied` or
+  # `satisfied`. Returns the apply status; a 75 is the caller's to hold.
+  tomb_status=0
+  fleet_run_apply_item "$1" "$2" "$3" "$4" "$5" '' || tomb_status=$?
+  case $tomb_status in
+    0 | 70) ;;
+    *) return "$tomb_status" ;;
+  esac
+  [ -z "$(fleet_applied_digest "$1" "$2" "$4")" ] ||
+    fleet_applied_forget "$1" "$2" "$4" || :
+  mkdir -p "$(dirname "$(fleet_run_tombstone_memo_path "$4")")"
+  printf '%s\n' "$6" >"$(fleet_run_tombstone_memo_path "$4")"
+  tomb_outcome=applied
+  [ "$tomb_status" -eq 0 ] || tomb_outcome=satisfied
+  fleet_journal_append "$1" "$2" \
+    "$(jq -cn --arg item "$4" --arg d "$6" --arg at "$7" --arg o "$tomb_outcome" \
+      '{item:$item,digest:$d,outcome:$o,at:$at}')" || :
+  if [ "$tomb_status" -eq 0 ]; then
+    printf '  applied %s (uninstalled)\n' "$4"
+  else
+    printf '  satisfied %s (absent, and not installed here)\n' "$4"
+  fi
+  return "$tomb_status"
+}
+
+fleet_run_desired() {
+  # fleet_run_desired LAYERDIR HOST -> the fold, plus the plugin tombstones its
+  # knockout removed: every ITEM this host has an opinion on, with its value.
+  # The run reads item values and digests from this, and so do the supervised
+  # verbs, so `fleet-review`, `fleet-apply` and the run all see a scalar
+  # `absent` tombstone the same way. The plain fold stays what every reader of
+  # desired STATE wants — policy, package managers, the alert detections.
+  printf '%s\n' "$(fleet_fold "$1" "$2")" \
+    "$(fleet_fold_tombstones "$1" "$2" plugins)" | jq -c -s '.[0] * .[1]'
+}
+
+fleet_run_tombstone_items() {
+  # fleet_run_tombstone_items DESIRED -> every `plugins.<name>` whose desired
+  # value is a tombstone: the scalar `absent` or `{state: absent}`.
+  printf '%s\n' "$1" | jq -r '
+    [(.plugins // {}) | select(type == "object") | to_entries[] |
+      select(.value == "absent" or
+        ((.value | type) == "object" and .value.state == "absent")) |
+      "plugins." + .key] | unique | .[]'
 }
 
 # --- §5/§10.4 the alert surface -----------------------------------------------
@@ -3518,7 +3518,10 @@ fleet_lock_command() (
   #
   # The lock is marked `manual`: it outlives this command by design, and no
   # process stands for the operator holding it, so it is never judged dead and
-  # taken over — it lasts until `fleet-unlock`, or until the stale age.
+  # taken over. It is NEVER released automatically either: a forgotten hand
+  # lock makes every run exit 0 ("another run holds") until it passes the
+  # stale age, and exit 75 (the stale refusal) from then on, until
+  # `fleet-unlock` releases it.
   require_jq
   lock=$(fleet_lock_path)
   fleet_lock_acquire "$lock" "$PPID" manual || {
