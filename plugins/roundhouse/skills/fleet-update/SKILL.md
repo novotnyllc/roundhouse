@@ -67,7 +67,10 @@ policy.
   `installed_versions`, `stale_versions` (installed, not the default),
   `globals` (the default's top-level globals), `globals_unpinnable` (globals
   that cannot be reinstalled by exact registry version: `file:`, `link:`,
-  git, no version) and `switch_hooks_unproven`.
+  git, no version, as far as npm reports a source) and `switch_hooks_unproven`.
+  Known limit: npm 12 reports no install source for most globals, so one
+  installed from a non-registry tarball under a published `name@version`
+  looks pinnable and a switch replaces it with the registry copy.
   A switch is a `package-upgrade` with `id: "fnm:node"`, argv exactly
   `["fnm","default","<candidate_version>"]`, a `carry` list
   `[{"name","version"}]`, a `hooks` list and a `required` list (both
@@ -251,7 +254,7 @@ say); those run too. What the new Node provides, and older Node versions
 (never removed), are reported as `note` lines. `runtimes.node: disabled` stops managing the
 runtime. Only fnm is a runtime source; DSC never runs on native Windows, whose
 Node converges only through the sealed lane above. Add `runtimes:` to the
-store only once every host runs a Roundhouse that knows the category (0.9.29
+store only once every host runs a Roundhouse that knows the category (0.9.30
 or later): an older host holds everything on an unknown category.
 
 Both intervals are jittered from the host **name**, so the fleet does not

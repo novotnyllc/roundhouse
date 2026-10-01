@@ -1,7 +1,7 @@
 # npm global packages, and the Node runtime under them
 
 Status: sections 1–6 shipped in 0.9.27. Section 7 (Node runtime convergence)
-shipped in 0.9.29, with the deferrals listed in §7.8. Section 8 (`~/.npmrc`)
+shipped in 0.9.30, with the known limit in §7.8 and the deferrals in §7.9. Section 8 (`~/.npmrc`)
 is follow-up design, not implemented.
 
 ## 1. Problem
@@ -248,7 +248,7 @@ machine-scope hold. `collect-windows.ps1 -SelfTest` covers the pin parser.
   check and the updater's own lookup. The post-check turns that into
   `partial` (2.4).
 
-## 7. The Node runtime (implemented in 0.9.29)
+## 7. The Node runtime (implemented in 0.9.30)
 
 The storage design's §5.1.2 now carries the amendment this needed: one
 runtime, the host-default Node that runs the managed npm globals, is in scope.
@@ -285,7 +285,7 @@ runtimes:
   in `package_managers`, where it would then be offered every other package.
   The cost of a new category is the documented one: a host that predates it
   holds everything until it is upgraded, so `runtimes:` enters the store only
-  once every host runs 0.9.29 or later.
+  once every host runs 0.9.30 or later.
 - Any other `runtimes.<name>` holds. `runtimes.node: disabled` is satisfied
   and changes nothing.
 
@@ -511,7 +511,28 @@ as LocalSystem through the enrolled broker within the channel its policy token
 enrolls; where readiness advertises it, that is the lane. Otherwise the answer
 is the hold, never a UAC prompt.
 
-### 7.8 Deferred
+### 7.8 Known limit: install source
+
+`globals_unpinnable` is only as good as what npm reports. npm 12 reports no
+install source for globals: `npm ls --global --json` (with or without
+`--long`) gives no `resolved` or `integrity`, there is no hidden lockfile in
+the global `node_modules`, and installed `package.json` files carry no
+`_resolved`. Measured on npm 12.2.0, a global installed from a local tarball
+shows exactly like a registry install. The blacklist therefore catches only
+what npm does report (`file:`, `link:`, git, a missing version). A global
+installed from a non-registry tarball (a local file or an HTTPS URL) that
+shares a published `name@version` is indistinguishable, and a switch replaces
+it with the registry copy, which may be different code; the version-only
+post-check accepts that.
+
+Closing this would need per-switch evidence: fetching the registry artifact
+and comparing it with the installed tree. The fleet's hands-off requirement
+rules that out. It costs network on every switch, and trees that a
+postinstall modifies (opencodex's bundled bun, for one) would never compare
+equal, so those switches would hold. Install such a global from the registry,
+or remove it before a switch, if its source matters.
+
+### 7.9 Deferred
 
 - **Windows pin reconciliation.** The collector reports the gating pin; nothing
   yet sets `winget pin add --id OpenJS.NodeJS --version <major>.*` from
