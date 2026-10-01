@@ -43,5 +43,37 @@ if [ -n "$fleet_fixture_yq" ]; then
           fail "the host-record filter dropped $pub_path, which the owner table does not give vireo"
       fi
     done
+
+    # --- §8.2 P0 fleet-disown --host-only: what only this host's layer wants ---
+    verb_store="$tmp/publish-verbs/store"
+    mkdir -p "$verb_store/hosts"
+    ROUNDHOUSE_FLEET_STORE=$verb_store
+    HOME="$tmp/publish-verbs/home"
+    export ROUNDHOUSE_FLEET_STORE HOME
+    mkdir -p "$HOME"
+    fleet_record_write "$(fleet_identity_path)" '{"name":"vireo"}'
+    printf '%s\n' 'policy:' '  canary_group: canary' >"$verb_store/fleet.yaml"
+    mkdir -p "$verb_store/groups" "$verb_store/applied"
+    printf '%s\n' 'packages:' '  jq: enabled' >"$verb_store/groups/development.yaml"
+    printf '%s\n' 'platform: macos' 'groups: [development]' 'plugins:' \
+      '  railyard: enabled' '  snapshot-only: enabled' 'packages:' '  jq: enabled' \
+      >"$verb_store/hosts/vireo.yaml"
+    printf '%s\n' 'packages:' '  ripgrep:' '    homebrew: ripgrep' \
+      >"$verb_store/definitions.yaml"
+    rm -f "$(fleet_applied_path "$verb_store" vireo)"
+    for verb_owned in plugins.railyard plugins.snapshot-only packages.jq \
+      definitions.packages.ripgrep plugins.gone-everywhere; do
+      fleet_applied_record "$verb_store" vireo "$verb_owned" d-"$verb_owned"
+    done
+    # Only the host file asks for `railyard` and `snapshot-only`, and nothing
+    # asks for `gone-everywhere`; jq is shared through the group, and a
+    # definition comes from no host layer at all.
+    [ "$(fleet_disown_host_only "$verb_store" vireo | tr '\n' ' ')" = \
+      'plugins.gone-everywhere plugins.railyard plugins.snapshot-only ' ] ||
+      fail "the host-only selection was wrong: $(fleet_disown_host_only "$verb_store" vireo | tr '\n' ' ')"
+    printf '%s\n' 'plugins:' '  railyard: enabled' >>"$verb_store/fleet.yaml"
+    [ "$(fleet_disown_host_only "$verb_store" vireo | tr '\n' ' ')" = \
+      'plugins.gone-everywhere plugins.snapshot-only ' ] ||
+      fail "an item a shared layer also asks for was selected as host-only"
   )
 fi

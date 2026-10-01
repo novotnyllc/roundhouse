@@ -163,6 +163,8 @@ if want_section 78; then . "$script_dir/tests/78-fleet-parked.sh"; fi
 # shellcheck source=tests/79-node-runtime.sh
 if want_section 79; then . "$script_dir/tests/79-node-runtime.sh"; fi
 
+# shellcheck source=tests/80-apply-claude.sh
+if want_section 80; then . "$script_dir/tests/80-apply-claude.sh"; fi
 # shellcheck source=tests/81-publish-verbs.sh
 if want_section 81; then . "$script_dir/tests/81-publish-verbs.sh"; fi
 # shellcheck source=tests/90-jj-bootstrap.sh
