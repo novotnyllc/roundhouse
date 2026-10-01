@@ -146,7 +146,7 @@ says rewrites it with the same `at`. An **event** alert takes `at` from its
 it happened.
 
 How an alert ENDS depends on its kind, and what it is keyed by on its scope,
-from one table (`fleet_alert_lifecycle_rows` in `lib/fleet-records.sh`):
+from one table (`fleet_alert_lifecycle_rows` in `lib/fleet-alerts.sh`):
 
 | Lifecycle | Scope | Kinds | Ends |
 | --- | --- | --- | --- |

@@ -123,6 +123,8 @@ EOF
 . "$script_dir/lib/fleet-fold.sh"
 # shellcheck source=lib/fleet-records.sh
 . "$script_dir/lib/fleet-records.sh"
+# shellcheck source=lib/fleet-alerts.sh
+. "$script_dir/lib/fleet-alerts.sh"
 # shellcheck source=lib/fleet-vcs.sh
 . "$script_dir/lib/fleet-vcs.sh"
 # shellcheck source=lib/fleet-trust.sh
