@@ -144,11 +144,11 @@ fleet_compact_alerts_command() (
   printf 'roundhouse: published the compaction\n'
 )
 
-fleet_fold_shared() (
-  # `fleet_fold_shared LAYERDIR HOST` — HOST's fold WITHOUT its own host tier:
-  # what the fleet, its platform and its groups want for it. An item this
-  # host owns that is absent here exists only because the host's own layer
-  # (often a machine snapshot) asked for it — the set `fleet-disown
+fleet_disown_shared_fold() (
+  # `fleet_disown_shared_fold LAYERDIR HOST` — HOST's fold WITHOUT its own
+  # host tier: what the fleet, its platform and its groups want for it. An
+  # item this host owns that is absent here exists only because the host's
+  # own layer (often a machine snapshot) asked for it — the set `fleet-disown
   # --host-only` selects. The host file is still READ, because its facts pick
   # the os/ and groups/ tiers.
   IFS='
@@ -168,7 +168,7 @@ fleet_disown_host_only() {
   LC_ALL=C comm -23 \
     <(fleet_record_read "$(fleet_applied_path "$1" "$2")" '{}' |
       jq -r '(.items // {}) | keys[]' | LC_ALL=C sort -u) \
-    <(fleet_run_item_digests "$(fleet_fold_shared "$1" "$2")" "$1" |
+    <(fleet_run_item_digests "$(fleet_disown_shared_fold "$1" "$2")" "$1" |
       awk '{ print $1 }' | LC_ALL=C sort -u)
 }
 

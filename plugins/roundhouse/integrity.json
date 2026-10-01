@@ -130,7 +130,7 @@
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
-      "sha256": "4e30bdeaf08a1ec15a8cd1e770f54744f7bb78566a8b93035351e38784d9a002"
+      "sha256": "fb2ee2dc0b0da235173bd77ac6fd68b71227b907da01159fd5024a86e919eea8"
     },
     {
       "path": "scripts/lib/fleet-records.sh",
