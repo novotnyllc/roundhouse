@@ -253,24 +253,6 @@ JSON
     done
 
     # --- §3.4 tombstones: `absent` uninstalls a Claude plugin ---
-    # The tombstone set is the fold with the knockout left out, so the last
-    # layer to speak still wins: a host layer that re-adds an item is not a
-    # tombstone there, and a host-layer `absent` over a fleet `enabled` is.
-    run_tomb_layers="$run_root/tomb-layers"
-    mkdir -p "$run_tomb_layers/hosts"
-    printf 'plugins:\n  gone: absent\n  readded: absent\n  kept: enabled\n' \
-      >"$run_tomb_layers/fleet.yaml"
-    printf 'platform: macos\nplugins:\n  readded: enabled\n  local-retire: absent\n' \
-      >"$run_tomb_layers/hosts/vireo.yaml"
-    [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo plugins | jq -c '.plugins | keys')" = \
-      '["gone","local-retire"]' ] ||
-      fail "the tombstone set did not follow last-layer-wins: $(fleet_fold_tombstones "$run_tomb_layers" vireo plugins)"
-    [ "$(fleet_fold "$run_tomb_layers" vireo | jq -c '.plugins | keys')" = \
-      '["kept","readded"]' ] ||
-      fail "reading tombstones changed what the ordinary fold knocks out"
-    [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo skills)" = '{}' ] ||
-      fail "a category with no tombstones produced some"
-
     run_tomb_installed() {
       printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.4.0\",\"gitCommitSha\":\"$run_sha_new\"}]}}" \
         >"$run_plugin_installed"

@@ -456,17 +456,108 @@ YAML
       *) fail "a downstream host stopped waiting on an item the canary could not apply: $runjj_out" ;;
     esac
 
-    # --- §3.4: a tombstone uninstalls, inside the cap, and then goes quiet ---
-    # The scalar form, which the fold knocks out: it reaches the run only
-    # through the tombstone read, and the installed record names its one
-    # marketplace. Disabled, so the live-session deferral does not apply.
-    mkdir -p "$HOME/.claude/plugins"
-    printf '{"version":2,"plugins":{"retired@test-market":[{"scope":"user","version":"1.0.0"}]}}\n' \
-      >"$HOME/.claude/plugins/installed_plugins.json"
-    printf '{"retired@test-market":false}\n' >"$rjj/plugin-enabled.json"
-    : >"$rjj/plugin-actions"
-    runjj_dev_group() {
-      cat >"$vireo/groups/development.yaml" <<YAML
+    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding)\n'
+  ) || fail "real-jj run block failed (see the FAIL: real-jj: line above)"
+fi
+
+# --- the P0 scenarios: one block and one OK line each -------------------------
+# Each builds its own fresh one-host fleet, so none depends on the order above
+# or on another's leftovers, and a sibling change to one scenario touches only
+# its own block.
+p0jj_setup() {
+  # p0jj_setup NAME — a fresh fleet of one host (vireo) under
+  # $runjj_root/p0-NAME with a private remote, a verified posture, the fleet
+  # and host layers the scenarios read, and its first run published. Defines
+  # the helpers the scenarios use: runjj, runjj_lib; sets rjj and vireo.
+  PATH="$(dirname "$real_jj"):$(dirname "$real_yq"):$PATH"
+  export PATH
+  # shellcheck source=/dev/null
+  ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+  rjj="$runjj_root/p0-$1"
+  mkdir -p "$rjj"
+  cat >"$rjj/jj-config.toml" <<'TOML'
+[user]
+name = "roundhouse selfcheck"
+email = "roundhouse-selfcheck@example.invalid"
+[ui]
+paginate = "never"
+editor = "true"
+TOML
+  export JJ_CONFIG="$rjj/jj-config.toml"
+  export XDG_CONFIG_HOME="$rjj/xdg"
+  export HOME="$rjj/home"
+  mkdir -p "$HOME"
+  rjj_key vireo
+  rjj_krl seed.krl
+  "$REAL_GIT" init -q --bare -b main "$rjj/remote.git"
+  runjj() {
+    runjj_host=$1
+    shift
+    env ROUNDHOUSE_FLEET_STORE="$rjj/$runjj_host/store" \
+      ROUNDHOUSE_FLEET_SIGNING_KEY="$rjj/$runjj_host-key" \
+      ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_TRUST_ROOT="$rjj/$runjj_host" \
+      "$@"
+  }
+  runjj_lib() {
+    runjj_host=$1
+    shift
+    env ROUNDHOUSE_FLEET_STORE="$rjj/$runjj_host/store" \
+      ROUNDHOUSE_FLEET_SIGNING_KEY="$rjj/$runjj_host-key" \
+      ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_TRUST_ROOT="$rjj/$runjj_host" \
+      bash -c 'ROUNDHOUSE_LIB_ONLY=1 . "$0"; shift; "$@"' "$cli" -- "$@"
+  }
+  mkdir -p "$rjj/vireo"
+  printf 'name: vireo\ndomain: fleet.example.invalid\n' >"$rjj/vireo/identity.yaml"
+  runjj vireo "$cli" fleet-init >/dev/null || fail "fleet-init failed on vireo"
+  vireo="$rjj/vireo/store"
+  jj -R "$vireo" git remote add origin "$rjj/remote.git" >/dev/null
+  runjj vireo "$cli" fleet-enroll >/dev/null || fail "fleet-enroll failed on vireo"
+  env ROUNDHOUSE_SELFTEST=1 \
+    ROUNDHOUSE_FLEET_VISIBILITY_PROBE='printf "Permission denied (publickey)\n" >&2; exit 128' \
+    ROUNDHOUSE_FLEET_STORE="$vireo" "$cli" fleet-verify-remote >/dev/null ||
+    fail "fleet-verify-remote did not accept an authentication refusal as private"
+  mkdir -p "$vireo/hosts" "$vireo/groups"
+  cat >"$vireo/fleet.yaml" <<'YAML'
+policy:
+  canary_wait_hours: 0
+config_files:
+  ~/.claude/settings.json:
+    keys:
+      env.DISABLE_TELEMETRY: managed
+YAML
+  printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\n' \
+    >"$vireo/hosts/vireo.yaml"
+  runjj vireo "$cli" fleet-run --fast >/dev/null ||
+    fail "the first fleet-run on the $1 fleet failed"
+}
+
+p0jj_block() {
+  # p0jj_block NAME SCENARIO-FUNCTION OK-TEXT — one scenario, in its own
+  # subshell over its own fleet, with its own OK line.
+  (
+    set -eu
+    fail() {
+      printf 'FAIL: real-jj: %s\n' "$*" >&2
+      exit 1
+    }
+    p0jj_setup "$1"
+    "$2"
+    printf 'real-jj: OK (%s)\n' "$3"
+  ) || fail "real-jj $1 block failed (see the FAIL: real-jj: line above)"
+}
+
+p0jj_tombstone() {
+  # --- §3.4: a tombstone uninstalls, inside the cap, and then goes quiet ---
+  # The scalar form, which the fold knocks out: it reaches the run only
+  # through the tombstone read, and the installed record names its one
+  # marketplace. Disabled, so the live-session deferral does not apply.
+  mkdir -p "$HOME/.claude/plugins"
+  printf '{"version":2,"plugins":{"retired@test-market":[{"scope":"user","version":"1.0.0"}]}}\n' \
+    >"$HOME/.claude/plugins/installed_plugins.json"
+  printf '{"retired@test-market":false}\n' >"$rjj/plugin-enabled.json"
+  : >"$rjj/plugin-actions"
+  runjj_dev_group() {
+    cat >"$vireo/groups/development.yaml" <<YAML
 policy:
   canary_wait_hours: 0
   max_removals_per_run: $1
@@ -476,176 +567,226 @@ mcp_servers:
 plugins:
   retired: absent
 YAML
-    }
-    runjj_tomb_run() {
-      runjj vireo env CLAUDE_CONFIG_DIR="$HOME/.claude" \
-        CLAUDE_PLUGIN_ENABLED_FILE="$rjj/plugin-enabled.json" \
-        CLAUDE_PLUGIN_ACTION_LOG="$rjj/plugin-actions" "$cli" fleet-run --fast
-    }
-    runjj_tomb_count() {
-      grep -rh -A2 'item: plugins.retired' "$vireo/journal/vireo" 2>/dev/null |
-        grep -c 'outcome:' || true
-    }
-    # Over the cap, the uninstall is a removal like any other and holds.
-    runjj_dev_group 0
-    runjj_out=$(runjj_tomb_run) || fail "the capped tombstone run failed: $runjj_out"
-    case $runjj_out in
-      *'hold  plugins.retired — the removal set is over the cap'*) ;;
-      *) fail "a tombstone uninstall was not counted toward the removal cap: $runjj_out" ;;
-    esac
-    jq -e '.plugins["retired@test-market"]' "$HOME/.claude/plugins/installed_plugins.json" \
-      >/dev/null || fail "a capped tombstone uninstalled anyway"
-    runjj_dev_group 5
-    runjj_out=$(runjj_tomb_run) || fail "the tombstone run failed: $runjj_out"
-    case $runjj_out in
-      *'applied plugins.retired (uninstalled)'*) ;;
-      *) fail "the tombstone did not uninstall the plugin: $runjj_out" ;;
-    esac
-    grep -Fqx 'uninstall retired@test-market' "$rjj/plugin-actions" ||
-      fail "the tombstone did not go through claude plugin uninstall"
-    ! jq -e '.plugins["retired@test-market"]' \
-      "$HOME/.claude/plugins/installed_plugins.json" >/dev/null ||
-      fail "the uninstalled plugin is still recorded as installed"
-    grep -rh -A2 'item: plugins.retired' "$vireo/journal/vireo" |
-      grep -q 'outcome: applied' || fail "the uninstall journaled no applied record"
-    [ -z "$(fleet_applied_digest "$vireo" vireo plugins.retired)" ] ||
-      fail "a tombstone was recorded as owned in applied/"
-    # Converged: the next working pass says nothing more about it.
-    runjj_tomb_before=$(runjj_tomb_count)
-    printf '# another edit\n' >>"$vireo/fleet.yaml"
-    runjj_tomb_run >/dev/null || fail "the pass after the uninstall failed"
-    [ "$(runjj_tomb_count)" = "$runjj_tomb_before" ] ||
-      fail "a converged tombstone journaled again on the next pass"
+  }
+  runjj_tomb_run() {
+    runjj vireo env CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$rjj/plugin-enabled.json" \
+      CLAUDE_PLUGIN_ACTION_LOG="$rjj/plugin-actions" "$cli" fleet-run --fast
+  }
+  runjj_tomb_count() {
+    grep -rh -A2 'item: plugins.retired' "$vireo/journal/vireo" 2>/dev/null |
+      grep -c 'outcome:' || true
+  }
+  # Over the cap, the uninstall is a removal like any other and holds.
+  runjj_dev_group 0
+  runjj_out=$(runjj_tomb_run) || fail "the capped tombstone run failed: $runjj_out"
+  case $runjj_out in
+    *'hold  plugins.retired — the removal set is over the cap'*) ;;
+    *) fail "a tombstone uninstall was not counted toward the removal cap: $runjj_out" ;;
+  esac
+  jq -e '.plugins["retired@test-market"]' "$HOME/.claude/plugins/installed_plugins.json" \
+    >/dev/null || fail "a capped tombstone uninstalled anyway"
+  runjj_dev_group 5
+  runjj_out=$(runjj_tomb_run) || fail "the tombstone run failed: $runjj_out"
+  case $runjj_out in
+    *'applied plugins.retired (uninstalled)'*) ;;
+    *) fail "the tombstone did not uninstall the plugin: $runjj_out" ;;
+  esac
+  grep -Fqx 'uninstall retired@test-market' "$rjj/plugin-actions" ||
+    fail "the tombstone did not go through claude plugin uninstall"
+  ! jq -e '.plugins["retired@test-market"]' \
+    "$HOME/.claude/plugins/installed_plugins.json" >/dev/null ||
+    fail "the uninstalled plugin is still recorded as installed"
+  grep -rh -A2 'item: plugins.retired' "$vireo/journal/vireo" |
+    grep -q 'outcome: applied' || fail "the uninstall journaled no applied record"
+  [ -z "$(fleet_applied_digest "$vireo" vireo plugins.retired)" ] ||
+    fail "a tombstone was recorded as owned in applied/"
+  # Converged: the next working pass says nothing more about it.
+  runjj_tomb_before=$(runjj_tomb_count)
+  printf '# another edit\n' >>"$vireo/fleet.yaml"
+  runjj_tomb_run >/dev/null || fail "the pass after the uninstall failed"
+  [ "$(runjj_tomb_count)" = "$runjj_tomb_before" ] ||
+    fail "a converged tombstone journaled again on the next pass"
+}
 
-    # --- §6.3: a dead holder's lock is taken over by the next run ---
-    # The wedge itself: a lock a dead pre-nonce run left behind, aged far past
-    # the stale threshold. The age check used to run first and refuse it
-    # forever; the holder check runs first now.
-    runjj_lock="$rjj/vireo/store.lock"
-    sleep 1 &
-    runjj_dead=$!
-    wait "$runjj_dead" 2>/dev/null || :
-    mkdir -p "$runjj_lock"
-    printf '{"host":"vireo","pid":%s,"started_at":"2000-01-01T00:00:00Z"}\n' \
-      "$runjj_dead" >"$runjj_lock/meta.json"
-    runjj_out=$(runjj vireo "$cli" fleet-run --fast 2>&1) ||
-      fail "a run refused a lock whose holder is dead: $runjj_out"
-    case $runjj_out in
-      *'took over the run lock'*) ;;
-      *) fail "the takeover was not reported: $runjj_out" ;;
-    esac
-    [ ! -d "$runjj_lock" ] ||
-      fail "the run did not release the lock it took over"
-    jj -R "$vireo" file list -r "$(fleet_vcs_heads_local "$vireo")" \
-      -T 'path ++ "\n"' | grep -qx 'alerts/vireo/lock-takeover.yaml' ||
-      fail "the takeover alert was not published"
+p0jj_takeover() {
+  # --- §6.3: a dead holder's lock is taken over by the next run ---
+  # The wedge itself: a lock a dead pre-nonce run left behind, aged far past
+  # the stale threshold. The age check used to run first and refuse it
+  # forever; the holder check runs first now.
+  runjj_lock="$rjj/vireo/store.lock"
+  sleep 1 &
+  runjj_dead=$!
+  wait "$runjj_dead" 2>/dev/null || :
+  mkdir -p "$runjj_lock"
+  printf '{"host":"vireo","pid":%s,"started_at":"2000-01-01T00:00:00Z"}\n' \
+    "$runjj_dead" >"$runjj_lock/meta.json"
+  runjj_out=$(runjj vireo "$cli" fleet-run --fast 2>&1) ||
+    fail "a run refused a lock whose holder is dead: $runjj_out"
+  case $runjj_out in
+    *'took over the run lock'*) ;;
+    *) fail "the takeover was not reported: $runjj_out" ;;
+  esac
+  [ ! -d "$runjj_lock" ] ||
+    fail "the run did not release the lock it took over"
+  jj -R "$vireo" file list -r "$(fleet_vcs_heads_local "$vireo")" \
+    -T 'path ++ "\n"' | grep -qx 'alerts/vireo/lock-takeover.yaml' ||
+    fail "the takeover alert was not published"
+}
 
-    # --- §6.4: the one-time alert compaction, published ---
-    runjj_alerts="$vireo/alerts/vireo"
-    for runjj_n in $(seq 1 40); do
-      printf 'kind: integrity\nhost: vireo\nitems: [plugins.p%s]\ndetail: held %s\nat: "2026-08-%02dT00:00:00Z"\n' \
-        "$((runjj_n % 4))" "$runjj_n" "$((runjj_n % 28 + 1))" \
-        >"$runjj_alerts/202608$(printf %02d $((runjj_n % 28 + 1)))T00$(printf %02d "$runjj_n")-integrity-p$runjj_n.yaml"
+p0jj_compaction() {
+  # --- §6.4: the one-time alert compaction, published ---
+  runjj_alerts="$vireo/alerts/vireo"
+  mkdir -p "$runjj_alerts"
+  for runjj_n in $(seq 1 40); do
+    printf 'kind: integrity\nhost: vireo\nitems: [plugins.p%s]\ndetail: held %s\nat: "2026-08-%02dT00:00:00Z"\n' \
+      "$((runjj_n % 4))" "$runjj_n" "$((runjj_n % 28 + 1))" \
+      >"$runjj_alerts/202608$(printf %02d $((runjj_n % 28 + 1)))T00$(printf %02d "$runjj_n")-integrity-p$runjj_n.yaml"
+  done
+  runjj vireo "$cli" fleet-run --fast >/dev/null ||
+    fail "vireo could not publish the stamped alert fixture"
+  # Refused while the working copy carries an edit that is not a record.
+  printf '# an unpublished layer edit\n' >>"$vireo/fleet.yaml"
+  runjj_status=0
+  runjj_out=$(runjj vireo "$cli" fleet-compact-alerts 2>&1) || runjj_status=$?
+  [ "$runjj_status" -eq 65 ] ||
+    fail "compaction published over an operator's unpublished layer edit (got $runjj_status): $runjj_out"
+  runjj vireo "$cli" fleet-run --fast >/dev/null ||
+    fail "vireo could not publish the pending layer edit"
+  runjj_out=$(runjj vireo "$cli" fleet-compact-alerts) ||
+    fail "fleet-compact-alerts failed: $runjj_out"
+  case $runjj_out in
+    *'published the compaction'*) ;;
+    *) fail "the compaction did not publish: $runjj_out" ;;
+  esac
+  [ "$(fleet_vcs_heads_local "$vireo")" = "$(fleet_vcs_head_origin "$vireo")" ] ||
+    fail "the compaction is not on the remote"
+  runjj_tree=$(jj -R "$vireo" file list -r "$(fleet_vcs_head_origin "$vireo")" \
+    -T 'path ++ "\n"')
+  ! printf '%s\n' "$runjj_tree" | grep -Eq '^alerts/vireo/[0-9]{8}T[0-9]{4}-' ||
+    fail "stamped alert files survived the published compaction"
+  [ "$(printf '%s\n' "$runjj_tree" | grep -c '^alerts/vireo/integrity--plugins\.p')" -eq 4 ] ||
+    fail "the compaction did not leave one keyed file per (kind, item)"
+  [ -z "$(jj -R "$vireo" log -r @ --no-graph -T 'if(empty,"","dirty")')" ] ||
+    fail "the compaction did not leave @ an empty child of main"
+  runjj_out=$(runjj vireo "$cli" fleet-compact-alerts) ||
+    fail "a second compaction failed: $runjj_out"
+  case $runjj_out in
+    *'nothing to publish'*) ;;
+    *) fail "a second compaction was not a no-op: $runjj_out" ;;
+  esac
+}
+
+p0jj_disown() {
+  # --- §8.2 P0: fleet-disown releases host-only ownership without a prune ---
+  runjj_hostonly='config_files.~/.hostonly'
+  # A tombstone the disown dry run can name (see below), in a shared layer.
+  mkdir -p "$vireo/groups"
+  printf 'plugins:\n  retired: absent\n' >"$vireo/groups/development.yaml"
+  runjj_outcomes() {
+    for runjj_day in "$vireo/journal/vireo"/*.yaml; do
+      FLEET_ITEM=$1 yq -r '.[] | select(.item == strenv(FLEET_ITEM)) | .outcome' \
+        "$runjj_day"
     done
-    runjj vireo "$cli" fleet-run --fast >/dev/null ||
-      fail "vireo could not publish the stamped alert fixture"
-    # Refused while the working copy carries an edit that is not a record.
-    printf '# an unpublished layer edit\n' >>"$vireo/fleet.yaml"
-    runjj_status=0
-    runjj_out=$(runjj vireo "$cli" fleet-compact-alerts 2>&1) || runjj_status=$?
-    [ "$runjj_status" -eq 65 ] ||
-      fail "compaction published over an operator's unpublished layer edit (got $runjj_status): $runjj_out"
-    runjj vireo "$cli" fleet-run --fast >/dev/null ||
-      fail "vireo could not publish the pending layer edit"
-    runjj_out=$(runjj vireo "$cli" fleet-compact-alerts) ||
-      fail "fleet-compact-alerts failed: $runjj_out"
-    case $runjj_out in
-      *'published the compaction'*) ;;
-      *) fail "the compaction did not publish: $runjj_out" ;;
-    esac
-    [ "$(fleet_vcs_heads_local "$vireo")" = "$(fleet_vcs_head_origin "$vireo")" ] ||
-      fail "the compaction is not on the remote"
-    runjj_tree=$(jj -R "$vireo" file list -r "$(fleet_vcs_head_origin "$vireo")" \
-      -T 'path ++ "\n"')
-    ! printf '%s\n' "$runjj_tree" | grep -Eq '^alerts/vireo/[0-9]{8}T[0-9]{4}-' ||
-      fail "stamped alert files survived the published compaction"
-    [ "$(printf '%s\n' "$runjj_tree" | grep -c '^alerts/vireo/integrity--plugins\.p')" -eq 4 ] ||
-      fail "the compaction did not leave one keyed file per (kind, item)"
-    [ -z "$(jj -R "$vireo" log -r @ --no-graph -T 'if(empty,"","dirty")')" ] ||
-      fail "the compaction did not leave @ an empty child of main"
-    runjj_out=$(runjj vireo "$cli" fleet-compact-alerts) ||
-      fail "a second compaction failed: $runjj_out"
-    case $runjj_out in
-      *'nothing to publish'*) ;;
-      *) fail "a second compaction was not a no-op: $runjj_out" ;;
-    esac
+  }
+  printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\nskills:\n  ponytail-audit: enabled\nconfig_files:\n  ~/.hostonly:\n    keys:\n      a: managed\n' \
+    >"$vireo/hosts/vireo.yaml"
+  runjj vireo "$cli" fleet-run --fast >/dev/null ||
+    fail "vireo could not apply its host-only item"
+  [ -n "$(fleet_applied_digest "$vireo" vireo "$runjj_hostonly")" ] ||
+    fail "the host-only fixture item was never owned"
+  runjj_out=$(runjj vireo "$cli" fleet-disown --host-only --dry-run) ||
+    fail "fleet-disown --dry-run failed: $runjj_out"
+  case $runjj_out in
+    *"disown $runjj_hostonly "*) ;;
+    *) fail "the dry run did not select the host-only item: $runjj_out" ;;
+  esac
+  case $runjj_out in
+    *'disown config_files.~/.claude/settings.json'*)
+      fail "the dry run selected an item the fleet layer asks for: $runjj_out" ;;
+  esac
+  [ -n "$(fleet_applied_digest "$vireo" vireo "$runjj_hostonly")" ] ||
+    fail "a dry-run disown changed applied/"
+  # An owned item that is TOMBSTONED is not left installed: the dry run says
+  # its tombstone will uninstall it.
+  fleet_applied_record "$vireo" vireo plugins.retired d-retired
+  runjj_out=$(runjj vireo "$cli" fleet-disown --dry-run plugins.retired) ||
+    fail "the tombstoned disown dry run failed: $runjj_out"
+  case $runjj_out in
+    *'will be uninstalled by its tombstone'*) ;;
+    *) fail "the dry run did not say a tombstoned item will be uninstalled: $runjj_out" ;;
+  esac
+  fleet_applied_forget "$vireo" vireo plugins.retired
+  runjj_status=0
+  runjj vireo "$cli" fleet-disown plugins.never-owned >/dev/null 2>&1 ||
+    runjj_status=$?
+  [ "$runjj_status" -eq 65 ] ||
+    fail "disowning an item this host does not own was not refused (got $runjj_status)"
+  runjj_out=$(runjj vireo "$cli" fleet-disown --host-only) ||
+    fail "fleet-disown failed: $runjj_out"
+  case $runjj_out in
+    *'published the disown'*) ;;
+    *) fail "the disown did not publish: $runjj_out" ;;
+  esac
+  [ -z "$(fleet_applied_digest "$vireo" vireo "$runjj_hostonly")" ] ||
+    fail "the disowned item is still owned"
+  [ -n "$(fleet_applied_digest "$vireo" vireo 'config_files.~/.claude/settings.json')" ] ||
+    fail "the disown released an item the fleet layer still asks for"
+  runjj_outcomes "$runjj_hostonly" | grep -qx disowned ||
+    fail "the disown journaled no disowned record"
+  [ "$(fleet_vcs_heads_local "$vireo")" = "$(fleet_vcs_head_origin "$vireo")" ] ||
+    fail "the disown is not on the remote"
+  # Retiring the host layer now changes nothing: no prune, no `reverted`.
+  printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\nskills:\n  ponytail-audit: enabled\n' \
+    >"$vireo/hosts/vireo.yaml"
+  runjj_out=$(runjj vireo "$cli" fleet-run --fast) ||
+    fail "the run after retiring the host-only item failed: $runjj_out"
+  case $runjj_out in
+    *"prune $runjj_hostonly"*) fail "a disowned item was pruned: $runjj_out" ;;
+  esac
+  ! runjj_outcomes "$runjj_hostonly" | grep -qx reverted ||
+    fail "a disowned item was journaled reverted"
+}
 
-    # --- §8.2 P0: fleet-disown releases host-only ownership without a prune ---
-    runjj_hostonly='config_files.~/.hostonly'
-    runjj_outcomes() {
-      for runjj_day in "$vireo/journal/vireo"/*.yaml; do
-        FLEET_ITEM=$1 yq -r '.[] | select(.item == strenv(FLEET_ITEM)) | .outcome' \
-          "$runjj_day"
-      done
-    }
-    printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\nskills:\n  ponytail-audit: enabled\nconfig_files:\n  ~/.hostonly:\n    keys:\n      a: managed\n' \
-      >"$vireo/hosts/vireo.yaml"
-    runjj vireo "$cli" fleet-run --fast >/dev/null ||
-      fail "vireo could not apply its host-only item"
-    [ -n "$(fleet_applied_digest "$vireo" vireo "$runjj_hostonly")" ] ||
-      fail "the host-only fixture item was never owned"
-    runjj_out=$(runjj vireo "$cli" fleet-disown --host-only --dry-run) ||
-      fail "fleet-disown --dry-run failed: $runjj_out"
-    case $runjj_out in
-      *"disown $runjj_hostonly "*) ;;
-      *) fail "the dry run did not select the host-only item: $runjj_out" ;;
-    esac
-    case $runjj_out in
-      *'disown config_files.~/.claude/settings.json'*)
-        fail "the dry run selected an item the fleet layer asks for: $runjj_out" ;;
-    esac
-    [ -n "$(fleet_applied_digest "$vireo" vireo "$runjj_hostonly")" ] ||
-      fail "a dry-run disown changed applied/"
-    # An owned item that is TOMBSTONED is not left installed: the dry run says
-    # its tombstone will uninstall it.
-    fleet_applied_record "$vireo" vireo plugins.retired d-retired
-    runjj_out=$(runjj vireo "$cli" fleet-disown --dry-run plugins.retired) ||
-      fail "the tombstoned disown dry run failed: $runjj_out"
-    case $runjj_out in
-      *'will be uninstalled by its tombstone'*) ;;
-      *) fail "the dry run did not say a tombstoned item will be uninstalled: $runjj_out" ;;
-    esac
-    fleet_applied_forget "$vireo" vireo plugins.retired
-    runjj_status=0
-    runjj vireo "$cli" fleet-disown plugins.never-owned >/dev/null 2>&1 ||
-      runjj_status=$?
-    [ "$runjj_status" -eq 65 ] ||
-      fail "disowning an item this host does not own was not refused (got $runjj_status)"
-    runjj_out=$(runjj vireo "$cli" fleet-disown --host-only) ||
-      fail "fleet-disown failed: $runjj_out"
-    case $runjj_out in
-      *'published the disown'*) ;;
-      *) fail "the disown did not publish: $runjj_out" ;;
-    esac
-    [ -z "$(fleet_applied_digest "$vireo" vireo "$runjj_hostonly")" ] ||
-      fail "the disowned item is still owned"
-    [ -n "$(fleet_applied_digest "$vireo" vireo 'config_files.~/.claude/settings.json')" ] ||
-      fail "the disown released an item the fleet layer still asks for"
-    runjj_outcomes "$runjj_hostonly" | grep -qx disowned ||
-      fail "the disown journaled no disowned record"
-    [ "$(fleet_vcs_heads_local "$vireo")" = "$(fleet_vcs_head_origin "$vireo")" ] ||
-      fail "the disown is not on the remote"
-    # Retiring the host layer now changes nothing: no prune, no `reverted`.
-    printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\nskills:\n  ponytail-audit: enabled\n' \
-      >"$vireo/hosts/vireo.yaml"
-    runjj_out=$(runjj vireo "$cli" fleet-run --fast) ||
-      fail "the run after retiring the host-only item failed: $runjj_out"
-    case $runjj_out in
-      *"prune $runjj_hostonly"*) fail "a disowned item was pruned: $runjj_out" ;;
-    esac
-    ! runjj_outcomes "$runjj_hostonly" | grep -qx reverted ||
-      fail "a disowned item was journaled reverted"
+p0jj_verb_refusals() {
+  # fleet_run_verb_begin's refusals, against a real store: a diverged main
+  # (two bookmark heads), a run holding the lock, and an unpublished layer
+  # edit. Each refuses BEFORE anything is written, and leaves no lock behind.
+  runjj_lock="$rjj/vireo/store.lock"
+  runjj_status=0
+  runjj vireo bash -c 'ROUNDHOUSE_LIB_ONLY=1 . "$0"
+    fleet_vcs_heads_local() { printf "%s\n" one two; }
+    fleet_run_verb_begin "$ROUNDHOUSE_FLEET_STORE" vireo fleet-disown' "$cli" \
+    2>"$rjj/verb-err" || runjj_status=$?
+  [ "$runjj_status" -eq 65 ] && grep -q 'main is diverged' "$rjj/verb-err" ||
+    fail "a publishing verb did not refuse a diverged main (got $runjj_status): $(cat "$rjj/verb-err")"
+  [ ! -d "$runjj_lock" ] || fail "the diverged-main refusal left a lock"
+  sleep 300 &
+  runjj_holder=$!
+  runjj_lib vireo fleet_lock_acquire "$runjj_lock" "$runjj_holder"
+  runjj_status=0
+  runjj vireo "$cli" fleet-disown --host-only 2>"$rjj/verb-err" >/dev/null ||
+    runjj_status=$?
+  kill "$runjj_holder" 2>/dev/null || :
+  wait "$runjj_holder" 2>/dev/null || :
+  rm -rf "$runjj_lock"
+  [ "$runjj_status" -eq 75 ] && grep -q 'retry when it finishes' "$rjj/verb-err" ||
+    fail "a publishing verb did not wait for a live run's lock (got $runjj_status): $(cat "$rjj/verb-err")"
+  printf '# an unpublished layer edit\n' >>"$vireo/fleet.yaml"
+  runjj_status=0
+  runjj vireo "$cli" fleet-disown --host-only 2>"$rjj/verb-err" >/dev/null ||
+    runjj_status=$?
+  [ "$runjj_status" -eq 65 ] && grep -q 'unpublished edits (fleet.yaml)' "$rjj/verb-err" ||
+    fail "a publishing verb published over a foreign working-copy edit (got $runjj_status): $(cat "$rjj/verb-err")"
+  [ ! -d "$runjj_lock" ] || fail "the foreign-edit refusal left its lock behind"
+}
 
-    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding, capped tombstone uninstall, dead-holder takeover, alert compaction, host-only disown)\n'
-  ) || fail "real-jj run block failed (see the FAIL: real-jj: line above)"
+if [ "$real_jj_ok" = true ]; then
+  p0jj_block tombstone p0jj_tombstone 'capped tombstone uninstall, then silent'
+  p0jj_block takeover p0jj_takeover 'dead-holder lock takeover, alerted and published'
+  p0jj_block compaction p0jj_compaction \
+    'alert compaction refused over a layer edit, published, idempotent'
+  p0jj_block disown p0jj_disown 'host-only disown: dry run, refusal, publish, no prune after'
+  p0jj_block verbs p0jj_verb_refusals \
+    'publishing verbs refuse a diverged main, a live lock and a foreign edit'
 fi
