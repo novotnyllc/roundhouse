@@ -85,6 +85,15 @@ fleet_schedule_lingers() {
 }
 
 fleet_schedule_state_path() {
+  # fast|full -> that job's remembered state: ONE file per job, so a fast and a
+  # full trigger landing together each replace only their own file and never
+  # read-modify-write the other's line.
+  printf '%s/schedule-state.%s\n' "$(fleet_run_state_dir)" "$1"
+}
+
+fleet_schedule_legacy_state_path() {
+  # The combined `MODE STATE` file written before the per-job files. Read as a
+  # fallback for one release, never written, removed by `uninstall`.
   printf '%s/schedule-state\n' "$(fleet_run_state_dir)"
 }
 
@@ -102,8 +111,15 @@ fleet_schedule_marker() {
 }
 
 fleet_schedule_last_state() {
-  # The last state OBSERVED for MODE (never `unavailable`), or nothing.
-  awk -v m="$1" '$1 == m { print $2; exit }' "$(fleet_schedule_state_path)" 2>/dev/null
+  # The last state OBSERVED for MODE (never `unavailable`), or nothing. The
+  # per-job file wins; the combined legacy file answers only for a job that has
+  # no file of its own yet.
+  last_state_path=$(fleet_schedule_state_path "$1")
+  if [ -f "$last_state_path" ]; then
+    head -n 1 "$last_state_path" 2>/dev/null
+    return 0
+  fi
+  awk -v m="$1" '$1 == m { print $2; exit }' "$(fleet_schedule_legacy_state_path)" 2>/dev/null
 }
 
 fleet_schedule_probe() {
@@ -173,16 +189,21 @@ fleet_schedule_probe() {
 
 fleet_schedule_job_state() {
   # The probe, remembered: every state actually observed is written to
-  # store.run/schedule-state, and `unavailable` never overwrites one. That
+  # store.run/schedule-state.MODE, and `unavailable` never overwrites one. That
   # memory is what lets a trigger over SSH (no GUI domain to ask) still honour
   # an operator's disable it can no longer see.
+  #
+  # Written whole through a temporary file UNIQUE to this writer and renamed
+  # into place, so two triggers racing on one job leave one complete state,
+  # never a torn file or another writer's half-written temporary.
   job_state=$(fleet_schedule_probe "$1")
   if [ "$job_state" != unavailable ] && [ "$(fleet_schedule_last_state "$1")" != "$job_state" ]; then
-    job_state_path=$(fleet_schedule_state_path)
-    mkdir -p "$(dirname "$job_state_path")" &&
-      { awk -v m="$1" '$1 != m' "$job_state_path" 2>/dev/null || :
-        printf '%s %s\n' "$1" "$job_state"; } >"$job_state_path.next" &&
-      mv -f "$job_state_path.next" "$job_state_path" || :
+    job_state_path=$(fleet_schedule_state_path "$1")
+    if mkdir -p "$(dirname "$job_state_path")" &&
+      job_state_next=$(mktemp "$job_state_path.next.XXXXXX" 2>/dev/null); then
+      { printf '%s\n' "$job_state" >"$job_state_next" &&
+        mv -f "$job_state_next" "$job_state_path"; } || rm -f "$job_state_next"
+    fi
   fi
   printf '%s\n' "$job_state"
 }
@@ -661,7 +682,10 @@ fleet_schedule_uninstall() {
   done
   [ "$(fleet_schedule_platform)" != systemd ] || ! fleet_schedule_user_manager ||
     systemctl --user daemon-reload >/dev/null 2>&1 || :
-  rm -f "$(fleet_schedule_marker)" "$(fleet_schedule_state_path)"
+  rm -f "$(fleet_schedule_marker)" "$(fleet_schedule_legacy_state_path)"
+  for uninstall_mode in $fleet_schedule_modes; do
+    rm -f "$(fleet_schedule_state_path "$uninstall_mode")"
+  done
   # The opt-out: from here on a trigger stamps and starts nothing, and a pass
   # raises no schedule alert, until `install` is run again.
   mkdir -p "$(dirname "$(fleet_schedule_optout_path)")"

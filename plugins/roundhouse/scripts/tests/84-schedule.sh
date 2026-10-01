@@ -213,9 +213,39 @@ STUB
     [ "$(fleet_schedule_last_state fast)" = loaded ] ||
       fail "an unreachable domain overwrote the remembered job state"
     # Never seen: nothing is known about the operator's intent, so nothing runs.
-    rm -f "$SCHED_STATE/runner" "$(fleet_schedule_state_path)"
+    rm -f "$SCHED_STATE/runner" "$(fleet_schedule_state_path fast)" \
+      "$(fleet_schedule_state_path full)"
     "$cli" fleet-trigger --fast >/dev/null
     sched_no_runner || fail "a job never seen running was started blind"
+    # The combined file an earlier release wrote still answers, for one
+    # release, for a job that has no file of its own…
+    printf 'fast loaded\nfull disabled\n' >"$(fleet_schedule_legacy_state_path)"
+    [ "$(fleet_schedule_last_state fast)" = loaded ] &&
+      [ "$(fleet_schedule_last_state full)" = disabled ] ||
+      fail "the combined legacy schedule-state file was not read as a fallback"
+    # …and the per-job file wins once there is one.
+    printf 'unloaded\n' >"$(fleet_schedule_state_path full)"
+    [ "$(fleet_schedule_last_state full)" = unloaded ] ||
+      fail "the legacy combined file overrode a job's own state file"
+    rm -f "$(fleet_schedule_legacy_state_path)" "$(fleet_schedule_state_path full)" \
+      "$SCHED_STATE/runner"
+    # Concurrent fast and full triggers each replace only their OWN job's
+    # state, through their own temporary file: neither loses the other's.
+    : >"$SCHED_STATE/gui"
+    : >"$sched_full"
+    : >"$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-full"
+    for sched_i in 1 2 3 4 5 6 7 8; do
+      fleet_schedule_job_state fast >/dev/null &
+      fleet_schedule_job_state full >/dev/null &
+    done
+    wait
+    [ "$(fleet_schedule_last_state fast)" = loaded ] &&
+      [ "$(fleet_schedule_last_state full)" = disabled ] ||
+      fail "concurrent fast and full probes lost a job's remembered state"
+    [ -z "$(find "$(fleet_run_state_dir)" -name 'schedule-state*.next*')" ] ||
+      fail "a state write left its temporary file behind"
+    rm -f "$sched_full" "$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-full"
+    rm -f "$SCHED_STATE/gui"
     # No job installed at all: stamped, nothing started.
     sched_reset
     : >"$SCHED_STATE/gui"
