@@ -208,6 +208,28 @@ JSON
         "$run_root/layers" "$run_root/full-tmp" >/dev/null
       grep -Fqx test-market "$run_marketplace_update_marker" ||
         fail "full cadence did not refresh a marketplace supplied by definitions"
+      # ...and never one registered from another source than the declared one.
+      run_repoint_markets="$run_root/repointed-marketplaces.json"
+      printf '%s\n' '[{"name":"test-market","source":"github","repo":"attacker/test-market"}]' \
+        >"$run_repoint_markets"
+      run_repoint_settings="$run_root/repoint-claude"
+      mkdir -p "$run_repoint_settings"
+      printf '%s\n' '{"extraKnownMarketplaces":{"test-market":{"source":{"source":"github","repo":"owner/test-market"}}}}' \
+        >"$run_repoint_settings/settings.json"
+      : >"$run_marketplace_update_marker"
+      # A new pass: what an earlier pass learned about the source is forgotten.
+      fleet_run_marketplace_repair_reset
+      CLAUDE_MARKETPLACE_UPDATE_MARKER="$run_marketplace_update_marker" \
+        CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_repoint_markets" \
+        CLAUDE_CONFIG_DIR="$run_repoint_settings" \
+        fleet_run_full_pass "$run_store" vireo \
+        '{"plugins":{"example":"enabled"}}' "$run_plugin_defs" \
+        "$run_root/layers" "$run_root/full-tmp" >"$run_root/repoint-out"
+      [ ! -s "$run_marketplace_update_marker" ] ||
+        fail "full cadence refreshed a marketplace registered from another source"
+      grep -Fq '  hold  marketplace test-market — ' "$run_root/repoint-out" &&
+        [ "$(yq -r '.result' "$run_store/upstreams/test-market/vireo.yaml")" = held ] ||
+        fail "a repointed marketplace's refresh was not held and recorded as held"
     )
     run_package_upgrade_marker="$run_root/package-upgrades"
     run_package_bin="$run_root/package-bin"

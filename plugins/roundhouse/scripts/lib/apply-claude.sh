@@ -295,6 +295,56 @@ fleet_run_marketplace_repair_reset() {
   fleet_run_repaired_ok=
   fleet_run_repaired_failed=
   fleet_run_repaired_reasons=
+  fleet_run_source_ok=
+  fleet_run_source_bad=
+  fleet_run_source_reasons=
+}
+
+fleet_run_marketplace_source_ok() {
+  # fleet_run_marketplace_source_ok NAME — READ-ONLY: is NAME registered from
+  # the source the user's own declaration (`extraKnownMarketplaces`) names?
+  # Exit 0 when it is, or when there is nothing to compare (NAME is not
+  # registered, or not declared); 75 when it cannot be listed, or for a
+  # same-name REPOINT, with the reason in `fleet_run_repair_reason`. Asked
+  # before a catalog entry is accepted and before a marketplace is refreshed:
+  # a catalog SHA proves bytes, not that they came from the declared
+  # repository. It never refreshes anything, and its answer is remembered
+  # for the pass (fleet_run_marketplace_repair_reset), so it costs one list
+  # per marketplace per pass. Called directly, never in `$(...)`.
+  fleet_run_repair_reason=
+  case " ${fleet_run_source_ok:-} " in *" $1 "*) return 0 ;; esac
+  case " ${fleet_run_source_bad:-} " in
+    *" $1 "*)
+      fleet_run_repair_reason=$(printf '%s\n' "${fleet_run_source_reasons:-}" |
+        awk -v n="$1" '$1 == n { sub(/^[^ ]* /, ""); print; exit }')
+      return 75
+      ;;
+  esac
+  fleet_run_source_list=$(fleet_run_marketplaces) || {
+    fleet_run_repair_reason="the registered marketplaces cannot be listed"
+    return 75
+  }
+  fleet_run_source_entry=$(printf '%s\n' "$fleet_run_source_list" | jq -c --arg n "$1" '
+    [.[] | select(.name == $n)] | .[0] // empty' 2>/dev/null) || fleet_run_source_entry=
+  fleet_run_source_declared=
+  fleet_run_source_settings=$(fleet_run_settings_path)
+  [ -z "$fleet_run_source_entry" ] || [ ! -f "$fleet_run_source_settings" ] ||
+    fleet_run_source_declared=$(jq -r --arg n "$1" \
+      "$fleet_run_marketplace_locator_filter"'
+      .extraKnownMarketplaces[$n] // empty | locator' \
+      "$fleet_run_source_settings" 2>/dev/null) || fleet_run_source_declared=
+  if [ -n "$fleet_run_source_declared" ]; then
+    fleet_run_source_registered=$(fleet_run_marketplace_registered_locator "$1" \
+      "$fleet_run_source_entry") || fleet_run_source_registered=
+    if [ "$fleet_run_source_declared" != "$fleet_run_source_registered" ]; then
+      fleet_run_repair_reason="$1 is registered from ${fleet_run_source_registered:-an unreadable source} but declared from $fleet_run_source_declared (a same-name repoint)"
+      fleet_run_source_bad="${fleet_run_source_bad:-} $1"
+      fleet_run_source_reasons="${fleet_run_source_reasons:-}$1 $fleet_run_repair_reason
+"
+      return 75
+    fi
+  fi
+  fleet_run_source_ok="${fleet_run_source_ok:-} $1"
 }
 
 fleet_run_marketplace_repair_once() {
@@ -315,20 +365,7 @@ fleet_run_marketplace_repair_once() {
   if [ -z "$fleet_run_repair_entry" ]; then
     fleet_run_ensure_marketplace "$1" || return 75
   else
-    fleet_run_repair_settings=$(fleet_run_settings_path)
-    fleet_run_repair_declared=
-    [ ! -f "$fleet_run_repair_settings" ] ||
-      fleet_run_repair_declared=$(jq -r --arg n "$1" \
-        "$fleet_run_marketplace_locator_filter"'
-        .extraKnownMarketplaces[$n] // empty | locator' \
-        "$fleet_run_repair_settings" 2>/dev/null) || fleet_run_repair_declared=
-    fleet_run_repair_registered=$(fleet_run_marketplace_registered_locator "$1" \
-      "$fleet_run_repair_entry") || fleet_run_repair_registered=
-    if [ -n "$fleet_run_repair_declared" ] &&
-      [ "$fleet_run_repair_declared" != "$fleet_run_repair_registered" ]; then
-      fleet_run_repair_reason="$1 is registered from ${fleet_run_repair_registered:-an unreadable source} but declared from $fleet_run_repair_declared (a same-name repoint)"
-      return 75
-    fi
+    fleet_run_marketplace_source_ok "$1" || return 75
   fi
   claude plugin marketplace update "$1" >/dev/null 2>&1 || return 75
 }
@@ -417,6 +454,13 @@ fleet_run_plugin_identity_matches() {
   [ -n "$fleet_run_identity_market" ] || return 0
   command -v claude >/dev/null 2>&1 || {
     fleet_run_identity_reason='claude is not on PATH for this run'
+    return 75
+  }
+  # A catalog SHA proves the bytes, not where they came from: a same-name
+  # marketplace registered from another repository holds before its catalog
+  # is read at all.
+  fleet_run_marketplace_source_ok "$fleet_run_identity_market" || {
+    fleet_run_identity_reason=$fleet_run_repair_reason
     return 75
   }
   fleet_run_identity_id="$2@$fleet_run_identity_market"

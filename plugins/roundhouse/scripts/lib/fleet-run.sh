@@ -1228,6 +1228,9 @@ fleet_run_apply_item() {
         # A catalog that cannot prove the bytes — no entry (an unregistered
         # or stale marketplace) or an entry with no SHA — re-registers and
         # refreshes the marketplace, then looks ONCE more (§3.5).
+        # ...and a catalog is only accepted from the marketplace's declared
+        # source: a same-name repoint holds (fleet_run_marketplace_source_ok).
+        fleet_run_marketplace_source_ok "$fleet_run_market" || return 75
         fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id") ||
           { fleet_run_marketplace_repair "$fleet_run_market" &&
             fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id"); } ||
@@ -2742,10 +2745,17 @@ fleet_run_full_pass() (
     full_result=unavailable
     if command -v claude >/dev/null 2>&1; then
       full_result=failed
-      # `update` cannot refresh a marketplace that was never registered.
+      # `update` cannot refresh a marketplace that was never registered, and
+      # never refreshes one registered from another source than the declared
+      # one: that would pull whatever the new source serves under the name.
       fleet_run_ensure_marketplace "$full_upstream" >/dev/null 2>&1 || :
-      ! claude plugin marketplace update "$full_upstream" >/dev/null 2>&1 ||
-        full_result=ok
+      if fleet_run_marketplace_source_ok "$full_upstream"; then
+        ! claude plugin marketplace update "$full_upstream" >/dev/null 2>&1 ||
+          full_result=ok
+      else
+        full_result=held
+        printf '  hold  marketplace %s — %s\n' "$full_upstream" "$fleet_run_repair_reason"
+      fi
     fi
     fleet_upstream_write "$full_store" "$full_upstream" "$full_host" "$full_result" || :
   done

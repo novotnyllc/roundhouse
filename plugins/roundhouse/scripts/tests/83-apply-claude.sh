@@ -163,6 +163,41 @@ JSON
       fi
     done
     rm -f "$HOME/.claude/plugins/known_marketplaces.json"
+    # A catalog entry WITH a SHA is still only accepted from the declared
+    # source: a repointed registration holds before its catalog is read, and
+    # nothing is refreshed to find out.
+    printf '%s\n' '{"extraKnownMarketplaces":{"test-market":{"source":{"source":"github","repo":"owner/test-market"}}}}' \
+      >"$HOME/.claude/settings.json"
+    printf '%s\n' "[{\"name\":\"test-market\",\"source\":\"github\",\"repo\":\"attacker/test-market\",\"installLocation\":\"$run_repair_checkout\"}]" \
+      >"$run_repair_markets"
+    run_sha_catalog="$run_repair_root/catalog-with-sha.json"
+    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.2.3\",\"source\":{\"source\":\"git\",\"url\":\"https://example.invalid/roundhouse.git\",\"sha\":\"$run_sha_old\"}}]}" \
+      >"$run_sha_catalog"
+    : >"$run_repair_updates"
+    fleet_run_marketplace_repair_reset
+    run_identity_status=0
+    CLAUDE_PLUGIN_CATALOG_FILE="$run_sha_catalog" \
+      CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_repair_markets" \
+      CLAUDE_MARKETPLACE_UPDATE_MARKER="$run_repair_updates" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_plugin_identity_matches \
+      "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
+      run_identity_status=$?
+    [ "$run_identity_status" -eq 75 ] ||
+      fail "a catalog SHA from a repointed marketplace was accepted (got $run_identity_status)"
+    case $fleet_run_identity_reason in
+      *'same-name repoint'*) ;;
+      *) fail "the repointed catalog hold did not say why: $fleet_run_identity_reason" ;;
+    esac
+    [ ! -s "$run_repair_updates" ] || fail "checking a marketplace's source refreshed it"
+    # The same registration from the declared source is accepted, and the
+    # check refreshed nothing.
+    printf '%s\n' "[{\"name\":\"test-market\",\"source\":\"github\",\"repo\":\"owner/test-market\",\"installLocation\":\"$run_repair_checkout\"}]" \
+      >"$run_repair_markets"
+    fleet_run_marketplace_repair_reset
+    CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_repair_markets" CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      fleet_run_marketplace_source_ok test-market ||
+      fail "a marketplace registered from its declared source failed the source check"
+    [ ! -s "$run_repair_updates" ] || fail "a healthy marketplace was refreshed by its source check"
     mv "$run_repair_root/manifest.saved" "$run_repair_checkout/.claude-plugin/marketplace.json"
     rm -f "$HOME/.claude/settings.json"
     # Still unproven after the refresh: hold, once, and say why.
