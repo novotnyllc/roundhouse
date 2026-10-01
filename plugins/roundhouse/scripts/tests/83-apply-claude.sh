@@ -235,13 +235,30 @@ JSON
       >"$run_rel_stubs/sha256sum"
     chmod +x "$run_rel_stubs/xargs" "$run_rel_stubs/sha256sum"
     : >"$run_repair_root/hash-calls"
-    [ "$(PATH="$run_rel_stubs:$PATH" fleet_run_tree_digest "$run_rel_big")" = \
-      "$(cd "$run_rel_big" && find . -type f -print0 | LC_ALL=C sort -z |
-        PATH="$run_rel_stubs:$PATH" sha256_file_list | sha256_stream)" ] ||
-      fail "a batched tree digest differed from hashing the same list"
+    [ "$(PATH="$run_rel_stubs:$PATH" fleet_run_tree_digest "$run_rel_big")" = "$run_rel_one" ] ||
+      fail "a batched tree digest differed from the one-batch digest"
     [ "$(grep -c . "$run_repair_root/hash-calls")" -ge 4 ] ||
       fail "the tree was not hashed in batches ($(grep -c . "$run_repair_root/hash-calls") calls)"
     [ -n "$run_rel_one" ] || fail "the tree digest was empty"
+    # The digest is of the tree's CONTENT, modes and links included: a file
+    # made executable, or a symlink pointed elsewhere, is a different plugin.
+    chmod +x "$run_rel_big/sub/f1"
+    run_rel_exec=$(fleet_run_tree_digest "$run_rel_big") ||
+      fail "the tree digest failed on an executable file"
+    [ "$run_rel_exec" != "$run_rel_one" ] ||
+      fail "a chmod +x did not change the tree digest"
+    chmod -x "$run_rel_big/sub/f1"
+    [ "$(fleet_run_tree_digest "$run_rel_big")" = "$run_rel_one" ] ||
+      fail "the tree digest did not return when the mode did"
+    ln -s f1 "$run_rel_big/sub/link"
+    run_rel_link1=$(fleet_run_tree_digest "$run_rel_big") ||
+      fail "the tree digest failed on a symlink"
+    rm -f "$run_rel_big/sub/link"
+    ln -s f2 "$run_rel_big/sub/link"
+    run_rel_link2=$(fleet_run_tree_digest "$run_rel_big")
+    [ "$run_rel_link1" != "$run_rel_one" ] && [ "$run_rel_link1" != "$run_rel_link2" ] ||
+      fail "a symlink, or a change of its target, did not change the tree digest"
+    rm -f "$run_rel_big/sub/link"
     # A hasher that FAILS is a failed digest, never an empty one — two failed
     # digests used to compare equal and read as identical bytes.
     run_status=0

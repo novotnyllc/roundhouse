@@ -107,23 +107,39 @@ fleet_run_marketplace_commit() {
 }
 
 fleet_run_tree_digest() (
-  # fleet_run_tree_digest DIR -> one digest over every file's relative path and
-  # bytes, `.git` excluded, and the two markers Claude leaves in an installed
-  # copy (`.in_use`, `.orphaned_at`), which are not plugin content.
+  # fleet_run_tree_digest DIR -> one digest over the tree's content: every
+  # regular file's relative path and bytes, which of them are EXECUTABLE, and
+  # every symlink's relative path and target (a link is never followed). `.git`
+  # is excluded, and so are the two markers Claude leaves in an installed copy
+  # (`.in_use`, `.orphaned_at`), which are not plugin content. A `chmod +x` or
+  # a repointed link is a different plugin, so it is a different digest.
   #
   # Exit non-zero rather than answer a digest it cannot stand behind: an
-  # unreadable directory, a tree with no files at all, or any hashing failure
+  # unreadable directory, a tree with nothing in it, or any hashing failure
   # (`pipefail`, and sha256_file_list keeps xargs' status). Two trees that both
   # failed would otherwise hash to the same empty digest and read as identical
   # bytes — and identical bytes is what lets an installed copy skip an update.
   set -o pipefail
   cd "$1" 2>/dev/null || exit 1
-  tree_list=$(mktemp "${TMPDIR:-/tmp}/roundhouse-tree.XXXXXX") || exit 1
-  trap 'rm -f "$tree_list"' EXIT
+  tree_work=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-tree.XXXXXX") || exit 1
+  trap 'rm -rf "$tree_work"' EXIT
   find . -name .git -prune -o -type f ! -path ./.in_use ! -path ./.orphaned_at \
-    -print0 | LC_ALL=C sort -z >"$tree_list" || exit 1
-  [ -s "$tree_list" ] || exit 1
-  sha256_file_list <"$tree_list" | sha256_stream
+    -print0 | LC_ALL=C sort -z >"$tree_work/files" || exit 1
+  find . -name .git -prune -o -type f -perm -u+x ! -path ./.in_use ! -path ./.orphaned_at \
+    -print0 | LC_ALL=C sort -z >"$tree_work/exec" || exit 1
+  find . -name .git -prune -o -type l -print0 | LC_ALL=C sort -z >"$tree_work/links" || exit 1
+  [ -s "$tree_work/files" ] || [ -s "$tree_work/links" ] || exit 1
+  {
+    printf 'files\n'
+    sha256_file_list <"$tree_work/files" || exit 1
+    printf 'executable\n'
+    sha256_stream <"$tree_work/exec" || exit 1
+    printf 'links\n'
+    while IFS= read -r -d '' tree_link; do
+      tree_target=$(readlink -- "$tree_link") || exit 1
+      printf '%s\0%s\0' "$tree_link" "$tree_target"
+    done <"$tree_work/links" | sha256_stream || exit 1
+  } | sha256_stream
 )
 
 fleet_run_relative_source_sha() {
