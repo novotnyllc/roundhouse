@@ -217,15 +217,16 @@ sha256_file_list() {
   # sha256_file. BATCH-SAFE: the paths go through `xargs -0`, never one
   # argument list, so a large tree cannot hit "Argument list too long" — and
   # xargs' own status (123 when any batch fails) is this function's, so a
-  # hashing failure is never silent. An empty list hashes nothing; whether
+  # hashing failure is never silent. `-r`: GNU xargs otherwise runs the hasher
+  # once on empty input, which hashes stdin. An empty list hashes nothing; whether
   # that means anything is the caller's question.
   if command -v sha256sum >/dev/null 2>&1; then
-    xargs -0 sha256sum --
+    xargs -0 -r sha256sum --
   elif command -v shasum >/dev/null 2>&1; then
-    xargs -0 shasum -a 256 --
+    xargs -0 -r shasum -a 256 --
   else
     # `-r`: the coreutils `<hash> *<path>` form, one line per file.
-    xargs -0 openssl dgst -sha256 -r
+    xargs -0 -r openssl dgst -sha256 -r
   fi
 }
 
