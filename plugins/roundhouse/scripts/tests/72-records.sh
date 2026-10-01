@@ -371,6 +371,28 @@ YAML
     [ "$(cat "$rec_jage"/journal/vireo/*.yaml | shasum)" = "$rec_jbad_before" ] ||
       fail "journal aging changed the journal while a day file was unreadable"
     rm -f "$rec_jage/journal/vireo/2001-01-05.yaml" "$rec_jage/journal/vireo/2001-01-06.yaml"
+    # A batch that holds one unreadable file is re-read file by file, and the
+    # records yq printed before it failed are NOT kept as well: each file is
+    # read once, and aging counts and removes each record once.
+    rec_batch="$tmp/records/batch"
+    rm -rf "$rec_batch"
+    mkdir -p "$rec_batch/findings/vireo"
+    for rec_n in 1 2 3 4 5 6; do
+      printf 'summary: old %s\nat: "2001-01-01T00:00:00Z"\n' "$rec_n" \
+        >"$rec_batch/findings/vireo/a$rec_n.yaml"
+    done
+    printf 'summary: [unterminated\n' >"$rec_batch/findings/vireo/m-bad.yaml"
+    fleet_records_read_dir "$rec_batch/findings/vireo" "$rec_batch/read"
+    [ "$(grep -c . "$rec_batch/read")" -eq 7 ] &&
+      [ -z "$(jq -r '.file' "$rec_batch/read" | sort | uniq -d)" ] ||
+      fail "a batch with one unreadable file was read twice: $(grep -c . "$rec_batch/read") lines for 7 files"
+    case $(fleet_records_age "$rec_batch" vireo 90 2>&1) in
+      *'findings/vireo: 6 of 7 removed'*) ;;
+      *) fail "aging a batch with one unreadable file miscounted its records" ;;
+    esac
+    [ "$(find "$rec_batch/findings/vireo" -name '*.yaml' | grep -c .)" -eq 1 ] &&
+      [ -f "$rec_batch/findings/vireo/m-bad.yaml" ] ||
+      fail "aging removed an unreadable finding, or kept an aged one"
     # Efficiency is structural: batched reads, one plan.
     cli_function_body fleet_records_age | grep -q 'fleet_records_read_dir' ||
       fail "evidence aging no longer reads its directories in batches"

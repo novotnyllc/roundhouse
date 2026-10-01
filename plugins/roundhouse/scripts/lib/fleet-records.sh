@@ -270,11 +270,20 @@ fleet_records_read_dir() {
   # command once, and a `yq` with no file reads stdin.
   if [ -s "$records_read_list" ]; then
     # shellcheck disable=SC2016 # the inner script is bash -c's, expanded there
+    # A batch's output is BUFFERED and emitted only when its yq succeeds: yq
+    # prints every record before the bad one first, so streaming it and then
+    # re-reading the batch file by file would emit those records twice.
     xargs -0 -n 256 bash -c '
-      yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$@" 2>/dev/null && exit 0
+      if records_out=$(yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$@" 2>/dev/null); then
+        [ -z "$records_out" ] || printf "%s\n" "$records_out"
+        exit 0
+      fi
       for records_file do
-        yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$records_file" 2>/dev/null ||
+        if records_out=$(yq -o=json -I=0 "{\"file\": filename, \"rec\": .}" "$records_file" 2>/dev/null); then
+          [ -z "$records_out" ] || printf "%s\n" "$records_out"
+        else
           jq -cn --arg f "$records_file" "{file: \$f, bad: true}"
+        fi
       done' records <"$records_read_list" >"$2" || {
       rm -f "$records_read_list"
       return 1
