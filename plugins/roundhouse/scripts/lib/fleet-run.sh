@@ -1145,12 +1145,23 @@ fleet_run_tombstone_converge() {
 
 fleet_run_desired() {
   # fleet_run_desired LAYERDIR HOST -> the fold, plus the plugin tombstones its
-  # knockout removed. What the SUPERVISED verbs resolve an item against, so
-  # `fleet-review` and `fleet-apply` see a scalar `absent` tombstone the same
-  # way the run does (the run keeps the two documents apart, because the fold
-  # alone is what every other reader of desired state wants).
+  # knockout removed: every ITEM this host has an opinion on, with its value.
+  # The run reads item values and digests from this, and so do the supervised
+  # verbs, so `fleet-review`, `fleet-apply` and the run all see a scalar
+  # `absent` tombstone the same way. The plain fold stays what every reader of
+  # desired STATE wants — policy, package managers, the alert detections.
   printf '%s\n' "$(fleet_fold "$1" "$2")" \
     "$(fleet_fold_tombstones "$1" "$2" plugins)" | jq -c -s '.[0] * .[1]'
+}
+
+fleet_run_tombstone_items() {
+  # fleet_run_tombstone_items DESIRED -> every `plugins.<name>` whose desired
+  # value is a tombstone: the scalar `absent` or `{state: absent}`.
+  printf '%s\n' "$1" | jq -r '
+    [(.plugins // {}) | select(type == "object") | to_entries[] |
+      select(.value == "absent" or
+        ((.value | type) == "object" and .value.state == "absent")) |
+      "plugins." + .key] | unique | .[]'
 }
 
 fleet_run_apply_item() {
@@ -1745,22 +1756,25 @@ fleet_run_command() (
   for run_head in $run_heads; do
     run_index=$((run_index + 1))
     fleet_run_export "$run_store" "$run_head" "$run_tmp/head-$run_index"
-    fleet_run_item_digests "$(fleet_fold "$run_tmp/head-$run_index" "$run_host")" \
+    # The item universe is the DESIRED document (fleet_run_desired), so §3.4's
+    # tombstones join it with their own digest. The fold knocks `absent` out,
+    # and from it alone a tombstoned plugin read as "gone from the layers" — a
+    # capped prune that forgot the record and uninstalled nothing — and a host
+    # that never owned it never heard of it at all.
+    fleet_run_item_digests \
+      "$(fleet_run_desired "$run_tmp/head-$run_index" "$run_host")" \
       "$run_tmp/head-$run_index" >>"$run_tmp/values"
-    # §3.4's tombstones join the item universe with their own digest. The fold
-    # knocks `absent` out, so without this a tombstoned plugin read as "gone
-    # from the layers" — a capped prune that forgot the record and uninstalled
-    # nothing — and a host that never owned it never heard of it at all.
-    fleet_run_item_digests "$(fleet_fold_tombstones "$run_tmp/head-$run_index" \
-      "$run_host" plugins)" >>"$run_tmp/values"
   done
   # The reviewed tree R. On the clean path that is the merge, and there is one
   # head. On the conflicted path it is the first head — legitimate because
   # §8.3 only converges items whose value is IDENTICAL at every head, so any
   # head answers for them, and the rest are held.
   run_layers=$run_tmp/head-1
+  # Two readings of R, merged ONCE: `run_desired` for item values (tombstones
+  # included), `run_fold` for desired state — policy, package managers and the
+  # detections — which a tombstone is not.
   run_fold=$(fleet_fold "$run_layers" "$run_host")
-  run_tombstones=$(fleet_fold_tombstones "$run_layers" "$run_host" plugins)
+  run_desired=$(fleet_run_desired "$run_layers" "$run_host")
   run_defs=$(fleet_definitions_load "$run_layers")
   fleet_vcs_enrolled_hosts "$run_store" "$run_reference" >"$run_tmp/hosts"
   grep -Fqx "$run_host" "$run_tmp/hosts" || printf '%s\n' "$run_host" >>"$run_tmp/hosts"
@@ -1928,17 +1942,11 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   # joins the list; one that finds nothing installed changes nothing and does
   # not. Undecidable (fleet_run_tombstone_target's 75) joins it, because the
   # cap is the direction to be wrong in.
-  printf '%s\n' "$run_fold" "$run_tombstones" | jq -r -s '
-    [.[] | (.plugins // {}) | select(type == "object") | to_entries[] |
-      select(.value == "absent" or
-        ((.value | type) == "object" and .value.state == "absent")) |
-      "plugins." + .key] | unique | .[]' >"$run_tmp/tombstones"
+  fleet_run_tombstone_items "$run_desired" >"$run_tmp/tombstones"
   while IFS= read -r run_tomb_item; do
     [ -n "$run_tomb_item" ] || continue
     ! grep -Fqx "held $run_tomb_item" "$run_tmp/verdicts" || continue
-    run_tomb_value=$(fleet_item_value "$run_fold" "$run_tomb_item")
-    [ -n "$run_tomb_value" ] ||
-      run_tomb_value=$(fleet_item_value "$run_tombstones" "$run_tomb_item")
+    run_tomb_value=$(fleet_item_value "$run_desired" "$run_tomb_item")
     run_tomb_target=$(fleet_run_tombstone_target "$run_defs" \
       "${run_tomb_item#plugins.}" "$run_tomb_value") || run_tomb_target=undecidable
     [ -z "$run_tomb_target" ] || printf 'uninstall %s\n' "$run_tomb_item"
@@ -2005,8 +2013,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
 
     run_split=$(fleet_item_split "$run_item") || continue
     run_category=$(printf '%s\n' "$run_split" | sed -n 1p)
-    run_value=$(fleet_item_value "$run_fold" "$run_item")
-    [ -n "$run_value" ] || run_value=$(fleet_item_value "$run_tombstones" "$run_item")
+    run_value=$(fleet_item_value "$run_desired" "$run_item")
 
     # §3.4: a TOMBSTONE converges by uninstalling. It is never recorded in
     # applied/ — that record means "installed and owned", and a recorded

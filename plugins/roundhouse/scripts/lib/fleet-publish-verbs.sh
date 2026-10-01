@@ -197,12 +197,8 @@ EOF
     awk '{ print $1 }')
   # A tombstoned item is not left installed for long: disowning forgets the
   # record, and the tombstone still uninstalls what it finds.
-  disown_tombstoned=$(printf '%s\n' "$disown_fold" \
-    "$(fleet_fold_tombstones "$disown_store" "$disown_host" plugins)" | jq -r -s '
-      [.[] | (.plugins // {}) | select(type == "object") | to_entries[] |
-        select(.value == "absent" or
-          ((.value | type) == "object" and .value.state == "absent")) |
-        "plugins." + .key] | unique | .[]')
+  disown_tombstoned=$(fleet_run_tombstone_items \
+    "$(fleet_run_desired "$disown_store" "$disown_host")")
   while IFS= read -r disown_item; do
     [ -n "$disown_item" ] || continue
     disown_note=
