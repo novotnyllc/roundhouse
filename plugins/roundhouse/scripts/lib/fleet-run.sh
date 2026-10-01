@@ -126,41 +126,80 @@ fleet_run_stale_after() {
   printf '%s\n' "$(($(fleet_policy_int "$stale_fold" cadence_hours) * 7200))"
 }
 
-# --- §6.1(a) the poll floor ---------------------------------------------------
+# --- §6.1(a)/§6.4 the poll floor ---------------------------------------------
+
+fleet_run_poll_floor_ref=refs/roundhouse/poll-floor/main
 
 fleet_run_poll_floor() {
-  # Exit 0 when there is genuinely nothing to do. ALL THREE CONDITIONS are
-  # needed: rev 5 checked only the remote head, so a host with a
-  # committed-but-unpushed edit and an unchanged remote exited immediately and
-  # its own edit sat unpublished — which breaks §6.1's freshness target at the
-  # PUBLISHING end.
+  # Exit 0 when there is genuinely nothing to do, with the reason in
+  # $fleet_run_floor_note for the caller to print.
   #
-  # `git ls-remote` joins `git verify-commit` as the second and last read-only
-  # git invocation this system makes (§8.4's ban is on `git push`/`git
-  # commit`). It moves no local ref and transfers no objects.
-  fleet_run_remote=$(git -C "$1" ls-remote origin refs/heads/main 2>/dev/null |
-    awk 'NR == 1 { print $1; exit }')
-  fleet_run_local=$(fleet_vcs_head_origin "$1")
-  # `present()` so a never-fetched store answers empty instead of erroring —
-  # host 1's very first run, and any host whose remote was just re-pointed.
+  # §6.4: the remote check is about DESIRED STATE, not about the head. The
+  # floor used to compare main@origin with `git ls-remote`, so every peer's
+  # records commit — a journal line, an alert, an applied/ update, which every
+  # pass of every host produced — forced a full pass on every other host. The
+  # floor now fetches the remote head into a private ref and compares the
+  # desired-state trees there with those at the commit this host last
+  # converged on. Records-only commits leave those trees byte-identical, so
+  # they no longer defeat the floor; any change to a layer, definitions or
+  # trust/ does.
+  #
+  # The fetch moves NO jj-visible ref: refs/roundhouse/ is outside what jj
+  # imports, so main@origin stays where the last full pass left it. That is
+  # load-bearing. The full pass captures main@origin BEFORE its own fetch and
+  # signature-gates exactly the range that arrived since (§7.7); a floor that
+  # advanced main@origin would let the commits it skipped fall out of that
+  # range forever. git is otherwise read-only here: no commit, no push.
+  fleet_run_floor_note=
+  # The local conditions first — they are free, and any one of them is work.
+  #
+  # Nothing to push, and a clean working copy: rev 5 checked only the remote,
+  # so a host with a committed-but-unpushed edit and an unchanged remote
+  # exited immediately and its own edit sat unpublished. `present()` so a
+  # never-fetched store answers empty instead of erroring.
   fleet_run_pending=$(jj -R "$1" log \
     -r 'present(main@origin)..heads(bookmarks(exact:"main"))' \
     --no-graph -T 'commit_id ++ "\n"')
+  [ -z "$fleet_run_pending" ] || return 1
   fleet_run_dirty=$(jj -R "$1" log -r @ --no-graph -T 'if(empty,"","x")')
-  # A fourth condition, host-local, and it is what makes the other three a
-  # PROPAGATION check rather than a convergence one: a host that just cloned
-  # has nothing to pull and nothing to push and has applied nothing, so on the
-  # three conditions alone it would sit idle until the remote happened to
-  # move. The marker is the reference this host last completed a run against.
-  #
-  # And a fifth: no published heartbeat is owed (§6.3). The heartbeat is
-  # published only by a pass that reaches the end, so a floor that exited
-  # while one was due would make a quiet host read as dead to every peer.
-  [ "$fleet_run_remote" = "$fleet_run_local" ] &&
-    [ -z "$fleet_run_pending" ] && [ -z "$fleet_run_dirty" ] &&
-    [ "$(cat "$(fleet_run_state_dir)/converged" 2>/dev/null)" = \
-      "$(fleet_vcs_heads_local "$1")" ] &&
-    ! fleet_heartbeat_due
+  [ -z "$fleet_run_dirty" ] || return 1
+  # Converged at this point: what makes this a PROPAGATION check rather than a
+  # convergence one. A host that just cloned has nothing to pull and nothing
+  # to push and has applied nothing, so without the marker it would sit idle.
+  # It is also the comparison base below: the commit this host last completed
+  # a published run against.
+  fleet_run_converged=$(cat "$(fleet_run_state_dir)/converged" 2>/dev/null) ||
+    return 1
+  [ -n "$fleet_run_converged" ] &&
+    [ "$fleet_run_converged" = "$(fleet_vcs_heads_local "$1")" ] || return 1
+  git -C "$1" cat-file -e "$fleet_run_converged^{commit}" 2>/dev/null || return 1
+  # No published heartbeat owed (§6.3): only a pass that reaches the end
+  # publishes one, so a floor that exited while one was due would make a quiet
+  # host read as dead to every peer.
+  ! fleet_heartbeat_due || return 1
+  # No item waiting on canary evidence. That evidence arrives as RECORDS —
+  # exactly what this floor now ignores — so a host waiting on it must keep
+  # re-reading the canary journals until the wait is over.
+  [ ! -e "$(fleet_run_state_dir)/canary-waiting" ] || return 1
+
+  # The incremental fetch: objects only, into the private ref. `--refmap=` is
+  # NOT optional: without it git also "opportunistically" updates
+  # refs/remotes/origin/main through the colocated repo's configured refspec,
+  # jj imports that as a moved main@origin, fast-forwards the tracked local
+  # bookmark — and the pass this floor skipped would never gate those commits.
+  git -C "$1" fetch --quiet --no-tags --refmap= origin \
+    "+refs/heads/main:$fleet_run_poll_floor_ref" >/dev/null 2>&1 || return 1
+  fleet_run_fetched=$(git -C "$1" rev-parse --verify --quiet \
+    "$fleet_run_poll_floor_ref^{commit}" 2>/dev/null) || return 1
+  [ -n "$fleet_run_fetched" ] || return 1
+  [ "$(fleet_vcs_desired_digest "$1" "$fleet_run_fetched")" = \
+    "$(fleet_vcs_desired_digest "$1" "$fleet_run_converged")" ] || return 1
+  if [ "$fleet_run_fetched" = "$fleet_run_converged" ]; then
+    fleet_run_floor_note='nothing new on the remote'
+  else
+    fleet_run_floor_note="$(git -C "$1" rev-list --count \
+      "$fleet_run_converged..$fleet_run_fetched" 2>/dev/null || printf 'some') record-only commit(s) on the remote; the layers, definitions and trust/ are unchanged"
+  fi
 }
 
 fleet_run_prune_empty() {
@@ -1698,19 +1737,21 @@ fleet_run_command() (
   mkdir -p "$(fleet_run_state_dir)"
   printf '%s\n' "$run_op" >"$(fleet_run_state_dir)/starting-operation"
 
-  # §6.1(a). One HTTPS round trip, one string compare, exit — no snapshot, no
-  # object transfer, no commit, no push. The full fetch runs only when the ids
-  # differ.
+  # Captured BEFORE any fetch: what arrives is what §7.7 has to gate, and after
+  # the fetch there is no other way to tell new from known. (The poll floor's
+  # own fetch lands in a private ref and does not move main@origin.)
+  run_pre_origin=$(fleet_vcs_head_origin "$run_store")
+
+  # §6.1(a)/§6.4. One incremental fetch, a tree-id compare, exit — no fold, no
+  # reconcile, no commit, no push. The convergence pass runs only when desired
+  # state moved or a local condition says there is work.
   if [ "$run_mode" = fast ] && fleet_run_poll_floor "$run_store"; then
     fleet_heartbeat_local "$(fleet_now)" || :
-    printf 'roundhouse: nothing to pull, nothing to push, clean working copy — one ls-remote round trip, no fetch (§6.1a)\n'
+    printf 'roundhouse: desired state unchanged (%s); nothing to push, clean working copy — one incremental fetch, no convergence pass (§6.4)\n' \
+      "$fleet_run_floor_note"
     printf 'roundhouse: starting operation %s\n' "$run_op"
     exit 0
   fi
-
-  # Captured BEFORE the fetch: what arrives is what §7.7 has to gate, and after
-  # the fetch there is no other way to tell new from known.
-  run_pre_origin=$(fleet_vcs_head_origin "$run_store")
   run_fetched=true
   fleet_vcs_fetch "$run_store" origin 2>/dev/null || run_fetched=false
   [ "$run_fetched" = true ] ||
@@ -1961,6 +2002,9 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   # Any `applied` or `satisfied` record this pass — the evidence §10.1 reads,
   # and the one thing that always publishes a heartbeat with it (§6.3).
   run_applied_any=false
+  # Set when an item waits on canary evidence; the poll floor will not exit
+  # while one does, because that evidence arrives as records (§6.4).
+  run_canary_waiting=false
 
   # §10.3's removal set, capped BEFORE any removal applies: ONE tagged list,
   # `prune ITEM` (owned, gone from the layers) and `uninstall ITEM` (a
@@ -2150,6 +2194,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       # shellcheck disable=SC2046 # the canary set, one host per argument
       fleet_canary_gate "$run_store" "$run_item" "$run_digest" "$run_wait" \
         "$run_now" $(cat "$run_tmp/canaries") || {
+        run_canary_waiting=true
         printf '  wait  %s — no canary evidence at %s yet\n' "$run_item" "$run_digest"
         fleet_run_runtime_hold "$run_item" 'canary evidence unavailable' \
           "$run_tmp/sigholds" || exit 65
@@ -2252,6 +2297,11 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         ;;
     esac
   done 9<"$run_tmp/verdicts"
+  if [ "$run_canary_waiting" = true ]; then
+    : >"$(fleet_run_state_dir)/canary-waiting"
+  else
+    rm -f "$(fleet_run_state_dir)/canary-waiting"
+  fi
 
   # --- the full cadence's maintenance half ---
   if [ "$run_mode" = full ]; then

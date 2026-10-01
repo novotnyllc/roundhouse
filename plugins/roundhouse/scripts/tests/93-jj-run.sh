@@ -174,14 +174,34 @@ YAML
     [ "$runjj_shape" = "empty undescribed $(fleet_vcs_heads_local "$vireo")" ] ||
       fail "the run did not end with @ an empty child of the published main: $runjj_shape"
 
-    # --- §6.1(a): the poll floor's three states ---
+    # --- §6.1(a)/§6.4: the poll floor's states ---
     # 1. fully published + empty @ -> the true no-op, and it says what it cost.
     runjj_out=$(runjj vireo "$cli" fleet-run --fast) ||
       fail "the no-op run failed"
     case $runjj_out in
-      *'no fetch'*) ;;
+      *'nothing new on the remote'*'no convergence pass'*) ;;
       *) fail "a settled store did not short-circuit at the poll floor: $runjj_out" ;;
     esac
+    # The floor's fetch moves no jj-visible ref: main@origin is what the last
+    # full pass gated, and the next one gates everything after it (§7.7).
+    "$REAL_GIT" -C "$vireo" rev-parse --verify --quiet \
+      refs/roundhouse/poll-floor/main >/dev/null ||
+      fail "the poll floor did not fetch into its private ref"
+    # A heartbeat that is owed is work: only a pass that reaches the end
+    # publishes one (§6.3), so the floor must not exit past it.
+    runjj_hb="$rjj/vireo/store.run/heartbeat.json"
+    cp "$runjj_hb" "$runjj_hb.saved"
+    rm -f "$runjj_hb"
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor exited while a published heartbeat was owed"
+    mv "$runjj_hb.saved" "$runjj_hb"
+    # …and so is an item waiting on canary evidence, which arrives as records.
+    : >"$rjj/vireo/store.run/canary-waiting"
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor exited while an item waited on canary evidence"
+    rm -f "$rjj/vireo/store.run/canary-waiting"
+    runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor did not exit on a settled store after the probes"
     # 2. a dirty @ is work to publish, even with an unchanged remote.
     printf '# a pending hand edit\n' >>"$vireo/fleet.yaml"
     ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
@@ -456,7 +476,52 @@ YAML
       *) fail "a downstream host stopped waiting on an item the canary could not apply: $runjj_out" ;;
     esac
 
-    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding)\n'
+    # --- §6.4: peers' record commits no longer defeat the floor ---
+    # Settle vireo, then let wren publish a pass whose commit carries only
+    # records (it is waiting on canary evidence, so it journals `held`).
+    runjj vireo "$cli" fleet-run --fast >/dev/null ||
+      fail "vireo could not settle before the floor probes"
+    runjj vireo "$cli" fleet-run --fast >/dev/null ||
+      fail "vireo could not settle before the floor probes"
+    runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "vireo was not settled at the poll floor before the record-only probe"
+    runjj_converged=$(cat "$rjj/vireo/store.run/converged")
+    runjj wren "$cli" fleet-run --fast >/dev/null ||
+      fail "wren could not publish its record-only pass"
+    runjj_remote=$("$REAL_GIT" -C "$vireo" ls-remote origin refs/heads/main |
+      awk '{ print $1; exit }')
+    [ "$runjj_remote" != "$runjj_converged" ] ||
+      fail "wren's pass published nothing, so the record-only probe proves nothing"
+    [ -z "$("$REAL_GIT" -C "$vireo" fetch --quiet --refmap= origin \
+      "+refs/heads/main:refs/selfcheck/probe" 2>&1 && "$REAL_GIT" -C "$vireo" \
+      diff --name-only "$runjj_converged" refs/selfcheck/probe -- \
+      fleet.yaml definitions.yaml definitions fleet os groups hosts trust)" ] ||
+      fail "wren's probe commit touched desired state, so it is not record-only"
+    runjj_origin_before=$(fleet_vcs_head_origin "$vireo")
+    runjj_out=$(runjj vireo "$cli" fleet-run --fast) ||
+      fail "vireo's run after a peer's record-only commit failed"
+    case $runjj_out in
+      *'record-only commit(s) on the remote'*'no convergence pass'*) ;;
+      *) fail "a peer's record-only commit defeated the poll floor (§6.4): $runjj_out" ;;
+    esac
+    [ "$(fleet_vcs_head_origin "$vireo")" = "$runjj_origin_before" ] ||
+      fail "the poll floor moved main@origin, dropping the skipped commits out of the next pass's §7.7 range"
+    # A desired-state change from a peer DOES defeat it, and the next pass
+    # converges on it.
+    printf '# a peer edit to a shared layer\n' >>"$wren/groups/development.yaml"
+    runjj wren "$cli" fleet-run --fast >/dev/null ||
+      fail "wren could not publish its layer edit"
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor exited past a peer's layer edit"
+    runjj vireo "$cli" fleet-run --fast >/dev/null ||
+      fail "vireo could not converge on the peer's layer edit"
+    grep -Fq '# a peer edit to a shared layer' "$vireo/groups/development.yaml" ||
+      fail "vireo's pass did not converge on the peer's layer edit"
+    runjj vireo "$cli" fleet-run --fast >/dev/null || :
+    runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "vireo did not settle at the poll floor after converging"
+
+    printf 'real-jj: OK (poll floor states incl. record-only peers, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding)\n'
   ) || fail "real-jj run block failed (see the FAIL: real-jj: line above)"
 fi
 

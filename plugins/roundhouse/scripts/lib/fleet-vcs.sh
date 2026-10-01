@@ -98,6 +98,31 @@ fleet_vcs_host_record_filter() {
     { print }'
 }
 
+fleet_vcs_desired_roots() {
+  # §6.4's desired-state paths: row 1 of the table above MINUS lineage/,
+  # proposals/ and checkpoints/ — fleet-shared writes, but history and
+  # suggestions rather than state anything converges on. trust/ stays in: a
+  # roster change is desired state (it decides whose layers apply). One list,
+  # kept beside the table it is derived from; tests/85-liveness.sh walks the
+  # table path by path and fails if a row-1 root is missing here, so a new
+  # fleet-wide layer cannot leave the poll floor blind to it.
+  printf '%s\n' fleet.yaml definitions.yaml definitions fleet os groups hosts trust
+}
+
+fleet_vcs_desired_digest() {
+  # fleet_vcs_desired_digest <store> <commit> -> one `<root> <object-id>` line
+  # per desired-state root, `-` for a root the commit does not carry. Git
+  # object ids are content addresses, so equal output IS byte-identical
+  # desired state, whatever records (journal/, alerts/, applied/, …) the two
+  # commits otherwise differ by. A read of objects already on disk: no ref
+  # moves and nothing is fetched here.
+  for fleet_vcs_root in $(fleet_vcs_desired_roots); do
+    fleet_vcs_object=$(git -C "$1" rev-parse --verify --quiet \
+      "$2:$fleet_vcs_root" 2>/dev/null) || fleet_vcs_object=-
+    printf '%s %s\n' "$fleet_vcs_root" "${fleet_vcs_object:--}"
+  done
+}
+
 fleet_vcs_path_identity_ok() {
   # fleet_vcs_path_identity_ok <store-relative-path> <principal> <hosts-file>
   #

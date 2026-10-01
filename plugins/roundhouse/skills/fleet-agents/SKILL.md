@@ -88,8 +88,15 @@ One scheduled entry per host runs both (see `roundhouse:fleet-update`):
 | Fast | `roundhouse fleet-run --fast` | 20 min ± 5 jitter | poll floor, fetch, reconcile, promote gate, review → apply → journal, publish, peer nudge |
 | Full | `roundhouse fleet-run --full` | 12 h ± 90 min jitter | everything fast does, plus marketplace refresh, re-seed, promotion proposals, unpinned package updates, and `fleet-doctor` |
 
-The **poll floor** is a head check, not a fetch: a run with nothing to pull,
-nothing to push and a clean `@` exits early. Jitter is seeded from the host
+The **poll floor** is one incremental fetch into a private ref and a tree
+compare: a fast run exits early when the desired-state paths at the fetched
+remote head (`fleet.yaml`, `definitions.yaml`, `definitions/`, `fleet/`, `os/`,
+`groups/`, `hosts/`, `trust/`) match those at the commit this host last
+converged on, and it has nothing to push, a clean `@`, no heartbeat owed and no
+item waiting on canary evidence. Peers' record commits (journal, alerts,
+`applied/`) no longer force a full pass; the floor's fetch does not move
+`main@origin`, so the next full pass still signature-gates everything that
+arrived. Jitter is seeded from the host
 **name**, never the clock, so the offsets are stable and the fleet does not
 re-synchronise on the same minute. The **push nudge** is an opportunistic
 accelerator only — it carries no data, says "go look", and the peer then runs
