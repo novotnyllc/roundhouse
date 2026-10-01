@@ -297,6 +297,8 @@ fleet_lock_identity() {
   # run left behind — the exact wedge this mechanism exists for — while still
   # refusing to move any lock it did not judge.
   lock_identity=$(fleet_lock_meta_field "$1" nonce)
+  # LEGACY (pre-nonce locks): delete this branch one release after the nonce
+  # lock ships, once no host can still hold a lock an older build wrote.
   if [ -z "$lock_identity" ]; then
     lock_identity_pid=$(fleet_lock_meta_field "$1" pid)
     lock_identity_at=$(fleet_lock_meta_field "$1" started_at)
@@ -358,6 +360,8 @@ fleet_lock_holder_state() {
   elif [ -z "$lock_was_start" ] || [ -z "$lock_was_command" ]; then
     # A lock written before holders were recorded: the pid is alive and there
     # is no evidence about whose it is, so this answer keeps the age rule.
+    # LEGACY (pre-nonce locks): delete this branch one release after the
+    # nonce lock ships, together with fleet_lock_identity's legacy form.
     fleet_lock_state=unknown
   elif [ "$lock_now_start" != "$lock_was_start" ] ||
     [ "$(fleet_lock_proc_command "$lock_pid")" != "$lock_was_command" ]; then

@@ -1332,18 +1332,29 @@ fleet_doctor_command() (
     fleet_doctor_row ok run-lock "no lock held; stale threshold ${doctor_stale}s (two full cadences)"
   else
     doctor_age=$(fleet_lock_age_seconds "$doctor_lock" || printf '')
+    # The same holder verdict the run takes the lock by (fleet_lock_holder_state),
+    # so this row and the run never disagree about whose lock it is.
+    fleet_lock_holder_state "$doctor_lock"
     # An unknown age is a FINDING, not "held for unknowns, under the
     # threshold". A lock whose meta.json is missing or unparsable carries no
     # evidence of a live runner, and reading it as fresh made this row print
     # `ok` about the exact state that wedges every future run.
-    if [ -z "$doctor_age" ]; then
+    if [ "$fleet_lock_state" = dead ]; then
+      fleet_doctor_row finding run-lock \
+        "$doctor_lock is held by a dead holder (pid $(fleet_lock_meta_field "$doctor_lock" pid)); the next run takes it over and alerts"
+    elif [ -z "$doctor_age" ]; then
       fleet_doctor_row finding run-lock \
         "$doctor_lock has no readable meta.json, so its age is unknown; confirm no live runner, then remove it"
+    elif [ "$doctor_age" -gt "$doctor_stale" ] && [ "$fleet_lock_state" = live ]; then
+      fleet_doctor_row finding run-lock \
+        "$doctor_lock has been held by a live run (pid $(fleet_lock_meta_field "$doctor_lock" pid)) for ${doctor_age}s, past the ${doctor_stale}s threshold; it may be hung"
     elif [ "$doctor_age" -gt "$doctor_stale" ]; then
       fleet_doctor_row finding run-lock \
         "$doctor_lock is ${doctor_age}s old, past the ${doctor_stale}s threshold; confirm no live runner, then remove it"
+    elif [ "$(fleet_lock_meta_field "$doctor_lock" manual)" = true ]; then
+      fleet_doctor_row ok run-lock "taken by hand ${doctor_age}s ago, under the ${doctor_stale}s threshold; release it with fleet-unlock"
     else
-      fleet_doctor_row ok run-lock "held for ${doctor_age}s, under the ${doctor_stale}s threshold"
+      fleet_doctor_row ok run-lock "held for ${doctor_age}s by a ${fleet_lock_state} holder, under the ${doctor_stale}s threshold"
     fi
   fi
 

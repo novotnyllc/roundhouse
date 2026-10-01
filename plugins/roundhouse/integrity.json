@@ -114,7 +114,7 @@
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
-      "sha256": "e963481f96adb30f2c518b00f81607eb4f82fe07f77def3cc29ba670124a532d"
+      "sha256": "d6df9d68f1c11362863bda93d87547a6142ab47bf0d0593352b2e89f03b35893"
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
@@ -138,7 +138,7 @@
     },
     {
       "path": "scripts/lib/fleet-store.sh",
-      "sha256": "0311332810e4d068f12c433d8f80208f089dd6f06fc8d2e3b9d8fab772bdd0fb"
+      "sha256": "c0e6bf025c94891a0ef1e042a7661868d67fc6687cbca7cd80555ce4d896a357"
     },
     {
       "path": "scripts/lib/fleet-trust.sh",
