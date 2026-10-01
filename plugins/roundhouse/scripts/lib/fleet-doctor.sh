@@ -1025,6 +1025,8 @@ fleet_readiness_command() (
       fleet_readiness_row "$fleet_readiness_host" remote-posture finding \
         "unsupported transport: $fleet_readiness_transport"
     fi
+
+    fleet_readiness_lane_row "$fleet_readiness_host"
   done <<EOF
 $fleet_readiness_targets
 EOF
@@ -1835,6 +1837,9 @@ EOF
     fleet_doctor_row finding clock \
       "a peer journal is ahead of this clock: $(printf '%s' "$doctor_skew" | tr '\n' ';')"
   fi
+
+  # --- the local privilege lane: this host's own root/SYSTEM side ---
+  fleet_doctor_lane_row
 
   doctor_count=$(grep -c . "$fleet_doctor_findings" || true)
   if [ "$doctor_count" -eq 0 ]; then

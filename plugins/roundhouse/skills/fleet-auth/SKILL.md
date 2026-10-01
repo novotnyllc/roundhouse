@@ -64,16 +64,16 @@ task's model and effort choice to `railyard:model-routing`; Claude reports
 unsupported. Never route secrets
 through WSL or another machine as a bridge.
 
-Protected broker records are status-only for this skill. Use
+Privilege-lane records are status-only for this skill. Use
 `"$CLI" privilege-status HOST SNAPSHOT` and the shared Codex/Claude vocabulary
-`prepare-privilege-identity`, `prepare-privilege-enrollment`,
-`verify-privilege-plan`, `submit-privilege-plan`,
-`lookup-privilege-result`, `preview-privilege-upgrade`, and
-`preview-privilege-revocation`, but never put an auth artifact, credential,
+`prepare-privilege-enrollment`, `verify-privilege-plan`,
+`submit-privilege-plan`, and `lookup-privilege-result` (the optional CA lane
+adds `prepare-privilege-identity`, `preview-privilege-upgrade`, and
+`preview-privilege-revocation`), but never put an auth artifact, credential,
 secret reference, encrypted file, token, private key, or secret-backed template
-in a profile bundle or protected request. S4U has no network or encrypted-file
-access. Preserve `needs_enrollment`, `drifted`, `transport_unavailable`,
-`unsupported_context`, `unsupported_security_boundary`, `partial`, and
-`stale` without fallback. Never ask for or relay a sudo or Administrator password;
-enrollment and lifecycle changes stop at the local
-human password/UAC boundary.
+in a lane request: the lane carries package tokens and versions only. Preserve
+`ready`, `needs_one_time_approval`, `user_session_unavailable`, `drifted`,
+`unreachable`, `partial`, and `rejected` without fallback.
+Never ask for or relay a sudo or Administrator password; the host's single OS
+approval (`roundhouse privilege-enroll HOST`) is the only privileged
+credential interaction and it belongs to the owner at the host's own prompt.

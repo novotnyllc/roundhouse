@@ -1143,6 +1143,13 @@ fleet_install_package() {
       fi
       ;;
     scoop) bounded_verb scoop install "$2" >/dev/null 2>&1 </dev/null ;;
+    # apt needs root. After the host's one-time approval that root work goes
+    # through the local privilege lane (lib/lane.sh); before it, the same loud
+    # hold as any other manager this host cannot drive.
+    apt)
+      [ "$(lane_local_state)" = ready ] || return 75
+      lane_local_request apt.install-package-version.v1 "$2" "${4:-}" >/dev/null 2>&1 </dev/null || return 1
+      ;;
     npm)
       # Global scope, through the durable npm and its own node (lib/npm.sh).
       # No npm on the host is the same HOLD as any other missing manager, and

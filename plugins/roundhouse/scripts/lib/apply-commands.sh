@@ -495,6 +495,10 @@ apply_plan_command() {
     printf 'roundhouse: apply confirmation must equal the sealed plan ID\n' >&2
     exit 64
   }
+  if plan_is_lane "$plan"; then
+    apply_lane_plan "$plan" "$confirmation" "$output"
+    return
+  fi
   if jq -e '.schema_version == 4' "$plan" >/dev/null 2>&1; then
     apply_mixed_privileged_plan_command "$plan" "$confirmation" "$output" "$native_mode"
     return
@@ -1001,6 +1005,10 @@ lookup_privilege_result_command() (
   check_mutation_config
   check_private_owned_file "$plan" "privilege result plan"
   case $index in ''|*[!0-9]*) usage ;; esac
+  if plan_is_lane "$plan"; then
+    lookup_lane_result "$plan" "$index" "$output"
+    return
+  fi
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-result-lookup.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   if jq -e '.schema_version == 4' "$plan" >/dev/null 2>&1; then

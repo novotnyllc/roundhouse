@@ -14,6 +14,10 @@ seal_plan_command() {
   }
   privileged=false
   mixed_privileged=false
+  if plan_is_lane "$draft"; then
+    seal_lane_plan "$draft" "$snapshot" "$output"
+    return
+  fi
   if jq -e '(.operations | type == "array") and any(.operations[]; has("privilege_request"))' "$draft" >/dev/null 2>&1; then
     validate_mixed_privileged_draft "$draft"
     mixed_privileged=true

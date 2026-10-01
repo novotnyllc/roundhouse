@@ -925,7 +925,7 @@ OPLOG
     # shellcheck disable=SC2046 # deliberate word splitting over the file list
     ! grep -nE '"?schema(_version)?"? *:' $(cli_program_files) |
       grep -vE ':[0-9]+: *#' |
-      grep -vE 'roundhouse\.inventory|schema=|integrity|plan-|apply-commands|broker-|identity\.sh|inventory\.sh|interop\.sh|host\.sh|config\.sh' |
+      grep -vE 'roundhouse\.inventory|schema=|integrity|plan-|apply-commands|broker-|identity\.sh|inventory\.sh|interop\.sh|host\.sh|config\.sh|lane\.sh' |
       grep -q . ||
       fail "a DSC record still emits schema: or schema_version:"
   ) || fail "guards fixture block failed"

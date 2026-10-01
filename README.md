@@ -11,12 +11,14 @@ one guided flow, and answers the only question a dispatcher cares about:
 *is this host ready to receive work?*
 
 - ➕ **Add a machine in one flow.** `fleet-hosts` takes a box from SSH alias
-  to enrolled, provisioned, and readiness-verified — certificate ceremony,
-  prerequisites, plugins — with consent at every trust step.
+  to enrolled, provisioned, and readiness-verified — one OS approval for
+  the privilege lane, prerequisites, plugins — with consent at every trust
+  step and no ceremony.
 - 🔄 **Drift, found and fixed.** Inventory and parity checks across every
   host: runtime versions, plugins, skills, auth, and packages.
-- 🔐 **Privilege, narrowly.** Signed, enrolled broker lanes for the few
-  privileged operations that need them — never `sudo` sprinkled in scripts.
+- 🔐 **Privilege, narrowly.** One OS approval per host, then a closed,
+  semantic privilege lane for the few root/SYSTEM operations the fleet
+  needs — never `sudo` sprinkled in scripts, never a recurring ceremony.
 - 🚉 **The dispatcher's go/no-go.** `fleet-readiness` is what
   [railyard](https://github.com/novotnyllc/railyard) consults before
   placing work on a host.
@@ -45,7 +47,7 @@ doesn't move a train the shop hasn't cleared:
 | Inventory & parity | `fleet-inventory`, `fleet-agents`, `fleet-projects`, `fleet-auth` |
 | Baselines | `fleet-update` (packages/tools) |
 | Integrations | Optional chezmoi cooperation through [`agent-utilities`](https://github.com/novotnyllc/agent-utilities) |
-| Transport | `remote-mac`, `ssh-doctor`, SSH certificate enrollment, the Codex remote-control contract, the signed `windows-sftp` lane |
+| Transport | `remote-mac`, `ssh-doctor`, the privilege lane, the WSL interop lane, the Codex remote-control contract |
 
 ## Standalone skill installation
 

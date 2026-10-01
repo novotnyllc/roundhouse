@@ -1,13 +1,13 @@
 ---
 name: fleet-hosts
-description: "Add a host to the fleet or remove one, end to end: config entry, SSH reachability, SSH-certificate identity enrollment or revocation, privilege-broker enrollment where wanted, target prerequisites (agent harnesses, plugins, tmux/jq), and readiness verification. Use when the user says to add, enroll, onboard, remove, retire, or decommission a machine."
+description: "Add a host to the fleet or remove one, end to end: config entry, SSH reachability, the privilege lane's one-time OS approval, target prerequisites (agent harnesses, plugins, tmux/jq), and readiness verification. Use when the user says to add, enroll, onboard, remove, retire, or decommission a machine."
 ---
 
 # Fleet Hosts
 
 Own the lifecycle of one fleet member at a time. Every mutating step names
-its target and gets explicit consent; signing and privileged steps are
-individually consented ceremonies, never batched into silence. Resolve
+its target and gets explicit consent; the one privilege approval is its own
+consented step, never batched into silence. Resolve
 `SKILL_DIR` and `CLI="$SKILL_DIR/../../scripts/roundhouse"` as usual.
 
 ## Add a host
@@ -29,12 +29,23 @@ lane. Validation requires that sibling to be a configured `platform: wsl`,
    `${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/config.json` (scaffold from
    the plugin's `config.example.json` if absent) and require
    `"$CLI" validate-config` to pass.
-3. **SSH certificate enrollment** (consent) — the three-step ceremony, in
-   order, each on its proper node: `prepare-ssh-identity` on the new host
-   generates its key and public-only CSR; `certify-ssh-node` signs that CSR
-   in the owner ceremony on the signing node (its own consent — this mints
-   trust); `enroll-ssh-posix install` then `verify` places the fleet CA and
-   KRL on the target. Do not shortcut with raw `authorized_keys` edits.
+3. **Privilege lane** (consent; the one OS prompt) — `"$CLI" privilege-enroll
+   HOST`. On macOS, Linux and WSL that is a single `sudo` password typed in
+   the terminal running the command (over `ssh -t` for a remote host); on
+   Windows it is a single UAC consent on the console, raised through the
+   WSL sibling. The approval installs a root/SYSTEM-owned copy of the lane
+   helper, an owner-only request queue and (POSIX) one exact sudoers grant
+   or (Windows) one LocalSystem scheduled task; after it, every privileged
+   package action the fleet needs runs unattended, including upgrades of
+   the lane itself. Without a terminal the command does not prompt: it
+   prints the exact command for the owner and readiness reports
+   `needs_one_time_approval` until it has run. Never ask for or relay the
+   sudo or Administrator password. The lane is on by default; set
+   `privilege_lane: "disabled"` in the machine entry to opt a host out.
+   The former CA-certificate lane (`prepare-ssh-identity`,
+   `certify-ssh-node`, `enroll-ssh-posix`, the `windows-sftp` route) is an
+   optional high-assurance mode selected only by an explicit
+   `privilege_broker.automation_transport`; it is not part of adding a host.
 4. **Prerequisites on the target** (consent, via the target's own managers) —
    `tmux` and `jq` through `roundhouse:fleet-update`; agent harnesses
    verified and user-authorized plugin/marketplace desired state supplied by
@@ -51,10 +62,11 @@ lane. Validation requires that sibling to be a configured `platform: wsl`,
    store repository and reuse it for nothing else; these are crown-jewel
    secrets, since the store is a trusted-write surface on every fleet
    machine.
-6. **Optional privilege enrollment** (separate consent; skip by default) —
-   `enroll-privilege-posix`, or on Windows `enroll-windows-sftp.ps1` /
-   `enroll-privilege-windows.ps1`, only when the host needs the privileged
-   install lane.
+6. **Lane check** — `"$CLI" privilege-lane-status HOST OUT.json` must report
+   `ready` (or `disabled` when the host opted out). `drifted` means the
+   root/SYSTEM copy, grant or queue no longer matches its identity record:
+   run `privilege-enroll` again (one more approval) rather than editing the
+   protected tree.
 7. **Verify** — finish with `roundhouse:fleet-readiness` for the new host and
    report the go/no-go table. A host is not "added" until readiness reports
    it.
@@ -68,14 +80,16 @@ Order matters: clean up over SSH while access still works, revoke second.
    touching); optionally uninstall the fleet plugins on the target; remove
    enrolled artifacts via the enroll scripts' own uninstall/revoke paths
    (never raw deletion of the protected trees).
-2. **Revoke trust** — generate the updated owner KRL (an owner-side
-   ceremony), tear down the departing host's enrollment with
-   `enroll-ssh-posix preview-revoke` then `revoke`, and deliver the new KRL
-   to every remaining fleet host with `enroll-ssh-posix repair` — not just
-   the departing one. **Revoke the store credential alongside SSH trust**:
+2. **Revoke trust** — remove the privilege lane on the departing host:
+   `sudo /usr/local/libexec/roundhouse-lane/privilege-lane revoke` (POSIX)
+   or an elevated `privilege-lane-windows.ps1 -Revoke` (Windows), each one
+   local approval; it removes the grant or task, the protected copy and the
+   queue and keeps the journal. A host on the optional CA lane follows
+   `"$SKILL_DIR/../../references/windows-sftp.md"` instead.
+   **Revoke the store credential alongside SSH trust**:
    delete the host's deploy key or token at the remote in the same step, so
    a decommissioned machine loses store write access exactly when it loses
-   SSH trust. Revoke privilege enrollment the same way when present.
+   SSH trust.
 3. **Config removal** — delete the machine entry, re-run
    `"$CLI" validate-config`, and drop the host from any groups.
 4. **Report** — if the entry shares a `physical_host` with others, say so
@@ -93,7 +107,7 @@ SSH identity. **Read first** — show the full delta before touching
 anything. Then, in this order:
 
 1. **Enrollment** — run the add-a-host flow above for X: config entry and
-   the SSH certificate ceremony.
+   the privilege lane's one approval.
 2. **Store credentials** — provision X's own store credential (step 5
    above), never reusing another host's.
 3. **Materialize file-carried surfaces** — skills, agents, hooks, and
@@ -120,7 +134,8 @@ run `fleet-verify-remote`, fetch the published enrollment head, rerun
   `fleet-agents` territory.
 - Never generate SSH keys anywhere but the host they identify; never move a
   private key between machines; the CSR is public-only by construction.
-- Signing (`certify-ssh-node`) and privilege enrollment always get their own
-  explicit consent naming the exact host, even inside a larger add flow.
+- Privilege enrollment always gets its own explicit consent naming the exact
+  host, even inside a larger add flow: it is the one OS prompt, and nothing
+  else in the lifecycle needs one.
 - `railyard:setup` delegates per-host work here during first-run setup;
   this skill is also directly invocable any time after.

@@ -1,5 +1,14 @@
 # Protected enrollment and Windows SFTP operations
 
+> **Optional high-assurance mode — not the default.** This reference
+> describes the CA-certificate lane, selected only by an explicit
+> `privilege_broker.automation_transport` route in a machine entry. The
+> default privilege lane needs no ceremony: one OS approval per host through
+> `roundhouse privilege-enroll HOST`, then unattended operation. See
+> `docs/specs/2026-10-01-hands-off-privilege-lane.md` in the repository.
+> Nothing below is required to add a host or to run privileged package work.
+
+
 This reference covers the owner-operated path from node identity preparation
 through enrollment, recovery, upgrade, and revocation. Agent commands prepare,
 inspect, submit closed requests, and retrieve public results. They never obtain

@@ -66,9 +66,14 @@ test_u5_contracts() {
     "$cli" prepare-privilege-enrollment test-wsl "$tmp/u5-wsl-enrollment.json"
   u5_wsl_rc=$?
   set -e
-  [ "$u5_wsl_rc" -eq 69 ] &&
-    [ "$(jq -r '.reason' "$tmp/u5-wsl-enrollment.json")" = unsupported_security_boundary ] ||
-    fail "U5 WSL enrollment preparation did not fail as unsupported_security_boundary"
+  # WSL has no CA-broker route and never did; it is a first-class host of the
+  # hands-off privilege lane (apt), so preparation names that lane's one
+  # approval instead of refusing the platform.
+  [ "$u5_wsl_rc" -eq 0 ] &&
+    jq -e '.route == "local-lane" and .platform == "wsl" and .state == "needs_one_time_approval" and
+      .next_command == "roundhouse privilege-enroll test-wsl" and .activation_performed == false' \
+      "$tmp/u5-wsl-enrollment.json" >/dev/null ||
+    fail "U5 WSL enrollment preparation did not route to the privilege lane"
 
   ROUNDHOUSE_CONFIG="$tmp/u5-config.json" \
     "$cli" preview-privilege-upgrade test-apt "$tmp/u5-upgrade.json"

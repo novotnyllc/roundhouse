@@ -905,12 +905,14 @@ unavailable.
 
 A harness that cannot drive the Codex task surface (Claude Code) is not
 blocked from the declarative half: stage the marketplace desired-record and
-profile bundles onto the Windows target through the enrolled `windows-sftp`
-lane (`"$SKILL_DIR/../../references/windows-sftp.md"`), which any harness can
-drive over SSH/SFTP. The broker's scheduled task picks up a committed slot
-within one minute. Only the in-session convergence — installing plugin caches
-and re-approving hook trust against the staged desired-record — still
-requires the visible Codex task or an operator at the machine.
+profile files onto the Windows target through the WSL interop lane, which any
+harness can drive over SSH into the sibling; the files land under the user's
+own profile with the user's own logged-on token. There is no profile task
+and no SFTP route — user-scope work needs an active user session, and
+readiness reports `user_session_unavailable` rather than borrowing another
+identity. Only the in-session convergence — installing plugin caches and
+re-approving hook trust against the staged desired-record — still requires
+the visible Codex task or an operator at the machine.
 
 Use the sealed-plan reconciliation path below instead when the request includes
 broad drift, runtime or settings changes, provenance repair, provider

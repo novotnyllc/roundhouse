@@ -594,6 +594,8 @@ if false; then
   . "$script_dir/tests/12-u2-enrollment.sh"
   # shellcheck source=tests/14-u2-collector.sh
   . "$script_dir/tests/14-u2-collector.sh"
+  # shellcheck source=tests/16-privilege-lane.sh
+  . "$script_dir/tests/16-privilege-lane.sh"
   # shellcheck source=tests/20-u1.sh
   . "$script_dir/tests/20-u1.sh"
   # shellcheck source=tests/30-u4.sh

@@ -42,6 +42,7 @@ jobs:
           bash -n plugins/roundhouse/scripts/git-merge-plugin-version
           bash -n plugins/roundhouse/scripts/preflight
           bash -n plugins/roundhouse/scripts/privilege-broker-posix
+          bash -n plugins/roundhouse/scripts/privilege-lane-posix
           bash -n plugins/roundhouse/scripts/test-roundhouse
           bash -n plugins/roundhouse/scripts/update-integrity
           for unit in plugins/roundhouse/scripts/lib/*.sh \
@@ -329,6 +330,7 @@ jobs:
             "plugins/roundhouse/scripts/privilege-broker-windows.ps1",
             "plugins/roundhouse/scripts/profile-worker-windows.ps1",
             "plugins/roundhouse/scripts/register-profile-task-windows.ps1",
+            "plugins/roundhouse/scripts/privilege-lane-windows.ps1",
             "plugins/roundhouse/scripts/windows-native-canary-runner.ps1"
           )
           foreach ($script in $scripts) {
