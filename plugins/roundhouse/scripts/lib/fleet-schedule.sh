@@ -590,9 +590,27 @@ EOF_LEGACY
   return "$install_rc"
 }
 
+fleet_schedule_lingers_preflight() {
+  # Before ANY unit is written: a user manager that does not linger stops
+  # every timer with the last login session, so installing them would only
+  # schedule jobs that die when the operator logs out.
+  fleet_schedule_lingers && return 0
+  printf 'roundhouse: this user manager does not linger, so its timers would stop with the last login session; run `loginctl enable-linger %s`, then re-run `roundhouse fleet-schedule install`. Nothing was written.\n' \
+    "$(id -un)" >&2
+  return 75
+}
+
+fleet_schedule_manager_unreachable_note() {
+  # Distinct from lingering: the account lingers (or logind cannot say), but
+  # `systemctl --user` reaches no running manager — WSL without systemd, or a
+  # manager that has not started.
+  printf 'roundhouse: the units are written but no systemd user manager is reachable (`systemctl --user`); under WSL enable systemd in /etc/wsl.conf (`[boot] systemd=true`) and restart the distribution, otherwise start the user manager, then re-run `roundhouse fleet-schedule install`\n' >&2
+}
+
 fleet_schedule_install_systemd() {
   install_dir=$(fleet_schedule_unit_dir)
   install_changed=false
+  fleet_schedule_lingers_preflight || return $?
   for install_mode in $fleet_schedule_modes; do
     install_unit=$(fleet_schedule_unit "$install_mode")
     fleet_schedule_service_render "$install_mode" >"$install_tmp/$install_unit.service"
@@ -609,8 +627,7 @@ fleet_schedule_install_systemd() {
     done
   done
   fleet_schedule_user_manager || {
-    printf 'roundhouse: the units are written but no systemd user manager is reachable (`systemctl --user`); under WSL enable systemd in /etc/wsl.conf, and on a headless host run `loginctl enable-linger %s`, then re-run `roundhouse fleet-schedule install`\n' \
-      "$(id -un)" >&2
+    fleet_schedule_manager_unreachable_note
     return 75
   }
   [ "$install_changed" != true ] || systemctl --user daemon-reload >/dev/null 2>&1 || :
@@ -630,11 +647,6 @@ fleet_schedule_install_systemd() {
     fi
     fleet_schedule_job_state "$install_mode" >/dev/null
   done
-  fleet_schedule_lingers || {
-    printf 'roundhouse: the timers are enabled, but this user manager does not linger, so they stop with the last login session and triggers fall back to a detached pass; run `loginctl enable-linger %s`\n' \
-      "$(id -un)" >&2
-    return 75
-  }
 }
 
 fleet_schedule_status() {

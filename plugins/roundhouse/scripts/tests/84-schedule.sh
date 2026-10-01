@@ -669,12 +669,21 @@ STUB
       *'fleet-fast: installed, enabled, loaded, definition matches'*) ;;
       *) fail "the Linux status did not report a healthy timer" ;;
     esac
-    # Without lingering, the timers die with the session: install says so.
+    # Without lingering, the timers die with the session: a PREFLIGHT, so
+    # install says so and writes and enables nothing.
     rm -f "$SCHED_STATE/linger"
+    mv "$sched_units" "$sched_units.away"
+    : >"$SCHED_LOG"
     sched_status=0
     sched_out=$("$cli" fleet-schedule install 2>&1) || sched_status=$?
     [ "$sched_status" -eq 75 ] || fail "install on a non-lingering user did not say so ($sched_status)"
-    case $sched_out in *'loginctl enable-linger'*) ;; *) fail "the linger warning named no fix: $sched_out" ;; esac
+    case $sched_out in *'loginctl enable-linger'*'Nothing was written'*) ;; *) fail "the linger preflight named no fix: $sched_out" ;; esac
+    [ -z "$(find "$sched_units" -name 'roundhouse-fleet-*' 2>/dev/null)" ] ||
+      fail "install wrote units for a user manager that does not linger"
+    ! grep -Eq 'systemctl --user (enable|start|restart|daemon-reload)' "$SCHED_LOG" ||
+      fail "install enabled timers for a user manager that does not linger: $(cat "$SCHED_LOG")"
+    rm -rf "$sched_units"
+    mv "$sched_units.away" "$sched_units"
     : >"$SCHED_STATE/linger"
     # The operator disables the timer; the pass alerts and leaves it disabled.
     systemctl --user disable --now roundhouse-fleet-fast.timer
@@ -693,7 +702,8 @@ STUB
     sched_status=0
     sched_out=$("$cli" fleet-schedule install 2>&1) || sched_status=$?
     [ "$sched_status" -eq 75 ] || fail "install with no user manager did not say so ($sched_status)"
-    case $sched_out in *'enable-linger'*) ;; *) fail "install with no user manager named no fix: $sched_out" ;; esac
+    case $sched_out in *'no systemd user manager is reachable'*'wsl.conf'*) ;; *) fail "install with no user manager named no fix: $sched_out" ;; esac
+    case $sched_out in *'enable-linger'*) fail "an unreachable manager on a lingering account was blamed on lingering: $sched_out" ;; esac
 
     # Native Windows is out of scope, and says so; bad arguments never reach a job.
     SCHED_UNAME=MINGW64_NT-10.0
