@@ -1261,16 +1261,17 @@ YAML
       *) fail "fleet-seed did not say it stopped at the working copy: $run_seed_out" ;;
     esac
     run_seeded="$run_store/hosts/$run_seed_host.yaml"
-    grep -Fq 'ponytail:' "$run_seeded" ||
-      fail "seeding did not describe an installed plugin"
-    yq -e '.plugins.ponytail.state == "enabled" and .plugins.ponytail.marketplace == "novotnyllc"' \
+    # §8.2 P0: the AGENT KEYS are not seeded. A machine snapshot in the host
+    # layer re-added every retired plugin and overrode every change made
+    # anywhere else; packages and the host facts still seed.
+    yq -e '.packages.jq == "enabled"' "$run_seeded" >/dev/null ||
+      fail "seeding stopped describing an installed package"
+    yq -e '.plugins.ponytail == null and .plugins.legal == null and
+      .plugins."codex-only" == null and .plugins."unknown-harness" == null' \
       "$run_seeded" >/dev/null ||
-      fail "a same-name Codex plugin replaced the Claude desired plugin"
-    yq -e '.plugins."codex-only" == null and .plugins."unknown-harness" == null' \
-      "$run_seeded" >/dev/null ||
-      fail "seeding sent a non-Claude plugin to the Claude-only apply surface"
-    yq -e '.plugins.legal.state == "disabled"' "$run_seeded" >/dev/null ||
-      fail "seeding lost a plugin's disabled state"
+      fail "seeding still writes installed plugins into the host layer"
+    yq -e '.skills == null' "$run_seeded" >/dev/null ||
+      fail "seeding still writes installed skills into the host layer"
     ! grep -Fq 'never-installed' "$run_seeded" ||
       fail "seeding described something the snapshot reports absent"
     # The fnm runtime record is never a package (Homebrew would read
@@ -1284,16 +1285,36 @@ YAML
       fail "seeding turned the fnm runtime record into desired state"
     [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" packages.node)" ] ||
       fail "seeding asserted applied evidence for the fnm runtime as a package"
-    # Re-seeding UPSERTS and never removes: a hand-authored entry survives.
+    # Re-seeding UPSERTS and never removes: a hand-authored entry survives,
+    # agent entries included — the seed stops writing them, it does not delete.
     grep -Fq 'hand-authored:' "$run_seeded" ||
       fail "seeding removed a hand-authored entry (re-seed must upsert)"
     # The first convergence after seeding is a no-op BY CONSTRUCTION, which is
     # the safety property worth paying a verbose host file for.
     [ -f "$(fleet_applied_path "$run_store" "$run_seed_host")" ] ||
       fail "seeding wrote no applied/<host>.yaml, so the first run would adopt everything"
-    [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" plugins.codex-only)" ] &&
-      [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" plugins.unknown-harness)" ] ||
-      fail "seeding asserted applied evidence for a non-Claude plugin"
+    [ -n "$(fleet_applied_digest "$run_store" "$run_seed_host" packages.jq)" ] ||
+      fail "seeding wrote no applied evidence for the package it seeded"
+    [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" plugins.ponytail)" ] &&
+      [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" plugins.codex-only)" ] &&
+      [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" skills.grilling)" ] ||
+      fail "seeding asserted applied evidence for an agent item it no longer seeds"
+    # Unanimity promotion skips the agent keys too: a plugin every host file
+    # happens to carry identically is not proposed fleet-wide.
+    run_prop_root="$run_root/proposal-layers"
+    mkdir -p "$run_prop_root/hosts" "$run_root/proposal-tmp" "$run_root/proposal-store"
+    for run_prop_host in vireo wren; do
+      printf 'platform: macos\nplugins:\n  ponytail: enabled\nskills:\n  tdd: enabled\npackages:\n  jq: enabled\n' \
+        >"$run_prop_root/hosts/$run_prop_host.yaml"
+    done
+    printf '%s\n' vireo wren >"$run_root/proposal-tmp/hosts"
+    fleet_run_proposals "$run_root/proposal-store" vireo "$run_prop_root" \
+      "$run_root/proposal-tmp"
+    [ -f "$run_root/proposal-store/proposals/promote-packages-jq-to-fleet.yaml" ] ||
+      fail "a unanimous package was no longer proposed for promotion"
+    [ -z "$(find "$run_root/proposal-store/proposals" \
+      -name 'promote-plugins-*' -o -name 'promote-skills-*' | head -1)" ] ||
+      fail "a unanimous agent item was proposed for promotion"
     # It stops at the working copy: no describe, no bookmark, no push. There is
     # no repository here at all, and seeding must not need one.
     [ ! -e "$run_store/.jj" ] ||
@@ -1337,7 +1358,7 @@ JSONC
     [ -z "$(ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
       fleet_run_package_managers '{"package_managers":[]}' "$run_seed_host")" ] ||
       fail "an explicit empty package_managers in the fold was overridden by config.json"
-    yq -e '.plugins.ponytail != null' "$run_seeded" >/dev/null ||
+    yq -e '.packages.jq != null' "$run_seeded" >/dev/null ||
       fail "seeding the facts cost the observed surfaces"
     # A fact already in the host file WINS: someone wrote it deliberately and
     # seeding is not the place to relitigate it.
@@ -1368,7 +1389,7 @@ JSONC
     [ "$(yq -r '.groups | tag' "$run_seeded")" = '!!seq' ] &&
       [ "$(yq -r '.groups | length' "$run_seeded")" -eq 0 ] ||
       fail "an empty groups list was dropped instead of seeded; machine-truth would fire forever"
-    yq -e '.plugins.ponytail != null' "$run_seeded" >/dev/null ||
+    yq -e '.packages.jq != null' "$run_seeded" >/dev/null ||
       fail "seeding the empty groups list cost the observed surfaces"
     # …and a config that states NO opinion has none invented for it. (The
     # machine stays listed with `transport: local`, because that entry is also
@@ -1386,7 +1407,7 @@ JSONC
     [ -f "$run_seeded" ] ||
       fail "the seed wrote a different host file than the fixture expects"
     yq -e '.platform == null and .groups == null and .package_managers == null and
-      .plugins.ponytail != null' \
+      .packages.jq != null' \
       "$run_seeded" >/dev/null ||
       fail "an unlisted machine had facts invented for it"
     # An ABSENT field and an empty list are different answers, and the doctor

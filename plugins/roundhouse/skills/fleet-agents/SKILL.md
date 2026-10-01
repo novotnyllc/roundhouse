@@ -173,6 +173,13 @@ from each host file that carried it — and **the item's digest is unchanged by
 construction**, so no host re-reviews anything. Promotion moves *where* a value
 is written, never *what* it is.
 
+Neither re-seeding nor promotion writes the agent keys. Seeding skips `plugins`
+and `skills` (packages, `platform`, `groups` and `package_managers` seed as
+before), and promotion never proposes a `plugins.*` or `skills.*` item: a
+machine snapshot in the narrowest layer re-added every retired plugin and
+overrode every change made anywhere else. Agent items are edited in the layer
+that declares them.
+
 ### Conflicts, and who resolves them
 
 Two hosts editing different layer files is not a conflict; jj merges them.
@@ -310,8 +317,8 @@ roundhouse fleet-set-remote <url>  # adds origin. fleet-init creates the store
                                # ADDS a missing one.
 roundhouse fleet-verify-remote # REQUIRED before the first push
 roundhouse fleet-seed          # discovery -> hosts/<name>.yaml + applied/<name>.yaml,
-                               # including this machine's platform and groups
-                               # from config.json — no hand-authored facts
+                               # packages plus this machine's platform and groups
+                               # from config.json — never plugins or skills
 $EDITOR fleet.yaml             # lift the commonalities
 roundhouse fleet-doctor        # every check must pass before host 2
 roundhouse fleet-run --fast    # the first convergence

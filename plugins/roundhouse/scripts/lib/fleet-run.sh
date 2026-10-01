@@ -3051,6 +3051,10 @@ fleet_run_proposals() (
   done <"$proposal_tmp/hosts"
   LC_ALL=C sort -u "$proposal_tmp/items" | while IFS= read -r proposal_item; do
     [ -n "$proposal_item" ] || continue
+    # §8.2 P0: agent items are not promoted. Unanimity across machine
+    # snapshots is how a plugin every host happened to have installed became a
+    # fleet-wide want that no removal on any one host could undo.
+    case $proposal_item in plugins.* | skills.*) continue ;; esac
     proposal_values=$(while IFS= read -r proposal_peer; do
       [ -n "$proposal_peer" ] || continue
       jq -cn --arg host "$proposal_peer" --argjson value \
@@ -3140,6 +3144,14 @@ fleet_seed_command() (
           $r.data.manager == "fnm" or $r.data.manager == "npm") | not) then
         .packages[$r.data.name] = "enabled"
       else . end)' "$seed_tmp/snapshot.jsonl")
+  # §3.1/§8.2 P0: RE-SEED NO LONGER WRITES THE AGENT KEYS. A seed snapshots
+  # whatever this machine has installed into its own host layer, the narrowest
+  # one, so every re-seed re-added a plugin the fleet had retired and
+  # overrode every change made anywhere else. `plugins` and `skills` are
+  # dropped here, after the reducer, and nothing else is: packages and the
+  # host facts below seed exactly as before, and an agent entry already in the
+  # host file is left alone (re-seed upserts, it never removes).
+  seed_desired=$(printf '%s\n' "$seed_desired" | jq -c 'del(.plugins, .skills)')
 
   # MACHINE TRUTH, seeded from the one file that already states it. `platform`
   # and `groups` are host FACTS rather than desired items — the fold reads them
