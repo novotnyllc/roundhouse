@@ -1179,7 +1179,7 @@ fleet_run_node_converge() (
   node_local=$(jq -c '.node_switch_hooks // {}' "$(config_path)" 2>/dev/null) || node_local='{}'
   [ -n "$node_local" ] || node_local='{}'
   node_plan=$(node_switch_plan "$(printf '%s\n' "$node_split" | jq -c '.globals')" \
-    "$(printf '%s\n' "$node_split" | jq -c '.unpinnable')" "$node_current" \
+    "$(printf '%s\n' "$node_split" | jq -c '.unpinnable')" "$node_target" \
     "$node_defs" "$node_local") ||
     node_hold 'could not compute the npm globals to carry'
   node_plan_held=$(printf '%s\n' "$node_plan" | jq -r '.held // empty')

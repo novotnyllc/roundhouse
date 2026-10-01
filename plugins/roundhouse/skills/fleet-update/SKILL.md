@@ -75,8 +75,8 @@ policy.
   None of them is chosen; seal-plan derives them with the one carry rule and
   requires the draft to equal it exactly: `carry` is every global the
   snapshot shows installed under the current default at its exact version,
-  less `npm` (and `corepack` when the old Node bundled it), which the new
-  Node provides; `hooks` is, in carry order, every argv the configuration
+  less what the target Node provides (`npm`, and `corepack` only when the
+  target is Node 24 or older; moving 24 to 26 carries an installed corepack); `hooks` is, in carry order, every argv the configuration
   declares under top-level `node_switch_hooks` for the carried packages (for
   example `"npm:@bitkyc08/opencodex": [["ocx", "service"]]`); `required` is
   every `node_switch` hook the store definitions require for a carried
@@ -227,8 +227,9 @@ only restores it after a drift (a host that must drop a fleet pin sets
 `version: null`). The reviewed apply (fast cadence, on a new or changed value)
 switches only when the default is outside the major or is not the pin. One
 rule governs every lane: a switch carries every global installed under the
-current default at its exact version (less `npm`, and a bundled `corepack`,
-which the new Node provides), then runs post-switch hooks. It never adds a
+current default at its exact version (less what the target Node provides:
+`npm`, and `corepack` only on Node 24 and older), then runs post-switch
+hooks. It never adds a
 package and never leaves an installed one behind, whatever the store says
 about it (disabled, renamed, held); a global it cannot reinstall by exact
 registry version (`file:`, `link:`, git) holds the switch by name. A

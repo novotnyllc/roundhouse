@@ -575,7 +575,8 @@ fleet_node_snapshot_verify() {
   snapshot_verify_plan=$(node_switch_plan \
     "$(printf '%s\n' "$snapshot_verify_record" | jq -c '.globals')" \
     "$(printf '%s\n' "$snapshot_verify_record" | jq -c '.globals_unpinnable // []')" \
-    "$(printf '%s\n' "$snapshot_verify_record" | jq -r '.installed_version')" '{}' \
+    "$(jq -r 'first(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node")) |
+      .candidate_version' "$1")" '{}' \
     "$(jq -c '.node_switch_hooks // {}' "$3")") || return 1
   jq -e --argjson current "$snapshot_verify_plan" '
     $current.held == null and

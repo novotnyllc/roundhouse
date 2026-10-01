@@ -390,11 +390,14 @@ requirement is a floor.
   (`node_switch_plan`) implements it for the reviewed apply, the full
   cadence, `fleet-apply runtimes.node`, `seal-plan` and the executor's
   `verify-preconditions`, from nothing but the installed set:
-  - *Not carried*: what the new Node provides itself, `npm`, and `corepack`
-    when the old default bundled it (Node 24 and older; on later releases a
-    corepack global was installed by someone and is carried). `npm` then
-    comes from the new Node; the npm pass that follows moves a store-managed
-    npm forward.
+  - *Not carried*: what the TARGET Node provides itself: `npm` (every
+    release bundles it), and `corepack` only when the target bundles it
+    (Node 24 and older). Leaving a bundling release for one that does not
+    (24 to 26) carries the installed corepack from the registry at its
+    version; dropping it would remove corepack and its shims. If that
+    version cannot be installed, the carry fails, the default is restored,
+    and the switch holds. `npm` comes from the new Node; the npm pass that
+    follows moves a store-managed npm forward.
   - *Holds*: a global that cannot be reinstalled by exact registry version
     (`file:`, `link:`, git, no version; the switch names it instead of
     stranding it), a malformed `node_switch` on a definition of a carried
@@ -474,7 +477,9 @@ argv is the marker only; the executor knows no other `fnm` shape. `carry`,
 - Executor: re-checks the argv marker and the hooks against its own (worker)
   configuration, then runs §7.3.
 - Post-state: `installed_version == candidate_version` and every carried
-  package present in the new record's `globals` at its version. A failure
+  package present in the new record's `globals` at its version, or at the
+  `candidate_version` of a later `npm:*` upgrade of it in the same plan
+  (seal orders those after the switch). A failure
   restores the default and reports `partial`. The `npm:*` records move to the
   new `prefix`/`node_version`, so npm plans sealed before a switch stop
   verifying after it.

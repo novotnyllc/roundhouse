@@ -575,11 +575,16 @@ apply_plan_command() {
           .status == "present" and
           .data.installed_version == $operation.candidate_version and
           # A Node switch is complete only when every carried global is
-          # present under the NEW default at its carried version.
+          # present under the NEW default at its carried version, or at the
+          # candidate of a later npm upgrade of it in this same plan (seal
+          # orders every npm upgrade after the switch).
           (if $operation.id == "fnm:node" then
              (.data.globals | type == "object") and
              (.data.globals as $globals |
-               all($operation.carry[]; $globals[.name] == .version))
+               all($operation.carry[]; . as $carried |
+                 ([$plan[0].operations[] | select(.type == "package-upgrade" and
+                   .id == ("npm:" + $carried.name)) | .candidate_version] | last) as $later |
+                 $globals[$carried.name] == ($later // $carried.version)))
            else true end))
       elif (.type == "auth-reauth" or .type == "auth-install") then
         . as $operation |

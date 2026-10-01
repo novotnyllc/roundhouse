@@ -382,7 +382,7 @@ node_globals_split() (
 )
 
 node_switch_plan() (
-  # `node_switch_plan GLOBALS UNPINNABLE OLD DEFS HOOKS` — THE carry rule, one
+  # `node_switch_plan GLOBALS UNPINNABLE TARGET DEFS HOOKS` — THE carry rule, one
   # pure function every lane asks (the scheduled cadences, seal-plan, and the
   # executor's verify-preconditions):
   #
@@ -395,8 +395,12 @@ node_switch_plan() (
   # state, and every refinement found another way to strand a package that
   # was held, renamed or disabled-but-held.) Two things are not carried:
   #
-  #   excluded    what the new Node provides itself: `npm`, and `corepack`
-  #               when OLD is a release that bundles it (Node 24 and older)
+  #   excluded    what the TARGET Node provides itself: `npm` (every release
+  #               bundles it), and `corepack` only when TARGET bundles it
+  #               (Node 24 and older). Moving off a bundling release carries
+  #               the installed corepack from the registry at its version:
+  #               the target would not provide one, and dropping it would
+  #               remove corepack and its shims.
   #   unpinnable  a global that cannot be reinstalled by exact registry
   #               version (`file:`, `link:`, git, no version). The switch
   #               HOLDS naming it rather than strand it.
@@ -406,13 +410,13 @@ node_switch_plan() (
   # host's config.json (HOOKS, `node_switch_hooks`) declares for the carried
   # packages, in carry order, and is what runs. A required hook that is not
   # declared, or a malformed `node_switch` on a carried package, holds.
-  jq -cn --argjson globals "$1" --argjson unpinnable "$2" --arg old "$3" \
+  jq -cn --argjson globals "$1" --argjson unpinnable "$2" --arg target "$3" \
     --argjson defs "$4" --argjson local "$5" '
     def argv_ok: type == "array" and length >= 1 and length <= 8 and
       all(.[]; type == "string") and
       (.[0] | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
       all(.[1:][]; length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$"));
-    ((($old | ltrimstr("v") | split(".")[0] | tonumber?) // 0) as $major |
+    ((($target | ltrimstr("v") | split(".")[0] | tonumber?) // 0) as $major |
       ["npm"] + (if $major < 25 then ["corepack"] else [] end)) as $provided |
     def provided($n): any($provided[]; . == $n);
     ([$globals | keys[]] + $unpinnable | unique) as $installed |

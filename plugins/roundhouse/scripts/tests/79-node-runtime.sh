@@ -50,7 +50,9 @@ case "$1 ${2:-}" in
     # reinstallable by registry version.
     jq -c --arg linked "${NRT_NPM_LINKED:-}" '{name:"lib",dependencies:(with_entries(.value = {version:.value}) +
       (if $linked == "" then {} else {($linked): {version:"0.0.1",resolved:"file:../../dev/devtool"}} end))}' "$state" ;;
-  "outdated --global") printf '{}\n' ;;
+  "outdated --global")
+    if [ -n "${NRT_NPM_OUTDATED:-}" ]; then printf '%s\n' "$NRT_NPM_OUTDATED"; else printf '{}\n'; fi
+    ;;
   "install --global")
     [ "${NRT_NPM_FAIL_INSTALL:-0}" != 1 ] || exit 1
     shift 2
@@ -281,8 +283,8 @@ nrt_reset
   printf '%s\n' '{"version":1,"node_switch_hooks":{"npm:@example/svc":[["svc","restart"]]}}' \
     >"$nrt_root/local-mismatched.json"
   nrt_plan_for() {
-    # nrt_plan_for CONFIG [GLOBALS] [UNPINNABLE] [OLD] [DEFS]
-    node_switch_plan "${2:-$nrt_globals_now}" "${3:-[]}" "${4:-v26.0.0}" "${5:-$nrt_defs}" \
+    # nrt_plan_for CONFIG [GLOBALS] [UNPINNABLE] [TARGET] [DEFS]
+    node_switch_plan "${2:-$nrt_globals_now}" "${3:-[]}" "${4:-v26.10.0}" "${5:-$nrt_defs}" \
       "$(jq -c '.node_switch_hooks // {}' "$nrt_root/$1.json")"
   }
   nrt_plan=$(nrt_plan_for local-declared)
@@ -313,15 +315,17 @@ nrt_reset
   nrt_plan_for local-declared "$nrt_globals_now" '[]' v26.0.0 \
     '{"packages":{"bad-hook":{"npm":{"name":"not-installed","node_switch":["svc service"]}}}}' |
     jq -e '.held == null' >/dev/null || fail "a malformed node_switch on an absent global held the switch"
-  # corepack is the new Node's own only where the old one bundled it (24 and
-  # older); on 26 a corepack global was installed by someone and is carried.
+  # What the TARGET provides is not carried; anything else is. corepack is
+  # bundled with Node 24 and older only: a switch within 24 leaves it to the
+  # new Node, a switch from 24 to 26 carries it (26 would not provide one),
+  # and on 26 a corepack global was installed by someone and is carried.
   nrt_with_corepack=$(printf '%s\n' "$nrt_globals_now" | jq -c '. + {corepack:"0.30.0"}')
-  nrt_plan_for local-declared "$nrt_with_corepack" '[]' v24.1.0 |
+  nrt_plan_for local-declared "$nrt_with_corepack" '[]' v24.2.0 |
     jq -e '.excluded == ["corepack","npm"] and all(.carry[]; .name != "corepack")' >/dev/null ||
-    fail "a corepack bundled with the old Node was carried"
-  nrt_plan_for local-declared "$nrt_with_corepack" '[]' v26.0.0 |
-    jq -e 'any(.carry[]; .name == "corepack")' >/dev/null ||
-    fail "a user-installed corepack was not carried"
+    fail "a switch to a corepack-bundling Node carried corepack"
+  nrt_plan_for local-declared "$nrt_with_corepack" '[]' v26.10.0 |
+    jq -e '.excluded == ["npm"] and any(.carry[]; . == {name:"corepack",version:"0.30.0"})' >/dev/null ||
+    fail "a switch to a Node that does not bundle corepack dropped the installed corepack"
   # A global that cannot be reinstalled by exact registry version holds the
   # switch by name; it is never silently left behind.
   [ "$(NRT_NPM_LINKED=devtool node_globals_split "$(NRT_NPM_LINKED=devtool npm_global_list_detail)" |
@@ -390,6 +394,25 @@ nrt_reset
   (FNM_DIR=$nrt_root/no-fnm HOME=$nrt_root/no-home \
     nrt_converge local-declared '{"major":26}' apply) || nrt_status=$?
   [ "$nrt_status" -eq 75 ] || fail "a host without an fnm default did not hold"
+
+  # A corepack installed on 26 is carried to 26.x at its version.
+  nrt_reset
+  nrt_env PATH="$nrt_fnm/aliases/default/bin:$PATH" "$nrt_fnm/aliases/default/bin/npm" \
+    install --global corepack@0.30.0
+  nrt_converge local-declared '{"major":26}' full || fail "a switch with corepack installed did not converge"
+  [ "$(jq -r '.corepack' "$nrt_fnm/node-versions/v26.10.0/installation/globals.json")" = 0.30.0 ] ||
+    fail "an installed corepack was not carried to a Node that does not bundle it"
+  # From a corepack-bundling 24 to 26, which bundles none: the installed
+  # corepack is carried from the registry at its version, not dropped.
+  nrt_reset
+  nrt_env "$nrt_bin/fnm" install v24.1.0
+  nrt_env "$nrt_bin/fnm" default v24.1.0
+  nrt_env PATH="$nrt_fnm/aliases/default/bin:$PATH" "$nrt_fnm/aliases/default/bin/npm" \
+    install --global corepack@0.30.0 npm@10.9.0
+  nrt_converge local-declared '{"major":26}' apply || fail "a 24 to 26 switch did not converge"
+  [ "$(nrt_default)" = v26.10.0 ] &&
+    [ "$(nrt_globals v26.10.0)" = '{"corepack":"0.30.0"}' ] ||
+    fail "a switch off a corepack-bundling Node dropped the installed corepack"
 
   # --- the category arm, and the manual fleet-apply path ------------------------
   nrt_status=0
@@ -680,6 +703,27 @@ else
   # would no longer verify.
   [ "$(jq -r 'select(.kind == "package" and .id == "npm:plain") | .data.node_version' "$tmp/node-apply.jsonl")" = \
     v26.10.0 ] || fail "the npm records did not move to the new runtime"
+
+  # A later npm upgrade of a carried global in the same plan: the switch
+  # carries it at its installed version, the upgrade then moves it, and the
+  # plan completes with the upgraded version rather than reading partial.
+  nrt_reset
+  nrt_outdated='{"plain":{"current":"2.0.0","wanted":"3.0.0","latest":"3.0.0","dependent":"global"}}'
+  nrt_up_cli() {
+    nrt_env NRT_NPM_OUTDATED="$nrt_outdated" ROUNDHOUSE_CONFIG="$tmp/node-config.json" "$cli" "$@"
+  }
+  nrt_up_cli collect --target test-host --section host --section packages \
+    --output "$tmp/node-upgrade-snapshot.jsonl"
+  nrt_up_cli seal-plan "$tmp/node-draft-npm-after.json" "$tmp/node-upgrade-snapshot.jsonl" \
+    "$tmp/node-upgrade-plan.json"
+  nrt_up_cli apply-plan "$tmp/node-upgrade-plan.json" "$(jq -r '.plan_id' "$tmp/node-upgrade-plan.json")" \
+    "$tmp/node-upgrade-apply.jsonl" ||
+    fail "a Node switch followed by an npm upgrade of a carried global did not complete"
+  [ "$(nrt_default)" = v26.10.0 ] &&
+    [ "$(jq -r 'select(.kind == "operation" and (.id | startswith("apply:"))) | .data.operation_status' \
+      "$tmp/node-upgrade-apply.jsonl")" = completed ] &&
+    [ "$(jq -r '.plain' "$nrt_fnm/node-versions/v26.10.0/installation/globals.json")" = 3.0.0 ] ||
+    fail "the later npm upgrade was not what the switch post-check expected"
 
   # --- the SSH lane: the worker needs no store ---------------------------------
   # The carry is proven from the worker's own fresh snapshot, and the required
