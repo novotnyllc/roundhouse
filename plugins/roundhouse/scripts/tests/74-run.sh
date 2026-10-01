@@ -1638,7 +1638,8 @@ printf 'verbs: the supervised item-level surface\n'
   for verb_bad in 'fleet-review one two' 'fleet-apply' 'fleet-apply a b' \
     'fleet-accept' 'fleet-hold only' 'fleet-pending extra' 'fleet-lock extra' \
     'fleet-set-remote' 'fleet-finding one' 'fleet-alerts-compact extra' \
-    'fleet-disown' 'fleet-disown --dry-run' 'fleet-disown --bogus x'; do
+    'fleet-disown' 'fleet-disown --dry-run' 'fleet-disown --bogus x' \
+    'fleet-unlock --force extra'; do
     verb_status=0
     # shellcheck disable=SC2086 # the malformed argv under test
     "$cli" $verb_bad >/dev/null 2>&1 || verb_status=$?
@@ -1775,14 +1776,41 @@ if [ -n "$fleet_fixture_yq" ]; then
     fleet_unlock_command >/dev/null
     fleet_lock_command >/dev/null ||
       fail "the lock could not be retaken after fleet-unlock"
-    # A hand-taken lock names the CALLER's shell, which is still alive, so the
-    # run treats it as a live holder rather than a dead one to take over.
+    # A hand-taken lock is `manual`, and is NEVER judged dead: its recorded pid
+    # is a shell that may exit a second later, and a run that took it over
+    # would publish the operator's half-done edits. The age rule governs it.
+    [ "$(fleet_lock_meta_field "$(fleet_lock_path)" manual)" = true ] ||
+      fail "a hand-taken lock was not marked manual"
     verb_status=0
     fleet_run_lock_take "$verb_store" vireo "$(fleet_lock_path)" 2>/dev/null ||
       verb_status=$?
     [ "$verb_status" -eq 10 ] ||
-      fail "a hand-taken lock was not honoured as a live holder (got $verb_status)"
+      fail "a hand-taken lock was not honoured as held (got $verb_status)"
+    jq -c '.pid = 999999' "$(fleet_lock_path)/meta.json" >"$verb_root/manual-meta" &&
+      mv "$verb_root/manual-meta" "$(fleet_lock_path)/meta.json"
+    fleet_lock_holder_state "$(fleet_lock_path)"
+    [ "$fleet_lock_state" = unknown ] ||
+      fail "a hand-taken lock whose shell is gone was judged $fleet_lock_state"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$(fleet_lock_path)" 2>/dev/null ||
+      verb_status=$?
+    [ "$verb_status" -eq 10 ] ||
+      fail "a run took over a hand-taken lock whose shell had exited (got $verb_status)"
     fleet_unlock_command >/dev/null
+    [ ! -d "$(fleet_lock_path)" ] || fail "fleet-unlock did not release a hand-taken lock"
+    # fleet-unlock REFUSES a verified-live run's lock unless forced.
+    sleep 300 &
+    verb_live_run=$!
+    fleet_lock_acquire "$(fleet_lock_path)" "$verb_live_run"
+    verb_status=0
+    fleet_unlock_command >/dev/null 2>&1 || verb_status=$?
+    [ "$verb_status" -eq 75 ] && [ -d "$(fleet_lock_path)" ] ||
+      fail "fleet-unlock released a verified-live run's lock (got $verb_status)"
+    fleet_unlock_command --force >/dev/null ||
+      fail "fleet-unlock --force did not release a live run's lock"
+    [ ! -d "$(fleet_lock_path)" ] || fail "fleet-unlock --force left the lock"
+    kill "$verb_live_run" 2>/dev/null || :
+    wait "$verb_live_run" 2>/dev/null || :
 
     # --- §6.3 lock liveness: the holder is asked before the clock ---
     verb_lock=$(fleet_lock_path)

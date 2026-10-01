@@ -233,12 +233,14 @@ fleet_lock_proc_start() {
 fleet_lock_proc_command() {
   # `fleet_lock_proc_command PID` — the process's full command line, or
   # nothing. Host-local evidence only: it lands in the lock meta beside the
-  # store, never in a replicated record.
-  ps -o command= -p "$1" 2>/dev/null | awk '{ sub(/[[:space:]]+$/, ""); if ($0 != "") print; exit }'
+  # store, never in a replicated record. `-ww`: procps cuts `command` to the
+  # terminal width otherwise, and two reads at different widths would disagree.
+  ps -ww -o command= -p "$1" 2>/dev/null |
+    awk '{ sub(/[[:space:]]+$/, ""); if ($0 != "") print; exit }'
 }
 
 fleet_lock_acquire() {
-  # `fleet_lock_acquire LOCK_DIR [HOLDER_PID]` — one lock shape for every entry
+  # `fleet_lock_acquire LOCK_DIR [HOLDER_PID] [manual]` — one lock shape for every entry
   # point: the directory is the mutex, the meta file is the evidence doctor and
   # the holder check read. Sets `fleet_lock_nonce_held` to this acquisition's
   # nonce, which is the only thing `fleet_lock_release` will act on.
@@ -246,14 +248,21 @@ fleet_lock_acquire() {
   # The meta names the holder by pid, start time AND command, because a pid
   # alone is not an identity: after a crash or reboot the same number belongs
   # to something else, and `kill -0` cannot tell the difference. HOLDER_PID
-  # defaults to this process; `fleet-lock` passes its caller's shell, so a
-  # hand-taken lock lives exactly as long as the shell that took it.
+  # defaults to this process.
+  #
+  # `manual` marks a lock taken by hand (`fleet-lock`). Its recorded pid is the
+  # caller's shell, which is often gone a second later — so a hand-taken lock
+  # is never judged dead (fleet_lock_holder_state answers `unknown`) and the
+  # age rule governs it exactly as before: a scheduled run must not take over
+  # an operator's lock and publish their half-done edits.
   #
   # Exit 1 when the lock is held, 2 when the directory was created but its
   # evidence could not be written: a lock nobody can identify is a lock nobody
   # can safely release or take over, so it is removed rather than left behind.
   lock_dir=$1
   lock_pid=${2:-$$}
+  lock_manual=false
+  [ "${3:-}" != manual ] || lock_manual=true
   fleet_lock_nonce_held=
   mkdir "$lock_dir" 2>/dev/null || return 1
   chmod 0700 "$lock_dir"
@@ -262,8 +271,10 @@ fleet_lock_acquire() {
     jq -S -n --arg host "$(fleet_host_name)" --argjson pid "$lock_pid" \
       --arg started "$(fleet_now)" --arg start_time "$(fleet_lock_proc_start "$lock_pid")" \
       --arg command "$(fleet_lock_proc_command "$lock_pid")" --arg nonce "$lock_nonce" \
+      --argjson manual "$lock_manual" \
       '{host:$host,pid:$pid,started_at:$started,start_time:$start_time,
-        command:$command,nonce:$nonce}' >"$lock_dir/meta.json.tmp" 2>/dev/null &&
+        command:$command,nonce:$nonce} + (if $manual then {manual:true} else {} end)' \
+      >"$lock_dir/meta.json.tmp" 2>/dev/null &&
     mv -f "$lock_dir/meta.json.tmp" "$lock_dir/meta.json"; then
     fleet_lock_nonce_held=$lock_nonce
     return 0
@@ -316,8 +327,8 @@ fleet_lock_holder_state() {
   #          reuse after a crash or a reboot)
   # live     the recorded holder is running right now, verified by all three
   # unknown  nothing here can be proved either way: no readable meta, another
-  #          host's pid, a pre-nonce lock whose pid is alive, or no identity
-  #          to bind a takeover to
+  #          host's pid, a hand-taken (`manual`) lock, a pre-nonce lock whose
+  #          pid is alive, or no identity to bind a takeover to
   #
   # The host name is compared because the lock lives beside a store path that
   # a second instance root could share; a pid from another machine says
@@ -328,6 +339,9 @@ fleet_lock_holder_state() {
   [ -f "$lock_meta" ] || return 0
   jq -e 'type == "object"' "$lock_meta" >/dev/null 2>&1 || return 0
   [ "$(fleet_lock_meta_field "$1" host)" = "$(fleet_host_name)" ] || return 0
+  # A hand-taken lock names a shell that may already have exited; its holder
+  # is the operator, whom no `ps` can see. The age rule decides it.
+  [ "$(fleet_lock_meta_field "$1" manual)" != true ] || return 0
   lock_pid=$(fleet_lock_meta_field "$1" pid)
   case $lock_pid in
     '' | *[!0-9]*) return 0 ;;

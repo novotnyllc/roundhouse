@@ -4084,22 +4084,43 @@ fleet_lock_command() (
   # exits 75 and STOPS rather than forcing — two convergences racing one plugin
   # cache is the failure this prevents.
   #
-  # The recorded holder is the CALLER's shell, not this short-lived process:
-  # the lock outlives the command by design, so naming this pid would make
-  # every hand-taken lock read as a dead holder and be taken over by the next
-  # run. The lock lives until `fleet-unlock` or until that shell exits.
+  # The lock is marked `manual`: it outlives this command by design, and no
+  # process stands for the operator holding it, so it is never judged dead and
+  # taken over — it lasts until `fleet-unlock`, or until the stale age.
   require_jq
   lock=$(fleet_lock_path)
-  fleet_lock_acquire "$lock" "$PPID" || {
+  fleet_lock_acquire "$lock" "$PPID" manual || {
     printf 'roundhouse: the fleet run-lock is held: %s\n' "$lock" >&2
     exit 75
   }
-  printf 'roundhouse: fleet run-lock acquired: %s (held by pid %s until fleet-unlock or that shell exits)\n' \
-    "$lock" "$PPID"
+  printf 'roundhouse: fleet run-lock acquired by hand: %s (held until fleet-unlock)\n' "$lock"
 )
 
 fleet_unlock_command() (
+  # `roundhouse fleet-unlock [--force]` — release the run lock by hand. A lock
+  # whose holder is a VERIFIED-LIVE run (pid, start time and command all match,
+  # and not hand-taken) is a run in progress, and removing its lock lets a
+  # second run race it; that is refused unless `--force` says so explicitly.
+  # Everything else — a hand-taken lock, a dead or unjudgeable holder — goes.
+  require_jq
+  unlock_force=false
+  case ${1:-} in
+    '') ;;
+    --force) unlock_force=true ;;
+    *)
+      printf 'roundhouse: unknown fleet-unlock option: %s\n' "$1" >&2
+      exit 64
+      ;;
+  esac
   unlock=$(fleet_lock_path)
+  if [ -d "$unlock" ] && [ "$unlock_force" != true ]; then
+    fleet_lock_holder_state "$unlock"
+    [ "$fleet_lock_state" != live ] || {
+      printf 'roundhouse: a live run (pid %s) holds %s; refusing to release it (use --force to override)\n' \
+        "$(fleet_lock_meta_field "$unlock" pid)" "$unlock" >&2
+      exit 75
+    }
+  fi
   rm -f "$unlock/meta.json"
   [ ! -d "$unlock" ] || rmdir "$unlock"
   printf 'roundhouse: fleet run-lock released\n'

@@ -332,9 +332,10 @@ raises a `lock-takeover` alert. A run releases the lock only while it still
 carries that run's nonce. Exit 75 is the STALE-lock refusal — a lock past two
 full cadences whose holder cannot be shown dead, or one
 whose `meta.json` is missing so its age cannot be read — and it names the
-recovery rather than forcing. `roundhouse fleet-unlock` releases a lock by hand;
-`roundhouse fleet-lock` records the calling shell as the holder and also exits
-75 when the lock is already held. Unattended runs skip protected/privileged actions — those
+recovery rather than forcing. `roundhouse fleet-unlock` releases a lock by hand, and refuses while a
+verified-live run holds it unless given `--force`; `roundhouse fleet-lock` marks
+its lock `manual`, which is never judged dead (the age rule governs it), and also
+exits 75 when the lock is already held. Unattended runs skip protected/privileged actions — those
 stay interactive by design. Failures land in the store's own alert and journal
 records and surface in `roundhouse fleet-pending` and `roundhouse fleet-doctor`.
 

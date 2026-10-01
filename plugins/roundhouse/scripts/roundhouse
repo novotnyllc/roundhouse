@@ -69,7 +69,7 @@ Usage:
   roundhouse fleet-journal ENTRY.json|-
   roundhouse fleet-finding SLUG SUMMARY [QUOTE]
   roundhouse fleet-lock
-  roundhouse fleet-unlock
+  roundhouse fleet-unlock [--force]
   roundhouse fleet-rollback ITEM [--now]
   roundhouse fleet-adopt-pin PLUGIN PIN.json
   roundhouse fleet-verify-remote
@@ -227,7 +227,7 @@ case $command in
     fleet_finding_command "$1" "$2" ${3+"$3"}
     ;;
   fleet-lock) [ $# -eq 0 ] || usage; fleet_lock_command ;;
-  fleet-unlock) [ $# -eq 0 ] || usage; fleet_unlock_command ;;
+  fleet-unlock) [ $# -le 1 ] || usage; fleet_unlock_command "$@" ;;
   fleet-rollback) [ $# -ge 1 ] && [ $# -le 2 ] || usage; fleet_rollback_command "$@" ;;
   fleet-adopt-pin) [ $# -eq 2 ] || usage; fleet_adopt_pin_command "$1" "$2" ;;
   fleet-verify-remote) [ $# -eq 0 ] || usage; fleet_verify_remote_command ;;
