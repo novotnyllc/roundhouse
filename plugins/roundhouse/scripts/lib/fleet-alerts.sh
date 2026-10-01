@@ -190,6 +190,10 @@ fleet_alert_items() {
   # `fleet_alert_items LEDGER < ITEMS` — the pass's whole item set, one per
   # line. An item-scoped alert whose item is in NO pass's set any more (retired
   # from the fold) has no condition left to hold, so the sweep clears it too.
+  # The `universe` marker says the set was recorded even when it is EMPTY: a
+  # pass whose last item left the fold has no `item` line, and without the
+  # marker that read as "no set recorded" and kept the last item's alerts.
+  printf 'universe\n' >>"$1"
   awk 'length { printf "item\t%s\n", $0 }' >>"$1"
 }
 
@@ -213,7 +217,7 @@ fleet_alert_sweep() {
   alert_sweep_ledger=$3
   [ -f "$alert_sweep_ledger" ] || return 0
   alert_sweep_has_items=false
-  ! grep -q "^$(printf 'item\t')" "$alert_sweep_ledger" || alert_sweep_has_items=true
+  ! grep -qx universe "$alert_sweep_ledger" || alert_sweep_has_items=true
   for alert_sweep_kind in $(fleet_alert_condition_kinds item); do
     for alert_sweep_file in "$alert_sweep_store/alerts/$alert_sweep_host/$alert_sweep_kind"--*.yaml; do
       [ -f "$alert_sweep_file" ] || continue

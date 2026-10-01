@@ -163,6 +163,25 @@ if [ -n "$fleet_fixture_yq" ]; then
       fail "the sweep cleared an alert for an item the pass skipped"
     [ ! -e "$rec_life/alerts/vireo/package-hold--packages.gone.yaml" ] ||
       fail "the sweep kept an alert for an item retired from the fold"
+    # An EMPTY item set is still a recorded set: the pass whose last item left
+    # the fold sweeps that item's alerts.
+    rec_empty_ledger="$rec_life/ledger-empty"
+    : >"$rec_empty_ledger"
+    fleet_alert_write "$rec_life" vireo package-hold package-hold-packages-last \
+      'held' packages.last
+    fleet_alert_items "$rec_empty_ledger" </dev/null
+    fleet_alert_sweep "$rec_life" vireo "$rec_empty_ledger"
+    [ ! -e "$rec_life/alerts/vireo/package-hold--packages.last.yaml" ] ||
+      fail "the last item to leave the fold kept its alert"
+    # No set recorded at all (a ledger nothing wrote an item set to) clears
+    # nothing that was not checked.
+    fleet_alert_write "$rec_life" vireo package-hold package-hold-packages-kept \
+      'held' packages.kept
+    : >"$rec_empty_ledger"
+    fleet_alert_sweep "$rec_life" vireo "$rec_empty_ledger"
+    [ -f "$rec_life/alerts/vireo/package-hold--packages.kept.yaml" ] ||
+      fail "a sweep with no recorded item set cleared an unchecked alert"
+    rm -f "$rec_life/alerts/vireo/package-hold--packages.kept.yaml"
     # A whole-fold check marks every item of its kind checked.
     fleet_alert_write "$rec_life" vireo chezmoi-coownership chezmoi-coownership \
       'co-owned' 'config_files.~/.a'
