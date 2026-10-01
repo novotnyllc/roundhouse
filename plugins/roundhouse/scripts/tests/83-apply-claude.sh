@@ -380,7 +380,9 @@ JSON
     for run_claude_line in \
       '/Users/x/.local/bin/claude --resume' 'claude' \
       'node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js' \
-      'node /Users/x/.npm-global/bin/claude -p hi'; do
+      'node /Users/x/.npm-global/bin/claude -p hi' \
+      'node /Users/a b/.npm-global/bin/claude --resume' \
+      'node /Users/a b/lib/node_modules/@anthropic-ai/claude-code/cli.js'; do
       printf '%s\n' "$run_claude_line" | fleet_run_claude_cmdline_match ||
         fail "a running claude CLI was not recognised: $run_claude_line"
     done
@@ -510,6 +512,13 @@ JSON
       fail "an unqualified tombstone installed from two marketplaces did not hold"
     [ -z "$(CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_tombstone_target '{}' never '"absent"')" ] ||
       fail "a tombstone for a plugin installed nowhere named something"
+    # A definition that cannot be resolved holds, never falling back to the
+    # unqualified lookup that would pick a same-named plugin elsewhere.
+    run_status=0
+    CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_tombstone_target \
+      '{"plugins":{"solo":"not-a-map"}}' solo '"absent"' >/dev/null || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "an unresolvable tombstone definition did not hold (got $run_status)"
     ) || exit 1
     # `absent` stays HELD where there is no uninstall verb.
     for run_tomb_other in skills.tdd packages.jj agents.triage-bot; do

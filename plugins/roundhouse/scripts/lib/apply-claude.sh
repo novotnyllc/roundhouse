@@ -425,7 +425,15 @@ fleet_run_plugin_market() {
     plugin_market=
   if [ -z "$plugin_market" ]; then
     plugin_market_surface=$(fleet_resolve_surface "$1" plugins "$2") || return 75
-    plugin_market=$(printf '%s\n' "$plugin_market_surface" | jq -r '.marketplace // ""')
+    # The surface must be a resolved plugin record whose marketplace is a
+    # string or absent: a malformed definition yields no record (the resolver
+    # does not fail on it), and treating that as "unqualified" would let a
+    # tombstone pick a same-named plugin from another marketplace.
+    plugin_market=$(printf '%s\n' "$plugin_market_surface" | jq -er '
+      if type == "object" and has("item") and
+        ((.marketplace | type) == "string" or .marketplace == null)
+      then (.marketplace // "") else error("unresolved") end' 2>/dev/null) ||
+      return 75
   fi
   printf '%s\n' "$plugin_market"
 }
@@ -513,8 +521,12 @@ fleet_run_tombstone_target() {
   # Exit 75 when that cannot be decided: an unreadable installed_plugins.json,
   # or an unqualified name that more than one marketplace has installed — an
   # uninstall must name exactly one plugin or none.
+  # A definition that cannot be resolved HOLDS (75): only a successful empty
+  # answer means "unqualified", or a malformed definition would let the
+  # unqualified lookup below uninstall a same-named plugin from another
+  # marketplace.
   fleet_run_tomb_market=$(fleet_run_plugin_market "$1" "$2" "$3" 2>/dev/null) ||
-    fleet_run_tomb_market=
+    return 75
   case $2 in
     *@*) fleet_run_tomb_id=$2 ;;
     *) fleet_run_tomb_id=${fleet_run_tomb_market:+$2@$fleet_run_tomb_market} ;;
@@ -556,11 +568,17 @@ fleet_run_claude_cmdline_match() {
   # argv[1] are read, so a process that merely MENTIONS claude in its
   # arguments (this awk program, a grep) never matches — and the desktop app,
   # `Claude`, which loads plugins in its own sessions only, does not either.
+  # A `node` script path may itself carry spaces (a home directory with a
+  # space), so the script is read as everything after argv[0], not as one
+  # field. That can over-match a later argument ending in `/claude` — which
+  # only DEFERS an uninstall, the safe direction.
   awk '
     { exe = $1; sub(/.*\//, "", exe) }
     exe == "claude" { found = 1; exit }
-    exe ~ /^node([0-9.]*)?$/ &&
-      ($2 ~ /(^|\/)claude$/ || $2 ~ /\/@anthropic-ai\/claude-code\//) { found = 1; exit }
+    exe ~ /^node([0-9.]*)?$/ {
+      rest = substr($0, length($1) + 2)
+      if (rest ~ /\/@anthropic-ai\/claude-code\// || rest ~ /(^|\/)claude( |$)/) { found = 1; exit }
+    }
     END { exit(found ? 0 : 1) }'
 }
 
