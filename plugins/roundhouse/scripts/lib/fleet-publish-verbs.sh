@@ -47,12 +47,12 @@ fleet_run_verb_begin() {
   esac
   fleet_run_verb_nonce=$fleet_lock_nonce_held
   fleet_run_verb_foreign=$(fleet_run_wc_foreign_paths "$1" "$2") || {
-    fleet_lock_release "$(fleet_lock_path)" "$fleet_run_verb_nonce"
+    fleet_lock_release "$(fleet_lock_path)" "$fleet_run_verb_nonce" || :
     printf 'roundhouse: could not read the working copy; %s refused\n' "$3" >&2
     return 65
   }
   [ -z "$fleet_run_verb_foreign" ] || {
-    fleet_lock_release "$(fleet_lock_path)" "$fleet_run_verb_nonce"
+    fleet_lock_release "$(fleet_lock_path)" "$fleet_run_verb_nonce" || :
     printf 'roundhouse: the working copy carries unpublished edits (%s); run `roundhouse fleet-run` first so this commit carries only %s\n' \
       "$(printf '%s\n' "$fleet_run_verb_foreign" | head -3 | tr '\n' ' ' | sed 's/ $//')" \
       "$3" >&2
@@ -78,7 +78,7 @@ fleet_compact_alerts_command() (
     exit $?
   compact_lock=$(fleet_lock_path)
   compact_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-compact-alerts.XXXXXX")
-  trap 'fleet_lock_release "$compact_lock" "$fleet_run_verb_nonce"; rm -rf "$compact_tmp"' \
+  trap 'fleet_lock_release "$compact_lock" "$fleet_run_verb_nonce" || :; rm -rf "$compact_tmp"' \
     EXIT HUP INT TERM
   compact_counts=$(fleet_alerts_compact "$compact_store" "$compact_host" \
     "$compact_tmp") || {
@@ -161,7 +161,7 @@ fleet_disown_command() (
   else
     fleet_run_verb_begin "$disown_store" "$disown_host" fleet-disown || exit $?
     disown_lock=$(fleet_lock_path)
-    trap 'fleet_lock_release "$disown_lock" "$fleet_run_verb_nonce"' EXIT HUP INT TERM
+    trap 'fleet_lock_release "$disown_lock" "$fleet_run_verb_nonce" || :' EXIT HUP INT TERM
   fi
   disown_selection=$(
     printf '%s' "$disown_named"

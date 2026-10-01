@@ -1625,9 +1625,9 @@ fleet_run_command() (
   # Release by NONCE, never by path: a run that was judged dead and taken over
   # must not delete its live successor's lock when it finally exits.
   run_lock_nonce=$fleet_lock_nonce_held
-  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce"' EXIT HUP INT TERM
+  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce" || :' EXIT HUP INT TERM
   run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-fleet-run.XXXXXX")
-  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce"; rm -rf "$run_tmp"' \
+  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce" || :; rm -rf "$run_tmp"' \
     EXIT HUP INT TERM
 
   # §8.6: the abort button for a bad local apply, captured deliberately
@@ -3435,6 +3435,12 @@ fleet_unlock_command() (
   # and not hand-taken) is a run in progress, and removing its lock lets a
   # second run race it; that is refused unless `--force` says so explicitly.
   # Everything else — a hand-taken lock, a dead or unjudgeable holder — goes.
+  #
+  # The release is by IDENTITY, read in the same breath as the holder check:
+  # the lock judged here is the only one removed, so a run that took the lock
+  # between the check and the release keeps it. A lock with no meta at all
+  # carries nothing to protect and its empty directory goes; one whose meta
+  # cannot be read needs `--force`.
   require_jq
   unlock_force=false
   case ${1:-} in
@@ -3446,7 +3452,12 @@ fleet_unlock_command() (
       ;;
   esac
   unlock=$(fleet_lock_path)
-  if [ -d "$unlock" ] && [ "$unlock_force" != true ]; then
+  [ -d "$unlock" ] || {
+    printf 'roundhouse: no fleet run-lock is held\n'
+    exit 0
+  }
+  unlock_id=$(fleet_lock_identity "$unlock")
+  if [ "$unlock_force" != true ]; then
     fleet_lock_holder_state "$unlock"
     [ "$fleet_lock_state" != live ] || {
       printf 'roundhouse: a live run (pid %s) holds %s; refusing to release it (use --force to override)\n' \
@@ -3454,8 +3465,25 @@ fleet_unlock_command() (
       exit 75
     }
   fi
-  rm -f "$unlock/meta.json"
-  [ ! -d "$unlock" ] || rmdir "$unlock"
+  if [ -n "$unlock_id" ]; then
+    fleet_lock_release "$unlock" "$unlock_id" || {
+      printf 'roundhouse: %s changed while it was being released (another run took it); nothing released\n' \
+        "$unlock" >&2
+      exit 75
+    }
+  elif [ ! -e "$unlock/meta.json" ]; then
+    rmdir "$unlock" 2>/dev/null || {
+      printf 'roundhouse: %s holds files other than its meta; remove it by hand\n' "$unlock" >&2
+      exit 75
+    }
+  elif [ "$unlock_force" = true ]; then
+    rm -f "$unlock/meta.json"
+    rmdir "$unlock" 2>/dev/null || :
+  else
+    printf 'roundhouse: %s has an unreadable meta.json; confirm no live runner, then release it with --force\n' \
+      "$unlock" >&2
+    exit 75
+  fi
   printf 'roundhouse: fleet run-lock released\n'
 )
 

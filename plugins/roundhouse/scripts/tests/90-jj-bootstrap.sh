@@ -119,6 +119,20 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ ! -d "$(fleet_lock_path)" ] || fail "fleet-unlock --force left the lock"
     kill "$verb_live_run" 2>/dev/null || :
     wait "$verb_live_run" 2>/dev/null || :
+    # fleet-unlock releases BY IDENTITY: a lock with no meta carries nothing to
+    # protect and goes; one whose meta cannot be read needs --force.
+    mkdir -p "$(fleet_lock_path)"
+    fleet_unlock_command >/dev/null || fail "fleet-unlock refused an evidence-less lock directory"
+    [ ! -d "$(fleet_lock_path)" ] || fail "fleet-unlock left an evidence-less lock directory"
+    mkdir -p "$(fleet_lock_path)"
+    printf ':::not json\n' >"$(fleet_lock_path)/meta.json"
+    verb_status=0
+    fleet_unlock_command >/dev/null 2>&1 || verb_status=$?
+    [ "$verb_status" -eq 75 ] && [ -d "$(fleet_lock_path)" ] ||
+      fail "fleet-unlock released a lock whose meta it could not read (got $verb_status)"
+    fleet_unlock_command --force >/dev/null ||
+      fail "fleet-unlock --force did not release an unreadable lock"
+    [ ! -d "$(fleet_lock_path)" ] || fail "fleet-unlock --force left an unreadable lock"
 
     # --- §6.3 lock liveness: the holder is asked before the clock ---
     verb_lock=$(fleet_lock_path)
@@ -169,7 +183,8 @@ if [ -n "$fleet_fixture_yq" ]; then
       fail "the takeover left the dead lock beside the live one"
     # RELEASE IS BY NONCE: the dead run, exiting late, must not remove its
     # successor's lock by path.
-    fleet_lock_release "$verb_lock" "$verb_first_nonce"
+    ! fleet_lock_release "$verb_lock" "$verb_first_nonce" ||
+      fail "a stale nonce reported releasing the successor's lock"
     [ -d "$verb_lock" ] ||
       fail "a stale nonce released the successor's lock"
     fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"

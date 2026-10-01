@@ -309,11 +309,13 @@ fleet_lock_identity() {
 }
 
 fleet_lock_release() {
-  # `fleet_lock_release LOCK_DIR NONCE` — remove the lock ONLY when it still
-  # carries this acquisition's nonce. A run that was judged dead and taken over
-  # must not, when it finally exits, delete the live successor's lock by path.
-  [ -n "${2:-}" ] || return 0
-  [ "$(fleet_lock_meta_field "$1" nonce)" = "$2" ] || return 0
+  # `fleet_lock_release LOCK_DIR IDENTITY` — remove the lock ONLY when it still
+  # carries IDENTITY (fleet_lock_identity: this acquisition's nonce, or a
+  # pre-nonce lock's pid and stamp as `fleet-unlock` read them). A run that was
+  # judged dead and taken over must not, when it finally exits, delete the live
+  # successor's lock by path. Exit 1 when the lock is not the one named.
+  [ -n "${2:-}" ] || return 1
+  [ "$(fleet_lock_identity "$1")" = "$2" ] || return 1
   rm -f "$1/meta.json"
   rmdir "$1" 2>/dev/null || :
 }

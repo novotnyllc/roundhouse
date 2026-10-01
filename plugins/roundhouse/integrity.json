@@ -130,7 +130,7 @@
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
-      "sha256": "786de70b89f1690d6877deec99560a31e4991da8da4a1ff42cf250383e7937f6"
+      "sha256": "59477dccd17c5feb5cd52bfc59f580cc80f639b6e77e2c8cd8d4741df67b1f40"
     },
     {
       "path": "scripts/lib/fleet-records.sh",
@@ -142,11 +142,11 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "28243be3c8151c82c9cfeb5cba36f3f8822ba24cbec1e1b2544eee2fdf03214c"
+      "sha256": "40a5928ab3e5f1b38ae567f25ef4a88ec0dea63920f316aa3e85df064b5eb0a2"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
-      "sha256": "673523bc98e2cc773f1b0e6245d597d0072914286ec69acc8dc3f6836629fce7"
+      "sha256": "e39d6bc6910bcb57fe6c9f3ff0bcce84e3c05286a612184522ad580384ed1f62"
     },
     {
       "path": "scripts/lib/fleet-trust.sh",
