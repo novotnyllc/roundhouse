@@ -533,10 +533,10 @@ YAML
     # The fixture ssh cannot reach a real peer, so an earlier nudge may have
     # parked vireo in the one-interval unreachable memo; clear it.
     rm -f "$rjj/wren/store.run/nudge-unreachable"
-    SSH_COMMAND_LOG=$runjj_nudges runjj wren "$cli" fleet-run --fast >/dev/null ||
-      fail "wren could not publish its layer edit"
+    runjj_wren_out=$(SSH_COMMAND_LOG=$runjj_nudges runjj wren "$cli" fleet-run --fast 2>&1) ||
+      fail "wren could not publish its layer edit: $runjj_wren_out"
     grep -q 'rh-vireo.*fleet-trigger --fast' "$runjj_nudges" ||
-      fail "a publish that changed desired state nudged nobody"
+      fail "a publish that changed desired state nudged nobody (nudges: $(cat "$runjj_nudges"); memo: $(cat "$rjj/wren/store.run/nudge-unreachable" 2>&1); pass: $(printf '%s\n' "$runjj_wren_out" | grep -v '^Working copy\|^Parent commit\|^Moved' | tail -15))"
     ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
       fail "the poll floor exited past a peer's layer edit"
     runjj vireo "$cli" fleet-run --fast >/dev/null ||
