@@ -10,6 +10,22 @@
 # Sourced by scripts/roundhouse; carries definitions only.
 # shellcheck shell=bash
 
+fleet_run_settings_path() {
+  # The user-scope Claude settings file, CLAUDE_CONFIG_DIR-aware: the one place
+  # its path is spelled.
+  printf '%s/settings.json\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+}
+
+fleet_run_marketplaces() {
+  # The one reader of `claude plugin marketplace list --json`: the registered
+  # marketplaces as a JSON ARRAY, whichever shape the manager prints (a bare
+  # array, or `{marketplaces: [...]}`). Exit 75 when the manager cannot list.
+  fleet_run_mlist=$(claude plugin marketplace list --json 2>/dev/null) || return 75
+  printf '%s\n' "$fleet_run_mlist" |
+    jq -c 'if type == "array" then . else (.marketplaces // []) end' 2>/dev/null ||
+    return 75
+}
+
 fleet_run_plugin_catalog() {
   # The source SHA is the byte identity; the catalog version remains useful
   # for the ordinary release advance but is never sufficient by itself.
@@ -33,12 +49,10 @@ fleet_run_plugin_catalog() {
     return 0
   }
 
-  fleet_run_marketplaces=$(claude plugin marketplace list --json 2>/dev/null) ||
-    return 75
-  fleet_run_catalog_locations=$(printf '%s\n' "$fleet_run_marketplaces" |
+  fleet_run_catalog_markets=$(fleet_run_marketplaces) || return 75
+  fleet_run_catalog_locations=$(printf '%s\n' "$fleet_run_catalog_markets" |
     jq -r --arg market "$fleet_run_catalog_market" '
-      (if type == "array" then .[] else (.marketplaces // [])[] end) |
-      select(.name == $market) | .installLocation // empty' 2>/dev/null) ||
+      .[] | select(.name == $market) | .installLocation // empty' 2>/dev/null) ||
     return 75
   while IFS= read -r fleet_run_catalog_location; do
     [ -n "$fleet_run_catalog_location" ] || continue
@@ -168,6 +182,9 @@ fleet_run_marketplace_locator_filter='
   # or a registration (`marketplace list --json` = {source, repo, url, path}).
   # A GitHub repository is the same source spelled as `owner/repo` or as its
   # https/ssh git URL, so all three meet on `github:owner/repo`.
+  #
+  # fleet_run_skill_source_identity (lib/fleet-run.sh) is a sibling normaliser
+  # for skill sources; P1 should merge the two into one source identity.
   def locator:
     (if (.source | type) == "object" then .source else . end) as $s |
     ($s.source // "") as $kind |
@@ -187,7 +204,7 @@ fleet_run_marketplace_source() {
   # declaration (`extraKnownMarketplaces`) registers NAME from. Nothing is
   # returned that is option-shaped or carries whitespace.
   fleet_run_msource=
-  fleet_run_msettings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+  fleet_run_msettings=$(fleet_run_settings_path)
   # A declared ref (branch or tag) is kept with `#ref`, so registration
   # resolves the revision the user pinned rather than the default branch.
   [ ! -f "$fleet_run_msettings" ] ||
@@ -258,14 +275,13 @@ fleet_run_marketplace_repair_once() {
   fleet_run_repair_reason=
   fleet_upstream_id_valid "$1" || return 75
   command -v claude >/dev/null 2>&1 || return 75
-  fleet_run_repair_list=$(claude plugin marketplace list --json 2>/dev/null) || return 75
+  fleet_run_repair_list=$(fleet_run_marketplaces) || return 75
   fleet_run_repair_entry=$(printf '%s\n' "$fleet_run_repair_list" | jq -c --arg n "$1" '
-    [(if type == "array" then .[] else (.marketplaces // [])[] end) |
-      select(.name == $n)] | .[0] // empty' 2>/dev/null) || return 75
+    [.[] | select(.name == $n)] | .[0] // empty' 2>/dev/null) || return 75
   if [ -z "$fleet_run_repair_entry" ]; then
     fleet_run_ensure_marketplace "$1" || return 75
   else
-    fleet_run_repair_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+    fleet_run_repair_settings=$(fleet_run_settings_path)
     fleet_run_repair_declared=
     [ ! -f "$fleet_run_repair_settings" ] ||
       fleet_run_repair_declared=$(jq -r --arg n "$1" \
@@ -294,18 +310,17 @@ fleet_run_ensure_marketplace() {
   fleet_run_ensure_name=$1
   fleet_upstream_id_valid "$fleet_run_ensure_name" || return 75
   command -v claude >/dev/null 2>&1 || return 75
-  fleet_run_ensure_list=$(claude plugin marketplace list --json 2>/dev/null) || return 75
-  if printf '%s\n' "$fleet_run_ensure_list" | jq -e --arg n "$fleet_run_ensure_name" '
-    (if type == "array" then . else (.marketplaces // []) end) | any(.[]; .name == $n)
-  ' >/dev/null 2>&1; then
+  fleet_run_ensure_list=$(fleet_run_marketplaces) || return 75
+  if printf '%s\n' "$fleet_run_ensure_list" | jq -e --arg n "$fleet_run_ensure_name" \
+    'any(.[]; .name == $n)' >/dev/null 2>&1; then
     return 0
   fi
   fleet_run_ensure_source=$(fleet_run_marketplace_source "$fleet_run_ensure_name") ||
     return 75
   claude plugin marketplace add "$fleet_run_ensure_source" >/dev/null 2>&1 || return 75
-  claude plugin marketplace list --json 2>/dev/null | jq -e --arg n "$fleet_run_ensure_name" '
-    (if type == "array" then . else (.marketplaces // []) end) | any(.[]; .name == $n)
-  ' >/dev/null 2>&1 || return 75
+  fleet_run_ensure_list=$(fleet_run_marketplaces) || return 75
+  printf '%s\n' "$fleet_run_ensure_list" | jq -e --arg n "$fleet_run_ensure_name" \
+    'any(.[]; .name == $n)' >/dev/null 2>&1 || return 75
 }
 
 fleet_run_installed_plugins() {
