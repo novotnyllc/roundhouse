@@ -102,6 +102,16 @@ chmod 755 "$nfx_install_dir/bin/node" "$nfx_install_dir/bin/npm" \
   "$nfx_modules/@example/tool/bin/tool.js" "$nfx_install_dir/bin/impostor"
 cp "$nfx_install_dir/bin/npm" "$nfx_install_dir/bin/node" "$nfx_root/multishell/fnm_multishells/4242/bin/"
 cp "$nfx_install_dir/bin/npm" "$nfx_root/bare-bin/npm"
+# The collector also reports the fnm runtime under these globals (fnm:node).
+# A stub fnm keeps that off the network and off any real fnm on the machine
+# running the suite: one published release, the installed default.
+mkdir -p "$nfx_root/fnm-bin"
+cat >"$nfx_root/fnm-bin/fnm" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = list-remote ] && { printf 'v26.0.0\n'; exit 0; }
+exit 64
+SH
+chmod 755 "$nfx_root/fnm-bin/fnm"
 
 nfx_reset_state() {
   printf '%s\n' '{"npm":"11.0.0","@example/tool":"1.0.0","current-only":"3.0.0"}' >"$nfx_state"
@@ -119,9 +129,11 @@ nfx_reset_state
   NPM_STUB_LOG=$nfx_log
   NPM_STUB_IMPOSTOR=$nfx_root/impostor-ran
   ROUNDHOUSE_TEST_NPM_FIXED_DIRS=
+  ROUNDHOUSE_TEST_FNM_FIXED_DIRS=
   export FNM_DIR NPM_STUB_STATE NPM_STUB_LATEST NPM_STUB_LOG NPM_STUB_IMPOSTOR \
-    ROUNDHOUSE_TEST_NPM_FIXED_DIRS
+    ROUNDHOUSE_TEST_NPM_FIXED_DIRS ROUNDHOUSE_TEST_FNM_FIXED_DIRS
   [ -z "$fleet_fixture_yq" ] || PATH=$fleet_fixture_path
+  PATH=$nfx_root/fnm-bin:$PATH
   export PATH
   # shellcheck source=/dev/null
   ROUNDHOUSE_LIB_ONLY=1 . "$cli"
@@ -322,9 +334,10 @@ jq '.machines["test-host"].package_managers = ["homebrew","npm"] |
   "$tmp/config.json" >"$tmp/npm-config.json"
 chmod 600 "$tmp/npm-config.json"
 nfx_cli() {
-  env -u XDG_DATA_HOME ROUNDHOUSE_CONFIG="$tmp/npm-config.json" FNM_DIR="$nfx_fnm" \
+  env -u XDG_DATA_HOME PATH="$nfx_root/fnm-bin:$PATH" ROUNDHOUSE_CONFIG="$tmp/npm-config.json" FNM_DIR="$nfx_fnm" \
     NPM_STUB_STATE="$nfx_state" NPM_STUB_LATEST="$nfx_latest" NPM_STUB_LOG="$nfx_log" \
-    NPM_STUB_IMPOSTOR="$nfx_root/impostor-ran" ROUNDHOUSE_TEST_NPM_FIXED_DIRS= "$cli" "$@"
+    NPM_STUB_IMPOSTOR="$nfx_root/impostor-ran" ROUNDHOUSE_TEST_NPM_FIXED_DIRS= \
+    ROUNDHOUSE_TEST_FNM_FIXED_DIRS= "$cli" "$@"
 }
 # Config validation: npm is accepted everywhere; an updater must be argv.
 for nfx_bad_config in \

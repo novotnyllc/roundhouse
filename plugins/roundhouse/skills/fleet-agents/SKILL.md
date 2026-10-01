@@ -208,7 +208,12 @@ bypass that becomes routine.
 Rollback is honest per category: reverting a `projects` entry stops managing
 the project, it does not restore repository state; `mcp_servers` and `hooks`
 are reversible for **configuration only** — removing one stops it firing, it
-does not undo what it already did.
+does not undo what it already did. Reverting `runtimes.node` switches the fnm
+default back the same way it moved forward, when that switch succeeds: the
+older version is still installed (none is ever removed), and every installed
+global is carried to it at its current version. If the switch holds (an
+unpinnable global, an undeclared required hook, or a global inventory whose
+detail is unknown), the runtime stays where it is until that is resolved.
 
 ### The trust ratchet
 

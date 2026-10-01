@@ -237,7 +237,9 @@ validate_config_file() {
     printf 'roundhouse: configuration not found: %s\n' "$path" >&2
     exit 64
   }
-  jq -e '
+  # npm_jq_grammar (lib/npm.sh) is the shared grammar for package updaters
+  # and post-switch hooks.
+  jq -e "${npm_jq_grammar:?}"'
     def valid_capability_provider:
       (.provider | IN("plugin","skills-cli","jsm","manual","plugin-source")) and
       (.source | type == "string" and length > 0) and
@@ -379,12 +381,15 @@ validate_config_file() {
     # itself installs (checked against the live package at collect, seal and
     # apply time); no shell, no flags that are not literal tokens.
     ((.package_updaters // {}) | type == "object") and
-    ([.package_updaters // {} | to_entries[] |
-      (.key | type == "string" and length <= 218 and
-        test("^npm:(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")) and
-      (.value | type == "array" and length >= 1 and length <= 8) and
-      (.value[0] | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
-      ([.value[1:][] | type == "string" and length <= 128 and test("^[A-Za-z0-9@=:,._/+-]+$")] | all)
+    ([.package_updaters // {} | to_entries[] | (.key | npm_id_ok) and (.value | npm_argv_ok)] | all) and
+    # Post-switch hooks for the Node runtime (lib/node-runtime.sh): per npm
+    # package, a list of argv in the package_updaters grammar, each a bin of
+    # that package. This file is the trust root: a store definition can only
+    # REQUIRE a hook, and the switch holds unless this host declares it here.
+    ((.node_switch_hooks // {}) | type == "object") and
+    ([.node_switch_hooks // {} | to_entries[] |
+      (.key | npm_id_ok) and
+      (.value | type == "array" and length >= 1 and length <= 4 and all(.[]; npm_argv_ok))
     ] | all) and
     ((.projects // {}) | type == "object") and
     ([.projects // {} | to_entries[] |
@@ -628,6 +633,11 @@ worker_config_command() (
       ),
       package_updaters:(if ($domain == "updates" or $domain == "inventory") then
         (.package_updaters // {}) else {} end),
+      # POSIX only: Windows Node comes from winget and its globals survive an
+      # upgrade, so there is nothing to carry and no hook to run.
+      node_switch_hooks:(if ($domain == "updates" or $domain == "inventory") and
+        .machines[$target].platform != "windows" then
+        (.node_switch_hooks // {}) else {} end),
       capabilities:(if ($domain == "agents" or $domain == "inventory") then (.capabilities // {}) else {} end),
       skill_roots:(if ($domain == "agents" or $domain == "inventory") then (.skill_roots // []) else [] end),
       agent_artifacts:(if ($domain == "agents" or $domain == "inventory") then

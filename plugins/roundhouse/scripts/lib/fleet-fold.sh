@@ -14,6 +14,11 @@ fleet_categories() {
   # (see fleet_unknown_categories), which is the deliberate asymmetry: an
   # unknown key inside a known item cannot under-converge, an unknown category
   # can.
+  #
+  # `runtimes` holds exactly one item, `runtimes.node`: the host-default Node
+  # that runs the managed npm globals (§5.1.2's amendment). A store that
+  # declares it must not reach a host older than the build that knows it; such
+  # a host holds everything and alerts, which is this rule working.
   cat <<'EOF'
 policy
 packages
@@ -24,6 +29,7 @@ hooks
 mcp_servers
 config_files
 projects
+runtimes
 EOF
 }
 
@@ -698,6 +704,32 @@ fleet_resolve_package() {
           continue
         }
       fi
+      # `node_switch:` names the package's own post-switch hooks (a list of
+      # argv, each a bin of the package) that must run after a Node runtime
+      # switch carries it to a new prefix. Same grammar and the same trust
+      # rule as `update:`: the definition can only REQUIRE a hook; this host's
+      # config.json `node_switch_hooks` decides whether it runs.
+      if printf '%s\n' "$resolve_spec" | jq -e '.attributes | has("node_switch")' >/dev/null; then
+        resolve_hooks_ok=false
+        if printf '%s\n' "$resolve_spec" | jq -e '.attributes.node_switch |
+          type == "array" and length >= 1 and length <= 4 and
+          all(.[]; type == "array" and length >= 1 and all(.[]; type == "string"))' >/dev/null; then
+          resolve_hooks_ok=true
+          while IFS= read -r resolve_hook; do
+            [ -n "$resolve_hook" ] || continue
+            resolve_update=()
+            while IFS= read -r resolve_update_arg; do
+              resolve_update+=("$resolve_update_arg")
+            done < <(printf '%s\n' "$resolve_hook" | jq -r '.[]')
+            [ "$(printf '%s\n' "$resolve_hook" | jq 'length')" -eq "${#resolve_update[@]}" ] &&
+              npm_updater_argv_valid "${resolve_update[@]}" || resolve_hooks_ok=false
+          done < <(printf '%s\n' "$resolve_spec" | jq -c '.attributes.node_switch[]')
+        fi
+        [ "$resolve_hooks_ok" = true ] || {
+          resolve_detail="npm node_switch for $resolve_concrete must be a list of argv: bins of the package and literal arguments"
+          continue
+        }
+      fi
     fi
     resolve_version=$(printf '%s\n' "$resolve_spec" | jq -r '.version // empty')
     resolve_pin=null
@@ -894,6 +926,11 @@ fleet_install_package() {
       # the install is VERIFIED: npm must then list the package, at the pinned
       # version when there is one.
       npm_global_bin_dir >/dev/null 2>&1 || return 75
+      # A Node switch recorded in flight leaves the runtime unverified (or
+      # mid-switch): no npm install runs under it (lib/node-runtime.sh). 73
+      # is a deferral with its own alert, not "no manager can provide it"
+      # (fleet_run_apply_held).
+      [ -z "$(node_switch_marker_read)" ] || return 73
       npm_global_install "$2" "${4:-}" || return 1
       npm_install_version=$(npm_global_installed_version "$2") || return 1
       [ -n "$npm_install_version" ] || return 1

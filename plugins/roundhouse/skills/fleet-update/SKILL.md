@@ -1,6 +1,6 @@
 ---
 name: fleet-update
-description: Plan and explicitly apply package updates across Homebrew, APT, winget, and global npm packages. Use for fleet patching, outdated-package reports, manager-specific updates, package drift, or post-update verification.
+description: Plan and explicitly apply package updates across Homebrew, APT, winget, global npm packages, and the Node runtime under them. Use for fleet patching, outdated-package reports, manager-specific updates, package or Node version drift, or post-update verification.
 ---
 
 # Fleet Update
@@ -60,6 +60,59 @@ policy.
   `~/.npmrc` allows them (`allow-scripts[]=<package>`, written in the ini
   array form because `npm config set` rejects it). chezmoi owns that file;
   Roundhouse neither writes nor rewrites it.
+- Node runtime (the one runtime Roundhouse owns: the host-default Node under
+  the managed npm globals). On POSIX the collector reports `fnm:node` next to
+  the npm records: `installed_version` is `fnm default`, `candidate_version`
+  the newest published release in that major (`fnm list-remote`), plus
+  `installed_versions`, `stale_versions` (installed, not the default),
+  `globals` (the default's top-level globals), `globals_unpinnable` (globals
+  that cannot be reinstalled by exact registry version: `file:`, `link:`,
+  git, no version, as far as npm reports a source) and `switch_hooks_unproven`.
+  Known limit: npm 12 reports no install source for most globals, so one
+  installed from a non-registry tarball under a published `name@version`
+  looks pinnable and a switch replaces it with the registry copy.
+  A switch is a `package-upgrade` with `id: "fnm:node"`, argv exactly
+  `["fnm","default","<candidate_version>"]`, a `carry` list
+  `[{"name","version"}]`, a `hooks` list and a `required` list (both
+  `[{"package","argv"}]`), placed before any `npm:*` upgrade in the same plan.
+  None of them is chosen; seal-plan derives them with the one carry rule and
+  requires the draft to equal it exactly: `carry` is every global the
+  snapshot shows installed under the current default at its exact version,
+  less what the target Node provides (`npm`, and `corepack` only when the
+  target is Node 24 or older; moving 24 to 26 carries an installed corepack); `hooks` is, in carry order, every argv the configuration
+  declares under top-level `node_switch_hooks` for the carried packages (for
+  example `"npm:@bitkyc08/opencodex": [["ocx", "service"]]`); `required` is
+  every `node_switch` hook the store definitions require for a carried
+  package, each of which must be in `hooks`. An empty or partial carry, a
+  hook mismatch, an unpinnable global, and a host with no store (hook
+  requirements unknown) are refused. At apply, the executing host (local or
+  the SSH worker) re-derives the carry from its fresh snapshot and requires
+  the same carry, hooks and required hooks; no lane reads a store at apply.
+  The executor takes the host's Node switch lock, proves each hook bin under
+  the current prefix, and STAGES the new version before anything live
+  moves: `fnm install`, the new version's npm brought up to the host's if
+  older, one exact `npm install --global a@x b@y …` into the new prefix
+  through its own npm, anything else left in a previously used prefix
+  uninstalled (bundled npm/corepack excepted), and the set verified as
+  exactly the carry at its versions. A failure there leaves the default
+  untouched. Only then does it RECORD the switch in flight, FLIP `fnm
+  default`, verify the default, run each hook by absolute path under the new
+  node, verify the default again, and clear the record. Any failure after
+  the flip points it back at the old version and the apply reports
+  `partial`. Old
+  versions are never removed (a service may still run from one); they are
+  reported. The sealed lane moves within the current major; a major change is
+  a store edit (`runtimes.node`, below). On Windows Node is winget
+  `OpenJS.NodeJS`: its record carries the gating `pin` (`winget pin add --id
+  OpenJS.NodeJS --version 26.*`), `line` and `install_scope` (read from the
+  package's HKLM/HKCU uninstall registration, never from PATH; ambiguous
+  evidence is null and treated as machine scope). The MSI
+  installs machine-wide, so the ordinary lane refuses its upgrade (`hold:
+  Node.js … needs elevation`); seal the protected
+  `winget.upgrade-machine-package.v1` action when readiness advertises it for
+  that channel, and otherwise report the hold. Never trigger a UAC prompt.
+  `%APPDATA%\npm` survives the upgrade, so Windows carries nothing and runs no
+  hooks.
 
 Present exact host, manager, package, current version, candidate version, and
 command. Every `package-upgrade` operation must carry the exact observed
@@ -163,10 +216,72 @@ and skips that package, with no `npm install` fallback. A `version:` pin
 installs exactly and is skipped by the update pass, as with winget and APT.
 The fast pass installs an enabled npm global that is missing, then requires
 `npm ls` to list it (at the pinned version when there is one) before it
-journals `applied`. A host without a durable npm holds the item. Node itself
-(fnm's default version on POSIX, winget `OpenJS.NodeJS` on Windows) and moving
-globals across a POSIX Node upgrade are not converged yet; see
-`docs/specs/2026-09-28-npm-global-manager.md` in the Roundhouse repository.
+journals `applied`. A host without a durable npm holds the item.
+
+The Node runtime under those globals is desired state too, in its own
+category, `runtimes`, with exactly one item:
+
+```yaml
+# fleet.yaml: the fleet line, the newest release in major 26
+runtimes:
+  node: {major: 26}
+# hosts/<name>.yaml: a per-host override, by ordinary layering
+runtimes:
+  node: {major: 24}          # or {version: "26.7.0"}: an exact pin
+```
+
+`major:` is the normal form: fnm never moves within a major on its own, so
+the full cadence does, to the newest published release in that major. An
+exact `version:` pins, like a package `version:`, and the full cadence then
+only restores it after a drift (a host that must drop a fleet pin sets
+`version: null`). The reviewed apply (fast cadence, on a new or changed value)
+switches only when the default is outside the major or is not the pin. One
+rule governs every lane: a switch carries every global installed under the
+current default at its exact version (less what the target Node provides:
+`npm`, and `corepack` only on Node 24 and older), then runs post-switch
+hooks. It never adds a
+package and never leaves an installed one behind, whatever the store says
+about it (disabled, renamed, held); a global it cannot reinstall by exact
+registry version (`file:`, `link:`, git) holds the switch by name. The
+carry is installed and verified in the new Node's own prefix before the
+default moves, so a failed carry never touches the live default; the npm
+that installs it is upgraded first if the host's global npm is newer than
+the one the new Node bundles. The move itself is recorded in flight
+(`~/.local/state/roundhouse/node-switch-inflight.json`, a fixed path whatever
+`XDG_STATE_HOME` says) until it verifies or its restore does, and one lock
+covers every switch and every recovery, so a run never rolls back a switch
+that is still running (it holds the item instead). A record left by a crash
+is rolled back by the next run (that run holds the item). One that cannot be
+rolled back reports the default as unverified, alerts
+`node-runtime-unverified`, and refuses every npm mutation (the full pass's
+npm step, fast-pass npm installs, sealed `npm:*` upgrades) until it is
+resolved. When the old version is gone for good, set a working default
+(`fnm default <version>`) and run `roundhouse node-switch-clear`: it clears
+the record (and any hook backoff) only if no switch is running and the
+current default verifies. A post-switch hook that fails restores the old
+default, and the reviewed apply then defers that exact attempt instead of
+flipping again every fast pass; the full cadence retries it, even in a run
+whose apply loop just deferred it. An npm install deferred by a switch in
+flight alerts `package-deferred`, not `package-hold`. A `runtimes.node` hold of any kind also
+alerts (`runtime-hold-runtimes-node`), so a persistent hold is visible.
+Hooks a definition requires are sealed from the sealing host's config; a
+hook only the target host declares cannot ride a plan sealed elsewhere (the
+target refuses it), so such a host converges through its scheduled run. `fleet-seed` never seeds `packages.node` or
+`runtimes.node` from the runtime record, nor a package from an `npm:*`
+record (npm manages only through an `npm:` definition). A definition may require hooks with
+`node_switch:` on its npm entry (`opencodex: {npm: {name:
+"@bitkyc08/opencodex", update: [ocx, update], node_switch: [[ocx,
+service]]}}`), but only this host's `config.json` `node_switch_hooks`
+introduces a command: every hook a definition requires for a carried
+package must be declared there identically, or the switch prints `hold
+runtimes.node — npm:<name> requires node_switch hook …` and changes nothing.
+The host may declare further host-only hooks (a WSL-only shim reinstall,
+say); those run too. What the new Node provides, and older Node versions
+(never removed), are reported as `note` lines. `runtimes.node: disabled` stops managing the
+runtime. Only fnm is a runtime source; DSC never runs on native Windows, whose
+Node converges only through the sealed lane above. Add `runtimes:` to the
+store only once every host runs a Roundhouse that knows the category (0.9.30
+or later): an older host holds everything on an unknown category.
 
 Both intervals are jittered from the host **name**, so the fleet does not
 re-synchronise on the same minute; the interval keys live in the store's
@@ -226,7 +341,8 @@ the repository-defined semantic action already present there:
 `macos.install-signed-pkg.v1`, `macos.apply-system-setting.v1`,
 `winget.inventory-machine.v1`, `winget.install-machine-package.v1`, or
 `winget.upgrade-machine-package.v1`. WinGet is required for V1 Windows
-machine-package work. macOS actions are owner-enrolled and default-disabled;
+machine-package work; it is also the only lane for a machine-scope Node.js
+(`OpenJS.NodeJS`) upgrade, within the channel its policy token enrolls. macOS actions are owner-enrolled and default-disabled;
 use them only when readiness advertises the exact active action. Never use root
 Homebrew, arbitrary `sudo`, arbitrary installer scripts, or arbitrary plist
 paths. `sealed-cask-payload-v1` is the sole scripted-package exception: it

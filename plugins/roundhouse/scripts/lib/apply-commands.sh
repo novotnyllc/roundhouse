@@ -555,7 +555,15 @@ apply_plan_command() {
     apply_status=partial
   fi
   validate_file "$work/post.jsonl"
+  # What the Node switch's target ships itself (node_target_bundled), for its
+  # exact-set post-check. Only a plan with a switch reads it; any other plan
+  # passes [].
+  node_post_bundled='[]'
+  node_post_target=$(jq -r 'first(.operations[] |
+    select(.type == "package-upgrade" and .id == "fnm:node") | .candidate_version) // ""' "$plan")
+  [ -z "$node_post_target" ] || node_post_bundled=$(node_target_bundled "$node_post_target")
   if [ "$apply_status" = completed ] && ! jq -e -n --slurpfile plan "$plan" --slurpfile before "$work/pre.jsonl" \
+    --argjson node_bundled "$node_post_bundled" \
     --slurpfile records "$work/post.jsonl" '
     def same_agent($record; $operation):
       if $operation.kind == "plugin" and
@@ -573,7 +581,25 @@ apply_plan_command() {
         . as $operation |
         any($records[]; .kind == $operation.kind and .id == $operation.id and
           .status == "present" and
-          .data.installed_version == $operation.candidate_version)
+          .data.installed_version == $operation.candidate_version and
+          # A Node switch is complete only when the NEW default holds
+          # exactly the carry (plus what that release bundles, and nothing
+          # left over from an earlier use of the same version), each at its
+          # carried version or at the candidate of a later npm upgrade of it
+          # in this same plan (seal orders every npm upgrade after the switch).
+          (if $operation.id == "fnm:node" then
+             (.data.globals | type == "object") and
+             (.data.globals_unpinnable | type == "array") and
+             ([.data.globals | keys[] | . as $n | select(any($node_bundled[]; . == $n) | not)] | sort) ==
+               ([$operation.carry[].name] | sort) and
+             ([.data.globals_unpinnable[] | . as $n | select(any($node_bundled[]; . == $n) | not)] == []) and
+             (.data.switch_inflight // null) == null and
+             (.data.globals as $globals |
+               all($operation.carry[]; . as $carried |
+                 ([$plan[0].operations[] | select(.type == "package-upgrade" and
+                   .id == ("npm:" + $carried.name)) | .candidate_version] | last) as $later |
+                 $globals[$carried.name] == ($later // $carried.version)))
+           else true end))
       elif (.type == "auth-reauth" or .type == "auth-install") then
         . as $operation |
         any($records[]; .kind == $operation.kind and .id == $operation.id and
@@ -681,7 +707,12 @@ validate_legacy_ssh_plan_file() {
     (.operations | type == "array" and length > 0 and
       all(.[];
         .type != "semantic-action" and
-        (if .type == "package-upgrade" then
+        (if .type == "package-upgrade" and .id == "fnm:node" then
+           # A Node runtime switch carries its exact globals and hooks; their
+           # shapes were checked at seal time and are checked again by
+           # verify-preconditions and the executor on the target.
+           exact(["argv","candidate_version","carry","hooks","id","kind","required","type"])
+         elif .type == "package-upgrade" then
            exact(["argv","candidate_version","id","kind","type"])
          elif .type == "chezmoi-apply" and has("targets") then
            exact(["argv","id","kind","targets","type"]) or

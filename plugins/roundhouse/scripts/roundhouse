@@ -76,6 +76,7 @@ Usage:
   roundhouse fleet-doctor
   roundhouse launcher-install [DESTINATION] [TARGET]
   roundhouse ensure-tools
+  roundhouse node-switch-clear
 EOF
   exit 64
 }
@@ -113,6 +114,8 @@ EOF
 . "$script_dir/lib/fleet-init.sh"
 # shellcheck source=lib/npm.sh
 . "$script_dir/lib/npm.sh"
+# shellcheck source=lib/node-runtime.sh
+. "$script_dir/lib/node-runtime.sh"
 # shellcheck source=lib/fleet-fold.sh
 . "$script_dir/lib/fleet-fold.sh"
 # shellcheck source=lib/fleet-records.sh
@@ -229,5 +232,6 @@ case $command in
   fleet-doctor) [ $# -eq 0 ] || usage; fleet_doctor_command ;;
   ensure-tools) [ $# -eq 0 ] || usage; fleet_ensure_tools_command ;;
   launcher-install) launcher_install_command "$@" ;;
+  node-switch-clear) [ $# -eq 0 ] || usage; node_switch_clear ;;
   *) usage ;;
 esac
