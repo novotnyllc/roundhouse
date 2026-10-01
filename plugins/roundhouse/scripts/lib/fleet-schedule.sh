@@ -488,9 +488,15 @@ fleet_schedule_place() {
     printf 'roundhouse: %s differs from the definition fleet-schedule writes; replacing it:\n' \
       "$1" >&2
     diff -u "$1" "$2" | sed 's/^/  /' >&2 || :
-    # Kept, never discarded: the replaced definition survives as .replaced.
-    cp "$1" "$1.replaced" 2>/dev/null &&
-      printf 'roundhouse: the previous definition is kept as %s.replaced\n' "$1" >&2 || :
+    # Kept, never discarded: the replaced definition survives as .replaced,
+    # and a backup that cannot be made is a replacement that does not happen.
+    # The existing definition stays exactly as it was.
+    cp -p "$1" "$1.replaced" 2>/dev/null && cmp -s "$1" "$1.replaced" || {
+      printf 'roundhouse: could not keep the previous definition as %s.replaced; %s was left in place, unchanged\n' \
+        "$1" "$1" >&2
+      return 1
+    }
+    printf 'roundhouse: the previous definition is kept as %s.replaced\n' "$1" >&2
   fi
   mkdir -p "$(dirname "$1")" || return 1
   cp "$2" "$1.next.$$" && chmod 0644 "$1.next.$$" && mv -f "$1.next.$$" "$1" || {
@@ -559,17 +565,28 @@ fleet_schedule_install_launchd() {
     printf 'fleet-%s: %s %s\n' "$install_mode" "$install_result" "$install_plist"
   done
   # Absorb, never duplicate (fleet-update): only now, with the new pair in
-  # place. Renamed, not deleted, so the superseded job can be restored.
-  fleet_schedule_legacy_plists | while IFS= read -r install_legacy; do
+  # place. Renamed, not deleted, so the superseded job can be restored — and
+  # renamed BEFORE it is unloaded: a rename that fails leaves the superseded
+  # entry on disk and running, and the install fails rather than retiring a
+  # job it could not keep.
+  install_legacy_list=$(fleet_schedule_legacy_plists)
+  while IFS= read -r install_legacy; do
+    [ -n "$install_legacy" ] || continue
+    install_absorbed="$install_legacy.absorbed"
+    [ ! -e "$install_absorbed" ] || install_absorbed="$install_legacy.absorbed.$(date +%Y%m%dT%H%M%S)"
+    mv "$install_legacy" "$install_absorbed" 2>/dev/null || {
+      printf 'roundhouse: could not keep the superseded %s as %s; it was left in place and loaded\n' \
+        "$install_legacy" "$install_absorbed" >&2
+      return 73
+    }
     [ "$install_has_domain" != true ] ||
       launchctl bootout "$install_domain/$(basename "$install_legacy" .plist)" \
         >/dev/null 2>&1 || :
-    install_absorbed="$install_legacy.absorbed"
-    [ ! -e "$install_absorbed" ] || install_absorbed="$install_legacy.absorbed.$(date +%Y%m%dT%H%M%S)"
-    mv "$install_legacy" "$install_absorbed" &&
-      printf 'roundhouse: absorbed the superseded %s entry (kept as %s)\n' \
-        "$(basename "$install_legacy" .plist)" "$install_absorbed"
-  done
+    printf 'roundhouse: absorbed the superseded %s entry (kept as %s)\n' \
+      "$(basename "$install_legacy" .plist)" "$install_absorbed"
+  done <<EOF_LEGACY
+$install_legacy_list
+EOF_LEGACY
   return "$install_rc"
 }
 

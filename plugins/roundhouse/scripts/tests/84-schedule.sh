@@ -474,6 +474,26 @@ STUB
     grep -Fqx "launchctl bootout gui/$sched_uid/com.novotnyllc.roundhouse.fleet-fast" "$SCHED_LOG" &&
       grep -Fqx "launchctl bootstrap gui/$sched_uid $sched_fast" "$SCHED_LOG" ||
       fail "a replaced, loaded job was not reloaded"
+    grep -Fq '<integer>7</integer>' "$sched_fast.replaced" ||
+      fail "the replaced definition was not kept as .replaced"
+    # A backup that cannot be made is a replacement that does not happen: the
+    # install fails and the operator's definition stays exactly as it was.
+    rm -f "$sched_fast.replaced"
+    mkdir "$sched_fast.replaced"
+    sed 's/<integer>[0-9]*</<integer>9</' "$sched_fast" >"$sched_fast.edit"
+    mv "$sched_fast.edit" "$sched_fast"
+    sched_before=$(cat "$sched_fast")
+    : >"$SCHED_LOG"
+    sched_status=0
+    sched_out=$("$cli" fleet-schedule install 2>&1) || sched_status=$?
+    [ "$sched_status" -ne 0 ] || fail "install replaced a definition it could not back up"
+    case $sched_out in *'could not keep the previous definition'*) ;;
+      *) fail "a failed backup was not reported: $sched_out" ;; esac
+    [ "$(cat "$sched_fast")" = "$sched_before" ] ||
+      fail "a definition whose backup failed was replaced anyway"
+    ! grep -Eq "launchctl (bootout|bootstrap) gui/$sched_uid.*fleet-fast" "$SCHED_LOG" ||
+      fail "a definition whose backup failed was reloaded: $(cat "$SCHED_LOG")"
+    rm -rf "$sched_fast.replaced"
 
     # Absorb, never duplicate — but never retire a WORKING superseded job for
     # a pair with no enrolled store to converge.
@@ -508,6 +528,22 @@ STUB
       *'fleet-fast: installed, enabled, loaded, definition matches'*'fleet-full: installed, enabled, loaded, definition matches'*) ;;
       *) fail "status did not report two healthy jobs: $sched_out" ;;
     esac
+    # A superseded entry that cannot be kept as .absorbed is not retired: it
+    # stays on disk and loaded, and the install fails.
+    (
+      fleet_vcs_store_ready() { return 0; }
+      : >"$sched_legacy"
+      : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate"
+      chmod a-w "$HOME/Library/LaunchAgents"
+      sched_status=0
+      fleet_schedule_command install >/dev/null 2>&1 || sched_status=$?
+      chmod u+w "$HOME/Library/LaunchAgents"
+      [ "$sched_status" -ne 0 ] || fail "install retired a superseded entry it could not keep"
+      [ -f "$sched_legacy" ] &&
+        [ -e "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate" ] ||
+        fail "a superseded entry whose rename failed was removed or unloaded"
+      rm -f "$sched_legacy" "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate"
+    )
 
     # --- a pass never re-enables an operator-disabled job; it alerts ---
     # The stub, like launchd, keeps the job LOADED through the disable.
