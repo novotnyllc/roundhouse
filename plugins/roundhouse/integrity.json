@@ -154,11 +154,15 @@
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
-      "sha256": "596fd55aa99e9e091b5681b1497222ea6f1f96671846e51d8ff16fe6950ee1b9"
+      "sha256": "4db3868f1d9874b16042435698974dd1db64024410f6e1a6f107a01e7010fe3a"
+    },
+    {
+      "path": "scripts/lib/fleet-schedule-windows.sh",
+      "sha256": "ca547663a53a660ebef31beaf324d1d787333e258c09c9272b6d74d3d64f267a"
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
-      "sha256": "40d1be3753073ec7cd6e67dad36b2896b76f18d6445d2a14302742c0250c2006"
+      "sha256": "62a8c14e4089ce447ee67f6cb35aa9905e9027d3c96500674b4b93188fa22176"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -218,7 +222,7 @@
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
-      "sha256": "dfe274a560df4471790623ceb37259191b1c71b209a8a4ba522d218e7bd3b9e2"
+      "sha256": "3263de0a344e88d3cae7e440fe3fd925ba2440076cd6774406e88051472aa611"
     },
     {
       "path": "scripts/lib/plan-seal.sh",
@@ -278,15 +282,19 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "b5717eeb0809d34adb90cd15472c77fd33734e01d0ad2babf765168ecf8d10c4"
+      "sha256": "5cecabcc45def351cfd54cb33d3648e8ad84ba0103bf7bd22c4afb99b9eee55e"
     },
     {
       "path": "scripts/roundhouse-trustd",
       "sha256": "0c6fd7a42ab886a49c7afb474afdee274f3a5428a19e6ea39c1fd84f646a4cfb"
     },
     {
+      "path": "scripts/schedule-windows.ps1",
+      "sha256": "2f0f3dbd5001fa0735a644dda8236c4a577f8195d7aad591872a3f38fae4c963"
+    },
+    {
       "path": "scripts/select-sections",
-      "sha256": "d51f05661b479241b2d2fb2a7cfbd37262e5c52e67c3c845c443fefbf54822f2"
+      "sha256": "cd3f5feeb0d6160827ff67dc7a72972f0aebfd94a59b913696f14aa52ffdfb89"
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",
@@ -338,7 +346,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "84063b23d2237d744d2f8ccee7368166120236406820ddbee95a52179ff2dd27"
+      "sha256": "4c4038904b5d10fc0d38baabf75b03e995111bbed178b30fde1d42b80fac7ac0"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",

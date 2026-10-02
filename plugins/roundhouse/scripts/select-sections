@@ -48,6 +48,7 @@ plugins/roundhouse/scripts/mcp-siding.mjs	76
 plugins/roundhouse/scripts/mcp-siding.selftest.mjs	76
 plugins/roundhouse/scripts/mcp-siding-windows.ps1	76 67
 plugins/roundhouse/scripts/interop-windows.ps1	69
+plugins/roundhouse/scripts/schedule-windows.ps1	88
 plugins/roundhouse/skills/mcp-shim/	76
 plugins/roundhouse/scripts/collect-posix	10 12 14 77 79
 plugins/roundhouse/scripts/enroll-ssh-posix	12 14

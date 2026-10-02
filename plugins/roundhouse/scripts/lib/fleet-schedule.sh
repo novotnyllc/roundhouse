@@ -16,7 +16,11 @@
 # two, so they cannot disagree about a job.
 #
 # Platform specifics live in fleet_schedule_launchd_* and
-# fleet_schedule_systemd_*, reached through fleet_schedule_backend.
+# fleet_schedule_systemd_*, reached through fleet_schedule_backend. Native
+# Windows has no backend of its own to dispatch to, because roundhouse has no
+# native Windows runtime: the Windows Task Scheduler is the other half of a
+# WSL machine, reached from that machine's systemd side through
+# fleet_schedule_native (lib/fleet-schedule-windows.sh).
 #
 # Sourced by scripts/roundhouse; carries definitions only.
 # shellcheck shell=bash
@@ -41,7 +45,9 @@ fleet_schedule_platform() {
 
 fleet_schedule_backend() {
   # fleet_schedule_backend VERB [ARG...] — fleet_schedule_<platform>_VERB, the
-  # one dispatcher to the per-backend functions. 69 on a platform with none.
+  # one dispatcher to the per-backend functions. 69 on a platform with none —
+  # native Windows among them: its Task Scheduler is reached from the WSL
+  # side through fleet_schedule_native instead.
   backend_platform=$(fleet_schedule_platform)
   case $backend_platform in
     launchd | systemd) "fleet_schedule_${backend_platform}_$1" "${@:2}" ;;

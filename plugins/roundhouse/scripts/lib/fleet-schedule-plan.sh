@@ -33,6 +33,12 @@
 #             left them — an uninstall is done only once the scheduler no
 #             longer holds them.
 #
+# On a WSL distribution the record also carries the machine's NATIVE half:
+# the Windows Task Scheduler's Roundhouse tasks, observed through the interop
+# lane (lib/fleet-schedule-windows.sh). Native Windows never gets a fleet-run
+# task of its own; `install` only removes the obsolete one-shot tasks an
+# earlier session left there, each bound to its sealed definition digest.
+#
 # A definition that is replaced is kept as `.replaced`, one that is removed as
 # `.removed`; a backup that cannot be made stops the step. No definition's
 # CONTENT is ever printed: a hand-added environment variable may be a secret.
@@ -102,16 +108,22 @@ EOF_OBSERVE
       return 70
     }
   fi
+  # The native Windows half of a WSL machine, or null where there is none.
+  observe_native=null
+  if [ "$observe_platform" = systemd ] && fleet_schedule_windows_host; then
+    observe_native=$(fleet_schedule_native observe) || observe_native=null
+  fi
   jq -cn --arg platform "$observe_platform" --arg domain "$(fleet_schedule_gui_domain)" \
     --argjson reachable "$observe_reachable" --argjson lingers "$observe_lingers" \
     --argjson reload "$observe_reload" \
     --argjson opted_out "$observe_optout" --argjson files "$observe_files" \
     --argjson jobs "$observe_jobs" --argjson legacy "$observe_legacy" \
+    --argjson native "$observe_native" \
     '{id:"roundhouse:schedule",artifact_kind:"schedule",platform:$platform,
       domain:(if $platform == "launchd" then $domain else null end),
       scheduler_reachable:$reachable,lingers:$lingers,needs_reload:$reload,
       opted_out:$opted_out,
-      files:$files,jobs:$jobs,legacy:$legacy}'
+      files:$files,jobs:$jobs,legacy:$legacy,native:$native}'
 }
 
 # --- plan --------------------------------------------------------------------------
@@ -345,6 +357,10 @@ EOF_PLAN
   done
   fleet_schedule_backend plan_finish "$plan_action" "$plan_changed" "$plan_reachable" \
     "$plan_record" >>"$plan_work/steps.jsonl" || return 70
+  # The native half last: the local jobs never wait on the Windows side.
+  if [ "$(printf '%s\n' "$plan_record" | jq -r '.native != null')" = true ]; then
+    fleet_schedule_native plan "$plan_action" "$plan_record" >>"$plan_work/steps.jsonl" || return 70
+  fi
   jq -cs . "$plan_work/steps.jsonl"
 }
 
@@ -475,6 +491,21 @@ EOF_ARGV
             exit 70
           }
         fi
+        ;;
+      unregister)
+        # The native half (lib/fleet-schedule-windows.sh): an obsolete
+        # one-shot task in the Windows root folder, by its sealed digest,
+        # and only on the WSL side of a machine. The Windows side re-checks
+        # both before it removes anything.
+        jq -e --arg oneshot "$fleet_schedule_windows_oneshot_re" '
+          .mode == "native" and .path == "\\" and (.name | test($oneshot)) and
+          (.digest | test("^[0-9a-f]{64}$"))' "$execute_tmp/step.json" >/dev/null &&
+          fleet_schedule_windows_host || {
+          printf 'roundhouse: a sealed fleet-schedule step unregisters a native task this host does not reach\n' >&2
+          exit 64
+        }
+        fleet_schedule_native unregister "$(jq -r '.name' "$execute_tmp/step.json")" \
+          "$(jq -r '.digest' "$execute_tmp/step.json")"
         ;;
       *) exit 64 ;;
     esac
@@ -754,12 +785,21 @@ fleet_schedule_sealed() (
   fleet_schedule_report "$sealed_action" "$(jq -c '.operations[0]' "$sealed_tmp/draft.json")" \
     "$sealed_reachable" "$sealed_record"
   fleet_schedule_verify "$sealed_action" "$sealed_reachable" || exit $?
+  # An obsolete native task the Windows side would not let go of is the
+  # operator's to remove from the desktop session: 75, named, after the local
+  # jobs are verified in place.
+  sealed_native=0
+  if [ "$sealed_action" = install ] &&
+    [ "$(printf '%s\n' "$sealed_record" | jq -r '.native.reachable == true')" = true ]; then
+    fleet_schedule_native verify || sealed_native=$?
+  fi
   # An install the scheduler could not take yet is 75 (written, loads later);
   # an uninstall has removed what it could see either way.
   [ "$sealed_action" != install ] || [ "$sealed_reachable" = true ] || {
     [ "$(fleet_schedule_platform)" != systemd ] || fleet_schedule_manager_unreachable_note
     exit 75
   }
+  [ "$sealed_native" -eq 0 ] || exit 75
 )
 
 fleet_schedule_command() (
@@ -783,7 +823,9 @@ fleet_schedule_command() (
   case $(fleet_schedule_platform) in
     launchd | systemd) ;;
     windows)
-      printf 'roundhouse: fleet-schedule does not manage native Windows; the operated Windows instance is scheduled by its Task Scheduler task and driven from its WSL operator host\n' >&2
+      # Roundhouse has no native Windows runtime, so no Task Scheduler entry
+      # here could run a pass: the machine's schedule is its WSL side's.
+      printf 'roundhouse: fleet-schedule does not run on native Windows: roundhouse has no native runtime there (no fleet store, jj or launcher), so no Task Scheduler task could run a pass. Run `roundhouse fleet-schedule install|status` on the WSL side of this machine; it inspects this Task Scheduler over interop and removes obsolete Roundhouse one-shot tasks\n' >&2
       exit 69
       ;;
     *)
@@ -798,6 +840,8 @@ fleet_schedule_command() (
   }
   if [ "$1" = status ]; then
     fleet_schedule_status
+    [ "$(fleet_schedule_platform)" != systemd ] || ! fleet_schedule_windows_host ||
+      fleet_schedule_native status || exit $?
     exit 0
   fi
   # One install or uninstall at a time, held from the first look at the jobs

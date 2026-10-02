@@ -378,7 +378,7 @@ is the exact double-runner this rule exists to prevent. `install` is also the on
 never re-enables one an operator disabled, it raises a `schedule-disabled`
 alert (and `schedule-missing` for a job that disappeared) instead.
 
-The shape per platform, all three running the same two commands:
+The shape per platform; macOS and Linux run the same two commands, and native Windows runs neither:
 
 Both intervals come from the same policy the run reads
 (`fast_interval_minutes` ± `fast_jitter_minutes`, `cadence_hours` ±
@@ -408,10 +408,24 @@ matches.
   only once the user manager reloads it, so `install`'s `daemon-reload` is a
   required step, and an `install` that finds the manager still on an older
   copy (`NeedDaemonReload`) reloads it and restarts the timers.
-- **Windows** — a **per-user** scheduled task. Where the machine has a
-  configured WSL sibling, register it there and drive the native side through
-  the interop lane rather than registering a second native entry.
-  `fleet-schedule` does not manage native Windows.
+- **Windows** — no **per-user** scheduled task runs `fleet-run` natively.
+  Roundhouse has no native Windows runtime (the CLI is Bash, the store is a
+  jj repository), so a Task Scheduler entry there would have nothing to run,
+  and `fleet-schedule` on native Windows exits 69 and says so. A Windows
+  machine with a WSL distribution is scheduled by that distribution's systemd
+  timer pair; its native side changes only through the interop lane
+  (`collect` / `apply-interop-plan`). On the WSL side, `fleet-schedule status`
+  and `install` also read the native Task Scheduler over interop, as the
+  logged-in user and unelevated: `status` lists every `Roundhouse*` task by
+  class (the privilege lane's `RoundhouseBrokerV1`/`RoundhouseProfileV1`,
+  obsolete one-shot release-gate tasks named `Roundhouse-<word>-<32 hex>`
+  with no trigger, or unknown), and `install` removes only the obsolete
+  one-shot tasks, each bound to its sealed definition digest and kept first
+  under `%LOCALAPPDATA%\Roundhouse\schedule-removed\`. Unknown tasks are
+  reported and never changed. If the Task Scheduler refuses the interop
+  session ("Access is denied"), `install` still installs the timers, exits
+  75, and names the `Unregister-ScheduledTask` command to run from the user's
+  own desktop session.
 
 ```bash
 roundhouse fleet-run --fast    # the fast slot

@@ -922,10 +922,12 @@ OPLOG
     # --- §14 the sweep the review record asked for, grep-wide over lib/ ---
     # Not row by row: the stale-lock refusal record carried the same two keys
     # and its §10.6 row mentioned only the threshold.
+    # fleet-schedule-windows.sh speaks a wire protocol to the Windows side,
+    # as interop.sh does, not a DSC record.
     # shellcheck disable=SC2046 # deliberate word splitting over the file list
     ! grep -nE '"?schema(_version)?"? *:' $(cli_program_files) |
       grep -vE ':[0-9]+: *#' |
-      grep -vE 'roundhouse\.inventory|schema=|integrity|plan-|apply-commands|broker-|identity\.sh|inventory\.sh|interop\.sh|host\.sh|config\.sh|lane\.sh' |
+      grep -vE 'roundhouse\.inventory|schema=|integrity|plan-|apply-commands|broker-|identity\.sh|inventory\.sh|interop\.sh|fleet-schedule-windows\.sh|host\.sh|config\.sh|lane\.sh' |
       grep -q . ||
       fail "a DSC record still emits schema: or schema_version:"
   ) || fail "guards fixture block failed"
