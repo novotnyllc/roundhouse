@@ -3043,6 +3043,13 @@ fleet_seed_command() (
   # every enabled package as "no package manager on this host can provide" —
   # on hosts whose manager plainly provides it.
   #
+  # Unlike platform and groups it is REFRESHED, not just seeded: config.json
+  # owns the list (it is where an operator adds `npm`, and what the collector
+  # reads), so when config states one it replaces the host file's list whole
+  # and in config order; when config states none (or null), the stored list
+  # stays. Under "the host file wins" the first seed froze it and later config
+  # edits never reached the store. An unchanged list rewrites identical bytes.
+  #
   # PRESENCE, not truthiness: a machine legitimately in no groups carries
   # `groups: []`, and dropping an empty list is not the same as having no
   # opinion. The `machine-truth` doctor row compares `.groups // null` on both
@@ -3062,10 +3069,23 @@ fleet_seed_command() (
   seed_existing=$(fleet_record_read "$seed_file" '{}')
   # Facts are the BASE, not an override: a value already in the host file wins,
   # because someone wrote it deliberately and seeding is not a place to
-  # relitigate it. Observed surfaces still win over both, unchanged.
+  # relitigate it. Observed surfaces still win over both, unchanged. The one
+  # exception is the refreshed `package_managers` above, which config.json owns.
+  seed_pm_before=$(printf '%s\n' "$seed_existing" | jq -c '.package_managers // null')
+  seed_pm_after=$(printf '%s\n' "$seed_facts" | jq -c '.package_managers // null')
+  # The write stays a plain statement so a direct `fleet-seed` (set -e) still
+  # stops on a failed write, exactly as before; the status only gates the notice.
   fleet_record_write "$seed_file" \
     "$(printf '%s\n' "$seed_existing" | jq -c --argjson seeded "$seed_desired" \
-      --argjson facts "$seed_facts" '$facts * . * $seeded')"
+      --argjson facts "$seed_facts" '($facts * . * $seeded) +
+        ($facts | with_entries(select(.key == "package_managers" and .value != null)))')"
+  seed_write_status=$?
+  # Say so when the refresh changed the list: dropping a manager holds every
+  # package only it provides, and the doctor does not compare this fact.
+  [ "$seed_write_status" -ne 0 ] || [ "$seed_pm_after" = null ] ||
+    [ "$seed_pm_before" = null ] || [ "$seed_pm_after" = "$seed_pm_before" ] ||
+    printf 'roundhouse: package_managers for %s refreshed from config.json: %s -> %s\n' \
+      "$seed_host" "$seed_pm_before" "$seed_pm_after"
 
   seed_fold=$(fleet_fold "$seed_store" "$seed_host")
   fleet_items "$seed_desired" | while IFS= read -r seed_item; do

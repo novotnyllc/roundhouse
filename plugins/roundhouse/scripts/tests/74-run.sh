@@ -1282,6 +1282,48 @@ JSONC
       fail "re-seeding failed over a hand-authored fact"
     yq -e '.platform == "macos"' "$run_seeded" >/dev/null ||
       fail "seeding overwrote a hand-authored platform with the config's"
+    # …except package_managers, which config.json OWNS. The first seed froze
+    # the list and a later edit to config.json (adding npm) never reached the
+    # store. Re-seeding refreshes it, in config order, idempotently, and
+    # touches no other host's file; a config that states no list keeps it.
+    printf 'platform: linux\npackage_managers: [apt]\n' >"$run_store/hosts/other-host.yaml"
+    run_other_before=$(cat "$run_store/hosts/other-host.yaml")
+    jq -c --arg h "$run_seed_host" \
+      '.machines[$h].package_managers = ["linuxbrew","apt","npm"]' \
+      "$run_root/seed-config.json" >"$run_root/seed-config-npm.json"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config-npm.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >"$run_root/seed-refresh.out" 2>&1 ||
+      fail "re-seeding failed after a package_managers change in config.json"
+    grep -Fq 'package_managers for' "$run_root/seed-refresh.out" ||
+      fail "a package_managers refresh that changed the list said nothing"
+    [ "$(yq -r '(.package_managers // []) | join(",")' "$run_seeded")" = linuxbrew,apt,npm ] ||
+      fail "a package_managers change in config.json did not refresh the host's store fact (or lost config order)"
+    yq -e '.platform == "macos" and .packages.jq != null' "$run_seeded" >/dev/null ||
+      fail "refreshing package_managers cost a hand-authored fact or an observed surface"
+    run_seed_before=$(cat "$run_seeded")
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config-npm.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >"$run_root/seed-refresh.out" 2>&1 ||
+      fail "re-seeding an unchanged package_managers failed"
+    ! grep -Fq 'package_managers for' "$run_root/seed-refresh.out" ||
+      fail "re-seeding an unchanged package_managers claimed a refresh"
+    [ "$(cat "$run_seeded")" = "$run_seed_before" ] ||
+      fail "re-seeding an unchanged package_managers rewrote the host file"
+    [ "$(cat "$run_store/hosts/other-host.yaml")" = "$run_other_before" ] ||
+      fail "refreshing package_managers touched another host's file"
+    rm -f "$run_store/hosts/other-host.yaml"
+    for run_nopm in 'del(.machines[$h].package_managers)' \
+      '.machines[$h].package_managers = null'; do
+      jq -c --arg h "$run_seed_host" "$run_nopm" \
+        "$run_root/seed-config.json" >"$run_root/seed-config-nopm.json"
+      ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config-nopm.json" \
+        ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+        fleet_seed_command >/dev/null 2>&1 ||
+        fail "re-seeding failed with a config that states no package_managers ($run_nopm)"
+      [ "$(yq -r '(.package_managers // []) | join(",")' "$run_seeded")" = linuxbrew,apt,npm ] ||
+        fail "a config with no package_managers erased the host's stored list ($run_nopm)"
+    done
     # An EMPTY groups list is a fact, not an absence. The `machine-truth` doctor
     # row compares `.groups // null` on both sides and jq's `//` passes `[]`
     # through, so omitting the field reads as `null` against the config's `[]`

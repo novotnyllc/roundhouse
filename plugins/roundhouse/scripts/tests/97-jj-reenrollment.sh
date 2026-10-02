@@ -111,11 +111,11 @@ YAML
     # lineage and alert paths are host-owned, so the sponsor must be present in
     # the host membership set when the re-enrolled peer verifies the history.
     fleet_enroll_seed_host_facts "$hub_store" hub
-    # The sponsor seeds the roster anchor only; a sponsor-written manager list
-    # would win the merge over the host's own fleet-seed forever.
+    # The sponsor seeds the roster anchor only; the manager list is the host's
+    # own fleet-seed's to write, from its own config.json.
     yq -e '.platform == "macos" and .package_managers == null' \
       "$hub_store/hosts/hub.yaml" >/dev/null ||
-      fail "the sponsor-side seed wrote package_managers the host's own seed could never correct"
+      fail "the sponsor-side seed wrote package_managers, which only the host's own seed owns"
     reenroll_hub_seed=$(fleet_enroll_commit "$hub_store" hub 'seed hub host facts')
     fleet_vcs_publish "$hub_store" "$reenroll_hub_seed"
     jj -R "$hub_store" new "$reenroll_hub_seed" >/dev/null
