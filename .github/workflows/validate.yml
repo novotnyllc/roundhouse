@@ -198,14 +198,15 @@ jobs:
           echo "only=$only" >> "$GITHUB_OUTPUT"
           echo "scopes=$scopes" >> "$GITHUB_OUTPUT"
 
-          # Enough shards that each holds ~450 weighted seconds: with the
-          # pool on the runner's cores that is ~3 minutes, plus setup.
+          # Enough shards that each holds ~900 weighted seconds (weights are
+          # macOS runner seconds): over its three workers that is ~5 minutes
+          # of tests, well inside the 10-minute cap, plus setup.
           total=$(ROUNDHOUSE_TEST_ONLY="$only" ROUNDHOUSE_TEST_SCOPES="$scopes" \
             ROUNDHOUSE_TEST_LIST=true plugins/roundhouse/scripts/test-roundhouse |
             awk '{ s += $2 } END { print s + 0 }')
           units=$(ROUNDHOUSE_TEST_ONLY="$only" ROUNDHOUSE_TEST_SCOPES="$scopes" \
             ROUNDHOUSE_TEST_LIST=true plugins/roundhouse/scripts/test-roundhouse | grep -c .)
-          count=$(( (total + 449) / 450 ))
+          count=$(( (total + 899) / 900 ))
           [ "$count" -ge 1 ] || count=1
           [ "$count" -le 8 ] || count=8
           # An empty shard fails, so never ask for more shards than units.

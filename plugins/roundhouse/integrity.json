@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "11c9d33637d6198ded64e106dc26fd51176f8211be707e22f742837e817d086f"
+      "sha256": "2292c7f38dacc6758d6670724cf8f26f6b9745f1e7fbf3df8d30e1258b517253"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "3bfdc7f9679390e48cd2b75ed29ddc085efa67b2c85e4710af53cf4506ea7e50"
+      "sha256": "a93ae7d135681c60d588fbd76b23615d00a511e8fa2396e72d96084c89783709"
     },
     {
       "path": "assets/icon.png",
@@ -42,7 +42,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "6fbeff1981210840f70b483d2e58f1e52c9d8e237d883031fde8fa62415d6e8f"
+      "sha256": "c40d38527a404fbcb0fb594a944134963fe8b2c60d4f844121e239750c742c37"
     },
     {
       "path": "scripts/certify-ssh-node",
@@ -150,7 +150,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "51daf7f000dc11e7cc990d518824de5dff8b89da9af3de7d77787d8434a39d1f"
+      "sha256": "9690f4fa191525970f1f280239be1f14b7f01ceeca03e2c7a8a8e44ee5b76001"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -182,7 +182,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "183f0606cd84cf9687dc0d2ea89f229cd52fd58906167996bf62453d44de905a"
+      "sha256": "f5afa0f1f56dba83669539a74113f79bd09ec182c06ce8387bdcd7100bf05a4f"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -282,7 +282,7 @@
     },
     {
       "path": "scripts/roundhouse-trustd",
-      "sha256": "e4c9fa0e4378ba67b44c7d628abe3745a780cac1b8b5bf9de5393b4ac2ce6c29"
+      "sha256": "9b17bc8d7b85a58c38c319aaf4e136f1a43542e4051ac06d58c77d7c73aeff4a"
     },
     {
       "path": "scripts/select-sections",
@@ -373,5 +373,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.48"
+  "version": "0.9.52"
 }
