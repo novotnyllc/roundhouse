@@ -15,6 +15,76 @@ yq_is_mikefarah() {
   "$1" --version 2>/dev/null | grep -qi mikefarah
 }
 
+roundhouse_is_root() {
+  # Absolute id, never $EUID: bash takes EUID from the environment when it is
+  # set there. Without a usable id, `-O /` asks the kernel's effective uid
+  # (whether it owns /) and is just as deaf to the environment.
+  rir_uid=$(/usr/bin/id -u 2>/dev/null) || rir_uid=
+  case $rir_uid in
+    0) return 0 ;;
+    '' | *[!0-9]*) [ -O / ] ;;
+    *) return 1 ;;
+  esac
+}
+
+root_node_ok() {
+  # root_node_ok PATH — PATH itself (no ancestors) is owned by uid 0 and carries
+  # no group or other write bit and no ACL. The twin of roundhouse-trustd's
+  # trustd_node_ok; keep them in step. file_owner/file_mode do not serve: they
+  # find stat on PATH and answer names. stat and ls are absolute so a caller's
+  # PATH cannot answer for them. BSD or GNU stat is picked by OSTYPE (GNU
+  # `stat -f` reads a file system, not a format). Darwin's ls prints `@`, not
+  # `+`, when a node has both xattrs and an ACL, so there `ls -lde` lists it.
+  case ${OSTYPE:-} in
+    darwin*)
+      rtp_stat=$(/usr/bin/stat -f '%u %Lp' "$1" 2>/dev/null) || return 1
+      rtp_ls=$(/bin/ls -lde "$1" 2>/dev/null) || return 1
+      case $rtp_ls in *$'\n'*) return 1 ;; esac
+      ;;
+    *bsd*)
+      rtp_stat=$(/usr/bin/stat -f '%u %Lp' "$1" 2>/dev/null) || return 1
+      rtp_ls=$(/bin/ls -ld "$1" 2>/dev/null) || return 1
+      ;;
+    *)
+      rtp_stat=$(/usr/bin/stat -c '%u %a' "$1" 2>/dev/null) || return 1
+      rtp_ls=$(/bin/ls -ld "$1" 2>/dev/null) || return 1
+      ;;
+  esac
+  case ${rtp_ls%% *} in *+*) return 1 ;; esac
+  [ "${rtp_stat%% *}" = 0 ] || return 1
+  rtp_mode=${rtp_stat##* }
+  while [ "${#rtp_mode}" -gt 3 ]; do rtp_mode=${rtp_mode#?}; done
+  case ${rtp_mode#?} in *[2367]*) return 1 ;; esac
+}
+
+root_trusted_path() {
+  # root_trusted_path PATH -> its physical path, printed only when root may run
+  # it: an absolute non-symlink that passes root_node_ok, as does every
+  # directory up to / along its physical path. The physical path is what the
+  # caller must exec: a symlinked ancestor cannot be swapped between this check
+  # and the exec. Nothing here runs the file. The twin of roundhouse-trustd's
+  # trustd_trusted_path, which must check this library before sourcing it.
+  case $1 in /*) ;; *) return 1 ;; esac
+  [ -e "$1" ] && [ ! -L "$1" ] || return 1
+  rtp_dir=${1%/*}
+  rtp_dir=$(CDPATH='' cd -P -- "${rtp_dir:-/}" 2>/dev/null && pwd -P) || return 1
+  rtp_physical=${rtp_dir%/}/${1##*/}
+  rtp_node=$rtp_physical
+  while :; do
+    root_node_ok "$rtp_node" || return 1
+    [ "$rtp_node" != / ] || break
+    rtp_node=${rtp_node%/*}
+    [ -n "$rtp_node" ] || rtp_node=/
+  done
+  printf '%s\n' "$rtp_physical"
+}
+
+yq_known_locations() {
+  # Where mikefarah yq lives when PATH does not lead to it.
+  printf '%s\n' "${HOMEBREW_PREFIX:-/nonexistent}/bin/yq" \
+    /home/linuxbrew/.linuxbrew/bin/yq /opt/homebrew/bin/yq /usr/local/bin/yq
+}
+
 select_mikefarah_yq() {
   # The fleet store needs mikefarah yq v4. Some hosts (Debian/Ubuntu under WSL)
   # put the unrelated Python `yq` first on PATH, so when the first `yq` is not
@@ -24,15 +94,20 @@ select_mikefarah_yq() {
   # that EXECS yq rather than calling it (xargs, env, find -exec) bypasses the
   # function and must name "${ROUNDHOUSE_YQ:-yq}" instead: a bare `xargs yq`
   # ran Python yq on iris-wsl and sent every fast pass down the per-item path.
+  #
+  # Choosing means running `--version`, so as root it is its own branch: see
+  # select_mikefarah_yq_root.
+  if roundhouse_is_root; then
+    select_mikefarah_yq_root
+    return 0
+  fi
   selected_yq=$(command -v yq 2>/dev/null || true)
   if [ -n "$selected_yq" ] && yq_is_mikefarah "$selected_yq"; then
     # PATH's own yq: an inherited ROUNDHOUSE_YQ without its function is stale.
     [ "$(type -t yq)" != file ] || unset ROUNDHOUSE_YQ
     return 0
   fi
-  for yq_candidate in $(which -a yq 2>/dev/null) \
-    "${HOMEBREW_PREFIX:-/nonexistent}/bin/yq" /home/linuxbrew/.linuxbrew/bin/yq \
-    /opt/homebrew/bin/yq /usr/local/bin/yq; do
+  for yq_candidate in $(which -a yq 2>/dev/null) $(yq_known_locations); do
     if ! { [ -x "$yq_candidate" ] && yq_is_mikefarah "$yq_candidate"; }; then continue; fi
     ROUNDHOUSE_YQ=$yq_candidate
     export ROUNDHOUSE_YQ
@@ -42,7 +117,48 @@ select_mikefarah_yq() {
   done
 }
 
+select_mikefarah_yq_root() {
+  # As root, a `--version` probe of a yq the user can replace is root running the
+  # user's code (#62): Homebrew and Linuxbrew prefixes are user-owned, and so is
+  # anything a user PATH puts first. So root considers ONLY candidates that
+  # root_trusted_path accepts, runs only those, and runs them by their physical
+  # path. A pin the caller already made (roundhouse-trustd's toolchain, in
+  # ROUNDHOUSE_YQ) is first and wins when it is trusted. With no trusted
+  # mikefarah yq, `yq` becomes a function that refuses: no later bare `yq` can
+  # fall through to a PATH lookup, and require_yq names the reason.
+  unset -f yq
+  for yq_candidate in ${ROUNDHOUSE_YQ:+"$ROUNDHOUSE_YQ"} $(type -aP yq 2>/dev/null) \
+    $(yq_known_locations); do
+    yq_trusted=$(root_trusted_path "$yq_candidate") || continue
+    [ -x "$yq_trusted" ] || continue
+    if [ "$yq_candidate" != "${ROUNDHOUSE_YQ:-}" ] && ! yq_is_mikefarah "$yq_trusted"; then
+      continue
+    fi
+    ROUNDHOUSE_YQ=$yq_trusted
+    export ROUNDHOUSE_YQ
+    yq() { command "$ROUNDHOUSE_YQ" "$@"; }
+    export -f yq
+    return 0
+  done
+  unset ROUNDHOUSE_YQ
+  yq() {
+    printf 'roundhouse: no root-owned mikefarah yq; refusing to run a yq the user can replace as root\n' >&2
+    return 69
+  }
+}
+
 require_yq() {
+  if roundhouse_is_root; then
+    # Never `command -v` + `--version` here: as root that is the probe #62 is
+    # about. select_mikefarah_yq_root left either a trusted ROUNDHOUSE_YQ or a
+    # refusing `yq`; check the path again rather than trust the variable.
+    if [ -z "${ROUNDHOUSE_YQ:-}" ] || ! root_trusted_path "$ROUNDHOUSE_YQ" >/dev/null ||
+      ! yq_is_mikefarah "$ROUNDHOUSE_YQ"; then
+      printf 'roundhouse: no root-owned mikefarah yq v4; refusing to run a yq the user can replace as root\n' >&2
+      exit 69
+    fi
+    return 0
+  fi
   if ! command -v yq >/dev/null 2>&1; then
     printf 'roundhouse: yq is required; the fleet store is YAML\n' >&2
     exit 69
