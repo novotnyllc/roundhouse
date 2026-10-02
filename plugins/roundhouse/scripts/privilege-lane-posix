@@ -920,14 +920,20 @@ action_apt_install() {
   state=completed; reason=package_installed
 }
 action_apt_autoremove() {
-  local apt_get rc=0 remaining
+  local apt_get rc=0 remaining simulation
   apt_get=$(native_binary apt-get) || fail_action apt_get_unavailable || return 1
   pre=$(apt_policy_snapshot) || pre=-
   native_env "$apt_get" -q -y autoremove >/dev/null 2>&1 || rc=$?
   native_exit=$rc
   [ "$rc" -eq 0 ] || { post=$(apt_policy_snapshot) || post=-; fail_action native_operation_failed || return 1; }
-  # Post-state: a simulation must report nothing left to remove.
-  remaining=$(native_env "$apt_get" -q --simulate autoremove 2>/dev/null | awk '$1 == "Remv" { n++ } END { print n + 0 }')
+  # Post-state: a simulation must run AND report nothing left to remove. The
+  # status is checked explicitly — errexit is off in this path and a failed
+  # simulation would otherwise read as "nothing remaining".
+  if ! simulation=$(native_env "$apt_get" -q --simulate autoremove 2>/dev/null); then
+    post=$(sha256_text 'autoremove|simulation|failed')
+    state=partial; reason=post_check_failed; return 1
+  fi
+  remaining=$(printf '%s\n' "$simulation" | awk '$1 == "Remv" { n++ } END { print n + 0 }')
   post=$(sha256_text "autoremove|remaining|$remaining")
   [ "$remaining" -eq 0 ] || { state=partial; reason=post_state_mismatch; return 1; }
   state=completed; reason=autoremove_completed
@@ -1276,6 +1282,10 @@ self_test() {
   rc=0; out=$("$installed" request apt.autoremove.v1) || rc=$?
   [ "$rc" -eq 71 ] && printf '%s\n' "$out" | grep -Fqx 'reason|post_state_mismatch' || self_fail "autoremove with leftovers was not partial (rc $rc)"
   rm -f "$root/apt-remaining"
+  : >"$root/apt-simulate-fail"
+  rc=0; out=$("$installed" request apt.autoremove.v1) || rc=$?
+  [ "$rc" -eq 71 ] && printf '%s\n' "$out" | grep -Fqx 'reason|post_check_failed' || self_fail "a failed autoremove simulation was not a failed post-check (rc $rc)"
+  rm -f "$root/apt-simulate-fail"
   # A lock directory with no pid yet belongs to a dispatcher between mkdir
   # and its pid write: a competitor, never a stale lock to break.
   mkdir "$root/fixture$lane_state/lock"
@@ -1415,7 +1425,7 @@ write_apt_stubs() {
 printf 'apt-get %s\n' "\$*" >>"$root/apt.log"
 [ ! -e "$root/apt-fail" ] || exit 1
 case "\$*" in
-  *"--simulate autoremove"*) [ ! -e "$root/apt-remaining" ] || printf 'Remv old-kernel [1.0]\n'; exit 0 ;;
+  *"--simulate autoremove"*) [ ! -e "$root/apt-simulate-fail" ] || exit 100; [ ! -e "$root/apt-remaining" ] || printf 'Remv old-kernel [1.0]\n'; exit 0 ;;
   *"install curl=8.2.0-1"*) printf '8.2.0-1\n' >"$root/state-curl" ;;
   *"install jq=1.7.1-3"*) printf '1.7.1-3\n' >"$root/state-jq" ;;
 esac

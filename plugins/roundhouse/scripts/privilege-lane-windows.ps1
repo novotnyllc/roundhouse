@@ -399,31 +399,72 @@ function Get-ProtectedSddl { return "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;B
 function Get-OwnerReadSddl([string]$OwnerSid) { return "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;$OwnerSid)" }
 function Get-IngressSddl([string]$OwnerSid) { return "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;$OwnerSid)" }
 function Get-ResultFileSddl([string]$OwnerSid) { return "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120089;;;$OwnerSid)" }
-function Test-ProtectedAcl([string]$Sddl, [string]$OwnerSid, [bool]$OwnerMayRead) {
-    # SYSTEM and Administrators must hold allow ACEs; no other principal may
-    # hold any write/delete/change-permission bit, and the owner may hold at
-    # most read bits (only on owner-readable paths). The service rewrites
-    # generic rights, so masks are inspected, never compared for equality.
-    if ($script:Fixture) {
-        $Expected = if ($OwnerMayRead) { Get-OwnerReadSddl $OwnerSid } else { Get-ProtectedSddl }
-        return $Sddl -ceq $Expected
+$script:AdministratorsSid = "S-1-5-32-544"
+$script:SddlSidAliases = @{ SY = "S-1-5-18"; BA = "S-1-5-32-544"; BU = "S-1-5-32-545"; BG = "S-1-5-32-546"; AU = "S-1-5-11"
+    WD = "S-1-1-0"; CO = "S-1-3-0"; CG = "S-1-3-1"; OW = "S-1-3-4"; IU = "S-1-5-4"; NS = "S-1-5-20"; LS = "S-1-5-19"; AN = "S-1-5-7"; AC = "S-1-15-2-1" }
+$script:SddlRights = @{ GA = 0x10000000; GR = 0x80000000; GW = 0x40000000; GX = 0x20000000; RC = 0x20000; SD = 0x10000
+    WD = 0x40000; WO = 0x80000; RP = 0x10; WP = 0x20; CC = 0x1; DC = 0x2; LC = 0x4; SW = 0x8; LO = 0x80; DT = 0x40; CR = 0x100
+    FA = 0x1F01FF; FR = 0x120089; FW = 0x120116; FX = 0x1200A0; KA = 0xF003F; KR = 0x20019; KW = 0x20006; KX = 0x20019 }
+function ConvertFrom-LaneSddl([string]$Sddl) {
+    # A platform-independent SDDL reader (the .NET ACL types exist only on
+    # Windows, and the self-test runs the same checks everywhere): owner SID
+    # plus every DACL ACE as type, flags, mask and SID. Anything it does not
+    # understand is a parse failure, which every caller treats as drift.
+    if ($Sddl -cnotmatch '^O:(?<owner>[^:]+?)(?:G:(?<group>[^:]+?))?D:(?<dacl>.*)$') { throw "invalid_sddl" }
+    $Resolve = { param([string]$Token) if ($script:SddlSidAliases.ContainsKey($Token)) { return $script:SddlSidAliases[$Token] }; if (Test-Sid $Token) { return $Token }; throw "invalid_sddl_sid" }
+    $Owner = & $Resolve $Matches.owner
+    $Dacl = $Matches.dacl
+    $Aces = [Collections.Generic.List[object]]::new()
+    $Flags = ""
+    if ($Dacl -cmatch '^([A-Z]*)(\(.*)$') { $Flags = $Matches[1]; $Dacl = $Matches[2] }
+    elseif ($Dacl -cmatch '^[A-Z]*$') { $Flags = $Dacl; $Dacl = "" }
+    foreach ($Entry in [regex]::Matches($Dacl, '\(([^)]*)\)')) {
+        $Parts = $Entry.Groups[1].Value.Split(';')
+        if ($Parts.Count -ne 6) { throw "invalid_sddl_ace" }
+        [long]$Mask = 0
+        if ($Parts[2] -cmatch '^0[xX]([0-9A-Fa-f]{1,8})$') { $Mask = [Convert]::ToInt64($Matches[1], 16) }
+        elseif ($Parts[2] -cmatch '^(?:[A-Z]{2})*$') {
+            for ($i = 0; $i -lt $Parts[2].Length; $i += 2) {
+                $Right = $Parts[2].Substring($i, 2)
+                if (-not $script:SddlRights.ContainsKey($Right)) { throw "invalid_sddl_right" }
+                $Mask = $Mask -bor [long]$script:SddlRights[$Right]
+            }
+        } else { throw "invalid_sddl_right" }
+        [void]$Aces.Add([pscustomobject]@{ Type = $Parts[0]; Flags = $Parts[1]; Mask = $Mask; Sid = (& $Resolve $Parts[5]) })
     }
-    try { $Descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($Sddl) } catch { return $false }
-    $WriteBits = 0x40000000 -bor 0x10000000 -bor 0x00000002 -bor 0x00000004 -bor 0x00000100 -bor 0x00010000 -bor 0x00040000 -bor 0x00080000
+    if ([string]::Join("", @($Dacl -replace '\([^)]*\)', '')) -cne "") { throw "invalid_sddl_dacl" }
+    return [pscustomobject]@{ Owner = $Owner; Flags = $Flags; Aces = $Aces.ToArray() }
+}
+function Test-ProtectedOwner([object]$Descriptor) {
+    # The object's owner can rewrite its DACL, so a DACL check alone proves
+    # nothing: the owner must be SYSTEM or Administrators.
+    return [string]$Descriptor.Owner -cin @($script:SystemSid, $script:AdministratorsSid)
+}
+function Test-ProtectedAcl([string]$Sddl, [string]$OwnerSid, [bool]$OwnerMayRead) {
+    # Owner SYSTEM/Administrators; SYSTEM and Administrators must hold allow
+    # ACEs; no other principal may hold any write/delete/change-permission
+    # bit, and the lane owner may hold at most read bits (only on
+    # owner-readable paths). The service rewrites generic rights, so masks
+    # are inspected, never compared for equality. The same parser runs in
+    # the fixture, against the SDDL strings the install wrote.
+    try { $Descriptor = ConvertFrom-LaneSddl $Sddl } catch { return $false }
+    if (-not (Test-ProtectedOwner $Descriptor)) { return $false }
+    # GENERIC_WRITE, GENERIC_ALL, WRITE_DATA/ADD_FILE, APPEND/ADD_SUBDIR,
+    # WRITE_EA, WRITE_ATTRIBUTES, DELETE_CHILD, DELETE, WRITE_DAC, WRITE_OWNER.
+    [long]$WriteBits = 0x40000000 -bor 0x10000000 -bor 0x00000002 -bor 0x00000004 -bor 0x00000010 -bor 0x00000100 -bor 0x00000040 -bor 0x00010000 -bor 0x00040000 -bor 0x00080000
     $Seen = @{}
-    foreach ($Ace in @($Descriptor.DiscretionaryAcl)) {
-        if ($Ace -isnot [Security.AccessControl.CommonAce]) { return $false }
-        $Sid = [string]$Ace.SecurityIdentifier.Value
-        if ($Ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed) { continue }
+    foreach ($Ace in @($Descriptor.Aces)) {
+        if ($Ace.Type -cne "A") { continue }
+        $Sid = [string]$Ace.Sid
         $Seen[$Sid] = $true
-        if ($Sid -cin @($script:SystemSid, "S-1-5-32-544")) { continue }
+        if ($Sid -cin @($script:SystemSid, $script:AdministratorsSid)) { continue }
         if ($Sid -ceq $OwnerSid -and $OwnerMayRead) {
-            if (([int]$Ace.AccessMask -band $WriteBits) -ne 0) { return $false }
+            if (([long]$Ace.Mask -band $WriteBits) -ne 0) { return $false }
             continue
         }
         return $false
     }
-    return $Seen.ContainsKey($script:SystemSid) -and $Seen.ContainsKey("S-1-5-32-544")
+    return $Seen.ContainsKey($script:SystemSid) -and $Seen.ContainsKey($script:AdministratorsSid)
 }
 function Get-TaskSddl([string]$OwnerSid) { return "O:SYG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;$OwnerSid)" }
 function Get-LaneTaskXml([string]$ScriptPath, [string]$WorkingDirectory) {
@@ -472,18 +513,34 @@ function Test-LaneTaskXml([string]$XmlText, [string]$ScriptPath, [string]$Workin
     return $true
 }
 function Test-LaneTaskSddl([string]$Sddl, [string]$OwnerSid) {
-    # The owner must hold an allow ACE (read + execute, so the task can be
-    # started), SYSTEM and Administrators theirs; the service may re-encode
-    # generic rights, so masks are compared for inclusion, not equality.
-    if ($script:Fixture) { return $Sddl -ceq (Get-TaskSddl $OwnerSid) }
-    try { $Descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($Sddl) } catch { return $false }
+    # Exactly three principals: SYSTEM and Administrators with full control,
+    # the lane owner with read + run only (generic read/execute, the task
+    # read/execute bits, READ_CONTROL and SYNCHRONIZE — never a write, delete
+    # or change-permission bit). Any other allow ACE, any deny ACE, any extra
+    # owner bit, or an owner other than SYSTEM/Administrators is drift. The
+    # service may re-encode generic rights, so masks are inspected as sets.
+    try { $Descriptor = ConvertFrom-LaneSddl $Sddl } catch { return $false }
+    if (-not (Test-ProtectedOwner $Descriptor)) { return $false }
+    [long]$OwnerAllowed = 0x80000000 -bor 0x20000000 -bor 0x00020000 -bor 0x00100000 -bor 0x00000001 -bor 0x00000004 -bor 0x00000008 -bor 0x00000080
+    [long]$FullControl = 0x10000000
     $Seen = @{}
-    foreach ($Ace in @($Descriptor.DiscretionaryAcl)) {
-        if ($Ace -isnot [Security.AccessControl.CommonAce]) { continue }
-        if ($Ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed) { continue }
-        $Seen[[string]$Ace.SecurityIdentifier.Value] = [int]$Ace.AccessMask
+    foreach ($Ace in @($Descriptor.Aces)) {
+        if ($Ace.Type -cne "A") { return $false }
+        $Sid = [string]$Ace.Sid
+        if ($Seen.ContainsKey($Sid)) { return $false }
+        [long]$Mask = $Ace.Mask
+        $Seen[$Sid] = $Mask
+        if ($Sid -cin @($script:SystemSid, $script:AdministratorsSid)) {
+            if (($Mask -band $FullControl) -eq 0 -and ($Mask -band 0x1F01FF) -ne 0x1F01FF) { return $false }
+            continue
+        }
+        if ($Sid -ceq $OwnerSid) {
+            if (($Mask -band (-bnot $OwnerAllowed)) -ne 0) { return $false }
+            continue
+        }
+        return $false
     }
-    foreach ($Required in @($script:SystemSid, "S-1-5-32-544", $OwnerSid)) {
+    foreach ($Required in @($script:SystemSid, $script:AdministratorsSid, $OwnerSid)) {
         if (-not $Seen.ContainsKey($Required)) { return $false }
     }
     return $true
@@ -1282,6 +1339,25 @@ function Invoke-SelfTest {
         Assert-SelfTest ($R.state -ceq "completed" -and $R.reason -ceq "lane_upgraded") "self-upgrade: $($R.reason)"
         Assert-SelfTest ((Get-Sha256File $Paths.Script) -ceq $NextSha -and (Read-Identity $Paths.Identity).'lane-version' -ceq $Next) "upgraded identity"
         Assert-SelfTest ((Get-LaneState).State -ceq "ready") "state after upgrade"
+        # The task's security: an owner with write or full control, an extra
+        # principal, or a non-SYSTEM object owner is drift, not ready.
+        $SavedTask = $World.Task.Sddl
+        foreach ($Bad in @("O:SYG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;$($World.Sid))",
+                "O:SYG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGWGX;;;$($World.Sid))",
+                "O:SYG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;$($World.Sid))(A;;GRGX;;;S-1-5-32-545)",
+                "O:$($World.Sid)G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;$($World.Sid))",
+                "O:SYG:BAD:P(A;;FA;;;SY)(A;;GRGX;;;$($World.Sid))")) {
+            $World.Task.Sddl = $Bad
+            Assert-SelfTest ((Get-LaneState).State -ceq "drifted") "task security drift not detected: $Bad"
+        }
+        $World.Task.Sddl = $SavedTask
+        Assert-SelfTest ((Get-LaneState).State -ceq "ready") "exact task security is ready"
+        # A protected object owned by the lane owner is drift even with a
+        # correct DACL: the owner could rewrite it.
+        $SavedIdentitySddl = $World.Sddl[$Paths.Identity]
+        $World.Sddl[$Paths.Identity] = "O:$($World.Sid)G:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;$($World.Sid))"
+        Assert-SelfTest ((Get-LaneState).State -ceq "drifted") "owner-owned identity is drift"
+        $World.Sddl[$Paths.Identity] = $SavedIdentitySddl
         # ACL drift on a protected path is drift, even with the bytes intact.
         $SavedSddl = $World.Sddl[$Paths.Script]
         $World.Sddl[$Paths.Script] = "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;$($World.Sid))"
