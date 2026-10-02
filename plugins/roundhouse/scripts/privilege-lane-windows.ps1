@@ -581,6 +581,25 @@ function Remove-Lane {
         if ([IO.Directory]::Exists($Directory)) { [IO.Directory]::Delete($Directory, $true) }
     }
 }
+function Invoke-OwnerCanary([string]$TargetHost) {
+    # The owner's own probe through the queue: the one request that may run
+    # while the lane is canary_pending, and the one that activates it. Writes
+    # the failed enrollment record itself; returns $true only on completion.
+    $Probe = Submit-Request "lane.probe.v1" "-" "-" "-" "-" "enroll-canary" "-" "-" 120
+    if ($Probe.state -ceq "completed") { return $true }
+    # The installed pieces stay `activation|pending`: status reports
+    # canary_pending, the dispatcher executes nothing but a probe, and
+    # re-running privilege-enroll retries without another consent.
+    Write-Record @("lane-enrollment|1", "state|failed", "reason|enrollment_canary_failed:$($Probe.reason)",
+        "platform|windows", "lane-state|canary_pending", "next-command|roundhouse privilege-enroll $TargetHost", "end-enrollment|")
+    return $false
+}
+function Get-EnrolledRecord([object]$Identity, [string]$TargetHost) {
+    return [string[]]@("lane-enrollment|1", "state|enrolled", "reason|one_time_approval_complete", "platform|windows",
+        "host-id|$TargetHost", "owner-sid|$($Identity.'owner-sid')", "lane-version|$($Identity.'lane-version')",
+        "lane-sha256|$($Identity.'lane-sha256')", "plugin-root|$($Identity.'plugin-root')",
+        "canary|task-registered,probe-completed", "end-enrollment|")
+}
 function Invoke-Enroll {
     if (-not (Test-Token $HostId)) { throw "invalid_host_id" }
     if (-not $script:Fixture -and -not $script:Native.IsWindows) { throw "unsupported_context" }
@@ -594,16 +613,8 @@ function Invoke-Enroll {
             $Pending.Identity.'owner-sid' -ceq $Sid -and $Pending.Identity.'lane-version' -ceq (Get-PluginVersionBeside $Self)) {
             # Everything is installed at this version; only the owner's probe
             # is missing, and that needs no consent at all.
-            $Probe = Submit-Request "lane.probe.v1" "-" "-" "-" "-" "enroll-canary" "-" "-" 120
-            if ($Probe.state -cne "completed") {
-                Write-Record @("lane-enrollment|1", "state|failed", "reason|enrollment_canary_failed:$($Probe.reason)",
-                    "platform|windows", "lane-state|canary_pending", "next-command|roundhouse privilege-enroll $HostId", "end-enrollment|")
-                return 74
-            }
-            Write-Record @("lane-enrollment|1", "state|enrolled", "reason|owner_probe_activated_pending_lane", "platform|windows",
-                "host-id|$($Pending.Identity.'host-id')", "owner-sid|$Sid", "lane-version|$($Pending.Identity.'lane-version')",
-                "lane-sha256|$($Pending.Identity.'lane-sha256')", "plugin-root|$($Pending.Identity.'plugin-root')",
-                "canary|task-registered,probe-completed", "end-enrollment|")
+            if (-not (Invoke-OwnerCanary $HostId)) { return 74 }
+            Write-Record (Get-EnrolledRecord $Pending.Identity $HostId)
             return 0
         }
         if (-not $script:Fixture -and -not (& $script:Native.IsElevated)) {
@@ -626,16 +637,8 @@ function Invoke-Enroll {
                     # Canary from the owner's own limited token: the file this
                     # writes has the owner as NTFS owner, exactly like a request
                     # arriving through drvfs will.
-                    $Probe = Submit-Request "lane.probe.v1" "-" "-" "-" "-" "enroll-canary" "-" "-" 120
-                    if ($Probe.state -cne "completed") {
-                        # The installed pieces stay `activation|pending`: status
-                        # reports canary_pending, the dispatcher executes nothing
-                        # but a probe, and re-running privilege-enroll retries.
-                        Write-Record @("lane-enrollment|1", "state|failed", "reason|enrollment_canary_failed:$($Probe.reason)",
-                            "platform|windows", "lane-state|canary_pending", "next-command|roundhouse privilege-enroll $HostId", "end-enrollment|")
-                        return 74
-                    }
-                    $ReceiptText = $ReceiptText.Replace("canary|task-registered`n", "canary|task-registered,probe-completed`n")
+                    if (-not (Invoke-OwnerCanary $HostId)) { return 74 }
+                    $ReceiptText = $script:Ascii.GetString((ConvertTo-CanonicalAsciiBytes (Get-EnrolledRecord (Read-Identity (Get-LanePaths).Identity) $HostId)))
                 }
                 [Console]::Out.Write($ReceiptText)
             } else {
@@ -709,6 +712,21 @@ function Publish-Result([hashtable]$Values, [object]$Identity) {
         $Values['request-sha256'] (Get-Sha256Bytes (ConvertTo-CanonicalAsciiBytes $Lines[0..19]))
     return $Values.state
 }
+function Set-LaneActivation([object]$Identity) {
+    # Rewrites lane.identity with activation|passed. The owner's status probe
+    # reads that file without FILE_SHARE_DELETE, so the rename behind
+    # Write-ProtectedBytes can hit a transient sharing violation; retry
+    # briefly rather than leave the probe without a result.
+    $Paths = Get-LanePaths
+    $Activated = @{}
+    foreach ($Name in $script:IdentityFields) { $Activated[$Name] = $Identity[$Name] }
+    $Activated.activation = "passed"
+    for ($Attempt = 0; ; $Attempt++) {
+        try { Write-ProtectedBytes $Paths.Identity (Render-Identity $Activated) ""; break }
+        catch { if ($Attempt -ge 4) { throw "identity_activation_write_failed" }; Start-Sleep -Milliseconds 200 }
+    }
+    $Identity.activation = "passed"
+}
 function Invoke-DispatchOne([IO.FileInfo]$Entry, [object]$Identity, [string]$LaneSha) {
     $Paths = Get-LanePaths
     $Id = [IO.Path]::GetFileNameWithoutExtension($Entry.Name)
@@ -770,16 +788,7 @@ function Invoke-DispatchOne([IO.FileInfo]$Entry, [object]$Identity, [string]$Lan
     if ($Outcome.state -ceq "completed" -and $Parsed.Fields.'action-id' -ceq "lane.probe.v1" -and $Identity.activation -cne "passed") {
         # The owner's own request reached SYSTEM and came back: the lane is
         # proven end to end from the token every real request will use.
-        $Activated = @{}
-        foreach ($Name in $script:IdentityFields) { $Activated[$Name] = $Identity[$Name] }
-        $Activated.activation = "passed"
-        $Written = $false
-        for ($Attempt = 0; $Attempt -lt 5 -and -not $Written; $Attempt++) {
-            try { Write-ProtectedBytes $Paths.Identity (Render-Identity $Activated) ""; $Written = $true }
-            catch { Start-Sleep -Milliseconds 200 }
-        }
-        if (-not $Written) { throw "identity_activation_write_failed" }
-        $Identity.activation = "passed"
+        Set-LaneActivation $Identity
         Write-Journal "activation" $Id "lane.probe.v1" "-" "completed" "owner_probe_passed" "-" "-"
     }
     foreach ($Name in @("state", "reason", "native-exit", "pre-state-sha256", "post-state-sha256")) { $Values[$Name] = $Outcome[$Name] }
@@ -1123,12 +1132,11 @@ function Invoke-SelfTest {
         # A failed owner canary (the file arrives with a foreign owner) leaves
         # the lane pending, never ready, and journals nothing as complete.
         $World.ForeignOwner = @("request")
-        $Failed = Submit-Request "lane.probe.v1" "-" "-" "-" "-" "enroll-canary" "-" "-" 5
+        Assert-SelfTest (-not (Invoke-OwnerCanary "test-host")) "owner canary reports failure"
         $World.ForeignOwner = @()
-        Assert-SelfTest ($Failed.state -ceq "rejected" -and (Get-LaneState).State -ceq "canary_pending") "failed canary keeps the lane pending"
+        Assert-SelfTest ((Get-LaneState).State -ceq "canary_pending") "failed canary keeps the lane pending"
         Assert-SelfTest (-not ([IO.File]::ReadAllText($Paths.JournalLog)).Contains("|activation|")) "failed canary did not activate"
-        $Canary = Submit-Request "lane.probe.v1" "-" "-" "-" "-" "enroll-canary" "-" "-" 5
-        Assert-SelfTest ($Canary.state -ceq "completed") "owner-side canary"
+        Assert-SelfTest (Invoke-OwnerCanary "test-host") "owner-side canary"
         Assert-SelfTest ((Read-Identity $Paths.Identity).activation -ceq "passed" -and (Get-LaneState).State -ceq "ready") "probe activated the lane"
         Assert-SelfTest (([IO.File]::ReadAllText($Paths.JournalLog)).Contains("|activation|")) "activation journaled"
         Assert-SelfTest ([IO.File]::Exists((Get-LanePaths).ModuleLock)) "module lock copied into the lane root"

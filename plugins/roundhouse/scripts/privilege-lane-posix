@@ -270,6 +270,9 @@ parse_identity() {
   [ "$id_plugin_root" = - ] || valid_abs_dir "$id_plugin_root" || return 1
   [ "$id_owner_uid" != "$(protected_uid)" ] || fixture_mode || return 1
 }
+# The POSIX identity has no `activation` field, unlike the Windows one: the
+# POSIX canary runs synchronously under the same sudo and an EXIT trap rolls
+# everything back, so a half-activated lane never exists here.
 render_identity() {
   # render_identity HOST PLATFORM UID NAME PLUGIN-ROOT MARKETPLACE PLUGIN VERSION SHA ENROLLED
   record 'lane-identity|1' "host-id|$1" "platform|$2" "owner-uid|$3" "owner-name|$4" \
@@ -1113,12 +1116,15 @@ candidate_command() {
   # unknown). This is what the controller seals a precondition against and
   # rechecks right before it submits; the root side checks the same thing
   # again against its own apt-cache.
-  local apt_cache output installed candidate
+  local policy installed candidate
   valid_apt_package "$1" || die 64 'candidate: PACKAGE must be an apt package name'
-  apt_cache=$(native_binary apt-cache) || die 69 'candidate: apt-cache is unavailable'
-  output=$("$apt_cache" policy "$1" 2>/dev/null </dev/null) || output=
-  installed=$(printf '%s\n' "$output" | awk '$1 == "Installed:" { print $2; exit }')
-  candidate=$(printf '%s\n' "$output" | awk '$1 == "Candidate:" { print $2; exit }')
+  native_binary apt-cache >/dev/null || die 69 'candidate: apt-cache is unavailable'
+  if policy=$(apt_candidate "$1"); then
+    installed=${policy%% *}
+    candidate=${policy##* }
+  else
+    installed=; candidate=
+  fi
   [ "$installed" != '(none)' ] || installed=
   [ "$candidate" != '(none)' ] || candidate=
   record 'lane-candidate|1' "package|$1" "installed|${installed:--}" "candidate|${candidate:--}" 'end-candidate|'

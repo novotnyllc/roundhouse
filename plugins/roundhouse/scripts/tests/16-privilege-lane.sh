@@ -265,6 +265,13 @@ EOF
   grep -q 'only-upgrade install curl=8.2.0-1' "$lane_tmp/apt.log" || fail "full-pass apt upgrade did not run through the lane: $(cat "$lane_tmp/apt.log")"
   [ "$(grep -c '|apt.update-metadata.v1|' "$lane_tmp/fixture/var/lib/roundhouse-lane/journal/events.log")" -ge 1 ] || fail 'refresh not journaled'
   lane_fleet_apt_refreshed=; lane_fleet_apt_alerted=
+  # A host-local plan whose version is not the candidate is refused at
+  # sealing, and nothing reaches apt-get.
+  : >"$lane_tmp/apt.log"
+  lane_rc=0
+  lane_env lane_host_apply test-apt "[$(lane_operation_json apt.upgrade-package.v1 curl 9.9.9)]" >/dev/null 2>"$lane_tmp/host-apply.err" || lane_rc=$?
+  [ "$lane_rc" -eq 65 ] || fail "host-local apply with a stale version exited $lane_rc, expected 65"
+  [ ! -s "$lane_tmp/apt.log" ] || fail 'a refused host-local plan reached apt-get'
   lane_env lane_package_hold_detail packages.curl test-apt | grep -q 'no package manager on this host can provide' ||
     fail 'an enrolled lane still blamed the package manager'
   lane_env fleet_doctor_lane_row | grep -Eq '^ok       privilege-lane +enrolled, lane [0-9.]+ [0-9a-f]{12}$' ||
@@ -401,6 +408,16 @@ grep -q -- "-Request -Action winget.upgrade-machine-package.v1 -Package OpenJS.N
   "$lane_tmp/pwsh.log" || fail "windows request command: $(cat "$lane_tmp/pwsh.log")"
 jq -e -s '.[0].data.operation_status == "completed" and .[0].data.transport == "local-lane"' "$lane_tmp/win-apply.jsonl" >/dev/null ||
   fail "windows apply records: $(cat "$lane_tmp/win-apply.jsonl")"
+# The Windows candidate moved after sealing: apply refuses before any request.
+lane_interop "$cli" seal-plan "$lane_tmp/win-draft.json" "$lane_tmp/win-snapshot.jsonl" "$lane_tmp/win-drift-plan.json" >/dev/null ||
+  fail 'seal-plan for the Windows drift plan'
+chmod 600 "$lane_tmp/win-drift-plan.json"
+: >"$lane_tmp/pwsh.log"
+lane_rc=0
+LANE_PWSH_CANDIDATE=26.2.0 lane_interop "$cli" submit-privilege-plan "$lane_tmp/win-drift-plan.json" \
+  "$(jq -r '.plan_id' "$lane_tmp/win-drift-plan.json")" "$lane_tmp/win-drift-apply.jsonl" >/dev/null 2>"$lane_tmp/win-drift.err" || lane_rc=$?
+[ "$lane_rc" -eq 65 ] && grep -q 'preconditions drifted' "$lane_tmp/win-drift.err" || fail "windows apply submitted despite a candidate drift (rc $lane_rc)"
+grep -q -- '-Request' "$lane_tmp/pwsh.log" && fail 'a drifted Windows plan reached the SYSTEM side'
 # No sibling means no session: readiness says so and nothing is attempted.
 jq 'del(.machines["test-windows"].wsl_interop_via)' "$lane_tmp/config.json" >"$lane_tmp/config-nosibling.json"
 chmod 600 "$lane_tmp/config-nosibling.json"

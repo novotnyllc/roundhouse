@@ -317,8 +317,14 @@ refused, and (c) a `lane.probe.v1` request completes end to end. On Windows
 the probe is submitted by the unelevated launcher after the elevated child
 returns, because a file created under the elevated token is owned by
 Administrators and the dispatcher would refuse it. Any failure before the
-canary passes rolls the installed pieces back (POSIX: an EXIT trap; Windows:
-`Remove-Lane`) and reports `needs_one_time_approval` again.
+canary passes rolls the installed pieces back on POSIX (an EXIT trap) and
+reports `needs_one_time_approval` again. Windows activates in two halves
+instead: the elevated child installs with `activation|pending`, status
+reports `canary_pending`, the dispatcher executes nothing but
+`lane.probe.v1`, and the owner's own probe flips the identity to `passed`.
+A failed probe therefore leaves nothing enabled, and re-running
+`privilege-enroll` on a pending lane at the same version submits only the
+probe — no second consent.
 
 ## Readiness and the scheduled run
 
@@ -341,6 +347,10 @@ canary passes rolls the installed pieces back (POSIX: an EXIT trap; Windows:
   existing hold (`no privileged lane enrolled`) and raises one
   `privilege-lane` alert with the exact enrollment command; a scheduled run
   never prompts.
+  Every such mutation is a sealed plan against the host itself
+  (`lane_host_apply`: seal from a fresh snapshot, then apply with the full
+  precondition — readiness and package versions — observed again
+  immediately before submission); there is no unsealed root mutation.
 - The controller's sealed-plan verbs (`privilege-status`,
   `verify-privilege-plan`, `submit-privilege-plan`,
   `lookup-privilege-result`) keep their names and file formats. For a host
@@ -358,15 +368,6 @@ canary passes rolls the installed pieces back (POSIX: an EXIT trap; Windows:
   host side (`privilege-lane-posix request … --payload`), but a plan naming
   them is refused at sealing until the format carries the digest and stages
   the bytes.
-- Windows enrollment activates in two halves: the elevated child installs
-  with `activation|pending`, status reports `canary_pending`, the dispatcher
-  executes nothing but `lane.probe.v1`, and the owner's own probe (submitted
-  by the unelevated launcher) flips the identity to `passed`. A failed probe
-  therefore leaves nothing enabled; re-running `privilege-enroll` retries.
-- The scheduled run reaches its own lane only through a sealed plan
-  (`lane_host_apply`): the same seal → verify → apply path as the
-  controller, with the full precondition (readiness and package versions)
-  observed again immediately before submission.
 
 - Homebrew cask root steps on macOS through the bridge hook.
 - fleet-run convergence of a native Windows sibling's winget packages: the
