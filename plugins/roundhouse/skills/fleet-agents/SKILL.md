@@ -125,7 +125,11 @@ legacy single-plist job reports no fleet-fast job to `fleet-trigger` (nudges
 only stamp there) until `fleet-schedule install` runs on it.
 A pass that finds the stamp moved since it began
 converges again in-process before it releases the lock (at most three extra
-passes), so a trigger that lands mid-pass is never lost.
+passes), so a trigger that lands mid-pass is never lost. One that lands after
+the last comparison but before the lock is released — when a systemd `start`
+of the still-active oneshot queues nothing — is caught by one more comparison
+once the lock is free, which starts a single detached `fleet-run --fast`
+through the normal lock.
 
 ```text
 roundhouse fleet-trigger [--fast|--full]   # stamp, kick the scheduled job, return
@@ -133,6 +137,14 @@ roundhouse fleet-schedule install          # write and load this host's two jobs
 roundhouse fleet-schedule status           # installed / enabled / loaded, and whether the definition matches
 roundhouse fleet-schedule uninstall        # unload and remove them
 ```
+
+`install` and `uninstall` change this host, so each rides the sealed-plan
+pipeline (as `launcher-install` does): the collector observes the jobs, the
+plan names the exact files and `launchctl`/`systemctl --user` commands with
+the observed definition hashes and job states as its precondition,
+`apply-plan` rechecks that precondition immediately before mutating, and
+`status` verifies the result. `status` itself is read-only and unsealed. See
+`roundhouse:fleet-update` for the steps.
 
 `fleet-schedule install` is the only path that enables a job. A pass checks its
 own jobs every time and never re-enables, loads or rewrites one: a job the

@@ -1896,14 +1896,46 @@ capability_matches() {
 auth_verify_allowed=false
 has_section auth && auth_verify_allowed=true
 
-if [ -n "${ROUNDHOUSE_LAUNCHER_PATH:-}" ]; then
-  launcher_hostname=$(hostname 2>/dev/null | clip || printf unknown)
-  launcher_user=$(id -un 2>/dev/null | clip || printf unknown)
-  launcher_host_data=$(jq -cn --arg hostname "$launcher_hostname" --arg user "$launcher_user" \
-    --arg home "$HOME" \
-    '{configured_name:"local-launcher",hostname:$hostname,user:$user,home:$home}')
-  emit host "$host_id" present high "$launcher_host_data" \
+emit_local_host() {
+  # The identity record a host-local plan binds to: this host's hostname and
+  # user, which verify-preconditions compares with the configured ones.
+  local_hostname=$(hostname 2>/dev/null | clip || printf unknown)
+  local_user=$(id -un 2>/dev/null | clip || printf unknown)
+  local_host_data=$(jq -cn --arg name "$1" --arg hostname "$local_hostname" \
+    --arg user "$local_user" --arg home "$HOME" \
+    '{configured_name:$name,hostname:$hostname,user:$user,home:$home}')
+  emit host "$host_id" present high "$local_host_data" \
     '[{"source":"system","method":"hostname+id"}]'
+}
+
+if [ "${ROUNDHOUSE_SCHEDULE_OBSERVE:-}" = 1 ]; then
+  # fleet-schedule's sealed plan: this host's two scheduled jobs, observed
+  # read-only through the same definitions `fleet-schedule` itself uses (the
+  # CLI's library, sourced in a subshell, never dispatched). The record's data
+  # — every definition file's digest, each job's state — is what the plan's
+  # precondition digest seals and what apply re-checks before it mutates.
+  emit_local_host local-schedule
+  schedule_data=$(
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$script_dir/roundhouse"
+    fleet_schedule_observe
+  ) || {
+    emit agent_artifact "roundhouse:schedule" unavailable low '{"id":"roundhouse:schedule"}' \
+      '[]' '[{"code":"schedule_observe_failed","severity":"error","retryable":true,"message":"the scheduled jobs could not be observed"}]'
+    exit 2
+  }
+  if printf '%s\n' "$schedule_data" | jq -e 'any(.files[]; .digest != null)' >/dev/null; then
+    schedule_status=present
+  else
+    schedule_status=absent
+  fi
+  emit agent_artifact "roundhouse:schedule" "$schedule_status" high "$schedule_data" \
+    '[{"source":"scheduler","method":"definition-files+sha256+job-state"}]'
+  exit 0
+fi
+
+if [ -n "${ROUNDHOUSE_LAUNCHER_PATH:-}" ]; then
+  emit_local_host local-launcher
   launcher_path=$(expand_home "$ROUNDHOUSE_LAUNCHER_PATH")
   launcher_data=$(jq -cn --arg path "$launcher_path" \
     '{id:"roundhouse:launcher",path:$path,artifact_kind:"launcher",

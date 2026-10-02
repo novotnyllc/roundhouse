@@ -128,6 +128,14 @@ STUB
 
     PATH="$sched_bin:$fleet_fixture_path"
     ROUNDHOUSE_SELFTEST=1
+    # install and uninstall ride the sealed-plan pipeline, which plans for the
+    # configured LOCAL machine whose expected hostname and user are this one.
+    jq '.machines["test-apt"].expected_hostname = "another-fixture-host" |
+      .machines["test-apt"].expected_user = "another-fixture-user"' \
+      "$tmp/config.json" >"$sched_root/config.json"
+    chmod 600 "$sched_root/config.json"
+    ROUNDHOUSE_CONFIG="$sched_root/config.json"
+    export ROUNDHOUSE_CONFIG
     ROUNDHOUSE_FLEET_TRIGGER_RUNNER="$sched_bin/runner"
     ROUNDHOUSE_FLEET_STORE="$sched_root/store"
     HOME="$sched_root/home"
@@ -146,6 +154,52 @@ STUB
     sched_full="$HOME/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet-full.plist"
     sched_units="$XDG_CONFIG_HOME/systemd/user"
 
+    # fleet-schedule as the CLI runs it — its own process, errexit live —
+    # with the test's hooks: `fast` replaces only the seal and apply-plan's
+    # transport with a direct execution of the drafted operation under the
+    # shared shape check; `sealed` runs the real pipeline and keeps copies of
+    # the draft, the planning snapshot and the sealed plan, running
+    # $SCHED_AFTER_SEAL between the seal and the apply. SCHED_STORE_READY
+    # stands in an enrolled store.
+    #
+    # The sealed pipeline costs seconds per run (the executor's integrity is
+    # verified at the seal and again at apply), so most install and uninstall
+    # BEHAVIOUR below runs `fast`: the real observation, planner, executor,
+    # report and status verification. The pipeline itself runs end to end in
+    # the "$cli" installs and uninstalls (first install, both uninstalls, the
+    # Linux install, the spaced HOME) and in the `sealed` block.
+    # shellcheck disable=SC2016 # the driver is a program, expanded by its own bash
+    sched_driver='set -eu
+ROUNDHOUSE_LIB_ONLY=1
+. "$0"
+[ -z "${SCHED_STORE_READY:-}" ] || fleet_vcs_store_ready() { return 0; }
+case $1 in
+  fast)
+    local_plan_seal_apply() {
+      schedule_operations_valid "$1"
+      jq ".operations[0]" "$1" >"$3/operation.json"
+      fleet_schedule_execute "$3/operation.json"
+    }
+    ;;
+  sealed)
+    eval "sched_seal_real() $(declare -f seal_plan_command | tail -n +2)"
+    seal_plan_command() {
+      cp "$1" "$SCHED_SEAL_DIR/draft.json"
+      cp "$2" "$SCHED_SEAL_DIR/planning.jsonl"
+      sched_seal_real "$@"
+      cp "$3" "$SCHED_SEAL_DIR/plan.json"
+      [ -z "${SCHED_AFTER_SEAL:-}" ] || eval "$SCHED_AFTER_SEAL"
+    }
+    ;;
+esac
+shift
+fleet_schedule_command "$@"'
+    sched_schedule() {
+      bash -c "$sched_driver" "$cli" fast "$@"
+    }
+    sched_sealed() {
+      bash -c "$sched_driver" "$cli" sealed "$@"
+    }
     sched_reset() {
       rm -rf "$SCHED_STATE" "$sched_units"
       mkdir -p "$SCHED_STATE"
@@ -485,13 +539,87 @@ STUB
     esac
     # Idempotent: a second install changes nothing and touches no job.
     : >"$SCHED_LOG"
-    sched_out=$("$cli" fleet-schedule install 2>&1) || fail "a repeat install failed"
+    sched_out=$(sched_schedule install 2>&1) || fail "a repeat install failed"
     case $sched_out in
       *'fleet-fast: unchanged'*'fleet-full: unchanged'*) ;;
       *) fail "a repeat install did not report the jobs unchanged: $sched_out" ;;
     esac
     ! grep -Eq 'launchctl (bootstrap|bootout|enable|disable|kickstart)' "$SCHED_LOG" ||
       fail "a repeat install reloaded an unchanged, loaded job: $(cat "$SCHED_LOG")"
+    # --- install and uninstall ride the sealed-plan pipeline ---
+    (
+      SCHED_SEAL_DIR="$sched_root/sealed"
+      export SCHED_SEAL_DIR
+      rm -rf "$SCHED_SEAL_DIR"
+      mkdir -p "$SCHED_SEAL_DIR"
+      sched_seal_dir=$SCHED_SEAL_DIR
+      # The sealed plan lists the exact files and commands, preconditioned on
+      # the observed record, and is bound to the configured local target.
+      rm -f "$sched_fast" "$sched_full" "$SCHED_STATE"/loaded.*
+      sched_sealed install >/dev/null 2>&1 || fail "the sealed install failed"
+      [ "$(jq -r '.operations[0].id' "$sched_seal_dir/plan.json")" = roundhouse:schedule ] &&
+        [ "$(jq -c '.operations[0].argv' "$sched_seal_dir/plan.json")" = '["roundhouse","fleet-schedule","install"]' ] &&
+        [ "$(jq -r '.target' "$sched_seal_dir/plan.json")" = test-host ] &&
+        jq -e '.precondition_digest.value | test("^[0-9a-f]{64}$")' "$sched_seal_dir/plan.json" >/dev/null ||
+        fail "install did not seal a roundhouse:schedule plan for the local target: $(jq -c . "$sched_seal_dir/plan.json")"
+      for sched_mode in fast full; do
+        sched_plist="$HOME/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet-$sched_mode.plist"
+        jq -e --arg path "$sched_plist" --arg digest "$(sha256_file "$sched_plist")" '
+          any(.operations[0].steps[]; .action == "write" and .path == $path and
+            .digest == $digest and .before == null)' "$sched_seal_dir/plan.json" >/dev/null ||
+          fail "the sealed plan does not name fleet-$sched_mode's file and its written digest"
+        jq -e --arg plist "$sched_plist" --arg domain "gui/$sched_uid" '
+          any(.operations[0].steps[]; .action == "run" and .required == true and
+            .argv == ["launchctl","bootstrap",$domain,$plist])' "$sched_seal_dir/plan.json" >/dev/null ||
+          fail "the sealed plan does not carry fleet-$sched_mode's exact bootstrap command"
+      done
+      jq -s -e '[.[] | select(.kind == "agent_artifact" and .id == "roundhouse:schedule") |
+          .data.files[] | select(.digest == null)] | length == 2' "$sched_seal_dir/planning.jsonl" \
+        >/dev/null || fail "the planning snapshot did not observe both definitions absent"
+      # RECHECKED before mutating: a job edited after the seal refuses the
+      # apply, and nothing the plan would have done happens.
+      cp "$sched_fast" "$sched_root/fast.sealed"
+      # Between the seal and the apply, the operator edits a definition.
+      SCHED_AFTER_SEAL="printf '<!-- hand -->\\n' >>'$sched_fast'"
+      export SCHED_AFTER_SEAL
+      sed 's/<integer>[0-9]*</<integer>11</' "$sched_full" >"$sched_full.edit"
+      mv "$sched_full.edit" "$sched_full"
+      : >"$SCHED_LOG"
+      sched_status=0
+      sched_out=$(sched_sealed install 2>&1) || sched_status=$?
+      [ "$sched_status" -ne 0 ] || fail "an install whose preconditions changed after sealing applied"
+      case $sched_out in *'target state changed after planning'*) ;;
+        *) fail "a changed precondition was not reported: $sched_out" ;; esac
+      grep -Fq '<integer>11</integer>' "$sched_full" ||
+        fail "an install refused at the recheck still replaced a definition"
+      ! grep -Eq 'launchctl (bootout|bootstrap|enable)' "$SCHED_LOG" ||
+        fail "an install refused at the recheck still ran a scheduler command: $(cat "$SCHED_LOG")"
+      unset SCHED_AFTER_SEAL
+      cp "$sched_root/fast.sealed" "$sched_fast"
+      sched_sealed install >/dev/null 2>&1 || fail "the re-planned install failed"
+      # The executor runs only what this host's jobs own, wherever the plan
+      # came from: a foreign command or path refuses.
+      for sched_bad_step in \
+        '{"action":"run","mode":"fast","required":true,"argv":["launchctl","bootout","gui/'"$sched_uid"'/com.apple.Finder"]}' \
+        '{"action":"run","mode":"fast","required":true,"argv":["systemctl","--user","stop","dbus.service"]}' \
+        '{"action":"remove","mode":"fast","form":"plist","path":"'"$HOME"'/Library/LaunchAgents/com.apple.Finder.plist","before":"'"$(printf '%064d' 0)"'"}'; do
+        jq -n --argjson step "$sched_bad_step" '{type:"agent-update",kind:"agent_artifact",
+          id:"roundhouse:schedule",argv:["roundhouse","fleet-schedule","install"],steps:[$step]}' \
+          >"$sched_seal_dir/bad.json"
+        sched_status=0
+        fleet_schedule_execute "$sched_seal_dir/bad.json" >/dev/null 2>&1 || sched_status=$?
+        [ "$sched_status" -eq 64 ] || fail "the executor ran a step this host's jobs do not own ($sched_status): $sched_bad_step"
+      done
+      # status is read-only and unsealed: it needs no mutation configuration.
+      ROUNDHOUSE_CONFIG="$sched_root/no-such-config.json" fleet_schedule_command status >/dev/null ||
+        fail "status required the sealed-plan configuration"
+      sched_status=0
+      ROUNDHOUSE_CONFIG="$sched_root/no-such-config.json" fleet_schedule_command install \
+        >/dev/null 2>&1 || sched_status=$?
+      [ "$sched_status" -ne 0 ] || fail "install ran without a mutation configuration to seal against"
+    ) || fail "the sealed fleet-schedule checks failed"
+    : >"$SCHED_LOG"
+
     # A job a previous session installed, in the shape install writes, is
     # matched — not duplicated, rewritten or reloaded.
     sched_saved=$(cat "$sched_fast")
@@ -499,7 +627,7 @@ STUB
     : >"$SCHED_STATE/gui"
     printf '%s\n' "$sched_saved" >"$sched_fast"
     : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-fast"
-    sched_out=$("$cli" fleet-schedule install 2>&1) || fail "install over an existing job failed"
+    sched_out=$(sched_schedule install 2>&1) || fail "install over an existing job failed"
     case $sched_out in
       *'fleet-fast: unchanged'*) ;;
       *) fail "an existing identical job was not recognised: $sched_out" ;;
@@ -512,7 +640,7 @@ STUB
     sed 's/<integer>[0-9]*</<integer>7</' "$sched_fast" >"$sched_fast.edit"
     mv "$sched_fast.edit" "$sched_fast"
     : >"$SCHED_LOG"
-    sched_out=$("$cli" fleet-schedule install 2>&1) || fail "install over a differing job failed"
+    sched_out=$(sched_schedule install 2>&1) || fail "install over a differing job failed"
     case $sched_out in
       *'differs from the definition fleet-schedule writes'*'-'*'<integer>7<'*'+'*) ;;
       *) fail "a differing job was replaced without reporting the difference: $sched_out" ;;
@@ -532,7 +660,7 @@ STUB
     sched_before=$(cat "$sched_fast")
     : >"$SCHED_LOG"
     sched_status=0
-    sched_out=$("$cli" fleet-schedule install 2>&1) || sched_status=$?
+    sched_out=$(sched_schedule install 2>&1) || sched_status=$?
     [ "$sched_status" -ne 0 ] || fail "install replaced a definition it could not back up"
     case $sched_out in *'could not keep the previous definition'*) ;;
       *) fail "a failed backup was not reported: $sched_out" ;; esac
@@ -550,16 +678,14 @@ STUB
     : >"$sched_legacy"
     : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate"
     sched_status=0
-    sched_out=$("$cli" fleet-schedule install 2>&1) || sched_status=$?
+    sched_out=$(sched_schedule install 2>&1) || sched_status=$?
     [ "$sched_status" -eq 69 ] || fail "install retired a legacy job with no enrolled store ($sched_status)"
     case $sched_out in *'Nothing was changed'*) ;; *) fail "the legacy refusal did not say so: $sched_out" ;; esac
     [ -f "$sched_legacy" ] && [ -e "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate" ] &&
       [ ! -e "$sched_fast" ] || fail "a refused install touched the legacy job or wrote new ones"
-    (
-      fleet_vcs_store_ready() { return 0; }
-      : >"$HOME/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist"
-      fleet_schedule_command install >/dev/null 2>&1 || fail "install with legacy entries failed"
-    )
+    : >"$HOME/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist"
+    SCHED_STORE_READY=1 sched_schedule install >/dev/null 2>&1 ||
+      fail "install with legacy entries failed"
     [ -f "$sched_fast" ] && [ -f "$sched_full" ] || fail "the absorbing install wrote no new pair"
     [ ! -e "$sched_legacy" ] && [ -f "$sched_legacy.absorbed" ] &&
       [ -f "$HOME/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist.absorbed" ] ||
@@ -578,12 +704,11 @@ STUB
     # A superseded entry that cannot be kept as .absorbed is not retired: it
     # stays on disk and loaded, and the install fails.
     (
-      fleet_vcs_store_ready() { return 0; }
       : >"$sched_legacy"
       : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate"
       chmod a-w "$HOME/Library/LaunchAgents"
       sched_status=0
-      fleet_schedule_command install >/dev/null 2>&1 || sched_status=$?
+      SCHED_STORE_READY=1 sched_schedule install >/dev/null 2>&1 || sched_status=$?
       chmod u+w "$HOME/Library/LaunchAgents"
       [ "$sched_status" -ne 0 ] || fail "install retired a superseded entry it could not keep"
       [ -f "$sched_legacy" ] &&
@@ -623,7 +748,7 @@ STUB
     # Only the operator's explicit install enables it again — and a job still
     # loaded is re-probed after the enable, never bootstrapped twice.
     : >"$SCHED_LOG"
-    sched_out=$("$cli" fleet-schedule install 2>&1) ||
+    sched_out=$(sched_schedule install 2>&1) ||
       fail "re-install of a disabled-but-loaded job failed: $sched_out"
     case $sched_out in *'fleet-fast: re-enabled'*) ;; *) fail "install did not re-enable: $sched_out" ;; esac
     grep -Fqx "launchctl enable gui/$sched_uid/com.novotnyllc.roundhouse.fleet-fast" "$SCHED_LOG" ||
@@ -634,7 +759,7 @@ STUB
     launchctl disable "gui/$sched_uid/com.novotnyllc.roundhouse.fleet-fast"
     launchctl bootout "gui/$sched_uid/com.novotnyllc.roundhouse.fleet-fast"
     : >"$SCHED_LOG"
-    "$cli" fleet-schedule install >/dev/null 2>&1 || fail "re-install after disable and unload failed"
+    sched_schedule install >/dev/null 2>&1 || fail "re-install after disable and unload failed"
     grep -Fqx "launchctl bootstrap gui/$sched_uid $sched_fast" "$SCHED_LOG" ||
       fail "install did not load the re-enabled, unloaded job"
     # The condition has ended: the next pass clears the alert.
@@ -678,7 +803,7 @@ STUB
     # lifts the opt-out.
     rm -f "$SCHED_STATE/gui"
     sched_status=0
-    sched_out=$("$cli" fleet-schedule install 2>&1) || sched_status=$?
+    sched_out=$(sched_schedule install 2>&1) || sched_status=$?
     [ "$sched_status" -eq 75 ] || fail "install with no GUI domain did not say so ($sched_status)"
     case $sched_out in *'loads at the next console login'*) ;; *) fail "install over SSH was not explained: $sched_out" ;; esac
     [ -f "$sched_fast" ] || fail "install with no GUI domain wrote no job"
@@ -709,7 +834,7 @@ STUB
     grep -Fqx 'systemctl --user daemon-reload' "$SCHED_LOG" ||
       fail "the Linux install did not reload the user manager"
     : >"$SCHED_LOG"
-    "$cli" fleet-schedule install >/dev/null 2>&1 || fail "a repeat Linux install failed"
+    sched_schedule install >/dev/null 2>&1 || fail "a repeat Linux install failed"
     ! grep -Eq 'systemctl --user (enable|restart|start|daemon-reload)' "$SCHED_LOG" ||
       fail "a repeat Linux install touched unchanged, active timers: $(cat "$SCHED_LOG")"
     case $("$cli" fleet-schedule status) in
@@ -764,7 +889,7 @@ STUB
     # No user manager (WSL without systemd): written, and the fix is named.
     rm -f "$SCHED_STATE/usermgr"
     sched_status=0
-    sched_out=$("$cli" fleet-schedule install 2>&1) || sched_status=$?
+    sched_out=$(sched_schedule install 2>&1) || sched_status=$?
     [ "$sched_status" -eq 75 ] || fail "install with no user manager did not say so ($sched_status)"
     case $sched_out in *'no systemd user manager is reachable'*'wsl.conf'*) ;; *) fail "install with no user manager named no fix: $sched_out" ;; esac
     case $sched_out in *'enable-linger'*) fail "an unreachable manager on a lingering account was blamed on lingering: $sched_out" ;; esac
@@ -786,8 +911,12 @@ STUB
         : >"$SCHED_STATE/gui"
         : >"$SCHED_STATE/usermgr"
         : >"$SCHED_STATE/linger"
-        "$cli" fleet-schedule install >/dev/null 2>&1 ||
-          fail "install under a spaced HOME failed on $sched_uname"
+        # The pipeline end to end on macOS; the planner and executor on Linux.
+        sched_run() {
+          if [ "$sched_uname" = Darwin ]; then "$cli" fleet-schedule "$@"; else sched_schedule "$@"; fi
+        }
+        sched_out=$(sched_run install 2>&1) ||
+          fail "install under a spaced HOME failed on $sched_uname: $sched_out"
         sched_spaced=$(fleet_schedule_def_paths fast; fleet_schedule_def_paths full)
         while IFS= read -r sched_spaced_path; do
           case $sched_spaced_path in *' '*) ;; *) fail "the spaced fixture produced an unspaced path: $sched_spaced_path" ;; esac
@@ -795,7 +924,7 @@ STUB
         done <<EOF_SPACED
 $sched_spaced
 EOF_SPACED
-        sched_out=$("$cli" fleet-schedule uninstall 2>&1) ||
+        sched_out=$(sched_run uninstall 2>&1) ||
           fail "uninstall under a spaced HOME failed on $sched_uname: $sched_out"
         while IFS= read -r sched_spaced_path; do
           [ ! -e "$sched_spaced_path" ] ||

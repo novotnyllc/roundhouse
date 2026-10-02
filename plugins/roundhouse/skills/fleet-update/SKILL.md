@@ -300,6 +300,24 @@ roundhouse fleet-schedule status      # installed / enabled / loaded, definition
 roundhouse fleet-schedule uninstall   # unload and remove both
 ```
 
+`install` and `uninstall` are mutations, so they ride the **sealed-plan
+pipeline** like `launcher-install` (they need the mutation configuration and
+one local machine whose `expected_hostname`/`expected_user` are this host's).
+The collector observes the jobs (an `agent_artifact roundhouse:schedule`
+record: every definition file's sha256 or its absence, each job's
+loaded/disabled or enabled/active state, the superseded entries); the plan
+lists the exact files to write, keep, remove or absorb (each written file with
+its rendered sha256) and the exact `launchctl`/`systemctl --user` commands, in
+order, and is sealed with that record as its precondition. `apply-plan`
+re-collects and refuses if anything changed since the seal — a job disabled or
+a definition edited in between gets a refusal, not a surprise — then runs only
+those steps (a definition only while it still renders to the sealed digest, a
+command only when it names this host's own jobs), checks every written file is
+at its sealed digest and every removed one is gone, and `status` must then
+report the result. `status` is read-only and unsealed. On Linux, lingering is
+checked before anything is planned: without it `install` exits 75 with the
+`loginctl enable-linger` fix and writes nothing.
+
 `install` matches a job that already exists: an identical definition is left
 alone (not rewritten, not reloaded); a differing one is reported with its diff,
 then replaced and reloaded. **Absorb, never duplicate**: if
@@ -333,8 +351,10 @@ minute. Re-run `install` after changing those keys.
   `OnBootSec`/`OnUnitActiveSec` monotonic intervals, so a laptop that was
   asleep resumes its cadence at wake rather than storming. The user manager
   must linger (`loginctl enable-linger`) for the timers to outlive a login
-  session — `install` exits 75 and names the fix when it does not — and WSL
-  needs systemd enabled.
+  session — `install` checks that first, exits 75 and names the fix, and
+  writes nothing — and WSL needs systemd enabled (an unreachable user manager
+  is its own diagnostic). A job is its timer AND its service: either one
+  missing is a missing job, and `status` compares both.
 - **Windows** — a **per-user** scheduled task. Where the machine has a
   configured WSL sibling, register it there and drive the native side through
   the interop lane rather than registering a second native entry.

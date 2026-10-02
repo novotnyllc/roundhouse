@@ -259,6 +259,33 @@ seal_plan_command() {
       exit 65
     }
   fi
+  if jq -e 'any(.operations[]; .id == "roundhouse:schedule")' "$draft" >/dev/null; then
+    schedule_operations_valid "$draft" || {
+      printf 'roundhouse: invalid fleet-schedule plan operation\n' >&2
+      exit 64
+    }
+    # Bound to what was OBSERVED: every file a step writes over, keeps,
+    # removes or absorbs is the observed file at its observed digest (or
+    # observed absent), so the plan is the snapshot's and nothing else's.
+    jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
+      first($records[] | select(.kind == "agent_artifact" and
+        .id == "roundhouse:schedule" and (.status | IN("present","absent")))) as $r |
+      all($draft[0].operations[] | select(.id == "roundhouse:schedule") | .steps[];
+        . as $s |
+        if .action == "write" then
+          any($r.data.files[]; .path == $s.path and .mode == $s.mode and .digest == $s.before)
+        elif .action == "keep" then
+          any($r.data.files[]; .path == $s.path and .mode == $s.mode and .digest == $s.digest)
+        elif .action == "remove" then
+          any($r.data.files[]; .path == $s.path and .mode == $s.mode and .digest == $s.before)
+        elif .action == "absorb" then
+          any($r.data.legacy[]; .path == $s.path and .digest == $s.before)
+        else true end)
+    ' >/dev/null || {
+      printf 'roundhouse: fleet-schedule plan is not bound to the observed definitions\n' >&2
+      exit 65
+    }
+  fi
   if [ "$privileged" = true ] || [ "$mixed_privileged" = true ]; then
     if [ "$mixed_privileged" = true ]; then
       privilege_actions=$(jq -c '[.operations[] | select(.type == "semantic-action") |

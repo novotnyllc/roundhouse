@@ -692,6 +692,17 @@ verify_preconditions_command() {
       exit 65
     }
   fi
+  if jq -e 'any(.operations[]; .id == "roundhouse:schedule")' "$plan" >/dev/null; then
+    schedule_operations_valid "$plan" || {
+      printf 'roundhouse: invalid fleet-schedule plan operation\n' >&2
+      exit 64
+    }
+    jq -e -s 'any(.[]; .kind == "agent_artifact" and .id == "roundhouse:schedule" and
+      (.status | IN("present","absent")))' "$snapshot" >/dev/null || {
+      printf 'roundhouse: current snapshot does not observe the scheduled jobs\n' >&2
+      exit 65
+    }
+  fi
   verify_executor_requirement "$plan" >/dev/null
   target=$(jq -r '.target' "$plan")
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")
