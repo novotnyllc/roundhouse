@@ -2345,7 +2345,7 @@ EOF
           # The manager wrote the cache under its caller's umask, and 002
           # leaves it group-writable. Seal it before it is re-verified, its
           # hooks are approved, or roundhouse's own executor check trusts it.
-          plugin_cache_seal_permissions claude "$fleet_run_id"
+          plugin_cache_seal_permissions "$fleet_run_id" || return 75
           # Trust the manager's exit status for nothing beyond "it ran": a
           # success exit with the catalog identity still unmatched (a no-op
           # install, a race against a catalog refresh) must not journal as
@@ -2366,7 +2366,7 @@ EOF
         fleet_run_cli_invalidate
         bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
         # As above: seal what the manager wrote before approving its hooks.
-        plugin_cache_seal_permissions claude "$fleet_run_id"
+        plugin_cache_seal_permissions "$fleet_run_id" || return 75
         if [ "$fleet_run_want_enabled" = true ]; then
           fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
         fi

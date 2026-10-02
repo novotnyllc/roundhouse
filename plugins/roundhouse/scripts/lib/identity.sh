@@ -452,7 +452,5 @@ codex_plugin_hooks_command() {
     printf 'roundhouse: Node.js is required for Codex hook approval\n' >&2
     exit 69
   }
-  "$codex_hooks_node" "$script_dir/codex-plugin-hooks.mjs" "$action" "$plugin_id" ||
-    return
-  [ "$action" != update ] || plugin_cache_seal_permissions codex "$plugin_id"
+  "$codex_hooks_node" "$script_dir/codex-plugin-hooks.mjs" "$action" "$plugin_id"
 }

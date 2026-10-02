@@ -465,47 +465,55 @@ check_safe_owned_directory() {
 
 plugin_root_seal_permissions() {
   # plugin_root_seal_permissions DIR — remove group and other write bits from
-  # a plugin tree before roundhouse trusts it. A plugin manager running under
-  # umask 002 (the WSL default) leaves a fresh cache group-writable, and
-  # check_safe_owned_path then refuses it. This only tightens modes and runs
-  # before any check, so the checks themselves stay strict. It applies to an
-  # absolute, non-symlink directory owned by the current user; `chmod -R`
-  # does not follow symlinks inside the tree. Anything it cannot change is
-  # left for the verifier to report. A change is named on stderr, so a tree
-  # that really was writable by others does not go unnoticed.
+  # a plugin tree before roundhouse trusts it, then refuse (1) if anything in
+  # it is still writable by others or owned by another user. A plugin manager
+  # running under umask 002 (the WSL default) leaves a fresh cache
+  # group-writable, and check_safe_owned_path then refuses it. This only
+  # tightens modes and runs before any check, so the checks stay strict, and
+  # the closing scan covers every entry, not only the files the manifest
+  # lists: a writable or foreign-owned directory could swap a verified file
+  # after the check. It applies to an absolute, non-symlink directory owned
+  # by the current user (anything else is the verifier's to refuse);
+  # `chmod -R` does not follow symlinks inside the tree. A change is named on
+  # stderr, so a tree that really was writable by others does not go
+  # unnoticed.
   case $1 in /*) ;; *) return 0 ;; esac
   [ -d "$1" ] && [ ! -L "$1" ] || return 0
-  [ "$(file_owner "$1")" = "$(id -un)" ] || return 0
-  [ -n "$(find "$1" ! -type l \( -perm -020 -o -perm -002 \) -print 2>/dev/null |
-    head -n 1)" ] || return 0
-  printf 'roundhouse: removing group/world write permission under %s\n' "$1" >&2
-  chmod -R go-w "$1" 2>/dev/null || :
+  seal_user=$(id -un)
+  [ "$(file_owner "$1")" = "$seal_user" ] || return 0
+  if [ -n "$(find "$1" ! -type l \( -perm -020 -o -perm -002 \) -print 2>/dev/null |
+    head -n 1)" ]; then
+    printf 'roundhouse: removing group/world write permission under %s\n' "$1" >&2
+    chmod -R go-w "$1" 2>/dev/null || :
+  fi
+  [ -z "$(find "$1" ! -type l \( -perm -020 -o -perm -002 -o ! -user "$seal_user" \) \
+    -print 2>/dev/null | head -n 1)" ] || {
+    printf 'roundhouse: %s holds entries writable or owned by another user\n' "$1" >&2
+    return 1
+  }
 }
 
 plugin_cache_seal_permissions() {
-  # plugin_cache_seal_permissions claude|codex NAME[@MARKETPLACE] — seal a
-  # plugin's harness cache right after roundhouse installed or updated it.
-  # For roundhouse itself this is the tree executor_status_command will
-  # trust; for any other plugin it is code (hooks, MCP servers) that the
+  # plugin_cache_seal_permissions NAME[@MARKETPLACE] — seal a plugin's Claude
+  # cache right after roundhouse installed or updated it; 1 when it cannot be
+  # sealed. For roundhouse itself this is the tree executor_status_command
+  # will trust; for any other plugin it is code (hooks, MCP servers) that the
   # harness runs as this user, which a group member must not be able to edit.
   # The zero-config form, with no marketplace, seals every marketplace's copy
-  # of NAME, since sealing only tightens.
-  case $1 in
-    claude) seal_cache=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache ;;
-    codex) seal_cache=${CODEX_HOME:-$HOME/.codex}/plugins/cache ;;
-    *) return 0 ;;
-  esac
-  seal_name=${2%%@*}
+  # of NAME, since sealing only tightens. (Codex's cache is sealed inside
+  # codex-plugin-hooks.mjs, between `plugin add` and the hook trust write.)
+  seal_cache=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache
+  seal_name=${1%%@*}
   case $seal_name in ''|.|..|*[!A-Za-z0-9._-]*) return 0 ;; esac
-  case $2 in
+  case $1 in
     *@*)
-      seal_market=${2#*@}
+      seal_market=${1#*@}
       case $seal_market in ''|.|..|*[!A-Za-z0-9._-]*) return 0 ;; esac
       plugin_root_seal_permissions "$seal_cache/$seal_market/$seal_name"
       ;;
     *)
       for seal_dir in "$seal_cache"/*/"$seal_name"; do
-        plugin_root_seal_permissions "$seal_dir"
+        plugin_root_seal_permissions "$seal_dir" || return 1
       done
       ;;
   esac
@@ -527,7 +535,7 @@ executor_status_command() (
   integrity=$plugin_root/integrity.json
   # Seal first, then verify: a manager update under umask 002 must not leave
   # this host refusing every sealed install until someone runs chmod by hand.
-  plugin_root_seal_permissions "$plugin_root"
+  plugin_root_seal_permissions "$plugin_root" || exit 64
   check_safe_owned_directory "$plugin_root" "plugin root"
   check_private_owned_file "$integrity" "executor integrity manifest"
   jq -e '

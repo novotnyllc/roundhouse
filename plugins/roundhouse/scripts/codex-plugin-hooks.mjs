@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { chmodSync, lstatSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 const TIMEOUT_MS = 15_000;
@@ -285,6 +288,32 @@ function runCodexPluginAdd(pluginId, codexExecutable) {
   });
 }
 
+// `codex plugin add` writes the cache under its caller's umask, and 002 (the
+// WSL default) leaves it group-writable. Seal it BEFORE the hook trust write,
+// or a group member could swap a hook in between and have its hash trusted:
+// clear group/other write on every entry (a directory before its listing, so
+// nothing new lands in it), and refuse an entry another user owns.
+function sealPluginCache(pluginId) {
+  if (process.platform === "win32") return;
+  const [name, marketplace] = pluginId.split("@");
+  const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
+  const uid = process.getuid();
+  const walk = (path) => {
+    let stat;
+    try {
+      stat = lstatSync(path);
+    } catch (error) {
+      if (error.code === "ENOENT") return;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) return;
+    if (stat.uid !== uid) fail(`plugin cache entry is owned by another user: ${path}`);
+    if (stat.mode & 0o022) chmodSync(path, stat.mode & 0o7755);
+    if (stat.isDirectory()) for (const entry of readdirSync(path)) walk(join(path, entry));
+  };
+  walk(join(codexHome, "plugins", "cache", marketplace, name));
+}
+
 async function main() {
   const [command, pluginId, ...rest] = process.argv.slice(2);
   let codexExecutable = "codex";
@@ -336,6 +365,7 @@ async function main() {
       .filter((hook) => hook.trustStatus === "trusted")
       .map((hook) => hook.key);
     await runCodexPluginAdd(pluginId, codexExecutable);
+    sealPluginCache(pluginId);
     await writeTrust(pluginId, cwd, keys, codexExecutable);
     const after = await verifyTrust(pluginId, cwd, keys, true, false, codexExecutable);
     process.stdout.write(
