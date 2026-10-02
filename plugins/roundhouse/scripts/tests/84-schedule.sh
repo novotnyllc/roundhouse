@@ -432,39 +432,69 @@ fleet_schedule_command "$@"'
       # THE HANDOFF RACE: a trigger landing after the loop's last comparison
       # but before the lock is released. Its own run found the lock and
       # exited, and systemd queues no second start of an active oneshot, so
-      # the run compares the stamp once more after releasing and starts ONE
-      # detached fast pass — through the normal lock, never inside it.
-      cat >"$sched_bin/handoff-runner" <<'STUB'
-#!/bin/sh
-if [ -e "$SCHED_LOCK" ]; then state=held; else state=free; fi
-printf '%s %s\n' "$state" "$*" >>"$SCHED_STATE/runner"
-STUB
-      chmod +x "$sched_bin/handoff-runner"
-      SCHED_LOCK=$(fleet_lock_path)
-      ROUNDHOUSE_FLEET_TRIGGER_RUNNER="$sched_bin/handoff-runner"
-      export SCHED_LOCK ROUNDHOUSE_FLEET_TRIGGER_RUNNER
+      # the run compares the stamp once more after releasing, takes the lock
+      # back IN-PROCESS and converges again — never a detached pass, which
+      # the scheduler would kill with the job's process group.
       eval "sched_lock_release_real() $(declare -f fleet_lock_release | tail -n +2)"
+      SCHED_LATE_TRIGGERS=1
       fleet_lock_release() {
-        fleet_trigger_stamp
+        if [ "$SCHED_LATE_TRIGGERS" -gt 0 ]; then
+          SCHED_LATE_TRIGGERS=$((SCHED_LATE_TRIGGERS - 1))
+          fleet_trigger_stamp
+        fi
         sched_lock_release_real "$@"
       }
       : >"$sched_calls"
       SCHED_TRIGGERS=0
       sched_run --fast
-      [ "$sched_status" -eq 0 ] || fail "the run with a late trigger failed"
-      [ "$(grep -c . "$sched_calls")" -eq 1 ] ||
-        fail "a trigger after the last comparison was run in-process, inside the lock"
+      [ "$sched_status" -eq 0 ] || fail "the run with a late trigger failed: $(cat "$sched_root/run.out")"
+      [ "$(grep -c . "$sched_calls")" -eq 2 ] ||
+        fail "a trigger that landed as the lock was released was not converged in-process ($(grep -c . "$sched_calls") passes)"
       case $(cat "$sched_root/run.out") in
-        *'released its lock; started a detached fleet-run --fast'*) ;;
-        *) fail "the run did not hand a late trigger off: $(cat "$sched_root/run.out")" ;;
+        *'released its lock; took it again and converging in-process'*) ;;
+        *) fail "the run did not say it took the lock back for a late trigger: $(cat "$sched_root/run.out")" ;;
       esac
-      sched_wait_runner || fail "a trigger that landed as the lock was released was lost"
-      [ "$(cat "$SCHED_STATE/runner")" = 'free fleet-run --fast' ] ||
-        fail "the follow-up was not one fleet-run --fast started after the lock was free: $(cat "$SCHED_STATE/runner")"
-      rm -f "$SCHED_STATE/runner"
+      [ ! -e "$(fleet_lock_path)" ] || fail "the handoff left its lock behind"
+      sched_no_runner || fail "the handoff started a detached pass"
+      # A late trigger every time is bounded: two handoffs, then the next
+      # scheduled run.
+      : >"$sched_calls"
+      SCHED_LATE_TRIGGERS=9
+      sched_run --fast
+      [ "$sched_status" -eq 0 ] && [ "$(grep -c . "$sched_calls")" -eq 3 ] ||
+        fail "a stream of late triggers was not bounded at two handoffs ($(grep -c . "$sched_calls") passes)"
+      grep -q 'the next scheduled run picks them up' "$sched_root/run.out" ||
+        fail "the bounded handoff did not say it stopped: $(cat "$sched_root/run.out")"
+      # If another run holds the lock by then, IT sees the stamp: no pass here.
+      eval "sched_lock_take_real() $(declare -f fleet_run_lock_take | tail -n +2)"
+      SCHED_LOCK_TAKES=0
+      fleet_run_lock_take() {
+        SCHED_LOCK_TAKES=$((SCHED_LOCK_TAKES + 1))
+        [ "$SCHED_LOCK_TAKES" -lt 2 ] || return 10
+        sched_lock_take_real "$@"
+      }
+      : >"$sched_calls"
+      SCHED_LATE_TRIGGERS=1
+      sched_run --fast
+      [ "$sched_status" -eq 0 ] && [ "$(grep -c . "$sched_calls")" -eq 1 ] ||
+        fail "the handoff ran a pass although another run held the lock"
+      grep -q 'the run that holds it now sees it' "$sched_root/run.out" ||
+        fail "the handoff did not leave the trigger to the run that holds the lock: $(cat "$sched_root/run.out")"
+      eval "fleet_run_lock_take() $(declare -f sched_lock_take_real | tail -n +2)"
       eval "fleet_lock_release() $(declare -f sched_lock_release_real | tail -n +2)"
-      ROUNDHOUSE_FLEET_TRIGGER_RUNNER="$sched_bin/runner"
-      export ROUNDHOUSE_FLEET_TRIGGER_RUNNER
+      # A run whose lock is taken over mid-loop starts no further pass.
+      eval "sched_lock_identity_real() $(declare -f fleet_lock_identity | tail -n +2)"
+      fleet_lock_identity() { printf 'someone-else\n'; }
+      : >"$sched_calls"
+      SCHED_TRIGGERS=9
+      sched_run --fast
+      [ "$(grep -c . "$sched_calls")" -eq 1 ] ||
+        fail "a run that lost its lock went on to another pass ($(grep -c . "$sched_calls") passes)"
+      grep -q 'no longer this run' "$sched_root/run.out" ||
+        fail "the loop did not say why it stopped: $(cat "$sched_root/run.out")"
+      eval "fleet_lock_identity() $(declare -f sched_lock_identity_real | tail -n +2)"
+      # (Its release refused the lock it no longer owns; clear it for the rest.)
+      rm -rf "$(fleet_lock_path)"
       # PER RUN: one starting operation, the abort point for every pass.
       : >"$sched_root/op-calls"
       : >"$sched_calls"
@@ -505,11 +535,68 @@ STUB
       # …and the loop REFUSES a caller that suppresses errexit, rather than
       # running every pass with it silently off.
       sched_status=0
-      fleet_run_command --fast >"$sched_root/run.out" 2>&1 || sched_status=$?
+      ( fleet_run_command --fast ) >"$sched_root/run.out" 2>&1 || sched_status=$?
       [ "$sched_status" -eq 70 ] &&
         grep -q 'ran where errexit is suppressed' "$sched_root/run.out" ||
         fail "the run loop accepted an errexit-suppressed caller ($sched_status): $(cat "$sched_root/run.out")"
       [ ! -e "$(fleet_lock_path)" ] || fail "the refused run left its lock behind"
+
+      # A SIGNAL ENDS THE RUN. The pass below moves the stamp (as a trigger
+      # would) and waits for a release file; the run is signalled mid-pass.
+      # Whatever the signal shape, the run exits 128+N after that pass, never
+      # starts another, and leaves no lock. (A handler that only cleaned up
+      # and returned let the loop run a second pass with no lock at all.)
+      # shellcheck disable=SC2016 # a program for the driver's own bash
+      sched_signal_driver='set -eu
+ROUNDHOUSE_LIB_ONLY=1
+. "$0"
+fleet_vcs_store_ready() { return 0; }
+fleet_vcs_op_id() { printf "op\n"; }
+fleet_host_name() { printf "vireo\n"; }
+fleet_run_pass() (
+  printf "pass\n" >>"$SCHED_SIG_DIR/calls"
+  fleet_trigger_stamp
+  : >"$SCHED_SIG_DIR/in-pass"
+  sig_n=0
+  while [ ! -e "$SCHED_SIG_DIR/release" ] && [ "$sig_n" -lt 100 ]; do
+    sleep 0.1
+    sig_n=$((sig_n + 1))
+  done
+)
+fleet_run_command --fast'
+      SCHED_SIG_DIR="$sched_root/signal"
+      export SCHED_SIG_DIR
+      for sched_signal in 'TERM pid 143' 'INT group 130'; do
+        # shellcheck disable=SC2086 # deliberate: signal, shape, status
+        set -- $sched_signal
+        rm -rf "$SCHED_SIG_DIR" "$(fleet_lock_path)"
+        mkdir -p "$SCHED_SIG_DIR"
+        # Its own process group, with INT and TERM at their defaults (a
+        # background job of a non-interactive shell starts with INT ignored).
+        perl -e '$SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; setpgrp(0, 0); exec @ARGV or die' \
+          bash -c "$sched_signal_driver" "$cli" >"$SCHED_SIG_DIR/out" 2>&1 &
+        sched_signal_pid=$!
+        sched_waited=0
+        while [ ! -e "$SCHED_SIG_DIR/in-pass" ] && [ "$sched_waited" -lt 100 ]; do
+          sleep 0.1
+          sched_waited=$((sched_waited + 1))
+        done
+        [ -e "$SCHED_SIG_DIR/in-pass" ] || fail "the signal fixture's pass never started"
+        if [ "$2" = group ]; then
+          kill -"$1" -- "-$sched_signal_pid"
+        else
+          kill -"$1" "$sched_signal_pid"
+        fi
+        : >"$SCHED_SIG_DIR/release"
+        sched_status=0
+        wait "$sched_signal_pid" || sched_status=$?
+        [ "$sched_status" -eq "$3" ] ||
+          fail "a run signalled with SIG$1 ($2) exited $sched_status, not $3: $(cat "$SCHED_SIG_DIR/out")"
+        [ "$(grep -c . "$SCHED_SIG_DIR/calls")" -eq 1 ] ||
+          fail "a run signalled with SIG$1 ($2) went on to another pass"
+        [ ! -e "$(fleet_lock_path)" ] ||
+          fail "a run signalled with SIG$1 ($2) left its lock behind"
+      done
     )
 
     # --- fleet-schedule on macOS: install, idempotence, status, uninstall ---

@@ -129,7 +129,8 @@ fleet_trigger_command() (
 # --- the running pass's re-loop -------------------------------------------------
 
 fleet_trigger_converge() {
-  # fleet_trigger_converge PASS ROOT MODE — run `PASS PASS-TMP PASS-MODE` once,
+  # fleet_trigger_converge PASS ROOT MODE LOCK NONCE — run `PASS PASS-TMP
+  # PASS-MODE` once,
   # then again in-process while the dirty stamp moved since that pass began.
   # Called by fleet_run_command under its lock. Every pass gets its own
   # PASS-TMP under ROOT (and, inside it, its own alert ledger): a re-run pass
@@ -143,6 +144,11 @@ fleet_trigger_converge() {
   # included: a trigger says "go look", and repeating a full pass's
   # marketplace refresh and package updates is not looking.
   #
+  # It STOPS, without another pass, when a pass ended on a signal (status
+  # 128 and above), when the run was signalled (fleet_trigger_signal), and
+  # when LOCK no longer carries NONCE — another run took it over, and a pass
+  # outside the lock is exactly what the lock exists to prevent.
+  #
   # Each pass runs with errexit LIVE (errexit_capture): `PASS || …` would
   # switch it off for the whole body. The results land in two globals rather
   # than the return status, so the caller can call this plainly:
@@ -155,6 +161,8 @@ fleet_trigger_converge() {
   converge_pass=$1
   converge_root=$2
   converge_mode=$3
+  converge_lock=$4
+  converge_nonce=$5
   converge_extra=0
   fleet_trigger_status=0
   fleet_trigger_last_stamp=
@@ -167,24 +175,17 @@ fleet_trigger_converge() {
     [ "$converge_pass_status" -le "$fleet_trigger_status" ] ||
       fleet_trigger_status=$converge_pass_status
     fleet_trigger_last_stamp=$(fleet_trigger_stamp_state)
+    [ "$converge_pass_status" -lt 128 ] && [ -z "${fleet_trigger_signal:-}" ] || break
     [ "$converge_extra" -lt 3 ] || break
     [ "$fleet_trigger_last_stamp" != "$converge_seen" ] || break
+    [ "$(fleet_lock_identity "$converge_lock")" = "$converge_nonce" ] || {
+      printf 'roundhouse: the run lock is no longer this run'"'"'s; not starting another pass\n' >&2
+      [ "$fleet_trigger_status" -ge 75 ] || fleet_trigger_status=75
+      break
+    }
     converge_extra=$((converge_extra + 1))
     converge_mode=fast
     printf 'roundhouse: a trigger arrived during the pass; converging again in-process (%s of 3)\n' \
       "$converge_extra"
   done
-}
-
-fleet_trigger_handoff() {
-  # fleet_trigger_handoff STAMP — the last word of a run, called by
-  # fleet_run_command AFTER it released the run lock, with the stamp the
-  # loop's final comparison read: a move starts ONE detached fast pass.
-  [ "$(fleet_trigger_stamp_state)" != "$1" ] || return 0
-  handoff_runner="$script_dir/roundhouse"
-  if fleet_test_hook "${ROUNDHOUSE_FLEET_TRIGGER_RUNNER:-}"; then
-    handoff_runner=$ROUNDHOUSE_FLEET_TRIGGER_RUNNER
-  fi
-  nohup "$handoff_runner" fleet-run --fast </dev/null >/dev/null 2>&1 &
-  printf 'roundhouse: a trigger arrived as this run released its lock; started a detached fleet-run --fast\n'
 }

@@ -2732,11 +2732,16 @@ fleet_run_lock_take() {
 
 # --- the commands -------------------------------------------------------------
 
-fleet_run_command() (
+fleet_run_command() {
   # `roundhouse fleet-run [--fast|--full]` — §6.1's two cadences. Fast is the
   # propagation path; full is maintenance. Splitting them is what lets the
   # propagation interval be short without running discovery, doctoring and
   # upstream fetches 72 times a day.
+  #
+  # NOT a subshell, deliberately, and it always ends in `exit`: the scheduler
+  # signals the process it started, so the run's signal traps must be in that
+  # process. In a `( … )` child the CLI process died on SIGTERM while the run
+  # went on without anyone able to stop it.
   fleet_run_env
   require_jq
   require_yq
@@ -2775,14 +2780,17 @@ fleet_run_command() (
   # Release by NONCE, never by path: a run that was judged dead and taken over
   # must not delete its live successor's lock when it finally exits.
   run_lock_nonce=$fleet_lock_nonce_held
-  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce" || :' EXIT HUP INT TERM
+  run_lock_held=true
   run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-fleet-run.XXXXXX")
-  # Any exit — a refusal, an errexit, a signal, the ceiling stop — first lands
-  # whatever the apply loop has queued (fleet_run_batch_open): an item it
-  # already installed is recorded as owned, as the per-item writes recorded it.
-  trap '[ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :
-    fleet_lock_release "$run_lock" "$run_lock_nonce" || :; rm -rf "$run_tmp"' \
-    EXIT HUP INT TERM
+  # A signal ENDS the run: its trap exits 128+N, which runs the EXIT trap —
+  # the lock is released and nothing after it runs. A handler that only
+  # cleaned up and returned let the loop go on to another pass with no lock.
+  # (Each pass closes its own apply batch on its way out, fleet_run_pass.)
+  trap '[ "$run_lock_held" != true ] || fleet_lock_release "$run_lock" "$run_lock_nonce" || :
+    rm -rf "$run_tmp"' EXIT
+  trap 'fleet_trigger_signal=HUP; exit 129' HUP
+  trap 'fleet_trigger_signal=INT; exit 130' INT
+  trap 'fleet_trigger_signal=TERM; exit 143' TERM
   # §8.6: the abort button for a bad local apply, captured ONCE per run,
   # before its first pass and deliberately WITHOUT --ignore-working-copy (that
   # flag suppresses the colocated auto-import, so restoring to the newest
@@ -2796,15 +2804,52 @@ fleet_run_command() (
   # §6.1: the pass, and its in-process re-runs while triggers land mid-pass.
   # Called plainly: each pass keeps errexit live (fleet_trigger_converge), and
   # the worst pass status comes back in fleet_trigger_status.
-  fleet_trigger_converge fleet_run_pass "$run_tmp" "$run_mode"
-  run_status=$fleet_trigger_status
-  # Released HERE rather than by the EXIT trap, so the stamp can be compared
-  # once more with the lock free (fleet_trigger_handoff).
-  fleet_lock_release "$run_lock" "$run_lock_nonce" || :
-  trap 'rm -rf "$run_tmp"' EXIT HUP INT TERM
-  fleet_trigger_handoff "$fleet_trigger_last_stamp"
+  #
+  # THE HANDOFF. A trigger can move the stamp after the loop's last
+  # comparison but before the lock is released: its own run found the lock
+  # and exited, and a scheduler `start` of the job that is still running
+  # queues nothing. So once the lock is released the stamp is compared again,
+  # and a move takes the lock back IN THIS PROCESS (non-blocking) and
+  # converges again — never a detached pass, which launchd and systemd would
+  # kill with this job's process group the moment it ends. If another run
+  # holds the lock by then, it is the one that will see the stamp. Two
+  # handoffs at most; a storm past that waits for the next scheduled run.
+  run_status=0
+  run_round=0
+  while :; do
+    fleet_trigger_converge fleet_run_pass "$run_tmp/round-$run_round" "$run_mode" \
+      "$run_lock" "$run_lock_nonce"
+    [ "$fleet_trigger_status" -le "$run_status" ] || run_status=$fleet_trigger_status
+    [ "$fleet_trigger_status" -lt 128 ] || exit "$fleet_trigger_status"
+    fleet_lock_release "$run_lock" "$run_lock_nonce" || :
+    run_lock_held=false
+    [ "$(fleet_trigger_stamp_state)" != "$fleet_trigger_last_stamp" ] || break
+    [ "$run_round" -lt 2 ] || {
+      printf 'roundhouse: triggers kept arriving as the run released its lock; the next scheduled run picks them up\n'
+      break
+    }
+    run_lock_status=0
+    fleet_run_lock_take "$run_store" "$run_host" "$run_lock" || run_lock_status=$?
+    case $run_lock_status in
+      0) ;;
+      10)
+        printf 'roundhouse: a trigger arrived as this run released its lock; the run that holds it now sees it\n'
+        break
+        ;;
+      *)
+        printf 'roundhouse: a trigger arrived as this run released its lock, and the lock could not be taken again (%s); the next run picks it up\n' \
+          "$run_lock_status" >&2
+        break
+        ;;
+    esac
+    run_lock_nonce=$fleet_lock_nonce_held
+    run_lock_held=true
+    run_round=$((run_round + 1))
+    run_mode=fast
+    printf 'roundhouse: a trigger arrived as this run released its lock; took it again and converging in-process\n'
+  done
   exit "$run_status"
-)
+}
 
 fleet_run_pass() (
   # fleet_run_pass PASS-TMP MODE — one observe/converge pass, under
