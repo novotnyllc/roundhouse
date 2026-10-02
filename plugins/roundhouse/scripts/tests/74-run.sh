@@ -1324,6 +1324,19 @@ JSONC
       [ "$(yq -r '(.package_managers // []) | join(",")' "$run_seeded")" = linuxbrew,apt,npm ] ||
         fail "a config with no package_managers erased the host's stored list ($run_nopm)"
     done
+    # A later split file that states the list still wins the fold: the seed
+    # must say the refresh is shadowed, never claim it took — even when the
+    # list changed ([linuxbrew,apt,npm] -> [apt]).
+    mkdir -p "$run_store/hosts/$run_seed_host"
+    printf 'package_managers: [homebrew]\n' >"$run_store/hosts/$run_seed_host/zz-split.yaml"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >"$run_root/seed-refresh.out" 2>&1 ||
+      fail "re-seeding failed with a split host file stating package_managers"
+    grep -Fq 'does not reach the fold' "$run_root/seed-refresh.out" &&
+      ! grep -Fq 'refreshed from config.json' "$run_root/seed-refresh.out" ||
+      fail "a refresh shadowed by a split host file was not reported as shadowed"
+    rm -rf "$run_store/hosts/$run_seed_host"
     # An EMPTY groups list is a fact, not an absence. The `machine-truth` doctor
     # row compares `.groups // null` on both sides and jq's `//` passes `[]`
     # through, so omitting the field reads as `null` against the config's `[]`

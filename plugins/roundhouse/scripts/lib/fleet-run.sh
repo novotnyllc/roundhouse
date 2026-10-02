@@ -3080,14 +3080,23 @@ fleet_seed_command() (
       --argjson facts "$seed_facts" '($facts * . * $seeded) +
         ($facts | with_entries(select(.key == "package_managers" and .value != null)))')"
   seed_write_status=$?
-  # Say so when the refresh changed the list: dropping a manager holds every
-  # package only it provides, and the doctor does not compare this fact.
-  [ "$seed_write_status" -ne 0 ] || [ "$seed_pm_after" = null ] ||
-    [ "$seed_pm_before" = null ] || [ "$seed_pm_after" = "$seed_pm_before" ] ||
-    printf 'roundhouse: package_managers for %s refreshed from config.json: %s -> %s\n' \
-      "$seed_host" "$seed_pm_before" "$seed_pm_after"
 
   seed_fold=$(fleet_fold "$seed_store" "$seed_host")
+  # Say so when the refresh changed the list: dropping a manager holds every
+  # package only it provides, and the doctor does not compare this fact. A
+  # later split file (hosts/<name>/*.yaml) that states the list folds after
+  # this file and still wins, so check the EFFECTIVE value and say so instead
+  # of claiming a refresh that did not take.
+  seed_pm_effective=$(printf '%s\n' "$seed_fold" | jq -c '.package_managers // null' 2>/dev/null)
+  if [ "$seed_write_status" -ne 0 ] || [ "$seed_pm_after" = null ]; then
+    :
+  elif [ -n "$seed_pm_effective" ] && [ "$seed_pm_effective" != "$seed_pm_after" ]; then
+    printf 'roundhouse: package_managers for %s from config.json (%s) does not reach the fold (overridden by another layer, e.g. hosts/%s/*.yaml); the effective list is %s\n' \
+      "$seed_host" "$seed_pm_after" "$seed_host" "$seed_pm_effective" >&2
+  elif [ "$seed_pm_before" != null ] && [ "$seed_pm_after" != "$seed_pm_before" ]; then
+    printf 'roundhouse: package_managers for %s refreshed from config.json: %s -> %s\n' \
+      "$seed_host" "$seed_pm_before" "$seed_pm_after"
+  fi
   fleet_items "$seed_desired" | while IFS= read -r seed_item; do
     [ -n "$seed_item" ] || continue
     seed_digest=$(fleet_item_digest "$seed_fold" "$seed_item") || continue
