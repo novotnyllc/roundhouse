@@ -58,7 +58,7 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "57aaf6583f6349bcdf766a7b49e9a63e74c20a6cf3c79a942dbc9c4a1f9932ba"
+      "sha256": "035c9315c1614653173ea23999c1c6655ecb1ee91dcda78073815d78781d05be"
     },
     {
       "path": "scripts/collect-windows.ps1",
@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/apply-claude.sh",
-      "sha256": "9da0e479639c02e2e591c5896d6901fedbbd01bc4dde5ae8f89e58545bdf74d0"
+      "sha256": "7567f7d8ca30725978d270f4edcf522ea5fac579d8749293a7d80ecaf2c15442"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
@@ -118,15 +118,15 @@
     },
     {
       "path": "scripts/lib/fleet-alerts.sh",
-      "sha256": "fb3ba33fd55f3f449efb88b5e1fc1943e8433658b743eaac1e383e65bf94fcde"
+      "sha256": "b2adf42ded7dfe137f22cdd228725083e7116ce901a1f561ec72e3367f959963"
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
-      "sha256": "2f1490082266fdae57dc1ae5a51d6484e9f10b65fae92b1274a6b54a566bac6f"
+      "sha256": "ed6788cbda0eaba2e93088d0d007943f2edf7f0900388f0f63e36af2428bc698"
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
-      "sha256": "fe675a19b53c7701af0eb130a88f8601a14ca8ef3e12a0a3967f656e7d28fe41"
+      "sha256": "2ca7df7e1cdb23a3b9ac66dd4008169dbb45d2ff158ec15a2435f7abd006789e"
     },
     {
       "path": "scripts/lib/fleet-init.sh",
@@ -146,19 +146,19 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "e30854a039ccdbe8d412385fda9a0cc3c63c65398dc829d6ede58769cc0ca988"
+      "sha256": "1bdc512f9960de566b8be1244127809ab2729308479dc772c79cb2ffe583df17"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
-      "sha256": "b74d8a9c2ab05cbbbadc12ef1af9add7bb13f6c2291ed3802503ab6ec24928de"
+      "sha256": "a9a3391290f38cc9e14b23739b4471b1bf2f2304988c5514e1c97ada39d0a62e"
     },
     {
       "path": "scripts/lib/fleet-trust.sh",
-      "sha256": "617001a077cc83b1d1138dd572ff7a185d28eaf9160a353f6dfcf1237b761613"
+      "sha256": "b4dc868620b3aba538398352f082eb1d7f6dabcfe27f081686b32745a51783ee"
     },
     {
       "path": "scripts/lib/fleet-vcs.sh",
-      "sha256": "a104737da2e92d8026acf4e4af1d97c5857887ced8760fdc15f8f2e6139a1839"
+      "sha256": "0bf2e81b355308a9fec3715d8d634d8f75ba4ba6f0106eb89b6c3fe01672bb51"
     },
     {
       "path": "scripts/lib/host.sh",
@@ -178,11 +178,11 @@
     },
     {
       "path": "scripts/lib/node-runtime.sh",
-      "sha256": "29dea1f30f7a79a0f0a5c5e6ed035d9f6f05646c435d6941815d6bc2e218663a"
+      "sha256": "0a69de8b2fccbcfdfbbbf77781caea3d5696a6c4fbefc9519d1a220995ce6da0"
     },
     {
       "path": "scripts/lib/npm.sh",
-      "sha256": "51172d0b8ab1cd4208efb7a957b839e8389b0f9b1ef174ada05c0c81ba70e88e"
+      "sha256": "020a93bac7b83224db628b7a9624618bfd8703ed7b2938627784125b5a7a4ef8"
     },
     {
       "path": "scripts/lib/plan-apply.sh",
@@ -199,6 +199,10 @@
     {
       "path": "scripts/lib/plan-verify.sh",
       "sha256": "3d4a2ef87f296db002db413c8f8a1c5b529ccb086ec6fd96a859f2cf38bd8186"
+    },
+    {
+      "path": "scripts/lib/timeout.sh",
+      "sha256": "f09c288da6f18c26f77aa490b94ad4a4142219bf7ff368d912617b00eb162aaa"
     },
     {
       "path": "scripts/mcp-siding-windows.ps1",
@@ -238,7 +242,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "dc8ae6ddef7f374ca2fa955a69a2343fb7b14817353f45c675127e2619daa650"
+      "sha256": "54165434b6315d0ab9102f5ae6164fad5c3349a364ae333897c372a870d19099"
     },
     {
       "path": "scripts/roundhouse-trustd",
@@ -254,7 +258,7 @@
     },
     {
       "path": "skills/fleet-agents/SKILL.md",
-      "sha256": "b5ce8324b0de412cf71b23b8895389618122a1f1100a3440408f32196e2b600c"
+      "sha256": "0b336b552bc93b1bde477b334e575c5ebd1c17c068d92717bd76ba37dd0a17a9"
     },
     {
       "path": "skills/fleet-agents/agents/openai.yaml",
@@ -298,7 +302,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "b4a2fceaf7a865385a0f06087d70af5ef3364d1dca3c49a561fc752ae58a5010"
+      "sha256": "e18d50a0938cd356242ff527012f853ac2f90bf13b469233ad1f9891e04c99c7"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",

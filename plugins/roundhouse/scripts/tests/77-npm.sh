@@ -41,7 +41,9 @@ self_dir=$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd -P)
 prefix=$(dirname -- "$self_dir")
 printf '%s node=%s\n' "$*" "$(command -v node)" >>"$NPM_STUB_LOG"
 case "$1 ${2:-}" in
-  "prefix --global") printf '%s\n' "$prefix" ;;
+  "prefix --global")
+    [ "${NPM_STUB_PREFIX_HANG:-0}" != 1 ] || { sleep 589 & wait; exit 0; }
+    printf '%s\n' "$prefix" ;;
   "root --global") printf '%s/lib/node_modules\n' "$prefix" ;;
   "ls --global")
     [ "${NPM_STUB_LS_FAIL:-0}" != 1 ] ||
@@ -366,6 +368,19 @@ nfx_cli collect --target test-host --section host --section packages --output "$
   "$nfx_prefix_physical" ] || fail "the npm record did not bind the global prefix"
 [ "$(jq -c 'select(.kind == "package" and .id == "npm:@example/tool") | .data.updater' "$tmp/npm-snapshot.jsonl")" = \
   '["tool","update"]' ] || fail "a proven package updater was not reported"
+
+# A timed-out prefix query leaves the globals' owner unknown: the whole npm
+# inventory is reported as a query timeout, never as records with a null prefix.
+set +e
+NPM_STUB_PREFIX_HANG=1 ROUNDHOUSE_TEST_QUERY_TIMEOUT=2 nfx_cli collect --target test-host \
+  --section host --section packages --output "$tmp/npm-prefix-hang.jsonl"
+set -e
+jq -se 'any(.[]; .id == "packages:npm" and .status == "unavailable" and
+  any(.errors[]; .code == "manager_query_timeout")) and
+  all(.[]; (.kind == "package" and .data.manager == "npm") | not)' \
+  "$tmp/npm-prefix-hang.jsonl" >/dev/null ||
+  fail "a timed-out npm prefix query was not reported as an unknown npm inventory"
+! pgrep -f 'sleep 589' >/dev/null 2>&1 || fail "a hung npm prefix query outlived its timeout"
 [ "$(jq -r 'select(.kind == "package" and .id == "npm:current-only") |
   [.data.update_available,.data.updater,.data.updater_status] | map(tostring) | join(" ")' \
   "$tmp/npm-snapshot.jsonl")" = 'false null unproven' ] ||

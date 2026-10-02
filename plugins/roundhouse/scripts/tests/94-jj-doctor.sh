@@ -705,3 +705,127 @@ $(docjj_lib fleet_vcs_trailers vireo scheduled/agent 'backdate fixture' -)" \
     printf 'real-jj: OK (first-push gate three verdicts, hook gate both delivery forms, sweep over descriptions and a create-then-delete, symlink walk, doctor clean and %s rows fired)\n' 18
   ) || fail "real-jj guards and doctor block failed (see the FAIL: real-jj: line above)"
 fi
+
+# --- §10.4 the batched sweep, its memo, and the batched export, against jj ---
+#
+# The sweep reads a whole range in a few batched jj calls and one awk, and
+# remembers the commits it swept clean; the export reads every layer file in
+# one `jj file show`. Each is asserted against the per-commit / per-file walk
+# it replaced, over a range built to hit the edges, and the memo is asserted
+# to FAIL CLOSED: missing, corrupted or differently keyed, it is empty.
+if [ "$real_jj_ok" = true ]; then
+  printf 'real-jj: batched sweep and export against the per-commit walk (jj %s)\n' \
+    "$real_jj_version"
+  (
+    set -eu
+    fail() {
+      printf 'FAIL: real-jj: %s\n' "$*" >&2
+      exit 1
+    }
+    PATH="$(dirname "$real_jj"):$(dirname "$real_yq"):$PATH"
+    export PATH
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+    sw="$tmp/sweep-batch"
+    mkdir -p "$sw/home"
+    printf '[user]\nname = "t"\nemail = "t@example.invalid"\n[ui]\npaginate = "never"\neditor = "true"\n' \
+      >"$sw/jj.toml"
+    export JJ_CONFIG="$sw/jj.toml" XDG_CONFIG_HOME="$sw/xdg" HOME="$sw/home"
+    jj git init "$sw/store" >/dev/null 2>&1 || fail "could not create the sweep fixture"
+    ROUNDHOUSE_FLEET_STORE="$sw/store"
+    export ROUNDHOUSE_FLEET_STORE
+    s="$sw/store"
+    sw_commit() { (cd "$s" && jj commit -m "$1" >/dev/null 2>&1); }
+    mkdir -p "$s/alerts/h" "$s/findings/h" "$s/hosts"
+    printf 'kind: x\ndetail: token ghp_abcdefghij1234567890\n' >"$s/alerts/h/a.yaml"
+    sw_commit 'add an alert
+roundhouse-intent: fine'
+    sw_base=$(jj -R "$s" log -r @- --no-graph -T commit_id)
+    printf 'ok: 1\nhash: %s\n' "$sw_base" >"$s/alerts/h/b.yaml"
+    printf 'quote: plain\n' >"$s/findings/h/f.yaml"
+    sw_commit "quote $sw_base and nothing else
+roundhouse-intent: $(awk 'BEGIN { while (n++ < 401) printf "a" }')
+roundhouse-host: h"
+    rm "$s/alerts/h/a.yaml"
+    printf 'kind: y\nk: AbCdEfGhIjKlMnOpQrStUvWxYz012345\n-----BEGIN KEY\n' >"$s/alerts/h/c.yaml"
+    sw_commit 'delete one, add one
+eyJabc.def.ghi in a description
+sk-ABCDEFGHIJKLMNOPQRST'
+    printf 'plain: 0123456789abcdef0123456789abcdef01234567\n' >"$s/alerts/h/d.yaml"
+    printf 'platform: macos\n' >"$s/hosts/h.yaml"
+    sw_commit 'unknown hex 0123456789abcdef0123456789abcdef01234567'
+    printf 'kind: z\n' >"$s/alerts/h/e.yaml"
+    printf 'quote: |\n  export TOKEN=ghp_0123456789abcdefghij\n' >"$s/findings/h/leak.yaml"
+    sw_commit 'a finding lands'
+    rm "$s/findings/h/leak.yaml"
+    sw_commit 'and is deleted again'
+    sw_range='::@- ~ root()'
+
+    fleet_sweep_commits_slow "$s" <<EOF >"$sw/slow"
+$(jj -R "$s" log -r "$sw_range" --no-graph -T 'commit_id ++ "\n"')
+EOF
+    rm -f "$sw/store.run/sweep-clean"
+    fleet_sweep_range "$s" "$sw_range" >"$sw/batch"
+    [ -s "$sw/slow" ] || fail "the sweep fixture found nothing, so it proves nothing"
+    cmp -s "$sw/slow" "$sw/batch" ||
+      fail "the batched sweep differs from the per-commit walk: $(diff "$sw/slow" "$sw/batch" | tr '\n' ' ')"
+    grep -q 'findings/h/leak.yaml:2 matches' "$sw/batch" ||
+      fail "the batched sweep missed a secret created and deleted inside the range"
+    grep -q 'exceeds 400 bytes' "$sw/batch" || fail "the batched sweep lost the trailer cap"
+    ! grep -q "alerts/h/b.yaml" "$sw/batch" ||
+      fail "the batched sweep refused a commit id this repository contains"
+
+    # A file whose last line has no newline: the per-commit `read` loop never
+    # saw that line; the batch does. The one difference, in the safe direction.
+    printf 'kind: x\ntoken: AKIAABCDEFGHIJKLMNOP' >"$s/alerts/h/nonl.yaml"
+    sw_commit 'no final newline'
+    sw_nonl=$(jj -R "$s" log -r @- --no-graph -T commit_id)
+    fleet_sweep_range "$s" "$sw_nonl" | grep -q 'alerts/h/nonl.yaml:2 matches' ||
+      fail "the batched sweep missed a secret on a final line without a newline"
+
+    # --- the memo: remembers clean commits only, and fails closed ---
+    sw_memo="$sw/store.run/sweep-clean"
+    printf 'quote: nothing to see\n' >"$s/findings/h/clean.yaml"
+    sw_commit 'a clean commit'
+    sw_clean=$(jj -R "$s" log -r @- --no-graph -T commit_id)
+    sw_dirty=$(jj -R "$s" log -r "description(substring:'a finding lands')" --no-graph -T commit_id)
+    fleet_sweep_range "$s" "$sw_range" >"$sw/batch1"
+    [ -f "$sw_memo" ] || fail "the sweep left no memo"
+    grep -qx "$sw_clean" "$sw_memo" || fail "a clean commit was not remembered"
+    ! grep -qx "$sw_dirty" "$sw_memo" || fail "a commit with a finding was remembered as clean"
+    fleet_sweep_range "$s" "$sw_range" >"$sw/batch2"
+    cmp -s "$sw/batch1" "$sw/batch2" || fail "the remembered sweep answered differently"
+    # Corrupted: a dirty commit smuggled into the body without its hash.
+    printf '%s\n' "$sw_dirty" >>"$sw_memo"
+    fleet_sweep_range "$s" "$sw_range" | grep -q 'leak.yaml:2 matches' ||
+      fail "a corrupted sweep memo was trusted"
+    # …and the same smuggling WITH a correct hash is honoured — which is why
+    # the hash is checked and why the memo lives host-local.
+    { sed 1d "$sw_memo"; printf '%s\n' "$sw_dirty"; } | LC_ALL=C sort -u |
+      fleet_run_memo_write "$sw_memo" "$(fleet_sweep_key)"
+    ! fleet_sweep_range "$s" "$sw_range" | grep -q 'leak.yaml:2 matches' ||
+      fail "a well-formed memo was not honoured, so the memo saves nothing"
+    # A different key (another predicate) is an empty memo.
+    sed 1d "$sw_memo" | fleet_run_memo_write "$sw_memo" "not-this-predicate"
+    fleet_sweep_range "$s" "$sw_range" | grep -q 'leak.yaml:2 matches' ||
+      fail "a memo written under another key was trusted"
+    rm -f "$sw_memo"
+    fleet_sweep_range "$s" "$sw_range" | grep -q 'leak.yaml:2 matches' ||
+      fail "a missing memo did not sweep everything"
+
+    # --- the export: byte-identical to one `jj file show` per file ---
+    printf 'skills:\n  x: enabled\nnote: |\n  last line, no newline' >"$s/hosts/h.yaml"
+    printf 'platform: macos\n' >"$s/fleet.yaml"
+    mkdir -p "$s/definitions"
+    printf 'packages: {jj: {homebrew: jj}}\n' >"$s/definitions/tools.yaml"
+    sw_commit 'layers'
+    sw_layers=$(jj -R "$s" log -r @- --no-graph -T commit_id)
+    fleet_run_export "$s" "$sw_layers" "$sw/export"
+    for sw_f in hosts/h.yaml fleet.yaml definitions/tools.yaml; do
+      jj -R "$s" file show -r "$sw_layers" "root:$sw_f" >"$sw/one"
+      cmp -s "$sw/one" "$sw/export/$sw_f" ||
+        fail "the batched export of $sw_f is not byte-identical to jj file show"
+    done
+    [ ! -e "$sw/export/alerts" ] || fail "the export carried a non-layer path"
+  ) || fail "real-jj batched sweep block failed (see the FAIL: real-jj: line above)"
+fi
