@@ -565,7 +565,18 @@ EOF
   rm -rf "$work"
 )
 lane_plan_check() {
-  # lane_plan_check PLAN: shape and integrity of a sealed lane plan.
+  # lane_plan_check PLAN: shape, integrity and freshness of a sealed lane
+  # plan — what a submission requires.
+  lane_plan_integrity_check "$1" || return $?
+  [ "$(jq -r '.expires_at | fromdateiso8601' "$1")" -gt "$(date -u +%s)" ] || {
+    printf 'roundhouse: lane plan has expired; seal a fresh one\n' >&2
+    return 65
+  }
+}
+lane_plan_integrity_check() {
+  # lane_plan_integrity_check PLAN: shape and integrity only. A lookup reads
+  # a published result and never resubmits, so an expired plan still names
+  # the request ids whose outcomes the host keeps for seven days.
   jq -e '
     .schema == "roundhouse.plan" and .schema_version == 5 and .lane == "local" and
     (.plan_id | type == "string" and test("^plan-[0-9a-f]{16}$")) and
@@ -582,10 +593,6 @@ lane_plan_check() {
   [ "$expected" = "$(jq -r '.plan_digest.value' "$1")" ] &&
     [ "$(jq -r '.plan_id' "$1")" = "plan-$(printf '%s' "$expected" | cut -c1-16)" ] || {
     printf 'roundhouse: lane plan integrity check failed\n' >&2
-    return 65
-  }
-  [ "$(jq -r '.expires_at | fromdateiso8601' "$1")" -gt "$(date -u +%s)" ] || {
-    printf 'roundhouse: lane plan has expired; seal a fresh one\n' >&2
     return 65
   }
 }
@@ -611,7 +618,10 @@ apply_lane_plan() (
   # (its digest is unkeyed, so a writable plan could be re-digested), and
   # the mutation config gate applies as on every other apply path. The
   # host-local path seals into its own 0600 temp file.
-  check_mutation_config
+  # The host-local path seals into the run's own 0600 temp file on a host
+  # that may carry no controller config.json at all; the gate is the
+  # controller's.
+  [ "$lane_host_local" = true ] || check_mutation_config
   check_private_owned_file "$plan" "lane apply plan"
   lane_plan_check "$plan" || exit $?
   [ "$confirmation" = "$(jq -r '.plan_id' "$plan")" ] || {
@@ -678,7 +688,7 @@ apply_lane_plan() (
 )
 lookup_lane_result() {
   # lookup_lane_result PLAN INDEX OUTPUT
-  lane_plan_check "$1" || exit $?
+  lane_plan_integrity_check "$1" || exit $?
   request=$(jq -r --argjson i "$2" '.operations[$i].request_id // empty' "$1")
   [ -n "$request" ] || { printf 'roundhouse: operation index %s is not in the plan\n' "$2" >&2; exit 64; }
   rc=0
@@ -808,7 +818,6 @@ lane_fleet_run_apt() {
   lane_fra_package=$3
   lane_fra_name=$4
   lane_fra_hold_dir=$5
-  lane_fra_err=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lane-apt.XXXXXX")
   if [ "$(lane_local_state)" != ready ]; then
     printf '  hold  packages.%s — apt needs the local privilege lane; run: roundhouse privilege-enroll %s\n' \
       "$lane_fra_package" "$lane_fra_host"
@@ -816,7 +825,6 @@ lane_fleet_run_apt() {
     lane_fleet_apt_alerted=true
     lane_fleet_apt_alert privilege-lane-needs-one-time-approval \
       "$(lane_package_hold_detail "packages.$lane_fra_package" "$lane_fra_host" apt)"
-    rm -f "$lane_fra_err"
     return 0
   fi
   # Metadata refresh once per pass, then the upgrade: each a sealed plan
@@ -827,9 +835,9 @@ lane_fleet_run_apt() {
   # reported once, and the flag is set only by a completed refresh.
   if [ "${lane_fleet_apt_refresh_failed:-false}" = true ]; then
     printf '  hold  packages.%s — apt metadata refresh did not complete this pass\n' "$lane_fra_package"
-    rm -f "$lane_fra_err"
     return 0
   fi
+  lane_fra_err=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lane-apt.XXXXXX")
   if [ "${lane_fleet_apt_refreshed:-false}" != true ]; then
     if lane_host_apply "$lane_fra_host" "[$(lane_operation_json apt.update-metadata.v1)]" </dev/null 2>"$lane_fra_err"; then
       lane_fleet_apt_refreshed=true

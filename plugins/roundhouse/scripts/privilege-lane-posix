@@ -899,8 +899,9 @@ action_apt_update() {
   pre=$(apt_policy_snapshot) || pre=-
   native_env "$apt_get" -q update >/dev/null 2>&1 || rc=$?
   native_exit=$rc
-  post=$(apt_policy_snapshot) || post=-
-  [ "$rc" -eq 0 ] || fail_action native_operation_failed || return 1
+  [ "$rc" -eq 0 ] || { post=-; fail_action native_operation_failed; return 1; }
+  # A refresh whose post-state cannot be read is not a verified refresh.
+  post=$(apt_policy_snapshot) || { post=-; state=partial; reason=post_state_unavailable; return 1; }
   state=completed; reason=metadata_refreshed
 }
 action_apt_upgrade() {
@@ -1011,23 +1012,27 @@ request_command() {
   validate_action_parameters || { rm -f "$ingress_dir/.$id.tmp"; die 64 "request: invalid parameters for $action"; }
   request_file=$ingress_dir/$id.request
   mv -f "$ingress_dir/.$id.tmp" "$request_file"
-  # Trigger. The grant permits exactly this; a refusal here means the lane
-  # has drifted since status said ready.
-  if fixture_mode; then
-    "$installed_script" dispatch >/dev/null 2>&1 || rc=$?
-  else
-    /usr/bin/sudo -n "$lane_libexec/$lane_name" dispatch >/dev/null 2>&1 || rc=$?
-  fi
+  # Trigger, in the background. The grant permits exactly this; a refusal
+  # means the lane has drifted since status said ready. The deadline bounds
+  # how long the OWNER waits, never how long root works: a native command
+  # that hangs (a package lock, a stalled mirror) keeps running under root
+  # and the owner reports the request as claimed-and-pending instead of
+  # hanging with it — an unattended run must get its turn back.
+  trigger_dispatch >/dev/null 2>&1 &
+  dispatch_pid=$!
   result_file=$results_dir/$id.result
   deadline=$(( $(now) + wait_seconds ))
-  while [ ! -f "$result_file" ] && [ "$(now)" -lt "$deadline" ]; do
-    sleep 1
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne 75 ]; then break; fi
-    if [ "$rc" -eq 75 ]; then
+  until [ -f "$result_file" ] || [ "$(now)" -ge "$deadline" ]; do
+    sleep 0.5
+    if ! kill -0 "$dispatch_pid" 2>/dev/null; then
+      rc=0; wait "$dispatch_pid" || rc=$?
+      [ ! -f "$result_file" ] || break
+      # 75: another dispatch held the lock and may have drained this
+      # request too; trigger once more. Anything else is final.
+      [ "$rc" -eq 75 ] || break
       rc=0
-      if fixture_mode; then "$installed_script" dispatch >/dev/null 2>&1 || rc=$?
-      else /usr/bin/sudo -n "$lane_libexec/$lane_name" dispatch >/dev/null 2>&1 || rc=$?
-      fi
+      trigger_dispatch >/dev/null 2>&1 &
+      dispatch_pid=$!
     fi
   done
   if [ ! -f "$result_file" ]; then
@@ -1061,6 +1066,10 @@ request_command() {
     partial) return 71 ;;
     *) return 70 ;;
   esac
+}
+trigger_dispatch() {
+  # The one privileged invocation the owner makes.
+  if fixture_mode; then "$installed_script" dispatch; else /usr/bin/sudo -n "$lane_libexec/$lane_name" dispatch; fi
 }
 candidate_command() {
   # candidate_command PACKAGE: the owner-side view of what apt would do,
@@ -1165,6 +1174,25 @@ self_test() {
     grep -Fqx 'plan-id|plan-0123456789abcdef' <<<"$out" &&
     grep -Fqx 'operation-index|3' <<<"$out" || self_fail "apt update: $out"
   grep -Fqx 'apt-get -q update' "$root/apt.log" || self_fail 'apt-get update argv'
+  # A refresh whose post-state cannot be read is partial, never completed.
+  : >"$root/apt-policy-fail"
+  rc=0; out=$("$installed" request apt.update-metadata.v1) || rc=$?
+  rm -f "$root/apt-policy-fail"
+  [ "$rc" -eq 71 ] && grep -Fqx 'reason|post_state_unavailable' <<<"$out" || self_fail "unreadable post-state reported as (rc $rc): $out"
+  # A native command that hangs does not hang the owner: the wait bounds the
+  # owner's side, the request is reported claimed-and-pending, and root
+  # finishes on its own so a later lookup finds the result.
+  : >"$root/apt-hang"
+  local hang_started hang_id
+  hang_started=$(now)
+  rc=0; out=$("$installed" request apt.update-metadata.v1 --wait 1) || rc=$?
+  rm -f "$root/apt-hang"
+  [ "$rc" -eq 71 ] && grep -Fqx 'reason|claimed_result_pending_use_result_lookup' <<<"$out" || self_fail "hung dispatch (rc $rc): $out"
+  [ $(( $(now) - hang_started )) -le 3 ] || self_fail 'the owner waited for the hung native command'
+  hang_id=$(sed -n 's/^request-id|//p' <<<"$out")
+  sleep 5
+  rc=0; out=$("$installed" result "$hang_id") || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'reason|metadata_refreshed' <<<"$out" || self_fail "hung dispatch never published (rc $rc): $out"
   grep -Fqx 'umask 0022' "$root/umask.log" || self_fail "native command did not run under the system umask: $(cat "$root/umask.log")"
   id=$(printf '%s\n' "$out" | sed -n 's/^request-id|//p')
   rc=0; "$installed" result "$id" >"$root/lookup.out" || rc=$?
@@ -1305,6 +1333,7 @@ write_apt_stubs() {
 #!/bin/sh
 printf 'apt-get %s\n' "\$*" >>"$root/apt.log"
 printf 'umask %s\n' "\$(umask)" >>"$root/umask.log"
+[ ! -e "$root/apt-hang" ] || sleep 4
 [ ! -e "$root/apt-fail" ] || exit 1
 case "\$*" in
   *"--simulate autoremove"*) [ ! -e "$root/apt-simulate-fail" ] || exit 100; [ ! -e "$root/apt-remaining" ] || printf 'Remv old-kernel [1.0]\n'; exit 0 ;;
@@ -1318,7 +1347,7 @@ EOF
 case "\$1 \$2" in
   "policy curl") printf 'curl:\n  Installed: %s\n  Candidate: 8.2.0-1\n' "\$(cat "$root/state-curl" 2>/dev/null || printf '8.1.0-1')" ;;
   "policy jq") printf 'jq:\n  Installed: (none)\n  Candidate: 1.7.1-3\n' ;;
-  "policy ") printf 'curl:\n  Installed: 8.1.0-1\n' ;;
+  "policy ") [ ! -e "$root/apt-policy-fail" ] || exit 100; printf 'curl:\n  Installed: 8.1.0-1\n' ;;
   *) exit 100 ;;
 esac
 EOF

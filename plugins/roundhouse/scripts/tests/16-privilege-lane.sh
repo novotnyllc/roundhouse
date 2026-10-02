@@ -220,6 +220,19 @@ lane_env "$cli" lookup-privilege-result "$lane_tmp/plan.json" 1 "$lane_tmp/looku
   fail 'lookup-privilege-result failed for a completed lane operation'
 grep -Fqx 'reason|package_upgraded' "$lane_tmp/lookup.result" || fail "lookup result: $(cat "$lane_tmp/lookup.result")"
 [ ! -s "$lane_tmp/apt.log" ] || fail 'lookup-privilege-result executed something'
+# An expired plan still answers a lookup (the host keeps results for seven
+# days) but never a submission.
+jq -S '.expires_at = "2000-01-01T00:00:00Z" | del(.plan_id, .plan_digest)' "$lane_tmp/plan.json" >"$lane_tmp/expired-unsealed.json"
+lane_expired_digest=$(jq -cS . "$lane_tmp/expired-unsealed.json" | shasum -a 256 | awk '{print $1}')
+jq -S --arg id "plan-${lane_expired_digest:0:16}" --arg d "$lane_expired_digest" \
+  '. + {plan_id:$id, plan_digest:{algorithm:"sha256", value:$d}}' "$lane_tmp/expired-unsealed.json" >"$lane_tmp/expired-plan.json"
+chmod 600 "$lane_tmp/expired-plan.json"
+lane_env "$cli" lookup-privilege-result "$lane_tmp/expired-plan.json" 1 "$lane_tmp/expired-lookup.result" >/dev/null 2>"$lane_tmp/expired-lookup.err" ||
+  fail "lookup refused an expired plan: $(cat "$lane_tmp/expired-lookup.err")"
+grep -Fqx 'reason|package_upgraded' "$lane_tmp/expired-lookup.result" || fail 'lookup through an expired plan returned the wrong result'
+lane_rc=0
+lane_env "$cli" submit-privilege-plan "$lane_tmp/expired-plan.json" "plan-${lane_expired_digest:0:16}" "$lane_tmp/expired-apply.jsonl" >/dev/null 2>"$lane_tmp/expired-apply.err" || lane_rc=$?
+[ "$lane_rc" -eq 65 ] && grep -q 'expired' "$lane_tmp/expired-apply.err" || fail "an expired plan was submitted (rc $lane_rc)"
 # The plan's request ids were consumed: a second submission is a replay and
 # never executes again.
 lane_rc=0
@@ -285,6 +298,12 @@ lane_rc=0
   lane_last_result=$(ls -t "$lane_tmp/fixture/var/lib/roundhouse-lane/results"/*.result | head -n 1)
   grep -Eq '^plan-id\|plan-[0-9a-f]{16}$' "$lane_last_result" || fail "host-local install did not ride a sealed plan: $(grep '^plan-id' "$lane_last_result")"
   grep -Eq '^plan-sha256\|[0-9a-f]{64}$' "$lane_last_result" || fail 'host-local install carried no plan digest'
+  # A host that runs scheduled passes may carry no controller config.json:
+  # the host-local path does not consult it.
+  : >"$lane_tmp/apt.log"
+  ROUNDHOUSE_CONFIG="$lane_tmp/absent-config.json" lane_env fleet_install_package apt curl false 8.2.0-1 ||
+    fail 'the host-local lane path required a controller config.json'
+  grep -q 'install curl=8.2.0-1' "$lane_tmp/apt.log" || fail 'the host-local install without config.json did not reach apt-get'
   # An unpinned install carries the `-` sentinel, never an empty version.
   : >"$lane_tmp/apt.log"
   lane_env fleet_install_package apt curl false || fail "unpinned fleet_install_package apt failed"
