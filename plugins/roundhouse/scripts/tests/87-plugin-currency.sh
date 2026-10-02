@@ -609,6 +609,19 @@ SH
     [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
       ! grep -q '^trust' "$pc/hooks-state/log" ||
       fail "a Codex copy with a symlink escaping the plugin root had its modified hook trusted (got $pc_status)"
+    # ...and so is one that escapes INDIRECTLY, through an excluded marker.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    for pc_tree in "$pc/claude-installs/widget@m/1.1.0" "$pc/codex-home/plugins/cache/m/widget/new"; do
+      ln -s "$pc" "$pc_tree/.in_use"
+      ln -s ../.in_use/outside-hooks.json "$pc_tree/hooks/extra.json"
+    done
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+      ! grep -q '^trust' "$pc/hooks-state/log" ||
+      fail "a symlink escaping through an excluded marker had its modified hook trusted (got $pc_status)"
     # ...a hook that was NEVER trusted is not carried over: no new grants.
     pc_hooks_reset
     fleet_run_marketplace_repair_reset

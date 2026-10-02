@@ -2,9 +2,9 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 
 const TIMEOUT_MS = 15_000;
@@ -37,13 +37,22 @@ function treeEntries(root, { rejectEscapingLinks = false } = {}) {
       if (stat.isSymbolicLink()) {
         const target = readlinkSync(full);
         // Two installs can hold the same escaping link text and still resolve
-        // it to different bytes, so carrying trust refuses any link that
-        // leaves the plugin root.
+        // it to different bytes, so carrying trust refuses any link whose
+        // WHOLE chain does not end inside the root, on content the tree
+        // compares (not under an excluded marker such as `.in_use`).
         if (rejectEscapingLinks) {
-          const base = resolve(root);
-          const to = isAbsolute(target) ? target : resolve(dirname(full), target);
-          if (to !== base && !to.startsWith(base + sep)) {
-            throw new Error(`symlink escapes the plugin root: ${relPath}`);
+          const base = realpathSync(root);
+          let to;
+          try {
+            to = realpathSync(full);
+          } catch {
+            throw new Error(`symlink does not resolve: ${relPath}`);
+          }
+          const inside = to.startsWith(base + sep) ? to.slice(base.length + 1) : null;
+          const top = inside === null ? null : inside.split(sep)[0];
+          if (inside === null || top === ".git" || top === ".in_use" || top === ".orphaned_at" ||
+            top === ".codex-marketplace-install.json") {
+            throw new Error(`symlink escapes the compared plugin tree: ${relPath}`);
           }
         }
         entries.set(relPath, `link ${target}`);

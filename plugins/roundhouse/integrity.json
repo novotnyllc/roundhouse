@@ -50,7 +50,7 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
-      "sha256": "88928198d1780934831913a3a51d0a436451de114265c6f2025a8e8f05655f5f"
+      "sha256": "5f395ca509f245bfb57b5df9ecb84b6ccbe1039161e50c70cc6c12ea4eeb6b98"
     },
     {
       "path": "scripts/codex-plugin-hooks.ps1",
