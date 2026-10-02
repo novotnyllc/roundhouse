@@ -1789,10 +1789,85 @@ fleet_run_approve_plugin_hooks() {
   fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" \
     "$fleet_run_expected_sha") || return 75
   [ "$fleet_run_codex_plugin_state" = match ] || return 75
+  # Codex advances its own copies (its startup sync), so a hook this host
+  # trusted reads `modified` once upstream changed it. Automatic approval
+  # carries that trust only for bytes PROVEN to be the verified upstream ones
+  # (fleet_run_codex_bytes_verified); otherwise the helper refuses a modified
+  # hook, and a never-trusted hook is refused either way.
+  fleet_run_hook_bytes=0
+  fleet_run_bytes_reason=
+  if [ -n "$fleet_run_expected_sha" ] &&
+    fleet_run_codex_bytes_verified "$1" "$fleet_run_expected_sha"; then
+    fleet_run_hook_bytes=1
+  fi
   fleet_run_cli_invalidate
   ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
+    ROUNDHOUSE_AUTOMATIC_HOOK_BYTES_VERIFIED=$fleet_run_hook_bytes \
     "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
-    >/dev/null || return 75
+    >/dev/null || {
+    [ -z "$fleet_run_bytes_reason" ] ||
+      printf 'roundhouse: automatic hook approval for %s carried no trust: %s\n' \
+        "$1" "$fleet_run_bytes_reason" >&2
+    return 75
+  }
+}
+
+fleet_run_codex_bytes_verified() {
+  # fleet_run_codex_bytes_verified ID SHA — exit 0 when Codex's installed
+  # copy of ID is byte-identical to Claude's verified install at SHA: the
+  # Codex record comes from the intended source (fleet_run_codex_source_ok)
+  # at SHA, Claude's user-scoped install is at SHA, and the two installed
+  # trees hash the same under fleet_run_tree_digest (the same digest and
+  # exclusions the relative-source identity uses). Otherwise 1, with the
+  # cause in `fleet_run_bytes_reason`.
+  fleet_run_bytes_reason=
+  fleet_run_codex_source_ok "$1" || {
+    fleet_run_bytes_reason="Codex's copy is not from the source Claude's catalog names"
+    return 1
+  }
+  fleet_run_bv_record=$(fleet_run_codex_record "$1") || {
+    fleet_run_bytes_reason='the Codex plugin list is unreadable'
+    return 1
+  }
+  fleet_run_bv_fields=$(printf '%s\n' "$fleet_run_bv_record" | jq -r '
+    [(.source.sha // ""), (.marketplaceName // ""), (.name // ""), (.version // "")] |
+    map(tostring) | join("\u001f")') || fleet_run_bv_fields=
+  IFS=$fleet_run_sep read -r fleet_run_bv_sha fleet_run_bv_market fleet_run_bv_name \
+    fleet_run_bv_version <<EOF
+$fleet_run_bv_fields
+EOF
+  [ "$fleet_run_bv_sha" = "$2" ] || {
+    fleet_run_bytes_reason="Codex's copy is at ${fleet_run_bv_sha:-no SHA}, not $2"
+    return 1
+  }
+  fleet_run_bv_claude=$(fleet_run_installed_plugin "$1" 2>/dev/null) || fleet_run_bv_claude='{}'
+  fleet_run_bv_claude_path=$(printf '%s\n' "$fleet_run_bv_claude" | jq -r --arg sha "$2" '
+    if (.gitCommitSha // "") == $sha then (.installPath // "") else "" end') ||
+    fleet_run_bv_claude_path=
+  [ -n "$fleet_run_bv_claude_path" ] && [ -d "$fleet_run_bv_claude_path" ] || {
+    fleet_run_bytes_reason="no Claude install of $1 at $2 to compare against"
+    return 1
+  }
+  for fleet_run_bv_part in "$fleet_run_bv_market" "$fleet_run_bv_name" "$fleet_run_bv_version"; do
+    case $fleet_run_bv_part in '' | . | .. | */*) fleet_run_bytes_reason="Codex's record names no installed copy"; return 1 ;; esac
+  done
+  fleet_run_bv_codex_path="${CODEX_HOME:-$HOME/.codex}/plugins/cache/$fleet_run_bv_market/$fleet_run_bv_name/$fleet_run_bv_version"
+  [ -d "$fleet_run_bv_codex_path" ] || {
+    fleet_run_bytes_reason="Codex's installed copy is missing at $fleet_run_bv_codex_path"
+    return 1
+  }
+  fleet_run_bv_want=$(fleet_run_tree_digest "$fleet_run_bv_claude_path") || {
+    fleet_run_bytes_reason="Claude's install of $1 could not be hashed"
+    return 1
+  }
+  fleet_run_bv_have=$(fleet_run_tree_digest "$fleet_run_bv_codex_path") || {
+    fleet_run_bytes_reason="Codex's installed copy of $1 could not be hashed"
+    return 1
+  }
+  [ "$fleet_run_bv_want" = "$fleet_run_bv_have" ] || {
+    fleet_run_bytes_reason="Codex's installed copy of $1 differs byte-for-byte from Claude's verified install at $2"
+    return 1
+  }
 }
 
 fleet_run_codex_record() {

@@ -330,14 +330,27 @@ SH
         source: {source: "git", url: "https://example.invalid/widget.git", sha: $b}}]}' \
         >"$pc/hooks-catalog.json"
       printf '%s\n' '{"widget@m":true}' >"$pc/hooks-enabled.json"
+      # The installed trees: Claude's verified install at the new SHA, and
+      # Codex's copies by version (`new` is byte-identical to Claude's).
+      rm -rf "$pc/claude-installs" "$pc/codex-home"
+      for pc_tree in "$pc/claude-installs/widget@m/1.1.0" \
+        "$pc/codex-home/plugins/cache/m/widget/new"; do
+        mkdir -p "$pc_tree/hooks"
+        printf '%s\n' '{"hooks":{"Stop":[{"command":"echo new"}]}}' >"$pc_tree/hooks/hooks.json"
+        printf 'widget 1.1.0\n' >"$pc_tree/README.md"
+      done
+      mkdir -p "$pc/codex-home/plugins/cache/m/widget/old/hooks"
+      printf '%s\n' '{"hooks":{"Stop":[{"command":"echo old"}]}}' \
+        >"$pc/codex-home/plugins/cache/m/widget/old/hooks/hooks.json"
     }
     pc_hooks_apply() {
-      PATH="$pc/hooks-bin:$PATH" PC_HOOKS_STATE="$pc/hooks-state" \
+      CODEX_HOME="$pc/codex-home" CLAUDE_INSTALL_PATH_ROOT="$pc/claude-installs" \
+        PATH="$pc/hooks-bin:$PATH" PC_HOOKS_STATE="$pc/hooks-state" \
         CLAUDE_PLUGIN_CATALOG_FILE="$pc/hooks-catalog.json" \
         CLAUDE_PLUGIN_ENABLED_FILE="$pc/hooks-enabled.json" \
         CLAUDE_INSTALL_MARKER="$pc/hooks-installs" \
         fleet_run_apply_item "$pc/store" vireo '{}' plugins.widget \
-          '{"state":"enabled","marketplace":"m"}' '' >/dev/null 2>&1
+          '{"state":"enabled","marketplace":"m"}' '' >/dev/null 2>"$pc/hooks-err"
     }
     pc_hooks_reset
     fleet_run_marketplace_repair_reset
@@ -362,18 +375,49 @@ SH
     ! grep -q codex-add "$pc/hooks-state/log" ||
       fail "a Codex copy already at the expected bytes was reinstalled: $(tr '\n' ';' <"$pc/hooks-state/log")"
     # Codex already advanced the copy AND its hooks changed upstream (they
-    # read `modified` against the old trusted hash), source verified. The
-    # item loop's AUTOMATIC approval refuses a modified hook, so the item
-    # holds and nothing is stamped. (Accepting this case is an open decision:
-    # see the plugin-currency report; flip this block when it is made.)
+    # read `modified` against the old trusted hash), from the verified source
+    # at the expected SHA, its installed tree byte-identical to Claude's
+    # verified install: automatic approval CARRIES the existing trust to the
+    # new hash, and the item applies. No reinstall.
     pc_hooks_reset
     fleet_run_marketplace_repair_reset
     printf '%s\n' new >"$pc/hooks-state/version"
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+    [ "$pc_status" -eq 0 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:new ] &&
       ! grep -q codex-add "$pc/hooks-state/log" ||
-      fail "an advanced copy's modified hook was handled differently than automatic approval allows (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
+      fail "a byte-verified advanced copy's changed hook was not carried to its new hash (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    # ...a ONE-BYTE local edit in Codex's tree is not the verified bytes.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    printf 'widget 1.1.1\n' >"$pc/codex-home/plugins/cache/m/widget/new/README.md"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+      fail "a locally edited Codex copy had its modified hook trusted (got $pc_status)"
+    grep -q "differs byte-for-byte from Claude's verified install" "$pc/hooks-err" ||
+      fail "the refusal did not name the byte mismatch: $(tr '\n' ';' <"$pc/hooks-err")"
+    # ...a hook that was NEVER trusted is not carried over: no new grants.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    : >"$pc/hooks-state/trusted"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] && [ ! -s "$pc/hooks-state/trusted" ] ||
+      fail "automatic approval granted trust to a never-trusted hook (got $pc_status)"
+    # ...and with no Claude install at that SHA there is nothing to compare.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    rm -rf "$pc/claude-installs"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+      fail "a modified hook was trusted with no Claude install to compare against (got $pc_status)"
+    grep -q 'no Claude install of widget@m' "$pc/hooks-err" ||
+      fail "the refusal did not name the missing Claude install: $(tr '\n' ';' <"$pc/hooks-err")"
     # The helper's update NEVER reports trust it did not carry: when Codex's
     # startup sync advances the copy under its snapshot (trusted hooks then
     # read modified), it says so and fails, and writes nothing.

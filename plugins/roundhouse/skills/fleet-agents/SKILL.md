@@ -860,14 +860,52 @@ target's installed Roundhouse version from its active Codex plugin
 record, and set `TARGET_CLI` to that target cache's
 `roundhouse/VERSION/scripts/roundhouse`; never send or interpolate
 the controller's `SKILL_DIR` or `CLI`. Require `"$TARGET_CLI" verify-executor`
-to pass before using it. Run only these target-native command sequences, in
-order, substituting the authorized marketplace and each installed plugin ID:
+to pass before using it.
+
+**Codex follows its own startup sync.** Every Codex app server start fetches
+Codex's Git marketplaces and reinstalls the plugins installed from them, so
+there is no catalog-only refresh and no per-plugin hold on the Codex side.
+Do not run `codex plugin marketplace upgrade` followed by
+`update-codex-plugin`: the upgrade has already reinstalled the plugins, so the
+helper's trust snapshot sees their changed hooks as `modified`, and
+`update-codex-plugin` now refuses (exit non-zero, nothing written) rather
+than report trust it did not carry. To bring a host's Codex plugins current,
+trigger Codex's own sync and wait for it:
 
 ```text
+codex plugin marketplace list --json
+node "$SKILL_DIR/../../scripts/codex-plugin-hooks.mjs" sync ROOT REVISION [ROOT REVISION ...]
 codex plugin list --json
-codex plugin marketplace upgrade MARKETPLACE --json
-"$TARGET_CLI" update-codex-plugin EACH_INSTALLED_PLUGIN@MARKETPLACE
+```
 
+where each `ROOT` is a Git marketplace's root from the listing and `REVISION`
+its upstream head (`git ls-remote`). The helper holds a Codex app server open
+until each root records its revision (30s at most) and exits 75 for any it
+did not reach.
+
+Hook trust then follows two rules:
+
+- **The fleet's own plugins** are approved by the scheduled run's item loop
+  after Claude updates them: it verifies that Codex's copy comes from the same
+  plugin source at the expected SHA, and that Codex's installed tree is
+  byte-identical to Claude's verified install, before automatic approval may
+  carry a `modified` hook's existing trust to its new hash. A hook that was
+  never trusted, a one-byte difference, or a missing Claude install refuses,
+  and the item holds, naming the cause.
+- **Third-party Codex plugins** whose hooks changed upstream stay untrusted
+  until the user approves them for that exact plugin and host, as Codex
+  itself leaves them: `"$TARGET_CLI" approve-codex-plugin-hooks
+  PLUGIN@MARKETPLACE` (see **Codex hook approval** below).
+
+`update-codex-plugin` remains as a command but has no remaining correct use
+for carrying trust across an upstream change: an app server start inside it
+advances the copy before its snapshot, so at best it is a no-op reinstall of
+an already current copy.
+
+For Claude, run only this target-native sequence, substituting the authorized
+marketplace and each installed plugin ID:
+
+```text
 claude plugin list --json
 claude plugin marketplace update MARKETPLACE
 claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user
@@ -876,23 +914,15 @@ claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user
 Require every frozen ID to end in the exact `@MARKETPLACE` suffix and attempt
 every ID even if another update fails. Do not add IDs that appear only after the
 catalog refresh. Update `roundhouse@novotnyllc` last when present, then
-recapture inventory and re-resolve its installed executor. After every Codex plugin
-install or update, run the hook-approval helper —
-`node "$SKILL_DIR/../../scripts/codex-plugin-hooks.mjs" approve
-PLUGIN@MARKETPLACE` — so ALL of the plugin's current hooks are trusted with
-their fresh hashes: new hooks, changed hooks, hooks never before on this
-machine. An installed plugin is a trusted plugin; a hook left silently
-untrusted after an update is the failure mode this exists to prevent. The
-helper discovers hooks against a fresh Codex app server, writes only
-matching `trusted_hash` leaves, and preserves disabled and unrelated hook
-state. Do not synchronize unrelated marketplaces, runtimes,
-settings, skills, provenance, or configuration. Manager output is progress
-evidence, not post-state. Recapture the bounded `agents` inventory after each
-harness attempt. Require every frozen marketplace plugin record to remain
-installed with its enabled state and Claude scope preserved; require every
-outside-marketplace record to be unchanged. Report before/after versions per
-plugin. A failure in one plugin or harness does not erase other evidence or stop
-the remaining marketplace plugins from being attempted.
+recapture inventory and re-resolve its installed executor. Do not synchronize
+unrelated marketplaces, runtimes, settings, skills, provenance, or
+configuration. Manager output is progress evidence, not post-state. Recapture
+the bounded `agents` inventory after each harness attempt. Require every
+frozen marketplace plugin record to remain installed with its enabled state
+and Claude scope preserved; require every outside-marketplace record to be
+unchanged. Report before/after versions per plugin, and any Codex hooks left
+untrusted. A failure in one plugin or harness does not erase other evidence or
+stop the remaining marketplace plugins from being attempted.
 
 Plugin dependencies belong to the workflow that declares them. Execute only
 the user-authorized desired state supplied by that owner, using each target's
@@ -902,11 +932,11 @@ or reinstall a removed plugin merely because a workflow previously used it.
 
 The only pre-helper fallback is a separately approved self-update of
 `roundhouse@novotnyllc` from an integrity-verified release that lacks
-`update-codex-plugin`. After upgrading the `novotnyllc` marketplace, run exactly
-`codex plugin add roundhouse@novotnyllc --json`, recapture inventory,
-reload the new target-native plugin, and require its version `0.5.1` executor
-and integrity verification before any other mutation. Never use that raw-add
-fallback for another plugin or once the helper command is available.
+`codex-plugin-hooks.mjs sync`: run exactly `codex plugin add
+roundhouse@novotnyllc --json`, recapture inventory, reload the new
+target-native plugin, and require its integrity verification before any other
+mutation. Never use that raw-add fallback for another plugin or once the
+helper command is available.
 
 For a native-Windows target with a configured `wsl_interop_via` sibling,
 prefer the WSL interop lane for this whole routine: SSH to the sibling,

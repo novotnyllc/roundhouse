@@ -369,7 +369,9 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = install ]; then
       "\$CLAUDE_PLUGIN_CATALOG_FILE")
     if [ -n "\$resolved" ]; then
       record=\$(printf '%s\n' "\$resolved" |
-        jq -c '{scope:"user", version: .version, gitCommitSha: .source.sha}')
+        jq -c --arg root "\${CLAUDE_INSTALL_PATH_ROOT:-}" --arg id "\$3" '
+          {scope:"user", version: .version, gitCommitSha: .source.sha} +
+          (if \$root == "" then {} else {installPath: (\$root + "/" + \$id + "/" + .version)} end)')
       jq -c --arg id "\$3" --argjson rec "\$record" \
         '.plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user")) + [\$rec])' \
         "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"
@@ -425,7 +427,9 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
       "\$CLAUDE_PLUGIN_CATALOG_FILE")
     if [ -n "\$resolved" ]; then
       record=\$(printf '%s\n' "\$resolved" |
-        jq -c '{scope:"user", version: .version, gitCommitSha: .source.sha}')
+        jq -c --arg root "\${CLAUDE_INSTALL_PATH_ROOT:-}" --arg id "\$3" '
+          {scope:"user", version: .version, gitCommitSha: .source.sha} +
+          (if \$root == "" then {} else {installPath: (\$root + "/" + \$id + "/" + .version)} end)')
       jq -c --arg id "\$3" --argjson rec "\$record" \
         '.plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user")) + [\$rec])' \
         "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"

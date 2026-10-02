@@ -379,11 +379,22 @@ async function main() {
   const cwd = process.cwd();
   if (command === "approve") {
     const hooks = await listHooks(pluginId, cwd, codexExecutable);
-    if (
-      process.env.ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL === "1" &&
-      hooks.some((hook) => ["modified", "untrusted"].includes(hook.trustStatus))
-    ) {
-      fail(`automatic approval refuses an untrusted or locally modified hook: ${pluginId}`);
+    if (process.env.ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL === "1") {
+      // Automatic approval CARRIES EXISTING TRUST; it never grants new trust.
+      // A hook never trusted before is refused, always. A `modified` hook —
+      // trusted once, its bytes since changed — is carried to its new hash
+      // only when the caller proved the installed bytes are the verified
+      // upstream ones (ROUNDHOUSE_AUTOMATIC_HOOK_BYTES_VERIFIED=1: same source,
+      // same SHA, a byte-identical tree); a local edit is refused.
+      if (hooks.some((hook) => hook.trustStatus === "untrusted")) {
+        fail(`automatic approval refuses a hook that was never trusted: ${pluginId}`);
+      }
+      if (
+        hooks.some((hook) => hook.trustStatus === "modified") &&
+        process.env.ROUNDHOUSE_AUTOMATIC_HOOK_BYTES_VERIFIED !== "1"
+      ) {
+        fail(`automatic approval refuses a locally modified hook: ${pluginId}`);
+      }
     }
     if (!hooks.length) {
       // A hookless plugin is the normal case, not an error: approve means
