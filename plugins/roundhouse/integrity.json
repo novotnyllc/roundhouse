@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "4e73a8cd581748526c586ef83dc067b67b5282141105ed0b072808328ea338b4"
+      "sha256": "b4f91c4175cc3d7ad26897572d682589bd36d89dee4666305e666f6155835492"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "d215830fcb45f66b8d12fbe990f859a18f0dc486543adea88023d849bef68c5d"
+      "sha256": "2ddf59cc0eccd659d2b3b60b31f1b39acdc1506ca55b3d316c7e462c3af1d9fb"
     },
     {
       "path": "assets/icon.png",
@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
-      "sha256": "a5d048eb1b28954d9c3cd56f745374d2cd9e367b08d2669a67e31ab88c17e144"
+      "sha256": "95b1e3105c377692618a2fb5f23799853c614d95cf2ff035ca561d1f131f250a"
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
@@ -166,7 +166,7 @@
     },
     {
       "path": "scripts/lib/fleet-trigger.sh",
-      "sha256": "661c396637939a38e13687581655f56f263b5528f8732dad872d5a25e6a84435"
+      "sha256": "b071249668532f67daf4f8e95fee9353cdcd25e925171b73a476d365adb88c96"
     },
     {
       "path": "scripts/lib/fleet-trust-migrate.sh",
@@ -373,5 +373,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.56"
+  "version": "0.9.57"
 }

@@ -984,6 +984,7 @@ fleet_run_command --fast'
     # trigger only stamps and a pass raises nothing. A removed definition is
     # kept, as .removed.
     : >"$SCHED_LOG"
+    fleet_trigger_request_full
     "$cli" fleet-schedule uninstall >/dev/null || fail "fleet-schedule uninstall failed"
     [ ! -e "$sched_fast" ] && [ ! -e "$sched_full" ] || fail "uninstall left a job behind"
     [ -f "$sched_fast.removed" ] || fail "uninstall kept no .removed copy of the definition"
@@ -992,6 +993,8 @@ fleet_run_command --fast'
       fail "uninstall did not unload the fast job"
     [ ! -e "$(fleet_schedule_marker)" ] || fail "uninstall left the install marker"
     [ -e "$(fleet_schedule_optout_path)" ] || fail "uninstall left no opt-out marker"
+    [ ! -e "$(fleet_trigger_full_path)" ] ||
+      fail "uninstall left a pending full request for a later install to inherit"
     : >"$sched_fast"
     : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-fast"
     : >"$SCHED_LOG"
