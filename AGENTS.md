@@ -38,7 +38,7 @@ prerequisite, and the Windows job — is in
   what belongs in `railyard` or `agent-utilities`
 - [Verification](docs/agents/verification.md) — every CI gate, reproduced
   locally
-- [Release coupling](docs/agents/release-coupling.md) — version bump,
-  integrity, repin, docs-only exemption
+- [Release coupling](docs/agents/release-coupling.md) — PRs never bump the
+  version; it is bumped once at release, then integrity and repin
 - [Transports and privileged lanes](docs/agents/transports.md) — SSH,
   remote-control contract, brokers
