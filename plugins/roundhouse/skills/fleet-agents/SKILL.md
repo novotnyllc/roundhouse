@@ -897,9 +897,10 @@ it is at that revision's catalog identity (30s at most; Codex records the
 revision before it reinstalls), and exits 75 for any it did not reach. The
 helper is the verified target's own, beside `"$TARGET_CLI"`; never send the
 controller's `SKILL_DIR` copy over SSH. An enabled install from an unpinned
-remote catalog entry carries no identity to wait on: `sync` holds the server
-open for a short grace and reports the root `unconfirmed`, and the pass does
-not remember its head, so every fast pass syncs it again. `sync` reads the
+remote catalog entry, or one the catalog no longer lists (removed or renamed
+upstream), carries no identity to wait on: `sync` holds the server open for a
+short grace and reports the root `unconfirmed`, and the pass does not remember
+its head, so every fast pass syncs it again. `sync` reads the
 catalog from each layout Codex supports (`.agents/plugins/marketplace.json`,
 `.agents/plugins/api_marketplace.json`, `.claude-plugin/marketplace.json`,
 `.cursor-plugin/marketplace.json`).
@@ -912,7 +913,12 @@ Hook trust then follows two rules:
   byte-identical to Claude's verified install, before automatic approval may
   carry a `modified` hook's existing trust to its new hash. A hook that was
   never trusted, a one-byte difference, or a missing Claude install refuses,
-  and the item holds, naming the cause.
+  and the item holds, naming the cause. An approval that fails transiently (an
+  app server or plugin list that failed or timed out) holds as transient, so
+  the next fast pass retries it. Both caches are sealed first (group/other
+  write removed, up to the harness home); a cache root that is a symlink or
+  owned by another user, or a symlink inside it that resolves outside it,
+  refuses.
 - **Third-party Codex plugins** whose hooks changed upstream stay untrusted
   until the user approves them for that exact plugin and host, as Codex
   itself leaves them: `"$TARGET_CLI" approve-codex-plugin-hooks

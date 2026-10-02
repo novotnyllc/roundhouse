@@ -1814,18 +1814,27 @@ fleet_run_approve_plugin_hooks() {
     fleet_run_hook_source_path=$fleet_run_bv_local_path
   fi
   fleet_run_cli_invalidate
+  # The helper exits 75 for a refusal (a never-trusted or locally modified
+  # hook, a copy no longer at the verified identity, a cache it cannot
+  # seal): standing until something else changes. Any other failure — an
+  # app server or `codex plugin list` that failed or timed out — is
+  # transient (74), so the pass owes a retry: the marketplace head is
+  # already remembered, and a 75 here would leave changed hooks untrusted
+  # until the full cadence.
+  fleet_run_hooks_status=0
   ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
     ROUNDHOUSE_VERIFIED_SHA=$fleet_run_hook_sha \
     ROUNDHOUSE_VERIFIED_TREE=$fleet_run_hook_tree \
     ROUNDHOUSE_CODEX_TREE=$fleet_run_hook_codex_tree \
     ROUNDHOUSE_CODEX_SOURCE_PATH=$fleet_run_hook_source_path \
     "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
-    >/dev/null || {
-    [ -z "$fleet_run_bytes_reason" ] ||
-      printf 'roundhouse: automatic hook approval for %s carried no trust: %s\n' \
-        "$1" "$fleet_run_bytes_reason" >&2
-    return 75
-  }
+    >/dev/null || fleet_run_hooks_status=$?
+  [ "$fleet_run_hooks_status" -ne 0 ] || return 0
+  [ -z "$fleet_run_bytes_reason" ] ||
+    printf 'roundhouse: automatic hook approval for %s carried no trust: %s\n' \
+      "$1" "$fleet_run_bytes_reason" >&2
+  [ "$fleet_run_hooks_status" -eq 75 ] || return 74
+  return 75
 }
 
 fleet_run_codex_bytes_verified() {
@@ -2592,11 +2601,19 @@ EOF
         fleet_run_marketplace_source_ok "$fleet_run_market" || return $?
         # A repair that failed in a bounded manager call is transient (74); a
         # catalog that still cannot prove the bytes after a repair is
-        # standing (75): no entry, or an entry with no SHA.
+        # standing (75): no entry, or an entry with no SHA. A re-read whose
+        # marketplace list failed or timed out proves nothing either way and
+        # stays transient (74), so the next pass asks again.
         fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id") || {
           fleet_run_marketplace_repair "$fleet_run_market" || return $?
+          fleet_run_catalog_status=0
           fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id") ||
-            return 75
+            fleet_run_catalog_status=$?
+          case $fleet_run_catalog_status in
+            0) ;;
+            74) return 74 ;;
+            *) return 75 ;;
+          esac
         }
         fleet_run_resolved_sha=$(printf '%s\n' "$fleet_run_catalog" |
           jq -r '.source.sha // empty')
@@ -2647,6 +2664,13 @@ EOF
               "$fleet_run_resolved_sha" refresh || return $?
           fi
           fleet_run_plugin_mutated=true
+        else
+          # Already current — Claude or the user updated it under umask 002,
+          # say — so no install or update ran, and nothing above sealed it.
+          # A converged item whose hooks stay group-writable is not
+          # converged: seal it before its state is verified or its hooks
+          # are approved.
+          plugin_cache_seal_permissions "$fleet_run_id" || return 75
         fi
       else
         fleet_run_cli_invalidate

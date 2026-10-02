@@ -198,6 +198,53 @@ JSON
       fleet_run_marketplace_source_ok test-market ||
       fail "a marketplace registered from its declared source failed the source check"
     [ ! -s "$run_repair_updates" ] || fail "a healthy marketplace was refreshed by its source check"
+    # #91: after a SUCCESSFUL repair the catalog is read once more, and when
+    # `--available` has no SHA that re-read falls back to the marketplace
+    # list. A list that fails or times out there proves nothing about the
+    # entry: the hold stays transient (74, retry owed), not a standing 75.
+    run_mlist_bin="$run_repair_root/mlist-bin"
+    run_mlist_updated="$run_repair_root/mlist-updated"
+    mkdir -p "$run_mlist_bin"
+    cat >"$run_mlist_bin/claude" <<SH
+#!/usr/bin/env bash
+case "\${1:-} \${2:-} \${3:-}" in
+  'plugin marketplace list') [ ! -e "$run_mlist_updated" ] || exit 1 ;;
+  'plugin marketplace update') : >"$run_mlist_updated" ;;
+esac
+exec "$(command -v claude)" "\$@"
+SH
+    chmod +x "$run_mlist_bin/claude"
+    rm -f "$run_mlist_updated"
+    : >"$run_repair_updates"
+    fleet_run_marketplace_repair_reset
+    run_status=0
+    PATH="$run_mlist_bin:$PATH" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
+      CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_repair_markets" \
+      CLAUDE_MARKETPLACE_UPDATE_MARKER="$run_repair_updates" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    grep -Fqx test-market "$run_repair_updates" ||
+      fail "the post-repair fixture did not repair the marketplace first"
+    [ "$run_status" -eq 74 ] ||
+      fail "a catalog re-read whose marketplace list failed after a repair held as standing (got $run_status)"
+    # The identity proof the unowned updates use says the same: transient.
+    rm -f "$run_mlist_updated"
+    fleet_run_marketplace_repair_reset
+    PATH="$run_mlist_bin:$PATH" run_repair_identity
+    [ "$run_identity_status" -eq 74 ] ||
+      fail "an identity proof cut off by a failed marketplace list held as standing (got $run_identity_status)"
+    # ...while a re-read that answers with no entry still holds as standing.
+    fleet_run_marketplace_repair_reset
+    run_status=0
+    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
+      CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_repair_markets" \
+      CLAUDE_MARKETPLACE_UPDATE_MARKER="$run_repair_updates" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "a catalog with no entry after a repair did not hold as standing (got $run_status)"
     mv "$run_repair_root/manifest.saved" "$run_repair_checkout/.claude-plugin/marketplace.json"
     rm -f "$HOME/.claude/settings.json"
     # Still unproven after the refresh: hold, once, and say why.

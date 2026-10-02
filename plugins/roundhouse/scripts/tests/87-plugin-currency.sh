@@ -327,6 +327,20 @@ SH
     )
     jq '(.installed[] | select(.name == "loose") | .enabled) = false' "$PC_CODEX_INSTALLED" \
       >"$PC_CODEX_INSTALLED.tmp" && mv "$PC_CODEX_INSTALLED.tmp" "$PC_CODEX_INSTALLED"
+    # #97: an ENABLED install the refreshed catalog no longer lists (removed
+    # or renamed upstream) has no identity to wait on either: UNCONFIRMED,
+    # never current, so its head is not remembered and fast passes retry.
+    jq '.installed += [{pluginId: "gone@novotnyllc", name: "gone", marketplaceName: "novotnyllc",
+      version: "1", installed: true, enabled: true, source: {source: "git-subdir", sha: "old"}}]' \
+      "$PC_CODEX_INSTALLED" >"$PC_CODEX_INSTALLED.tmp" && mv "$PC_CODEX_INSTALLED.tmp" "$PC_CODEX_INSTALLED"
+    pc_status=0
+    pc_out=$(ROUNDHOUSE_CODEX_UNCONFIRMED_GRACE_MS=200 node "$script_dir/codex-plugin-hooks.mjs" sync \
+      --codex-executable "$pc/bin/codex" "$pc/codex-root" "$(cat "$PC_CODEX_SYNC_TO")") || pc_status=$?
+    [ "$pc_status" -eq 0 ] &&
+      [ "$(printf '%s' "$pc_out" | jq -c '[.missing, .unconfirmed]')" = "[[],[\"$pc/codex-root\"]]" ] ||
+      fail "an enabled install with no catalog entry left the root current, not unconfirmed (got $pc_status): $pc_out"
+    jq 'del(.installed[] | select(.name == "gone"))' "$PC_CODEX_INSTALLED" \
+      >"$PC_CODEX_INSTALLED.tmp" && mv "$PC_CODEX_INSTALLED.tmp" "$PC_CODEX_INSTALLED"
     # Codex reads other catalog layouts too: a marketplace whose catalog is
     # `.claude-plugin/marketplace.json` alone is confirmed, not left missing.
     rm -rf "$pc/codex-root/.agents"
@@ -417,6 +431,116 @@ SH
       [ "$(fleet_plugins_memo_read claude m attempted)" = "$pc_claude_head" ] ||
         fail "a marketplace whose unowned updates all converged was not remembered"
     )
+    # #97: a STANDING hold (here an unowned plugin whose catalog entry is
+    # gone upstream) still remembers the head, or every fast pass would
+    # refresh a marketplace only a change elsewhere can unblock. A TRANSIENT
+    # one (the marketplace list failing once the refresh ran) does not.
+    jq 'del(.available[] | select(.pluginId == "gadget@m"))' "$pc/catalog.json" \
+      >"$pc/catalog-gone.json"
+    mkdir -p "$pc/mlist-bin"
+    cat >"$pc/mlist-bin/claude" <<SH
+#!/usr/bin/env bash
+case "\${1:-} \${2:-} \${3:-}" in
+  'plugin marketplace list') [ ! -e "$pc/mlist-updated" ] || exit 1 ;;
+  'plugin marketplace update') [ -z "\${PC_MLIST_FAIL:-}" ] || : >"$pc/mlist-updated" ;;
+esac
+exec "$(command -v claude)" "\$@"
+SH
+    chmod +x "$pc/mlist-bin/claude"
+    pc_claude_head=cccccccccccccccccccccccccccccccccccccccc
+    pc_moved="claude${us}m${us}$pc_claude_head$us"
+    (
+      fleet_plugins_probed=true fleet_plugins_moved="$pc_moved
+"
+      PATH="$pc/mlist-bin:$PATH"
+      rm -f "$(fleet_plugins_memo_path claude m attempted)" "$pc/mlist-updated"
+      fleet_run_marketplace_repair_reset
+      pc_out=$(PC_MLIST_FAIL=1 CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog-gone.json" \
+        fleet_plugins_refresh "$pc/store" vireo '{}' '{}' fast "$pc")
+      [ -z "$(fleet_plugins_memo_read claude m attempted)" ] ||
+        fail "a marketplace whose unowned update held transiently was remembered: $pc_out"
+      rm -f "$pc/mlist-updated"
+      fleet_run_marketplace_repair_reset
+      pc_out=$(CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog-gone.json" \
+        fleet_plugins_refresh "$pc/store" vireo '{}' '{}' fast "$pc")
+      case $pc_out in
+        *'hold  plugin gadget@m — installed marketplace identity unavailable'*) ;;
+        *) fail "the gone catalog entry did not hold: $pc_out" ;;
+      esac
+      [ "$(fleet_plugins_memo_read claude m attempted)" = "$pc_claude_head" ] ||
+        fail "a marketplace whose only hold is standing was not remembered: $pc_out"
+    )
+    # The unowned update refuses a cache it cannot seal: an existing root
+    # that is a symlink holds (standing), it is never read as sealed.
+    jq --arg a "$pc_sha_a" '.plugins["gadget@m"][0].gitCommitSha = $a' \
+      "$HOME/.claude/plugins/installed_plugins.json" >"$pc/installed.next"
+    mv "$pc/installed.next" "$HOME/.claude/plugins/installed_plugins.json"
+    mkdir -p "$pc/elsewhere" "$HOME/.claude/plugins/cache/m"
+    ln -s "$pc/elsewhere" "$HOME/.claude/plugins/cache/m/gadget"
+    fleet_run_marketplace_repair_reset
+    pc_status=0
+    pc_out=$(CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog.json" \
+      fleet_plugins_claude_update_unowned "$pc_defs" m "$pc/owned" 2>&1) || pc_status=$?
+    [ "$pc_status" -eq 75 ] ||
+      fail "an unowned update into a symlinked cache root did not hold as standing (got $pc_status): $pc_out"
+    case $pc_out in
+      *'hold  plugin gadget@m — its updated cache cannot be sealed'*) ;;
+      *) fail "the unsealable unowned cache was not named: $pc_out" ;;
+    esac
+    rm -f "$HOME/.claude/plugins/cache/m/gadget"
+
+    # --- the Claude cache seal (lib/host.sh) ---
+    # #87/#84: the seal fails closed. An absent root is nothing to seal; a
+    # root that is a symlink or not a directory refuses; a link inside the
+    # tree is accepted only when its whole chain ends inside it; a tree the
+    # closing scan cannot traverse refuses; and the directories above the
+    # root, up to the harness home, are sealed too.
+    pc_seal="$HOME/.claude/plugins/cache/sealm/sealp"
+    plugin_cache_seal_permissions sealp@sealm ||
+      fail "an absent plugin cache did not read as nothing to seal"
+    mkdir -p "$HOME/.claude/plugins/cache/sealm"
+    printf 'x\n' >"$pc_seal"
+    ! plugin_cache_seal_permissions sealp@sealm 2>/dev/null ||
+      fail "a plugin cache root that is a file was read as sealed"
+    rm -f "$pc_seal"
+    mkdir -p "$pc_seal/1/hooks" "$pc/seal-outside"
+    printf '{}\n' >"$pc_seal/1/hooks/hooks.json"
+    printf '{}\n' >"$pc/seal-outside/hooks.json"
+    chmod -R g+w "$HOME/.claude/plugins/cache/sealm"
+    chmod g+w "$HOME/.claude" "$HOME/.claude/plugins" "$HOME/.claude/plugins/cache"
+    ln -s hooks/hooks.json "$pc_seal/1/inside.json"
+    ln -s 1/hooks "$pc_seal/dirlink"
+    plugin_cache_seal_permissions sealp@sealm 2>/dev/null ||
+      fail "a plugin cache with only internal links was refused"
+    [ -z "$(find "$HOME/.claude/plugins/cache/sealm" "$HOME/.claude/plugins/cache" \
+      "$HOME/.claude/plugins" "$HOME/.claude" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print)" ] &&
+      [ -z "$(find "$pc_seal" ! -type l \( -perm -020 -o -perm -002 \) -print)" ] ||
+      fail "the seal left the plugin cache or a directory above it group-writable"
+    ln -s "$pc/seal-outside/hooks.json" "$pc_seal/1/hooks/extra.json"
+    ! plugin_cache_seal_permissions sealp@sealm 2>/dev/null ||
+      fail "a plugin cache with a symlink leaving the tree was read as sealed"
+    rm -f "$pc_seal/1/hooks/extra.json"
+    ln -s ../../sealp/1/../.. "$pc_seal/1/up"
+    ! plugin_cache_seal_permissions sealp@sealm 2>/dev/null ||
+      fail "a plugin cache with a link resolving above the tree was read as sealed"
+    rm -f "$pc_seal/1/up"
+    ln -s missing.json "$pc_seal/1/hooks/dangling.json"
+    ! plugin_cache_seal_permissions sealp@sealm 2>/dev/null ||
+      fail "a plugin cache with a dangling symlink was read as sealed"
+    rm -f "$pc_seal/1/hooks/dangling.json"
+    if [ "$(id -u)" -ne 0 ]; then
+      mkdir -p "$pc_seal/1/private"
+      chmod 000 "$pc_seal/1/private"
+      ! plugin_cache_seal_permissions sealp@sealm 2>/dev/null ||
+        fail "a plugin cache the closing scan could not traverse was read as sealed"
+      chmod 700 "$pc_seal/1/private"
+    fi
+    mv "$pc_seal" "$pc/seal-real"
+    ln -s "$pc/seal-real" "$pc_seal"
+    ! plugin_cache_seal_permissions sealp@sealm 2>/dev/null ||
+      fail "a plugin cache root that is a symlink was read as sealed"
+    rm -f "$pc_seal"
+    rm -rf "$HOME/.claude/plugins/cache/sealm" "$pc/seal-real"
 
     # --- the fleet's own plugins: source-verified approval of Codex's copy ---
     # The item loop updates Claude's copy; automatic approval reads Codex's.
@@ -429,6 +553,9 @@ SH
 st=$PC_HOOKS_STATE
 ver=$(cat "$st/version")
 if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
+  # PC app-server-fail: the app server dies before answering, as a crashed
+  # or timed-out one does.
+  [ ! -e "$st/app-server-fail" ] || exit 1
   if [ -s "$st/pending" ]; then
     cat "$st/pending" >"$st/version"
     rm -f "$st/pending"
@@ -504,7 +631,7 @@ SH
         >"$pc/hooks-state/source"
       printf '%s\n' '{"marketplaces":[]}' >"$pc/hooks-state/markets"
       rm -f "$pc/hooks-state/pending" "$pc/hooks-state/lists" "$pc/hooks-state/advance-at" \
-        "$pc/hooks-state/advance-after" "$pc/hooks-state/nohooks"
+        "$pc/hooks-state/advance-after" "$pc/hooks-state/nohooks" "$pc/hooks-state/app-server-fail"
       pc_claude_markets=
       printf '%s\n' cccccccccccccccccccccccccccccccccccccccc >"$pc/hooks-state/sha-newer"
       : >"$pc/hooks-state/log"
@@ -564,6 +691,103 @@ SH
       fail "a Codex copy already at the expected bytes was held (got $pc_status)"
     ! grep -q codex-add "$pc/hooks-state/log" ||
       fail "a Codex copy already at the expected bytes was reinstalled: $(tr '\n' ';' <"$pc/hooks-state/log")"
+    # #87: a Claude cache that is ALREADY current (Claude or the user updated
+    # it under umask 002) skips the update, and used to skip the seal with
+    # it: the item converged with its hooks group-writable. It is sealed on
+    # that path too, with the directories above it (#84).
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    printf '%s\n' sha256:new >"$pc/hooks-state/trusted"
+    jq -n --arg b "$pc_sha_b" '{version: 2, plugins: {"widget@m":
+      [{scope: "user", version: "1.1.0", gitCommitSha: $b}]}}' \
+      >"$HOME/.claude/plugins/installed_plugins.json"
+    pc_claude_cache="$HOME/.claude/plugins/cache/m/widget"
+    rm -rf "$pc_claude_cache"
+    mkdir -p "$pc_claude_cache/1.1.0/hooks"
+    printf '{}\n' >"$pc_claude_cache/1.1.0/hooks/hooks.json"
+    chmod -R g+w "$HOME/.claude/plugins/cache/m"
+    : >"$pc/hooks-installs"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 0 ] && [ ! -s "$pc/hooks-installs" ] ||
+      fail "an already-current plugin did not converge without an update (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    [ -z "$(find "$HOME/.claude/plugins/cache/m" ! -type l \( -perm -020 -o -perm -002 \) -print)" ] ||
+      fail "an already-current plugin converged with its cache group-writable"
+    # #97: on the update path, an existing cache root that is a symlink is a
+    # cache the seal cannot vouch for: the item holds (standing) instead of
+    # carrying on as if it were sealed.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    printf '%s\n' sha256:new >"$pc/hooks-state/trusted"
+    rm -rf "$pc_claude_cache" "$pc/claude-cache-real"
+    mkdir -p "$pc/claude-cache-real/1.1.0"
+    ln -s "$pc/claude-cache-real" "$pc_claude_cache"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] ||
+      fail "an update into a symlinked cache root did not hold (got $pc_status)"
+    grep -q 'is a symlink, not a directory, or owned by another user' "$pc/hooks-err" ||
+      fail "the symlinked cache root hold did not say why: $(tr '\n' ';' <"$pc/hooks-err")"
+    rm -f "$pc_claude_cache"
+    rm -rf "$pc/claude-cache-real"
+    # #97: automatic approval that fails TRANSIENTLY (the app server died or
+    # timed out) is 74, which owes a retry; only the helper's refusals are
+    # 75. Otherwise the marketplace head, already remembered, leaves the
+    # changed hooks untrusted until the full cadence.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    : >"$pc/hooks-state/app-server-fail"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 74 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+      fail "a transient automatic approval failure did not hold as transient (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    fleet_run_hold_owes_retry "$pc_status" false ||
+      fail "a transient approval hold owes no retry"
+    # #87/#84: an explicit approve seals Codex's cache, and the directories
+    # above it, before its first hook listing...
+    pc_hooks_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    chmod -R g+w "$pc/codex-home/plugins/cache"
+    pc_status=0
+    (cd "$pc" && CODEX_HOME="$pc/codex-home" PATH="$pc/hooks-bin:$PATH" \
+      PC_HOOKS_STATE="$pc/hooks-state" node "$script_dir/codex-plugin-hooks.mjs" \
+      approve widget@m >/dev/null 2>"$pc/hooks-err") || pc_status=$?
+    [ "$pc_status" -eq 0 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:new ] ||
+      fail "an explicit approve failed (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    [ -z "$(find "$pc/codex-home/plugins/cache" -perm -g+w -print -quit)" ] ||
+      fail "an explicit approve trusted a group-writable Codex cache without sealing it"
+    # ...and an entry it cannot tighten (immutable) is a STANDING refusal (75),
+    # not a transient one every fast pass would retry. chflags is macOS/BSD.
+    if command -v chflags >/dev/null 2>&1; then
+      pc_hooks_reset
+      printf '%s\n' new >"$pc/hooks-state/version"
+      pc_locked=$pc/codex-home/plugins/cache/m/widget/new/README.md
+      chmod g+w "$pc_locked" && chflags uchg "$pc_locked"
+      pc_status=0
+      (cd "$pc" && CODEX_HOME="$pc/codex-home" PATH="$pc/hooks-bin:$PATH" \
+        PC_HOOKS_STATE="$pc/hooks-state" node "$script_dir/codex-plugin-hooks.mjs" \
+        approve widget@m >/dev/null 2>"$pc/hooks-err") || pc_status=$?
+      chflags nouchg "$pc_locked"
+      [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+        fail "an unsealable Codex cache entry did not refuse as a standing hold (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    fi
+    # ...and refuses (75), writing nothing, when the cache holds a symlink
+    # that leaves it: its target is bytes the seal never touched.
+    pc_hooks_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    printf '{}\n' >"$pc/seal-target.json"
+    ln -s "$pc/seal-target.json" "$pc/codex-home/plugins/cache/m/widget/new/hooks/extra.json"
+    pc_status=0
+    (cd "$pc" && CODEX_HOME="$pc/codex-home" PATH="$pc/hooks-bin:$PATH" \
+      PC_HOOKS_STATE="$pc/hooks-state" node "$script_dir/codex-plugin-hooks.mjs" \
+      approve widget@m >/dev/null 2>"$pc/hooks-err") || pc_status=$?
+    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+      fail "an explicit approve trusted a Codex cache with a symlink leaving it (got $pc_status)"
+    grep -q 'symlink leaves the plugin tree' "$pc/hooks-err" ||
+      fail "the escaping-symlink refusal did not say why: $(tr '\n' ';' <"$pc/hooks-err")"
     # Codex already advanced the copy AND its hooks changed upstream (they
     # read `modified` against the old trusted hash), from the verified source
     # at the expected SHA, its installed tree byte-identical to Claude's

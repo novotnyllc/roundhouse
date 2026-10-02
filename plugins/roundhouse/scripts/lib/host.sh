@@ -463,20 +463,48 @@ check_safe_owned_directory() {
   check_safe_owned_path "$1" "$2" directory
 }
 
+plugin_seal_link_target() {
+  # plugin_seal_link_target LINK -> the physical path LINK's whole chain ends
+  # at; 1 when it does not resolve (dangling, a loop, or over 40 links).
+  seal_link=$1
+  seal_hops=0
+  while [ -L "$seal_link" ]; do
+    seal_hops=$((seal_hops + 1))
+    [ "$seal_hops" -le 40 ] || return 1
+    seal_target=$(readlink -- "$seal_link") || return 1
+    case $seal_target in
+      /*) seal_link=$seal_target ;;
+      *) seal_link=${seal_link%/*}/$seal_target ;;
+    esac
+  done
+  [ -e "$seal_link" ] || return 1
+  if [ -d "$seal_link" ]; then
+    (CDPATH='' cd -P -- "$seal_link" 2>/dev/null && pwd -P)
+  else
+    seal_link_dir=$(CDPATH='' cd -P -- "${seal_link%/*}/" 2>/dev/null && pwd -P) || return 1
+    printf '%s/%s\n' "${seal_link_dir%/}" "${seal_link##*/}"
+  fi
+}
+
 plugin_root_seal_permissions() {
   # plugin_root_seal_permissions DIR — remove group and other write bits from
   # a plugin tree before roundhouse trusts it, then refuse (1) if anything in
-  # it is still writable by others or owned by another user. A plugin manager
+  # it is still writable by others or owned by another user, if a symlink in
+  # it does not resolve to an entry inside it, or if the tree cannot be
+  # scanned at all. A plugin manager
   # running under umask 002 (the WSL default) leaves a fresh cache
   # group-writable, and check_safe_owned_path then refuses it. This only
   # tightens modes and runs before any check, so the checks stay strict, and
   # the closing scan covers every entry, not only the files the manifest
   # lists: a writable or foreign-owned directory could swap a verified file
-  # after the check. It applies to an absolute, non-symlink directory owned
-  # by the current user (anything else is the verifier's to refuse);
-  # `chmod -R` does not follow symlinks inside the tree. A change is named on
-  # stderr, so a tree that really was writable by others does not go
-  # unnoticed.
+  # after the check. A link is never followed by `chmod -R`, so one that
+  # leaves the tree would point at bytes this seal never touched (and a peer
+  # could have planted it while the tree was writable): only a link whose
+  # whole chain ends inside the sealed tree is accepted. It applies to an
+  # absolute, non-symlink directory owned by the current user (anything else
+  # is the verifier's to refuse; plugin_cache_seal_permissions, which has no
+  # verifier after it, refuses it itself). A change is named on stderr, so a
+  # tree that really was writable by others does not go unnoticed.
   case $1 in /*) ;; *) return 0 ;; esac
   [ -d "$1" ] && [ ! -L "$1" ] || return 0
   seal_user=$(id -un)
@@ -486,37 +514,135 @@ plugin_root_seal_permissions() {
     printf 'roundhouse: removing group/world write permission under %s\n' "$1" >&2
     chmod -R go-w "$1" 2>/dev/null || :
   fi
-  [ -z "$(find "$1" ! -type l \( -perm -020 -o -perm -002 -o ! -user "$seal_user" \) \
-    -print 2>/dev/null | head -n 1)" ] || {
+  # The closing scan fails closed: a traversal error (an unreadable
+  # directory) is a tree it cannot vouch for, not an empty answer.
+  seal_unsafe=$(find "$1" ! -type l \( -perm -020 -o -perm -002 -o ! -user "$seal_user" \) \
+    -print 2>/dev/null) || {
+    printf 'roundhouse: %s cannot be scanned to seal it\n' "$1" >&2
+    return 1
+  }
+  [ -z "$seal_unsafe" ] || {
     printf 'roundhouse: %s holds entries writable or owned by another user\n' "$1" >&2
     return 1
   }
+  seal_base=$(CDPATH='' cd -P -- "$1" 2>/dev/null && pwd -P) || return 1
+  seal_list=$(mktemp "${TMPDIR:-/tmp}/roundhouse-seal.XXXXXX") || return 1
+  find "$1" -type l -print0 >"$seal_list" 2>/dev/null || {
+    rm -f "$seal_list"
+    printf 'roundhouse: %s cannot be scanned to seal it\n' "$1" >&2
+    return 1
+  }
+  seal_status=0
+  while IFS= read -r -d '' seal_entry; do
+    seal_to=$(plugin_seal_link_target "$seal_entry") || seal_to=
+    case $seal_to in
+      "$seal_base"/*) ;;
+      *)
+        printf 'roundhouse: %s holds a symlink that does not resolve inside it: %s\n' \
+          "$1" "$seal_entry" >&2
+        seal_status=1
+        break
+        ;;
+    esac
+  done <"$seal_list"
+  rm -f "$seal_list"
+  return "$seal_status"
+}
+
+plugin_seal_ancestors() {
+  # plugin_seal_ancestors HOME DIR — seal and check every directory above DIR
+  # up to the harness home HOME: through a writable parent a group member
+  # could rename a sealed plugin directory and put another in its place
+  # after the seal. Each must be a directory (the harness home may be reached
+  # through a symlink; nothing below it may be one) owned by this user or
+  # root; group/other write is removed from this user's own, and 1 when any
+  # is still writable by others afterwards. DIR must lie under HOME.
+  seal_anc_home=${1%/}
+  seal_anc_dir=${2%/}
+  case $seal_anc_dir in "$seal_anc_home"/?*) ;; *) return 1 ;; esac
+  seal_anc_user=$(id -un)
+  seal_anc_dir=${seal_anc_dir%/*}
+  while :; do
+    if [ "$seal_anc_dir" = "$seal_anc_home" ]; then
+      seal_anc_check=$(CDPATH='' cd -P -- "$seal_anc_dir" 2>/dev/null && pwd -P) || seal_anc_check=
+    else
+      seal_anc_check=$seal_anc_dir
+      [ ! -L "$seal_anc_check" ] || seal_anc_check=
+    fi
+    [ -n "$seal_anc_check" ] && [ -d "$seal_anc_check" ] || {
+      printf 'roundhouse: %s is not a plain directory above a plugin cache\n' "$seal_anc_dir" >&2
+      return 1
+    }
+    seal_anc_owner=$(file_owner "$seal_anc_check")
+    [ "$seal_anc_owner" = "$seal_anc_user" ] || [ "$seal_anc_owner" = root ] || {
+      printf 'roundhouse: %s, above a plugin cache, is owned by another user\n' "$seal_anc_dir" >&2
+      return 1
+    }
+    if [ "$seal_anc_owner" = "$seal_anc_user" ] &&
+      [ -n "$(find "$seal_anc_check" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print 2>/dev/null)" ]; then
+      printf 'roundhouse: removing group/world write permission from %s\n' "$seal_anc_dir" >&2
+      chmod go-w "$seal_anc_check" 2>/dev/null || :
+    fi
+    seal_anc_open=$(find "$seal_anc_check" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print 2>/dev/null) ||
+      seal_anc_open=unscanned
+    [ -z "$seal_anc_open" ] || {
+      printf 'roundhouse: %s, above a plugin cache, is writable by others\n' "$seal_anc_dir" >&2
+      return 1
+    }
+    [ "$seal_anc_dir" != "$seal_anc_home" ] || return 0
+    seal_anc_dir=${seal_anc_dir%/*}
+  done
 }
 
 plugin_cache_seal_permissions() {
   # plugin_cache_seal_permissions NAME[@MARKETPLACE] — seal a plugin's Claude
-  # cache right after roundhouse installed or updated it; 1 when it cannot be
-  # sealed. For roundhouse itself this is the tree executor_status_command
-  # will trust; for any other plugin it is code (hooks, MCP servers) that the
-  # harness runs as this user, which a group member must not be able to edit.
-  # The zero-config form, with no marketplace, seals every marketplace's copy
-  # of NAME, since sealing only tightens. (Codex's cache is sealed inside
-  # codex-plugin-hooks.mjs, between `plugin add` and the hook trust write.)
-  seal_cache=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache
+  # cache right after roundhouse installed or updated it (or found it already
+  # current); 1 when it cannot be sealed. For roundhouse itself this is the
+  # tree executor_status_command will trust; for any other plugin it is code
+  # (hooks, MCP servers) that the harness runs as this user, which a group
+  # member must not be able to edit. Nothing verifies the tree after this, so
+  # an existing root it cannot seal — a symlink, not a directory, owned by
+  # another user — refuses here; an absent one is nothing to seal. The
+  # directories above it, up to the harness home, are sealed too
+  # (plugin_seal_ancestors). The zero-config form, with no marketplace, seals
+  # every marketplace's copy of NAME, since sealing only tightens. (Codex's
+  # cache is sealed inside codex-plugin-hooks.mjs, before any hook trust is
+  # read or written.)
+  seal_home=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+  seal_cache=$seal_home/plugins/cache
   seal_name=${1%%@*}
   case $seal_name in ''|.|..|*[!A-Za-z0-9._-]*) return 0 ;; esac
   case $1 in
     *@*)
       seal_market=${1#*@}
       case $seal_market in ''|.|..|*[!A-Za-z0-9._-]*) return 0 ;; esac
-      plugin_root_seal_permissions "$seal_cache/$seal_market/$seal_name"
+      plugin_cache_seal_root "$seal_home" "$seal_cache/$seal_market/$seal_name"
       ;;
     *)
       for seal_dir in "$seal_cache"/*/"$seal_name"; do
-        plugin_root_seal_permissions "$seal_dir" || return 1
+        plugin_cache_seal_root "$seal_home" "$seal_dir" || return 1
       done
       ;;
   esac
+}
+
+plugin_cache_seal_root() {
+  # plugin_cache_seal_root HOME ROOT — plugin_cache_seal_permissions' one
+  # cache root: absent is 0, anything it cannot seal is 1.
+  [ -e "$2" ] || [ -L "$2" ] || return 0
+  case $2 in
+    /*) ;;
+    *)
+      printf 'roundhouse: plugin cache %s is not an absolute path\n' "$2" >&2
+      return 1
+      ;;
+  esac
+  [ -d "$2" ] && [ ! -L "$2" ] && [ "$(file_owner "$2")" = "$(id -un)" ] || {
+    printf 'roundhouse: plugin cache %s is a symlink, not a directory, or owned by another user\n' \
+      "$2" >&2
+    return 1
+  }
+  plugin_seal_ancestors "$1" "$2" && plugin_root_seal_permissions "$2"
 }
 
 check_enrolled_trust_file() {
@@ -536,6 +662,19 @@ executor_status_command() (
   # Seal first, then verify: a manager update under umask 002 must not leave
   # this host refusing every sealed install until someone runs chmod by hand.
   plugin_root_seal_permissions "$plugin_root" || exit 64
+  # An installed copy also needs the directories above it sealed, up to the
+  # harness home: a writable parent lets a group member swap the whole tree
+  # after it was verified (plugin_seal_ancestors). A source checkout is not
+  # under a harness cache, and has none to check.
+  # The home is compared as `pwd` spells it, the way plugin_root was found.
+  for executor_home in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "${CODEX_HOME:-$HOME/.codex}"; do
+    executor_home=$(CDPATH='' cd -- "$executor_home" 2>/dev/null && pwd) || continue
+    case $plugin_root in
+      "${executor_home%/}"/plugins/cache/?*/?*)
+        plugin_seal_ancestors "$executor_home" "$plugin_root" || exit 64
+        ;;
+    esac
+  done
   check_safe_owned_directory "$plugin_root" "plugin root"
   check_private_owned_file "$integrity" "executor integrity manifest"
   jq -e '
