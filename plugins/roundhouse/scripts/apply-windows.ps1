@@ -2238,7 +2238,7 @@ $script:NodeSelfTestOps = @{
     Hook = {
         param([string]$Path, [string[]]$Arguments, [string]$BinDir)
         $Fake = $script:NodeSelfTestFake
-        $Fake.Log.Add("hook $(Split-Path -Leaf $Path) $($Arguments -join ' ') node=$(([IO.File]::ReadAllText((Join-Path $BinDir 'version.txt'))).Trim())")
+        $Fake.Log.Add("hook $([IO.Path]::GetFileNameWithoutExtension($Path)) $($Arguments -join ' ') node=$(([IO.File]::ReadAllText((Join-Path $BinDir 'version.txt'))).Trim())")
         if ($Fake.HookExit -ne 0) { $script:LastOutputTail = [string[]]@("svc: service registration failed") }
         return $Fake.HookExit
     }

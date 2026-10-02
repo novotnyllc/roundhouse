@@ -515,6 +515,9 @@ case ${1:-} in
 esac
 SH
     chmod 755 "$ifn_root/template/bin/node" "$ifn_root/template/bin/npm" "$ifn_root/svc" "$ifn_root/bin/fnm"
+    # yq alone, never its whole directory: that can hold a real ssh ahead of
+    # the stub (/usr/bin on Linux runners).
+    ln -sfn "$fleet_fixture_yq" "$ifn_root/bin/yq"
     printf '%s\n' 'packages:' '  svc: {npm: {name: "@example/svc", node_switch: [[svc, service]]}}' \
       >"$ifn_root/store/definitions.yaml"
     jq '.machines["test-windows"].package_managers = ["winget","npm"] |
@@ -524,7 +527,7 @@ SH
       env FNM_DIR="$ifn_dir" IFN_DIR="$ifn_dir" IFN_LOG="$ifn_root/calls.log" IFN_HOOK="$ifn_root/svc" \
         IFN_TEMPLATE="$ifn_root/template" ROUNDHOUSE_FLEET_STORE="$ifn_root/store" \
         ROUNDHOUSE_CONFIG="$ifn_root/config.json" \
-        PATH="$ifn_root/bin:$(dirname -- "$fleet_fixture_yq"):$PATH" "$@"
+        PATH="$ifn_root/bin:$PATH" "$@"
     }
     ifn_default() {
       basename -- "$(dirname -- "$(CDPATH='' cd -P -- "$ifn_dir/aliases/default" && pwd -P)")"
