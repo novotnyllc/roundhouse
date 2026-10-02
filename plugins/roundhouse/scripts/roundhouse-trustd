@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 set -eu
 
 # roundhouse-trustd — the root-owned materializer for §7.9's local trust state.
@@ -75,30 +75,116 @@ trustd_die() {
 # `env -i … sudo -n` (lib/fleet-trust.sh, mirroring invoke_fixed_posix_broker)
 # and the sudoers entry is NOSETENV — but trustd re-establishes every trusted
 # input itself rather than relying on that, so the two layers fail independently.
-trustd_is_root() { [ "$(id -u)" -eq 0 ]; }
-
-# Ownership check WITHOUT the sourced library (it runs before the source): a
-# path is trusted only if it is a non-symlink owned by root and not group/world
-# writable. Used to gate the library tree and the toolchain the root run runs.
-trustd_root_owned() {
-  [ -e "$1" ] && [ ! -L "$1" ] || return 1
-  trustd_ro_owner=$(stat -f %Su "$1" 2>/dev/null || stat -c %U "$1" 2>/dev/null || printf '?')
-  [ "$trustd_ro_owner" = root ] || return 1
-  trustd_ro_mode=$(stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null || printf 777)
-  trustd_ro_perm=$(printf '%s' "$trustd_ro_mode" | sed 's/.*\(...\)$/\1/')
-  case $(printf '%s' "$trustd_ro_perm" | cut -c 2-3) in
-    *2* | *3* | *6* | *7*) return 1 ;;
+# That matters because the sudoers entry also lets the same user run
+# `sudo -n roundhouse-trustd apply …` directly, and sudo without secure_path
+# passes the caller's PATH (macOS ships none) while env_keep can pass HOME. So:
+#   - the interpreter is /bin/bash, never `env bash`'s PATH lookup, and `-p`
+#     makes bash skip BASH_ENV/ENV, functions exported into the environment,
+#     and an inherited SHELLOPTS before line one (the env wipe below takes the
+#     rest, CDPATH and GLOBIGNORE among them);
+#   - rootness comes from /usr/bin/id, never $EUID, which bash takes from the
+#     environment when it is set there; an id that cannot answer counts as
+#     root, so a broken probe can only make trustd stricter;
+#   - nothing below runs a command found on the inherited PATH.
+trustd_is_root() {
+  trustd_uid=$(/usr/bin/id -u 2>/dev/null) || return 0
+  case $trustd_uid in
+    '' | *[!0-9]* | 0) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
+# trustd_node_ok PATH — PATH itself (no ancestors) is owned by uid 0 and carries
+# no group or other write bit and no ACL. Keep it the twin of lib/host.sh's
+# root_node_ok. stat and ls are absolute. BSD or GNU stat is picked by OSTYPE
+# (GNU `stat -f` reads a file system, not a format); an OSTYPE that lies only
+# picks the wrong flavour, which fails closed. Darwin's ls prints `@`, not `+`,
+# when a node has both xattrs and an ACL, so there `ls -lde` lists the ACL.
+trustd_node_ok() {
+  case ${OSTYPE:-} in
+    darwin*)
+      trustd_ro_stat=$(/usr/bin/stat -f '%u %Lp' "$1" 2>/dev/null) || return 1
+      trustd_ro_ls=$(/bin/ls -lde "$1" 2>/dev/null) || return 1
+      case $trustd_ro_ls in *$'\n'*) return 1 ;; esac
+      ;;
+    *bsd*)
+      trustd_ro_stat=$(/usr/bin/stat -f '%u %Lp' "$1" 2>/dev/null) || return 1
+      trustd_ro_ls=$(/bin/ls -ld "$1" 2>/dev/null) || return 1
+      ;;
+    *)
+      trustd_ro_stat=$(/usr/bin/stat -c '%u %a' "$1" 2>/dev/null) || return 1
+      trustd_ro_ls=$(/bin/ls -ld "$1" 2>/dev/null) || return 1
+      ;;
+  esac
+  case ${trustd_ro_ls%% *} in *+*) return 1 ;; esac
+  [ "${trustd_ro_stat%% *}" = 0 ] || return 1
+  trustd_ro_mode=${trustd_ro_stat##* }
+  while [ "${#trustd_ro_mode}" -gt 3 ]; do trustd_ro_mode=${trustd_ro_mode#?}; done
+  case ${trustd_ro_mode#?} in *[2367]*) return 1 ;; esac
+}
+
+# trustd_trusted_path PATH -> its physical path, printed only when root may RUN
+# or SOURCE it: a non-symlink that passes trustd_node_ok, as does every
+# directory up to / along its physical path, because a user who can write any
+# one of them can swap what is below it. Callers that exec or read the file use
+# the printed physical path. The twin of lib/host.sh's root_trusted_path, which
+# this cannot call: it gates that library before it is sourced.
+trustd_trusted_path() {
+  case $1 in /*) ;; *) return 1 ;; esac
+  [ -e "$1" ] && [ ! -L "$1" ] || return 1
+  trustd_tp_dir=${1%/*}
+  trustd_tp_dir=$(CDPATH='' cd -P -- "${trustd_tp_dir:-/}" 2>/dev/null && pwd -P) || return 1
+  trustd_tp_physical=${trustd_tp_dir%/}/${1##*/}
+  trustd_tp_node=$trustd_tp_physical
+  while :; do
+    trustd_node_ok "$trustd_tp_node" || return 1
+    [ "$trustd_tp_node" != / ] || break
+    trustd_tp_node=${trustd_tp_node%/*}
+    [ -n "$trustd_tp_node" ] || trustd_tp_node=/
+  done
+  printf '%s\n' "$trustd_tp_physical"
+}
+
+# THE ENVIRONMENT, REPLACED WHEN ROOT. Every exported variable is dropped but the
+# locale, and HOME is root's own: jj reads its user and per-repo config under
+# HOME (or XDG_CONFIG_HOME, or JJ_CONFIG), and that config names programs jj runs
+# (a signing backend, a pager, an fsmonitor) — a same-user HOME would be root
+# running the user's choice of binary. (The store's own legacy config is the
+# other way in; trustd_apply refuses a store that would trigger it.) Dropping
+# ROUNDHOUSE_* also keeps every self-check hook (ROUNDHOUSE_SELFTEST, the
+# relocated trust root) off the root run whatever reached it.
+#
 # PATH. When root, REPLACE with the trusted system dirs and never append the
 # inherited PATH: awk/sed/grep/sort/cmp/date/mktemp/chown live here root-owned,
 # and jj/yq/jq are pinned to verified absolute paths below (they do NOT live in
 # these dirs, so a bare lookup could otherwise only find an attacker's copy on a
-# user PATH). Off-root (the self-check and dev) the inherited PATH is kept so the
-# suite's own jj/yq resolve.
+# user PATH). Each of these dirs that exists must itself pass
+# trustd_trusted_path, so every bare command the root run looks up comes from a
+# directory only root can write. Off-root (the self-check and dev) the inherited
+# PATH and environment are kept so the suite's own jj/yq resolve.
 if trustd_is_root; then
-  export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  trustd_envs=$(compgen -e) ||
+    trustd_die "refusing to run as root: cannot list the inherited environment" 77
+  for trustd_env in $trustd_envs; do
+    case $trustd_env in
+      LC_ALL | LANG | TZ) ;;
+      *) unset "$trustd_env" 2>/dev/null || : ;;
+    esac
+  done
+  case ${OSTYPE:-} in
+    darwin*) HOME=/var/root ;;
+    *) HOME=/root ;;
+  esac
+  export HOME PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  for trustd_sysdir in /usr/sbin /usr/bin /sbin /bin; do
+    [ -e "$trustd_sysdir" ] || continue
+    # Merged-/usr makes /bin and /sbin symlinks (in /, which the walk checks):
+    # verify where they lead.
+    trustd_sysdir=$(CDPATH='' cd -P -- "$trustd_sysdir" 2>/dev/null && pwd -P) ||
+      trustd_die "refusing to run as root: cannot resolve a system directory" 77
+    trustd_trusted_path "$trustd_sysdir" >/dev/null ||
+      trustd_die "refusing to run as root: $trustd_sysdir is not root-owned and closed to group and other writes" 77
+  done
 else
   export PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 fi
@@ -119,52 +205,83 @@ fi
 [ -f "$trustd_home/roundhouse" ] ||
   trustd_die "cannot locate the roundhouse library at $trustd_home/roundhouse" 69
 # ROOT SOURCES ONLY A ROOT-OWNED TREE. `$trustd_home/roundhouse` sources every
-# `$trustd_home/lib/*.sh`, so a same-user-writable member is code run as root.
+# `$trustd_home/lib/*.sh`, so a same-user-writable member — or a same-user-
+# writable directory anywhere above one — is code run as root.
 # Verify the whole tree before sourcing and REFUSE otherwise — this is the
 # ownership fleet-doctor also asserts. Off-root the tree is same-user by design,
 # so the check is root-only.
 if trustd_is_root; then
-  trustd_root_owned "$trustd_home/roundhouse" ||
+  # The tree is checked along its physical path; $trustd_home is $0's directory,
+  # the path sudoers names and sudo ran, so a component an unprivileged user
+  # could swap there would already have handed them this binary.
+  trustd_trusted_path "$trustd_home/roundhouse" >/dev/null ||
     trustd_die "refusing to source a non-root-owned library as root: $trustd_home/roundhouse" 77
-  trustd_root_owned "$trustd_home/lib" ||
+  trustd_trusted_path "$trustd_home/lib" >/dev/null ||
     trustd_die "refusing to source a non-root-owned library tree as root: $trustd_home/lib" 77
   for trustd_lib in "$trustd_home"/lib/*.sh; do
     [ -e "$trustd_lib" ] || continue
-    trustd_root_owned "$trustd_lib" ||
+    trustd_trusted_path "$trustd_lib" >/dev/null ||
       trustd_die "refusing to source a non-root-owned library file as root: $trustd_lib" 77
   done
 fi
-# shellcheck source=/dev/null
-ROUNDHOUSE_LIB_ONLY=1 . "$trustd_home/roundhouse"
-
-# THE TOOLCHAIN, PINNED WHEN ROOT. jj/yq/jq live in user-writable prefixes
-# (Homebrew, /usr/local), so on a root run they are resolved from a root-owned
-# manifest the install lane co-located beside this binary and each verified
-# root-owned at use, then shadowed as shell functions so every bare `jj`/`yq`/
-# `jq` in the sourced library reaches the verified absolute path and nothing a
-# same-user PATH could shadow. Missing manifest or any non-root-owned tool fails
-# closed. Off-root the ordinary PATH lookup stands (the self-check's own tools).
+# THE TOOLCHAIN, PINNED WHEN ROOT, BEFORE THE LIBRARY IS SOURCED. jj/yq/jq live
+# in user-writable prefixes (Homebrew, Linuxbrew, /usr/local), so on a root run
+# they are resolved from a root-owned manifest the install lane co-located
+# beside this binary, each verified with trustd_trusted_path (the file and every
+# directory above it) and shadowed as a shell function calling the verified
+# PHYSICAL path, so every bare `jj`/`yq`/`jq` in the sourced library reaches it
+# and nothing a same-user PATH could shadow. It runs BEFORE the source because
+# sourcing runs select_mikefarah_yq, whose `--version` probes are executions
+# (#62): with ROUNDHOUSE_YQ pinned first, the library's root branch keeps the pin
+# and never probes a yq the user can replace. Missing manifest or any untrusted
+# tool fails closed. Off-root the ordinary PATH lookup stands (the self-check's
+# own tools).
 trustd_pin_toolchain() {
   trustd_is_root || return 0
   trustd_tc=$script_dir/toolchain
-  trustd_root_owned "$trustd_tc" ||
-    trustd_die "no root-owned toolchain manifest beside trustd at $trustd_tc" 77
+  trustd_tc=$(trustd_trusted_path "$trustd_tc") ||
+    trustd_die "no root-owned toolchain manifest beside trustd at $script_dir/toolchain" 77
   for trustd_tool in jj yq jq; do
     trustd_tool_abs=$(awk -v n="$trustd_tool" '$1 == n { print $2; exit }' "$trustd_tc")
     case $trustd_tool_abs in
       /*) ;;
       *) trustd_die "toolchain manifest lacks an absolute path for $trustd_tool" 77 ;;
     esac
-    trustd_root_owned "$trustd_tool_abs" && [ -x "$trustd_tool_abs" ] ||
+    trustd_tool_real=$(trustd_trusted_path "$trustd_tool_abs") && [ -x "$trustd_tool_real" ] ||
       trustd_die "pinned $trustd_tool is not a root-owned executable: $trustd_tool_abs" 77
-    eval "$trustd_tool() { \"$trustd_tool_abs\" \"\$@\"; }"
-    # An exec'd yq (xargs) names ROUNDHOUSE_YQ, not the function: pin it too.
+    case $trustd_tool_real in
+      *[!A-Za-z0-9/._-]*) trustd_die "pinned $trustd_tool path is not a plain path: $trustd_tool_real" 77 ;;
+    esac
+    if [ "$trustd_tool" = jj ]; then
+      # Every root jj call, the library's included, carries these whatever
+      # config jj ends up loading: no working-copy snapshot (no root write
+      # into, or signing of, the same-user working copy), no gpg/gpgsm program
+      # (fleet signatures are ssh; fleet_trust_signature_read pins ssh-keygen
+      # later on the line, so it still wins), no signing, no fsmonitor, no
+      # pager. And trustd_jj_guard first re-checks that no store config can
+      # reach this call (trustd_store_config_ok).
+      case ${OSTYPE:-} in darwin*) trustd_false=/usr/bin/false ;; *) trustd_false=/bin/false ;; esac
+      eval "jj() { trustd_jj_guard; \"$trustd_tool_real\" --ignore-working-copy \\
+        --config 'signing.backends.gpg.program=\"$trustd_false\"' \\
+        --config 'signing.backends.gpgsm.program=\"$trustd_false\"' \\
+        --config 'signing.behavior=\"keep\"' --config 'fsmonitor.backend=\"none\"' \\
+        --config 'ui.paginate=\"never\"' \"\$@\"; }"
+    else
+      eval "$trustd_tool() { \"$trustd_tool_real\" \"\$@\"; }"
+    fi
+    # An exec'd yq (xargs) names ROUNDHOUSE_YQ, not the function, and the
+    # library's root yq selection keeps a trusted ROUNDHOUSE_YQ: pin it too.
     if [ "$trustd_tool" = yq ]; then
-      ROUNDHOUSE_YQ=$trustd_tool_abs
+      ROUNDHOUSE_YQ=$trustd_tool_real
       export ROUNDHOUSE_YQ
     fi
   done
 }
+
+trustd_pin_toolchain
+
+# shellcheck source=/dev/null
+ROUNDHOUSE_LIB_ONLY=1 . "$trustd_home/roundhouse"
 
 # --- root-owned atomic writes -------------------------------------------------
 
@@ -215,6 +332,53 @@ trustd_reject_symlink() {
 
 # --- apply --------------------------------------------------------------------
 
+trustd_cleanup() {
+  [ -z "${trustd_tmp:-}" ] || rm -rf "$trustd_tmp"
+  [ -z "${trustd_jj_home:-}" ] || rm -rf "$trustd_jj_home"
+}
+
+trustd_store_config_ok() {
+  # trustd_store_config_ok STORE — false (reason in $trustd_store_refusal) when
+  # jj, run on STORE, would load configuration the store itself supplies. jj
+  # keeps repo and workspace config outside the store, under HOME, keyed by
+  # .jj/repo/config-id and .jj/workspace-config-id, and ignores an in-store
+  # config.toml / workspace-config.toml once that id exists. Without the id jj
+  # MIGRATES the in-store file into the running user's HOME and loads it: as
+  # root, a same-user file that names programs jj runs or redefines the
+  # templates and revsets trustd's answers come from. And .jj/repo as a FILE is
+  # a secondary workspace pointing at another repo, whose config this never
+  # sees. Neither is ever handed to jj.
+  trustd_store_refusal=
+  [ -d "$1/.jj/repo" ] && [ ! -L "$1/.jj/repo" ] || {
+    trustd_store_refusal="store's .jj/repo is not a plain directory: $1"
+    return 1
+  }
+  for trustd_cfg in repo/config workspace-config; do
+    case $trustd_cfg in
+      repo/config) trustd_cfg_id=$1/.jj/repo/config-id ;;
+      *) trustd_cfg_id=$1/.jj/workspace-config-id ;;
+    esac
+    if { [ -e "$1/.jj/$trustd_cfg.toml" ] || [ -L "$1/.jj/$trustd_cfg.toml" ]; } &&
+      [ ! -f "$trustd_cfg_id" ]; then
+      trustd_store_refusal="refusing a store whose own jj config would be migrated and loaded: $1/.jj/$trustd_cfg.toml"
+      return 1
+    fi
+  done
+}
+
+trustd_jj_guard() {
+  # Run by the root jj() wrapper before every jj call. A store changed mid-run
+  # ends the whole run, not only this (possibly command-substituted) call.
+  [ -n "${trustd_store:-}" ] || return 0
+  trustd_store_config_ok "$trustd_store" && return 0
+  printf 'roundhouse-trustd: %s\n' "$trustd_store_refusal" >&2
+  kill -TERM "$$"
+  exit 65
+}
+
+trap trustd_cleanup EXIT
+trap 'exit 70' HUP INT TERM
+
 trustd_apply() {
   # trustd_apply <store> <reviewed-rev>. Every argument is untrusted; the only
   # trusted inputs are the signed jj history and the genesis pin.
@@ -236,6 +400,20 @@ trustd_apply() {
   # redirect at a path the root run reads; refuse it rather than follow it. The
   # root writes go to $TRUST, checked the same way below.
   trustd_reject_symlink "$trustd_store"
+  # NO STORE CONFIG REACHES jj (trustd_store_config_ok), checked here and again
+  # by the root jj() wrapper before every call, because the store stays
+  # same-user writable for the whole run.
+  trustd_store_config_ok "$trustd_store" || trustd_die "$trustd_store_refusal" 65
+  # A FRESH HOME FOR jj, PER RUN, when root. A store config that still slipped
+  # in (by winning the race between that check and jj's own read) migrates into
+  # this directory and dies with it, instead of persisting in root's own config
+  # dir where its now-written config id would satisfy every later check.
+  if trustd_is_root; then
+    trustd_jj_home=$(mktemp -d "$HOME/.roundhouse-trustd-jj.XXXXXX") ||
+      trustd_die "cannot create a private HOME for jj under $HOME" 73
+    HOME=$trustd_jj_home
+    export HOME
+  fi
   # THE GENESIS PIN AND $TRUST ARE DERIVED FROM THE VALIDATED STORE ARG, NOT
   # INHERITED ENV. A root run under `env -i … sudo` sees neither the user's
   # ROUNDHOUSE_FLEET_STORE nor the user's HOME, so identity.yaml (the pin) is
@@ -254,7 +432,7 @@ trustd_apply() {
   # Resolve to a canonical commit id and require EXACTLY ONE — `all()`,
   # `main@origin`, a bookmark that is diverged, all land as zero or many and
   # are refused. Downstream uses the resolved id, never the caller's string.
-  trustd_rev=$(jj -R "$trustd_store" log -r "$trustd_rev_in" --no-graph \
+  trustd_rev=$(jj --ignore-working-copy -R "$trustd_store" log -r "$trustd_rev_in" --no-graph \
     -T 'commit_id ++ "\n"' 2>/dev/null | grep . || true)
   [ "$(printf '%s\n' "$trustd_rev" | grep -c .)" -eq 1 ] ||
     trustd_die "revision does not resolve to exactly one commit: $trustd_rev_in" 65
@@ -265,9 +443,9 @@ trustd_apply() {
   trustd_pin=$(fleet_identity_get store_id)
   [ -n "$trustd_pin" ] ||
     trustd_die "no genesis pin in identity.yaml; refusing to materialize an unanchored store" 65
-  jj -R "$trustd_store" log -r "$trustd_pin" --no-graph -T '""' >/dev/null 2>&1 ||
+  jj --ignore-working-copy -R "$trustd_store" log -r "$trustd_pin" --no-graph -T '""' >/dev/null 2>&1 ||
     trustd_die "genesis pin $trustd_pin does not resolve in this store" 65
-  [ -n "$(jj -R "$trustd_store" log -r "$trustd_pin & ::$trustd_rev" \
+  [ -n "$(jj --ignore-working-copy -R "$trustd_store" log -r "$trustd_pin & ::$trustd_rev" \
     --no-graph -T 'commit_id' 2>/dev/null)" ] ||
     trustd_die "$trustd_rev does not descend from the genesis pin $trustd_pin" 65
 
@@ -294,7 +472,6 @@ trustd_apply() {
     trustd_scratch=${TMPDIR:-/tmp}
   fi
   trustd_tmp=$(mktemp -d "$trustd_scratch/roundhouse-trustd.XXXXXX")
-  trap 'rm -rf "$trustd_tmp"' EXIT HUP INT TERM
   fleet_trust_roster_show "$trustd_store" "$trustd_rev" "$trustd_tmp/signers.yaml"
   trustd_gen=$(fleet_trust_generation "$trustd_tmp/signers.yaml")
   trustd_gen_seen=$(fleet_trust_seen_generation)
@@ -327,7 +504,7 @@ trustd_apply() {
   fleet_trust_roster_at_head "$trustd_store" "$trustd_rev" \
     "$trustd_tmp/reviewed-roster"
   if [ -n "$trustd_ref" ] &&
-    jj -R "$trustd_store" log -r "$trustd_ref" --no-graph -T '""' >/dev/null 2>&1; then
+    jj --ignore-working-copy -R "$trustd_store" log -r "$trustd_ref" --no-graph -T '""' >/dev/null 2>&1; then
     trustd_replay="$trustd_ref..$trustd_rev"
   else
     trustd_replay="::$trustd_rev ~ root()"
@@ -340,7 +517,7 @@ trustd_apply() {
       "$trustd_tmp/h.$trustd_c" "$trustd_tmp/reviewed-roster") ||
       trustd_bad="$trustd_c: ${trustd_hold:-unverifiable}"
   done <<EOF
-$(jj -R "$trustd_store" log -r "$trustd_replay" --no-graph -T 'commit_id ++ "\n"' 2>/dev/null)
+$(jj --ignore-working-copy -R "$trustd_store" log -r "$trustd_replay" --no-graph -T 'commit_id ++ "\n"' 2>/dev/null)
 EOF
   [ -z "$trustd_bad" ] ||
     trustd_die "the history does not verify at $trustd_bad; refusing to materialize" 65
@@ -379,7 +556,7 @@ EOF
   #    self-check) custody is a no-op and the existing same-user file is adopted.
   trustd_krl=$trustd_dest/krl
   if [ -f "$trustd_krl" ] && [ ! -L "$trustd_krl" ]; then
-    if trustd_is_root && ! trustd_root_owned "$trustd_krl"; then
+    if trustd_is_root && ! trustd_node_ok "$trustd_krl"; then
       trustd_die "refusing to root a same-user KRL at $trustd_krl (§7.9 residual 2); re-run the trustd install lane to seed the enrollment KRL" 77
     fi
     trustd_install "$trustd_krl" "$trustd_krl" 0644
@@ -398,7 +575,7 @@ EOF
   printf '%s\n' "$trustd_rev" >"$trustd_tmp/privileged"
   trustd_install "$trustd_tmp/privileged" "$trustd_dest/privileged" 0644
 
-  rm -rf "$trustd_tmp"
+  trustd_cleanup
   trap - EXIT HUP INT TERM
 }
 
@@ -413,16 +590,24 @@ trustd_selftest_own() {
   printf '%s\n' "$(file_owner "$1")"
 }
 
+trustd_selftest_trusted() {
+  # `roundhouse-trustd selftest-trusted <path>` — prints the physical path when
+  # trustd_trusted_path would let root run <path>, and fails otherwise. It only
+  # reads metadata, so the suite can check the root gate's verdicts (and their
+  # parity with lib/host.sh's root_trusted_path) without being root.
+  trustd_trusted_path "$1" || trustd_die "not root-trusted: $1" 77
+}
+
 trustd_command=${1:-}
 [ -n "$trustd_command" ] || trustd_die "usage: roundhouse-trustd apply STORE REVIEWED-REV"
 shift || true
 case $trustd_command in
   apply)
     [ $# -eq 2 ] || trustd_die "usage: roundhouse-trustd apply STORE REVIEWED-REV"
-    # jq/yq and the pinned toolchain are needed only by the apply path — the
-    # ownership self-check below touches neither — so they are required here, not
-    # at load time where they would make selftest-own demand tools it never runs.
-    trustd_pin_toolchain
+    # jq/yq are needed only by the apply path — the ownership self-check below
+    # touches neither — so they are required here, not at load time where they
+    # would make selftest-own demand tools it never runs. (The pin itself ran
+    # before the library was sourced; off-root it is a no-op.)
     require_jq
     require_yq
     fleet_run_env
@@ -431,6 +616,10 @@ case $trustd_command in
   selftest-own)
     [ $# -eq 1 ] || trustd_die "usage: roundhouse-trustd selftest-own PATH"
     trustd_selftest_own "$1"
+    ;;
+  selftest-trusted)
+    [ $# -eq 1 ] || trustd_die "usage: roundhouse-trustd selftest-trusted PATH"
+    trustd_selftest_trusted "$1"
     ;;
   *) trustd_die "unknown subcommand: $trustd_command" ;;
 esac
