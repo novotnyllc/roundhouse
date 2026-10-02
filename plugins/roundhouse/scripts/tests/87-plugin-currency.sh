@@ -200,6 +200,17 @@ SH
       ! grep -q FORBIDDEN "$PC_CODEX_LOG" ||
         fail "Roundhouse drove a Codex upgrade or install: $(tr '\n' ';' <"$PC_CODEX_LOG")"
     )
+    # A Windows task passes the resolved Codex executable, as approve/update
+    # take it: sync starts exactly that one, not the `codex` on PATH (here,
+    # the fixture's stub, which never writes this log).
+    pc_codex_head=$(pc_commit codex-up 'another release')
+    printf '%s\n' "$pc_codex_head" >"$PC_CODEX_SYNC_TO"
+    : >"$PC_CODEX_LOG"
+    pc_out=$(node "$script_dir/codex-plugin-hooks.mjs" sync \
+      --codex-executable "$pc/bin/codex" "$pc/codex-root" "$pc_codex_head") ||
+      fail "sync with an explicit Codex executable failed: $pc_out"
+    [ "$(cat "$PC_CODEX_LOG")" = app-server ] && [ "$pc_out" = '{"synced":1,"missing":[]}' ] ||
+      fail "sync did not start the named Codex executable: $pc_out $(tr '\n' ';' <"$PC_CODEX_LOG")"
 
     # The run hands the refresh its whole desired universe (fleet_run_desired:
     # the fold plus tombstones), not the bare fold, which drops `absent`.

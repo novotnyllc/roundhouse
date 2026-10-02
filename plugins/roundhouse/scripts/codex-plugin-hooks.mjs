@@ -351,17 +351,24 @@ function runCodexPluginAdd(pluginId, codexExecutable) {
 
 async function main() {
   if (process.argv[2] === "sync") {
-    // sync ROOT REVISION [ROOT REVISION ...]: trigger Codex's own marketplace
-    // sync and report which roots reached their revision. Exit non-zero
-    // when any did not, so nobody records a revision Codex never reached.
-    const pairs = process.argv.slice(3);
+    // sync [--codex-executable PATH] ROOT REVISION [ROOT REVISION ...]:
+    // trigger Codex's own marketplace sync and report which roots reached
+    // their revision. Exit non-zero when any did not, so nobody records a
+    // revision Codex never reached.
+    let pairs = process.argv.slice(3);
+    let syncExecutable = "codex";
+    if (pairs[0] === CODEX_EXECUTABLE_FLAG) {
+      if (!pairs[1]) fail("usage: codex-plugin-hooks.mjs sync [--codex-executable PATH] ROOT REVISION ...");
+      syncExecutable = pairs[1];
+      pairs = pairs.slice(2);
+    }
     if (!pairs.length || pairs.length % 2 || pairs.some((value) => !value)) {
-      fail("usage: codex-plugin-hooks.mjs sync ROOT REVISION [ROOT REVISION ...]");
+      fail("usage: codex-plugin-hooks.mjs sync [--codex-executable PATH] ROOT REVISION [ROOT REVISION ...]");
     }
     const targets = [];
     for (let index = 0; index < pairs.length; index += 2) targets.push([pairs[index], pairs[index + 1]]);
     const waitMs = Number(process.env.ROUNDHOUSE_CODEX_SYNC_WAIT_MS || 30_000);
-    const missing = await syncMarketplaces(targets, waitMs, "codex");
+    const missing = await syncMarketplaces(targets, waitMs, syncExecutable);
     process.stdout.write(`${JSON.stringify({ synced: targets.length - missing.length, missing })}\n`);
     if (missing.length) process.exitCode = 75;
     return;

@@ -111,9 +111,11 @@ for native_status in tool_surface_missing host_offline saved_project_missing nat
   assert_contains "$remote_control_text" "$native_status"
 done
 assert_contains "$remote_control_text" 'does not require or preflight the Roundhouse executor'
+# Windows remote-control targets follow Codex's own startup sync too.
 assert_ordered "$remote_control_reference" \
-  'codex plugin marketplace upgrade MARKETPLACE --json' \
-  'codex-plugin-hooks.mjs" update EACH_INSTALLED_PLUGIN@MARKETPLACE'
+  'codex plugin marketplace list --json' \
+  'codex-plugin-hooks.mjs" sync --codex-executable "RESOLVED-CODEX-EXE" ROOT REVISION'
+assert_contains "$remote_control_text" 'Do not run `codex plugin marketplace upgrade` followed by'
 assert_contains "$remote_control_text" 'applicable Codex'
 assert_contains "$remote_control_text" 'Claude harnesses'
 assert_contains "$remote_control_text" 'native PowerShell only'
