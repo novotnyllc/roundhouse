@@ -359,7 +359,9 @@ replaced and reloaded. **Absorb, never duplicate**: if
 `com.novotnyllc.roundhouse.fleet` (or a systemd/Task Scheduler equivalent)
 exists, unload it and set it aside (renamed `.absorbed`, never deleted) in the
 same step that installs the fleet entry; `install` does this for both macOS
-labels. A replaced definition that differed is kept as `.replaced`, and one
+labels. A superseded job launchd still holds must unload: if the `bootout`
+fails, `install` fails and reports nothing absorbed, and the next `install`
+unloads it even though its plist was already set aside. A replaced definition that differed is kept as `.replaced`, and one
 `uninstall` removes as `.removed`; a backup that cannot be made stops the step.
 `uninstall` unloads a job the scheduler still holds before it removes the file,
 and is not done until the scheduler has let go of it. A scheduler this session

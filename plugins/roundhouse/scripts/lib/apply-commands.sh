@@ -623,17 +623,26 @@ apply_plan_command() {
         end
       elif .type == "agent-update" and .id == "roundhouse:schedule" then
         # Every definition a step wrote or kept is on disk at its sealed
-        # digest, and every one it removed or absorbed is gone.
+        # digest, every one it removed or absorbed is gone, and once a
+        # superseded job was unloaded, launchd holds none of them.
         . as $operation |
         any($records[];
           .kind == "agent_artifact" and .id == "roundhouse:schedule" and
           (.status | IN("present","absent")) and
-          (((.data.files // []) + (.data.legacy // [])) as $files |
+          ((.data.legacy // []) as $legacy | ((.data.files // []) + $legacy) as $files |
             all($operation.steps[]; . as $s |
               if .action == "write" or .action == "keep" then
                 any($files[]; .path == $s.path and .digest == $s.digest)
-              elif .action == "remove" or .action == "absorb" then
+              elif .action == "remove" then
                 all($files[]; .path != $s.path or .digest == null)
+              elif .action == "absorb" then
+                # An absorbed definition may have been bootstrapped after the
+                # precondition recheck: it is gone AND launchd holds no legacy
+                # job, whether or not a bootout step was planned.
+                all($files[]; .path != $s.path or .digest == null) and
+                  all($legacy[]; (.loaded // false) | not)
+              elif .action == "run" and .mode == "legacy" then
+                all($legacy[]; (.loaded // false) | not)
               else true end)))
       elif .type == "agent-update" and .id == "roundhouse:launcher" then
         . as $operation |

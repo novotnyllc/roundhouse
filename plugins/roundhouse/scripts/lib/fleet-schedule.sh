@@ -90,6 +90,42 @@ fleet_schedule_legacy_plists() {
   done
 }
 
+fleet_schedule_legacy_entries() {
+  # The superseded entries as ONE JSON array, an object per label in
+  # fleet_schedule_legacy_labels, plist or not: its plist path, the plist's
+  # sha256 (null when absent), and whether launchd still holds the job
+  # (`loaded`; false with no GUI domain, where no agent can be loaded). One
+  # whose plist an earlier install set aside but whose unload failed is
+  # still a second runner, so it is listed by its label, not its file. A
+  # present plist that cannot be hashed fails the observation (exit 1): read
+  # as absent, it would never be set aside.
+  legacy_entries='[]'
+  legacy_domain=$(fleet_schedule_gui_domain)
+  legacy_reachable=false
+  ! launchctl print "$legacy_domain" >/dev/null 2>&1 || legacy_reachable=true
+  for legacy_label in $fleet_schedule_legacy_labels; do
+    legacy_path="$HOME/Library/LaunchAgents/$legacy_label.plist"
+    legacy_digest=
+    if [ -f "$legacy_path" ]; then
+      legacy_digest=$(sha256_file "$legacy_path" 2>/dev/null) || return 1
+      case $legacy_digest in
+        *[!0-9a-f]* | '') return 1 ;;
+      esac
+      [ "${#legacy_digest}" -eq 64 ] || return 1
+    fi
+    legacy_loaded=false
+    if [ "$legacy_reachable" = true ] &&
+      launchctl print "$legacy_domain/$legacy_label" >/dev/null 2>&1; then
+      legacy_loaded=true
+    fi
+    legacy_entries=$(printf '%s\n' "$legacy_entries" | jq -c --arg label "$legacy_label" \
+      --arg path "$legacy_path" --arg digest "$legacy_digest" --argjson loaded "$legacy_loaded" \
+      '. + [{label:$label,path:$path,digest:(if $digest == "" then null else $digest end),
+        loaded:$loaded}]')
+  done
+  printf '%s\n' "$legacy_entries"
+}
+
 fleet_schedule_paths_in_home() {
   # True when every path on stdin (one per line) is strictly under $HOME. A
   # definition is per-user state: an XDG_CONFIG_HOME pointing elsewhere must

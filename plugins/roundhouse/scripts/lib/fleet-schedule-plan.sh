@@ -10,9 +10,10 @@
 #   observe   the collector's `agent_artifact roundhouse:schedule` record
 #             (fleet_schedule_observe): every definition file's sha256 or its
 #             absence, each job's facts and state word (lib/fleet-schedule.sh),
-#             the superseded entries, the scheduler's reachability, and
-#             whether a systemd user manager still runs an older copy of a
-#             replaced unit;
+#             the superseded entries (each plist's sha256 or its absence, and
+#             whether launchd still holds the job), the scheduler's
+#             reachability, and whether a systemd user manager still runs an
+#             older copy of a replaced unit;
 #   plan      fleet_schedule_plan_steps turns that record into the EXACT
 #             steps — each file to write (with its rendered sha256), keep,
 #             remove or absorb, and each scheduler command with the effect it
@@ -96,14 +97,10 @@ EOF_OBSERVE
   fi
   observe_legacy='[]'
   if [ "$observe_platform" = launchd ]; then
-    observe_legacy_list=$(fleet_schedule_legacy_plists)
-    while IFS= read -r observe_path; do
-      [ -n "$observe_path" ] || continue
-      observe_legacy=$(printf '%s\n' "$observe_legacy" | jq -c --arg path "$observe_path" \
-        --arg digest "$(sha256_file "$observe_path")" '. + [{path:$path,digest:$digest}]')
-    done <<EOF_OBSERVE
-$observe_legacy_list
-EOF_OBSERVE
+    observe_legacy=$(fleet_schedule_legacy_entries) || {
+      printf 'roundhouse: a superseded scheduler entry could not be read\n' >&2
+      return 70
+    }
   fi
   jq -cn --arg platform "$observe_platform" --arg domain "$(fleet_schedule_gui_domain)" \
     --argjson reachable "$observe_reachable" --argjson lingers "$observe_lingers" \
@@ -148,7 +145,7 @@ fleet_schedule_launchd_commands() {
       "$(fleet_schedule_launchd_def_path "$launchd_mode")"
   done
   for launchd_label in $fleet_schedule_legacy_labels; do
-    fleet_schedule_run_step legacy unload false launchctl bootout "$launchd_domain/$launchd_label"
+    fleet_schedule_run_step legacy unload true launchctl bootout "$launchd_domain/$launchd_label"
   done
 }
 
@@ -227,17 +224,24 @@ fleet_schedule_launchd_plan_finish() {
   # fleet_schedule_launchd_plan_finish ACTION CHANGED REACHABLE RECORD —
   # Absorb, never duplicate (fleet-update): only after the new pair, and
   # renamed BEFORE it is unloaded — a rename that fails leaves the superseded
-  # entry on disk and running. The new name is sealed too.
+  # entry on disk and running. The new name is sealed too. A superseded job
+  # launchd still holds (the record's `loaded`, false where the domain could
+  # not be reached) is unloaded, REQUIRED: one left running beside the new
+  # pair is not absorbed, and the install fails before reporting it. That
+  # holds with no plist left to rename too (an earlier unload failed).
   [ "$1" = install ] || return 0
-  printf '%s\n' "$4" | jq -c '.legacy[]' | while IFS= read -r finish_file; do
-    [ -n "$finish_file" ] || continue
-    finish_path=$(printf '%s\n' "$finish_file" | jq -r '.path')
-    finish_to="$finish_path.absorbed"
-    [ ! -e "$finish_to" ] || finish_to="$finish_path.absorbed.$(date -u +%Y%m%dT%H%M%SZ)"
-    printf '%s\n' "$finish_file" | jq -c --arg to "$finish_to" \
-      '{action:"absorb",path,before:.digest,to:$to}'
-    [ "$3" != true ] || fleet_schedule_run_step legacy unload false launchctl bootout \
-      "$(fleet_schedule_gui_domain)/$(basename "$finish_path" .plist)"
+  printf '%s\n' "$4" | jq -c '.legacy[]' | while IFS= read -r finish_entry; do
+    [ -n "$finish_entry" ] || continue
+    if [ "$(printf '%s\n' "$finish_entry" | jq -r '.digest != null')" = true ]; then
+      finish_path=$(printf '%s\n' "$finish_entry" | jq -r '.path')
+      finish_to="$finish_path.absorbed"
+      [ ! -e "$finish_to" ] || finish_to="$finish_path.absorbed.$(date -u +%Y%m%dT%H%M%SZ)"
+      printf '%s\n' "$finish_entry" | jq -c --arg to "$finish_to" \
+        '{action:"absorb",path,before:.digest,to:$to}'
+    fi
+    [ "$(printf '%s\n' "$finish_entry" | jq -r '.loaded')" != true ] ||
+      fleet_schedule_run_step legacy unload true launchctl bootout \
+        "$(fleet_schedule_gui_domain)/$(printf '%s\n' "$finish_entry" | jq -r '.label')"
   done
 }
 
@@ -480,11 +484,13 @@ EOF_ARGV
 # --- report and verify ----------------------------------------------------------------
 
 fleet_schedule_report() {
-  # fleet_schedule_report install|uninstall OPERATION-JSON REACHABLE — what the
-  # applied plan did, one line per definition, read from the sealed steps'
-  # actions and effects.
+  # fleet_schedule_report install|uninstall OPERATION-JSON REACHABLE RECORD —
+  # what the applied plan did, one line per definition, read from the sealed
+  # steps' actions and effects; the superseded entries it unloaded are the
+  # ones the observed RECORD says launchd held (each one's unload is a
+  # required step, so an applied install unloaded them all).
   printf '%s\n' "$2" | jq -r --arg action "$1" --argjson reachable "$3" \
-    --arg platform "$(fleet_schedule_platform)" '
+    --argjson record "$4" --arg platform "$(fleet_schedule_platform)" '
     .steps as $steps |
     ($steps | map(select(.action == "absorb"))) as $absorbed |
     (["fast","full"][] as $mode |
@@ -513,7 +519,12 @@ fleet_schedule_report() {
         all($steps[]; .action != "write") then
        "roundhouse: reloaded the user manager, which was still on an older copy of a unit"
      else empty end),
-    ($absorbed[] | "roundhouse: absorbed the superseded \(.path | split("/") | last | rtrimstr(".plist")) entry (kept as \(.to))")'
+    (if $action == "install" then [($record.legacy // [])[] | select(.loaded) | .path] else [] end) as $unloaded |
+    ($absorbed[] |
+      "roundhouse: absorbed the superseded \(.path | split("/") | last | rtrimstr(".plist")) entry (kept as \(.to)\(if (.path as $p | $unloaded | index($p)) != null then ", unloaded" else "" end))"),
+    (($record.legacy // [])[] | select(.loaded and $action == "install" and
+        (.path as $p | all($absorbed[]; .path != $p))) |
+      "roundhouse: unloaded the superseded \(.label) entry")'
 }
 
 fleet_schedule_verify() {
@@ -616,10 +627,13 @@ fleet_schedule_preflight() {
       }
       # A superseded job that WORKS is not retired for a pair that would only
       # fail: the new jobs converge the fleet store, so it must be enrolled.
-      if [ -n "$(fleet_schedule_legacy_plists)" ] &&
+      # On disk or still loaded: either is a working job install would retire.
+      install_legacy=$(fleet_schedule_legacy_entries | jq -r \
+        '[.[] | select(.digest != null or .loaded) | .label] | join(" ")')
+      if [ -n "$install_legacy" ] &&
         ! fleet_vcs_store_ready "$(fleet_store_path)" >/dev/null 2>&1; then
         printf 'roundhouse: a superseded scheduler entry is still installed (%s) and this host has no enrolled fleet store for the new jobs to converge; enroll it (roundhouse fleet-init / fleet-enroll), then re-run install. Nothing was changed.\n' \
-          "$(fleet_schedule_legacy_plists | tr '\n' ' ')" >&2
+          "$install_legacy" >&2
         return 69
       fi
       [ "$(fleet_schedule_platform)" != systemd ] || fleet_schedule_lingers_preflight
@@ -738,7 +752,7 @@ fleet_schedule_sealed() (
     exit 70
   }
   fleet_schedule_report "$sealed_action" "$(jq -c '.operations[0]' "$sealed_tmp/draft.json")" \
-    "$sealed_reachable"
+    "$sealed_reachable" "$sealed_record"
   fleet_schedule_verify "$sealed_action" "$sealed_reachable" || exit $?
   # An install the scheduler could not take yet is 75 (written, loads later);
   # an uninstall has removed what it could see either way.
