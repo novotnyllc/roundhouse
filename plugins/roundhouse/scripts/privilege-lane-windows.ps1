@@ -685,7 +685,12 @@ function Invoke-Enroll {
                 }
                 [Console]::Out.Write($ReceiptText)
             } else {
-                Write-Record @("lane-enrollment|1", "state|failed", "reason|elevated_enrollment_left_no_receipt", "platform|windows", "end-enrollment|")
+                # No receipt means the canary never ran and the lane, if it was
+                # installed at all, is still pending: that is a failure
+                # whatever the child's exit status said.
+                Write-Record @("lane-enrollment|1", "state|failed", "reason|elevated_enrollment_left_no_receipt", "platform|windows",
+                    "next-command|roundhouse privilege-enroll $HostId", "end-enrollment|")
+                return 74
             }
             return $ExitCode
         }
