@@ -556,7 +556,7 @@ lane_draft_valid() {
       (.id | type == "string" and test("^[a-z]+\\.[a-z0-9-]+\\.v[0-9]+$")) and
       (.package | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}(:[a-z0-9-]{1,16})?$"))) and
       (.version | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,127}$"))) and
-      (.source == "-")
+      (.source | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")))
     ] | all)' "$1" >/dev/null 2>&1
 }
 lane_plan_precondition() {
