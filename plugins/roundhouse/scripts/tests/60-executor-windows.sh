@@ -62,6 +62,9 @@ fi
 dotfiles_home="$tmp/dotfiles-home"
 mkdir -p "$dotfiles_home"
 git -C "$dotfiles_home" init -q
+# No detached auto gc/maintenance racing the rm -rf below (see N18).
+git -C "$dotfiles_home" config gc.auto 0
+git -C "$dotfiles_home" config maintenance.auto false
 printf '.claude/\n.codex/\n' >"$dotfiles_home/.gitignore"
 git -C "$dotfiles_home" add .gitignore
 git -C "$dotfiles_home" -c user.email=test@test.invalid -c user.name=test commit -q -m dotfiles
@@ -109,6 +112,13 @@ rm -rf "$dotfiles_home"
 backup_home="$tmp/backup-home"
 mkdir -p "$backup_home"
 git -C "$backup_home" init -q
+# This repo commits the whole plugin tree and is then rm -rf'd. commit
+# spawns a detached `git maintenance run --auto`; on git 2.55 its geometric
+# repack fires at ~160 loose objects and can still be writing
+# .git/objects/pack when rm runs ("Directory not empty"). Keep every git call
+# in this repo free of auto maintenance and gc.
+git -C "$backup_home" config gc.auto 0
+git -C "$backup_home" config maintenance.auto false
 nested_backup_cache="$backup_home/.claude/plugins/cache/novotnyllc/roundhouse/$plugin_version"
 mkdir -p "$nested_backup_cache"
 cp -R "$script_dir/../." "$nested_backup_cache/"
