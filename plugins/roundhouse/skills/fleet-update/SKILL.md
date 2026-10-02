@@ -24,10 +24,9 @@ policy.
   the planned formulae/casks. macOS casks run as the ordinary Homebrew owner through the
   packaged bridge hook so Homebrew retains Caskroom authority. An unprivileged
   app upgrade (including Visual Studio Code when its destination is writable)
-  follows Homebrew normally. A cask package that reaches Homebrew's hardcoded
-  `sudo` succeeds only when it byte-matches an active exact
-  `sealed-cask-payload-v1` enrollment on the optional CA lane; otherwise it
-  holds (see "Protected package actions").
+  follows Homebrew normally. A cask step that reaches Homebrew's hardcoded
+  `sudo` holds in this version (see "Protected package actions"); nothing
+  elevates it.
 - APT: on an update request, `apt-get update` then plan with
   `apt-get --simulate upgrade`. Do not use `full-upgrade`, `dist-upgrade`, or
   `autoremove` unless explicitly selected.
@@ -434,12 +433,7 @@ failure. The holder is checked before the age: the lock records the holder's
 pid, process start time, command and a random nonce, and a lock whose holder is
 dead — the pid is gone, or now belongs to a process with a different start time
 or command — is taken over (renamed aside, verified by nonce, recreated) and
-raises a `lock-takeover` alert. A holder that is provably the recorded run
-(pid, start time and command all match) but has held the lock past the pass
-ceiling (2 h) is a hung pass, not a slow one: the next run stops it and every
-process under it (TERM, then KILL, then confirms it is gone), takes the lock
-over the same way, and raises a `lock-takeover` alert naming the stopped run.
-A `manual` lock is never stopped. Every package- and agent-manager query a
+raises a `lock-takeover` alert. Every package- and agent-manager query a
 pass makes is bounded (about a minute for a listing, longer only for an
 install), so a manager that hangs makes only its own inventory unknown for
 that pass and raises an `inventory-timeout` alert. A run releases the lock only while it still
@@ -461,22 +455,25 @@ land in the store's own alert and journal records and surface in
 ## Protected package actions
 
 Privileged package work goes through the host's **privilege lane** — a
-root-owned helper behind an owner-only queue, enrolled by one OS
+root/SYSTEM-owned helper behind an owner-only queue, enrolled by one OS
 approval (`roundhouse privilege-enroll HOST`) and never by a ceremony. The
-catalog is closed and semantic; a request carries a package token and a
-version, never argv, an executable, an installer selector, an environment, a
-shell, or an elevation control:
+catalog is closed and semantic; a request carries a package token, a version
+and (winget) a source, never argv, an executable, an installer selector, an
+environment, a shell, or an elevation control:
 
 | Platform | Actions |
 | --- | --- |
-| linux, wsl | `apt.update-metadata.v1`, `apt.upgrade-package.v1` (package, candidate version), `apt.install-package-version.v1`, `apt.autoremove.v1`, `lane.probe.v1` |
-| macos, windows | none in this version: readiness reports the lane as `not yet supported`, and machine-scope winget or signed macOS package work holds unless the host has the optional CA lane configured (`privilege_broker.automation_transport`), whose own `winget.*` / `macos.*` actions and vocabulary then apply |
+| linux, wsl | `apt.update-metadata.v1`, `apt.upgrade-package.v1` (package, candidate version), `apt.install-package-version.v1`, `apt.autoremove.v1` |
+| macos | `lane.probe.v1` only in this version: `macos.install-signed-pkg.v1` exists on the host side but the sealed format does not bind its payload digest yet, so plans cannot name it |
+| windows | `winget.inventory-machine.v1`, `winget.install-machine-package.v1`, `winget.upgrade-machine-package.v1` (machine scope, `winget` or `msstore` source; this is also the only lane for a machine-scope Node.js `OpenJS.NodeJS` upgrade) |
+| all | `lane.probe.v1` (`lane.self-upgrade.v1` is host-side only for the same reason) |
 
 User-scope winget packages, fnm/Node and profile configuration are not lane
-work: they run in the ordinary lane as the user. Never use root Homebrew,
-arbitrary `sudo`, arbitrary installer scripts, or arbitrary plist paths;
-Homebrew cask steps that reach Homebrew's own `sudo` are not routed through
-the lane in this version and hold.
+work: they run in the ordinary lane as the user (on Windows, through the WSL
+interop lane under the user's own logged-on session). Never use root
+Homebrew, arbitrary `sudo`, arbitrary installer scripts, or arbitrary plist
+paths; Homebrew cask steps that reach Homebrew's own `sudo` are not routed
+through the lane in this version and hold.
 
 To drive it from a plan: `"$CLI" privilege-status HOST SNAPSHOT` (a
 `privilege_broker`/`readiness` record whose `lifecycle_status` must be
@@ -488,15 +485,14 @@ immediately before `submit-privilege-plan`, and use
 `lookup-privilege-result PLAN INDEX OUTPUT` for recovery without
 resubmission: every operation carries a sealed request id that the host
 accepts exactly once. `prepare-privilege-enrollment HOST OUT` reports
-`ready`, `needs_one_time_approval` with the exact command, `disabled`,
-`drifted`, or `unreachable`; `prepare-privilege-identity`,
+`ready`, `needs_one_time_approval` with the exact command, `disabled`, or
+`user_session_unavailable`; `prepare-privilege-identity`,
 `preview-privilege-upgrade`, and `preview-privilege-revocation` belong to
-the optional CA lane and are not needed here. Preserve the readiness states
-`ready`, `needs_one_time_approval`, `disabled`, `legacy`, `unsupported`,
-`drifted`, and `unreachable`, and the operation-result states `partial` and
-`rejected`, exactly; perform no fallback.
+the optional CA lane and are not needed here. Preserve `ready`,
+`needs_one_time_approval`, `user_session_unavailable`, `drifted`,
+`unreachable`, `partial`, and `rejected` exactly; perform no fallback.
 Never ask for or relay a sudo or Administrator password: the one approval is
-typed by the owner at the host's own prompt, and the agent's job
+typed or clicked by the owner at the host's own prompt, and the agent's job
 when it is missing is to report `needs_one_time_approval` and the command.
 After a Roundhouse plugin install or update on POSIX, run
 `roundhouse launcher-install ~/.local/bin/roundhouse` so the maintained

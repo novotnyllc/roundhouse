@@ -1,32 +1,36 @@
 # roundhouse — the controller side of the local privilege lane.
 #
-# Every Linux and WSL host is lane-capable by default: after one OS approval
-# per host (`roundhouse privilege-enroll HOST`), privileged apt work reaches
-# the host's root side through an owner-only queue over the host's ordinary
-# transport (local shell or SSH as the user). No CA, no certificates, no
-# dedicated request account. macOS and native Windows report `unsupported`
-# in this version: their lanes are designed in the spec and arrive in a
-# follow-up. Design: docs/specs/2026-10-01-hands-off-privilege-lane.md.
+# Every host is lane-capable by default: after one OS approval per host
+# (`roundhouse privilege-enroll HOST`), privileged package work reaches the
+# host's root/SYSTEM side through an owner-only queue over the host's
+# ordinary transport (local shell, SSH as the user, or SSH into the WSL
+# sibling for native Windows). No CA, no certificates, no dedicated request
+# account. Design: docs/specs/2026-10-01-hands-off-privilege-lane.md.
 #
 # Sourced by scripts/roundhouse; carries definitions only.
 # shellcheck shell=bash
 
+lane_windows_script='C:\ProgramData\Roundhouse-Lane\privilege-lane-windows.ps1'
+lane_windows_relative=ProgramData/Roundhouse-Lane/privilege-lane-windows.ps1
+
 lane_actions_for_platform() {
-  # The actions a sealed lane plan may carry: the apt catalog on linux and
-  # wsl, nothing anywhere else in this version (the helper's own catalog is
-  # the same list; section 16 checks they agree).
+  # The actions a sealed lane plan may carry. The helpers also implement
+  # `macos.install-signed-pkg.v1` and `lane.self-upgrade.v1`, but both need
+  # a payload digest the sealed format does not bind yet, so the controller
+  # does not advertise them (docs/specs/…hands-off-privilege-lane.md,
+  # "Deferred").
   case $1 in
     linux | wsl) printf '%s\n' apt.update-metadata.v1 apt.upgrade-package.v1 \
       apt.install-package-version.v1 apt.autoremove.v1 lane.probe.v1 ;;
+    macos) printf '%s\n' lane.probe.v1 ;;
+    windows) printf '%s\n' winget.inventory-machine.v1 winget.install-machine-package.v1 \
+      winget.upgrade-machine-package.v1 lane.probe.v1 ;;
     *) return 1 ;;
   esac
 }
 lane_platform_note() {
-  # lane_platform_note PLATFORM -> why a platform has no lane in this version.
-  case $1 in
-    macos | windows) printf 'the privilege lane covers linux and wsl in this version; %s follows in a later release' "$1" ;;
-    *) printf 'the machine is absent from inventory or on an unsupported platform' ;;
-  esac
+  # lane_platform_note PLATFORM -> why a machine has no lane.
+  printf 'the machine is absent from inventory or on an unsupported platform'
 }
 
 # lane_host_local=true makes every lane function treat TARGET as this host's
@@ -45,17 +49,24 @@ lane_route() {
     if $m == null then "unsupported"
     elif ($m.privilege_broker.automation_transport // null) != null then "legacy"
     elif ($m.privilege_lane // "enabled") == "disabled" then "disabled"
-    elif ($m.platform | IN("linux","wsl")) then "local"
+    elif ($m.platform | IN("macos","linux","wsl","windows")) then "local"
     else "unsupported" end' "$(config_path)"
 }
 
-# lane_transport TARGET -> "local" | "ssh ALIAS" | "unavailable REASON".
+# lane_transport TARGET -> "local" | "ssh ALIAS" | "interop ALIAS" |
+# "unavailable REASON". Windows is reachable only through its WSL sibling.
 lane_transport() {
   if [ "$lane_host_local" = true ]; then printf 'local\n'; return; fi
   lane_platform=$(jq -r --arg target "$1" '.machines[$target].platform // empty' "$(config_path)")
   lane_kind=$(jq -r --arg target "$1" '.machines[$target].transport // empty' "$(config_path)")
   case $lane_platform:$lane_kind in
-    macos:* | windows:*) printf 'unavailable unsupported_platform\n' ;;
+    windows:*)
+      if lane_alias=$(wsl_interop_alias "$(config_path)" "$1"); then
+        printf 'interop %s\n' "$lane_alias"
+      else
+        printf 'unavailable user_session_unavailable\n'
+      fi
+      ;;
     *:local) printf 'local\n' ;;
     *:ssh)
       lane_alias=$(fleet_ssh_destination "$1") || { printf 'unavailable invalid_ssh_alias\n'; return; }
@@ -70,14 +81,16 @@ lane_transport() {
 lane_remote_sh() {
   case $1 in
     local) sh -c "$2" ;;
-    ssh\ *) ssh_run "${1#* }" "$2" ;;
+    ssh\ * | interop\ *) ssh_run "${1#* }" "$2" ;;
     *) return 69 ;;
   esac
 }
 
-# The command the TARGET runs for one lane verb. Hosts resolve the installed
-# plugin's helper through the `roundhouse` launcher on their PATH; the local
-# host uses this checkout's copy.
+# The command the TARGET runs for one lane verb. POSIX hosts resolve the
+# installed plugin's helper through the `roundhouse` launcher on their PATH;
+# the local host uses this checkout's copy. Windows runs the SYSTEM-owned
+# copy through pwsh from the WSL side and reports the one approval itself
+# when that copy is absent.
 lane_posix_helper_script() {
   # lane_posix_helper_script TRANSPORT -> shell text that sets $lane_helper.
   case $1 in
@@ -86,6 +99,24 @@ lane_posix_helper_script() {
   esac
 }
 lane_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+# The WSL-side programs are CONSTANT one-line text (the same shape as interop_invoke):
+# every value reaches them as a positional argument, never interpolated into
+# program text, so nothing crosses the `$SHELL -lc` argument boundary except
+# quoting the values themselves. Output goes through a file rather than a
+# pipe so pwsh's exit status survives.
+lane_windows_program='root=$1; pwsh=$2; script=$3; shift 3; if [ ! -f "$root/ProgramData/Roundhouse-Lane/privilege-lane-windows.ps1" ]; then if [ -e "$root/ProgramData/Roundhouse-Lane/lane.identity" ]; then printf "%s\n" "lane-status|1" "state|drifted" "platform|windows" "host-id|-" "owner-sid|-" "owner-name|-" "lane-version|-" "lane-sha256|-" "plugin-root|-" "interop-token|-" "detail|installed lane copy missing while the identity survives" "next-command|roundhouse privilege-enroll HOST" "end-status|"; exit 74; fi; printf "%s\n" "lane-status|1" "state|needs_one_time_approval" "platform|windows" "host-id|-" "owner-sid|-" "owner-name|-" "lane-version|-" "lane-sha256|-" "plugin-root|-" "interop-token|-" "detail|installed lane copy absent" "next-command|roundhouse privilege-enroll HOST" "end-status|"; exit 75; fi; [ -x "$pwsh" ] || { printf "privilege-lane: PowerShell 7 is not reachable through WSL interop\n" >&2; exit 69; }; cd "$root" || exit 69; out=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lane.XXXXXX") || exit 69; "$pwsh" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$script" "$@" </dev/null >"$out"; rc=$?; tr -d "\r" <"$out"; rm -f "$out"; exit "$rc"'
+lane_windows_enroll_program='root=$1; pwsh=$2; version=$3; host=$4; [ -x "$pwsh" ] || { printf "privilege-lane: PowerShell 7 is not reachable through WSL interop\n" >&2; exit 69; }; cd "$root" || exit 69; profile=$("$root/Windows/System32/cmd.exe" /c "echo %USERPROFILE%" 2>/dev/null | tr -d "\r"); case $profile in [A-Za-z]:\\*) ;; *) printf "privilege-lane: cannot resolve the Windows user profile through interop\n" >&2; exit 69 ;; esac; helper=; for cache in .claude .codex; do candidate="$profile\\$cache\\plugins\\cache\\novotnyllc\\roundhouse\\$version\\scripts\\privilege-lane-windows.ps1"; posix=$(printf "%s" "$candidate" | sed "s#^[A-Za-z]:#$root#; s#\\\\#/#g"); [ -f "$posix" ] && helper=$candidate && break; done; [ -n "$helper" ] || { printf "privilege-lane: roundhouse %s is not installed in a Windows plugin cache; install or update the Windows plugin first\n" "$version" >&2; exit 69; }; out=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lane.XXXXXX") || exit 69; "$pwsh" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$helper" -Enroll -HostId "$host" </dev/null >"$out"; rc=$?; tr -d "\r" <"$out"; rm -f "$out"; exit "$rc"'
+lane_windows_script_text() {
+  # lane_windows_script_text PWSH-ARG...: the one-line remote command that
+  # runs the constant program with the drive root, pwsh path, SYSTEM-owned
+  # script path and the pwsh arguments as positionals.
+  lane_wst_args=
+  for lane_wst_arg in "$@"; do lane_wst_args="$lane_wst_args $(lane_quote "$lane_wst_arg")"; done
+  printf 'sh -c %s roundhouse-lane %s %s %s%s\n' "$(lane_quote "$lane_windows_program")" \
+    "$(lane_quote "$(interop_drive_root)")" "$(lane_quote "$(interop_pwsh_path)")" \
+    "$(lane_quote "$lane_windows_script")" "$lane_wst_args"
+}
+
 # lane_status_raw TARGET OUTPUT: the host's own `lane-status|1` record into
 # OUTPUT. Prints nothing; the return status is the host's.
 lane_status_raw() {
@@ -96,9 +127,10 @@ lane_status_raw() {
     unavailable\ *)
       printf '%s\n' 'lane-status|1' "state|${lane_tr#* }" "platform|$(jq -r --arg t "$lane_target" '.machines[$t].platform' "$(config_path)")" \
         'host-id|-' 'owner-uid|-' 'owner-name|-' 'lane-version|-' 'lane-sha256|-' 'plugin-root|-' \
-        "detail|${lane_tr#* }" 'next-command|-' 'end-status|' >"$lane_out"
+        "detail|$(lane_transport_detail "${lane_tr#* }")" 'next-command|-' 'end-status|' >"$lane_out"
       return 75
       ;;
+    interop\ *) lane_script=$(lane_windows_script_text -Status) ;;
     *) lane_script="$(lane_posix_helper_script "$lane_tr"); exec \"\$lane_helper\" status" ;;
   esac
   lane_rc=0
@@ -112,6 +144,12 @@ lane_status_raw() {
   fi
   rm -f "$lane_out.err"
   return "$lane_rc"
+}
+lane_transport_detail() {
+  case $1 in
+    user_session_unavailable) printf 'native Windows is reachable only through a configured, reachable wsl_interop_via sibling with an active user session' ;;
+    *) printf '%s' "$1" ;;
+  esac
 }
 lane_record_valid() {
   # lane_record_valid FILE HEADER: printable ASCII, LF-terminated, bounded,
@@ -128,8 +166,9 @@ lane_field() {
 }
 
 # lane_status_command TARGET OUTPUT: JSON status for the controller and the
-# skills. States: ready, needs_one_time_approval, disabled, legacy,
-# unsupported, drifted, unreachable.
+# skills. States: ready, needs_one_time_approval, canary_pending,
+# user_session_unavailable, disabled, legacy, unsupported, drifted,
+# unreachable.
 lane_status_command() (
   target=$1
   output=$2
@@ -158,31 +197,41 @@ lane_status_command() (
         state=drifted
         detail="the host is enrolled as $(lane_field "$raw" host-id), not $target; the transport resolves to another machine"
       fi
+      if [ "$(lane_field "$raw" interop-token)" = elevated ]; then
+        # Requests written under an elevated token are owned by
+        # Administrators, not the user, and the SYSTEM side refuses them;
+        # user-scope work would land in the wrong profile for the same
+        # reason. The WSL session must be started from a limited shell.
+        state=user_session_unavailable
+        detail='the WSL interop token is elevated; start the WSL session from a non-elevated shell'
+      fi
       ;;
     legacy) detail='an explicit privilege_broker.automation_transport route is configured; the local lane is not used' ;;
     disabled) detail='privilege_lane is disabled for this machine' ;;
-    *) detail=$(lane_platform_note "$platform") ;;
+    *) detail='the machine is absent from inventory or on an unsupported platform' ;;
   esac
   next=-
   case $state in
-    needs_one_time_approval | drifted) next="roundhouse privilege-enroll $target" ;;
+    needs_one_time_approval | drifted | canary_pending) next="roundhouse privilege-enroll $target" ;;
   esac
   jq -S -n --arg target "$target" --arg platform "$platform" --arg route "$route" \
     --arg transport "$(lane_transport "$target")" --arg state "$state" --arg detail "$detail" \
     --arg next "$next" --arg host_id "$(lane_field "$raw" host-id)" \
-    --arg owner "$(lane_field "$raw" owner-uid)" \
+    --arg owner "$(lane_field "$raw" owner-uid)" --arg owner_sid "$(lane_field "$raw" owner-sid)" \
     --arg version "$(lane_field "$raw" lane-version)" --arg sha "$(lane_field "$raw" lane-sha256)" \
+    --arg token "$(lane_field "$raw" interop-token)" \
     --arg actions "$(lane_actions_for_platform "$platform" 2>/dev/null | tr '\n' ' ')" '
     {schema:"roundhouse.privilege-lane-status",schema_version:1,target:$target,platform:$platform,
      route:$route,transport:$transport,state:$state,detail:$detail,next_command:$next,
-     host_id:$host_id,owner:$owner,lane_version:$version,lane_sha256:$sha,
+     host_id:$host_id,owner:(if $owner_sid != "-" then $owner_sid else $owner end),
+     lane_version:$version,lane_sha256:$sha,interop_token:$token,
      actions:($actions | split(" ") | map(select(length > 0)))}' >"$tmp/status.json"
   safe_output "$tmp/status.json" "$output"
   trap - EXIT HUP INT TERM
   rm -rf "$tmp"
   case $state in
     ready) exit 0 ;;
-    needs_one_time_approval | disabled | legacy) exit 75 ;;
+    needs_one_time_approval | user_session_unavailable | disabled | legacy) exit 75 ;;
     unsupported) exit 69 ;;
     *) exit 74 ;;
   esac
@@ -208,7 +257,7 @@ lane_readiness_snapshot() (
      data:{lifecycle_status:$s.state,transport:"local-lane",platform_adapter:"local-privilege-lane-v1",
        broker_ready:($s.state == "ready"),action_context_ready:($s.state == "ready"),
        platform:$s.platform,route:$s.route,lane_version:$s.lane_version,lane_sha256:$s.lane_sha256,
-       host_id:$s.host_id,owner:$s.owner,actions:$s.actions,
+       host_id:$s.host_id,owner:$s.owner,interop_token:$s.interop_token,actions:$s.actions,
        detail:$s.detail,next_command:$s.next_command},
      evidence:[{source:"privilege-lane",method:"status"}],errors:[]}' "$tmp/status.json" >"$tmp/readiness.jsonl"
   validate_file "$tmp/readiness.jsonl"
@@ -231,19 +280,22 @@ privilege_enroll_command() (
       exit 69
       ;;
     disabled) printf 'roundhouse: privilege_lane is disabled for %s\n' "$target" >&2; exit 69 ;;
-    *)
-      printf 'roundhouse: %s: %s\n' "$target" \
-        "$(lane_platform_note "$(jq -r --arg t "$target" '.machines[$t].platform // "-"' "$(config_path)")")" >&2
-      exit 69
-      ;;
+    *) printf 'roundhouse: %s is not a lane-capable machine\n' "$target" >&2; exit 64 ;;
   esac
   tr=$(lane_transport "$target")
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-lane-enroll.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   case $tr in
     unavailable\ *)
-      lane_report_pending "$target" "${tr#* }" "${tr#* }"
+      lane_report_pending "$target" "${tr#* }" "$(lane_transport_detail "${tr#* }")"
       exit 75
+      ;;
+    interop\ *)
+      # UAC consent is a GUI dialog on the console, so the controller may
+      # trigger it without a terminal of its own.
+      version=$(jq -r '.version' "$plugin_root/.codex-plugin/plugin.json")
+      lane_remote_sh "$tr" "$(lane_windows_enroll_script "$target" "$version")" </dev/null >"$tmp/out" 2>"$tmp/err" || rc=$?
+      lane_report_enrollment "$target" "$tmp/out" "$tmp/err" "${rc:-0}"
       ;;
     local)
       lane_enroll_identity_check "$target" "$tr" || exit $?
@@ -320,6 +372,15 @@ lane_enroll_identity_check() {
   printf 'roundhouse: %s: enrollment refused: %s\n' "$1" "$lane_eic_detail" >&2
   return 65
 }
+
+lane_windows_enroll_script() {
+  # lane_windows_enroll_script TARGET VERSION: the constant enrollment
+  # program with the drive root, pwsh path, plugin version and host as
+  # positionals. The helper it finds re-launches itself elevated (UAC).
+  printf 'sh -c %s roundhouse-lane %s %s %s %s\n' "$(lane_quote "$lane_windows_enroll_program")" \
+    "$(lane_quote "$(interop_drive_root)")" "$(lane_quote "$(interop_pwsh_path)")" \
+    "$(lane_quote "$2")" "$(lane_quote "$1")"
+}
 lane_report_pending() {
   # lane_report_pending TARGET STATE DETAIL — the human-facing one-time step.
   jq -S -n --arg target "$1" --arg state "$2" --arg detail "$3" '
@@ -373,6 +434,10 @@ lane_submit() {
       lane_unavailable_result "$submit_target" "$2" "$3" "$4" "$7" "$8" "$9" "lane_${submit_tr#* }" >"$submit_output"
       return 75
       ;;
+    interop\ *)
+      submit_script=$(lane_windows_script_text -Request -Action "$2" -Package "$3" -Version "$4" -Source "$5" \
+        -PayloadSha256 "$6" -PlanId "$7" -PlanSha256 "$8" -OperationIndex "$9" ${submit_id:+-RequestId "$submit_id"})
+      ;;
     *)
       submit_script="$(lane_posix_helper_script "$submit_tr"); exec \"\$lane_helper\" request $(lane_quote "$2") $(lane_quote "$3") $(lane_quote "$4") $(lane_quote "$5") $(lane_quote "$6") --plan-id $(lane_quote "$7") --plan-sha256 $(lane_quote "$8") --operation-index $(lane_quote "$9")$submit_id_posix"
       ;;
@@ -407,6 +472,7 @@ lane_lookup() {
   lookup_tr=$(lane_transport "$1")
   case $lookup_tr in
     unavailable\ *) return 75 ;;
+    interop\ *) lookup_script=$(lane_windows_script_text -Lookup -RequestId "$2") ;;
     *) lookup_script="$(lane_posix_helper_script "$lookup_tr"); exec \"\$lane_helper\" result $(lane_quote "$2")" ;;
   esac
   lookup_rc=0
@@ -415,18 +481,19 @@ lane_lookup() {
   return "$lookup_rc"
 }
 
-# lane_candidate TARGET PACKAGE -> "INSTALLED CANDIDATE" as the host's
-# owner-side apt view reports it (`-` for unknown), through the lane helper.
+# lane_candidate TARGET MANAGER PACKAGE SOURCE -> "INSTALLED CANDIDATE" as the
+# host's owner-side view reports it (`-` for unknown), through the lane helper.
 lane_candidate() {
   lane_cand_tr=$(lane_transport "$1")
-  case $lane_cand_tr in
-    unavailable\ *) return 75 ;;
-    local | ssh\ *) lane_cand_script="$(lane_posix_helper_script "$lane_cand_tr"); exec \"\$lane_helper\" candidate $(lane_quote "$2")" ;;
+  case $2:$lane_cand_tr in
+    *:unavailable\ *) return 75 ;;
+    winget:interop\ *) lane_cand_script=$(lane_windows_script_text -Candidate -Package "$3" -Source "$4") ;;
+    apt:local | apt:ssh\ *) lane_cand_script="$(lane_posix_helper_script "$lane_cand_tr"); exec \"\$lane_helper\" candidate $(lane_quote "$3")" ;;
     *) return 70 ;;
   esac
   lane_cand_out=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lane-candidate.XXXXXX")
   lane_remote_sh "$lane_cand_tr" "$lane_cand_script" </dev/null >"$lane_cand_out" 2>/dev/null || :
-  if ! lane_record_valid "$lane_cand_out" lane-candidate || [ "$(lane_field "$lane_cand_out" package)" != "$2" ]; then
+  if ! lane_record_valid "$lane_cand_out" lane-candidate || [ "$(lane_field "$lane_cand_out" package)" != "$3" ]; then
     rm -f "$lane_cand_out"
     return 70
   fi
@@ -443,11 +510,16 @@ lane_fresh_snapshot() {
   lane_readiness_snapshot "$lane_fs_target" "$lane_fs_out" >/dev/null 2>&1 || return 70
   lane_fs_id=$(jq -r '.snapshot_id' "$lane_fs_out")
   lane_fs_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  while IFS=$'\t' read -r lane_fs_action lane_fs_package; do
-    [ "$lane_fs_action" = apt.upgrade-package.v1 ] || continue
-    lane_fs_versions=$(lane_candidate "$lane_fs_target" "$lane_fs_package") || continue
+  while IFS=$'\t' read -r lane_fs_action lane_fs_package lane_fs_source; do
+    [ -n "$lane_fs_action" ] || continue
+    case $lane_fs_action in
+      apt.upgrade-package.v1) lane_fs_manager=apt ;;
+      winget.upgrade-machine-package.v1) lane_fs_manager=winget ;;
+      *) continue ;;
+    esac
+    lane_fs_versions=$(lane_candidate "$lane_fs_target" "$lane_fs_manager" "$lane_fs_package" "$lane_fs_source") || continue
     jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" --arg s "$lane_fs_id" \
-      --arg host "$lane_fs_target" --arg at "$lane_fs_at" --arg manager apt \
+      --arg host "$lane_fs_target" --arg at "$lane_fs_at" --arg manager "$lane_fs_manager" \
       --arg name "$lane_fs_package" --arg installed "${lane_fs_versions%% *}" --arg candidate "${lane_fs_versions##* }" '
       {schema:$schema,schema_version:$schema_version,snapshot_id:$s,host_id:$host,kind:"package",
        id:($manager + ":" + $name),observed_at:$at,status:"present",confidence:"high",
@@ -456,7 +528,7 @@ lane_fresh_snapshot() {
          update_available:($candidate != "-" and $candidate != $installed)},
        evidence:[{source:"privilege-lane",method:"candidate"}],errors:[]}' >>"$lane_fs_out"
   done <<EOF
-$(jq -r '.operations[] | [.id, .package] | @tsv' "$lane_fs_plan")
+$(jq -r '.operations[] | [.id, .package, .source] | @tsv' "$lane_fs_plan")
 EOF
   validate_file "$lane_fs_out"
 }
@@ -484,7 +556,7 @@ lane_draft_valid() {
       (.id | type == "string" and test("^[a-z]+\\.[a-z0-9-]+\\.v[0-9]+$")) and
       (.package | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}(:[a-z0-9-]{1,16})?$"))) and
       (.version | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,127}$"))) and
-      (.source == "-")
+      (.source | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")))
     ] | all)' "$1" >/dev/null 2>&1
 }
 lane_plan_precondition() {
@@ -492,7 +564,8 @@ lane_plan_precondition() {
   # lane readiness record and the package records the operations depend on.
   jq -cS -n --slurpfile plan "$1" --slurpfile records "$2" '
     $plan[0] as $p |
-    [$p.operations[] | select(.id == "apt.upgrade-package.v1") | {manager:"apt", package:.package}] as $deps |
+    [$p.operations[] | select(.id | IN("apt.upgrade-package.v1","winget.upgrade-machine-package.v1")) |
+      {manager:(if (.id | startswith("apt.")) then "apt" else "winget" end), package:.package}] as $deps |
     [$records[] | select(.host_id == $p.target) |
       if .kind == "privilege_broker" and .id == "readiness" then
         {kind,id,status,data:(.data | del(.detail,.next_command))}
@@ -510,8 +583,8 @@ lane_snapshot_supports_draft() {
       .data.transport == "local-lane" and .data.lifecycle_status == "ready")] | length == 1) and
     ([$records[] | select(.host_id == $d.target and .kind == "privilege_broker" and .id == "readiness")][0].data.actions as $actions |
       [$d.operations[] | .id as $a | $actions | index($a) != null] | all) and
-    ([$d.operations[] | select(.id == "apt.upgrade-package.v1") |
-      ("apt:" + .package) as $pid | .version as $v |
+    ([$d.operations[] | select(.id | IN("apt.upgrade-package.v1","winget.upgrade-machine-package.v1")) |
+      ((if (.id | startswith("apt.")) then "apt:" else "winget:" end) + .package) as $pid | .version as $v |
       any($records[]; .host_id == $d.target and .kind == "package" and .id == $pid and .data.candidate_version == $v)
     ] | all)' >/dev/null 2>&1
 }
@@ -764,14 +837,7 @@ fleet_readiness_lane_row() {
     legacy) fleet_readiness_row "$1" privilege-lane ok 'legacy automation_transport route configured'; return 0 ;;
     disabled) fleet_readiness_row "$1" privilege-lane ok 'disabled by configuration'; return 0 ;;
     local) ;;
-    *)
-      # Not a finding and not pending: nothing on this host is waiting for
-      # the lane, and nothing is broken. The row says which platforms the
-      # lane covers so the absence is explained, not silent.
-      fleet_readiness_row "$1" privilege-lane ok \
-        "not yet supported: $(lane_platform_note "$(jq -r --arg t "$1" '.machines[$t].platform // "-"' "$(config_path)")")"
-      return 0
-      ;;
+    *) fleet_readiness_row "$1" privilege-lane finding 'unsupported platform for the privilege lane'; return 0 ;;
   esac
   lane_row_tmp=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lane-row.XXXXXX")
   lane_status_command "$1" "$lane_row_tmp" >/dev/null 2>&1 || :
@@ -781,13 +847,13 @@ fleet_readiness_lane_row() {
   rm -f "$lane_row_tmp"
   case $lane_row_state in
     ready) fleet_readiness_row "$1" privilege-lane ok "enrolled, lane $lane_row_version" ;;
-    needs_one_time_approval)
+    needs_one_time_approval | canary_pending)
       printf 'PENDING  %-24s %-18s %s\n' "$1" privilege-lane \
         "$lane_row_state: run \`roundhouse privilege-enroll $1\` once" ;;
-    unreachable)
-      # Not a finding: ordinary work proceeds without the lane, and an
+    user_session_unavailable | unreachable)
+      # Neither is a finding: ordinary work proceeds without the lane, and an
       # unreachable probe (no roundhouse on the remote PATH yet, a sleeping
-      # host) is what the `tools`/`roundhouse` rows already report.
+      # host) is what `tools`/`roundhouse` rows already report.
       printf 'PENDING  %-24s %-18s %s\n' "$1" privilege-lane \
         "$lane_row_state: $lane_row_detail" ;;
     *) fleet_readiness_row "$1" privilege-lane finding "$lane_row_state: $lane_row_detail" ;;
@@ -803,7 +869,7 @@ fleet_doctor_lane_row() {
   case ${lane_doctor_state:-unreachable} in
     ready) fleet_doctor_row ok privilege-lane "enrolled, lane $lane_doctor_version $(printf '%s' "$lane_doctor_sha" | cut -c1-12)" ;;
     needs_one_time_approval) fleet_doctor_row ok privilege-lane 'not enrolled; privileged package work holds until `roundhouse privilege-enroll` runs once' ;;
-    unsupported) fleet_doctor_row ok privilege-lane 'not yet supported on this platform (the lane covers linux and wsl in this version)' ;;
+    unsupported) fleet_doctor_row ok privilege-lane 'not applicable on this platform' ;;
     unreachable) fleet_doctor_row finding privilege-lane 'the lane helper printed no status; the installed plugin is damaged' ;;
     *) fleet_doctor_row finding privilege-lane "${lane_doctor_state}: ${lane_doctor_detail:--}" ;;
   esac
