@@ -88,7 +88,33 @@ seal_plan_command() {
     exit 64
   }
   fi
+  # One Node switch per plan: plain operation validation allows duplicate IDs,
+  # and a second switch would carry versions an earlier npm upgrade changed.
+  jq -e '[.operations[] | select(.id == "fnm:node")] | length <= 1' "$draft" >/dev/null || {
+    printf 'roundhouse: a plan may contain at most one Node switch\n' >&2
+    exit 65
+  }
+  # A Node switch must run before any npm upgrade in the same plan: an npm
+  # upgrade first changes a version the switch's sealed carry names, and the
+  # switch would then refuse halfway through an already-mutated plan.
+  jq -e '(.operations | map(.id)) as $ids | ($ids | index("fnm:node")) as $switch |
+    $switch == null or all(range(0; $switch); $ids[.] | startswith("npm:") | not)' \
+    "$draft" >/dev/null || {
+    printf 'roundhouse: the Node switch must precede every npm upgrade in the same plan\n' >&2
+    exit 65
+  }
+  # The shape of a Node switch, shared with verify-preconditions.
+  node_switch_operations_valid "$draft" || {
+    printf 'roundhouse: invalid plan draft\n' >&2
+    exit 64
+  }
   validate_file "$snapshot"
+  # No npm upgrade seals for a host whose snapshot records a Node switch in
+  # flight: its runtime is unverified or still moving.
+  ! node_switch_npm_blocked "$draft" "$snapshot" || {
+    printf 'roundhouse: a Node switch is recorded in flight on the target; npm upgrades are refused until it is resolved\n' >&2
+    exit 65
+  }
   target=$(jq -r '.target' "$draft")
   domain=$(jq -r '.domain' "$draft")
   case $domain in
@@ -179,6 +205,25 @@ seal_plan_command() {
       else false end
     ' "$draft" >/dev/null || {
       printf 'roundhouse: operation is not supported by the native Windows executor\n' >&2
+      exit 69
+    }
+  fi
+  if [ "$platform" = windows ]; then
+    # Node on Windows is winget's OpenJS.NodeJS MSI, installed machine-wide:
+    # its upgrade needs elevation (UAC), which the ordinary lane never
+    # attempts. Only a user-scope install observed as such may upgrade here;
+    # a machine-scope one goes through the protected
+    # winget.upgrade-machine-package.v1 action when readiness advertises it,
+    # and is otherwise a hold. Unknown scope is machine scope.
+    jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
+      all($draft[0].operations[];
+        if .type == "package-upgrade" and .id == "winget:OpenJS.NodeJS" then
+          . as $operation |
+          any($records[]; .kind == "package" and .id == $operation.id and
+            .data.install_scope == "user")
+        else true end)
+    ' >/dev/null || {
+      printf 'roundhouse: hold: Node.js (winget OpenJS.NodeJS) is installed machine-wide and needs elevation; seal the protected winget.upgrade-machine-package.v1 action when readiness advertises it, never a UAC prompt\n' >&2
       exit 69
     }
   fi
@@ -329,7 +374,17 @@ seal_plan_command() {
             (if ($operation.id | startswith("npm:")) and
                 $operation.argv != ["npm","install","--global",
                   (($operation.id | ltrimstr("npm:")) + "@" + $operation.candidate_version)]
-             then .data.updater == $operation.argv else true end))
+             then .data.updater == $operation.argv else true end) and
+            # A Node switch carries only globals installed under the current
+            # default at exactly the recorded versions, and never a package
+            # whose configured post-switch hook was unproven at collect time.
+            (if $operation.id == "fnm:node" then
+               (.data.prefix | type == "string") and (.data.globals | type == "object") and
+               (.data.globals as $globals | all($operation.carry[]; $globals[.name] == .version)) and
+               ((.data.switch_hooks_unproven // []) as $unproven |
+                 all($operation.carry[]; ("npm:" + .name) as $key |
+                   any($unproven[]; . == $key) | not))
+             else true end))
         elif .type == "agent-update" and .kind == "agent_runtime" then
           . as $operation |
           any($records[]; .kind == $operation.kind and .id == $operation.id and
@@ -353,6 +408,45 @@ seal_plan_command() {
     ' >/dev/null || {
       printf 'roundhouse: %s plan does not match an actionable observed state\n' \
         "$domain" >&2
+      exit 65
+    }
+  fi
+  # A Node switch seals only on the carry rule (node_switch_plan, §7.5): its
+  # carry is every global the snapshot shows installed under the current
+  # default at its exact version, less what the new Node provides itself; an
+  # unpinnable global holds it. `hooks` are exactly what the configuration
+  # declares for the carried packages and `required` exactly the node_switch
+  # hooks the store definitions require for them, each of which must be in
+  # `hooks`. (Its order before any npm upgrade is checked above.)
+  if jq -e 'any(.operations[]?; .type == "package-upgrade" and .id == "fnm:node")' \
+    "$draft" >/dev/null 2>&1; then
+    node_seal_store=$(fleet_store_path)
+    [ -d "$node_seal_store" ] || {
+      printf 'roundhouse: a Node switch seals only against the store definitions (its hook requirements); no store at %s\n' \
+        "$node_seal_store" >&2
+      exit 65
+    }
+    node_seal_plan=$(node_switch_plan_from_snapshot "$snapshot" \
+      "$(jq -r 'first(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node")) |
+        .candidate_version' "$draft")" \
+      "$(fleet_definitions_load "$node_seal_store")" \
+      "$(jq -c '.node_switch_hooks // {}' "$config")") || {
+      printf 'roundhouse: the snapshot does not record the npm globals under the current Node default\n' >&2
+      exit 65
+    }
+    node_seal_held=$(printf '%s\n' "$node_seal_plan" | jq -r '.held // empty')
+    [ -z "$node_seal_held" ] || {
+      printf 'roundhouse: Node switch held: %s\n' "$node_seal_held" >&2
+      exit 65
+    }
+    jq -e --argjson plan "$node_seal_plan" '
+      all(.operations[] | select(.type == "package-upgrade" and .id == "fnm:node");
+        .carry == $plan.carry and .hooks == $plan.hooks and .required == $plan.required)
+    ' "$draft" >/dev/null || {
+      printf 'roundhouse: a Node switch carries every installed npm global: carry %s, hooks %s, required %s\n' \
+        "$(printf '%s\n' "$node_seal_plan" | jq -c '.carry')" \
+        "$(printf '%s\n' "$node_seal_plan" | jq -c '.hooks')" \
+        "$(printf '%s\n' "$node_seal_plan" | jq -c '.required')" >&2
       exit 65
     }
   fi

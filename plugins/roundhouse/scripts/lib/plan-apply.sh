@@ -536,6 +536,12 @@ EOF
             printf 'roundhouse: invalid npm package upgrade\n' >&2
             return 64
           }
+          # Never under a Node default a switch left unverified or is
+          # still moving (this host's own record, lib/node-runtime.sh).
+          [ -z "$(node_switch_marker_read)" ] || {
+            printf 'roundhouse: a Node switch is recorded in flight on this host; npm upgrades are refused until it is resolved\n' >&2
+            return 65
+          }
           if [ $# -eq 4 ] && [ "$1" = npm ] && [ "$2" = install ] &&
             [ "$3" = --global ] && [ "$4" = "$npm_name@$candidate" ]; then
             npm_global_run install --global "$npm_name@$candidate"
@@ -563,6 +569,30 @@ EOF
             return 65
           }
           npm_global_run_updater "$npm_name" "$@"
+          return
+          ;;
+        fnm:node)
+          # The Node runtime switch (lib/node-runtime.sh): one fixed marker
+          # argv, the exact carried globals, and exactly the configured
+          # post-switch hooks for them. All re-checked here against the
+          # configuration this executor was handed before anything runs.
+          { node_version_valid "$candidate" && [ $# -eq 3 ] && [ "$1" = fnm ] &&
+            [ "$2" = default ] && [ "$3" = "$candidate" ]; } || {
+            printf 'roundhouse: unsafe Node runtime switch argv\n' >&2
+            return 64
+          }
+          jq -e --slurpfile operation "$operation" '
+            . as $config | $operation[0] as $o |
+            ($o.carry | type == "array") and ($o.hooks | type == "array") and
+            $o.hooks == [$o.carry[] | .name as $n |
+              (($config.node_switch_hooks // {})["npm:" + $n] // [])[] |
+              {package: ("npm:" + $n), argv: .}]
+          ' "$config" >/dev/null || {
+            printf 'roundhouse: Node switch hooks differ from the configured node_switch_hooks\n' >&2
+            return 64
+          }
+          node_runtime_switch "$candidate" "$(jq -c '.carry' "$operation")" \
+            "$(jq -c '.hooks' "$operation")"
           return
           ;;
         *)

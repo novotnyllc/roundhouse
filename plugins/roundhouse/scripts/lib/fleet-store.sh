@@ -211,15 +211,355 @@ fleet_lock_path() {
   printf '%s.lock\n' "$(fleet_store_path)"
 }
 
+fleet_lock_nonce() {
+  # 128 random bits as hex. The nonce is what makes a lock THIS acquisition's
+  # rather than whatever directory happens to sit at the path: release and
+  # takeover both compare it, and neither ever acts on the path alone.
+  od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
+}
+
+fleet_lock_proc_start() {
+  # `fleet_lock_proc_start PID` — the process's start time as `ps` prints it,
+  # whitespace-normalised, or nothing when no such process exists. `lstart` is
+  # spelled the same by BSD (macOS) and procps (Linux) ps, and it is what tells
+  # a live holder from an unrelated process that was handed the same pid.
+  # Pinned to UTC and the C locale: `lstart` is printed in the READER's zone and
+  # language, and a scheduled run and an interactive one need not share either
+  # — a mismatch there would judge a live holder dead.
+  LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null |
+    awk '{ $1 = $1; if ($0 != "") print; exit }'
+}
+
+fleet_lock_proc_command() {
+  # `fleet_lock_proc_command PID` — the process's full command line, or
+  # nothing. Host-local evidence only: it lands in the lock meta beside the
+  # store, never in a replicated record. `-ww`: procps cuts `command` to the
+  # terminal width otherwise, and two reads at different widths would disagree.
+  ps -ww -o command= -p "$1" 2>/dev/null |
+    awk '{ sub(/[[:space:]]+$/, ""); if ($0 != "") print; exit }'
+}
+
 fleet_lock_acquire() {
-  # One lock shape for every entry point: the directory is the mutex, the meta
-  # file is the evidence doctor and the stale-lock check read.
+  # `fleet_lock_acquire LOCK_DIR [HOLDER_PID] [manual]` — one lock shape for every entry
+  # point: the directory is the mutex, the meta file is the evidence doctor and
+  # the holder check read. Sets `fleet_lock_nonce_held` to this acquisition's
+  # nonce, which is the only thing `fleet_lock_release` will act on.
+  #
+  # The meta names the holder by pid, start time AND command, because a pid
+  # alone is not an identity: after a crash or reboot the same number belongs
+  # to something else, and `kill -0` cannot tell the difference. HOLDER_PID
+  # defaults to this process.
+  #
+  # `manual` marks a lock taken by hand (`fleet-lock`). Its recorded pid is the
+  # caller's shell, which is often gone a second later — so a hand-taken lock
+  # is never judged dead (fleet_lock_holder_state answers `unknown`) and the
+  # age rule governs it exactly as before: a scheduled run must not take over
+  # an operator's lock and publish their half-done edits.
+  #
+  # Exit 1 when the lock is held, 2 when the directory was created but its
+  # evidence could not be written: a lock nobody can identify is a lock nobody
+  # can safely release or take over, so it is removed rather than left behind.
   lock_dir=$1
+  lock_pid=${2:-$$}
+  lock_manual=false
+  [ "${3:-}" != manual ] || lock_manual=true
+  fleet_lock_nonce_held=
   mkdir "$lock_dir" 2>/dev/null || return 1
   chmod 0700 "$lock_dir"
-  jq -S -n --arg host "$(fleet_host_name)" --argjson pid "$$" \
-    --arg started "$(fleet_now)" \
-    '{host:$host,pid:$pid,started_at:$started}' >"$lock_dir/meta.json" 2>/dev/null || true
+  lock_nonce=$(fleet_lock_nonce)
+  if [ -n "$lock_nonce" ] &&
+    jq -S -n --arg host "$(fleet_host_name)" --argjson pid "$lock_pid" \
+      --arg started "$(fleet_now)" --arg start_time "$(fleet_lock_proc_start "$lock_pid")" \
+      --arg command "$(fleet_lock_proc_command "$lock_pid")" --arg nonce "$lock_nonce" \
+      --argjson manual "$lock_manual" \
+      '{host:$host,pid:$pid,started_at:$started,start_time:$start_time,
+        command:$command,nonce:$nonce} + (if $manual then {manual:true} else {} end)' \
+      >"$lock_dir/meta.json.tmp" 2>/dev/null &&
+    mv -f "$lock_dir/meta.json.tmp" "$lock_dir/meta.json"; then
+    fleet_lock_nonce_held=$lock_nonce
+    return 0
+  fi
+  rm -rf "$lock_dir"
+  return 2
+}
+
+fleet_lock_meta_field() {
+  # `fleet_lock_meta_field LOCK_DIR FIELD` — one scalar from the lock's meta,
+  # or nothing (no meta, unparsable meta, absent field).
+  [ -f "$1/meta.json" ] || return 0
+  jq -r --arg f "$2" '.[$f] // empty | tostring' "$1/meta.json" 2>/dev/null || true
+}
+
+fleet_lock_identity() {
+  # `fleet_lock_identity LOCK_DIR` — what a takeover binds to: the nonce, or for
+  # a lock written before nonces existed, its pid and start stamp. The legacy
+  # form is what lets the first nonce-aware run recover a lock a dead pre-nonce
+  # run left behind — the exact wedge this mechanism exists for — while still
+  # refusing to move any lock it did not judge.
+  lock_identity=$(fleet_lock_meta_field "$1" nonce)
+  # LEGACY (pre-nonce locks): delete this branch one release after the nonce
+  # lock ships, once no host can still hold a lock an older build wrote.
+  if [ -z "$lock_identity" ]; then
+    lock_identity_pid=$(fleet_lock_meta_field "$1" pid)
+    lock_identity_at=$(fleet_lock_meta_field "$1" started_at)
+    [ -z "$lock_identity_pid" ] || [ -z "$lock_identity_at" ] ||
+      lock_identity="legacy:$lock_identity_pid:$lock_identity_at"
+  fi
+  printf '%s\n' "$lock_identity"
+}
+
+fleet_lock_transition_enter() {
+  # `fleet_lock_transition_enter LOCK_DIR` — the one short mutex every lock
+  # TRANSITION runs under: a takeover's verify-then-rename (and its put-back)
+  # and a release's verify-then-remove. Without it two transitions interleave
+  # between a verify and the rename or removal it decided — a takeover could
+  # move the lock a racing takeover had just made live. Plain acquisition (the
+  # `mkdir` of the lock itself) never takes it. A `mkdir` of `LOCK_DIR.t`,
+  # retried for up to ~10s; one older than a minute belongs to a transition
+  # that crashed mid-way, and is broken — moved aside and re-checked first,
+  # so a mutex that went live meanwhile is put back, not broken. Exit 1 when it
+  # cannot be had. Every caller leaves it on every path
+  # (fleet_lock_transition_leave); its whole span is a handful of renames.
+  lock_t="$1.t"
+  lock_t_tries=0
+  while ! mkdir "$lock_t" 2>/dev/null; do
+    if [ -n "$(find "$lock_t" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+      lock_t_aside="$lock_t.broken.$$"
+      if mv "$lock_t" "$lock_t_aside" 2>/dev/null; then
+        if [ -n "$(find "$lock_t_aside" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+          rmdir "$lock_t_aside" 2>/dev/null || rm -rf "$lock_t_aside"
+        else
+          [ -e "$lock_t" ] || mv "$lock_t_aside" "$lock_t" 2>/dev/null || :
+          rm -rf "$lock_t_aside" 2>/dev/null || :
+        fi
+      fi
+      continue
+    fi
+    lock_t_tries=$((lock_t_tries + 1))
+    [ "$lock_t_tries" -lt 100 ] || return 1
+    sleep 0.1
+  done
+  # The holder's token: leave removes the mutex only while it is still THIS
+  # holder's, so a holder that stalled past the break cannot remove the
+  # mutex of the transition that broke it.
+  fleet_lock_transition_token="$$.${RANDOM}${RANDOM}"
+  printf '%s\n' "$fleet_lock_transition_token" >"$lock_t/owner" 2>/dev/null || :
+}
+
+fleet_lock_transition_leave() {
+  [ "$(cat "$1.t/owner" 2>/dev/null)" = "${fleet_lock_transition_token:-}" ] || return 0
+  rm -f "$1.t/owner" 2>/dev/null || :
+  rmdir "$1.t" 2>/dev/null || :
+}
+
+fleet_lock_transition_test_pause() {
+  # Test-only, inert outside the self-check: holds a transition open so a
+  # racing one can be shown to wait for it.
+  if [ "${ROUNDHOUSE_SELFTEST:-0}" = 1 ] && [ -n "${ROUNDHOUSE_TEST_LOCK_TRANSITION_PAUSE:-}" ]; then
+    sleep "$ROUNDHOUSE_TEST_LOCK_TRANSITION_PAUSE"
+  fi
+}
+
+fleet_lock_release() {
+  # `fleet_lock_release LOCK_DIR IDENTITY` — remove the lock ONLY when it still
+  # carries IDENTITY (fleet_lock_identity: this acquisition's nonce, or a
+  # pre-nonce lock's pid and stamp as `fleet-unlock` read them). A run that was
+  # judged dead and taken over must not, when it finally exits, delete the live
+  # successor's lock by path. The verify and the removal are one transition
+  # (fleet_lock_transition_enter). Exit 1 when the lock is not the one named,
+  # or the transition mutex cannot be had (the lock then stays, and a later
+  # run judges its holder).
+  [ -n "${2:-}" ] || return 1
+  fleet_lock_transition_enter "$1" || return 1
+  if [ "$(fleet_lock_identity "$1")" != "$2" ]; then
+    fleet_lock_transition_leave "$1"
+    return 1
+  fi
+  rm -f "$1/meta.json"
+  rmdir "$1" 2>/dev/null || :
+  fleet_lock_transition_leave "$1"
+}
+
+fleet_lock_holder_state() {
+  # `fleet_lock_holder_state LOCK_DIR` — sets `fleet_lock_state` to `dead`,
+  # `live` or `unknown`, and `fleet_lock_judged_id` to the identity
+  # (fleet_lock_identity) the verdict is about. Globals rather than output, so
+  # the takeover that follows can use the identity: call it directly.
+  #
+  # dead     the meta names a pid on THIS host that no longer exists, or a live
+  #          pid whose start time or command is not the recorded holder's (pid
+  #          reuse after a crash or a reboot)
+  # live     the recorded holder is running right now, verified by all three
+  # unknown  nothing here can be proved either way: no readable meta, another
+  #          host's pid, a hand-taken (`manual`) lock, a pre-nonce lock whose
+  #          pid is alive, or no identity to bind a takeover to
+  #
+  # The host name is compared because the lock lives beside a store path that
+  # a second instance root could share; a pid from another machine says
+  # nothing about this one.
+  fleet_lock_judged_id=
+  fleet_lock_state=unknown
+  lock_meta="$1/meta.json"
+  [ -f "$lock_meta" ] || return 0
+  jq -e 'type == "object"' "$lock_meta" >/dev/null 2>&1 || return 0
+  [ "$(fleet_lock_meta_field "$1" host)" = "$(fleet_host_name)" ] || return 0
+  # A hand-taken lock names a shell that may already have exited; its holder
+  # is the operator, whom no `ps` can see. The age rule decides it.
+  [ "$(fleet_lock_meta_field "$1" manual)" != true ] || return 0
+  lock_pid=$(fleet_lock_meta_field "$1" pid)
+  case $lock_pid in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  # A `ps` that cannot see THIS process cannot see anything, and reading its
+  # silence as "the holder is gone" would take over a live run's lock.
+  [ -n "$(fleet_lock_proc_start "$$")" ] || return 0
+  fleet_lock_judged_id=$(fleet_lock_identity "$1")
+  lock_now_start=$(fleet_lock_proc_start "$lock_pid")
+  lock_was_start=$(fleet_lock_meta_field "$1" start_time)
+  lock_was_command=$(fleet_lock_meta_field "$1" command)
+  if [ -z "$lock_now_start" ]; then
+    fleet_lock_state=dead
+  elif [ -z "$lock_was_start" ] || [ -z "$lock_was_command" ]; then
+    # A lock written before holders were recorded: the pid is alive and there
+    # is no evidence about whose it is, so this answer keeps the age rule.
+    # LEGACY (pre-nonce locks): delete this branch one release after the
+    # nonce lock ships, together with fleet_lock_identity's legacy form.
+    fleet_lock_state=unknown
+  elif [ "$lock_now_start" != "$lock_was_start" ] ||
+    [ "$(fleet_lock_proc_command "$lock_pid")" != "$lock_was_command" ]; then
+    fleet_lock_state=dead
+  else
+    fleet_lock_state=live
+  fi
+  # A dead verdict is only actionable against an identity: the takeover proves
+  # it moved the SAME lock it judged, and without one there is nothing to prove.
+  [ "$fleet_lock_state" != dead ] || [ -n "$fleet_lock_judged_id" ] ||
+    fleet_lock_state=unknown
+}
+
+fleet_lock_takeover() {
+  # `fleet_lock_takeover LOCK_DIR JUDGED_ID [HOLDER_PID]` — replace a lock
+  # whose holder `fleet_lock_holder_state` judged dead, atomically:
+  #
+  #   1. rename the lock directory to a unique sibling (rename(2) is atomic, so
+  #      of two runs racing the same dead lock exactly one moves it);
+  #   2. verify the renamed directory carries the identity judged dead —
+  #      if a racing run already replaced it with a live lock, this run moved
+  #      THAT one, so it is put back and the takeover refused;
+  #   3. create the new lock through the ordinary acquire.
+  #
+  # Sets `fleet_lock_dead_meta` to the dead holder's meta (compact JSON) for
+  # the caller's alert, and `fleet_lock_nonce_held` through the acquire — so it
+  # is called directly, never in a command substitution. Exit 1 when the
+  # takeover was refused or lost a race.
+  fleet_lock_dead_meta=
+  [ -n "${2:-}" ] || return 1
+  # One transition (fleet_lock_transition_enter), and the identity is
+  # re-verified INSIDE it before anything moves: a lock a racing takeover has
+  # already made live is never renamed at all.
+  fleet_lock_transition_enter "$1" || return 1
+  if [ "$(fleet_lock_identity "$1")" != "$2" ]; then
+    fleet_lock_transition_leave "$1"
+    return 1
+  fi
+  lock_aside="$1.dead.$(fleet_lock_nonce)"
+  mv "$1" "$lock_aside" 2>/dev/null || {
+    fleet_lock_transition_leave "$1"
+    return 1
+  }
+  if [ "$(fleet_lock_identity "$lock_aside")" != "$2" ]; then
+    # Never `mv` onto an existing directory: that would nest the lock inside
+    # whatever now holds the path. If the path was taken meanwhile, the moved
+    # lock stays aside and its owner's nonce release simply finds nothing.
+    [ -e "$1" ] || mv "$lock_aside" "$1" 2>/dev/null || :
+    fleet_lock_transition_leave "$1"
+    return 1
+  fi
+  lock_dead_meta=$(jq -c '.' "$lock_aside/meta.json" 2>/dev/null || printf '{}')
+  fleet_lock_acquire "$1" "${3:-$$}" || {
+    rm -rf "$lock_aside"
+    fleet_lock_transition_leave "$1"
+    return 1
+  }
+  rm -rf "$lock_aside"
+  fleet_lock_transition_test_pause
+  fleet_lock_transition_leave "$1"
+  fleet_lock_dead_meta=$lock_dead_meta
+}
+
+# --- §6.3 the run lock: liveness before age ------------------------------------
+
+fleet_lock_take() {
+  # fleet_lock_take LOCK STALE_SECONDS — take the run lock. Exit 0 acquired
+  # (`fleet_lock_nonce_held` names it), 11 acquired by TAKING OVER a dead
+  # holder's lock (`fleet_lock_taken_from` describes that holder, for the
+  # caller's alert), 10 held by a live run (the ordinary overlap; the caller
+  # decides whether that is success), 75 refused. The stale threshold is the
+  # caller's: it is policy, read from the fold, and this unit stays free of it.
+  #
+  # THE HOLDER IS ASKED BEFORE THE CLOCK. The canary wedged for weeks on a lock
+  # a dead process left, because the age check ran first and refused it as
+  # "stale, confirm no live runner" — a question the lock's own meta could
+  # already answer. A dead holder (pid gone, or the pid now belongs to a
+  # process with a different start time or command) is taken over through
+  # `fleet_lock_takeover`'s rename-and-verify, and reported (exit 11) so the
+  # caller can alert on the crash that left it. A live holder still blocks, and
+  # the age rule still governs every lock whose holder cannot be judged.
+  fleet_lock_taken_from=
+  fleet_run_lock_rc=0
+  fleet_lock_acquire "$1" || fleet_run_lock_rc=$?
+  case $fleet_run_lock_rc in
+    0) return 0 ;;
+    2)
+      printf 'roundhouse: could not record the run lock evidence at %s; refusing to run without it\n' \
+        "$1" >&2
+      return 75
+      ;;
+  esac
+  fleet_lock_holder_state "$1"
+  fleet_run_lock_state=$fleet_lock_state
+  if [ "$fleet_run_lock_state" = dead ]; then
+    if fleet_lock_takeover "$1" "$fleet_lock_judged_id"; then
+      fleet_run_lock_was=$(printf '%s\n' "$fleet_lock_dead_meta" |
+        jq -r '"pid \(.pid // "?") started \(.started_at // "at an unknown time")"' \
+          2>/dev/null || printf 'an unreadable holder')
+      printf 'roundhouse: took over the run lock at %s from a dead holder (%s)\n' \
+        "$1" "$fleet_run_lock_was" >&2
+      # The command line stays in the host-local meta; only pid and stamp
+      # are handed back, because the caller replicates them in an alert.
+      fleet_lock_taken_from=$fleet_run_lock_was
+      return 11
+    fi
+    # Lost the rename race to another run, or the lock changed under the
+    # verdict: whoever holds it now is not the holder that was judged.
+    return 10
+  fi
+  fleet_run_lock_age=$(fleet_lock_age_seconds "$1" || printf '')
+  fleet_run_lock_stale=$2
+  # AN UNKNOWN AGE IS STALE, NOT FRESH. `fleet_lock_age_seconds` answers empty
+  # when meta.json is missing or unparsable, and reading that as "under the
+  # threshold" wedged every future run on this host silently, forever, at
+  # exit 0. It is reachable through the recovery fleet-update/SKILL.md
+  # prescribes: `fleet-unlock` removes meta.json BEFORE an rmdir that can
+  # fail. A lock directory with no evidence of a live runner is exactly the
+  # case the stale branch exists for.
+  if [ -z "$fleet_run_lock_age" ]; then
+    printf 'roundhouse: a run lock at %s is of unknown age (no readable meta.json); confirm no live runner on this host, then remove it\n' \
+      "$1" >&2
+    return 75
+  fi
+  if [ "$fleet_run_lock_age" -gt "$fleet_run_lock_stale" ]; then
+    if [ "$fleet_run_lock_state" = live ]; then
+      printf 'roundhouse: a live run (pid %s) has held the run lock at %s for %ss, past the %ss threshold; it may be hung — confirm, stop it, then remove the lock\n' \
+        "$(fleet_lock_meta_field "$1" pid)" "$1" "$fleet_run_lock_age" \
+        "$fleet_run_lock_stale" >&2
+    else
+      printf 'roundhouse: a run lock at %s is %ss old; confirm no live runner on this host, then remove it\n' \
+        "$1" "$fleet_run_lock_age" >&2
+    fi
+    return 75
+  fi
+  return 10
 }
 
 fleet_lock_age_seconds() {
@@ -236,27 +576,6 @@ fleet_lock_age_seconds() {
     'try ($at | fromdateiso8601) catch empty' 2>/dev/null || true)
   [ -n "$lock_epoch" ] || return 1
   printf '%s\n' "$(($(date +%s) - lock_epoch))"
-}
-
-fleet_lock_holder_gone() {
-  # True when the lock names a pid on THIS host that no longer exists. The pid
-  # was already being recorded and never read: staleness was time-only, so a
-  # SIGKILLed or power-cut run wedged the host for two full cadences while a
-  # slow-but-live run looked identical. `kill -0` distinguishes them in one
-  # syscall.
-  #
-  # The host name is compared because the lock lives beside a store path that
-  # a second instance root could share; a pid from another machine says
-  # nothing about this one, so it falls back to the time-only answer.
-  lock_meta="$1/meta.json"
-  [ -f "$lock_meta" ] || return 1
-  [ "$(jq -r '.host // empty' "$lock_meta" 2>/dev/null)" = "$(fleet_host_name)" ] ||
-    return 1
-  lock_pid=$(jq -r '.pid // empty' "$lock_meta" 2>/dev/null || true)
-  case $lock_pid in
-    '' | *[!0-9]*) return 1 ;;
-  esac
-  ! kill -0 "$lock_pid" 2>/dev/null
 }
 
 fleet_validate_fetch_url() {
@@ -314,6 +633,9 @@ fleet_quote_is_content_address() {
 }
 
 fleet_quote_is_secret() {
+  # TWIN: fleet_sweep_predicate_awk (lib/fleet-doctor.sh) is this predicate in
+  # one awk for the batched sweep. Change both; tests/72-records.sh fails when
+  # they disagree.
   # fleet_quote_is_secret TEXT [STORE] — mechanical backstop to agent-side
   # redaction, not the primary control: named secret classes plus one bounded
   # high-entropy check. Every field a record replicates passes through here,
@@ -330,21 +652,14 @@ fleet_quote_is_secret() {
   # newline — `eyJ…\n…` — evaded every pattern, and an embedded NUL truncated
   # the match; collapsing newlines to spaces and stripping NUL makes the whole
   # quote one line so a split token is seen whole.
-  quote_text=$(printf '%s' "$1" | tr -d '\000' | tr '\n' ' ')
+  # (A shell string cannot hold NUL, so only the newlines need collapsing.
+  # This runs for every replicated field of every sweep, so it stays in-shell.)
+  quote_text=${1//$'\n'/ }
   case $quote_text in *'-----BEGIN'*) return 0 ;; esac
+  # The named classes, one grep: a JWT; GitHub/GitLab/Slack tokens (`ghr_` is a
+  # real GitHub prefix and was once missing); OpenAI-style `sk-`; AWS `AKIA`.
   if printf '%s' "$quote_text" |
-    grep -qE 'eyJ[A-Za-z0-9_=-]*\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*'; then
-    return 0
-  fi
-  # `ghr_` is a real GitHub token prefix and was missing from the alternation.
-  if printf '%s' "$quote_text" |
-    grep -qE '(^|[^A-Za-z0-9_-])(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_-]{8,}'; then
-    return 0
-  fi
-  if printf '%s' "$quote_text" | grep -qE '(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9]{16,}'; then
-    return 0
-  fi
-  if printf '%s' "$quote_text" | grep -qE '(^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}'; then
+    grep -qE 'eyJ[A-Za-z0-9_=-]*\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]*|(^|[^A-Za-z0-9_-])(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_-]{8,}|(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9]{16,}|(^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}'; then
     return 0
   fi
   # Bounded entropy heuristic: one 32+ run of `[A-Za-z0-9_]`. Neither `/` nor
@@ -373,6 +688,8 @@ fleet_quote_is_secret() {
   # `grep -oE` yields maximal runs, so each token below is a WHOLE token — a
   # secret that merely opens with 40 hex arrives as one longer run and is
   # accounted for as itself.
+  # A 32+ run needs 32+ characters; most fields are shorter and stop here.
+  [ "${#quote_text}" -ge 32 ] || return 1
   quote_hits=$(printf '%s' "$quote_text" | grep -oE '[A-Za-z0-9_]{32,}' |
     awk '(/[0-9]/ && /[A-Za-z]/) || (/[a-z]/ && /[A-Z]/) { print }')
   [ -n "$quote_hits" ] || return 1

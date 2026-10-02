@@ -120,6 +120,9 @@ cat >"$tmp/bin/jsm" <<'SH'
   [ -z "${AGENT_EXEC_MARKER:-}" ] || : >"$AGENT_EXEC_MARKER"
   exit 64
 }
+# A manager that never answers, the way one held a run for ~37 hours: the
+# sleep is a CHILD, so only a whole-group stop ends it.
+[ "${JSM_HANG:-0}" != 1 ] || { sleep 587 & wait; exit 0; }
 [ "${JSM_INVALID:-0}" != 1 ] || { printf '{invalid\n'; exit 0; }
 [ "${JSM_INVALID_SHAPE:-0}" != 1 ] || { printf '%s\n' '{"skills":{"name":"bogus"}}'; exit 0; }
 if [ "${JSM_OPTION_NAME:-0}" = 1 ]; then
@@ -290,7 +293,9 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = marketplace ] &&
   [ "\${3:-}" = add ]; then
   [ -z "\${CLAUDE_MARKETPLACE_ADD_LOG:-}" ] || printf '%s\n' "\$4" >>"\$CLAUDE_MARKETPLACE_ADD_LOG"
   if [ -n "\${CLAUDE_PLUGIN_MARKETPLACE_FILE:-}" ] && [ -n "\${CLAUDE_MARKETPLACE_ADD_NAME:-}" ]; then
-    jq --arg n "\$CLAUDE_MARKETPLACE_ADD_NAME" '. + [{name:\$n}]' "\$CLAUDE_PLUGIN_MARKETPLACE_FILE" \
+    jq --arg n "\$CLAUDE_MARKETPLACE_ADD_NAME" --arg loc "\${CLAUDE_MARKETPLACE_ADD_LOCATION:-}" \
+      '. + [{name:\$n} + (if \$loc == "" then {} else {installLocation:\$loc} end)]' \
+      "\$CLAUDE_PLUGIN_MARKETPLACE_FILE" \
       >"\$CLAUDE_PLUGIN_MARKETPLACE_FILE.new" && mv "\$CLAUDE_PLUGIN_MARKETPLACE_FILE.new" "\$CLAUDE_PLUGIN_MARKETPLACE_FILE"
   fi
   exit 0
@@ -417,6 +422,38 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
   fi
   exit 0
 fi
+if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = uninstall ] || [ "\${2:-}" = remove ]; }; then
+  # \`claude plugin uninstall --scope user --keep-data ID\`: the id is the one
+  # argument that is neither an option nor an option's value. --keep-data is
+  # REQUIRED: without it the real manager deletes the plugin's data directory,
+  # which no rollback restores.
+  shift 2
+  scope=user
+  uninstall_id=
+  keep_data=false
+  while [ "\$#" -gt 0 ]; do
+    case \$1 in
+      -s | --scope) scope=\${2:-}; shift ;;
+      --keep-data) keep_data=true ;;
+      -*) ;;
+      *) uninstall_id=\$1 ;;
+    esac
+    shift
+  done
+  [ "\$scope" = user ] && [ -n "\$uninstall_id" ] && [ "\$keep_data" = true ] || exit 64
+  [ -z "\${CLAUDE_PLUGIN_ACTION_LOG:-}" ] ||
+    printf '%s %s\n' uninstall "\$uninstall_id" >>"\$CLAUDE_PLUGIN_ACTION_LOG"
+  [ "\${CLAUDE_UNINSTALL_FAIL:-0}" != 1 ] || exit 1
+  if [ -z "\${CLAUDE_UNINSTALL_SKIP_RECORD:-}" ] && [ -n "\${CLAUDE_CONFIG_DIR:-}" ]; then
+    installed_file="\$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+    [ ! -f "\$installed_file" ] ||
+      jq -c --arg id "\$uninstall_id" '
+        .plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user"))) |
+        if (.plugins[\$id] | length) == 0 then del(.plugins[\$id]) else . end' \
+        "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"
+  fi
+  exit 0
+fi
 exit 64
 SH
 chmod +x "$tmp/bin/claude"
@@ -454,6 +491,16 @@ winget_state_version=
   winget_state_version=$(cat "$WINGET_STATE_FILE")
 case ${1:-} in
   upgrade)
+    # WINGET_UPGRADE_FAILURE (opt-in) makes an exact upgrade fail the way a
+    # real installer does: styled progress on stdout, a secret-shaped line and
+    # then the named error on stderr, and a non-zero exit.
+    if [ -n "${WINGET_UPGRADE_FAILURE:-}" ] && [ "${2:-}" = --id ]; then
+      printf '\033[32mFound Example package [Example.Package]\033[0m\n'
+      printf '  -  \r  \\  \r  |  \n'
+      printf '%s\n' 'token ghp_abcdefghijklmnopqrstuvwxyz0123' >&2
+      printf '%s\n' "$WINGET_UPGRADE_FAILURE" >&2
+      exit 1
+    fi
     if [ -n "${WINGET_STATE_FILE:-}" ] && [ "${2:-}" = --id ]; then
       while [ $# -gt 0 ]; do
         case $1 in --version) printf '%s\n' "$2" >"$WINGET_STATE_FILE"; exit 0 ;; esac
@@ -600,6 +647,8 @@ case ${1:-} in
     ;;
   --no-tty)
     [ "${2:-}" = apply ] || exit 64
+    # CHEZMOI_APPLY_STDERR (opt-in): what apply reports while it "succeeds".
+    [ -z "${CHEZMOI_APPLY_STDERR:-}" ] || printf '%s\n' "$CHEZMOI_APPLY_STDERR" >&2
     : >"$CHEZMOI_APPLY_MARKER"
     if [ "$#" -gt 2 ]; then
       [ "${3:-}" = -- ] && [ "$#" -gt 3 ] || exit 64
@@ -811,6 +860,17 @@ export SHELL="$tmp/bin/login-shell"
 export REAL_GIT="$real_git"
 export GIT_CLONE_FIXTURE="$tmp/clone-example.git"
 export GIT_PULL_MARKER="$tmp/git-pull-executed"
+# Host-wide scheduler state is not fixture state: keep the collector off the
+# real /Library launchd directories (and launchd queries about them) and off
+# the real user crontab, which no fake HOME can hide.
+export ROUNDHOUSE_TEST_STARTUP_SYSTEM_ROOT="$tmp/startup-system-root"
+cat >"$tmp/bin/crontab" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = -l ] || exit 64
+printf 'crontab: no crontab for fixture\n' >&2
+exit 1
+SH
+chmod +x "$tmp/bin/crontab"
 
 printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"
 approve_result=$(CODEX_HOOK_SCENARIO=approve \
@@ -1007,8 +1067,12 @@ cp -R "$script_dir/../." "$plugin_cache/"
 if command -v git >/dev/null 2>&1 &&
   git -C "$script_dir/.." rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   ignore_status=0
+  # Enumerate the COPY, and ask the source's ignore rules about it: under the
+  # parallel runner another section can create and remove an ignored file in
+  # the source (60 does) between the cp and this walk.
   ignored_fixture_paths=$(
-    (cd "$script_dir/.." && find . ! -type d -print | sed 's#^\./##' | git check-ignore --stdin) 2>/dev/null
+    (cd "$plugin_cache" && find . ! -type d -print | sed 's#^\./##' |
+      (cd "$script_dir/.." && git check-ignore --stdin)) 2>/dev/null
   ) || ignore_status=$?
   if [ "$ignore_status" -le 1 ] && [ -n "$ignored_fixture_paths" ]; then
     printf '%s\n' "$ignored_fixture_paths" | while IFS= read -r rel; do
@@ -1084,7 +1148,7 @@ if [ -z "${ROUNDHOUSE_TEST_SCOPE:-}" ] &&
   # A second capture a second later: identical inventory, different timestamps
   # and run IDs. 65 compares the pair to prove that difference is not reported
   # as drift, and 68 needs a recapture distinct from the planning snapshot.
-  sleep 1
+  t_next_second
   "$cli" collect --target test-host --section all --output "$tmp/snapshot-2.jsonl"
 
   # Codex readiness metadata: 65 enriches snapshots with it and probes the

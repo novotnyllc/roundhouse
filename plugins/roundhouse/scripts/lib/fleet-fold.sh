@@ -14,6 +14,11 @@ fleet_categories() {
   # (see fleet_unknown_categories), which is the deliberate asymmetry: an
   # unknown key inside a known item cannot under-converge, an unknown category
   # can.
+  #
+  # `runtimes` holds exactly one item, `runtimes.node`: the host-default Node
+  # that runs the managed npm globals (§5.1.2's amendment). A store that
+  # declares it must not reach a host older than the build that knows it; such
+  # a host holds everything and alerts, which is this rule working.
   cat <<'EOF'
 policy
 packages
@@ -24,6 +29,7 @@ hooks
 mcp_servers
 config_files
 projects
+runtimes
 EOF
 }
 
@@ -56,11 +62,15 @@ fleet_definitions_file_path() {
   esac
 }
 
-fleet_fold_program='. as $layer ireduce ({};
-  (. *d ($layer | with_entries(select(.value != null))
-    | (.[] | select(tag == "!!map")) |= with_entries(select(.value != null))))
-  | (.[] | select(tag == "!!map")) |= with_entries(select(.value != "absent")))'
-# The whole merge rule, and the reason it is one expression:
+fleet_fold_merge_program='. as $layer ireduce ({};
+  . *d ($layer | with_entries(select(.value != null))
+    | (.[] | select(tag == "!!map")) |= with_entries(select(.value != null))))'
+fleet_fold_absent_program='(.[] | select(tag == "!!map")) |= with_entries(select(.value != "absent"))'
+fleet_fold_program="($fleet_fold_merge_program) | $fleet_fold_absent_program"
+# The merge rule, in two steps — MERGE, then the `absent` KNOCKOUT — so the
+# tombstone reader runs the identical merge instead of a hand copy. Knocking
+# out once at the end equals knocking out per layer: `absent` is a scalar, and
+# a narrower layer that speaks again replaces it whole.
 #
 #   the first |=  the NULL DROP, applied to the incoming layer BEFORE it
 #           merges. §4:416 — a null item value is "no opinion at this layer;
@@ -86,8 +96,8 @@ fleet_fold_program='. as $layer ireduce ({};
 #           a null nested inside a config_files value is data.
 #   *d      map+map deep merge, anything else replaced whole by the higher
 #           layer, a null document contributing nothing — §4, verbatim.
-#   the second |=  the `absent` knockout, applied AFTER EACH LAYER and scoped
-#           to exactly <category>.<item>. Never a recursive del(.. ==
+#   the knockout  fleet_fold_absent_program, applied to the merged result and
+#           scoped to exactly <category>.<item>. Never a recursive del(.. ==
 #           "absent"): a legitimate string "absent" nested inside a
 #           config_files value is data and must survive. `select(tag ==
 #           "!!map")` skips the host file's scalar and sequence facts
@@ -169,6 +179,31 @@ fleet_fold() (
   fleet_fold_files $(fleet_layer_files "$1" "$2")
 )
 
+fleet_fold_tombstones() (
+  # `fleet_fold_tombstones LAYERDIR HOST CATEGORY` — the items of CATEGORY whose
+  # effective value at HOST is the scalar `absent`, as a fold-shaped document
+  # (`{"plugins":{"x":"absent"}}`, or `{}`).
+  #
+  # §3.4. A SEPARATE read, because the knockout is right for every reader of
+  # desired state: the fold's own merge step without it, so the last layer to
+  # speak still wins. `{state: absent}` is never knocked out at all.
+  IFS='
+'
+  set -f
+  # shellcheck disable=SC2046 # deliberate word splitting over the file list
+  set -- "$3" $(fleet_layer_files "$1" "$2")
+  tombstone_category=$1
+  shift
+  [ "$#" -gt 0 ] || { printf '{}\n'; return; }
+  yq ea -o=json -I=0 "$fleet_fold_merge_program" "$@" |
+    jq -c --arg c "$tombstone_category" '
+      (.[$c] // {}) as $entries |
+      if ($entries | type) != "object" then {}
+      else ($entries | with_entries(select(.value == "absent"))) as $dead |
+        if $dead == {} then {} else {($c): $dead} end
+      end'
+)
+
 fleet_item_split() {
   # `<category>.<name>` -> two lines, category then name. The split is on the
   # FIRST dot, because names carry dots freely (`~/.claude/settings.json`,
@@ -176,12 +211,23 @@ fleet_item_split() {
   # namespace, where `definitions.packages.jj` splits into
   # `definitions.packages` and `jj` (§5.1: the mapping and the desired item
   # are different items, with different digests and different verdicts).
+  fleet_item_split_set "$1" || return 1
+  printf '%s\n%s\n' "$fleet_item_category" "$fleet_item_name"
+}
+
+fleet_item_split_set() {
+  # fleet_item_split's answer in `fleet_item_category` / `fleet_item_name`,
+  # for a caller that splits hundreds of items and should not fork per item.
   case $1 in
     definitions.*.*)
       split_rest=${1#definitions.}
-      printf 'definitions.%s\n%s\n' "${split_rest%%.*}" "${split_rest#*.}"
+      fleet_item_category=definitions.${split_rest%%.*}
+      fleet_item_name=${split_rest#*.}
       ;;
-    *.*) printf '%s\n%s\n' "${1%%.*}" "${1#*.}" ;;
+    *.*)
+      fleet_item_category=${1%%.*}
+      fleet_item_name=${1#*.}
+      ;;
     *) return 1 ;;
   esac
 }
@@ -247,6 +293,124 @@ fleet_item_digest() {
   [ -n "$digest_value" ] || return 1
   printf '%s\n' "$digest_value" | fleet_value_digest "$2"
 }
+
+# --- the same answers, for a whole document at once ---------------------------
+#
+# A run asks for every item's value and digest, hundreds per head, and the
+# one-item functions above spend four processes on each (jq, yq, jq, sha256).
+# Measured on a 550-item host: 2,200 spawns and ~30 s before the run had
+# reviewed anything. The batch forms below run each STAGE once over the whole
+# set and are defined to print exactly what the one-item forms print: the
+# item split, the `// empty` drop and the digest pipeline are the same
+# expressions, and any stage that fails falls back to the one-item path
+# rather than guessing.
+
+# fleet_item_split and fleet_item_value, in jq. `split(".")` rather than
+# `index`: jq 1.6's string `index` counted bytes while slicing counted
+# codepoints, so a non-ASCII name would have split in the wrong place.
+fleet_item_value_jq='
+  def fleet_item_split:
+    split(".") as $p |
+    if startswith("definitions.") and ($p | length) >= 3 then
+      ["definitions." + $p[1], ($p[2:] | join("."))]
+    elif ($p | length) >= 2 then [$p[0], ($p[1:] | join("."))]
+    else null end;
+  def fleet_item_value($doc):
+    fleet_item_split as $s |
+    if $s == null then empty else ($doc | getpath($s) // empty) end;'
+
+fleet_fold_item_values() {
+  # fleet_fold_item_values FOLD -> `<item>\t<compact value>` for every item
+  # fleet_items lists whose fleet_item_value is non-empty, in that order: the
+  # input fleet_item_digest would have hashed, item by item.
+  printf '%s\n' "$1" | jq -r --arg facts "$(fleet_host_fact_keys)" \
+    "$fleet_item_value_jq"'
+    . as $doc |
+    ($facts | split("\n") | map(select(. != ""))) as $facts |
+    to_entries[] | select(.value | type == "object") |
+    select(.key as $k | $facts | index($k) | not) |
+    .key as $category | .value | keys_unsorted[] | "\($category).\(.)" |
+    . as $item | [fleet_item_value($doc)] | select(length > 0) |
+    "\($item)\t\(.[0] | tojson)"'
+}
+
+fleet_definition_item_values() {
+  # fleet_definition_item_values DEFS -> `<item>\t<compact value>` for every
+  # definitions item, exactly the lookup fleet_run_item_digests made per item
+  # (`definitions.<c>.<n>` resolved through fleet_definition_entry, split on
+  # the first dot after the prefix).
+  printf '%s\n' "$1" | jq -r '
+    . as $doc |
+    to_entries[] | select(.value | type == "object") |
+    .key as $category | .value | keys_unsorted[] |
+    "definitions.\($category).\(.)" as $item |
+    ($item | ltrimstr("definitions.") | split(".")) as $p |
+    [$doc | getpath([$p[0], ($p[1:] | join("."))]) // empty] |
+    select(length > 0) | "\($item)\t\(.[0] | tojson)"'
+}
+
+fleet_value_digests() (
+  # stdin: `<item>\t<compact JSON>` lines. stdout: `<item> <digest>` — for each
+  # line, byte-for-byte what `printf '%s\n' VALUE | fleet_value_digest ITEM`
+  # prints, in input order.
+  #
+  # The pipeline is fleet_value_digest's, one process per stage: the values go
+  # through ONE yq as a multi-document stream (compact JSON never contains a
+  # bare `---` line, so the document boundaries are exactly the lines), ONE
+  # jq with the same normalization, and ONE hashing process over a file per
+  # item holding the very bytes the one-item form pipes into sha256_stream.
+  # A stage that fails or loses a line falls back to the one-item path.
+  digests_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-digests.XXXXXX") || return 1
+  trap 'rm -rf "$digests_tmp"' EXIT HUP INT TERM
+  cat >"$digests_tmp/in"
+  [ -s "$digests_tmp/in" ] || return 0
+  digests_n=$(awk 'END { print NR }' "$digests_tmp/in")
+  digests_ok=true
+  LC_ALL=C awk '{ i = index($0, "\t"); if (NR > 1) print "---"; print substr($0, i + 1) }' \
+    "$digests_tmp/in" | yq -o=json -I=0 '.' >"$digests_tmp/json" 2>/dev/null ||
+    digests_ok=false
+  [ "$digests_ok" = false ] ||
+    jq -Sc "$fleet_value_normalize" <"$digests_tmp/json" >"$digests_tmp/norm" 2>/dev/null ||
+    digests_ok=false
+  [ "$digests_ok" = false ] ||
+    [ "$(awk 'END { print NR }' "$digests_tmp/norm")" = "$digests_n" ] ||
+    digests_ok=false
+  if [ "$digests_ok" = true ] && mkdir "$digests_tmp/h"; then
+    # One file per item: `<item>\n<normalized json>\n`, named by line number.
+    LC_ALL=C awk -v dir="$digests_tmp/h" '
+      NR == FNR { i = index($0, "\t"); item[FNR] = substr($0, 1, i - 1); next }
+      { printf "%s\n%s\n", item[FNR], $0 > (dir "/" FNR); close(dir "/" FNR) }
+    ' "$digests_tmp/in" "$digests_tmp/norm"
+    digests_tool=
+    if command -v sha256sum >/dev/null 2>&1; then
+      digests_tool='sha256sum'
+    elif command -v shasum >/dev/null 2>&1; then
+      digests_tool='shasum -a 256'
+    fi
+    if [ -n "$digests_tool" ]; then
+      # shellcheck disable=SC2086 # the tool and its one fixed flag
+      (cd "$digests_tmp/h" && seq 1 "$digests_n" | xargs $digests_tool) \
+        >"$digests_tmp/sums" 2>/dev/null || digests_ok=false
+      [ "$digests_ok" = false ] ||
+        [ "$(awk 'END { print NR }' "$digests_tmp/sums")" = "$digests_n" ] ||
+        digests_ok=false
+      if [ "$digests_ok" = true ]; then
+        LC_ALL=C awk '
+          NR == FNR { i = index($0, "\t"); item[FNR] = substr($0, 1, i - 1); next }
+          { sum[$2] = tolower($1) }
+          END { for (n = 1; n in item; n++) print item[n], sum[n] }
+        ' "$digests_tmp/in" "$digests_tmp/sums"
+        return 0
+      fi
+    fi
+  fi
+  while IFS= read -r digests_line; do
+    digests_item=${digests_line%%"	"*}
+    digests_digest=$(printf '%s\n' "${digests_line#*"	"}" |
+      fleet_value_digest "$digests_item") || continue
+    printf '%s %s\n' "$digests_item" "$digests_digest"
+  done <"$digests_tmp/in"
+)
 
 fleet_unknown_categories() {
   # §4's asymmetry, the loud half: a top-level key that is neither a known
@@ -606,6 +770,16 @@ fleet_package_pinned() {
       >/dev/null 2>&1
 }
 
+fleet_packages_pinned() {
+  # fleet_packages_pinned DEFS < names -> the names fleet_package_pinned DEFS
+  # NAME answers true for: its lookup and its predicate, in one jq.
+  jq -r -R --argjson defs "$1" '
+    . as $n | ($defs | try (getpath(["packages", $n]) // empty) catch empty) as $e |
+    select([$e | objects |
+      (.version // ([.[] | objects | .version // empty] | first)) != null] | first // false) |
+    $n' 2>/dev/null
+}
+
 fleet_resolve_package() {
   # `fleet_resolve_package DEFS NAME MANAGER...` — the host's own
   # `package_managers:` list picks the manager, in its order; the definition
@@ -698,6 +872,32 @@ fleet_resolve_package() {
           continue
         }
       fi
+      # `node_switch:` names the package's own post-switch hooks (a list of
+      # argv, each a bin of the package) that must run after a Node runtime
+      # switch carries it to a new prefix. Same grammar and the same trust
+      # rule as `update:`: the definition can only REQUIRE a hook; this host's
+      # config.json `node_switch_hooks` decides whether it runs.
+      if printf '%s\n' "$resolve_spec" | jq -e '.attributes | has("node_switch")' >/dev/null; then
+        resolve_hooks_ok=false
+        if printf '%s\n' "$resolve_spec" | jq -e '.attributes.node_switch |
+          type == "array" and length >= 1 and length <= 4 and
+          all(.[]; type == "array" and length >= 1 and all(.[]; type == "string"))' >/dev/null; then
+          resolve_hooks_ok=true
+          while IFS= read -r resolve_hook; do
+            [ -n "$resolve_hook" ] || continue
+            resolve_update=()
+            while IFS= read -r resolve_update_arg; do
+              resolve_update+=("$resolve_update_arg")
+            done < <(printf '%s\n' "$resolve_hook" | jq -r '.[]')
+            [ "$(printf '%s\n' "$resolve_hook" | jq 'length')" -eq "${#resolve_update[@]}" ] &&
+              npm_updater_argv_valid "${resolve_update[@]}" || resolve_hooks_ok=false
+          done < <(printf '%s\n' "$resolve_spec" | jq -c '.attributes.node_switch[]')
+        fi
+        [ "$resolve_hooks_ok" = true ] || {
+          resolve_detail="npm node_switch for $resolve_concrete must be a list of argv: bins of the package and literal arguments"
+          continue
+        }
+      fi
     fi
     resolve_version=$(printf '%s\n' "$resolve_spec" | jq -r '.version // empty')
     resolve_pin=null
@@ -731,6 +931,59 @@ fleet_resolve_package() {
     --args '{item: $item, resolved: false, hold: "unresolvable",
       detail: $detail, managers_tried: $ARGS.positional}' "$@"
   return 75
+}
+
+fleet_resolve_packages() {
+  # fleet_resolve_packages DEFS MANAGERS < package names -> `<name>\t<json>`
+  # for every name whose resolution is decided by the definition and the
+  # manager list alone — fleet_resolve_package's own answer, field for field,
+  # without seven jq processes per package. A name whose resolution needs
+  # more than that (an npm declaration, whose name and updater are validated
+  # in shell; a Homebrew version pin, which asks brew; a definition that is
+  # not a map) is simply not printed, and the caller asks
+  # fleet_resolve_package for it.
+  jq -R -r --argjson defs "$1" --arg managers "$2" '
+    . as $n |
+    ($managers | split(" ") | map(select(. != ""))) as $ms |
+    ($defs | try (getpath(["packages", $n]) // {}) catch {}) as $entry |
+    def walk_managers($i; $detail):
+      if $i >= ($ms | length) then
+        {item: "packages.\($n)", resolved: false, hold: "unresolvable",
+         detail: $detail, managers_tried: $ms}
+      else $ms[$i] as $m | $entry[$m] as $em |
+        (if $em == "unavailable" then {unavailable: true}
+         elif $em == null and $m == "npm" then
+           {unavailable: true, detail: "npm resolves only a package whose definition declares npm"}
+         elif ($em | type) == "string" then {name: $em, attributes: {}}
+         elif ($em | type) == "object" then
+           {name: ($em.name // $n), attributes: ($em | del(.name, .version))}
+         else {name: $n, attributes: {}} end)
+        | .version = (($em | objects | .version) // $entry.version)
+        | if (.unavailable // false) == true then
+            walk_managers($i + 1; .detail // "explicitly unavailable on \($m)")
+          elif $m == "npm" then "slow"
+          else
+            (.name | if type == "string" then . else tojson end) as $concrete |
+            # The resolver reads the version with `jq -r ".version // empty"`.
+            (.version | if . == null or . == false then ""
+              elif type == "string" then . else tojson end) as $v |
+            if $v == "" then
+              {item: "packages.\($n)", resolved: true, manager: $m, name: $concrete,
+               version: .version, pin: null, attributes: .attributes}
+            elif ($m == "winget" or $m == "apt") then
+              {item: "packages.\($n)", resolved: true, manager: $m, name: $concrete,
+               version: .version, pin: "flag", attributes: .attributes}
+            elif ($m == "homebrew" or $m == "linuxbrew") then "slow"
+            else walk_managers($i + 1; "\($m) cannot express version \($v) at install time")
+            end
+          end
+      end;
+    select($n != "") |
+    if ($entry | type) != "object" then empty
+    elif (($entry.npm // null) != null and $entry.npm != "unavailable") then empty
+    else walk_managers(0; "no package manager on this host provides it") |
+      select(. != "slow") | "\($n)\t\(tojson)"
+    end'
 }
 
 fleet_skill_root_source() {
@@ -864,6 +1117,8 @@ fleet_install_package() {
   # Homebrew needs nothing here: its mechanism is `formula`, and the resolver
   # has already rewritten NAME to `<name>@<version>`.
   #
+  # Every install is bounded (bounded_verb, lib/timeout.sh): one that never
+  # returns is stopped and fails like any other failed install.
   # `</dev/null` on every manager: these run inside `while read` loops whose
   # stdin is the verdict or package list, and one greedy child consumed a
   # 4-item run down to 1.
@@ -872,28 +1127,33 @@ fleet_install_package() {
     # collector already treat the two alike.
     homebrew | linuxbrew)
       if [ "$3" = true ]; then
-        brew install --cask "$2" >/dev/null 2>&1 </dev/null
+        bounded_verb brew install --cask "$2" >/dev/null 2>&1 </dev/null
       else
-        brew install "$2" >/dev/null 2>&1 </dev/null
+        bounded_verb brew install "$2" >/dev/null 2>&1 </dev/null
       fi
       ;;
     winget)
       if [ -n "${4:-}" ]; then
-        winget install --id "$2" --version "$4" --silent \
+        bounded_verb winget install --id "$2" --version "$4" --silent \
           --accept-package-agreements --accept-source-agreements \
           >/dev/null 2>&1 </dev/null
       else
-        winget install --id "$2" --silent --accept-package-agreements \
+        bounded_verb winget install --id "$2" --silent --accept-package-agreements \
           --accept-source-agreements >/dev/null 2>&1 </dev/null
       fi
       ;;
-    scoop) scoop install "$2" >/dev/null 2>&1 </dev/null ;;
+    scoop) bounded_verb scoop install "$2" >/dev/null 2>&1 </dev/null ;;
     npm)
       # Global scope, through the durable npm and its own node (lib/npm.sh).
       # No npm on the host is the same HOLD as any other missing manager, and
       # the install is VERIFIED: npm must then list the package, at the pinned
       # version when there is one.
       npm_global_bin_dir >/dev/null 2>&1 || return 75
+      # A Node switch recorded in flight leaves the runtime unverified (or
+      # mid-switch): no npm install runs under it (lib/node-runtime.sh). 73
+      # is a deferral with its own alert, not "no manager can provide it"
+      # (fleet_run_apply_held).
+      [ -z "$(node_switch_marker_read)" ] || return 73
       npm_global_install "$2" "${4:-}" || return 1
       npm_install_version=$(npm_global_installed_version "$2") || return 1
       [ -n "$npm_install_version" ] || return 1

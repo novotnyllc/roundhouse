@@ -90,6 +90,14 @@
       "update"
     ]
   },
+  "node_switch_hooks": {
+    "npm:@example/cli": [
+      [
+        "example-cli",
+        "service"
+      ]
+    ]
+  },
   "projects": {
     "example": {
       "source": "owner/example",

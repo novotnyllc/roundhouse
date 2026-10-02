@@ -2,6 +2,486 @@
 set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+# --- environment hygiene ---------------------------------------------------
+# 07 stands up its own HOME, PATH and config, but some inherited variables
+# reach real state straight through a fake HOME: XDG_* points config and
+# fleet-store resolution at the operator's real ~/.config, GIT_DIR and friends
+# (set whenever this runs from a git hook) aim every fixture `git -C` at the
+# real repository, JJ_* imports a real jj identity, and the CLI's own
+# ROUNDHOUSE_* inputs (fleet store, identity, trust root, config) would select
+# live material. None of them is a suite input, so drop them before anything
+# runs. ROUNDHOUSE_TEST_* survives: the runner's own selectors and the
+# product's self-test hooks, which 07 and the sections set themselves.
+for rh_inherited in $(compgen -e); do
+  case $rh_inherited in
+    ROUNDHOUSE_TEST_*|ROUNDHOUSE_REQUIRE_REAL_JJ) ;;
+    XDG_*|JJ_*|GIT_*|ROUNDHOUSE_*) unset "$rh_inherited" ;;
+  esac
+done
+unset rh_inherited
+
+# Select a subset of test sections for a fast inner loop; unset runs everything,
+# which is the release gate. ROUNDHOUSE_TEST_ONLY is a space list of section
+# number prefixes (e.g. "94 95"); ROUNDHOUSE_TEST_TIER is fast (pre-jj) or jj
+# (real-jj). The 00/05/07 harness sections and the 90 real-jj fixtures are
+# prerequisites and run whenever a dependent section does.
+want_section() {
+  n=$1
+  case "$n" in 00|05|07) return 0 ;; esac
+  # Plan scopes enter only their section over a fresh shared harness. Other
+  # sections can mutate manager/config state before 68, so they are not setup.
+  case "${ROUNDHOUSE_TEST_SCOPE:-}" in
+    plan-packages|plan-agents|plan-projects|plan-chezmoi|plan-auth)
+      [ "$n" = 68 ]; return $? ;;
+  esac
+  case "${ROUNDHOUSE_TEST_TIER:-all}" in
+    fast) [ "$n" -lt 90 ] || return 1 ;;
+    jj)   [ "$n" -ge 90 ] || return 1 ;;
+  esac
+  [ -n "${ROUNDHOUSE_TEST_ONLY:-}" ] || return 0
+  if [ "$n" -eq 90 ]; then
+    for s in $ROUNDHOUSE_TEST_ONLY; do
+      case "$s" in ''|*[!0-9]*) continue ;; esac
+      [ "$s" -ge 90 ] && return 0
+    done
+    return 1
+  fi
+  case " $ROUNDHOUSE_TEST_ONLY " in *" $n "*) return 0 ;; *) return 1 ;; esac
+}
+
+# True when section $1 was asked for itself, not merely loaded as another
+# section's prerequisite (90 for the real-jj sections). A prerequisite load
+# needs the section's definitions, not its assertions: those run once, in the
+# section's own run.
+section_requested() {
+  case "${ROUNDHOUSE_TEST_TIER:-all}" in
+    fast) [ "$1" -lt 90 ] || return 1 ;;
+    jj)   [ "$1" -ge 90 ] || return 1 ;;
+  esac
+  [ -n "${ROUNDHOUSE_TEST_ONLY:-}" ] || return 0
+  case " $ROUNDHOUSE_TEST_ONLY " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# True when this run owns part $1 of a section split by a `parts=N` marker:
+# always, unless the runner started this child for one part
+# (ROUNDHOUSE_TEST_PART=I/N). A split section guards each independent block
+# with this; code outside every guard runs in each part.
+section_part() {
+  [ -n "${ROUNDHOUSE_TEST_PART:-}" ] || return 0
+  [ "${ROUNDHOUSE_TEST_PART%%/*}" = "$1" ]
+}
+
+if [ -n "${ROUNDHOUSE_TEST_PART:-}" ]; then
+  case ${ROUNDHOUSE_TEST_ONLY:-} in
+    ''|*[!0-9]*) printf 'FAIL: ROUNDHOUSE_TEST_PART needs ROUNDHOUSE_TEST_ONLY naming one section\n' >&2
+       exit 64 ;;
+  esac
+fi
+
+# --- parallel runner -------------------------------------------------------
+# A whole-suite run is the publishing gate, and serially it took 20+ minutes.
+# Every section already stands alone over the 00/05/07 harness (CI has run
+# each one in its own job for a while), so the runner re-enters this driver
+# once per unit in a bounded worker pool. Each child is an ordinary
+# single-section (or single-scope) run with its own fixture root, HOME, TMPDIR
+# and log, so no two units share a path, a store or a lock.
+# Output is buffered per unit and printed in section order with timings; a
+# failing unit's whole log is printed; the final PASS line keeps its meaning.
+#
+#   ROUNDHOUSE_TEST_JOBS     worker count (default: rh_default_jobs). 1 keeps
+#                            the original single-process serial run.
+#   ROUNDHOUSE_TEST_SCOPES   ROUNDHOUSE_TEST_SCOPE runs to add as units ("all"
+#                            = every scope CI runs).
+#   ROUNDHOUSE_TEST_SHARD    I/K: run only the I-th of K weight-balanced shards
+#                            of the selected units (how CI splits the suite).
+#   ROUNDHOUSE_TEST_LIST     true: print the selected units and weights; run
+#                            nothing.
+#   ROUNDHOUSE_TEST_UNIT_TIMEOUT  seconds before a unit is killed and failed
+#                            with its log (default 1200).
+#   ROUNDHOUSE_TEST_VERBOSE  true: print every unit's log, not only failures.
+#
+# Sections are discovered from tests/NN-*.sh; running needs no registration
+# (linting does: see the anchor at the end, which CI checks). Header
+# markers (first 20 lines) adjust scheduling without registering anything:
+#   # roundhouse-test: serial            run alone after the pool drains, for
+#                                        timing assertions that must not share
+#                                        the machine;
+#   # roundhouse-test: partition=S1 S2.. run as these scopes instead of as one
+#                                        unit; together they must cover every
+#                                        default assertion of the section;
+#   # roundhouse-test: parts=N           run as N units, part I with
+#                                        ROUNDHOUSE_TEST_PART=I/N; the section
+#                                        guards each block with section_part.
+# Unit weights (seconds, for longest-first scheduling and shard balance) live
+# in tests/weights.tsv; an unlisted unit is assumed heavy and starts early.
+rh_now_ms() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    rh_now_us=${EPOCHREALTIME//[!0-9]/}
+    printf '%s\n' "$((10#$rh_now_us / 1000))"
+  else
+    printf '%s000\n' "$(date +%s)"
+  fi
+}
+
+rh_seconds() {
+  printf '%d.%d' "$(($1 / 1000))" "$((($1 % 1000) / 100))"
+}
+
+rh_default_jobs() {
+  # Apple silicon: every performance core plus half the efficiency cores. The
+  # units are fork/exec- and I/O-bound shell, so efficiency cores still carry
+  # real work, and measured wall time kept falling past the P-core count.
+  rh_cores=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || true)
+  rh_ecores=$(sysctl -n hw.perflevel1.physicalcpu 2>/dev/null || true)
+  case $rh_cores in ''|*[!0-9]*) ;; *)
+    case $rh_ecores in ''|*[!0-9]*) ;; *) rh_cores=$((rh_cores + rh_ecores / 2)) ;; esac ;;
+  esac
+  case $rh_cores in ''|*[!0-9]*|0)
+    rh_cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || true) ;;
+  esac
+  case $rh_cores in ''|*[!0-9]*|0) rh_cores=2 ;; esac
+  printf '%s\n' "$rh_cores"
+}
+
+rh_marker() {
+  sed -n '1,20p' "$1" | sed -n "s/^# roundhouse-test: $2//p" | head -1
+}
+
+# Every scope CI runs, from the source guards (the manual u2-contracts
+# composite only repeats nine of them).
+rh_all_scopes() {
+  grep -ho 'ROUNDHOUSE_TEST_SCOPE:-}" != [a-z0-9-]*' "$script_dir"/tests/*.sh |
+    awk '{ print $NF }' | grep -v '^u2-contracts$' | LC_ALL=C sort -u
+}
+
+# One line per selected unit: label<TAB>kind<TAB>value<TAB>serial(0|1)
+rh_units() {
+  for rh_file in "$script_dir"/tests/[0-9][0-9]-*.sh; do
+    rh_base=${rh_file##*/}
+    rh_base=${rh_base%.sh}
+    rh_n=${rh_base%%-*}
+    case $rh_n in 00|05|07) continue ;; esac
+    section_requested "$rh_n" || continue
+    rh_serial=0
+    if sed -n '1,20p' "$rh_file" | grep -qx '# roundhouse-test: serial'; then rh_serial=1; fi
+    rh_partition=$(rh_marker "$rh_file" partition=)
+    rh_parts=$(rh_marker "$rh_file" parts=)
+    case $rh_parts in ''|*[!0-9]*) rh_parts=1 ;; esac
+    if [ "$rh_parts" -gt 1 ]; then
+      rh_part=1
+      while [ "$rh_part" -le "$rh_parts" ]; do
+        printf '%s#%s\tpart\t%s:%s/%s\t%s\n' "$rh_base" "$rh_part" "$rh_n" "$rh_part" \
+          "$rh_parts" "$rh_serial"
+        rh_part=$((rh_part + 1))
+      done
+    elif [ -n "$rh_partition" ]; then
+      for rh_scope in $rh_partition; do
+        printf 'scope:%s\tscope\t%s\t%s\n' "$rh_scope" "$rh_scope" "$rh_serial"
+      done
+    else
+      printf '%s\tsection\t%s\t%s\n' "$rh_base" "$rh_n" "$rh_serial"
+    fi
+  done
+  rh_scopes=${ROUNDHOUSE_TEST_SCOPES:-}
+  case " $rh_scopes " in *" all "*) rh_scopes=$(rh_all_scopes) ;; esac
+  for rh_scope in $rh_scopes; do
+    printf 'scope:%s\tscope\t%s\t0\n' "$rh_scope" "$rh_scope"
+  done
+}
+
+# Units with their weight appended as a fifth field. A selection of nothing
+# but the harness (a docs-only change selects 00/05/07) still runs the harness.
+rh_weighted_units() {
+  { rh_units | grep . || printf '00-harness\tsection\t00\t0\n'; } | LC_ALL=C sort -u | awk -F '\t' -v OFS='\t' \
+    -v weights="$script_dir/tests/weights.tsv" '
+    BEGIN {
+      while ((getline line < weights) > 0) {
+        if (line ~ /^#/ || line == "") continue
+        split(line, f, "\t")
+        w[f[1]] = f[2]
+      }
+    }
+    { print $0, (($1 in w) ? w[$1] : 120) }'
+}
+
+# Deterministic longest-first assignment of units to K shards; prints shard
+# I's units heaviest first.
+rh_shard() {
+  sort -t "$(printf '\t')" -k5,5nr -k1,1 | awk -F '\t' -v want="$1" -v k="$2" '
+    {
+      best = 1
+      for (i = 2; i <= k; i++) if (load[i] < load[best]) best = i
+      load[best] += $5
+      if (best == want) print
+    }'
+}
+
+rh_runner() {
+  rh_jobs=$1
+  rh_shard_spec=${ROUNDHOUSE_TEST_SHARD:-1/1}
+  case $rh_shard_spec in
+    [1-9]*/[1-9]*) rh_shard_i=${rh_shard_spec%%/*} rh_shard_k=${rh_shard_spec#*/} ;;
+    *) rh_shard_i=x rh_shard_k=x ;;
+  esac
+  case "$rh_shard_i$rh_shard_k" in
+    *[!0-9]*) printf 'FAIL: ROUNDHOUSE_TEST_SHARD must be I/K\n' >&2; exit 64 ;;
+  esac
+  [ "$rh_shard_i" -le "$rh_shard_k" ] || {
+    printf 'FAIL: ROUNDHOUSE_TEST_SHARD must be I/K with 1 <= I <= K\n' >&2
+    exit 64
+  }
+  if [ -n "${ROUNDHOUSE_TEST_SCOPES:-}" ]; then
+    rh_known_scopes=" all $(rh_all_scopes | tr '\n' ' ')u2-contracts "
+    for rh_scope in $ROUNDHOUSE_TEST_SCOPES; do
+      case $rh_known_scopes in
+        *" $rh_scope "*) ;;
+        *) printf 'FAIL: unknown ROUNDHOUSE_TEST_SCOPES entry: %s\n' "$rh_scope" >&2
+           exit 64 ;;
+      esac
+    done
+  fi
+
+  rh_timeout=${ROUNDHOUSE_TEST_UNIT_TIMEOUT:-1200}
+  case $rh_timeout in ''|*[!0-9]*|0)
+    printf 'FAIL: ROUNDHOUSE_TEST_UNIT_TIMEOUT must be a positive integer\n' >&2
+    exit 64 ;;
+  esac
+  rh_root=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-test-run.XXXXXX")
+  rh_weighted_units | rh_shard "$rh_shard_i" "$rh_shard_k" >"$rh_root/plan"
+
+  if [ "${ROUNDHOUSE_TEST_LIST:-false}" = true ]; then
+    cut -f 1,5 "$rh_root/plan"
+    rm -rf "$rh_root"
+    exit 0
+  fi
+
+  # Units are numbered in label order, which is the print order; rh_order
+  # lists them in scheduling order (heaviest first).
+  LC_ALL=C sort -t "$(printf '\t')" -k1,1 "$rh_root/plan" >"$rh_root/units"
+  rh_count=0
+  rh_label=() rh_kind=() rh_value=() rh_serial=() rh_state=() rh_pid=() rh_t0=() rh_ms=() rh_rc=()
+  rh_gone=()
+  while IFS="$(printf '\t')" read -r rh_f1 rh_f2 rh_f3 rh_f4 _; do
+    rh_count=$((rh_count + 1))
+    rh_label[rh_count]=$rh_f1 rh_kind[rh_count]=$rh_f2 rh_value[rh_count]=$rh_f3
+    rh_serial[rh_count]=$rh_f4 rh_state[rh_count]=pending
+  done <"$rh_root/units"
+  [ "$rh_count" -gt 0 ] || {
+    rm -rf "$rh_root"
+    printf 'FAIL: roundhouse self-check: shard %s selects no units\n' "$rh_shard_spec" >&2
+    exit 1
+  }
+  rh_order=$(cut -f 1 "$rh_root/units" |
+    awk 'NR == FNR { at[$0] = NR; next } { print at[$1] }' - "$rh_root/plan")
+
+  rh_started_ms=$(rh_now_ms)
+  rh_shard_note=
+  [ "$rh_shard_k" -eq 1 ] || rh_shard_note=", shard $rh_shard_spec"
+  printf 'roundhouse self-check: %s unit(s), %s job(s)%s\n' "$rh_count" "$rh_jobs" "$rh_shard_note"
+
+  # Completions come back over one FIFO: each unit's wrapper writes a single
+  # short line (atomic below PIPE_BUF) when its child exits, so the pool
+  # blocks on real events instead of polling. A ticker adds a line every five
+  # seconds so the pool can enforce timeouts with plain blocking reads (a
+  # timed-out `read -t` can lose half a line).
+  mkfifo "$rh_root/done"
+  exec 7<>"$rh_root/done"
+  rh_runner_pid=$$
+  (
+    while kill -0 "$rh_runner_pid" 2>/dev/null; do
+      sleep 5
+      printf 'tick\n' >&7 || exit 0
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  rh_ticker=$!
+  rh_running=0
+  rh_failed=
+  # A unit is reaped as a whole tree by pid ancestry, never by name or by
+  # process group: no unit can signal a sibling's processes, and the tree is
+  # collected before the first signal so nothing escapes by reparenting.
+  rh_kill_tree() {
+    rh_tree=" $* "
+    rh_frontier=$*
+    while [ -n "$rh_frontier" ]; do
+      rh_frontier=$(ps -axo pid=,ppid= | awk -v parents=" $rh_frontier " \
+        'index(parents, " " $2 " ") { printf "%s ", $1 }')
+      rh_tree="$rh_tree$rh_frontier"
+    done
+    # shellcheck disable=SC2086 # deliberate: one pid per word
+    kill -TERM $rh_tree 2>/dev/null || true
+    sleep 1
+    # shellcheck disable=SC2086 # deliberate: one pid per word
+    kill -KILL $rh_tree 2>/dev/null || true
+  }
+  rh_cleanup() {
+    kill "$rh_ticker" 2>/dev/null || true
+    rh_live=
+    rh_i=1
+    while [ "$rh_i" -le "$rh_count" ]; do
+      [ "${rh_state[rh_i]}" != running ] || rh_live="$rh_live ${rh_pid[rh_i]}"
+      rh_i=$((rh_i + 1))
+    done
+    # shellcheck disable=SC2086 # deliberate: one pid per word
+    [ -z "$rh_live" ] || rh_kill_tree $rh_live
+    if [ "${ROUNDHOUSE_TEST_KEEP_TMP:-false}" = true ]; then
+      printf 'preserved-test-run|%s\n' "$rh_root" >&2
+    else
+      rm -rf "$rh_root"
+    fi
+  }
+  trap rh_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM HUP
+
+  rh_launch() {
+    rh_u=$1
+    mkdir -p "$rh_root/$rh_u/tmp" "$rh_root/$rh_u/home"
+    : >"$rh_root/$rh_u/log"
+    (
+      unset ROUNDHOUSE_TEST_ONLY ROUNDHOUSE_TEST_SCOPE ROUNDHOUSE_TEST_SCOPES \
+        ROUNDHOUSE_TEST_TIER ROUNDHOUSE_TEST_SHARD ROUNDHOUSE_TEST_LIST ROUNDHOUSE_TEST_PART
+      case ${rh_kind[rh_u]} in
+        section) export ROUNDHOUSE_TEST_ONLY="${rh_value[rh_u]}" ;;
+        part)
+          export ROUNDHOUSE_TEST_ONLY="${rh_value[rh_u]%%:*}"
+          export ROUNDHOUSE_TEST_PART="${rh_value[rh_u]#*:}"
+          ;;
+        *) export ROUNDHOUSE_TEST_SCOPE="${rh_value[rh_u]}" ;;
+      esac
+      rh_unit_rc=0
+      ROUNDHOUSE_TEST_JOBS=1 TMPDIR="$rh_root/$rh_u/tmp" HOME="$rh_root/$rh_u/home" \
+        "$script_dir/test-roundhouse" >>"$rh_root/$rh_u/log" 2>&1 </dev/null 7>&- ||
+        rh_unit_rc=$?
+      printf '%s %s %s\n' "$rh_u" "$rh_unit_rc" "$(rh_now_ms)" >&7
+    ) &
+    rh_pid[rh_u]=$! rh_state[rh_u]=running rh_t0[rh_u]=$(rh_now_ms)
+    rh_running=$((rh_running + 1))
+  }
+
+  rh_next_print=1
+  rh_report() {
+    while [ "$rh_next_print" -le "$rh_count" ]; do
+      rh_p=$rh_next_print
+      case ${rh_state[rh_p]} in pass|fail) ;; *) return 0 ;; esac
+      rh_l=${rh_label[rh_p]}
+      rh_log=$rh_root/$rh_p/log
+      if [ "${rh_state[rh_p]}" = pass ]; then
+        printf 'ok   %-40s %7ss\n' "$rh_l" "$(rh_seconds "${rh_ms[rh_p]}")"
+        if [ "${ROUNDHOUSE_TEST_VERBOSE:-false}" = true ]; then
+          sed 's/^/     | /' "$rh_log"
+        else
+          { grep -E '^(NOTICE|skip:)' "$rh_log" || true; } | sed 's/^/     | /'
+        fi
+      else
+        printf 'FAIL %-40s %7ss (exit %s)\n' "$rh_l" "$(rh_seconds "${rh_ms[rh_p]}")" "${rh_rc[rh_p]}"
+        printf -- '----- %s log -----\n' "$rh_l"
+        cat "$rh_log"
+        printf -- '----- end %s -----\n' "$rh_l"
+      fi
+      rh_next_print=$((rh_next_print + 1))
+    done
+  }
+
+  rh_finish() {
+    rh_fu=$1
+    [ "${rh_state[rh_fu]:-}" = running ] || return 0
+    rh_ms[rh_fu]=$(($3 - rh_t0[rh_fu])) rh_rc[rh_fu]=$2
+    if [ "$2" -eq 0 ]; then
+      rh_state[rh_fu]=pass
+    else
+      rh_state[rh_fu]=fail
+      rh_failed="$rh_failed ${rh_label[rh_fu]}"
+    fi
+    rh_running=$((rh_running - 1))
+    wait "${rh_pid[rh_fu]}" 2>/dev/null || true
+    rh_report
+  }
+
+  # Block until one unit completes, enforcing the per-unit timeout meanwhile.
+  rh_wait_one() {
+    while read -r rh_du rh_drc rh_dend <&7; do
+      if [ "$rh_du" != tick ]; then
+        rh_finish "$rh_du" "$rh_drc" "$rh_dend"
+        return 0
+      fi
+      rh_now=$(rh_now_ms)
+      rh_i=1
+      while [ "$rh_i" -le "$rh_count" ]; do
+        if [ "${rh_state[rh_i]}" = running ]; then
+          rh_p=${rh_pid[rh_i]}
+          if ! kill -0 "$rh_p" 2>/dev/null && [ "${rh_gone[rh_i]:-}" != 1 ]; then
+            # Gone, but its report may sit just behind this tick. Any report
+            # was written before it exited, so it precedes the NEXT tick.
+            rh_gone[rh_i]=1
+          elif [ "${rh_gone[rh_i]:-}" = 1 ]; then
+            # Still no report a full tick later: something outside killed
+            # the unit, and silence is not a pass.
+            printf '\nFAIL: the unit vanished without reporting (killed from outside?)\n' \
+              >>"$rh_root/$rh_i/log"
+            rh_finish "$rh_i" 125 "$(rh_now_ms)"
+            return 0
+          fi
+          if [ "${rh_gone[rh_i]:-}" != 1 ] &&
+            [ $(((rh_now - rh_t0[rh_i]) / 1000)) -ge "$rh_timeout" ]; then
+            rh_kill_tree "$rh_p"
+            printf '\nFAIL: unit exceeded ROUNDHOUSE_TEST_UNIT_TIMEOUT=%ss and was killed\n' \
+              "$rh_timeout" >>"$rh_root/$rh_i/log"
+            rh_finish "$rh_i" 124 "$(rh_now_ms)"
+            return 0
+          fi
+        fi
+        rh_i=$((rh_i + 1))
+      done
+    done
+    printf 'FAIL: roundhouse self-check: lost the unit completion channel\n' >&2
+    exit 1
+  }
+
+  # The pool first, heaviest units first; then serial units, one at a time.
+  for rh_pass in pool serial; do
+    rh_limit=$rh_jobs
+    [ "$rh_pass" = pool ] || rh_limit=1
+    for rh_u in $rh_order; do
+      case $rh_pass${rh_serial[rh_u]} in pool0|serial1) ;; *) continue ;; esac
+      while [ "$rh_running" -ge "$rh_limit" ]; do rh_wait_one; done
+      rh_launch "$rh_u"
+    done
+    while [ "$rh_running" -gt 0 ]; do rh_wait_one; done
+  done
+  rh_report
+
+  rh_total_ms=$(($(rh_now_ms) - rh_started_ms))
+  if [ -n "$rh_failed" ]; then
+    printf 'FAIL: roundhouse self-check:%s (%ss)\n' "$rh_failed" "$(rh_seconds "$rh_total_ms")" >&2
+    exit 1
+  fi
+  printf 'all %s unit(s) passed in %ss\n' "$rh_count" "$(rh_seconds "$rh_total_ms")"
+  # A shard is not the suite: say so on the contract line itself.
+  if [ "$rh_shard_k" -eq 1 ]; then
+    printf 'PASS: roundhouse self-check\n'
+  else
+    printf 'PASS: roundhouse self-check (shard %s only)\n' "$rh_shard_spec"
+  fi
+  exit 0
+}
+
+# The runner takes any multi-unit selection outside a scope run. JOBS=1, and
+# a single selected section without a partition or parts marker, keep the
+# original single-process run unchanged.
+if [ -z "${ROUNDHOUSE_TEST_SCOPE:-}" ]; then
+  rh_jobs=${ROUNDHOUSE_TEST_JOBS:-$(rh_default_jobs)}
+  case $rh_jobs in ''|*[!0-9]*|0)
+    printf 'FAIL: ROUNDHOUSE_TEST_JOBS must be a positive integer\n' >&2
+    exit 64 ;;
+  esac
+  if [ -n "${ROUNDHOUSE_TEST_SCOPES:-}" ] || [ -n "${ROUNDHOUSE_TEST_SHARD:-}" ] ||
+    [ "${ROUNDHOUSE_TEST_LIST:-false}" = true ] ||
+    { [ "$rh_jobs" -gt 1 ] && [ "$(rh_units | grep -c .)" -gt 1 ]; }; then
+    rh_runner "$rh_jobs"
+  fi
+fi
+
 cli="$script_dir/roundhouse"
 plugin_version=$(jq -r '.version' "$script_dir/../.codex-plugin/plugin.json")
 pwsh_command=$(command -v pwsh 2>/dev/null || true)
@@ -48,6 +528,13 @@ t_blocks() { stat -c %b "$1" 2>/dev/null || stat -f %b  "$1"; }
 t_device() { stat -c %d "$1" 2>/dev/null || stat -f %d  "$1"; }
 t_mode()   { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
+# What a `sleep 1` between two second-resolution timestamps was buying - a
+# strictly later second - without paying for the rest of that second.
+t_next_second() {
+  t_second=$(date +%s)
+  while [ "$(date +%s)" = "$t_second" ]; do sleep 0.05; done
+}
+
 # A section that only applies to one OS gates on this and lives in its own
 # clearly-named file (e.g. 50-macos-privilege.sh). Only genuinely
 # platform-specific fixtures may gate; everything else must run on every OS.
@@ -78,103 +565,95 @@ cli_function_body() {
 }
 
 # The suite is one program: sequential fixtures over shared mutable state,
-# under `set -eu`. The sections below are SOURCED in this fixed order,
-# never run as separate files — shared state and fail-fast stay exactly
-# what they were when this was one file, and a section that exits early
-# (the ROUNDHOUSE_TEST_SCOPE shortcuts) still ends the whole run.
-# Select a subset of test sections for a fast inner loop; unset runs everything,
-# which is the release gate. ROUNDHOUSE_TEST_ONLY is a space list of section
-# number prefixes (e.g. "94 95"); ROUNDHOUSE_TEST_TIER is fast (pre-jj) or jj
-# (real-jj). The 00/05/07 harness sections and the 90 real-jj fixtures are
-# prerequisites and run whenever a dependent section does. Sources stay static
-# below so shellcheck -x still analyses every section as part of the program.
-want_section() {
-  n=$1
-  case "$n" in 00|05|07) return 0 ;; esac
-  # Plan scopes enter only their section over a fresh shared harness. Other
-  # sections can mutate manager/config state before 68, so they are not setup.
-  case "${ROUNDHOUSE_TEST_SCOPE:-}" in
-    plan-packages|plan-agents|plan-projects|plan-chezmoi|plan-auth)
-      [ "$n" = 68 ]; return $? ;;
-  esac
-  case "${ROUNDHOUSE_TEST_TIER:-all}" in
-    fast) [ "$n" -lt 90 ] || return 1 ;;
-    jj)   [ "$n" -ge 90 ] || return 1 ;;
-  esac
-  [ -n "${ROUNDHOUSE_TEST_ONLY:-}" ] || return 0
-  if [ "$n" -eq 90 ]; then
-    for s in $ROUNDHOUSE_TEST_ONLY; do
-      case "$s" in ''|*[!0-9]*) continue ;; esac
-      [ "$s" -ge 90 ] && return 0
-    done
-    return 1
+# under `set -eu`. The selected sections are SOURCED in numeric order, never
+# run as separate files - shared state and fail-fast stay exactly what they
+# were when this was one file, and a section that exits early (the
+# ROUNDHOUSE_TEST_SCOPE shortcuts) still ends the whole run. Sections are
+# discovered, not registered: a new tests/NN-*.sh runs without an edit here.
+for rh_section_file in "$script_dir"/tests/[0-9][0-9]-*.sh; do
+  rh_section=${rh_section_file##*/}
+  if want_section "${rh_section%%-*}"; then
+    # shellcheck source=/dev/null # each section is followed via the anchor below
+    . "$rh_section_file"
   fi
-  case " $ROUNDHOUSE_TEST_ONLY " in *" $n "*) return 0 ;; *) return 1 ;; esac
-}
+done
 
-# shellcheck source=tests/00-contracts.sh
-if want_section 00; then . "$script_dir/tests/00-contracts.sh"; fi
-# shellcheck source=tests/05-fixture-tree.sh
-if want_section 05; then . "$script_dir/tests/05-fixture-tree.sh"; fi
-# shellcheck source=tests/07-stubs.sh
-if want_section 07; then . "$script_dir/tests/07-stubs.sh"; fi
-# shellcheck source=tests/10-u2-broker.sh
-if want_section 10; then . "$script_dir/tests/10-u2-broker.sh"; fi
-# shellcheck source=tests/12-u2-enrollment.sh
-if want_section 12; then . "$script_dir/tests/12-u2-enrollment.sh"; fi
-# shellcheck source=tests/14-u2-collector.sh
-if want_section 14; then . "$script_dir/tests/14-u2-collector.sh"; fi
-# shellcheck source=tests/20-u1.sh
-if want_section 20; then . "$script_dir/tests/20-u1.sh"; fi
-# shellcheck source=tests/30-u4.sh
-if want_section 30; then . "$script_dir/tests/30-u4.sh"; fi
-# shellcheck source=tests/40-u5.sh
-if want_section 40; then . "$script_dir/tests/40-u5.sh"; fi
-# shellcheck source=tests/50-macos-privilege.sh
-if want_section 50; then . "$script_dir/tests/50-macos-privilege.sh"; fi
-# shellcheck source=tests/60-executor-windows.sh
-if want_section 60; then . "$script_dir/tests/60-executor-windows.sh"; fi
-# shellcheck source=tests/65-config-validation.sh
-if want_section 65; then . "$script_dir/tests/65-config-validation.sh"; fi
-# shellcheck source=tests/67-windows-collector.sh
-if want_section 67; then . "$script_dir/tests/67-windows-collector.sh"; fi
-# shellcheck source=tests/68-plan-lifecycle.sh
-if want_section 68; then . "$script_dir/tests/68-plan-lifecycle.sh"; fi
-# shellcheck source=tests/69-windows-interop.sh
-if want_section 69; then . "$script_dir/tests/69-windows-interop.sh"; fi
-# shellcheck source=tests/70-fold.sh
-if want_section 70; then . "$script_dir/tests/70-fold.sh"; fi
-# shellcheck source=tests/71-definitions.sh
-if want_section 71; then . "$script_dir/tests/71-definitions.sh"; fi
-# shellcheck source=tests/72-records.sh
-if want_section 72; then . "$script_dir/tests/72-records.sh"; fi
-# shellcheck source=tests/73-ladder.sh
-if want_section 73; then . "$script_dir/tests/73-ladder.sh"; fi
-# shellcheck source=tests/74-run.sh
-if want_section 74; then . "$script_dir/tests/74-run.sh"; fi
-# shellcheck source=tests/75-guards.sh
-if want_section 75; then . "$script_dir/tests/75-guards.sh"; fi
-# shellcheck source=tests/76-mcp-siding.sh
-if want_section 76; then . "$script_dir/tests/76-mcp-siding.sh"; fi
-# shellcheck source=tests/77-npm.sh
-if want_section 77; then . "$script_dir/tests/77-npm.sh"; fi
-# shellcheck source=tests/78-fleet-parked.sh
-if want_section 78; then . "$script_dir/tests/78-fleet-parked.sh"; fi
-# shellcheck source=tests/90-jj-bootstrap.sh
-if want_section 90; then . "$script_dir/tests/90-jj-bootstrap.sh"; fi
-# shellcheck source=tests/91-jj-integrity.sh
-if want_section 91; then . "$script_dir/tests/91-jj-integrity.sh"; fi
-# shellcheck source=tests/92-jj-reconcile.sh
-if want_section 92; then . "$script_dir/tests/92-jj-reconcile.sh"; fi
-# shellcheck source=tests/93-jj-run.sh
-if want_section 93; then . "$script_dir/tests/93-jj-run.sh"; fi
-# shellcheck source=tests/94-jj-doctor.sh
-if want_section 94; then . "$script_dir/tests/94-jj-doctor.sh"; fi
-# shellcheck source=tests/95-jj-trustd.sh
-if want_section 95; then . "$script_dir/tests/95-jj-trustd.sh"; fi
-# shellcheck source=tests/96-u20-chezmoi-absent.sh
-if want_section 96; then . "$script_dir/tests/96-u20-chezmoi-absent.sh"; fi
-# shellcheck source=tests/97-jj-reenrollment.sh
-if want_section 97; then . "$script_dir/tests/97-jj-reenrollment.sh"; fi
+# Lint anchor, never executed: shellcheck -x cannot follow the loop above, so
+# it follows these and analyses every section as part of this one program. A
+# new section belongs here for lint coverage; it runs whether listed or not.
+if false; then
+  # shellcheck source=tests/00-contracts.sh
+  . "$script_dir/tests/00-contracts.sh"
+  # shellcheck source=tests/05-fixture-tree.sh
+  . "$script_dir/tests/05-fixture-tree.sh"
+  # shellcheck source=tests/07-stubs.sh
+  . "$script_dir/tests/07-stubs.sh"
+  # shellcheck source=tests/10-u2-broker.sh
+  . "$script_dir/tests/10-u2-broker.sh"
+  # shellcheck source=tests/12-u2-enrollment.sh
+  . "$script_dir/tests/12-u2-enrollment.sh"
+  # shellcheck source=tests/14-u2-collector.sh
+  . "$script_dir/tests/14-u2-collector.sh"
+  # shellcheck source=tests/20-u1.sh
+  . "$script_dir/tests/20-u1.sh"
+  # shellcheck source=tests/30-u4.sh
+  . "$script_dir/tests/30-u4.sh"
+  # shellcheck source=tests/40-u5.sh
+  . "$script_dir/tests/40-u5.sh"
+  # shellcheck source=tests/50-macos-privilege.sh
+  . "$script_dir/tests/50-macos-privilege.sh"
+  # shellcheck source=tests/60-executor-windows.sh
+  . "$script_dir/tests/60-executor-windows.sh"
+  # shellcheck source=tests/65-config-validation.sh
+  . "$script_dir/tests/65-config-validation.sh"
+  # shellcheck source=tests/67-windows-collector.sh
+  . "$script_dir/tests/67-windows-collector.sh"
+  # shellcheck source=tests/68-plan-lifecycle.sh
+  . "$script_dir/tests/68-plan-lifecycle.sh"
+  # shellcheck source=tests/69-windows-interop.sh
+  . "$script_dir/tests/69-windows-interop.sh"
+  # shellcheck source=tests/70-fold.sh
+  . "$script_dir/tests/70-fold.sh"
+  # shellcheck source=tests/71-definitions.sh
+  . "$script_dir/tests/71-definitions.sh"
+  # shellcheck source=tests/72-records.sh
+  . "$script_dir/tests/72-records.sh"
+  # shellcheck source=tests/73-ladder.sh
+  . "$script_dir/tests/73-ladder.sh"
+  # shellcheck source=tests/74-run.sh
+  . "$script_dir/tests/74-run.sh"
+  # shellcheck source=tests/75-guards.sh
+  . "$script_dir/tests/75-guards.sh"
+  # shellcheck source=tests/76-mcp-siding.sh
+  . "$script_dir/tests/76-mcp-siding.sh"
+  # shellcheck source=tests/77-npm.sh
+  . "$script_dir/tests/77-npm.sh"
+  # shellcheck source=tests/78-fleet-parked.sh
+  . "$script_dir/tests/78-fleet-parked.sh"
+  # shellcheck source=tests/79-node-runtime.sh
+  . "$script_dir/tests/79-node-runtime.sh"
+  # shellcheck source=tests/80-alerts.sh
+  . "$script_dir/tests/80-alerts.sh"
+  # shellcheck source=tests/83-apply-claude.sh
+  . "$script_dir/tests/83-apply-claude.sh"
+  # shellcheck source=tests/86-publish-verbs.sh
+  . "$script_dir/tests/86-publish-verbs.sh"
+  # shellcheck source=tests/90-jj-bootstrap.sh
+  . "$script_dir/tests/90-jj-bootstrap.sh"
+  # shellcheck source=tests/91-jj-integrity.sh
+  . "$script_dir/tests/91-jj-integrity.sh"
+  # shellcheck source=tests/92-jj-reconcile.sh
+  . "$script_dir/tests/92-jj-reconcile.sh"
+  # shellcheck source=tests/93-jj-run.sh
+  . "$script_dir/tests/93-jj-run.sh"
+  # shellcheck source=tests/94-jj-doctor.sh
+  . "$script_dir/tests/94-jj-doctor.sh"
+  # shellcheck source=tests/95-jj-trustd.sh
+  . "$script_dir/tests/95-jj-trustd.sh"
+  # shellcheck source=tests/96-u20-chezmoi-absent.sh
+  . "$script_dir/tests/96-u20-chezmoi-absent.sh"
+  # shellcheck source=tests/97-jj-reenrollment.sh
+  . "$script_dir/tests/97-jj-reenrollment.sh"
+fi
 
 printf 'PASS: roundhouse self-check\n'

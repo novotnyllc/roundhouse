@@ -459,3 +459,51 @@ fi
   fail "fleet-explain is not in the usage banner"
 grep -qE '^  fleet-explain\)' "$cli" ||
   fail "fleet-explain is not dispatched by the entrypoint"
+
+# --- the fold's tombstone READER beside the fold itself: it reuses the fold's
+# own merge step and tier list.
+if [ -n "$fleet_fixture_yq" ]; then
+  printf 'fold: the tombstone reader\n'
+  (
+    set -eu
+    PATH=$fleet_fixture_path
+    export PATH
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+    run_root="$tmp/fold-readers"
+    mkdir -p "$run_root"
+    # The tombstone set is the fold with the knockout left out, so the last
+    # layer to speak still wins: a host layer that re-adds an item is not a
+    # tombstone there, and a host-layer `absent` over a fleet `enabled` is.
+    run_tomb_layers="$run_root/tomb-layers"
+    mkdir -p "$run_tomb_layers/hosts"
+    printf 'plugins:\n  gone: absent\n  readded: absent\n  kept: enabled\n' \
+      >"$run_tomb_layers/fleet.yaml"
+    printf 'platform: macos\nplugins:\n  readded: enabled\n  local-retire: absent\n' \
+      >"$run_tomb_layers/hosts/vireo.yaml"
+    [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo plugins | jq -c '.plugins | keys')" = \
+      '["gone","local-retire"]' ] ||
+      fail "the tombstone set did not follow last-layer-wins: $(fleet_fold_tombstones "$run_tomb_layers" vireo plugins)"
+    [ "$(fleet_fold "$run_tomb_layers" vireo | jq -c '.plugins | keys')" = \
+      '["kept","readded"]' ] ||
+      fail "reading tombstones changed what the ordinary fold knocks out"
+    [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo skills)" = '{}' ] ||
+      fail "a category with no tombstones produced some"
+
+    # Knocking `absent` out once, after the merge, is the same as knocking it
+    # out after every layer: a narrower layer that speaks again replaces the
+    # scalar whole, so the last layer to speak wins either way.
+    run_mid="$run_root/mid-layers"
+    mkdir -p "$run_mid/hosts" "$run_mid/groups"
+    printf 'plugins:\n  x: {state: enabled, marketplace: m}\n' >"$run_mid/fleet.yaml"
+    printf 'plugins:\n  x: absent\n' >"$run_mid/groups/dev.yaml"
+    printf 'platform: macos\ngroups: [dev]\nplugins:\n  x: {marketplace: n}\n' \
+      >"$run_mid/hosts/vireo.yaml"
+    [ "$(fleet_fold "$run_mid" vireo | jq -c '.plugins.x')" = '{"marketplace":"n"}' ] ||
+      fail "a layer that speaks after an absent did not replace it whole"
+    printf 'platform: macos\ngroups: [dev]\n' >"$run_mid/hosts/vireo.yaml"
+    [ "$(fleet_fold "$run_mid" vireo | jq -c '.plugins.x // "gone"')" = '"gone"' ] &&
+      [ "$(fleet_fold_tombstones "$run_mid" vireo plugins | jq -c '.plugins.x')" = '"absent"' ] ||
+      fail "an absent over a wider map was not knocked out of the fold and read as a tombstone"
+  )
+fi

@@ -173,12 +173,14 @@ if [ "${PREFLIGHT_FAST:-0}" = "1" ]; then
     fail=1
   fi
 else
-  # Unset the scope selectors. test-roundhouse honours ROUNDHOUSE_TEST_SCOPE /
-  # _ONLY / _TIER and will exit early with a scoped PASS, which this gate would
-  # then accept as a full run - a release gate that reports PASSED for a partial
-  # suite is worse than no gate, because it reads as coverage.
+  # Unset every selector. test-roundhouse honours ROUNDHOUSE_TEST_SCOPE /
+  # _ONLY / _TIER / _SCOPES / _SHARD / _PART / _LIST and would run (or list) a
+  # subset, which this gate would then accept as a full run - a release gate
+  # that reports PASSED for a partial suite is worse than no gate, because it
+  # reads as coverage.
   suite_out=$(env -u ROUNDHOUSE_TEST_SCOPE -u ROUNDHOUSE_TEST_ONLY -u ROUNDHOUSE_TEST_TIER \
-    plugins/roundhouse/scripts/test-roundhouse 2>&1)
+    -u ROUNDHOUSE_TEST_SCOPES -u ROUNDHOUSE_TEST_SHARD -u ROUNDHOUSE_TEST_PART \
+    -u ROUNDHOUSE_TEST_LIST plugins/roundhouse/scripts/test-roundhouse 2>&1)
   suite_rc=$?
   if [ "$suite_rc" -eq 0 ] && printf '%s' "$suite_out" | grep -q '^PASS'; then
     note "ok   test-roundhouse"

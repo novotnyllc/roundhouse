@@ -157,14 +157,18 @@ function Get-ExecutorRoots([string]$Marketplace, [string]$Version) {
 function Invoke-ChildPowerShell([string]$Pwsh, [string[]]$Arguments) {
     # A separate native process, as the Codex protocol runs the executor.
     # Its stderr is captured so a refusal reaches the controller as one
-    # plain-text reason rather than raw console output.
+    # plain-text reason rather than raw console output: the last stderr line,
+    # which the apply worker makes its sanitized failure summary.
     $Output = @(& $Pwsh -NoLogo -NoProfile -NonInteractive @Arguments 2>&1)
     $ExitCode = $LASTEXITCODE
     $Stderr = @($Output | Where-Object { $_ -is [Management.Automation.ErrorRecord] } |
         ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     $Reason = if ($Stderr.Count -gt 0) { ($Stderr[-1] -replace '^\s*\|\s*', '').Trim() } else { "" }
     $Reason = $Reason -replace '[\x00-\x1f\x7f-\x9f]', ' '
-    if ($Reason.Length -gt 512) { $Reason = $Reason.Substring(0, 512) }
+    # Room for the apply worker's bounded failure detail (at most 2560
+    # characters plus its prefix) while every envelope message the controller
+    # builds from it stays under the envelope's 4096-character limit.
+    if ($Reason.Length -gt 3072) { $Reason = $Reason.Substring(0, 3072) }
     return @{
         ExitCode = $ExitCode
         Stdout = @($Output | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })

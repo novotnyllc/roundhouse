@@ -41,7 +41,9 @@ self_dir=$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd -P)
 prefix=$(dirname -- "$self_dir")
 printf '%s node=%s\n' "$*" "$(command -v node)" >>"$NPM_STUB_LOG"
 case "$1 ${2:-}" in
-  "prefix --global") printf '%s\n' "$prefix" ;;
+  "prefix --global")
+    [ "${NPM_STUB_PREFIX_HANG:-0}" != 1 ] || { sleep 589 & wait; exit 0; }
+    printf '%s\n' "$prefix" ;;
   "root --global") printf '%s/lib/node_modules\n' "$prefix" ;;
   "ls --global")
     [ "${NPM_STUB_LS_FAIL:-0}" != 1 ] ||
@@ -102,6 +104,16 @@ chmod 755 "$nfx_install_dir/bin/node" "$nfx_install_dir/bin/npm" \
   "$nfx_modules/@example/tool/bin/tool.js" "$nfx_install_dir/bin/impostor"
 cp "$nfx_install_dir/bin/npm" "$nfx_install_dir/bin/node" "$nfx_root/multishell/fnm_multishells/4242/bin/"
 cp "$nfx_install_dir/bin/npm" "$nfx_root/bare-bin/npm"
+# The collector also reports the fnm runtime under these globals (fnm:node).
+# A stub fnm keeps that off the network and off any real fnm on the machine
+# running the suite: one published release, the installed default.
+mkdir -p "$nfx_root/fnm-bin"
+cat >"$nfx_root/fnm-bin/fnm" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = list-remote ] && { printf 'v26.0.0\n'; exit 0; }
+exit 64
+SH
+chmod 755 "$nfx_root/fnm-bin/fnm"
 
 nfx_reset_state() {
   printf '%s\n' '{"npm":"11.0.0","@example/tool":"1.0.0","current-only":"3.0.0"}' >"$nfx_state"
@@ -119,9 +131,11 @@ nfx_reset_state
   NPM_STUB_LOG=$nfx_log
   NPM_STUB_IMPOSTOR=$nfx_root/impostor-ran
   ROUNDHOUSE_TEST_NPM_FIXED_DIRS=
+  ROUNDHOUSE_TEST_FNM_FIXED_DIRS=
   export FNM_DIR NPM_STUB_STATE NPM_STUB_LATEST NPM_STUB_LOG NPM_STUB_IMPOSTOR \
-    ROUNDHOUSE_TEST_NPM_FIXED_DIRS
+    ROUNDHOUSE_TEST_NPM_FIXED_DIRS ROUNDHOUSE_TEST_FNM_FIXED_DIRS
   [ -z "$fleet_fixture_yq" ] || PATH=$fleet_fixture_path
+  PATH=$nfx_root/fnm-bin:$PATH
   export PATH
   # shellcheck source=/dev/null
   ROUNDHOUSE_LIB_ONLY=1 . "$cli"
@@ -258,7 +272,7 @@ nfx_reset_state
   nfx_run_full() {
     (
       fleet_trust_prune_expired() { :; }
-      fleet_trust_age_evidence() { :; }
+      fleet_records_age() { :; }
       fleet_enroll_process_joins() { :; }
       fleet_seed_command() { :; }
       fleet_run_proposals() { :; }
@@ -322,9 +336,10 @@ jq '.machines["test-host"].package_managers = ["homebrew","npm"] |
   "$tmp/config.json" >"$tmp/npm-config.json"
 chmod 600 "$tmp/npm-config.json"
 nfx_cli() {
-  env -u XDG_DATA_HOME ROUNDHOUSE_CONFIG="$tmp/npm-config.json" FNM_DIR="$nfx_fnm" \
+  env -u XDG_DATA_HOME PATH="$nfx_root/fnm-bin:$PATH" ROUNDHOUSE_CONFIG="$tmp/npm-config.json" FNM_DIR="$nfx_fnm" \
     NPM_STUB_STATE="$nfx_state" NPM_STUB_LATEST="$nfx_latest" NPM_STUB_LOG="$nfx_log" \
-    NPM_STUB_IMPOSTOR="$nfx_root/impostor-ran" ROUNDHOUSE_TEST_NPM_FIXED_DIRS= "$cli" "$@"
+    NPM_STUB_IMPOSTOR="$nfx_root/impostor-ran" ROUNDHOUSE_TEST_NPM_FIXED_DIRS= \
+    ROUNDHOUSE_TEST_FNM_FIXED_DIRS= "$cli" "$@"
 }
 # Config validation: npm is accepted everywhere; an updater must be argv.
 for nfx_bad_config in \
@@ -353,6 +368,19 @@ nfx_cli collect --target test-host --section host --section packages --output "$
   "$nfx_prefix_physical" ] || fail "the npm record did not bind the global prefix"
 [ "$(jq -c 'select(.kind == "package" and .id == "npm:@example/tool") | .data.updater' "$tmp/npm-snapshot.jsonl")" = \
   '["tool","update"]' ] || fail "a proven package updater was not reported"
+
+# A timed-out prefix query leaves the globals' owner unknown: the whole npm
+# inventory is reported as a query timeout, never as records with a null prefix.
+set +e
+NPM_STUB_PREFIX_HANG=1 ROUNDHOUSE_TEST_QUERY_TIMEOUT=2 nfx_cli collect --target test-host \
+  --section host --section packages --output "$tmp/npm-prefix-hang.jsonl"
+set -e
+jq -se 'any(.[]; .id == "packages:npm" and .status == "unavailable" and
+  any(.errors[]; .code == "manager_query_timeout")) and
+  all(.[]; (.kind == "package" and .data.manager == "npm") | not)' \
+  "$tmp/npm-prefix-hang.jsonl" >/dev/null ||
+  fail "a timed-out npm prefix query was not reported as an unknown npm inventory"
+! pgrep -f 'sleep 589' >/dev/null 2>&1 || fail "a hung npm prefix query outlived its timeout"
 [ "$(jq -r 'select(.kind == "package" and .id == "npm:current-only") |
   [.data.update_available,.data.updater,.data.updater_status] | map(tostring) | join(" ")' \
   "$tmp/npm-snapshot.jsonl")" = 'false null unproven' ] ||

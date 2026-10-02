@@ -800,8 +800,8 @@ test_u2_upgrade_confirmation_contracts() {
   # tighter bound would misreport a slow runner as an unbounded wait. There is
   # no portable `timeout` on macOS, so poll.
   u2_abandon_waited=0
-  while kill -0 "$u2_abandon_job" 2>/dev/null && [ "$u2_abandon_waited" -lt 60 ]; do
-    sleep 1
+  while kill -0 "$u2_abandon_job" 2>/dev/null && [ "$u2_abandon_waited" -lt 1200 ]; do
+    sleep 0.05
     u2_abandon_waited=$((u2_abandon_waited + 1))
   done
   if kill -0 "$u2_abandon_job" 2>/dev/null; then

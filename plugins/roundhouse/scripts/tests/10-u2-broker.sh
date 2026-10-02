@@ -147,7 +147,7 @@ setup_u2_fixture() {
     pause_job=$2
     pause_output=${3:-}
     pause_count=0
-    while [ "$pause_count" -lt 45 ]; do
+    while [ "$pause_count" -lt 900 ]; do
       if [ -f "$pause_marker" ]; then
         pause_pid=$(awk -F '[|=]' 'NR==1&&$1=="pause"&&$2=="1"&&$3=="point"&&$5=="pid"{print $6}' \
           "$pause_marker")
@@ -159,7 +159,7 @@ setup_u2_fixture() {
         [ -z "$pause_output" ] || cat "$pause_output" >&2
         fail "U2 paused lifecycle process exited before its marker"
       fi
-      sleep 1
+      sleep 0.05
       pause_count=$((pause_count + 1))
     done
     fail "U2 lifecycle pause marker timed out"
@@ -181,13 +181,13 @@ setup_u2_fixture() {
     done
     touch "$pause_marker.kill"
     pause_wait=0
-    while [ "$pause_wait" -lt 5 ]; do
+    while [ "$pause_wait" -lt 100 ]; do
       pause_survivor=false
       for pause_process in $pause_processes; do
         if kill -0 "$pause_process" 2>/dev/null; then pause_survivor=true; fi
       done
       [ "$pause_survivor" = false ] && break
-      sleep 1
+      sleep 0.05
       pause_wait=$((pause_wait + 1))
     done
     if [ "$pause_survivor" = true ]; then

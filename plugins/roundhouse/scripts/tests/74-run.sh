@@ -193,9 +193,10 @@ JSON
       fail "fallback catalog reapplied an already-matching plugin"
     run_marketplace_update_marker="$run_root/marketplace-updates"
     : >"$run_marketplace_update_marker"
+    mkdir -p "$run_root/full-tmp"
     (
       fleet_trust_prune_expired() { :; }
-      fleet_trust_age_evidence() { :; }
+      fleet_records_age() { :; }
       fleet_enroll_process_joins() { :; }
       fleet_seed_command() { :; }
       fleet_run_proposals() { :; }
@@ -207,6 +208,28 @@ JSON
         "$run_root/layers" "$run_root/full-tmp" >/dev/null
       grep -Fqx test-market "$run_marketplace_update_marker" ||
         fail "full cadence did not refresh a marketplace supplied by definitions"
+      # ...and never one registered from another source than the declared one.
+      run_repoint_markets="$run_root/repointed-marketplaces.json"
+      printf '%s\n' '[{"name":"test-market","source":"github","repo":"attacker/test-market"}]' \
+        >"$run_repoint_markets"
+      run_repoint_settings="$run_root/repoint-claude"
+      mkdir -p "$run_repoint_settings"
+      printf '%s\n' '{"extraKnownMarketplaces":{"test-market":{"source":{"source":"github","repo":"owner/test-market"}}}}' \
+        >"$run_repoint_settings/settings.json"
+      : >"$run_marketplace_update_marker"
+      # A new pass: what an earlier pass learned about the source is forgotten.
+      fleet_run_marketplace_repair_reset
+      CLAUDE_MARKETPLACE_UPDATE_MARKER="$run_marketplace_update_marker" \
+        CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_repoint_markets" \
+        CLAUDE_CONFIG_DIR="$run_repoint_settings" \
+        fleet_run_full_pass "$run_store" vireo \
+        '{"plugins":{"example":"enabled"}}' "$run_plugin_defs" \
+        "$run_root/layers" "$run_root/full-tmp" >"$run_root/repoint-out"
+      [ ! -s "$run_marketplace_update_marker" ] ||
+        fail "full cadence refreshed a marketplace registered from another source"
+      grep -Fq '  hold  marketplace test-market — ' "$run_root/repoint-out" &&
+        [ "$(yq -r '.result' "$run_store/upstreams/test-market/vireo.yaml")" = held ] ||
+        fail "a repointed marketplace's refresh was not held and recorded as held"
     )
     run_package_upgrade_marker="$run_root/package-upgrades"
     run_package_bin="$run_root/package-bin"
@@ -224,7 +247,7 @@ SH
       >"$run_root/package-held-tmp/sigholds"
     (
       fleet_trust_prune_expired() { :; }
-      fleet_trust_age_evidence() { :; }
+      fleet_records_age() { :; }
       fleet_enroll_process_joins() { :; }
       fleet_seed_command() { :; }
       fleet_run_proposals() { :; }
@@ -1130,6 +1153,8 @@ YAML
 {"kind":"plugin","status":"present","data":{"name":"unknown-harness","marketplace":"unknown","enabled":true}}
 {"kind":"skill","status":"present","data":{"name":"grilling"}}
 {"kind":"package","status":"present","data":{"name":"jq"}}
+{"kind":"package","id":"npm:@example/cli","status":"present","data":{"manager":"npm","name":"@example/cli","installed_version":"1.0.0"}}
+{"kind":"package","id":"fnm:node","status":"present","data":{"manager":"fnm","name":"node","installed_version":"v26.7.0","candidate_version":null,"update_available":false}}
 {"kind":"plugin","status":"absent","data":{"agent":"claude","name":"never-installed","marketplace":"x","enabled":true}}
 JSONL
     run_seed_host=$(fleet_host_name)
@@ -1148,28 +1173,60 @@ YAML
       *) fail "fleet-seed did not say it stopped at the working copy: $run_seed_out" ;;
     esac
     run_seeded="$run_store/hosts/$run_seed_host.yaml"
-    grep -Fq 'ponytail:' "$run_seeded" ||
-      fail "seeding did not describe an installed plugin"
-    yq -e '.plugins.ponytail.state == "enabled" and .plugins.ponytail.marketplace == "novotnyllc"' \
+    # §8.2 P0: the AGENT KEYS are not seeded. A machine snapshot in the host
+    # layer re-added every retired plugin and overrode every change made
+    # anywhere else; packages and the host facts still seed.
+    yq -e '.packages.jq == "enabled"' "$run_seeded" >/dev/null ||
+      fail "seeding stopped describing an installed package"
+    yq -e '.plugins.ponytail == null and .plugins.legal == null and
+      .plugins."codex-only" == null and .plugins."unknown-harness" == null' \
       "$run_seeded" >/dev/null ||
-      fail "a same-name Codex plugin replaced the Claude desired plugin"
-    yq -e '.plugins."codex-only" == null and .plugins."unknown-harness" == null' \
-      "$run_seeded" >/dev/null ||
-      fail "seeding sent a non-Claude plugin to the Claude-only apply surface"
-    yq -e '.plugins.legal.state == "disabled"' "$run_seeded" >/dev/null ||
-      fail "seeding lost a plugin's disabled state"
+      fail "seeding still writes installed plugins into the host layer"
+    yq -e '.skills == null' "$run_seeded" >/dev/null ||
+      fail "seeding still writes installed skills into the host layer"
     ! grep -Fq 'never-installed' "$run_seeded" ||
       fail "seeding described something the snapshot reports absent"
-    # Re-seeding UPSERTS and never removes: a hand-authored entry survives.
+    # The fnm runtime record is never a package (Homebrew would read
+    # `packages.node` as its own `node` formula), and seeding never writes
+    # `runtimes:` either: that category enters the store by hand. An npm
+    # global is not seeded: without an `npm:` definition it would resolve to
+    # a system manager and be owned without ever being carried by a switch.
+    yq -e '.packages.jq == "enabled" and .packages.node == null and .runtimes == null and
+      .packages["@example/cli"] == null' \
+      "$run_seeded" >/dev/null ||
+      fail "seeding turned the fnm runtime record into desired state"
+    [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" packages.node)" ] ||
+      fail "seeding asserted applied evidence for the fnm runtime as a package"
+    # Re-seeding UPSERTS and never removes: a hand-authored entry survives,
+    # agent entries included — the seed stops writing them, it does not delete.
     grep -Fq 'hand-authored:' "$run_seeded" ||
       fail "seeding removed a hand-authored entry (re-seed must upsert)"
     # The first convergence after seeding is a no-op BY CONSTRUCTION, which is
     # the safety property worth paying a verbose host file for.
     [ -f "$(fleet_applied_path "$run_store" "$run_seed_host")" ] ||
       fail "seeding wrote no applied/<host>.yaml, so the first run would adopt everything"
-    [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" plugins.codex-only)" ] &&
-      [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" plugins.unknown-harness)" ] ||
-      fail "seeding asserted applied evidence for a non-Claude plugin"
+    [ -n "$(fleet_applied_digest "$run_store" "$run_seed_host" packages.jq)" ] ||
+      fail "seeding wrote no applied evidence for the package it seeded"
+    [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" plugins.ponytail)" ] &&
+      [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" plugins.codex-only)" ] &&
+      [ -z "$(fleet_applied_digest "$run_store" "$run_seed_host" skills.grilling)" ] ||
+      fail "seeding asserted applied evidence for an agent item it no longer seeds"
+    # Unanimity promotion skips the agent keys too: a plugin every host file
+    # happens to carry identically is not proposed fleet-wide.
+    run_prop_root="$run_root/proposal-layers"
+    mkdir -p "$run_prop_root/hosts" "$run_root/proposal-tmp" "$run_root/proposal-store"
+    for run_prop_host in vireo wren; do
+      printf 'platform: macos\nplugins:\n  ponytail: enabled\nskills:\n  tdd: enabled\npackages:\n  jq: enabled\n' \
+        >"$run_prop_root/hosts/$run_prop_host.yaml"
+    done
+    printf '%s\n' vireo wren >"$run_root/proposal-tmp/hosts"
+    fleet_run_proposals "$run_root/proposal-store" vireo "$run_prop_root" \
+      "$run_root/proposal-tmp"
+    [ -f "$run_root/proposal-store/proposals/promote-packages-jq-to-fleet.yaml" ] ||
+      fail "a unanimous package was no longer proposed for promotion"
+    [ -z "$(find "$run_root/proposal-store/proposals" \
+      -name 'promote-plugins-*' -o -name 'promote-skills-*' | head -1)" ] ||
+      fail "a unanimous agent item was proposed for promotion"
     # It stops at the working copy: no describe, no bookmark, no push. There is
     # no repository here at all, and seeding must not need one.
     [ ! -e "$run_store/.jj" ] ||
@@ -1213,7 +1270,7 @@ JSONC
     [ -z "$(ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
       fleet_run_package_managers '{"package_managers":[]}' "$run_seed_host")" ] ||
       fail "an explicit empty package_managers in the fold was overridden by config.json"
-    yq -e '.plugins.ponytail != null' "$run_seeded" >/dev/null ||
+    yq -e '.packages.jq != null' "$run_seeded" >/dev/null ||
       fail "seeding the facts cost the observed surfaces"
     # A fact already in the host file WINS: someone wrote it deliberately and
     # seeding is not the place to relitigate it.
@@ -1244,7 +1301,7 @@ JSONC
     [ "$(yq -r '.groups | tag' "$run_seeded")" = '!!seq' ] &&
       [ "$(yq -r '.groups | length' "$run_seeded")" -eq 0 ] ||
       fail "an empty groups list was dropped instead of seeded; machine-truth would fire forever"
-    yq -e '.plugins.ponytail != null' "$run_seeded" >/dev/null ||
+    yq -e '.packages.jq != null' "$run_seeded" >/dev/null ||
       fail "seeding the empty groups list cost the observed surfaces"
     # …and a config that states NO opinion has none invented for it. (The
     # machine stays listed with `transport: local`, because that entry is also
@@ -1262,7 +1319,7 @@ JSONC
     [ -f "$run_seeded" ] ||
       fail "the seed wrote a different host file than the fixture expects"
     yq -e '.platform == null and .groups == null and .package_managers == null and
-      .plugins.ponytail != null' \
+      .packages.jq != null' \
       "$run_seeded" >/dev/null ||
       fail "an unlisted machine had facts invented for it"
     # An ABSENT field and an empty list are different answers, and the doctor
@@ -1330,7 +1387,7 @@ printf 'verbs: the supervised item-level surface\n'
   set -eu
   for verb_name in fleet-review fleet-apply fleet-accept fleet-hold \
     fleet-pending fleet-journal fleet-finding fleet-lock fleet-unlock \
-    fleet-set-remote; do
+    fleet-set-remote fleet-compact-alerts fleet-disown fleet-age-evidence; do
     grep -Fq "  roundhouse $verb_name" "$cli" ||
       fail "$verb_name is missing from the usage heredoc"
     grep -Eq "^  $verb_name\)" "$cli" ||
@@ -1340,7 +1397,9 @@ printf 'verbs: the supervised item-level surface\n'
   # malformed invocation can never reach a store at all.
   for verb_bad in 'fleet-review one two' 'fleet-apply' 'fleet-apply a b' \
     'fleet-accept' 'fleet-hold only' 'fleet-pending extra' 'fleet-lock extra' \
-    'fleet-set-remote' 'fleet-finding one'; do
+    'fleet-set-remote' 'fleet-finding one' 'fleet-compact-alerts extra' \
+    'fleet-disown' 'fleet-disown --dry-run' 'fleet-disown --bogus x' \
+    'fleet-unlock --force extra' 'fleet-age-evidence --dry-run extra'; do
     verb_status=0
     # shellcheck disable=SC2086 # the malformed argv under test
     "$cli" $verb_bad >/dev/null 2>&1 || verb_status=$?
@@ -1409,6 +1468,27 @@ if [ -n "$fleet_fixture_yq" ]; then
     fleet_apply_command plugins.railyard >/dev/null 2>&1 || verb_status=$?
     [ "$verb_status" -eq 65 ] || fail "a stale pass verdict authorised an apply"
     fleet_review_command plugins.railyard pass 'reviewed by hand' >/dev/null
+
+    # --- fleet-apply converges a SCALAR tombstone through the same path the
+    # run uses (fleet_run_tombstone_converge): the fold knocks `absent` out,
+    # so review and apply resolve it through fleet_run_desired.
+    printf '%s\n' 'plugins:' '  retired-by-hand: absent' >"$verb_store/fleet.yaml.tomb"
+    cat "$verb_store/fleet.yaml" "$verb_store/fleet.yaml.tomb" >"$verb_store/fleet.yaml.new"
+    mv "$verb_store/fleet.yaml.new" "$verb_store/fleet.yaml"
+    rm -f "$verb_store/fleet.yaml.tomb"
+    fleet_review_command plugins.retired-by-hand pass 'retire it' >/dev/null ||
+      fail "a scalar tombstone could not be reviewed"
+    verb_out=$(CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_apply_command plugins.retired-by-hand) ||
+      fail "fleet-apply refused a reviewed scalar tombstone: $verb_out"
+    case $verb_out in
+      *'satisfied plugins.retired-by-hand'*'converged to absent'*) ;;
+      *) fail "fleet-apply did not converge the tombstone through the shared path: $verb_out" ;;
+    esac
+    [ -n "$(cat "$(fleet_run_tombstone_memo_path plugins.retired-by-hand)" 2>/dev/null)" ] ||
+      fail "fleet-apply's tombstone left no converged-digest memo"
+    fleet_journal_entries "$verb_store" vireo |
+      jq -e -s 'any(.[]; .item == "plugins.retired-by-hand" and .outcome == "satisfied")' >/dev/null ||
+      fail "fleet-apply's tombstone journaled no satisfied record"
 
     # --- fleet-accept: a promotion moves WHERE a value lives, never what it is
     fleet_record_write "$verb_store/proposals/promote-skills-tdd.yaml" \

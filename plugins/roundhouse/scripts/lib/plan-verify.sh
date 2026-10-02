@@ -656,7 +656,7 @@ verify_preconditions_command() {
     (.plan_digest.algorithm == "sha256") and
     (.plan_digest.value | test("^[0-9a-f]{64}$")) and
     ([.. | strings | length <= 8192] | all)
-  ' "$plan" >/dev/null || {
+  ' "$plan" >/dev/null && node_switch_operations_valid "$plan" || {
     printf 'roundhouse: invalid apply plan\n' >&2
     exit 64
   }
@@ -770,10 +770,24 @@ verify_preconditions_command() {
     printf 'roundhouse: current snapshot does not cover every planned operation\n' >&2
     exit 65
   }
+  # No npm upgrade under a Node default a switch left in flight.
+  ! node_switch_npm_blocked "$plan" "$snapshot" || {
+    printf 'roundhouse: a Node switch is recorded in flight on the target; npm upgrades are refused until it is resolved\n' >&2
+    exit 65
+  }
   [ "$(jq -r '.precondition_digest.value' "$plan")" = "$(precondition_digest "$plan" "$snapshot")" ] || {
     printf 'roundhouse: target state changed after planning; create a new plan\n' >&2
     exit 65
   }
+  # A Node switch: its carry must still be exactly the installed set the
+  # fresh snapshot shows, with the configured hooks (node_switch_verify_snapshot).
+  if jq -e 'any(.operations[]?; .type == "package-upgrade" and .id == "fnm:node")' \
+    "$plan" >/dev/null 2>&1; then
+    node_switch_verify_snapshot "$plan" "$snapshot" "$config" || {
+      printf 'roundhouse: the Node switch carry or hooks no longer match the installed npm globals; create a new plan\n' >&2
+      exit 65
+    }
+  fi
   jq -cn --arg plan_id "$expected_plan_id" --arg target "$target" \
     '{verified:true,plan_id:$plan_id,target:$target}'
 }

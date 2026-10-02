@@ -8,10 +8,45 @@ snapshot_id=${3:?snapshot id required}
 sections=${4:-all}
 observed_at=${ROUNDHOUSE_OBSERVED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
 
+# Every manager query is bounded (lib/timeout.sh): a manager that hangs makes
+# its own inventory UNKNOWN for this collection and nothing else.
+# shellcheck source=lib/timeout.sh
+. "$script_dir/lib/timeout.sh"
 # The npm manager's durable-path resolution is shared with the executor and
 # the desired-state run, so all three agree on which Node owns the globals.
 # shellcheck source=lib/npm.sh
 . "$script_dir/lib/npm.sh"
+# …and so is the fnm runtime under it (the `fnm:node` record).
+# shellcheck source=lib/node-runtime.sh
+. "$script_dir/lib/node-runtime.sh"
+
+# BOUNDED MANAGER QUERIES. Every package- and agent-manager query below runs
+# under run_bounded with the listing ceiling. One that hangs is stopped, its
+# manager's inventory is reported UNAVAILABLE with `manager_query_timeout`
+# (the run raises a keyed `inventory-timeout` alert from it), and collection
+# carries on: a hung `jsm` once held a run, and its lock, for ~37 hours.
+# The npm and fnm calls are bounded inside lib/npm.sh and lib/node-runtime.sh;
+# run_bounded_log is how a timeout down there reaches the record here.
+run_bounded_log=$(mktemp "${TMPDIR:-/tmp}/roundhouse-bounded.XXXXXX")
+trap 'rm -f "$run_bounded_log"' EXIT
+
+query_reset() {
+  # Starts one query's window: query_errors reports only a timeout since.
+  : >"$run_bounded_log"
+}
+
+query_errors() {
+  # `query_errors CODE MESSAGE [RETRYABLE]` -> the record's `errors` array:
+  # CODE as given, or `manager_query_timeout` when a bounded call since
+  # query_reset ran out of time, which is retryable whatever CODE says.
+  if [ -s "$run_bounded_log" ]; then
+    jq -cn --arg message "$2 (timed out after $(run_bounded_seconds list)s)" \
+      '[{code:"manager_query_timeout",severity:"warning",retryable:true,message:$message}]'
+  else
+    jq -cn --arg code "$1" --arg message "$2" --argjson retryable "${3:-true}" \
+      '[{code:$code,severity:"warning",retryable:$retryable,message:$message}]'
+  fi
+}
 
 has_section() {
   [ "$sections" = all ] || case ",$sections," in *",$1,"*) return 0 ;; *) return 1 ;; esac
@@ -1638,9 +1673,11 @@ run_auth_health() {
   printf '%s' "$entry" | jq -j '.value.verify[1:][]? | . + "\u0000"' >"$args_file"
   xargs -0 "$verify_command" <"$args_file" >/dev/null 2>&1 &
   verify_pid=$!
+  # Same 10s budget as fifty 0.2s ticks, but a verifier that answers at once
+  # (the common case) is seen within milliseconds instead of a fixed 0.2s.
   ticks=0
   while kill -0 "$verify_pid" >/dev/null 2>&1; do
-    if [ "$ticks" -ge 50 ]; then
+    if [ "$ticks" -ge 69 ]; then
       kill "$verify_pid" >/dev/null 2>&1 || true
       if wait "$verify_pid" >/dev/null 2>&1; then :; fi
       auth_health_status=timeout
@@ -1648,7 +1685,7 @@ run_auth_health() {
       rm -f "$args_file"
       return
     fi
-    sleep 0.2
+    if [ "$ticks" -lt 20 ]; then sleep 0.01; else sleep 0.2; fi
     ticks=$((ticks + 1))
   done
   if wait "$verify_pid" >/dev/null 2>&1; then
@@ -1961,18 +1998,20 @@ if has_section packages; then
           candidate_casks="$package_tmp/cask-candidates.tsv"
           : >"$candidate_formulae"
           : >"$candidate_casks"
-          if outdated_json=$(brew outdated --json=v2 2>/dev/null); then
+          query_reset
+          if outdated_json=$(bounded_query brew outdated --json=v2 2>/dev/null); then
             printf '%s\n' "$outdated_json" |
               jq -r '.formulae[]? | [.name, .current_version] | @tsv' >"$candidate_formulae"
             printf '%s\n' "$outdated_json" |
               jq -r '.casks[]? | [.name, .current_version] | @tsv' >"$candidate_casks"
           else
             emit error "packages:$manager-updates" unavailable high '{}' '[]' \
-              '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"brew outdated inventory failed"}]'
+              "$(query_errors candidate_query_failed 'brew outdated inventory failed')"
           fi
           # A formula may retain several kegs; list order is not current state.
           # Keg-only/unlinked formulae without linked_keg need one installed version.
-          if brew_packages=$(brew info --json=v2 --installed --formula 2>/dev/null) &&
+          query_reset
+          if brew_packages=$(bounded_query brew info --json=v2 --installed --formula 2>/dev/null) &&
             printf '%s\n' "$brew_packages" |
               jq -r '
                 def version_text: type == "string" and length > 0 and
@@ -1998,16 +2037,17 @@ if has_section packages; then
               emit_package_lines "$manager" info-installed-formulae
           else
             emit error "packages:$manager" unavailable high '{}' '[]' \
-              '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"brew package inventory failed"}]'
+              "$(query_errors manager_query_failed 'brew package inventory failed')"
           fi
-          if casks=$(brew list --cask --versions 2>/dev/null); then
+          query_reset
+          if casks=$(bounded_query brew list --cask --versions 2>/dev/null); then
             printf '%s\n' "$casks" |
               awk 'NF >= 2 { print $1 "\t" $2 }' >"$installed_casks"
             join_package_candidates "$installed_casks" "$candidate_casks" |
               emit_package_lines "$manager-cask" list-installed-casks
           else
             emit error "packages:$manager-cask" unavailable high '{}' '[]' \
-              '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"brew cask inventory failed"}]'
+              "$(query_errors manager_query_failed 'brew cask inventory failed')"
           fi
           rm -rf "$package_tmp"
         else
@@ -2021,15 +2061,17 @@ if has_section packages; then
           installed_apt="$package_tmp/installed.tsv"
           candidate_apt="$package_tmp/candidates.tsv"
           : >"$candidate_apt"
+          query_reset
           if command -v apt >/dev/null 2>&1 &&
-            apt_candidates=$(apt list --upgradable 2>/dev/null); then
+            apt_candidates=$(bounded_query apt list --upgradable 2>/dev/null); then
             printf '%s\n' "$apt_candidates" |
               awk -F '[/ ]' 'NR > 1 && NF >= 3 { print $1 "\t" $3 }' >"$candidate_apt"
           else
             emit error packages:apt-updates unavailable high '{}' '[]' \
-              '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"APT candidate inventory failed"}]'
+              "$(query_errors candidate_query_failed 'APT candidate inventory failed')"
           fi
-          if apt_packages=$(dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null); then
+          query_reset
+          if apt_packages=$(bounded_query dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null); then
             printf '%s\n' "$apt_packages" >"$installed_apt"
             native_apt_arch=
             if command -v dpkg >/dev/null 2>&1; then
@@ -2039,7 +2081,7 @@ if has_section packages; then
               emit_package_lines apt dpkg-query+apt-upgradable
           else
             emit error packages:apt unavailable high '{}' '[]' \
-              '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"dpkg-query package inventory failed"}]'
+              "$(query_errors manager_query_failed 'dpkg-query package inventory failed')"
           fi
           rm -rf "$package_tmp"
         else
@@ -2053,19 +2095,27 @@ if has_section packages; then
         # version: under fnm a Node upgrade moves every global to a new
         # prefix, so a plan sealed against the old one must not verify.
         if npm_bin=$(npm_global_bin_dir); then
-          npm_node_version=$(PATH="$npm_bin:$PATH" "$npm_bin/node" --version 2>/dev/null </dev/null |
+          query_reset
+          npm_node_version=$(PATH="$npm_bin:$PATH" bounded_query "$npm_bin/node" --version 2>/dev/null </dev/null |
             head -1 | clip) || npm_node_version=
           npm_prefix=$(npm_global_prefix | clip) || npm_prefix=
+          # A timed-out Node or prefix query leaves the globals' owner unknown:
+          # the whole npm inventory is then unknown, never a record with a null
+          # prefix that a sealed plan could bind to.
+          npm_runtime_timeout=false
+          [ ! -s "$run_bounded_log" ] || npm_runtime_timeout=true
           npm_candidates=null
           npm_candidate_confidence=high
+          query_reset
           if npm_outdated=$(npm_global_outdated); then
             npm_candidates=$npm_outdated
           else
             npm_candidate_confidence=medium
             emit error packages:npm-updates unavailable high '{}' '[]' \
-              '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"npm outdated inventory failed"}]'
+              "$(query_errors candidate_query_failed 'npm outdated inventory failed')"
           fi
-          if npm_installed=$(npm_global_list); then
+          query_reset
+          if [ "$npm_runtime_timeout" = false ] && npm_installed=$(npm_global_list); then
             # A configured updater is reported only once it is proven to be
             # a bin of the installed package itself; the executor re-proves
             # it before running anything. An unproven one is marked on the
@@ -2113,8 +2163,93 @@ NPM_UPDATERS
                       elif $unproven["npm:"+$name] == true then "unproven" else null end)},
                   evidence:[{source:"package-manager",method:"npm-ls-global+outdated"}],errors:[]}'
           else
+            npm_installed=
+            [ "$npm_runtime_timeout" = false ] || printf 'npm runtime\n' >>"$run_bounded_log"
             emit error packages:npm unavailable high '{}' '[]' \
-              '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"npm global inventory failed"}]'
+              "$(query_errors manager_query_failed 'npm global inventory failed')"
+          fi
+          # The runtime under those globals, when fnm provides it: `fnm:node`,
+          # a package record whose installed_version is fnm's default and
+          # whose candidate is the newest published release in that major.
+          # It also binds the global set (`globals`) and the prefix, so a
+          # sealed switch plan stops verifying the moment either changes.
+          if node_root=$(node_fnm_root 2>/dev/null) &&
+            node_default=$(node_fnm_default "$node_root" 2>/dev/null); then
+            node_line=$(node_version_major "$node_default")
+            node_installed_list=$(node_fnm_installed "$node_root" |
+              jq -Rsc 'split("\n") | map(select(length > 0))')
+            node_prefix=$(node_fnm_prefix "$node_root" "$node_default" | clip) || node_prefix=
+            node_candidate=
+            node_candidate_known=false
+            query_reset
+            if node_candidate=$(node_fnm_remote_latest "$node_root" "$node_line" 2>/dev/null); then
+              node_candidate_known=true
+              release_newer "$node_candidate" "$node_default" || node_candidate=
+            else
+              node_candidate=
+              emit error packages:fnm-updates unavailable high '{}' '[]' \
+                "$(query_errors candidate_query_failed 'fnm list-remote inventory failed')"
+            fi
+            # The global set a switch would carry, and the globals it cannot
+            # reinstall by exact registry version (file:, link:, git, no
+            # version), from ONE `npm ls`, so the two can never disagree. A
+            # failed query is UNKNOWN (both null), never "none unpinnable":
+            # sealing and the switch hold on it.
+            node_globals=null
+            node_unpinnable=null
+            if node_detail=$(npm_global_list_detail 2>/dev/null) &&
+              node_split=$(node_globals_split "$node_detail"); then
+              node_globals=$(printf '%s\n' "$node_split" | jq -c '.globals')
+              node_unpinnable=$(printf '%s\n' "$node_split" | jq -c '.globals_unpinnable')
+            fi
+            # A switch recorded in flight on this host (interrupted, or failed
+            # without a verified restore): nothing seals or verifies over it.
+            node_inflight=$(node_switch_marker_read)
+            [ -n "$node_inflight" ] || node_inflight=null
+            # Configured post-switch hooks, proven the same way as updaters:
+            # argv[0] must be a bin of the installed package. A sealed switch
+            # refuses a carried package whose hook is unproven here.
+            node_hooks_unproven='[]'
+            while IFS= read -r node_hook_entry; do
+              [ -n "$node_hook_entry" ] || continue
+              node_hook_name=$(printf '%s\n' "$node_hook_entry" | jq -r '.key | sub("^npm:"; "")')
+              [ -n "$npm_installed" ] &&
+                printf '%s\n' "$npm_installed" | jq -e --arg name "$node_hook_name" 'has($name)' \
+                  >/dev/null || continue
+              while IFS= read -r node_hook_bin; do
+                [ -n "$node_hook_bin" ] || continue
+                npm_updater_path "$node_hook_name" "$node_hook_bin" >/dev/null 2>&1 && continue
+                node_hooks_unproven=$(printf '%s\n' "$node_hooks_unproven" |
+                  jq -c --arg key "npm:$node_hook_name" '. + [$key] | unique')
+              done <<NODE_HOOK_BINS
+$(printf '%s\n' "$node_hook_entry" | jq -r '.value[][0]')
+NODE_HOOK_BINS
+            done <<NODE_HOOKS
+$(jq -c '(.node_switch_hooks // {}) | to_entries[]' "$config")
+NODE_HOOKS
+            jq -cn \
+              --arg schema roundhouse.inventory --argjson schema_version 1 \
+              --arg snapshot_id "$snapshot_id" --arg host_id "$host_id" \
+              --arg observed_at "$observed_at" --arg default "$node_default" \
+              --arg candidate "$node_candidate" --argjson known "$node_candidate_known" \
+              --arg line "$node_line" --argjson installed "$node_installed_list" \
+              --arg root "$node_root" --arg prefix "$node_prefix" \
+              --argjson globals "$node_globals" --argjson unproven "$node_hooks_unproven" \
+              --argjson unpinnable "$node_unpinnable" --argjson inflight "$node_inflight" '
+                {schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
+                  host_id:$host_id,kind:"package",id:"fnm:node",observed_at:$observed_at,
+                  status:"present",confidence:(if $known then "high" else "medium" end),
+                  data:{manager:"fnm",name:"node",installed_version:$default,
+                    candidate_version:(if $candidate == "" then null else $candidate end),
+                    update_available:(if $known then $candidate != "" else null end),
+                    line:$line,installed_versions:$installed,
+                    stale_versions:($installed - [$default]),
+                    fnm_dir:($root[0:8192]),
+                    prefix:(if $prefix == "" then null else $prefix end),
+                    globals:$globals,
+                    globals_unpinnable:$unpinnable,switch_inflight:$inflight,
+                    switch_hooks_unproven:$unproven},
+                  evidence:[{source:"package-manager",method:"fnm-default-alias+list-remote"}],errors:[]}'
           fi
         else
           emit error packages:npm unavailable high '{}' '[]' \
@@ -2150,7 +2285,8 @@ if has_section agents; then
     fi
     plugin_output=
     normalized_plugins=
-    if plugin_output=$("$plugin_agent" plugin list --json 2>/dev/null); then
+    query_reset
+    if plugin_output=$(bounded_query "$plugin_agent" plugin list --json 2>/dev/null); then
       case $plugin_agent in
         codex)
           normalized_plugins=$(printf '%s\n' "$plugin_output" | jq -ce '
@@ -2244,7 +2380,7 @@ if has_section agents; then
       esac
       emit plugin_manager "$plugin_agent" unavailable high \
         "$(jq -cn --arg agent "$plugin_agent" '{agent:$agent,authoritative:false}')" '[]' \
-        '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"plugin manager inventory failed"}]'
+        "$(query_errors manager_query_failed 'plugin manager inventory failed')"
     fi
   done
 
@@ -2289,7 +2425,8 @@ if has_section agents; then
 
   jsm_inventory=
   if command -v jsm >/dev/null 2>&1; then
-    if jsm_inventory=$(jsm --json --offline list 2>/dev/null) &&
+    query_reset
+    if jsm_inventory=$(bounded_query jsm --json --offline list 2>/dev/null) &&
       printf '%s\n' "$jsm_inventory" | jq -e '
         (.skills | type == "array") and
         ([.skills[] |
@@ -2333,7 +2470,7 @@ if has_section agents; then
           }'
     else
       emit error agents:jsm unavailable medium '{}' '[]' \
-        '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"jsm offline inventory failed"}]'
+        "$(query_errors manager_query_failed 'jsm offline inventory failed')"
     fi
   fi
 
@@ -2782,12 +2919,20 @@ if has_section projects; then
 fi
 
 if has_section startup; then
+  # Self-test only: the system launchd directories are host-wide state that no
+  # fixture HOME can contain, so a fixture run would otherwise inventory (and
+  # query launchd for) whatever the developer's or runner's machine happens to
+  # have installed. Never honoured outside ROUNDHOUSE_SELFTEST=1.
+  startup_system_root=
+  if [ "${ROUNDHOUSE_SELFTEST:-0}" = 1 ] && [ -n "${ROUNDHOUSE_TEST_STARTUP_SYSTEM_ROOT:-}" ]; then
+    startup_system_root=$ROUNDHOUSE_TEST_STARTUP_SYSTEM_ROOT
+  fi
   case $(uname -s 2>/dev/null || printf unknown) in
     Darwin)
       for startup_spec in \
         "launchd-user|user|$HOME/Library/LaunchAgents" \
-        "launchd-system-agent|system|/Library/LaunchAgents" \
-        "launchd-system-daemon|system|/Library/LaunchDaemons"; do
+        "launchd-system-agent|system|$startup_system_root/Library/LaunchAgents" \
+        "launchd-system-daemon|system|$startup_system_root/Library/LaunchDaemons"; do
         scheduler=${startup_spec%%|*}
         startup_remainder=${startup_spec#*|}
         scope=${startup_remainder%%|*}
@@ -2939,7 +3084,7 @@ fi
 if has_section chezmoi; then
   source_path=${CHEZMOI_SOURCE_DIR:-}
   if [ -z "$source_path" ] && command -v chezmoi >/dev/null 2>&1; then
-    source_path=$(chezmoi source-path 2>/dev/null | head -1 | clip || true)
+    source_path=$(bounded_query chezmoi source-path 2>/dev/null | head -1 | clip || true)
   fi
   source_path=${source_path:-"$HOME/.local/share/chezmoi"}
   source_path=$(expand_home "$source_path")
@@ -2962,7 +3107,8 @@ if has_section chezmoi; then
   if command -v chezmoi >/dev/null 2>&1; then
     chezmoi_status=$(mktemp "${TMPDIR:-/tmp}/roundhouse-chezmoi.XXXXXX")
     chmod 600 "$chezmoi_status"
-    if chezmoi status >"$chezmoi_status" 2>/dev/null; then
+    query_reset
+    if bounded_query chezmoi status >"$chezmoi_status" 2>/dev/null; then
       drift_count=$(awk 'NF {count++} END {print count+0}' "$chezmoi_status")
       status_digest=$(sha256_file "$chezmoi_status")
       status_codes=$(awk 'NF {code=substr($0,1,2); counts[code]++} END {
@@ -2976,7 +3122,7 @@ if has_section chezmoi; then
       emit chezmoi_state live present high "$data" '[{"source":"chezmoi","method":"source-path+status"}]'
     else
       emit chezmoi_state live unavailable high "$(jq -cn --arg source_path "$source_path" '{source_path:$source_path}')" \
-        '[]' '[{"code":"chezmoi_status_failed","severity":"warning","retryable":true,"message":"chezmoi status failed"}]'
+        '[]' "$(query_errors chezmoi_status_failed 'chezmoi status failed')"
     fi
     rm -f "$chezmoi_status"
     # git-repo externals: chezmoi runs `pull --ff-only` in each, so an upstream
@@ -2984,7 +3130,7 @@ if has_section chezmoi; then
     # the clone is clean and whether every commit it holds came from upstream
     # (the branch moved only by clone or fast-forward, and HEAD is an ancestor
     # of a tip upstream delivered). Only then may a sealed reset follow.
-    chezmoi managed --include=externals --path-style=absolute 2>/dev/null |
+    bounded_query chezmoi managed --include=externals --path-style=absolute 2>/dev/null |
       while IFS= read -r external_path; do
         [ -d "$external_path/.git" ] || continue
         external_head=$(git -C "$external_path" rev-parse HEAD 2>/dev/null || true)
