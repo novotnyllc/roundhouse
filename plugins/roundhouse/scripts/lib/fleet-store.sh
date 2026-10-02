@@ -544,12 +544,21 @@ fleet_lock_take() {
         # over: the lock is simply free, and is taken the ordinary way — but it
         # was still a stopped run, and is reported as one.
         if [ ! -d "$1" ]; then
-          if fleet_lock_acquire "$1"; then
-            fleet_lock_taken_from=$fleet_run_lock_stopped
-            printf 'roundhouse: took the run lock at %s after stopping its holder (%s)\n' \
-              "$1" "$fleet_run_lock_stopped" >&2
-            return 12
-          fi
+          fleet_run_lock_rc=0
+          fleet_lock_acquire "$1" || fleet_run_lock_rc=$?
+          case $fleet_run_lock_rc in
+            0)
+              fleet_lock_taken_from=$fleet_run_lock_stopped
+              printf 'roundhouse: took the run lock at %s after stopping its holder (%s)\n' \
+                "$1" "$fleet_run_lock_stopped" >&2
+              return 12
+              ;;
+            2)
+              printf 'roundhouse: could not record the run lock evidence at %s; refusing to run without it\n' \
+                "$1" >&2
+              return 75
+              ;;
+          esac
           return 10
         fi
         fleet_lock_holder_state "$1"
