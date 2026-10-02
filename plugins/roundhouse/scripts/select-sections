@@ -54,6 +54,7 @@ plugins/roundhouse/scripts/enroll-ssh-posix	12 14
 plugins/roundhouse/scripts/prepare-ssh-identity	12 14
 plugins/roundhouse/scripts/certify-ssh-node	12 14
 plugins/roundhouse/scripts/enroll-privilege-posix	50
+plugins/roundhouse/scripts/privilege-lane-posix	16
 plugins/roundhouse/scripts/privilege-broker-posix	50
 plugins/roundhouse/scripts/launcher-install	40
 plugins/roundhouse/scripts/update-integrity	00 60
@@ -84,6 +85,7 @@ scopes_for() {
     plugins/roundhouse/scripts/enroll-privilege-posix*|\
     plugins/roundhouse/scripts/privilege-broker-posix*) printf 'macos-privilege-contracts\n'; u2_scopes ;;
     plugins/roundhouse/scripts/launcher-install*) printf 'u4-contracts\nu5-contracts\n' ;;
+    plugins/roundhouse/scripts/privilege-lane-posix*) printf 'u5-contracts\n' ;;
     *) return 1 ;;
   esac
 }
@@ -98,18 +100,20 @@ helpers_for() {
     plugins/roundhouse/scripts/enroll-ssh-posix*) printf 'enroll-ssh-posix\n' ;;
     plugins/roundhouse/scripts/prepare-ssh-identity*) printf 'prepare-ssh-identity\n' ;;
     plugins/roundhouse/scripts/certify-ssh-node*) printf 'certify-ssh-node\n' ;;
+    plugins/roundhouse/scripts/privilege-lane-posix*) printf 'privilege-lane-posix\n' ;;
     *) return 1 ;;
   esac
 }
 
 ALL_HELPERS='enroll-ssh-posix
 prepare-ssh-identity
-certify-ssh-node'
+certify-ssh-node
+privilege-lane-posix'
 
 # Sections are SOURCED cumulatively, and a few used to build on an earlier
 # one's fixtures: 67 read $oversized_setting and snapshot.jsonl from 65, 68 read
 # snapshot-2.jsonl from 65, and 71/72/74/75 read $fleet_fixture_yq from 70 (as
-# 83 and 86 would; 84 and 85 are reserved for a sibling branch). That
+# 83, 84, 85 and 86 would). That
 # made a per-section matrix unschedulable without pairing entries together.
 # Those fixtures now live in the always-run 07 harness, so every section stands
 # alone and the matrix can schedule them in any combination. Verified by running

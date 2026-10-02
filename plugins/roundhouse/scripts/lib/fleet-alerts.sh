@@ -64,9 +64,10 @@ fleet_alert_name_bound() {
 # A kind not listed — a legacy kind, or one a newer build raises — is an
 # EVENT: aging is the safe way for a notice nobody clears to end.
 #
-# `stale-host`, `schedule-disabled` and `schedule-missing` belong to
-# claude/p0-loop-liveness, which flips them to condition when it adds their
-# clears; until then they are events, so they age rather than linger.
+# `stale-host` (keyed by the silent peer), `schedule-disabled` and
+# `schedule-missing` (keyed by the job, `fleet-fast`/`fleet-full`) are
+# store-scoped conditions their own checks set and clear every pass
+# (fleet_liveness_alerts, fleet_schedule_check).
 fleet_alert_lifecycle_rows='
 removal-cap            condition  store
 materialization        condition  store
@@ -80,6 +81,7 @@ integrity              condition  item
 config-key-collision   condition  item
 chezmoi-coownership    condition  item
 package-hold           condition  item
+privilege-lane         condition  item
 enabled-but-untrusted  condition  item
 record-write           condition  item
 identity-unavailable   condition  item
@@ -88,9 +90,9 @@ package-deferred       condition  item
 runtime-hold           condition  item
 node-runtime-unverified condition item
 inventory-timeout      condition  store
-stale-host             event      store
-schedule-disabled      event      store
-schedule-missing       event      store
+stale-host             condition  store
+schedule-disabled      condition  store
+schedule-missing       condition  store
 lock-takeover          event      store
 canary-override        event      item
 conflict               event      item

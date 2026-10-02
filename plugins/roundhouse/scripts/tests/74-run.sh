@@ -27,6 +27,27 @@ if [ -n "$fleet_fixture_yq" ]; then
     export ROUNDHOUSE_FLEET_STORE HOME
     mkdir -p "$HOME"
 
+    # --- which held applies keep the poll floor open (retry-owed) ---
+    # Transient holds (a tombstone's live-session deferral or failed probe, a
+    # plugin's bounded install or unresolved marketplace) and every failure
+    # are retried every pass; standing capability holds are left to the full
+    # cadence.
+    for run_retry_case in '75 true plugins' '75 false plugins' '75 true skills' \
+      '1 false plugins' '65 false packages' '73 false packages' '64 false skills'; do
+      # shellcheck disable=SC2086 # deliberate: status, tombstone, category
+      fleet_run_hold_owes_retry $run_retry_case ||
+        fail "a transient hold ($run_retry_case) left the poll floor free to skip its retry"
+    done
+    for run_retry_case in '75 false packages' '75 false hooks' '75 false skills'; do
+      # shellcheck disable=SC2086 # deliberate: status, tombstone, category
+      ! fleet_run_hold_owes_retry $run_retry_case ||
+        fail "a standing capability hold ($run_retry_case) held the poll floor open"
+    done
+    # A plugin hold on a host with no claude at all is standing: the fixture
+    # stubs claude into its PATH, so this case runs on a PATH without it.
+    ! PATH=/usr/bin:/bin fleet_run_hold_owes_retry 75 false plugins ||
+      fail "a plugin hold on a host with no claude held the poll floor open"
+
     # --- §6.1 the two cadences and the jitter that spreads them ---
     # Seeded from the host NAME. A fleet whose hosts re-roll their offset every
     # run converges on the same minute as often as it spreads out, and jitter
@@ -107,8 +128,9 @@ JSON
     for run_readiness_host in readiness-a readiness-b readiness-c; do
       grep -Fqx "$run_readiness_host" "$run_readiness_calls" ||
         fail "readiness never called ssh_run for $run_readiness_host"
-      [ "$(grep -Fc "$run_readiness_host" "$run_readiness_calls")" -eq 2 ] ||
-        fail "readiness did not complete both SSH probes for $run_readiness_host"
+      # tools/identity, remote posture, and the privilege-lane status probe.
+      [ "$(grep -Fc "$run_readiness_host" "$run_readiness_calls")" -eq 3 ] ||
+        fail "readiness did not complete all three SSH probes for $run_readiness_host"
     done
     )
 
@@ -277,15 +299,17 @@ SH
         "$run_root/layers" "$run_root/package-open-tmp" >/dev/null
       grep -Fqx 'upgrade example' "$run_package_upgrade_marker" ||
         fail "full cadence skipped a linuxbrew package instead of upgrading it"
-      # apt has no user-space update path: the pass says so rather than
-      # skipping silently, and runs nothing.
+      # apt needs root: without the privilege lane's one-time approval the
+      # pass says so (naming the command) rather than skipping silently, and
+      # runs nothing. This host has no enrolled lane.
       : >"$run_package_upgrade_marker"
-      run_apt_out=$(fleet_run_full_pass "$run_store" vireo \
+      run_apt_out=$(ROUNDHOUSE_LANE_FIXTURE_ROOT="$run_root/no-lane" ROUNDHOUSE_LANE_FIXTURE_PLATFORM=linux \
+        fleet_run_full_pass "$run_store" vireo \
         '{"packages":{"example":"enabled"},"package_managers":["apt"]}' \
         '{"packages":{"example":{"apt":"example"}}}' \
         "$run_root/layers" "$run_root/package-open-tmp")
       printf '%s\n' "$run_apt_out" |
-        grep -Fq 'hold  packages.example — apt has no user-space update path' ||
+        grep -Fq 'hold  packages.example — apt needs the local privilege lane; run: roundhouse privilege-enroll vireo' ||
         fail "full cadence silently skipped an apt package instead of reporting the hold"
       [ ! -s "$run_package_upgrade_marker" ] ||
         fail "full cadence ran brew for an apt-resolved package"
@@ -1282,6 +1306,61 @@ JSONC
       fail "re-seeding failed over a hand-authored fact"
     yq -e '.platform == "macos"' "$run_seeded" >/dev/null ||
       fail "seeding overwrote a hand-authored platform with the config's"
+    # …except package_managers, which config.json OWNS. The first seed froze
+    # the list and a later edit to config.json (adding npm) never reached the
+    # store. Re-seeding refreshes it, in config order, idempotently, and
+    # touches no other host's file; a config that states no list keeps it.
+    printf 'platform: linux\npackage_managers: [apt]\n' >"$run_store/hosts/other-host.yaml"
+    run_other_before=$(cat "$run_store/hosts/other-host.yaml")
+    jq -c --arg h "$run_seed_host" \
+      '.machines[$h].package_managers = ["linuxbrew","apt","npm"]' \
+      "$run_root/seed-config.json" >"$run_root/seed-config-npm.json"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config-npm.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >"$run_root/seed-refresh.out" 2>&1 ||
+      fail "re-seeding failed after a package_managers change in config.json"
+    grep -Fq 'package_managers for' "$run_root/seed-refresh.out" ||
+      fail "a package_managers refresh that changed the list said nothing"
+    [ "$(yq -r '(.package_managers // []) | join(",")' "$run_seeded")" = linuxbrew,apt,npm ] ||
+      fail "a package_managers change in config.json did not refresh the host's store fact (or lost config order)"
+    yq -e '.platform == "macos" and .packages.jq != null' "$run_seeded" >/dev/null ||
+      fail "refreshing package_managers cost a hand-authored fact or an observed surface"
+    run_seed_before=$(cat "$run_seeded")
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config-npm.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >"$run_root/seed-refresh.out" 2>&1 ||
+      fail "re-seeding an unchanged package_managers failed"
+    ! grep -Fq 'package_managers for' "$run_root/seed-refresh.out" ||
+      fail "re-seeding an unchanged package_managers claimed a refresh"
+    [ "$(cat "$run_seeded")" = "$run_seed_before" ] ||
+      fail "re-seeding an unchanged package_managers rewrote the host file"
+    [ "$(cat "$run_store/hosts/other-host.yaml")" = "$run_other_before" ] ||
+      fail "refreshing package_managers touched another host's file"
+    rm -f "$run_store/hosts/other-host.yaml"
+    for run_nopm in 'del(.machines[$h].package_managers)' \
+      '.machines[$h].package_managers = null'; do
+      jq -c --arg h "$run_seed_host" "$run_nopm" \
+        "$run_root/seed-config.json" >"$run_root/seed-config-nopm.json"
+      ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config-nopm.json" \
+        ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+        fleet_seed_command >/dev/null 2>&1 ||
+        fail "re-seeding failed with a config that states no package_managers ($run_nopm)"
+      [ "$(yq -r '(.package_managers // []) | join(",")' "$run_seeded")" = linuxbrew,apt,npm ] ||
+        fail "a config with no package_managers erased the host's stored list ($run_nopm)"
+    done
+    # A later split file that states the list still wins the fold: the seed
+    # must say the refresh is shadowed, never claim it took — even when the
+    # list changed ([linuxbrew,apt,npm] -> [apt]).
+    mkdir -p "$run_store/hosts/$run_seed_host"
+    printf 'package_managers: [homebrew]\n' >"$run_store/hosts/$run_seed_host/zz-split.yaml"
+    ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_CONFIG="$run_root/seed-config.json" \
+      ROUNDHOUSE_SEED_SNAPSHOT="$run_root/snapshot.jsonl" \
+      fleet_seed_command >"$run_root/seed-refresh.out" 2>&1 ||
+      fail "re-seeding failed with a split host file stating package_managers"
+    grep -Fq 'does not reach the fold' "$run_root/seed-refresh.out" &&
+      ! grep -Fq 'refreshed from config.json' "$run_root/seed-refresh.out" ||
+      fail "a refresh shadowed by a split host file was not reported as shadowed"
+    rm -rf "$run_store/hosts/$run_seed_host"
     # An EMPTY groups list is a fact, not an absence. The `machine-truth` doctor
     # row compares `.groups // null` on both sides and jq's `//` passes `[]`
     # through, so omitting the field reads as `null` against the config's `[]`
@@ -1352,8 +1431,12 @@ STUB
       fail "the nudge never reached the peer"
     ! grep -q 'rh-vireo' "$ROUNDHOUSE_NUDGE_LOG" ||
       fail "the pushing host nudged itself"
-    grep -q 'fleet-run --fast' "$ROUNDHOUSE_NUDGE_LOG" ||
+    # §6.1: the nudge is the peer's trigger, never its pass — a pass inside
+    # this ten-second channel is what the watchdog used to kill mid-apply.
+    grep -q 'fleet-trigger --fast' "$ROUNDHOUSE_NUDGE_LOG" ||
       fail "the nudge carried something other than \"go look\""
+    ! grep -q 'fleet-run' "$ROUNDHOUSE_NUDGE_LOG" ||
+      fail "the nudge still runs the peer's pass inside the SSH channel"
     grep -Fqx wren "$(fleet_run_state_dir)/nudge-unreachable" ||
       fail "an unreachable peer was not remembered for the interval"
     # Remembered for ONE interval only, so a peer that comes back is retried.

@@ -14,6 +14,10 @@ seal_plan_command() {
   }
   privileged=false
   mixed_privileged=false
+  if plan_is_lane "$draft"; then
+    seal_lane_plan "$draft" "$snapshot" "$output"
+    return
+  fi
   if jq -e '(.operations | type == "array") and any(.operations[]; has("privilege_request"))' "$draft" >/dev/null 2>&1; then
     validate_mixed_privileged_draft "$draft"
     mixed_privileged=true
@@ -256,6 +260,33 @@ seal_plan_command() {
         (.status | IN("present","absent")) and .data.path == $destination)
     ' "$snapshot" >/dev/null || {
       printf 'roundhouse: launcher plan is not bound to its observed destination\n' >&2
+      exit 65
+    }
+  fi
+  if jq -e 'any(.operations[]; .id == "roundhouse:schedule")' "$draft" >/dev/null; then
+    schedule_operations_valid "$draft" "$HOME" || {
+      printf 'roundhouse: invalid fleet-schedule plan operation\n' >&2
+      exit 64
+    }
+    # Bound to what was OBSERVED: every file a step writes over, keeps,
+    # removes or absorbs is the observed file at its observed digest (or
+    # observed absent), so the plan is the snapshot's and nothing else's.
+    jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
+      first($records[] | select(.kind == "agent_artifact" and
+        .id == "roundhouse:schedule" and (.status | IN("present","absent")))) as $r |
+      all($draft[0].operations[] | select(.id == "roundhouse:schedule") | .steps[];
+        . as $s |
+        if .action == "write" then
+          any($r.data.files[]; .path == $s.path and .mode == $s.mode and .digest == $s.before)
+        elif .action == "keep" then
+          any($r.data.files[]; .path == $s.path and .mode == $s.mode and .digest == $s.digest)
+        elif .action == "remove" then
+          any($r.data.files[]; .path == $s.path and .mode == $s.mode and .digest == $s.before)
+        elif .action == "absorb" then
+          any($r.data.legacy[]; .path == $s.path and .digest == $s.before)
+        else true end)
+    ' >/dev/null || {
+      printf 'roundhouse: fleet-schedule plan is not bound to the observed definitions\n' >&2
       exit 65
     }
   fi

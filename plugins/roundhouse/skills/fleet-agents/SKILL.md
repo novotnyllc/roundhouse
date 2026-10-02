@@ -81,20 +81,92 @@ marked `unmanaged` are not compared, not reported, and not read.
 
 ### The two cadences
 
-One scheduled entry per host runs both (see `roundhouse:fleet-update`):
+Two scheduled jobs per host run them, installed by
+`roundhouse fleet-schedule install` (see `roundhouse:fleet-update`):
 
 | | Command | Default | Does |
 | --- | --- | --- | --- |
 | Fast | `roundhouse fleet-run --fast` | 20 min ± 5 jitter | poll floor, fetch, reconcile, promote gate, review → apply → journal, publish, peer nudge |
 | Full | `roundhouse fleet-run --full` | 12 h ± 90 min jitter | everything fast does, plus marketplace refresh, re-seed, promotion proposals, unpinned package updates, and `fleet-doctor` |
 
-The **poll floor** is a head check, not a fetch: a run with nothing to pull,
-nothing to push and a clean `@` exits early. Jitter is seeded from the host
+The **poll floor** is one incremental fetch into a private ref and a tree
+compare: a fast run exits early when the desired-state paths at the fetched
+remote head (`fleet.yaml`, `definitions.yaml`, `definitions/`, `fleet/`, `os/`,
+`groups/`, `hosts/`, `trust/`) match those of the reference this host last
+converged from, the fetched head descends from what it converged on, and it
+has nothing to push, a clean `@`, no heartbeat owed, no item waiting on canary
+evidence and no retry owed (a failed apply, an unreadable identity, or a
+`fleet-review` verdict not yet acted on). Peers' record commits (journal,
+alerts, `applied/`) no longer force a full pass; the floor's fetch does not
+move `main@origin`, so the next full pass still signature-gates everything
+that arrived. Jitter is seeded from the host
 **name**, never the clock, so the offsets are stable and the fleet does not
 re-synchronise on the same minute. The **push nudge** is an opportunistic
 accelerator only — it carries no data, says "go look", and the peer then runs
-its ordinary fast path with every gate. Turn it off with `push_nudge: false`
+its ordinary fast path with every gate. It is sent only when the publish
+changed desired state — never for a records-only one. Turn it off with `push_nudge: false`
 and the fleet still converges at poll speed; nothing depends on it.
+
+**Triggers.** The nudge sends the peer `roundhouse fleet-trigger --fast` over
+SSH and returns; the pass never runs inside that channel. Every trigger does
+the same three things: touch the dirty stamp (`store.run/dirty-stamp`), start
+the scheduled job (`launchctl kickstart gui/$UID/com.novotnyllc.roundhouse.fleet-fast`
+on macOS, `systemctl --user start --no-block roundhouse-fleet-fast.service` on
+Linux), and return. Only when the job is known installed and enabled but its
+scheduler cannot be reached (a Mac over SSH with nobody at the console, whose
+job was last seen loaded; a Linux user manager that does not linger) does it
+start a detached `nohup roundhouse fleet-run --fast` instead. A job the
+operator disabled or unloaded, a host with no job, or one taken off the
+schedule with `fleet-schedule uninstall` is stamped and nothing is started.
+On macOS the disabled flag cannot be read without a console session, so a raw
+`launchctl disable`/`bootout` is honoured over SSH only once a pass has seen
+it; `fleet-schedule uninstall` is the supported hard stop. A host still on the
+legacy single-plist job reports no fleet-fast job to `fleet-trigger` (nudges
+only stamp there) until `fleet-schedule install` runs on it.
+A pass that finds the stamp moved since it began
+converges again in-process before it releases the lock (at most three extra
+passes), so a trigger that lands mid-pass is never lost. One that lands after
+the last comparison but before the lock is released — when a systemd `start`
+of the still-active oneshot queues nothing — is caught by one more comparison
+once the lock is free: the run takes the lock back in-process (non-blocking)
+and converges again, at most twice — never a detached pass, which the
+scheduler would kill with the job's process group. If another run holds the
+lock by then, that run sees the stamp. A signal (SIGTERM from the scheduler,
+SIGINT to the group) ends the run after the pass it interrupts, releases the
+lock and starts nothing further; a pass that is cut short still records the
+items it already applied.
+
+```text
+roundhouse fleet-trigger [--fast|--full]   # stamp, kick the scheduled job, return
+roundhouse fleet-schedule install          # write and load this host's two jobs (idempotent)
+roundhouse fleet-schedule status           # installed / enabled / loaded, and whether the definition matches
+roundhouse fleet-schedule uninstall        # unload and remove them
+```
+
+`install` and `uninstall` change this host, so each rides the sealed-plan
+pipeline (as `launcher-install` does): the collector observes the jobs, the
+plan names the exact files and `launchctl`/`systemctl --user` commands with
+the observed definition hashes and job states as its precondition,
+`apply-plan` rechecks that precondition immediately before mutating, and
+`status` verifies the result. `status` itself is read-only and unsealed. See
+`roundhouse:fleet-update` for the steps.
+
+`fleet-schedule install` is the only path that enables a job. A pass checks its
+own jobs every time and never re-enables, loads or rewrites one: a job the
+operator disabled raises a `schedule-disabled` alert, and a job that went
+missing on a host that is scheduled raises `schedule-missing`, each one keyed
+alert for as long as it lasts, cleared by the check itself once it ends.
+
+**Heartbeats.** Every pass records a host-local heartbeat
+(`store.run/alive`). The `outcome: alive` journal record is *published* at most
+every `heartbeat_publish_hours` (default 6), and always after a pass that applied
+or satisfied an item, and at a canary's evidence deadline
+(`applied_at + canary_wait_hours`), so the canary gate never waits on a
+throttled record. Every pass keeps one keyed `stale-host` alert per other
+enrolled host that has published no heartbeat within `liveness_alert_hours`
+(default 12, never less than twice `heartbeat_publish_hours`), naming its last
+published heartbeat, and clears it when the peer is heard from again. Both keys are ordinary store policy;
+`0` turns the throttle or the alert off.
 
 An unpinned package is kept current by the full pass — that is what anyone
 gets by doing nothing. A `version:` key in `definitions.yaml` opts one
@@ -150,12 +222,14 @@ from one table (`fleet_alert_lifecycle_rows` in `lib/fleet-alerts.sh`):
 
 | Lifecycle | Scope | Kinds | Ends |
 | --- | --- | --- | --- |
-| condition | store | `removal-cap`, `integrity-store-wide`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render`, `inventory-timeout` | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
+| condition | store | `removal-cap`, `integrity-store-wide`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render`, `inventory-timeout`, `stale-host` (per silent peer), `schedule-disabled` and `schedule-missing` (per job) | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
 | condition | item | `integrity`, `config-key-collision`, `chezmoi-coownership`, `package-hold`, `enabled-but-untrusted`, `record-write`, `identity-unavailable`, `uninstall-deferred`, `package-deferred`, `runtime-hold`, `node-runtime-unverified` | the end-of-pass sweep (`fleet_alert_sweep`) clears it when the pass **checked** the item and did not raise it, or when the item has left the fold; an item the pass skipped (held, waiting on its canary) keeps it; never ages |
-| event | store or item | `stale-host`, `schedule-disabled`, `schedule-missing`, `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by its latest `at` after the evidence retention window |
+| event | store or item | `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by its latest `at` after the evidence retention window |
 
-`stale-host`, `schedule-disabled` and `schedule-missing` are events until the
-loop-liveness work adds the checks that clear them; it moves them to condition.
+`stale-host` clears when the peer publishes a heartbeat again, or leaves the
+roster or the enrolled hosts; `schedule-disabled` and `schedule-missing` clear
+when the job is re-enabled or reinstalled, or the host is taken off the
+schedule with `fleet-schedule uninstall`.
 
 `inventory-timeout` is raised by the full pass's seed, one per manager
 (`inventory-timeout--packages-homebrew.yaml`, `--agents-jsm`, …), when the
@@ -236,10 +310,11 @@ construction**, so no host re-reviews anything. Promotion moves *where* a value
 is written, never *what* it is.
 
 Neither re-seeding nor promotion writes the agent keys. Seeding skips `plugins`
-and `skills` (packages, `platform`, `groups` and `package_managers` seed as
-before), and promotion never proposes a `plugins.*` or `skills.*` item: a
-machine snapshot in the narrowest layer re-added every retired plugin and
-overrode every change made anywhere else. Agent items are edited in the layer
+and `skills` (packages, `platform` and `groups` seed as before, and
+`package_managers` refreshes from the host's own config.json), and promotion
+never proposes a `plugins.*` or `skills.*` item: a machine snapshot in the
+narrowest layer re-added every retired plugin and overrode every change made
+anywhere else. Agent items are edited in the layer
 that declares them.
 
 ### Conflicts, and who resolves them

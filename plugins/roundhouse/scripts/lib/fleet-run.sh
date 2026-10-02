@@ -698,36 +698,73 @@ fleet_run_stale_after() {
   printf '%s\n' "$(($(fleet_policy_int "$stale_fold" cadence_hours) * 7200))"
 }
 
-# --- §6.1(a) the poll floor ---------------------------------------------------
+# --- §6.1(a)/§6.4 the poll floor ---------------------------------------------
 
 fleet_run_poll_floor() {
-  # Exit 0 when there is genuinely nothing to do. ALL THREE CONDITIONS are
-  # needed: rev 5 checked only the remote head, so a host with a
-  # committed-but-unpushed edit and an unchanged remote exited immediately and
-  # its own edit sat unpublished — which breaks §6.1's freshness target at the
-  # PUBLISHING end.
+  # Exit 0 when there is genuinely nothing to do, with the reason in
+  # $fleet_run_floor_note for the caller to print.
   #
-  # `git ls-remote` joins `git verify-commit` as the second and last read-only
-  # git invocation this system makes (§8.4's ban is on `git push`/`git
-  # commit`). It moves no local ref and transfers no objects.
-  fleet_run_remote=$(git -C "$1" ls-remote origin refs/heads/main 2>/dev/null |
-    awk 'NR == 1 { print $1; exit }')
-  fleet_run_local=$(fleet_vcs_head_origin "$1")
-  # `present()` so a never-fetched store answers empty instead of erroring —
-  # host 1's very first run, and any host whose remote was just re-pointed.
+  # §6.4: the remote check is about DESIRED STATE, not about the head. The
+  # floor used to compare main@origin with `git ls-remote`, so every peer's
+  # records commit — a journal line, an alert, an applied/ update, which every
+  # pass of every host produced — forced a full pass on every other host. The
+  # floor now fetches the remote head into a private ref (fleet_vcs_floor_fetch,
+  # which moves no jj-visible ref) and compares the desired-state trees there
+  # with those of the reference this host last CONVERGED FROM. Records-only
+  # commits leave those trees byte-identical, so they no longer defeat the
+  # floor; any change to a layer, definitions or trust/ does.
+  #
+  # The base is the converged REFERENCE (store.run/converged-desired), not the
+  # published head: a full pass's maintenance half (re-seed, joins, trust
+  # prune) edits layers AFTER it applied, and comparing against the head
+  # would read those unapplied edits as already converged.
+  fleet_run_floor_note=
+  # The local conditions first — they are free, and any one of them is work.
+  #
+  # Nothing to push, and a clean working copy: a host with a committed-but-
+  # unpushed edit and an unchanged remote must not exit and leave its own edit
+  # unpublished. `present()` so a never-fetched store answers empty.
   fleet_run_pending=$(jj -R "$1" log \
     -r 'present(main@origin)..heads(bookmarks(exact:"main"))' \
     --no-graph -T 'commit_id ++ "\n"')
+  [ -z "$fleet_run_pending" ] || return 1
   fleet_run_dirty=$(jj -R "$1" log -r @ --no-graph -T 'if(empty,"","x")')
-  # A fourth condition, host-local, and it is what makes the other three a
-  # PROPAGATION check rather than a convergence one: a host that just cloned
-  # has nothing to pull and nothing to push and has applied nothing, so on the
-  # three conditions alone it would sit idle until the remote happened to
-  # move. The marker is the reference this host last completed a run against.
-  [ "$fleet_run_remote" = "$fleet_run_local" ] &&
-    [ -z "$fleet_run_pending" ] && [ -z "$fleet_run_dirty" ] &&
-    [ "$(cat "$(fleet_run_state_dir)/converged" 2>/dev/null)" = \
-      "$(fleet_vcs_heads_local "$1")" ]
+  [ -z "$fleet_run_dirty" ] || return 1
+  # Converged at this point: what makes this a PROPAGATION check rather than a
+  # convergence one. A host that just cloned has nothing to pull and nothing
+  # to push and has applied nothing, so without the marker it would sit idle.
+  fleet_run_converged=$(cat "$(fleet_run_state_dir)/converged" 2>/dev/null) ||
+    return 1
+  [ -n "$fleet_run_converged" ] &&
+    [ "$fleet_run_converged" = "$(fleet_vcs_heads_local "$1")" ] || return 1
+  [ -s "$(fleet_run_state_dir)/converged-desired" ] || return 1
+  # No published heartbeat owed (§6.3): only a pass that reaches the end
+  # publishes one, so a floor that exited while one was due would make a quiet
+  # host read as dead to every peer.
+  ! fleet_heartbeat_due || return 1
+  # No item waiting on canary evidence — that evidence arrives as RECORDS,
+  # exactly what this floor ignores — and no retry owed: an apply that failed
+  # or a gate whose input was transiently unavailable must be re-attempted,
+  # and a host-local `fleet-review` verdict must be acted on, though nothing
+  # on the remote moved.
+  [ ! -e "$(fleet_run_state_dir)/canary-waiting" ] || return 1
+  [ ! -e "$(fleet_run_state_dir)/retry-owed" ] || return 1
+
+  fleet_run_fetched=$(fleet_vcs_floor_fetch "$1") || return 1
+  [ -n "$fleet_run_fetched" ] || return 1
+  # A fetched head that does not descend from what this host converged on is
+  # a re-root or a rollback: that is the full pass's archive check to make
+  # (§7.11.2), never something to sit out at the floor.
+  git -C "$1" merge-base --is-ancestor "$fleet_run_converged" \
+    "$fleet_run_fetched" 2>/dev/null || return 1
+  [ "$(fleet_vcs_desired_digest "$1" "$fleet_run_fetched" 2>/dev/null)" = \
+    "$(cat "$(fleet_run_state_dir)/converged-desired")" ] || return 1
+  if [ "$fleet_run_fetched" = "$fleet_run_converged" ]; then
+    fleet_run_floor_note='nothing new on the remote'
+  else
+    fleet_run_floor_note="$(git -C "$1" rev-list --count \
+      "$fleet_run_converged..$fleet_run_fetched" 2>/dev/null || printf 'some') record-only commit(s) on the remote; the layers, definitions and trust/ are unchanged"
+  fi
 }
 
 fleet_run_prune_empty() {
@@ -2234,8 +2271,12 @@ EOF
         fleet_run_uninstall_plugin "$3" "$4" "$fleet_run_name" "$5"
         return $?
       fi
+      # A definition that does not resolve HOLDS (75). Falling through to the
+      # unqualified id here installed from the manager's DEFAULT marketplace —
+      # a same-named plugin from a source nobody declared. Empty output with
+      # status 0 is the zero-config case below, and only that is unqualified.
       fleet_run_market=$(fleet_run_plugin_market "$3" "$fleet_run_name" "$5") ||
-        fleet_run_market=
+        return 75
       # HELD, not satisfied: a host with no `claude` cannot speak to the item
       # at all, and a peer that has one still must not converge on this host's
       # inability. See the exit-code contract above.
@@ -2582,12 +2623,22 @@ fleet_run_publish() {
   # working-copy commit of its own; naming the target is what makes @ a child
   # of the bookmark instead of a child of that leftover, and it is the line
   # that keeps §8.1's invariant true between runs.
+  #
+  # A bookmark move that jj REFUSES is a failed publish, never a silent one: jj
+  # will not move main sideways or backwards (an @ that descends from a stale
+  # local head, not from main), and pushing the unmoved main afterwards pushes
+  # nothing while the caller reports success and the work sits in an orphan.
+  # No --allow-backwards: a move that would drop main's own commits is exactly
+  # what must not happen quietly.
   if [ "$(jj -R "$1" log -r @ --no-graph -T 'if(empty,"y","n")')" = n ]; then
     jj -R "$1" describe -r @ -m "${6:-converge on $2}
 
 $(fleet_vcs_trailers "$2" "$3" "$4" "$5")" >/dev/null
     jj -R "$1" bookmark set main \
-      -r "$(jj -R "$1" log -r @ --no-graph -T 'commit_id')" >/dev/null
+      -r "$(jj -R "$1" log -r @ --no-graph -T 'commit_id')" >/dev/null || {
+      printf 'roundhouse: could not move main to the new commit (it does not descend from main); nothing published\n' >&2
+      return 65
+    }
   fi
   fleet_run_target=$(fleet_vcs_heads_local "$1" | head -1)
   [ -n "$fleet_run_target" ] || return 65
@@ -2636,7 +2687,14 @@ fleet_run_nudge_peer() {
   # review gates, canary, the lot — so a nudge from a compromised host can
   # cause exactly one thing: an early fetch of content that is signature-gated
   # anyway.
-  ssh_run "rh-$1" 'roundhouse fleet-run --fast' >/dev/null 2>&1 &
+  #
+  # §6.1: the nudge is the peer's ordinary TRIGGER, not its pass. Running the
+  # whole `fleet-run --fast` inside this channel tied the peer's pass to a
+  # ten-second SSH watchdog that killed it mid-apply; `fleet-trigger` stamps,
+  # starts the peer's own scheduled job (or a detached pass) and returns, so
+  # the pass runs under the peer's scheduler and this host waits for the
+  # handshake only.
+  ssh_run "rh-$1" 'roundhouse fleet-trigger --fast' </dev/null >/dev/null 2>&1 &
   fleet_run_nudge_pid=$!
   (
     sleep 10
@@ -2665,20 +2723,48 @@ fleet_run_lock_take() {
   # takeover owes: evidence, not a refusal, so the run proceeds. Exit 0
   # acquired (by takeover or not), 10 held by a live run, 75 refused.
   fleet_run_lock_take_rc=0
-  fleet_lock_take "$3" "$(fleet_run_stale_after "$1" "$2")" || fleet_run_lock_take_rc=$?
-  [ "$fleet_run_lock_take_rc" -eq 11 ] || return "$fleet_run_lock_take_rc"
-  fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
-    "took over the run lock from a dead holder ($fleet_lock_taken_from); the run it belonged to did not finish" ||
-    :
+  fleet_lock_take "$3" "$(fleet_run_stale_after "$1" "$2")" "$(fleet_run_pass_ceiling)" ||
+    fleet_run_lock_take_rc=$?
+  case $fleet_run_lock_take_rc in
+    11)
+      fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
+        "took over the run lock from a dead holder ($fleet_lock_taken_from); the run it belonged to did not finish" ||
+        :
+      ;;
+    12)
+      fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
+        "stopped a run that held the run lock past the $(fleet_run_pass_ceiling)s ceiling ($fleet_lock_taken_from) and took the lock over; that run did not finish" ||
+        :
+      ;;
+    *) return "$fleet_run_lock_take_rc" ;;
+  esac
+}
+
+fleet_run_pass_ceiling() {
+  # The longest a pass may hold the run lock before the next run stops it as
+  # hung (fleet_lock_take's ceiling): two hours. A converged full pass takes a
+  # few minutes; genuine package downloads are what the margin is for, so a
+  # pass that is still running at the ceiling is stuck, not busy. The test
+  # hook only shortens it, and only under the self-check.
+  if fleet_test_hook "${ROUNDHOUSE_TEST_PASS_CEILING:-}"; then
+    printf '%s\n' "$ROUNDHOUSE_TEST_PASS_CEILING"
+    return
+  fi
+  printf '7200\n'
 }
 
 # --- the commands -------------------------------------------------------------
 
-fleet_run_command() (
+fleet_run_command() {
   # `roundhouse fleet-run [--fast|--full]` — §6.1's two cadences. Fast is the
   # propagation path; full is maintenance. Splitting them is what lets the
   # propagation interval be short without running discovery, doctoring and
   # upstream fetches 72 times a day.
+  #
+  # NOT a subshell, deliberately, and it always ends in `exit`: the scheduler
+  # signals the process it started, so the run's signal traps must be in that
+  # process. In a `( … )` child the CLI process died on SIGTERM while the run
+  # went on without anyone able to stop it.
   fleet_run_env
   require_jq
   require_yq
@@ -2717,39 +2803,115 @@ fleet_run_command() (
   # Release by NONCE, never by path: a run that was judged dead and taken over
   # must not delete its live successor's lock when it finally exits.
   run_lock_nonce=$fleet_lock_nonce_held
-  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce" || :' EXIT HUP INT TERM
+  run_lock_held=true
   run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-fleet-run.XXXXXX")
-  # Any exit — a refusal, an errexit, a signal, the ceiling stop — first lands
-  # whatever the apply loop has queued (fleet_run_batch_open): an item it
-  # already installed is recorded as owned, as the per-item writes recorded it.
-  trap '[ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :
-    fleet_lock_release "$run_lock" "$run_lock_nonce" || :; rm -rf "$run_tmp"' \
-    EXIT HUP INT TERM
-  # The pass's alert ledger: what each item-scoped condition check evaluated
-  # and raised, for the end-of-pass sweep (fleet_alert_sweep).
-  run_ledger=$run_tmp/alert-ledger
-  : >"$run_ledger"
-
-  # §8.6: the abort button for a bad local apply, captured deliberately
-  # WITHOUT --ignore-working-copy (that flag suppresses the colocated
-  # auto-import, so restoring to the newest operation exports an empty view and
-  # deletes the bookmarks outright).
+  # A signal ENDS the run: its trap exits 128+N, which runs the EXIT trap —
+  # the lock is released and nothing after it runs. A handler that only
+  # cleaned up and returned let the loop go on to another pass with no lock.
+  # (Each pass closes its own apply batch on its way out, fleet_run_pass.)
+  trap '[ "$run_lock_held" != true ] || fleet_lock_release "$run_lock" "$run_lock_nonce" || :
+    rm -rf "$run_tmp"' EXIT
+  fleet_lock_signals_exit
+  # §8.6: the abort button for a bad local apply, captured ONCE per run,
+  # before its first pass and deliberately WITHOUT --ignore-working-copy (that
+  # flag suppresses the colocated auto-import, so restoring to the newest
+  # operation exports an empty view and deletes the bookmarks outright). One
+  # run is one abort point however many in-process passes it makes: restoring
+  # it undoes them all, which is what an operator aborting "this run" means.
   run_op=$(fleet_vcs_op_id "$run_store")
   mkdir -p "$(fleet_run_state_dir)"
   printf '%s\n' "$run_op" >"$(fleet_run_state_dir)/starting-operation"
 
-  # §6.1(a). One HTTPS round trip, one string compare, exit — no snapshot, no
-  # object transfer, no commit, no push. The full fetch runs only when the ids
-  # differ.
+  # §6.1: the pass, and its in-process re-runs while triggers land mid-pass.
+  # Called plainly: each pass keeps errexit live (fleet_trigger_converge), and
+  # the worst pass status comes back in fleet_trigger_status.
+  #
+  # THE HANDOFF. A trigger can move the stamp after the loop's last
+  # comparison but before the lock is released: its own run found the lock
+  # and exited, and a scheduler `start` of the job that is still running
+  # queues nothing. So once the lock is released the stamp is compared again,
+  # and a move takes the lock back IN THIS PROCESS (non-blocking) and
+  # converges again — never a detached pass, which launchd and systemd would
+  # kill with this job's process group the moment it ends. If another run
+  # holds the lock by then, it is the one that will see the stamp. Two
+  # handoffs at most; a storm past that waits for the next scheduled run.
+  run_status=0
+  run_round=0
+  while :; do
+    fleet_trigger_converge fleet_run_pass "$run_tmp/round-$run_round" "$run_mode" \
+      "$run_lock" "$run_lock_nonce"
+    [ "$fleet_trigger_status" -le "$run_status" ] || run_status=$fleet_trigger_status
+    [ "$fleet_trigger_status" -lt 128 ] || exit "$fleet_trigger_status"
+    fleet_lock_release "$run_lock" "$run_lock_nonce" || break
+    run_lock_held=false
+    [ "$(fleet_trigger_stamp_state)" != "$fleet_trigger_last_stamp" ] || break
+    [ "$run_round" -lt 2 ] || {
+      printf 'roundhouse: triggers kept arriving as the run released its lock; the next scheduled run picks them up\n'
+      break
+    }
+    run_lock_status=0
+    fleet_run_lock_take "$run_store" "$run_host" "$run_lock" || run_lock_status=$?
+    case $run_lock_status in
+      0) ;;
+      10)
+        printf 'roundhouse: a trigger arrived as this run released its lock; the run that holds it now sees it\n'
+        break
+        ;;
+      *)
+        printf 'roundhouse: a trigger arrived as this run released its lock, and the lock could not be taken again (%s); the next run picks it up\n' \
+          "$run_lock_status" >&2
+        break
+        ;;
+    esac
+    run_lock_nonce=$fleet_lock_nonce_held
+    run_lock_held=true
+    run_round=$((run_round + 1))
+    run_mode=fast
+    printf 'roundhouse: a trigger arrived as this run released its lock; took it again and converging in-process\n'
+  done
+  exit "$run_status"
+}
+
+fleet_run_pass() {
+  # fleet_run_pass PASS-TMP MODE — one observe/converge pass, under
+  # fleet_run_command's lock, run by fleet_trigger_converge. Its arguments are
+  # PER PASS: a fresh scratch directory holding this pass's alert ledger (the
+  # one the end-of-pass sweep reads), and the cadence (fast on a re-run). PER
+  # RUN, from the caller: run_store, run_host, run_lock and its nonce, run_op.
+  # Everything else — the marketplace repair memo (reset below) and all this
+  # body computes — is the pass's own. A subshell, so every `exit` below ends
+  # THIS pass and hands its status back to the loop.
+  errexit_require fleet_run_pass
+  run_tmp=$1
+  run_mode=$2
+  run_ledger="$run_tmp/alert-ledger"
+  # ANY way out of this pass — a refusal, an errexit, a signal — first lands
+  # whatever the apply loop has queued (fleet_run_batch_open): an item it
+  # already installed is recorded as owned, as the per-item writes recorded
+  # it. HERE, in the pass's own subshell, because the batch is: a trap in
+  # fleet_run_command never saw it open. A signal exits 128+N, which runs it.
+  trap '[ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :' EXIT
+  fleet_lock_signals_exit
+  # Captured BEFORE any fetch: what arrives is what §7.7 has to gate, and after
+  # the fetch there is no other way to tell new from known. (The poll floor's
+  # own fetch lands in a private ref and does not move main@origin.)
+  run_pre_origin=$(fleet_vcs_head_origin "$run_store")
+
+  # §6.1: this host's own scheduled jobs. A disabled or missing job is ALERTED,
+  # never re-enabled — only `fleet-schedule install`, run by a human, enables.
+  # Before the floor, so the alert it writes is published by this very pass.
+  fleet_schedule_check "$run_store" "$run_host" || :
+
+  # §6.1(a)/§6.4. One incremental fetch, a tree-id compare, exit — no fold, no
+  # reconcile, no commit, no push. The convergence pass runs only when desired
+  # state moved or a local condition says there is work.
   if [ "$run_mode" = fast ] && fleet_run_poll_floor "$run_store"; then
-    printf 'roundhouse: nothing to pull, nothing to push, clean working copy — one ls-remote round trip, no fetch (§6.1a)\n'
+    fleet_heartbeat_local "$(fleet_now)" || :
+    printf 'roundhouse: desired state unchanged (%s); nothing to push, clean working copy — one incremental fetch, no convergence pass (§6.4)\n' \
+      "$fleet_run_floor_note"
     printf 'roundhouse: starting operation %s\n' "$run_op"
     exit 0
   fi
-
-  # Captured BEFORE the fetch: what arrives is what §7.7 has to gate, and after
-  # the fetch there is no other way to tell new from known.
-  run_pre_origin=$(fleet_vcs_head_origin "$run_store")
   run_fetched=true
   fleet_vcs_fetch "$run_store" origin 2>/dev/null || run_fetched=false
   [ "$run_fetched" = true ] ||
@@ -2909,12 +3071,35 @@ fleet_run_command() (
     # privileged helper that refuses) all come back non-zero here, and every
     # sibling hold in this function exits 65 and alerts — this one silently
     # converged on. Take the same branch the drift compare below takes.
-    if ! fleet_trust_materialize "$run_store" "$run_reference"; then
+    #
+    # A REVIEWED-REF OFF THE PUBLISHED LINE (exit 66) GETS ITS OWN KEYED ALERT,
+    # naming the mark and its newest published ancestor and pointing at the
+    # doctor row for the re-point command; the short hold text is sized under
+    # §10.4's cap by construction, so the alert cannot be refused and leave the
+    # hold silent. Every other refusal keeps the generic key. (A holding host
+    # publishes nothing, so peers learn of it from the stale-host alert, #42.)
+    run_mat_rc=0
+    fleet_trust_materialize "$run_store" "$run_reference" || run_mat_rc=$?
+    if [ "$run_mat_rc" -ne 0 ]; then
       run_reference_short=${run_reference:0:12}
-      fleet_alert_set "$run_store" "$run_host" materialization \
-        materialization-refused true \
-        "materialization refused for commit[$run_reference_short] (abbreviated commit id): a roster generation rollback or a non-descendant head (§7.12.3); holding everything" ||
-        :
+      if [ "$run_mat_rc" -eq 66 ]; then
+        read -r run_rstate run_rref run_ranchor <<EOF
+$(fleet_trust_reviewed_state "$run_store")
+EOF
+        fleet_alert_set "$run_store" "$run_host" materialization \
+          materialization-refused false ''
+        fleet_alert_set "$run_store" "$run_host" materialization \
+          reviewed-ref-unpublished true \
+          "$(fleet_trust_reviewed_hold_text "$run_store" "$run_rref" \
+            "${run_ranchor:--}" short)" || :
+      else
+        fleet_alert_set "$run_store" "$run_host" materialization \
+          reviewed-ref-unpublished false ''
+        fleet_alert_set "$run_store" "$run_host" materialization \
+          materialization-refused true \
+          "materialization refused for commit[$run_reference_short] (abbreviated commit id): a roster generation rollback or a non-descendant head (§7.12.3); holding everything" ||
+          :
+      fi
       printf 'roundhouse: materialization refused (§7.12.3); holding everything (§7.9)\n' >&2
       exit 65
     fi
@@ -2927,6 +3112,7 @@ fleet_run_command() (
       exit 65
     }
     fleet_alert_set "$run_store" "$run_host" materialization materialization-refused false ''
+    fleet_alert_set "$run_store" "$run_host" materialization reviewed-ref-unpublished false ''
     fleet_alert_set "$run_store" "$run_host" materialization materialization false ''
   fi
 
@@ -2997,6 +3183,15 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   ! grep -Fqx "$run_host" "$run_tmp/canaries" || run_self_canary=true
   run_now=$(fleet_now)
   run_applied_items=
+  # Any `applied` or `satisfied` record this pass — the evidence §10.1 reads,
+  # and the one thing that always publishes a heartbeat with it (§6.3).
+  run_applied_any=false
+  # Set when an item waits on canary evidence; the poll floor will not exit
+  # while one does, because that evidence arrives as records (§6.4).
+  run_canary_waiting=false
+  # Set by a runtime or transient hold (an apply that failed, an identity that
+  # could not be read): retried next pass even if the remote never moves.
+  run_retry_owed=false
 
   # §10.3's removal set, capped BEFORE any removal applies: ONE tagged list,
   # `prune ITEM` (owned, gone from the layers) and `uninstall ITEM` (a
@@ -3182,6 +3377,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       case $run_plugin_identity_status in
         1) run_match=no ;;
         75)
+          run_retry_owed=true
           printf '  hold  %s — installed marketplace identity unavailable (%s)\n' \
             "$run_item" "${fleet_run_identity_reason:-unproven}"
           fleet_run_runtime_hold "$run_item" \
@@ -3237,6 +3433,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       # the loop (fleet_run_canary_passing): the canaries' journals do not
       # change while this host applies.
       grep -Fqx "$run_item$fleet_run_sep$run_digest" "$run_tmp/canary-pass" || {
+        run_canary_waiting=true
         printf '  wait  %s — no canary evidence at %s yet\n' "$run_item" "$run_digest"
         fleet_run_runtime_hold "$run_item" 'canary evidence unavailable' \
           "$run_tmp/sigholds" || {
@@ -3272,17 +3469,24 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         if [ "$((run_defer_first + 86400))" -gt "$(date +%s)" ]; then
           run_defer_detail="$run_item is enabled and a claude session is running; its uninstall waits up to 24h from the first deferral"
         else
-          run_defer_detail="$run_item: the 24h live-session window has passed and the uninstall still fails; it is retried every pass"
+          run_defer_detail="$run_item: the 24h live-session window has passed and the uninstall still fails; every fast pass retries it (it keeps the poll floor open)"
         fi
         fleet_alert_raise "$run_ledger" "$run_store" "$run_host" \
           uninstall-deferred uninstall-deferred "$run_defer_detail" "$run_item" || :
       fi
+      # Converged either way — uninstalled (0) or already absent (70) — and,
+      # like any applied or satisfied item, that is evidence a canary owes
+      # its heartbeat for (run_applied_any).
       case $run_status in
         0)
           run_applied_items="$run_applied_items$run_item "
+          run_applied_any=true
           continue
           ;;
-        70) continue ;;
+        70)
+          run_applied_any=true
+          continue
+          ;;
       esac
     else
       case $run_category in
@@ -3322,7 +3526,15 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         fleet_run_journal_queue "$run_store" "$run_host" "$run_item" "$run_digest" \
           applied "$run_now" || :
         run_applied_items="$run_applied_items$run_item "
+        run_applied_any=true
         printf '  applied %s\n' "$run_item"
+        # Self-test only: abort the pass right after this item applied, so the
+        # self-check can prove the queued records still land.
+        if fleet_test_hook "${ROUNDHOUSE_FLEET_TEST_ABORT_AFTER_APPLY:-}" &&
+          [ "$run_item" = "$ROUNDHOUSE_FLEET_TEST_ABORT_AFTER_APPLY" ]; then
+          printf 'roundhouse: self-test abort after applying %s\n' "$run_item" >&2
+          false
+        fi
         ;;
       70)
         # No-op BECAUSE CORRECT: the item resolved and reviewed, and this
@@ -3335,13 +3547,19 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         # unchanged.
         fleet_run_journal_queue "$run_store" "$run_host" "$run_item" "$run_digest" \
           satisfied "$run_now" || :
+        run_applied_any=true
         printf '  satisfied %s (no state-alignment verb for this category)\n' \
           "$run_item"
         ;;
       *)
+        # A FAILED apply, or a TRANSIENT hold, owes a retry next pass: the
+        # poll floor stays open for it (fleet_run_hold_owes_retry names which
+        # holds are transient and which are standing).
+        ! fleet_run_hold_owes_retry "$run_status" "$run_tombstone" "$run_category" ||
+          run_retry_owed=true
         run_holds_grew=true
         fleet_run_apply_held "$run_store" "$run_host" "$run_defs" "$run_item" \
-          "$run_category" "$run_digest" "$run_status" "$run_tmp" "$run_now" || {
+          "$run_category" "$run_digest" "$run_status" "$run_tmp" "$run_now" "$run_managers" || {
           fleet_run_batch_close "$run_store" "$run_host"
           exit 65
         }
@@ -3350,6 +3568,17 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   done 9<"$run_tmp/plan"
   fleet_run_batch_close "$run_store" "$run_host"
   fleet_run_apply_context_close
+  for run_marker in canary-waiting retry-owed; do
+    case $run_marker in
+      canary-waiting) run_marker_set=$run_canary_waiting ;;
+      *) run_marker_set=$run_retry_owed ;;
+    esac
+    if [ "$run_marker_set" = true ]; then
+      : >"$(fleet_run_state_dir)/$run_marker"
+    else
+      rm -f "$(fleet_run_state_dir)/$run_marker"
+    fi
+  done
 
   # --- the full cadence's maintenance half ---
   if [ "$run_mode" = full ]; then
@@ -3363,10 +3592,24 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   fleet_alert_sweep "$run_store" "$run_host" "$run_ledger"
 
   # §10.1 condition 3's heartbeat: a canary that applies an item, is wrecked by
-  # it and stops journaling otherwise satisfies conditions 1 and 2. One record
-  # per completed run is what makes silence visible.
-  fleet_journal_append "$run_store" "$run_host" \
-    "$(jq -cn --arg at "$(fleet_now)" '{outcome:"alive",at:$at}')" || :
+  # it and stops journaling otherwise satisfies conditions 1 and 2. A record
+  # per completed run is what makes silence visible — host-local on every
+  # pass, and PUBLISHED only when §6.3's throttle, an apply, or a canary
+  # evidence deadline calls for it (lib/fleet-liveness.sh). Publishing it on
+  # every pass was a record commit per host per pass, which is what defeated
+  # every peer's poll floor.
+  run_alive_at=$(fleet_now)
+  fleet_heartbeat_local "$run_alive_at" || :
+  # §6.3's other half: a peer with no published heartbeat inside
+  # `liveness_alert_hours` is alerted on, from this store's journal alone.
+  fleet_liveness_alerts "$run_store" "$run_host" "$run_tmp/hosts" \
+    "$run_tmp/reviewed-roster" "$run_fold" "$run_alive_at" |
+    while read -r _ run_silent; do
+      printf 'roundhouse: %s has published no heartbeat within liveness_alert_hours (stale-host alert)\n' \
+        "$run_silent" >&2
+    done || :
+  fleet_heartbeat_publish "$run_store" "$run_host" "$run_alive_at" "$run_fold" \
+    "$run_self_canary" "$run_applied_any" "$run_wait" || :
 
   # §8.4: while a conflict is open the host is locally converging and
   # PUBLICATION-SILENT — the same state it is in when offline.
@@ -3389,16 +3632,28 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   fi
   fleet_run_publish "$run_store" "$run_host" scheduled/agent \
     "$run_mode convergence" "${run_applied_items:--}" || exit $?
-  # The poll floor's fourth condition: this host has converged at this
-  # reference, so the next run may honestly short-circuit.
+  # The poll floor's converged-here condition and its comparison base: the
+  # head this host now sits on, and the desired state of the reference it
+  # converged FROM (fleet_run_poll_floor says why it is not the head's).
   fleet_vcs_heads_local "$run_store" >"$(fleet_run_state_dir)/converged"
+  fleet_vcs_desired_digest "$run_store" "$run_reference" \
+    >"$(fleet_run_state_dir)/converged-desired" 2>/dev/null ||
+    rm -f "$(fleet_run_state_dir)/converged-desired"
   printf 'roundhouse: published; starting operation %s\n' "$run_op"
+  # §6.1: nudge only when this publish moved DESIRED STATE past what arrived
+  # at the start of the pass. A records-only publish is not news a peer needs
+  # pushed to it — and two hosts waiting on the same canary would otherwise
+  # nudge each other every pass for the whole wait.
+  #
   # The off-switch is a policy key like any other, and its absence reads as
   # "on" — an accelerator you cannot turn off is a dependency.
-  [ "$(fleet_policy_get "$run_fold" push_nudge 2>/dev/null || printf true)" = false ] ||
-    fleet_run_nudge "$run_store" "$run_host" "$run_layers" \
-      "$(fleet_run_interval_seconds "$run_fold" "$run_host" fast)" || :
-)
+  if fleet_vcs_desired_changed "$run_store" "$run_pre_origin" \
+    "$(fleet_vcs_heads_local "$run_store" | head -1)"; then
+    [ "$(fleet_policy_get "$run_fold" push_nudge 2>/dev/null || printf true)" = false ] ||
+      fleet_run_nudge "$run_store" "$run_host" "$run_layers" \
+        "$(fleet_run_interval_seconds "$run_fold" "$run_host" fast)" || :
+  fi
+}
 
 fleet_run_resolve_conflict() (
   # fleet_run_resolve_conflict STORE HOST TMP FOLD HEADS
@@ -3690,8 +3945,27 @@ fleet_run_hold_items_into_verdicts() {
   mv -f "$fleet_run_held_verdicts" "$2"
 }
 
+fleet_run_hold_owes_retry() {
+  # fleet_run_hold_owes_retry STATUS TOMBSTONE CATEGORY — true when an apply
+  # that ended STATUS (neither applied nor satisfied) owes a retry next pass,
+  # keeping the poll floor open (retry-owed).
+  #
+  # Every failure does. A 75 HOLD does when it is one of the TRANSIENT kinds:
+  # a tombstone's (the live-session uninstall deferral, a `ps` probe that
+  # could not answer) and a plugin's (a bounded Claude install or update
+  # that failed or timed out, a marketplace that would not resolve). Every
+  # other 75 is a standing "this host cannot" — no package manager here
+  # provides the package, a hook this host does not trust, no skill root or
+  # source for a skill — which only a change elsewhere resolves; each has its
+  # alert, and the full cadence re-reads them.
+  [ "$1" = 75 ] || return 0
+  [ "$2" != true ] || return 0
+  # A plugin hold on a host with no `claude` at all is standing, not transient.
+  [ "$3" = plugins ] && command -v claude >/dev/null 2>&1
+}
+
 fleet_run_apply_held() {
-  # fleet_run_apply_held STORE HOST DEFS ITEM CATEGORY DIGEST STATUS TMP NOW —
+  # fleet_run_apply_held STORE HOST DEFS ITEM CATEGORY DIGEST STATUS TMP NOW MANAGERS —
   # the run loop's answer to an apply that neither applied (0) nor was
   # satisfied (70): the run-local hold the full cadence consumes, the alert
   # that names why, the `held` journal entry, and the line. STATUS 73 is a
@@ -3705,7 +3979,7 @@ fleet_run_apply_held() {
   [ "$7" -ne 75 ] || [ "$5" != packages ] ||
     fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-hold \
       "package-hold-$(printf '%s' "$4" | tr './' '--')" \
-      "no package manager on this host can provide $4" "$4" ||
+      "$(lane_package_hold_detail "$4" "$2" "$(fleet_run_resolve_package "$3" "${4#packages.}" "${10}" 2>/dev/null | jq -r '.manager // "none"')")" "$4" ||
     :
   [ "$7" -ne 73 ] || [ "$5" != packages ] ||
     fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-deferred \
@@ -3993,6 +4267,10 @@ fleet_run_full_pass() (
   # current by this pass — that is what anyone gets by doing nothing — and a
   # `version:` key opts one package out. Skipping the pinned ones is not an
   # optimisation; running them would quietly undo the pin.
+  # The privilege-lane alert is a keyed condition: say the pass looked, so an
+  # alert raised earlier clears on the first pass after the approval even
+  # when no apt package remains to route.
+  [ -z "$full_hold_dir" ] || fleet_alert_checked "$full_hold_dir/alert-ledger" privilege-lane '*'
   full_npm_queried=false
   full_npm_outdated='{}'
   # The per-package questions — held?, pinned?, how does it resolve? — asked
@@ -4096,9 +4374,14 @@ EOF
             printf 'roundhouse: npm global %s did not reach %s\n' \
               "$full_npm_name" "$full_npm_latest" >&2
           ;;
-        # A manager with no user-space update path (apt needs root, and
-        # roundhouse never uses sudo) is reported, never silently skipped —
-        # the same answer fleet_install_package gives at install time.
+        # Root work rides the local privilege lane once this host has had
+        # its one approval; before it the package holds and the pass raises
+        # the one-time-approval alert once. A scheduled run never prompts.
+        apt) lane_fleet_run_apt "$full_store" "$full_host" "$full_package" \
+          "$(printf '%s\n' "$full_resolved" | jq -r '.name')" "$full_hold_dir" || : ;;
+        # A manager with no user-space update path is reported, never
+        # silently skipped — the same answer fleet_install_package gives at
+        # install time.
         *) printf '  hold  packages.%s — %s has no user-space update path\n' \
           "$full_package" "$full_manager" ;;
       esac
@@ -4334,6 +4617,13 @@ fleet_seed_command() (
   # every enabled package as "no package manager on this host can provide" —
   # on hosts whose manager plainly provides it.
   #
+  # Unlike platform and groups it is REFRESHED, not just seeded: config.json
+  # owns the list (it is where an operator adds `npm`, and what the collector
+  # reads), so when config states one it replaces the host file's list whole
+  # and in config order; when config states none (or null), the stored list
+  # stays. Under "the host file wins" the first seed froze it and later config
+  # edits never reached the store. An unchanged list rewrites identical bytes.
+  #
   # PRESENCE, not truthiness: a machine legitimately in no groups carries
   # `groups: []`, and dropping an empty list is not the same as having no
   # opinion. The `machine-truth` doctor row compares `.groups // null` on both
@@ -4353,12 +4643,35 @@ fleet_seed_command() (
   seed_existing=$(fleet_record_read "$seed_file" '{}')
   # Facts are the BASE, not an override: a value already in the host file wins,
   # because someone wrote it deliberately and seeding is not a place to
-  # relitigate it. Observed surfaces still win over both, unchanged.
+  # relitigate it. Observed surfaces still win over both, unchanged. The one
+  # exception is the refreshed `package_managers` above, which config.json owns.
+  seed_pm_before=$(printf '%s\n' "$seed_existing" | jq -c '.package_managers // null')
+  seed_pm_after=$(printf '%s\n' "$seed_facts" | jq -c '.package_managers // null')
+  # The write stays a plain statement so a direct `fleet-seed` (set -e) still
+  # stops on a failed write, exactly as before; the status only gates the notice.
   fleet_record_write "$seed_file" \
     "$(printf '%s\n' "$seed_existing" | jq -c --argjson seeded "$seed_desired" \
-      --argjson facts "$seed_facts" '$facts * . * $seeded')"
+      --argjson facts "$seed_facts" '($facts * . * $seeded) +
+        ($facts | with_entries(select(.key == "package_managers" and .value != null)))')"
+  seed_write_status=$?
 
   seed_fold=$(fleet_fold "$seed_store" "$seed_host")
+  # Say so when the refresh changed the list: dropping a manager holds every
+  # package only it provides, and the doctor does not compare this fact. A
+  # later split file (hosts/<name>/*.yaml) that states the list folds after
+  # this file and still wins, so check the EFFECTIVE value and say so instead
+  # of claiming a refresh that did not take.
+  seed_pm_effective=$(printf '%s\n' "$seed_fold" | jq -c '.package_managers // null' 2>/dev/null)
+  if [ "$seed_write_status" -ne 0 ] || [ "$seed_pm_after" = null ]; then
+    :
+  elif [ -n "$seed_pm_effective" ] && [ "$seed_pm_effective" != "$seed_pm_after" ]; then
+    printf 'roundhouse: package_managers for %s from config.json (%s) does not reach the fold (overridden by another layer, e.g. hosts/%s/*.yaml); the effective list is %s\n' \
+      "$seed_host" "$seed_pm_after" "$seed_host" "$seed_pm_effective" >&2
+  elif [ "$seed_pm_before" != null ] && [ "$seed_pm_after" != "$seed_pm_before" ]; then
+    printf 'roundhouse: package_managers for %s refreshed from config.json: %s -> %s\n' \
+      "$seed_host" "$seed_pm_before" "$seed_pm_after"
+  fi
+
   # Every seeded item's digest at once (fleet_value_digests over the values
   # fleet_item_digest would hash), then ONE read-modify-write of
   # applied/<host>.yaml carrying them in the seeded order — the record a
@@ -4380,7 +4693,6 @@ fleet_seed_command() (
           .items[$e[0]] = {digest: $e[1], at: $at})')
     fleet_record_write "$seed_applied" "$seed_record"
   fi
-
 
   printf 'roundhouse: seeded %s items into %s and applied/%s.yaml (working copy only — the next run publishes them)\n' \
     "$(fleet_items "$seed_desired" | grep -c . || printf 0)" \
@@ -4679,6 +4991,9 @@ fleet_review_command() (
   }
   fleet_run_verdict_write "$review_item" "$review_digest" "$review_reason" \
     human "$review_verdict"
+  # A host-local verdict is news nothing on the remote carries, so the poll
+  # floor must not sit it out: the next pass acts on it.
+  : >"$(fleet_run_state_dir)/retry-owed"
   printf 'roundhouse: %s %s at %s\n' "$review_item" "$review_verdict" "$review_digest"
 )
 
@@ -4890,8 +5205,8 @@ fleet_unlock_command() (
   if [ "$unlock_force" != true ]; then
     fleet_lock_holder_state "$unlock"
     [ "$fleet_lock_state" != live ] || {
-      printf 'roundhouse: a live run (pid %s) holds %s; refusing to release it (use --force to override)\n' \
-        "$(fleet_lock_meta_field "$unlock" pid)" "$unlock" >&2
+      printf 'roundhouse: a live run (%s) holds %s; refusing to release it (use --force to override)\n' \
+        "$(fleet_lock_holder_desc "$unlock")" "$unlock" >&2
       exit 75
     }
   fi

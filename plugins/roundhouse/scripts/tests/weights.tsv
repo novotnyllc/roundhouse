@@ -8,6 +8,7 @@
 10-u2-broker	3
 12-u2-enrollment	3
 14-u2-collector	3
+16-privilege-lane	15
 20-u1	7
 30-u4	3
 40-u5	3
@@ -28,12 +29,17 @@
 79-node-runtime	131
 80-alerts	9
 83-apply-claude	15
+84-schedule#1	41
+84-schedule#2	150
+84-schedule#3	87
+85-liveness	5
 86-publish-verbs	9
 90-jj-bootstrap	15
 91-jj-integrity	50
 92-jj-reconcile	19
 93-jj-run#1	160
 93-jj-run#2	150
+93-jj-run#3	200
 94-jj-doctor	197
 95-jj-trustd	20
 96-u20-chezmoi-absent	24

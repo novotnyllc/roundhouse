@@ -1,0 +1,416 @@
+# Sourced by scripts/test-roundhouse — the local privilege lane: controller
+# status/enrollment/plan verbs over the local and SSH transports, the
+# readiness and doctor rows, and the host-local routing fleet-run uses. The
+# helper's own `self-test` covers the root side; this section covers the
+# controller around it with the POSIX helper in fixture mode.
+# shellcheck shell=bash
+
+lane_tmp=$tmp/lane
+mkdir -p "$lane_tmp/bin" "$lane_tmp/fixture"
+# The remote side resolves the installed helper through `roundhouse` on PATH.
+cat >"$lane_tmp/bin/roundhouse" <<SH
+#!/bin/sh
+exec "$cli" "\$@"
+SH
+chmod +x "$lane_tmp/bin/roundhouse"
+# apt stubs the fixture lane executes as its "root" side.
+cat >"$lane_tmp/bin/apt-get" <<SH
+#!/bin/sh
+printf 'apt-get %s\n' "\$*" >>"$lane_tmp/apt.log"
+case "\$*" in
+  "-q update") [ ! -e "$lane_tmp/apt-update-fail" ] || exit 100 ;;
+  *"install curl=8.2.0-1"*) printf '8.2.0-1\n' >"$lane_tmp/state-curl" ;;
+esac
+exit 0
+SH
+cat >"$lane_tmp/bin/apt-cache" <<SH
+#!/bin/sh
+case "\$1 \$2" in
+  "policy curl") printf 'curl:\n  Installed: %s\n  Candidate: 8.2.0-1\n' "\$(cat "$lane_tmp/state-curl" 2>/dev/null || printf '8.1.0-1')" ;;
+  "policy ") printf 'curl:\n  Installed: 8.1.0-1\n' ;;
+  *) exit 100 ;;
+esac
+SH
+cat >"$lane_tmp/bin/dpkg-query" <<SH
+#!/bin/sh
+case "\$4" in curl) cat "$lane_tmp/state-curl" 2>/dev/null || printf '8.1.0-1' ;; *) exit 1 ;; esac
+SH
+chmod +x "$lane_tmp/bin/apt-get" "$lane_tmp/bin/apt-cache" "$lane_tmp/bin/dpkg-query"
+
+lane_env() {
+  # lane_env COMMAND...: the controller with the fixture lane on a Linux
+  # "host" that is this machine.
+  PATH="$lane_tmp/bin:$PATH" ROUNDHOUSE_LANE_FIXTURE_ROOT="$lane_tmp/fixture" \
+    ROUNDHOUSE_LANE_FIXTURE_BIN="$lane_tmp/bin" ROUNDHOUSE_LANE_FIXTURE_PLATFORM=linux "$@"
+}
+lane_rc=0
+
+# --- before the one approval ------------------------------------------------
+lane_env "$cli" privilege-lane-status test-apt "$lane_tmp/status.json" >/dev/null 2>&1 || lane_rc=$?
+[ "$lane_rc" -eq 75 ] || fail "lane status before enrollment exited $lane_rc, expected 75"
+jq -e '.schema == "roundhouse.privilege-lane-status" and .state == "needs_one_time_approval" and
+  .route == "local" and .transport == "local" and .next_command == "roundhouse privilege-enroll test-apt" and
+  (.actions | index("apt.upgrade-package.v1") != null)' "$lane_tmp/status.json" >/dev/null ||
+  fail "lane status before enrollment: $(cat "$lane_tmp/status.json")"
+
+lane_env "$cli" privilege-status test-apt "$lane_tmp/readiness.jsonl" >/dev/null 2>&1 || :
+"$cli" validate "$lane_tmp/readiness.jsonl" >/dev/null || fail 'lane readiness snapshot failed validation'
+jq -e '.kind == "privilege_broker" and .id == "readiness" and .host_id == "test-apt" and
+  .data.transport == "local-lane" and .data.lifecycle_status == "needs_one_time_approval" and
+  .data.broker_ready == false' "$lane_tmp/readiness.jsonl" >/dev/null ||
+  fail "privilege-status did not report the lane: $(cat "$lane_tmp/readiness.jsonl")"
+
+lane_env "$cli" prepare-privilege-enrollment test-apt "$lane_tmp/prep.json" >/dev/null 2>&1 || :
+jq -e '.route == "local-lane" and .state == "needs_one_time_approval" and .reason == "one_os_approval_required" and
+  .next_command == "roundhouse privilege-enroll test-apt" and .activation_performed == false and
+  (.fixed_entrypoints[0].path == "scripts/privilege-lane-posix") and
+  (.credential_handling | contains("never_requests_or_relays"))' "$lane_tmp/prep.json" >/dev/null ||
+  fail "prepare-privilege-enrollment did not name the one approval: $(cat "$lane_tmp/prep.json")"
+
+# Without a terminal the enrollment never prompts: it names the command.
+lane_rc=0
+lane_env "$cli" privilege-enroll test-apt >"$lane_tmp/enroll-notty.json" 2>"$lane_tmp/enroll-notty.err" </dev/null || lane_rc=$?
+[ "$lane_rc" -eq 75 ] || fail "privilege-enroll without a terminal exited $lane_rc, expected 75"
+jq -e '.state == "needs_one_time_approval" and .next_command == "roundhouse privilege-enroll test-apt"' \
+  "$lane_tmp/enroll-notty.json" >/dev/null || fail 'privilege-enroll without a terminal did not report the pending approval'
+grep -q 'one sudo password prompt' "$lane_tmp/enroll-notty.err" || fail 'privilege-enroll did not explain the one prompt'
+[ ! -e "$lane_tmp/fixture/usr/local/libexec/roundhouse-lane/privilege-lane" ] || fail 'privilege-enroll installed without approval'
+
+# The readiness table reports the pending approval without a finding.
+lane_env "$cli" fleet-readiness test-apt >"$lane_tmp/readiness.txt" 2>/dev/null || :
+grep -Eq '^PENDING  test-apt +privilege-lane +needs_one_time_approval: run `roundhouse privilege-enroll test-apt` once$' \
+  "$lane_tmp/readiness.txt" || fail "fleet-readiness did not report the pending lane: $(cat "$lane_tmp/readiness.txt")"
+grep -Eq '^FINDING  test-apt +privilege-lane' "$lane_tmp/readiness.txt" && fail 'an unenrolled lane counted as a finding'
+
+# A plan cannot be sealed against a lane that is not ready.
+cat >"$lane_tmp/draft.json" <<'JSON'
+{"domain":"updates","target":"test-apt","lane":"local","operations":[
+  {"type":"semantic-action","kind":"privileged_action","id":"apt.update-metadata.v1","package":"-","version":"-","source":"-"},
+  {"type":"semantic-action","kind":"privileged_action","id":"apt.upgrade-package.v1","package":"curl","version":"8.2.0-1","source":"-"}]}
+JSON
+lane_rc=0
+lane_env "$cli" seal-plan "$lane_tmp/draft.json" "$lane_tmp/readiness.jsonl" "$lane_tmp/plan.json" >/dev/null 2>&1 || lane_rc=$?
+[ "$lane_rc" -eq 65 ] || fail "seal-plan sealed a lane plan against an unenrolled lane (rc $lane_rc)"
+
+# The host must answer as the configured identity before anything is
+# enrolled under its name: a mismatch, or no configured identity at all, is
+# a refusal that runs nothing.
+jq '.machines["test-apt"].expected_hostname = "elsewhere.example"' "$tmp/config.json" >"$lane_tmp/config-wrong-host.json"
+chmod 600 "$lane_tmp/config-wrong-host.json"
+lane_rc=0
+ROUNDHOUSE_CONFIG="$lane_tmp/config-wrong-host.json" ROUNDHOUSE_LANE_ENROLL_COMMAND="exit 99" lane_env "$cli" privilege-enroll test-apt \
+  >"$lane_tmp/enroll-wrong.json" 2>/dev/null </dev/null || lane_rc=$?
+[ "$lane_rc" -eq 65 ] && jq -e '.state == "failed" and .reason == "identity_mismatch" and (.detail | contains("elsewhere.example"))' \
+  "$lane_tmp/enroll-wrong.json" >/dev/null || fail "enrollment under the wrong identity was not refused (rc $lane_rc): $(cat "$lane_tmp/enroll-wrong.json")"
+jq 'del(.machines["test-apt"].expected_user)' "$tmp/config.json" >"$lane_tmp/config-no-identity.json"
+chmod 600 "$lane_tmp/config-no-identity.json"
+lane_rc=0
+ROUNDHOUSE_CONFIG="$lane_tmp/config-no-identity.json" ROUNDHOUSE_LANE_ENROLL_COMMAND="exit 99" lane_env "$cli" privilege-enroll test-apt \
+  >"$lane_tmp/enroll-noid.json" 2>/dev/null </dev/null || lane_rc=$?
+[ "$lane_rc" -eq 65 ] && jq -e '.reason == "identity_unverifiable"' "$lane_tmp/enroll-noid.json" >/dev/null ||
+  fail "enrollment without a configured identity was not refused (rc $lane_rc)"
+[ ! -e "$lane_tmp/fixture/etc/sudoers.d/roundhouse-lane" ] || fail 'a refused enrollment installed the grant'
+
+# --- the one approval, through the test hook ----------------------------------
+# The hook stands in for `sudo …/privilege-lane-posix enroll`; the helper's
+# own self-test covers what that enrollment does on the host.
+lane_enroll_hook="ROUNDHOUSE_LANE_FIXTURE_ROOT='$lane_tmp/fixture' ROUNDHOUSE_LANE_FIXTURE_BIN='$lane_tmp/bin' ROUNDHOUSE_LANE_FIXTURE_PLATFORM=linux '$script_dir/privilege-lane-posix' enroll --host-id \"\$1\" --owner \"\$(id -un)\""
+lane_rc=0
+ROUNDHOUSE_LANE_ENROLL_COMMAND="$lane_enroll_hook" lane_env "$cli" privilege-enroll test-apt >"$lane_tmp/enroll.json" 2>"$lane_tmp/enroll.err" </dev/null || lane_rc=$?
+[ "$lane_rc" -eq 0 ] || fail "privilege-enroll through the hook exited $lane_rc: $(cat "$lane_tmp/enroll.err")"
+jq -e '.state == "enrolled" and .reason == "one_time_approval_complete" and (.canary | contains("probe-completed")) and
+  .next_command == "-"' "$lane_tmp/enroll.json" >/dev/null || fail "privilege-enroll report: $(cat "$lane_tmp/enroll.json")"
+grep -Fq "$(id -un) ALL=(root) NOPASSWD:NOSETENV: /usr/local/libexec/roundhouse-lane/privilege-lane dispatch" \
+  "$lane_tmp/fixture/etc/sudoers.d/roundhouse-lane" || fail 'the enrollment did not install the exact sudoers grant'
+
+lane_env "$cli" privilege-lane-status test-apt "$lane_tmp/status.json" >/dev/null || fail 'lane status after enrollment'
+jq -e '.state == "ready" and .host_id == "test-apt" and (.lane_version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+  (.lane_sha256 | test("^[0-9a-f]{64}$"))' "$lane_tmp/status.json" >/dev/null || fail "lane status ready: $(cat "$lane_tmp/status.json")"
+lane_env "$cli" fleet-readiness test-apt >"$lane_tmp/readiness.txt" 2>/dev/null || :
+grep -Eq '^ok       test-apt +privilege-lane +enrolled, lane [0-9.]+$' "$lane_tmp/readiness.txt" ||
+  fail "fleet-readiness did not report the enrolled lane: $(cat "$lane_tmp/readiness.txt")"
+lane_env "$cli" prepare-privilege-enrollment test-apt "$lane_tmp/prep.json" >/dev/null 2>&1 || :
+jq -e '.state == "ready" and .reason == "lane_enrolled" and .next_command == "-"' "$lane_tmp/prep.json" >/dev/null ||
+  fail 'prepare-privilege-enrollment did not report the enrolled lane'
+
+# --- the sealed lane plan ------------------------------------------------------
+lane_env "$cli" privilege-status test-apt "$lane_tmp/readiness.jsonl" >/dev/null 2>&1 || fail 'privilege-status after enrollment'
+lane_snapshot_id=$(jq -r '.snapshot_id' "$lane_tmp/readiness.jsonl")
+{
+  cat "$lane_tmp/readiness.jsonl"
+  jq -cn --arg s "$lane_snapshot_id" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    {schema:"roundhouse.inventory",schema_version:1,snapshot_id:$s,host_id:"test-apt",kind:"package",id:"apt:curl",
+     observed_at:$at,status:"present",confidence:"high",
+     data:{manager:"apt",name:"curl",installed_version:"8.1.0-1",candidate_version:"8.2.0-1",update_available:true},
+     evidence:[],errors:[]}'
+} >"$lane_tmp/snapshot.jsonl"
+"$cli" validate "$lane_tmp/snapshot.jsonl" >/dev/null || fail 'lane plan snapshot failed validation'
+lane_env "$cli" seal-plan "$lane_tmp/draft.json" "$lane_tmp/snapshot.jsonl" "$lane_tmp/plan.json" >/dev/null ||
+  fail 'seal-plan refused a valid lane draft'
+chmod 600 "$lane_tmp/plan.json"
+jq -e '.schema == "roundhouse.plan" and .schema_version == 5 and .lane == "local" and
+  (.plan_id | test("^plan-[0-9a-f]{16}$")) and (.operations | length == 2) and
+  ([.operations[].request_id] | all(test("^request-[0-9a-f]{32}$"))) and
+  (.operations[1].package == "curl") and (.operations[1].version == "8.2.0-1") and
+  (.precondition.value | test("^[0-9a-f]{64}$"))' "$lane_tmp/plan.json" >/dev/null ||
+  fail "sealed lane plan shape: $(cat "$lane_tmp/plan.json")"
+# Nothing argv-shaped survives sealing.
+jq -e '[.. | strings] | any(test("sudo|apt-get|/bin/"))' "$lane_tmp/plan.json" >/dev/null && fail 'a lane plan carried argv'
+lane_plan_id=$(jq -r '.plan_id' "$lane_tmp/plan.json")
+
+lane_env "$cli" verify-privilege-plan "$lane_tmp/plan.json" "$lane_tmp/snapshot.jsonl" >/dev/null ||
+  fail 'verify-privilege-plan refused the sealed lane plan'
+# A drifted candidate version is a refusal, never a resubmission.
+jq -c 'if .kind == "package" then .data.candidate_version = "8.3.0-1" else . end' "$lane_tmp/snapshot.jsonl" >"$lane_tmp/drifted.jsonl"
+lane_rc=0
+lane_env "$cli" verify-privilege-plan "$lane_tmp/plan.json" "$lane_tmp/drifted.jsonl" >/dev/null 2>&1 || lane_rc=$?
+[ "$lane_rc" -eq 65 ] || fail "verify-privilege-plan accepted a drifted candidate (rc $lane_rc)"
+# A tampered plan fails its own integrity check.
+jq '.operations[1].version = "9.9.9"' "$lane_tmp/plan.json" >"$lane_tmp/tampered.json"
+chmod 600 "$lane_tmp/tampered.json"
+lane_rc=0
+lane_env "$cli" verify-privilege-plan "$lane_tmp/tampered.json" "$lane_tmp/snapshot.jsonl" >/dev/null 2>&1 || lane_rc=$?
+[ "$lane_rc" -eq 65 ] || fail "verify-privilege-plan accepted a tampered lane plan (rc $lane_rc)"
+
+# Submission: one lane request per operation, in order, each digest-bound
+# to the plan; the inventory records say what happened.
+: >"$lane_tmp/apt.log"
+lane_rc=0
+lane_env "$cli" submit-privilege-plan "$lane_tmp/plan.json" "$lane_plan_id" "$lane_tmp/apply.jsonl" >/dev/null 2>"$lane_tmp/apply.err" || lane_rc=$?
+[ "$lane_rc" -eq 0 ] || fail "submit-privilege-plan exited $lane_rc: $(cat "$lane_tmp/apply.err")"
+"$cli" validate "$lane_tmp/apply.jsonl" >/dev/null || fail 'lane apply records failed validation'
+[ "$(jq -s 'length' "$lane_tmp/apply.jsonl")" -eq 2 ] || fail 'lane apply did not record both operations'
+jq -e -s 'all(.[]; .kind == "operation" and .data.transport == "local-lane" and .data.operation_status == "completed" and
+  .data.state == "completed" and (.data.request_id | test("^request-[0-9a-f]{32}$")))' "$lane_tmp/apply.jsonl" >/dev/null ||
+  fail "lane apply records: $(cat "$lane_tmp/apply.jsonl")"
+grep -Fqx 'apt-get -q update' "$lane_tmp/apt.log" && grep -Fqx 'apt-get -q -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-remove --only-upgrade install curl=8.2.0-1' "$lane_tmp/apt.log" ||
+  fail "the lane did not run the fixed apt commands: $(cat "$lane_tmp/apt.log")"
+jq -r -s '.[1].data.result_record[]' "$lane_tmp/apply.jsonl" | grep -Fqx "plan-id|$lane_plan_id" || fail 'the lane result is not bound to the plan id'
+jq -r -s '.[1].data.result_record[]' "$lane_tmp/apply.jsonl" | grep -Fqx 'operation-index|1' || fail 'the lane result is not bound to the operation index'
+jq -r -s '.[1].data.result_record[]' "$lane_tmp/apply.jsonl" | grep -Fqx "plan-sha256|$(jq -r '.plan_digest.value' "$lane_tmp/plan.json")" ||
+  fail 'the lane result is not bound to the plan digest'
+
+# Apply rechecks the whole sealed precondition right before submitting: a
+# candidate that moved after sealing is a refusal, never a stale submission.
+cat >"$lane_tmp/drift-draft.json" <<'JSON'
+{"domain":"updates","target":"test-apt","lane":"local","operations":[
+  {"type":"semantic-action","kind":"privileged_action","id":"apt.upgrade-package.v1","package":"curl","version":"8.2.0-1","source":"-"}]}
+JSON
+printf '8.1.0-1\n' >"$lane_tmp/state-curl"
+lane_env "$cli" privilege-status test-apt "$lane_tmp/drift-readiness.jsonl" >/dev/null 2>&1 || fail 'privilege-status for the drift plan'
+{
+  cat "$lane_tmp/drift-readiness.jsonl"
+  jq -cn --arg s "$(jq -r '.snapshot_id' "$lane_tmp/drift-readiness.jsonl")" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    {schema:"roundhouse.inventory",schema_version:1,snapshot_id:$s,host_id:"test-apt",kind:"package",id:"apt:curl",
+     observed_at:$at,status:"present",confidence:"high",
+     data:{manager:"apt",name:"curl",installed_version:"8.0.0-1",candidate_version:"8.2.0-1",update_available:true},
+     evidence:[],errors:[]}'
+} >"$lane_tmp/drift-snapshot.jsonl"
+lane_env "$cli" seal-plan "$lane_tmp/drift-draft.json" "$lane_tmp/drift-snapshot.jsonl" "$lane_tmp/drift-plan.json" >/dev/null || fail 'seal-plan for the drift plan'
+chmod 600 "$lane_tmp/drift-plan.json"
+: >"$lane_tmp/apt.log"
+lane_rc=0
+lane_env "$cli" submit-privilege-plan "$lane_tmp/drift-plan.json" "$(jq -r '.plan_id' "$lane_tmp/drift-plan.json")" "$lane_tmp/drift-apply.jsonl" >/dev/null 2>"$lane_tmp/drift.err" || lane_rc=$?
+[ "$lane_rc" -eq 65 ] && grep -q 'preconditions drifted' "$lane_tmp/drift.err" || fail "apply submitted despite a package drift (rc $lane_rc): $(cat "$lane_tmp/drift.err")"
+[ ! -s "$lane_tmp/apt.log" ] || fail 'a drifted plan reached apt-get'
+
+# Lookup reads the published result for an operation without resubmitting.
+: >"$lane_tmp/apt.log"
+lane_env "$cli" lookup-privilege-result "$lane_tmp/plan.json" 1 "$lane_tmp/lookup.result" >/dev/null ||
+  fail 'lookup-privilege-result failed for a completed lane operation'
+grep -Fqx 'reason|package_upgraded' "$lane_tmp/lookup.result" || fail "lookup result: $(cat "$lane_tmp/lookup.result")"
+[ ! -s "$lane_tmp/apt.log" ] || fail 'lookup-privilege-result executed something'
+# An expired plan still answers a lookup (the host keeps results for seven
+# days) but never a submission.
+jq -S '.expires_at = "2000-01-01T00:00:00Z" | del(.plan_id, .plan_digest)' "$lane_tmp/plan.json" >"$lane_tmp/expired-unsealed.json"
+lane_expired_digest=$(jq -cS . "$lane_tmp/expired-unsealed.json" | shasum -a 256 | awk '{print $1}')
+jq -S --arg id "plan-${lane_expired_digest:0:16}" --arg d "$lane_expired_digest" \
+  '. + {plan_id:$id, plan_digest:{algorithm:"sha256", value:$d}}' "$lane_tmp/expired-unsealed.json" >"$lane_tmp/expired-plan.json"
+chmod 600 "$lane_tmp/expired-plan.json"
+lane_env "$cli" lookup-privilege-result "$lane_tmp/expired-plan.json" 1 "$lane_tmp/expired-lookup.result" >/dev/null 2>"$lane_tmp/expired-lookup.err" ||
+  fail "lookup refused an expired plan: $(cat "$lane_tmp/expired-lookup.err")"
+grep -Fqx 'reason|package_upgraded' "$lane_tmp/expired-lookup.result" || fail 'lookup through an expired plan returned the wrong result'
+lane_rc=0
+lane_env "$cli" submit-privilege-plan "$lane_tmp/expired-plan.json" "plan-${lane_expired_digest:0:16}" "$lane_tmp/expired-apply.jsonl" >/dev/null 2>"$lane_tmp/expired-apply.err" || lane_rc=$?
+[ "$lane_rc" -eq 65 ] && grep -q 'expired' "$lane_tmp/expired-apply.err" || fail "an expired plan was submitted (rc $lane_rc)"
+# The plan's request ids were consumed: a second submission is a replay and
+# never executes again.
+lane_rc=0
+lane_env "$cli" submit-privilege-plan "$lane_tmp/plan.json" "$lane_plan_id" "$lane_tmp/apply-again.jsonl" >/dev/null 2>&1 || lane_rc=$?
+[ "$lane_rc" -eq 65 ] || fail "a resubmitted lane plan exited $lane_rc, expected 65"
+[ ! -s "$lane_tmp/apt.log" ] || fail 'a resubmitted lane plan executed something'
+# A request id the lane never saw cannot be looked up (the plan's digest no
+# longer matches, which is the integrity refusal, never a guess).
+jq '.operations[0].request_id = "request-00000000000000000000000000000000"' "$lane_tmp/plan.json" >"$lane_tmp/unknown.json"
+chmod 600 "$lane_tmp/unknown.json"
+lane_rc=0
+lane_env "$cli" lookup-privilege-result "$lane_tmp/unknown.json" 0 "$lane_tmp/unknown.result" >/dev/null 2>&1 || lane_rc=$?
+[ "$lane_rc" -eq 65 ] || fail "lookup of a tampered plan exited $lane_rc, expected 65"
+# The controller's catalog and the helper's catalog agree, per platform.
+for lane_platform in linux wsl; do
+  while IFS= read -r lane_action; do
+    "$script_dir/privilege-lane-posix" actions "$lane_platform" | grep -Fqx "$lane_action" ||
+      fail "the controller advertises $lane_action on $lane_platform but the POSIX helper does not implement it"
+  done <<EOF
+$(ROUNDHOUSE_LIB_ONLY=1 . "$cli"; lane_actions_for_platform "$lane_platform")
+EOF
+done
+# macOS and native Windows have no lane in this version: the controller
+# advertises nothing for them, status says so with its own exit status, the
+# readiness row is neither pending nor a finding, and enrollment refuses
+# before touching anything. (Their lanes are designed in the spec and arrive
+# in a follow-up.)
+for lane_platform in macos windows; do
+  if (ROUNDHOUSE_LIB_ONLY=1 . "$cli"; lane_actions_for_platform "$lane_platform") 2>/dev/null | grep -q .; then
+    fail "the controller advertises lane actions on $lane_platform"
+  fi
+done
+lane_rc=0
+"$cli" privilege-lane-status test-windows "$lane_tmp/win-status.json" >/dev/null 2>&1 || lane_rc=$?
+[ "$lane_rc" -eq 69 ] && jq -e '.state == "unsupported" and .route == "unsupported" and .platform == "windows" and
+  (.detail | contains("linux and wsl")) and .next_command == "-" and .actions == []' "$lane_tmp/win-status.json" >/dev/null ||
+  fail "a Windows host did not report the lane as unsupported (rc $lane_rc): $(cat "$lane_tmp/win-status.json")"
+"$cli" fleet-readiness test-windows >"$lane_tmp/win-readiness.txt" 2>/dev/null || :
+grep -Eq '^ok       test-windows +privilege-lane +not yet supported: the privilege lane covers linux and wsl' "$lane_tmp/win-readiness.txt" ||
+  fail "fleet-readiness did not explain the missing Windows lane: $(grep privilege-lane "$lane_tmp/win-readiness.txt")"
+lane_rc=0
+"$cli" privilege-enroll test-windows >/dev/null 2>"$lane_tmp/win-enroll.err" </dev/null || lane_rc=$?
+[ "$lane_rc" -eq 69 ] && grep -q 'linux and wsl' "$lane_tmp/win-enroll.err" || fail "privilege-enroll on a Windows host exited $lane_rc"
+lane_rc=0
+"$cli" privilege-lane-status test-ssh "$lane_tmp/mac-status.json" >/dev/null 2>&1 || lane_rc=$?
+[ "$lane_rc" -eq 69 ] && jq -e '.state == "unsupported" and .platform == "macos"' "$lane_tmp/mac-status.json" >/dev/null ||
+  fail "a macOS host did not report the lane as unsupported (rc $lane_rc): $(cat "$lane_tmp/mac-status.json")"
+
+# --- host-local routing used by fleet-run --------------------------------------
+# The fast pass installs apt packages through the lane; before enrollment
+# the same call holds (75) with the one-approval alert text.
+(
+  ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+  # Architecture-qualified apt names are valid draft packages; a malformed
+  # suffix is not.
+  jq -c '.operations[0].package = "curl:i386"' "$lane_tmp/drift-draft.json" >"$lane_tmp/arch-draft.json"
+  lane_draft_valid "$lane_tmp/arch-draft.json" || fail 'an architecture-qualified package was refused in a lane draft'
+  jq -c '.operations[0].package = "curl:I386!"' "$lane_tmp/drift-draft.json" >"$lane_tmp/arch-bad-draft.json"
+  lane_draft_valid "$lane_tmp/arch-bad-draft.json" && fail 'a malformed architecture suffix was accepted in a lane draft'
+  : >"$lane_tmp/apt.log"
+  fleet_host_name() { printf 'test-apt\n'; }
+  lane_env fleet_install_package apt curl false 8.2.0-1 || fail "fleet_install_package apt through the lane failed"
+  grep -Fqx 'apt-get -q -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-remove --no-install-recommends install curl=8.2.0-1' "$lane_tmp/apt.log" ||
+    fail "fleet_install_package did not route apt through the lane: $(cat "$lane_tmp/apt.log")"
+  # Every host-local mutation is a sealed plan: the lane's journal shows a
+  # sealed plan id, never the ad-hoc fleet-run token.
+  grep -q '|request|request-[0-9a-f]*|apt.install-package-version.v1|' "$lane_tmp/fixture/var/lib/roundhouse-lane/journal/events.log" ||
+    fail 'host-local install was not journaled'
+  lane_last_result=$(ls -t "$lane_tmp/fixture/var/lib/roundhouse-lane/results"/*.result | head -n 1)
+  grep -Eq '^plan-id\|plan-[0-9a-f]{16}$' "$lane_last_result" || fail "host-local install did not ride a sealed plan: $(grep '^plan-id' "$lane_last_result")"
+  grep -Eq '^plan-sha256\|[0-9a-f]{64}$' "$lane_last_result" || fail 'host-local install carried no plan digest'
+  # A host that runs scheduled passes may carry no controller config.json:
+  # the host-local path does not consult it.
+  : >"$lane_tmp/apt.log"
+  ROUNDHOUSE_CONFIG="$lane_tmp/absent-config.json" lane_env fleet_install_package apt curl false 8.2.0-1 ||
+    fail 'the host-local lane path required a controller config.json'
+  grep -q 'install curl=8.2.0-1' "$lane_tmp/apt.log" || fail 'the host-local install without config.json did not reach apt-get'
+  # An unpinned install carries the `-` sentinel, never an empty version.
+  : >"$lane_tmp/apt.log"
+  lane_env fleet_install_package apt curl false || fail "unpinned fleet_install_package apt failed"
+  grep -Fqx 'apt-get -q -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-remove --no-install-recommends install curl' "$lane_tmp/apt.log" ||
+    fail "unpinned install did not reach apt-get without a version: $(cat "$lane_tmp/apt.log")"
+  # The full-pass apt arm: metadata refresh and upgrade, both sealed.
+  : >"$lane_tmp/apt.log"
+  printf '8.1.0-1\n' >"$lane_tmp/state-curl"
+  lane_env lane_fleet_run_apt "$tmp/store" test-apt curl curl "" >/dev/null 2>&1 || :
+  grep -Fqx 'apt-get -q update' "$lane_tmp/apt.log" || fail "full-pass apt refresh did not run through the lane: $(cat "$lane_tmp/apt.log")"
+  grep -q 'only-upgrade install curl=8.2.0-1' "$lane_tmp/apt.log" || fail "full-pass apt upgrade did not run through the lane: $(cat "$lane_tmp/apt.log")"
+  [ "$(grep -c '|apt.update-metadata.v1|' "$lane_tmp/fixture/var/lib/roundhouse-lane/journal/events.log")" -ge 1 ] || fail 'refresh not journaled'
+  lane_fleet_apt_refreshed=; lane_fleet_apt_alerted=
+  # A failed metadata refresh holds the pass's apt upgrades: nothing is
+  # upgraded from a stale cache.
+  : >"$lane_tmp/apt.log"; : >"$lane_tmp/apt-update-fail"; printf '8.1.0-1\n' >"$lane_tmp/state-curl"
+  lane_apt_hold=$(lane_env lane_fleet_run_apt "$tmp/store" test-apt curl curl "" 2>/dev/null) || :
+  rm -f "$lane_tmp/apt-update-fail"
+  grep -q 'apt metadata refresh did not complete' <<<"$lane_apt_hold" || fail "failed refresh did not hold: $lane_apt_hold"
+  grep -rlq 'apt metadata refresh through the privilege lane did not complete' "$tmp/store/alerts" 2>/dev/null ||
+    fail "a failed refresh on an enrolled lane raised no alert: $(ls -R "$tmp/store/alerts" 2>/dev/null | head -n 5)"
+  grep -q 'only-upgrade' "$lane_tmp/apt.log" && fail 'an upgrade ran after a failed metadata refresh'
+  lane_fleet_apt_refreshed=; lane_fleet_apt_alerted=; lane_fleet_apt_refresh_failed=
+  # A host-local plan whose version is not the candidate is refused at
+  # sealing, and nothing reaches apt-get.
+  : >"$lane_tmp/apt.log"
+  lane_rc=0
+  lane_env lane_host_apply test-apt "[$(lane_operation_json apt.upgrade-package.v1 curl 9.9.9)]" >/dev/null 2>"$lane_tmp/host-apply.err" || lane_rc=$?
+  [ "$lane_rc" -eq 65 ] || fail "host-local apply with a stale version exited $lane_rc, expected 65"
+  [ ! -s "$lane_tmp/apt.log" ] || fail 'a refused host-local plan reached apt-get'
+  lane_env lane_package_hold_detail packages.curl test-apt apt | grep -q 'no package manager on this host can provide' ||
+    fail 'an enrolled lane still blamed the package manager'
+  lane_env fleet_doctor_lane_row | grep -Eq '^ok       privilege-lane +enrolled, lane [0-9.]+ [0-9a-f]{12}$' ||
+    fail 'fleet-doctor did not report the enrolled lane'
+  mv "$lane_tmp/fixture" "$lane_tmp/fixture.enrolled"
+  mkdir -p "$lane_tmp/fixture"
+  lane_rc=0
+  lane_env fleet_install_package apt curl false >/dev/null 2>&1 || lane_rc=$?
+  [ "$lane_rc" -eq 75 ] || fail "fleet_install_package apt without a lane returned $lane_rc, expected 75"
+  lane_env lane_package_hold_detail packages.curl test-apt apt | grep -q 'run `roundhouse privilege-enroll test-apt` once' ||
+    fail 'the hold text did not name the one-time approval'
+  lane_env lane_package_hold_detail packages.curl test-apt | grep -q 'no package manager on this host can provide' ||
+    fail 'a package no manager resolves was blamed on the apt lane'
+  lane_env fleet_doctor_lane_row | grep -Eq '^ok       privilege-lane +not enrolled' ||
+    fail 'fleet-doctor did not report the unenrolled lane as pending'
+  rm -rf "$lane_tmp/fixture"
+  mv "$lane_tmp/fixture.enrolled" "$lane_tmp/fixture"
+) || exit 1
+
+# --- SSH transport ------------------------------------------------------------
+# A Linux host reached over `fake-host`; the stub runs the remote command
+# locally, so the same fixture lane answers through `roundhouse
+# privilege-lane-path`.
+jq '.machines["test-ssh-linux"] = {platform:"linux",transport:"ssh",ssh_alias:"fake-host",package_managers:["apt"]}' \
+  "$tmp/config.json" >"$lane_tmp/config-ssh.json"
+chmod 600 "$lane_tmp/config-ssh.json"
+: >"$lane_tmp/ssh.log"
+ROUNDHOUSE_CONFIG="$lane_tmp/config-ssh.json" SSH_COMMAND_LOG="$lane_tmp/ssh.log" lane_env "$cli" privilege-lane-status test-ssh-linux "$lane_tmp/ssh-status.json" >/dev/null 2>&1 || :
+# The fixture lane is enrolled as test-apt, so an alias that lands on it
+# under another machine name is drift: the operation would run elsewhere.
+jq -e '.transport == "ssh fake-host" and .state == "drifted" and (.detail | contains("enrolled as test-apt"))' "$lane_tmp/ssh-status.json" >/dev/null ||
+  fail "lane status over ssh: $(cat "$lane_tmp/ssh-status.json")"
+grep -q 'fake-host' "$lane_tmp/ssh.log" && grep -q 'privilege-lane-path' "$lane_tmp/ssh.log" ||
+  fail 'the ssh transport did not resolve the remote helper through roundhouse'
+grep -Eq 'RequestTTY=no' "$lane_tmp/ssh.log" || fail 'a lane status probe requested a TTY'
+
+# --- configuration -------------------------------------------------------------
+# A machine may opt out; a legacy route still wins; anything else is rejected.
+jq '.machines["test-apt"].privilege_lane = "disabled"' "$tmp/config.json" >"$lane_tmp/config-disabled.json"
+chmod 600 "$lane_tmp/config-disabled.json"
+ROUNDHOUSE_CONFIG="$lane_tmp/config-disabled.json" "$cli" validate-config >/dev/null || fail 'privilege_lane: disabled was rejected'
+lane_rc=0
+ROUNDHOUSE_CONFIG="$lane_tmp/config-disabled.json" "$cli" privilege-lane-status test-apt "$lane_tmp/status.json" >/dev/null 2>&1 || lane_rc=$?
+[ "$lane_rc" -eq 75 ] && jq -e '.state == "disabled"' "$lane_tmp/status.json" >/dev/null || fail 'a disabled lane was not reported as disabled'
+jq '.machines["test-apt"].privilege_lane = "sometimes"' "$tmp/config.json" >"$lane_tmp/config-bad.json"
+chmod 600 "$lane_tmp/config-bad.json"
+if ROUNDHOUSE_CONFIG="$lane_tmp/config-bad.json" "$cli" validate-config >/dev/null 2>&1; then
+  fail 'an invalid privilege_lane value was accepted'
+fi
+lane_rc=0
+ROUNDHOUSE_CONFIG="$lane_tmp/config-disabled.json" "$cli" privilege-enroll test-apt >/dev/null 2>&1 </dev/null || lane_rc=$?
+[ "$lane_rc" -eq 69 ] || fail "privilege-enroll on a disabled lane exited $lane_rc, expected 69"
+# The legacy route keeps its own path: no lane status, no lane enrollment.
+jq '.machines["test-apt"].privilege_broker = {automation_transport:{mode:"posix-ssh",host:"linux.example.invalid",port:22,
+  request_user:"roundhouse",pinned_host_key_fingerprint:"SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",management_networks:["192.0.2.0/24"]}}' \
+  "$tmp/config.json" >"$lane_tmp/config-legacy.json"
+chmod 600 "$lane_tmp/config-legacy.json"
+lane_rc=0
+ROUNDHOUSE_CONFIG="$lane_tmp/config-legacy.json" "$cli" privilege-enroll test-apt >/dev/null 2>&1 </dev/null || lane_rc=$?
+[ "$lane_rc" -eq 69 ] || fail "privilege-enroll with a legacy route exited $lane_rc, expected 69"
+
+# --- no ceremony anywhere in the user-facing text ----------------------------------
+for lane_skill in fleet-hosts fleet-readiness fleet-update fleet-auth; do
+  lane_text=$(cat "$script_dir/../skills/$lane_skill/SKILL.md")
+  assert_contains "$lane_text" 'privilege-enroll'
+  case $lane_text in
+    *'certify-ssh-node signs'*|*'enroll-windows-sftp.ps1'*|*'owner ceremony'*)
+      fail "$lane_skill still tells the user to perform a ceremony" ;;
+  esac
+done
+assert_contains "$(cat "$script_dir/../skills/fleet-update/SKILL.md")" 'needs_one_time_approval'
+assert_contains "$(cat "$script_dir/../skills/fleet-readiness/SKILL.md")" 'not yet supported'
+rm -rf "$lane_tmp"
+printf 'section 16 ok: privilege lane\n'

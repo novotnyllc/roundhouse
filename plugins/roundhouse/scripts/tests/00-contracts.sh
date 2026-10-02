@@ -286,13 +286,15 @@ added'
 assert_contains "$fleet_update_text" 'it runs `roundhouse fleet-run`'
 assert_contains "$fleet_update_text" '**Absorb, never duplicate**'
 assert_contains "$fleet_update_text" 'com.novotnyllc.roundhouse.autoupdate'
-assert_contains "$fleet_update_text" 'unload and remove it in the same step that installs the
-fleet entry'
+assert_contains "$fleet_update_text" 'unload it and set it aside (renamed `.absorbed`, never deleted) in the
+same step that installs the fleet entry'
 assert_contains "$fleet_update_text" 'roundhouse fleet-run --fast'
 assert_contains "$fleet_update_text" 'roundhouse fleet-run --full'
 # All three platforms, because a scheduler section that only says "launchd"
 # leaves two thirds of this fleet with nothing scheduled.
-assert_contains "$fleet_update_text" 'com.novotnyllc.roundhouse.fleet.plist'
+assert_contains "$fleet_update_text" 'com.novotnyllc.roundhouse.fleet-fast.plist'
+assert_contains "$fleet_update_text" 'com.novotnyllc.roundhouse.fleet-full.plist'
+assert_contains "$fleet_update_text" 'roundhouse fleet-schedule install'
 assert_contains "$fleet_update_text" 'systemd **user** timer pair'
 assert_contains "$fleet_update_text" 'per-user** scheduled task'
 case $fleet_update_text in
@@ -312,7 +314,8 @@ assert_contains "$fleet_update_text" 'a second run finds the lock
 held and exits 0 without acting'
 assert_contains "$fleet_update_text" 'Exit 75 is the STALE-lock refusal'
 assert_contains "$fleet_update_text" 'whose `meta.json` is missing so its age cannot be read'
-assert_contains "$fleet_update_text" 'Unattended runs skip protected/privileged actions'
+assert_contains "$fleet_update_text" 'Unattended runs route privileged package work through the
+host'
 assert_contains "$fleet_update_text" 'After every plugin `install`, `update`, or `enable` operation'
 assert_contains "$fleet_update_text" 'scripts/codex-plugin-hooks.ps1 approve PLUGIN@MARKETPLACE'
 assert_contains "$fleet_update_text" '$SHELL -lc'

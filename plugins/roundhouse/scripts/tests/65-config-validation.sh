@@ -656,6 +656,12 @@ jq -se 'any(.[]; .id == "agents:jsm" and .status == "unavailable" and
 jq -se 'all(.[]; .id != "jsm:example-jsm") and
   any(.[]; .kind == "package" and .data.manager == "homebrew")' "$tmp/hung-jsm.jsonl" >/dev/null ||
   fail "a hung manager's timeout did not leave the other managers' inventory intact"
+# A KILLed child can take a moment to be reaped under load: poll, bounded.
+hung_reap=0
+while pgrep -f 'sleep 587' >/dev/null 2>&1 && [ "$hung_reap" -lt 50 ]; do
+  sleep 0.1
+  hung_reap=$((hung_reap + 1))
+done
 ! pgrep -f 'sleep 587' >/dev/null 2>&1 || fail "a hung manager's child outlived its timeout"
 # …and the full pass's seed turns it into a keyed `inventory-timeout` alert
 # (a store-scoped CONDITION), cleared by the next collection that answers.

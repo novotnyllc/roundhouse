@@ -127,34 +127,7 @@ launcher_install_command() (
   launcher_home=$(cd -- "$HOME" && pwd -P) || exit 65
   destination=${1:-$launcher_home/.local/bin/roundhouse}
   validate_launcher_destination "$destination"
-  config=$(config_path)
-  requested_target=${2:-}
-  if [ -n "$requested_target" ]; then
-    jq -e --arg target "$requested_target" '
-      .machines[$target].transport == "local" and
-      (.machines[$target].expected_hostname | type == "string" and length > 0) and
-      (.machines[$target].expected_user | type == "string" and length > 0)
-    ' "$config" >/dev/null || {
-      printf 'roundhouse: launcher target must be one local machine with expected_hostname and expected_user\n' >&2
-      exit 64
-    }
-    target=$requested_target
-  else
-    launcher_hostname=$(hostname)
-    launcher_user=$(id -un)
-    target_candidates=$(jq -r --arg hostname "$launcher_hostname" --arg user "$launcher_user" '
-      .machines | to_entries[] |
-      select(.value.transport == "local" and
-        .value.expected_hostname == $hostname and .value.expected_user == $user) |
-      .key
-    ' "$config")
-    target_count=$(printf '%s\n' "$target_candidates" | grep -c . || true)
-    [ "$target_count" -eq 1 ] || {
-      printf 'roundhouse: launcher installation requires one local target matching hostname/user; pass TARGET explicitly\n' >&2
-      exit 64
-    }
-    target=$target_candidates
-  fi
+  target=$(local_plan_target launcher-install "${2:-}") || exit $?
   launcher_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-launcher-plan.XXXXXX")
   trap 'rm -rf "$launcher_tmp"' EXIT HUP INT TERM
   ROUNDHOUSE_LAUNCHER_EMIT=1 bash "$script_dir/launcher-install" \
@@ -169,19 +142,8 @@ launcher_install_command() (
   export ROUNDHOUSE_LAUNCHER_PATH=$destination
   collect_command --target "$target" --section agents \
     --output "$launcher_tmp/planning.jsonl"
-  seal_plan_command "$launcher_tmp/draft.json" "$launcher_tmp/planning.jsonl" \
-    "$launcher_tmp/plan.json"
-  collect_command --target "$target" --section agents \
-    --output "$launcher_tmp/current.jsonl"
-  verify_preconditions_command "$launcher_tmp/plan.json" "$launcher_tmp/current.jsonl" \
-    >/dev/null
-  launcher_plan_id=$(jq -r '.plan_id' "$launcher_tmp/plan.json")
-  apply_plan_command "$launcher_tmp/plan.json" "$launcher_plan_id" \
-    "$launcher_tmp/result.jsonl" >/dev/null
-  jq -s -e --arg plan "$launcher_plan_id" '
-    any(.[]; type == "object" and .kind == "operation" and
-      .id == ("apply:" + $plan) and .data.operation_status == "completed")
-  ' "$launcher_tmp/result.jsonl" >/dev/null
+  local_plan_seal_apply "$launcher_tmp/draft.json" "$launcher_tmp/planning.jsonl" \
+    "$launcher_tmp"
 )
 
 install_auth_artifact() (
@@ -667,6 +629,17 @@ EOF
             return 69
           }
           "$plan_node" "$script_dir/codex-plugin-hooks.mjs" update "$plugin_id" >/dev/null
+          return
+          ;;
+        roundhouse:schedule)
+          # fleet-schedule install|uninstall: the sealed steps, exactly
+          # (fleet_schedule_execute re-derives and checks every one).
+          { [ "$kind" = agent_artifact ] && [ $# -eq 3 ] &&
+            [ "$1" = roundhouse ] && [ "$2" = fleet-schedule ]; } || {
+            printf 'roundhouse: unsafe fleet-schedule plan argv\n' >&2
+            return 64
+          }
+          fleet_schedule_execute "$operation"
           return
           ;;
         roundhouse:launcher)

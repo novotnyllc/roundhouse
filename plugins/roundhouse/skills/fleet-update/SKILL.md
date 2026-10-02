@@ -26,7 +26,8 @@ policy.
   app upgrade (including Visual Studio Code when its destination is writable)
   follows Homebrew normally. A cask package that reaches Homebrew's hardcoded
   `sudo` succeeds only when it byte-matches an active exact
-  `sealed-cask-payload-v1` enrollment; other privileged artifacts fail closed.
+  `sealed-cask-payload-v1` enrollment on the optional CA lane; otherwise it
+  holds (see "Protected package actions").
 - APT: on an update request, `apt-get update` then plan with
   `apt-get --simulate upgrade`. Do not use `full-upgrade`, `dist-upgrade`, or
   `autoremove` unless explicitly selected.
@@ -151,7 +152,8 @@ Cleanup and autoremove are separate explicit actions.
 
 Auto-updating on a schedule uses the OS scheduler calling the CLI — no new
 daemon, database, or engine. **There is exactly one owned scheduler
-entry per host**, and it runs `roundhouse fleet-run`. Two local runners racing one
+entry per host**: the fast and full job pair that `roundhouse fleet-schedule`
+installs, and it runs `roundhouse fleet-run`. Two local runners racing one
 plugin cache is the failure this prevents, so a second entry is never
 added: the desired-state run **absorbs** the older autoupdate entry rather
 than being given one of its own. Marketplace refresh and package updates are
@@ -289,25 +291,81 @@ Both intervals are jittered from the host **name**, so the fleet does not
 re-synchronise on the same minute; the interval keys live in the store's
 policy block, not on the machine being governed.
 
-The calling workflow installs the entry on request. **Absorb, never duplicate**:
-if `com.novotnyllc.roundhouse.autoupdate` (or its systemd/Task Scheduler
-equivalent) exists, unload and remove it in the same step that installs the
-fleet entry. A host carrying both is the exact double-runner this rule exists
-to prevent.
+The calling workflow installs the entry on request, on the host itself, after
+`roundhouse launcher-install` (the jobs run that `~/.local/bin/roundhouse`
+shim):
+
+```bash
+roundhouse fleet-schedule install     # write and load both jobs; idempotent
+roundhouse fleet-schedule status      # installed / enabled / loaded, definition matches or differs
+roundhouse fleet-schedule uninstall   # unload and remove both
+```
+
+`install` and `uninstall` are mutations, so they ride the **sealed-plan
+pipeline** like `launcher-install` (they need the mutation configuration and
+one local machine whose `expected_hostname`/`expected_user` are this host's).
+The collector observes the jobs (an `agent_artifact roundhouse:schedule`
+record: every definition file's sha256 or its absence, each job's
+loaded/disabled or enabled/active state, the superseded entries); the plan
+lists the exact files to write, keep, remove or absorb (each written file with
+its rendered sha256) and the exact `launchctl`/`systemctl --user` commands, in
+order, and is sealed with that record as its precondition. `apply-plan`
+re-collects and refuses if anything changed since the seal — a job disabled or
+a definition edited in between gets a refusal, not a surprise — then runs only
+those steps (a definition only while it still renders to the sealed digest, a
+command only when it names this host's own jobs), checks every written file is
+at its sealed digest and every removed one is gone, and `status` must then
+report the result. `status` is read-only and unsealed. On Linux, lingering is
+checked before anything is planned: without it `install` exits 75 with the
+`loginctl enable-linger` fix and writes nothing.
+
+`install` matches a job that already exists: an identical definition is left
+alone (not rewritten, not reloaded); a differing one is reported by path
+(never by content — a hand-added environment variable may be a secret), then
+replaced and reloaded. **Absorb, never duplicate**: if
+`com.novotnyllc.roundhouse.autoupdate` or the older one-plist
+`com.novotnyllc.roundhouse.fleet` (or a systemd/Task Scheduler equivalent)
+exists, unload it and set it aside (renamed `.absorbed`, never deleted) in the
+same step that installs the fleet entry; `install` does this for both macOS
+labels. A replaced definition that differed is kept as `.replaced`, and one
+`uninstall` removes as `.removed`; a backup that cannot be made stops the step.
+`uninstall` unloads a job the scheduler still holds before it removes the file,
+and is not done until the scheduler has let go of it. It also opts the host
+out of triggers: after `uninstall`, a trigger or peer nudge only stamps and
+starts no pass until `install` runs again. A host carrying both
+is the exact double-runner this rule exists to prevent. `install` is also the only thing that enables a job: a scheduled pass
+never re-enables one an operator disabled, it raises a `schedule-disabled`
+alert (and `schedule-missing` for a job that disappeared) instead.
 
 The shape per platform, all three running the same two commands:
 
-- **macOS** — one per-user launchd agent,
-  `~/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist`, with two
-  `StartCalendarInterval`/`StartInterval` slots (or two agents only if the
-  scheduler cannot express both in one).
-- **Linux** — a systemd **user** timer pair,
-  `roundhouse-fleet-fast.timer` and `roundhouse-fleet-full.timer`, with
-  `Persistent=true` so a laptop that was asleep catches up once rather than
-  storming.
+Both intervals come from the same policy the run reads
+(`fast_interval_minutes` ± `fast_jitter_minutes`, `cadence_hours` ±
+`jitter_minutes`; 20 ± 5 min and 12 h ± 90 min by default), with the offset
+seeded from the host name, so each host's jobs fire on their own stable
+minute. Re-run `install` after changing those keys.
+
+- **macOS** — two per-user launchd agents (launchd cannot run two commands
+  from one), `~/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet-fast.plist`
+  and `com.novotnyllc.roundhouse.fleet-full.plist`, each a `StartInterval`
+  job running
+  `/bin/zsh -lc 'exec "$HOME/.local/bin/roundhouse" fleet-run --fast|--full'`
+  and logging to `~/Library/Logs/roundhouse-fleet-fast.log` /
+  `roundhouse-fleet-full.log`. Over SSH with nobody logged in at the console
+  there is no GUI domain to load into; the agents load at the next login.
+- **Linux** — a systemd **user** timer pair, each timer with its oneshot
+  service, `roundhouse-fleet-fast.timer` and `roundhouse-fleet-full.timer`, on
+  `OnBootSec`/`OnUnitActiveSec` monotonic intervals, so a laptop that was
+  asleep resumes its cadence at wake rather than storming. The user manager
+  must linger (`loginctl enable-linger`) for the timers to outlive a login
+  session — `install` checks that first, exits 75 and names the fix, and
+  writes nothing — and WSL needs systemd enabled (an unreachable user manager
+  is its own diagnostic). A job is its timer AND its service: either one
+  missing is a missing job, and `status` compares both.
 - **Windows** — a **per-user** scheduled task. Where the machine has a
   configured WSL sibling, register it there and drive the native side through
   the interop lane rather than registering a second native entry.
+  `fleet-schedule` does not manage native Windows.
 
 ```bash
 roundhouse fleet-run --fast    # the fast slot
@@ -330,7 +388,12 @@ failure. The holder is checked before the age: the lock records the holder's
 pid, process start time, command and a random nonce, and a lock whose holder is
 dead — the pid is gone, or now belongs to a process with a different start time
 or command — is taken over (renamed aside, verified by nonce, recreated) and
-raises a `lock-takeover` alert. Every package- and agent-manager query a
+raises a `lock-takeover` alert. A holder that is provably the recorded run
+(pid, start time and command all match) but has held the lock past the pass
+ceiling (2 h) is a hung pass, not a slow one: the next run stops it and every
+process under it (TERM, then KILL, then confirms it is gone), takes the lock
+over the same way, and raises a `lock-takeover` alert naming the stopped run.
+A `manual` lock is never stopped. Every package- and agent-manager query a
 pass makes is bounded (about a minute for a listing, longer only for an
 install), so a manager that hangs makes only its own inventory unknown for
 that pass and raises an `inventory-timeout` alert. A run releases the lock only while it still
@@ -340,51 +403,55 @@ whose `meta.json` is missing so its age cannot be read — and it names the
 recovery rather than forcing. `roundhouse fleet-unlock` releases a lock by hand, and refuses while a
 verified-live run holds it unless given `--force`; `roundhouse fleet-lock` marks
 its lock `manual`, which is never judged dead (the age rule governs it), and also
-exits 75 when the lock is already held. Unattended runs skip protected/privileged actions — those
-stay interactive by design. Failures land in the store's own alert and journal
-records and surface in `roundhouse fleet-pending` and `roundhouse fleet-doctor`.
+exits 75 when the lock is already held. Unattended runs route privileged package work through the
+host's enrolled privilege lane (the fast pass installs a missing apt package,
+the full pass refreshes apt metadata and upgrades each unpinned package to
+its candidate); on a host that has not had its one-time approval the run
+keeps the hold and raises a `privilege-lane` alert naming
+`roundhouse privilege-enroll HOST` — a scheduled run never prompts. Failures
+land in the store's own alert and journal records and surface in
+`roundhouse fleet-pending` and `roundhouse fleet-doctor`.
 
 ## Protected package actions
 
-When readiness advertises an active protected action-context pair, select only
-the repository-defined semantic action already present there:
-`apt.update-metadata.v1`, `apt.install-package-version.v1`,
-`apt.upgrade-package.v1`, `apt.autoremove.v1`,
-`macos.install-signed-pkg.v1`, `macos.apply-system-setting.v1`,
-`winget.inventory-machine.v1`, `winget.install-machine-package.v1`, or
-`winget.upgrade-machine-package.v1`. WinGet is required for V1 Windows
-machine-package work; it is also the only lane for a machine-scope Node.js
-(`OpenJS.NodeJS`) upgrade, within the channel its policy token enrolls. macOS actions are owner-enrolled and default-disabled;
-use them only when readiness advertises the exact active action. Never use root
-Homebrew, arbitrary `sudo`, arbitrary installer scripts, or arbitrary plist
-paths. `sealed-cask-payload-v1` is the sole scripted-package exception: it
-authorizes one exact owner-enrolled Apple-signed package and still invokes only
-the fixed broker installer action. During a normal `homebrew-cask:*` apply,
-Homebrew remains the ordinary-user transaction owner and writes its own
-Caskroom metadata. A human-enrolled `macos-cask-app` record may bind the cask
-token to one existing `/Applications/<Name>.app`; the typed broker prepares
-only that non-symlink tree for the enrolled UID, then Homebrew replaces it as
-the ordinary user. For package casks, the root bridge ignores Homebrew's
-submitted package path after matching its bytes and executes the protected
-artifact instead. It does not authorize unenrolled app targets, package
-receipt-pattern deletion, installer choices, or any other Homebrew sudo shape; those return
-`unsupported_homebrew_cask_privilege_boundary`. Never add argv, executable,
-source, installer, dependency, environment, shell, or elevation controls to a
-protected request; WinGet source dependency selection remains delegated to the
-attested provider.
+Privileged package work goes through the host's **privilege lane** — a
+root-owned helper behind an owner-only queue, enrolled by one OS
+approval (`roundhouse privilege-enroll HOST`) and never by a ceremony. The
+catalog is closed and semantic; a request carries a package token and a
+version, never argv, an executable, an installer selector, an environment, a
+shell, or an elevation control:
 
-Run `"$CLI" privilege-status HOST SNAPSHOT`, seal the semantic action, use
-`verify-privilege-plan` immediately before `submit-privilege-plan`, and use
-`lookup-privilege-result PLAN INDEX OUTPUT` for recovery without resubmission.
-The shared Codex/Claude lifecycle vocabulary is
-`prepare-privilege-identity`, `prepare-privilege-enrollment`,
-`preview-privilege-upgrade`, and `preview-privilege-revocation`. Preserve
-`needs_enrollment`, `drifted`, `transport_unavailable`,
-`unsupported_context`, `unsupported_security_boundary`, `partial`, and
-`stale`; perform no fallback. Never ask for or relay a sudo or Administrator password.
-Human enrollment, upgrade, activation, and revocation stop at the local
-password/UAC boundary; on macOS that is owner-local interactive elevation, not
-an SSH fallback.
+| Platform | Actions |
+| --- | --- |
+| linux, wsl | `apt.update-metadata.v1`, `apt.upgrade-package.v1` (package, candidate version), `apt.install-package-version.v1`, `apt.autoremove.v1`, `lane.probe.v1` |
+| macos, windows | none in this version: readiness reports the lane as `not yet supported`, and machine-scope winget or signed macOS package work holds unless the host has the optional CA lane configured (`privilege_broker.automation_transport`), whose own `winget.*` / `macos.*` actions and vocabulary then apply |
+
+User-scope winget packages, fnm/Node and profile configuration are not lane
+work: they run in the ordinary lane as the user. Never use root Homebrew,
+arbitrary `sudo`, arbitrary installer scripts, or arbitrary plist paths;
+Homebrew cask steps that reach Homebrew's own `sudo` are not routed through
+the lane in this version and hold.
+
+To drive it from a plan: `"$CLI" privilege-status HOST SNAPSHOT` (a
+`privilege_broker`/`readiness` record whose `lifecycle_status` must be
+`ready`), append the package records the plan depends on, seal a lane draft
+(`{"domain":"updates","target":HOST,"lane":"local","operations":[{"type":
+"semantic-action","kind":"privileged_action","id":ACTION,"package":…,
+"version":…,"source":…}]}`) with `seal-plan`, run `verify-privilege-plan`
+immediately before `submit-privilege-plan`, and use
+`lookup-privilege-result PLAN INDEX OUTPUT` for recovery without
+resubmission: every operation carries a sealed request id that the host
+accepts exactly once. `prepare-privilege-enrollment HOST OUT` reports
+`ready`, `needs_one_time_approval` with the exact command, `disabled`,
+`drifted`, or `unreachable`; `prepare-privilege-identity`,
+`preview-privilege-upgrade`, and `preview-privilege-revocation` belong to
+the optional CA lane and are not needed here. Preserve the readiness states
+`ready`, `needs_one_time_approval`, `disabled`, `legacy`, `unsupported`,
+`drifted`, and `unreachable`, and the operation-result states `partial` and
+`rejected`, exactly; perform no fallback.
+Never ask for or relay a sudo or Administrator password: the one approval is
+typed by the owner at the host's own prompt, and the agent's job
+when it is missing is to report `needs_one_time_approval` and the command.
 After a Roundhouse plugin install or update on POSIX, run
 `roundhouse launcher-install ~/.local/bin/roundhouse` so the maintained
 launcher is refreshed from the installed plugin and selects the highest

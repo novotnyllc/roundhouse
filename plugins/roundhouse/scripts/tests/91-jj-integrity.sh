@@ -48,6 +48,83 @@ mkdir -p "$integrity_root"
       fail "§7.3 claimed an identity for an unrecognised path: $integrity_unowned"
   done
 
+  # §6.4: the poll floor's desired-state roots are DERIVED from row 1's one
+  # list. Every root that list names is row 1, and the floor watches all of
+  # them except the history and suggestion roots.
+  for integrity_root_name in $(fleet_vcs_fleet_roots); do
+    case $integrity_root_name in
+      definitions) integrity_sample=definitions/10-overrides.yaml ;;
+      *.yaml) integrity_sample=$integrity_root_name ;;
+      *) integrity_sample=$integrity_root_name/x.yaml ;;
+    esac
+    [ "$(fleet_vcs_path_owner "$integrity_sample")" = '*' ] ||
+      fail "fleet_vcs_fleet_roots names $integrity_root_name, which §7.3 row 1 refuses"
+  done
+  integrity_desired=" $(fleet_vcs_desired_roots | tr '\n' ' ')"
+  for integrity_root_name in fleet.yaml definitions.yaml definitions fleet os \
+    groups hosts trust; do
+    case $integrity_desired in *" $integrity_root_name "*) ;; *)
+      fail "the poll floor does not watch desired-state root $integrity_root_name" ;;
+    esac
+  done
+  for integrity_root_name in lineage proposals checkpoints joins journal alerts \
+    applied findings upstreams; do
+    case $integrity_desired in *" $integrity_root_name "*)
+      fail "the poll floor watches $integrity_root_name, which is not desired state" ;;
+    esac
+  done
+
+  # …and the digest is over git object ids: records-only commits leave it
+  # unchanged, every desired-state root moves it, and the nudge predicate
+  # reads the same answer.
+  integrity_repo="$integrity_root/desired-repo"
+  mkdir -p "$integrity_repo"
+  git -C "$integrity_repo" init -q
+  git -C "$integrity_repo" config user.email selfcheck@example.invalid
+  git -C "$integrity_repo" config user.name selfcheck
+  integrity_commit() {
+    git -C "$integrity_repo" add -A
+    git -C "$integrity_repo" -c commit.gpgsign=false commit -qm "$1" --allow-empty
+    git -C "$integrity_repo" rev-parse HEAD
+  }
+  mkdir -p "$integrity_repo/hosts" "$integrity_repo/trust"
+  printf 'policy: {}\n' >"$integrity_repo/fleet.yaml"
+  printf 'platform: macos\n' >"$integrity_repo/hosts/vireo.yaml"
+  printf 'members: {}\n' >"$integrity_repo/trust/signers.yaml"
+  integrity_base=$(integrity_commit base)
+  integrity_base_digest=$(fleet_vcs_desired_digest "$integrity_repo" "$integrity_base")
+  [ -n "$integrity_base_digest" ] || fail "the desired-state digest of a real commit is empty"
+  integrity_prev=$integrity_base
+  for integrity_record in journal/vireo/2026-10-01.yaml alerts/vireo/x-y.yaml \
+    applied/vireo.yaml findings/vireo/f.yaml upstreams/u/vireo.yaml \
+    joins/robin.yaml lineage/1-x.yaml proposals/promote-x.yaml checkpoints/c.yaml; do
+    mkdir -p "$integrity_repo/$(dirname "$integrity_record")"
+    printf 'at: x\n' >>"$integrity_repo/$integrity_record"
+    integrity_next=$(integrity_commit "$integrity_record")
+    [ "$(fleet_vcs_desired_digest "$integrity_repo" "$integrity_next")" = \
+      "$integrity_base_digest" ] ||
+      fail "a records-only change to $integrity_record moved the desired-state digest"
+    ! fleet_vcs_desired_changed "$integrity_repo" "$integrity_prev" "$integrity_next" ||
+      fail "a records-only change to $integrity_record read as a desired-state change"
+    integrity_prev=$integrity_next
+  done
+  for integrity_layer in groups/development.yaml os/macos.yaml fleet/agents.yaml \
+    hosts/wren.yaml trust/signers.yaml definitions.yaml \
+    definitions/10-overrides.yaml fleet.yaml; do
+    mkdir -p "$integrity_repo/$(dirname "$integrity_layer")"
+    printf 'x: 1\n' >>"$integrity_repo/$integrity_layer"
+    integrity_next=$(integrity_commit "$integrity_layer")
+    fleet_vcs_desired_changed "$integrity_repo" "$integrity_prev" "$integrity_next" ||
+      fail "a change to $integrity_layer did not read as a desired-state change"
+    integrity_prev=$integrity_next
+  done
+  # No "before" (a never-fetched store) is a change; an unreadable commit is
+  # not a reason to stay quiet either.
+  fleet_vcs_desired_changed "$integrity_repo" '' "$integrity_prev" ||
+    fail "a publish with no prior origin read as unchanged"
+  ! fleet_vcs_desired_digest "$integrity_repo" 0000000000000000000000000000000000000000 \
+    >/dev/null 2>&1 || fail "the digest of a missing commit did not fail"
+
   printf '%s\n' vireo wren corvid >"$integrity_root/hosts"
 
   # The whole point of §7.3: a commit dropped into journal/wren/ by vireo

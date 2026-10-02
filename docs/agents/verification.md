@@ -22,8 +22,8 @@ plugin changes.
    ```sh
    for s in roundhouse certify-ssh-node collect-posix enroll-privilege-posix \
            enroll-ssh-posix git-merge-plugin-version launcher-install preflight \
-           prepare-ssh-identity privilege-broker-posix select-sections \
-            test-roundhouse update-integrity; do
+           prepare-ssh-identity privilege-broker-posix privilege-lane-posix \
+           select-sections test-roundhouse update-integrity; do
      bash -n "plugins/roundhouse/scripts/$s"
    done
    for s in plugins/roundhouse/scripts/lib/*.sh plugins/roundhouse/scripts/tests/*.sh; do
@@ -36,7 +36,7 @@ plugin changes.
 
 2. **Lint** — `shellcheck --severity=warning -x -P SCRIPTDIR` (Linux job only)
    on the five substantial scripts: `roundhouse`, `collect-posix`,
-   `launcher-install`, `test-roundhouse`, `update-integrity`. `-x` follows the `# shellcheck
+   `launcher-install`, `privilege-lane-posix`, `test-roundhouse`, `update-integrity`. `-x` follows the `# shellcheck
    source=` directives, so `lib/` and `tests/` are analysed as part of the
    program that sources them rather than as standalone fragments.
 3. **Integrity** — `plugins/roundhouse/scripts/update-integrity` followed by
@@ -44,7 +44,8 @@ plugin changes.
    means the manifest was not regenerated after editing a covered file.
 4. **Self-tests** — the transport and identity helpers each answer a
    `self-test` subcommand: `enroll-ssh-posix self-test`,
-   `prepare-ssh-identity self-test`, `certify-ssh-node self-test`. Any new
+   `prepare-ssh-identity self-test`, `certify-ssh-node self-test`,
+   `privilege-lane-posix self-test`. Any new
    script in these lanes carries the same convention. CI runs enrollment's
    Linux and macOS fixture lifecycles in separate jobs on **both actual runner
    OSes**, using `ROUNDHOUSE_SSH_SELFTEST_PLATFORM=linux` or `macos`. Each

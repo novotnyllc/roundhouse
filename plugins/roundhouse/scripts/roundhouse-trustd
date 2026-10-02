@@ -296,20 +296,21 @@ trustd_apply() {
   [ "$trustd_gen" -ge "$trustd_gen_seen" ] ||
     trustd_die "roster generation went backward ($trustd_gen < $trustd_gen_seen); refusing (§7.12.3)" 65
 
-  # 4. THE DESCENDANT GATE, §7.12.3's other half. The new head must descend
-  #    from trustd's own root-owned reviewed-ref — unless reviewed-ref is local
-  #    work built atop main@origin (a §10.4 abandon leaves the next head a
-  #    SIBLING, which is this host's own doing, not the rollback attack). Same
-  #    rule fleet_trust_materialize applies unprivileged; trustd recomputes it.
+  # 4. THE DESCENDANT GATE, §7.12.3's other half, and the high-water mark to
+  #    record. The new head must descend from trustd's own root-owned
+  #    reviewed-ref, and reviewed-ref only ever records a commit this host saw
+  #    PUBLISHED — never the adopted revision itself, which may be local work no
+  #    remote has. ONE shared function, fleet_trust_reviewed_next, is what
+  #    fleet_trust_materialize applies unprivileged; trustd recomputes it from
+  #    its own root-owned copy of the library and its own root-owned mark.
+  #    trustd IS the privileged lane, so a mark off the published line is a
+  #    plain refusal here, never a migration: every input a migration proof
+  #    reads is same-user state (lib/fleet-trust-migrate.sh).
+  # shellcheck disable=SC2034 # read by lib/fleet-trust-migrate.sh, sourced at run time
+  fleet_trust_privileged_lane=true
   trustd_ref=$(fleet_trust_reviewed_ref)
-  if [ -n "$trustd_ref" ] &&
-    jj -R "$trustd_store" log -r "$trustd_ref" --no-graph -T '""' >/dev/null 2>&1 &&
-    [ -z "$(jj -R "$trustd_store" log -r "$trustd_ref & ::$trustd_rev" \
-      --no-graph -T 'commit_id' 2>/dev/null)" ] &&
-    [ -z "$(jj -R "$trustd_store" log -r "present(main@origin) & ::$trustd_ref" \
-      --no-graph -T 'commit_id' 2>/dev/null)" ]; then
-    trustd_die "$trustd_rev is not a descendant of reviewed-ref $trustd_ref; refusing (§7.12.3)" 65
-  fi
+  trustd_next=$(fleet_trust_reviewed_next "$trustd_store" "$trustd_rev") ||
+    trustd_die "$trustd_next; refusing (§7.12.3)" 65
 
   # 5. RE-DERIVE FROM VERIFIED HISTORY. Replay the ratchet from trustd's own
   #    reviewed-ref high-water mark (or genesis, on first apply) up to the
@@ -345,9 +346,12 @@ EOF
   trustd_at=$(fleet_now)
   fleet_trust_roster_at_head "$trustd_store" "$trustd_rev" \
     "$trustd_tmp/roster" "$trustd_at"
-  printf '%s\n' "$trustd_rev" >"$trustd_tmp/reviewed-ref"
-  printf '%s\n' "$trustd_gen" >"$trustd_tmp/generation"
-  printf '%s\n' "$trustd_at" >"$trustd_tmp/materialized-at"
+  # reviewed-ref is the PUBLISHED mark step 4 chose; the rendered revision
+  # rides in materialized-at's second field, which is what the drift compare
+  # re-renders (fleet_trust_materialized_rev).
+  printf '%s\n' "$trustd_next" >"$trustd_tmp/reviewed-ref"
+  fleet_trust_generation_mark "$trustd_store" "$trustd_next" >"$trustd_tmp/generation"
+  printf '%s %s\n' "$trustd_at" "$trustd_rev" >"$trustd_tmp/materialized-at"
   trustd_install "$trustd_tmp/roster" "$(fleet_trust_materialized_path)" 0644
   trustd_install "$trustd_tmp/reviewed-ref" "$trustd_dest/reviewed-ref" 0644
   trustd_install "$trustd_tmp/generation" "$trustd_dest/generation" 0644

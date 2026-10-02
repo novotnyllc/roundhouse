@@ -1,0 +1,1564 @@
+#!/bin/bash
+# roundhouse — the local privilege lane (POSIX).
+#
+# One OS approval per host (a single sudo, run by `roundhouse privilege-enroll`)
+# installs a root-owned copy of this script, a sudoers grant naming exactly
+# that copy with exactly one argument, and an owner-only request queue. From
+# then on every privileged action the fleet needs runs unattended: the owner
+# writes a closed, semantic request into the queue and asks root to dispatch
+# it; root moves the request out of the owner's reach, validates it, executes
+# the one native command the action stands for, and publishes a digest-bound
+# result. No CA, no certificate, no ceremony, no argv in a request.
+#
+#   privilege-lane-posix status
+#   privilege-lane-posix enroll --host-id HOST --owner USER [--plugin-root DIR]
+#   privilege-lane-posix revoke
+#   privilege-lane-posix dispatch
+#   privilege-lane-posix request ACTION [PACKAGE [VERSION [SOURCE [PAYLOAD-SHA256]]]]
+#                            [--plan-id ID] [--plan-sha256 DIGEST] [--operation-index N]
+#                            [--wait SECONDS] [--request-id REQUEST-ID]
+#   privilege-lane-posix result REQUEST-ID
+#   privilege-lane-posix candidate PACKAGE
+#   privilege-lane-posix actions PLATFORM
+#   privilege-lane-posix self-test
+#
+# This version covers the apt catalog on Linux and WSL. macOS reports
+# `unsupported` here (its signed-package action, the Windows lane and the
+# lane's own self-upgrade are designed in the spec and arrive in a follow-up).
+#
+# Trust model: the lane trusts the enrolled owner. The design, the catalog and
+# the residual risks are in docs/specs/2026-10-01-hands-off-privilege-lane.md.
+set -euo pipefail
+# Under pipefail, `printf … | grep -q` can fail when grep exits on its match
+# before the writer's last write (seen under load with bash 3.2), so every
+# grep over a variable below reads a here-string instead of a pipe.
+
+umask 077
+export LC_ALL=C LANG=C TZ=UTC
+unset BASH_ENV CDPATH ENV GLOBIGNORE IFS \
+  APT_CONFIG DEBIAN_FRONTEND LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES \
+  DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH http_proxy https_proxy ftp_proxy \
+  all_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+readonly lane_name=privilege-lane
+readonly lane_libexec=/usr/local/libexec/roundhouse-lane
+readonly lane_state=/var/lib/roundhouse-lane
+readonly lane_sudoers=/etc/sudoers.d/roundhouse-lane
+readonly max_request_bytes=8192
+readonly max_requests_per_dispatch=32
+readonly max_requests_per_hour=32
+readonly max_request_age=600
+readonly max_request_ttl=3600
+readonly max_future_skew=60
+readonly retain_seconds=604800
+
+host_os=$(uname -s)
+readonly host_os
+
+# --- fixture mode -------------------------------------------------------------
+# The self-check and the fixture suite relocate every root path below a
+# private, non-root prefix and replace the native binaries with stubs. Fixture
+# mode refuses to run as root so a stray variable can never redirect a real
+# enrollment.
+fixture_root=
+fixture_bin=
+fixture_platform=
+if [ -n "${ROUNDHOUSE_LANE_FIXTURE_ROOT:-}" ]; then
+  fixture_root=$ROUNDHOUSE_LANE_FIXTURE_ROOT
+  case $fixture_root in
+    /*) ;;
+    *) printf 'privilege-lane: fixture root must be absolute\n' >&2; exit 64 ;;
+  esac
+  [ "$fixture_root" != / ] || { printf 'privilege-lane: fixture root cannot be /\n' >&2; exit 64; }
+  [ "$(id -u)" -ne 0 ] || { printf 'privilege-lane: fixture mode refuses root\n' >&2; exit 64; }
+  fixture_bin=${ROUNDHOUSE_LANE_FIXTURE_BIN:-}
+  fixture_platform=${ROUNDHOUSE_LANE_FIXTURE_PLATFORM:-}
+fi
+root_prefix=$fixture_root
+libexec_dir=$root_prefix$lane_libexec
+state_dir=$root_prefix$lane_state
+sudoers_path=$root_prefix$lane_sudoers
+installed_script=$libexec_dir/$lane_name
+identity_path=$libexec_dir/lane.identity
+ingress_dir=$state_dir/ingress
+claims_dir=$state_dir/claims
+results_dir=$state_dir/results
+journal_dir=$state_dir/journal
+journal_path=$journal_dir/events.log
+lock_dir=$state_dir/lock
+
+fixture_mode() { [ -n "$fixture_root" ]; }
+
+# --- small portable helpers ---------------------------------------------------
+record() { printf '%s\n' "$@"; }
+now() { date -u +%s; }
+die() {
+  # die STATUS MESSAGE
+  printf 'privilege-lane: %s\n' "$2" >&2
+  exit "$1"
+}
+portable_stat() {
+  case $host_os in
+    Darwin) stat -f "$1" "$3" 2>/dev/null ;;
+    *) stat -c "$2" "$3" 2>/dev/null ;;
+  esac
+}
+file_uid() { portable_stat %u %u "$1"; }
+file_mode() { portable_stat %Lp %a "$1"; }
+file_size() { portable_stat %z %s "$1"; }
+file_links() { portable_stat %l %h "$1"; }
+file_mtime() { portable_stat %m %Y "$1"; }
+sha256_stream() {
+  local output
+  if [ -x /usr/bin/sha256sum ]; then output=$(/usr/bin/sha256sum)
+  elif [ -x /usr/bin/shasum ]; then output=$(/usr/bin/shasum -a 256)
+  elif [ -x /bin/sha256sum ]; then output=$(/bin/sha256sum)
+  else output=$(/usr/bin/openssl dgst -sha256 -r)
+  fi
+  output=${output%% *}
+  [[ $output =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$output"
+}
+sha256_file() { sha256_stream <"$1"; }
+sha256_text() { printf '%s' "$1" | sha256_stream; }
+platform_boundary() {
+  if fixture_mode && [ -n "$fixture_platform" ]; then
+    printf '%s\n' "$fixture_platform"
+    return
+  fi
+  case $host_os in
+    Darwin) printf 'macos\n' ;;
+    Linux)
+      if [ -r /proc/sys/kernel/osrelease ] && grep -Eiq '(microsoft|wsl)' /proc/sys/kernel/osrelease; then
+        printf 'wsl\n'
+      else
+        printf 'linux\n'
+      fi
+      ;;
+    *) printf 'unsupported\n' ;;
+  esac
+}
+protected_uid() {
+  # The uid that owns the privileged side: root natively, the fixture user
+  # inside a fixture root.
+  if fixture_mode; then id -u; else printf '0\n'; fi
+}
+protected_group() {
+  if fixture_mode; then id -gn; elif [ "$host_os" = Darwin ]; then printf 'wheel\n'; else printf 'root\n'; fi
+}
+protected_chain() {
+  # protected_chain DIR: DIR and every ancestor is a privileged-owned,
+  # non-group/world-writable, non-symlink directory. The sudoers grant trusts
+  # the path, so the path's ancestry must be as trustworthy as the file.
+  local cursor=$1
+  while :; do
+    [ -d "$cursor" ] && [ ! -L "$cursor" ] && protected_path "$cursor" || return 1
+    if fixture_mode && [ "$cursor" = "$fixture_root" ]; then return 0; fi
+    [ "$cursor" != / ] || return 0
+    cursor=${cursor%/*}
+    [ -n "$cursor" ] || cursor=/
+  done
+}
+protected_path() {
+  # protected_path PATH MODE-REGEX: a regular file or directory owned by the
+  # privileged uid, not a symlink, with no group/world write bit.
+  local path=$1 mode
+  [ -e "$path" ] && [ ! -L "$path" ] || return 1
+  [ "$(file_uid "$path")" = "$(protected_uid)" ] || return 1
+  mode=$(file_mode "$path") || return 1
+  mode=${mode: -3}
+  case ${mode#?} in *[2367]*) return 1 ;; esac
+  return 0
+}
+native_binary() {
+  # native_binary NAME -> absolute path of a protected native binary, or the
+  # fixture stub of the same name.
+  local name=$1 candidate
+  if fixture_mode; then
+    [ -n "$fixture_bin" ] && [ -x "$fixture_bin/$name" ] || return 1
+    printf '%s\n' "$fixture_bin/$name"
+    return
+  fi
+  for candidate in /usr/sbin/$name /usr/bin/$name /sbin/$name /bin/$name; do
+    [ -x "$candidate" ] && [ ! -L "$candidate" ] && protected_path "$candidate" || continue
+    printf '%s\n' "$candidate"
+    return
+  done
+  return 1
+}
+require_root() {
+  if fixture_mode; then return 0; fi
+  [ "$(id -u)" -eq 0 ] || die 77 "$1 requires root; run it through roundhouse privilege-enroll"
+}
+write_protected_file() {
+  # write_protected_file PATH MODE < content: atomic, privileged-owned.
+  local path=$1 mode=$2 tmp
+  tmp=$(mktemp "${path%/*}/.lane.XXXXXX" 2>/dev/null) || return 1
+  cat >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod "$mode" "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$path"
+}
+ascii_record() {
+  # ascii_record FILE MAX: printable ASCII plus LF, LF-terminated, bounded.
+  local size
+  size=$(file_size "$1") || return 1
+  [ "$size" -ge 1 ] && [ "$size" -le "$2" ] || return 1
+  ! LC_ALL=C grep -q '[^ -~]' "$1" || return 1
+  [ "$(tail -c 1 "$1" | od -An -c | tr -d ' ')" = '\n' ]
+}
+field() {
+  # field FILE LINE-NUMBER NAME -> value, or failure when the line is not
+  # exactly `NAME|value`.
+  awk -F '|' -v number="$2" -v name="$3" '
+    NR == number && NF == 2 && $1 == name { print $2; found = 1 }
+    END { exit found ? 0 : 1 }' "$1"
+}
+
+# --- grammar ------------------------------------------------------------------
+valid_token() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; }
+valid_request_id() { [[ $1 =~ ^request-[0-9a-f]{32}$ ]]; }
+valid_digest() { [[ $1 =~ ^[0-9a-f]{64}$ ]]; }
+valid_digest_or_dash() { [ "$1" = - ] || valid_digest "$1"; }
+valid_uint() { [[ $1 =~ ^(0|[1-9][0-9]{0,18})$ ]]; }
+valid_uint_or_dash() { [ "$1" = - ] || valid_uint "$1"; }
+valid_version() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,127}$ ]]; }
+valid_version_or_dash() { [ "$1" = - ] || valid_version "$1"; }
+valid_plugin_version() { [[ $1 =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]]; }
+# A Debian package name, optionally architecture-qualified (`pkg:i386`), as
+# the apt inventory already records them. A trailing `-` is apt-get's
+# remove syntax (`install PKG-`), never a name.
+valid_apt_package() { [[ $1 =~ ^[a-z0-9][a-z0-9+.-]{0,127}(:[a-z0-9-]{1,16})?$ ]] && [[ $1 != *- ]]; }
+valid_sealed_plan_id() { [[ $1 =~ ^plan-[0-9a-f]{16}$ ]]; }
+valid_plan_id() { [ "$1" = - ] || [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
+valid_account() { [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]]; }
+valid_abs_dir() { [[ $1 =~ ^/[A-Za-z0-9._/@-]+$ ]] && [[ $1 != *'/../'* ]] && [[ $1 != *'/..' ]]; }
+
+platform_actions() {
+  # The closed catalog. Every action takes at most a package and a version;
+  # `source` and `payload-sha256` stay `-` on every one of them. The fields
+  # exist now because the owner-side copy that writes requests is updated
+  # with the plugin while root's copy, which parses them, stays at the
+  # enrolled version until re-enrollment: the record shape must not move
+  # between the two.
+  case $1 in
+    linux|wsl) record apt.update-metadata.v1 apt.upgrade-package.v1 \
+      apt.install-package-version.v1 apt.autoremove.v1 lane.probe.v1 ;;
+    *) return 1 ;;
+  esac
+}
+action_known() {
+  local platform=$1 action=$2 candidate
+  while IFS= read -r candidate; do
+    [ "$candidate" = "$action" ] && return 0
+  done <<EOF
+$(platform_actions "$platform")
+EOF
+  return 1
+}
+
+# --- identity -----------------------------------------------------------------
+# lane-identity|1 is the root-owned record of what was enrolled. Every
+# privileged command re-reads it; nothing in a request can change it.
+id_host=; id_platform=; id_owner_uid=; id_owner_name=; id_plugin_root=
+id_marketplace=; id_plugin=; id_version=; id_sha256=; id_enrolled_at=
+parse_identity() {
+  local file=$1 lines
+  protected_path "$file" && ascii_record "$file" 4096 || return 1
+  lines=$(wc -l <"$file" | tr -d ' ')
+  [ "$lines" = 12 ] && [ "$(sed -n 1p "$file")" = 'lane-identity|1' ] &&
+    [ "$(sed -n 12p "$file")" = 'end-identity|' ] || return 1
+  id_host=$(field "$file" 2 host-id) || return 1
+  id_platform=$(field "$file" 3 platform) || return 1
+  id_owner_uid=$(field "$file" 4 owner-uid) || return 1
+  id_owner_name=$(field "$file" 5 owner-name) || return 1
+  id_plugin_root=$(field "$file" 6 plugin-root) || return 1
+  id_marketplace=$(field "$file" 7 marketplace) || return 1
+  id_plugin=$(field "$file" 8 plugin) || return 1
+  id_version=$(field "$file" 9 lane-version) || return 1
+  id_sha256=$(field "$file" 10 lane-sha256) || return 1
+  id_enrolled_at=$(field "$file" 11 enrolled-at) || return 1
+  valid_token "$id_host" && valid_uint "$id_owner_uid" && valid_account "$id_owner_name" &&
+    valid_token "$id_marketplace" && valid_token "$id_plugin" && valid_plugin_version "$id_version" &&
+    valid_digest "$id_sha256" && valid_uint "$id_enrolled_at" || return 1
+  case $id_platform in linux|wsl) ;; *) return 1 ;; esac
+  [ "$id_plugin_root" = - ] || valid_abs_dir "$id_plugin_root" || return 1
+  [ "$id_owner_uid" != "$(protected_uid)" ] || fixture_mode || return 1
+}
+# The identity has no activation flag: the canary runs synchronously under
+# the same sudo and an EXIT trap rolls everything back, so a half-activated
+# lane never exists.
+render_identity() {
+  # render_identity HOST PLATFORM UID NAME PLUGIN-ROOT MARKETPLACE PLUGIN VERSION SHA ENROLLED
+  record 'lane-identity|1' "host-id|$1" "platform|$2" "owner-uid|$3" "owner-name|$4" \
+    "plugin-root|$5" "marketplace|$6" "plugin|$7" "lane-version|$8" "lane-sha256|$9" \
+    "enrolled-at|${10}" 'end-identity|'
+}
+
+# --- request record -----------------------------------------------------------
+rq_id=; rq_host=; rq_owner=; rq_plan=; rq_plan_sha=; rq_index=; rq_action=
+rq_package=; rq_version=; rq_source=; rq_payload_sha=; rq_created=; rq_expires=; rq_sha=
+render_request_body() {
+  # render_request_body ID HOST OWNER PLAN PLAN-SHA INDEX ACTION PACKAGE VERSION SOURCE PAYLOAD CREATED EXPIRES
+  record 'lane-request|1' "request-id|$1" "host-id|$2" "owner|$3" "plan-id|$4" \
+    "plan-sha256|$5" "operation-index|$6" "action-id|$7" "package|$8" "version|$9" \
+    "source|${10}" "payload-sha256|${11}" "created-at|${12}" "expires-at|${13}" 'end-request|'
+}
+render_request() {
+  local body digest
+  body=$(render_request_body "$@")
+  digest=$(printf '%s\n' "$body" | sha256_stream)
+  printf '%s\n' "$body" "request-sha256|$digest"
+}
+parse_request() {
+  # parse_request FILE: grammar only. Policy (platform, owner, freshness) is
+  # the dispatcher's.
+  local file=$1 lines digest expected
+  ascii_record "$file" "$max_request_bytes" || return 1
+  lines=$(wc -l <"$file" | tr -d ' ')
+  [ "$lines" = 16 ] && [ "$(sed -n 1p "$file")" = 'lane-request|1' ] &&
+    [ "$(sed -n 15p "$file")" = 'end-request|' ] || return 1
+  rq_id=$(field "$file" 2 request-id) || return 1
+  rq_host=$(field "$file" 3 host-id) || return 1
+  rq_owner=$(field "$file" 4 owner) || return 1
+  rq_plan=$(field "$file" 5 plan-id) || return 1
+  rq_plan_sha=$(field "$file" 6 plan-sha256) || return 1
+  rq_index=$(field "$file" 7 operation-index) || return 1
+  rq_action=$(field "$file" 8 action-id) || return 1
+  rq_package=$(field "$file" 9 package) || return 1
+  rq_version=$(field "$file" 10 version) || return 1
+  rq_source=$(field "$file" 11 source) || return 1
+  rq_payload_sha=$(field "$file" 12 payload-sha256) || return 1
+  rq_created=$(field "$file" 13 created-at) || return 1
+  rq_expires=$(field "$file" 14 expires-at) || return 1
+  rq_sha=$(field "$file" 16 request-sha256) || return 1
+  valid_request_id "$rq_id" && valid_token "$rq_host" && valid_uint "$rq_owner" &&
+    valid_plan_id "$rq_plan" && valid_digest_or_dash "$rq_plan_sha" && valid_uint_or_dash "$rq_index" &&
+    valid_token "$rq_action" && valid_version_or_dash "$rq_version" &&
+    valid_digest_or_dash "$rq_payload_sha" && valid_uint "$rq_created" && valid_uint "$rq_expires" &&
+    valid_digest "$rq_sha" || return 1
+  [ "$rq_package" = - ] || [[ $rq_package =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}(:[a-z0-9-]{1,16})?$ ]] || return 1
+  [ "$rq_source" = - ] || valid_token "$rq_source" || return 1
+  expected=$(head -n 15 "$file" | sha256_stream) || return 1
+  digest=$rq_sha
+  [ "$digest" = "$expected" ]
+}
+sealed_mutation() {
+  # Every mutating action must carry the sealed plan it came from — a real
+  # plan id, the plan digest and the operation index — so nothing running
+  # as the owner can skip sealing, verification and the precondition
+  # snapshot by writing a request by hand. Only the probe is ad hoc.
+  [ "$rq_action" = lane.probe.v1 ] ||
+    { valid_sealed_plan_id "$rq_plan" && valid_digest "$rq_plan_sha" && valid_uint "$rq_index"; }
+}
+validate_action_parameters() {
+  # The per-action parameter shape. Anything the action does not use must be
+  # `-`, so a request cannot smuggle a value into a field nobody reads.
+  case $rq_action in
+    apt.update-metadata.v1|apt.autoremove.v1|lane.probe.v1)
+      [ "$rq_package" = - ] && [ "$rq_version" = - ] && [ "$rq_source" = - ] && [ "$rq_payload_sha" = - ] ;;
+    apt.upgrade-package.v1)
+      valid_apt_package "$rq_package" && valid_version "$rq_version" && [ "$rq_source" = - ] && [ "$rq_payload_sha" = - ] ;;
+    apt.install-package-version.v1)
+      valid_apt_package "$rq_package" && [ "$rq_source" = - ] && [ "$rq_payload_sha" = - ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- result record ------------------------------------------------------------
+render_result() {
+  # render_result STATE REASON NATIVE-EXIT PRE POST STARTED FINISHED — from the
+  # parsed request and identity globals.
+  local body digest
+  body=$(record 'lane-result|1' "request-id|$rq_id" "host-id|$id_host" "plan-id|$rq_plan" \
+    "plan-sha256|$rq_plan_sha" "operation-index|$rq_index" "action-id|$rq_action" \
+    "package|$rq_package" "version|$rq_version" "state|$1" "reason|$2" "native-exit|$3" \
+    "pre-state-sha256|$4" "post-state-sha256|$5" "started-at|$6" "finished-at|$7" \
+    "lane-version|$id_version" "lane-sha256|$id_sha256" "request-sha256|$rq_sha" 'end-result|')
+  digest=$(printf '%s\n' "$body" | sha256_stream)
+  printf '%s\n' "$body" "result-sha256|$digest"
+}
+rs_state=; rs_request_id=; rs_native_exit=
+parse_result() {
+  local file=$1 lines digest
+  ascii_record "$file" 8192 || return 1
+  lines=$(wc -l <"$file" | tr -d ' ')
+  [ "$lines" = 21 ] && [ "$(sed -n 1p "$file")" = 'lane-result|1' ] &&
+    [ "$(sed -n 20p "$file")" = 'end-result|' ] || return 1
+  rs_request_id=$(field "$file" 2 request-id) || return 1
+  field "$file" 3 host-id >/dev/null && field "$file" 4 plan-id >/dev/null &&
+    field "$file" 5 plan-sha256 >/dev/null && field "$file" 6 operation-index >/dev/null &&
+    field "$file" 7 action-id >/dev/null && field "$file" 8 package >/dev/null &&
+    field "$file" 9 version >/dev/null && field "$file" 11 reason >/dev/null || return 1
+  rs_state=$(field "$file" 10 state) || return 1
+  rs_native_exit=$(field "$file" 12 native-exit) || return 1
+  digest=$(field "$file" 21 result-sha256) || return 1
+  case $rs_state in completed|rejected|failed|partial) ;; *) return 1 ;; esac
+  [ "$(head -n 20 "$file" | sha256_stream)" = "$digest" ]
+}
+
+# --- status -------------------------------------------------------------------
+grant_present() {
+  # grant_present: the sudoers grant exists, is root-owned and unwritable by
+  # anyone else, and — where this process can read it (root, the fixture) —
+  # holds exactly the expected line. The owner cannot read a 0440 root file,
+  # so from the owner's seat the content is proved by `sudo -n -l` in
+  # owner_can_dispatch instead, never guessed from an unreadable file.
+  local expected
+  protected_path "$sudoers_path" || return 1
+  [ -r "$sudoers_path" ] || return 0
+  expected=$(render_sudoers)
+  [ "$(cat "$sudoers_path")" = "$expected" ]
+}
+render_sudoers() {
+  printf '%s ALL=(root) NOPASSWD:NOSETENV: %s dispatch\n' "$id_owner_name" "$lane_libexec/$lane_name"
+}
+owner_can_dispatch() {
+  # The grant as the owner sees it: `sudo -n -l COMMAND` succeeds only when
+  # the exact command is permitted without a password. Root reads the grant
+  # file itself (grant_present); fixture mode has no sudo and checks the
+  # rendered grant instead.
+  if fixture_mode; then grant_present; return; fi
+  [ "$(id -u)" -ne 0 ] || return 0
+  /usr/bin/sudo -n -l "$lane_libexec/$lane_name" dispatch >/dev/null 2>&1
+}
+st_state=
+st_detail=
+lane_state() {
+  # lane_state: sets st_state and st_detail (and the identity globals when
+  # the identity parses). Never fails; runs in the caller's shell so the
+  # identity it read stays visible.
+  st_detail=
+  st_state=drifted
+  local platform d
+  platform=$(platform_boundary)
+  case $platform in
+    linux|wsl) ;;
+    macos) st_detail='the privilege lane covers linux and wsl in this version; macOS follows'; st_state=unsupported; return 0 ;;
+    *) st_detail="platform $platform"; st_state=unsupported; return 0 ;;
+  esac
+  if [ ! -e "$identity_path" ] && [ ! -e "$installed_script" ] && [ ! -e "$sudoers_path" ]; then
+    st_state=needs_one_time_approval
+    return 0
+  fi
+  if ! parse_identity "$identity_path"; then st_detail='identity record unreadable or unprotected'; return 0; fi
+  if ! protected_path "$installed_script" || [ ! -x "$installed_script" ]; then
+    st_detail='installed lane script missing or unprotected'; return 0
+  fi
+  if ! protected_chain "$libexec_dir" || ! protected_chain "$state_dir"; then
+    st_detail='a directory above the lane is not root-owned or is group/world-writable'; return 0
+  fi
+  if [ "$(sha256_file "$installed_script")" != "$id_sha256" ]; then
+    st_detail='installed lane script digest differs from identity'; return 0
+  fi
+  if ! grant_present; then st_detail='sudoers grant missing or altered'; return 0; fi
+  if [ ! -d "$ingress_dir" ] || [ -L "$ingress_dir" ] || [ "$(file_uid "$ingress_dir")" != "$id_owner_uid" ] ||
+    [ "$(file_mode "$ingress_dir")" != 700 ]; then
+    st_detail='ingress directory ownership or mode drifted'; return 0
+  fi
+  # Each must be a real directory: a protected regular file in the place of
+  # the results directory would pass every ownership check and then swallow
+  # the result of a mutation that already ran.
+  for d in "$claims_dir" "$journal_dir" "$results_dir"; do
+    [ -d "$d" ] && [ ! -L "$d" ] && protected_path "$d" || { st_detail="$d is not a protected directory"; return 0; }
+  done
+  # The owner must be able to reach the helper and read its results: a
+  # root-only 0700 on any of these is protected but unusable, so it is drift.
+  for d in "$libexec_dir" "$state_dir" "$results_dir"; do
+    [ "$(file_mode "$d")" = 755 ] || { st_detail="$d is not traversable by the owner (mode $(file_mode "$d"), expected 755)"; return 0; }
+  done
+  # Only the enrolled owner (or root) can vouch for the grant: another user
+  # on the host has no lane here, and is told so rather than shown `ready`.
+  if [ "$(id -u)" -ne 0 ] && [ "$(id -u)" != "$id_owner_uid" ]; then
+    st_detail="the lane is enrolled for $id_owner_name (uid $id_owner_uid), not the current user"; return 0
+  fi
+  if ! owner_can_dispatch; then st_detail='sudo does not permit the owner to dispatch'; return 0; fi
+  if [ "$id_platform" != "$platform" ]; then st_detail="enrolled for $id_platform on $platform"; return 0; fi
+  st_state=ready
+}
+status_command() {
+  local state platform
+  platform=$(platform_boundary)
+  lane_state
+  state=$st_state
+  record 'lane-status|1' "state|$state" "platform|$platform" \
+    "host-id|${id_host:--}" "owner-uid|${id_owner_uid:--}" "owner-name|${id_owner_name:--}" \
+    "lane-version|${id_version:--}" "lane-sha256|${id_sha256:--}" \
+    "plugin-root|${id_plugin_root:--}" "detail|${st_detail:--}" \
+    "next-command|$(next_command "$state")" 'end-status|'
+  case $state in
+    ready) return 0 ;;
+    needs_one_time_approval) return 75 ;;
+    unsupported) return 69 ;;
+    *) return 74 ;;
+  esac
+}
+next_command() {
+  case $1 in
+    needs_one_time_approval|drifted) printf 'roundhouse privilege-enroll HOST' ;;
+    *) printf -- '-' ;;
+  esac
+}
+
+# --- enrollment ---------------------------------------------------------------
+script_self() {
+  local self=$0
+  case $self in /*) ;; *) self=$PWD/$self ;; esac
+  [ -f "$self" ] || die 64 "cannot locate this script"
+  printf '%s\n' "$self"
+}
+plugin_version_of() {
+  # plugin_version_of SCRIPT-PATH -> the plugin version recorded beside it,
+  # read with sed rather than a user-installed JSON tool (this runs as root).
+  local manifest=${1%/*}/../.codex-plugin/plugin.json version
+  [ -f "$manifest" ] || return 1
+  version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([0-9][0-9.]*\)".*$/\1/p' "$manifest" | head -n 1)
+  valid_plugin_version "$version" || return 1
+  printf '%s\n' "$version"
+}
+plugin_root_of() {
+  # plugin_root_of SCRIPT-PATH VERSION -> the parent of the version directory
+  # when the script lives in an installed plugin cache (…/<version>/scripts/),
+  # otherwise `-` (a repository checkout has no versioned parent).
+  local scripts=${1%/*} version_dir
+  version_dir=${scripts%/*}
+  [ "${version_dir##*/}" = "$2" ] || { printf -- '-\n'; return; }
+  printf '%s\n' "${version_dir%/*}"
+}
+enroll_command() {
+  local host='' owner='' plugin_root='' self version platform owner_uid sha enrolled canary_rc=0
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --host-id) host=${2-}; shift 2 ;;
+      --owner) owner=${2-}; shift 2 ;;
+      --plugin-root) plugin_root=${2-}; shift 2 ;;
+      *) die 64 "enroll: unknown argument $1" ;;
+    esac
+  done
+  valid_token "$host" || die 64 'enroll: --host-id must be a machine name'
+  valid_account "$owner" || die 64 'enroll: --owner must be an account name'
+  require_root enroll
+  platform=$(platform_boundary)
+  case $platform in
+    linux|wsl) ;;
+    macos) die 69 'enroll: the privilege lane covers linux and wsl in this version; macOS follows' ;;
+    *) die 69 "enroll: unsupported platform $platform" ;;
+  esac
+  owner_uid=$(id -u "$owner" 2>/dev/null) || die 64 "enroll: unknown owner account $owner"
+  valid_uint "$owner_uid" || die 64 'enroll: owner uid unreadable'
+  if ! fixture_mode; then
+    [ "$owner_uid" -ne 0 ] || die 64 'enroll: the owner cannot be root'
+  fi
+  self=$(script_self)
+  version=$(plugin_version_of "$self") || die 65 'enroll: cannot read the plugin version beside this script'
+  if [ -z "$plugin_root" ]; then plugin_root=$(plugin_root_of "$self" "$version"); fi
+  [ "$plugin_root" = - ] || valid_abs_dir "$plugin_root" || die 64 'enroll: --plugin-root must be an absolute directory'
+  bash -n "$self" || die 65 'enroll: this script does not parse'
+  native_binary visudo >/dev/null 2>&1 || fixture_mode || die 69 'enroll: visudo is unavailable'
+
+  # Layout. Idempotent: re-running after a partial enrollment or a plugin
+  # update refreshes the root-owned copy and re-validates everything. Every
+  # directory on the way down must be traversable by the owner (the lane's
+  # umask is 077, so the parents are created explicitly at 755), and any
+  # failure from here until the enrollment is journaled rolls back: to the
+  # previous working installation when there was one (the owner's single
+  # approval must survive a failed refresh), to nothing on a first attempt.
+  backup_enrollment
+  trap 'rollback_enrollment' EXIT
+  (umask 022; mkdir -p "$libexec_dir" "$state_dir" "$claims_dir" "$results_dir" "$journal_dir") ||
+    die 74 'enroll: cannot create the lane directories'
+  chmod 755 "$libexec_dir" "$state_dir" "$results_dir"
+  chmod 700 "$claims_dir" "$journal_dir"
+  protected_chain "$libexec_dir" && protected_chain "$state_dir" ||
+    die 74 'enroll: a directory above the lane is not root-owned or is group/world-writable; the grant would trust an unprotected path'
+  mkdir -p "$ingress_dir"
+  chmod 700 "$ingress_dir"
+  chown "$owner_uid" "$ingress_dir"
+  # The owner never executes root's copy, but reads it to compare digests.
+  write_protected_file "$installed_script" 755 <"$self"
+  sha=$(sha256_file "$installed_script")
+  enrolled=$(now)
+  id_owner_name=$owner
+  render_identity "$host" "$platform" "$owner_uid" "$owner" "$plugin_root" novotnyllc roundhouse \
+    "$version" "$sha" "$enrolled" | write_protected_file "$identity_path" 644
+  parse_identity "$identity_path" || die 74 'enroll: identity record failed to round-trip'
+  [ -f "$journal_path" ] || : >"$journal_path"
+  chmod 600 "$journal_path"
+  install_grant
+  # `if cmd; then … else rc=$?` — never `if ! cmd`, whose $? is the negation.
+  if enrollment_canary; then canary_rc=0; else canary_rc=$?; fi
+  if [ "$canary_rc" -ne 0 ]; then
+    rollback_enrollment
+    trap - EXIT
+    record 'lane-enrollment|1' 'state|failed' "reason|$canary_reason" "platform|$platform" 'end-enrollment|'
+    return 74
+  fi
+  # Rollback stays armed until the enrollment is on record: a journal the
+  # lane cannot append to is a lane that cannot account for what it does.
+  if ! journal_event enrollment - - - completed "version=$version" - -; then
+    rollback_enrollment
+    trap - EXIT
+    record 'lane-enrollment|1' 'state|failed' 'reason|journal_write_failed' "platform|$platform" 'end-enrollment|'
+    return 74
+  fi
+  trap - EXIT
+  discard_enrollment_backup
+  record 'lane-enrollment|1' 'state|enrolled' 'reason|one_time_approval_complete' "platform|$platform" \
+    "host-id|$host" "owner-uid|$owner_uid" "owner-name|$owner" "lane-version|$version" "lane-sha256|$sha" \
+    "plugin-root|$plugin_root" "canary|$canary_summary" 'end-enrollment|'
+}
+install_grant() {
+  local tmp visudo
+  if fixture_mode; then
+    mkdir -p "${sudoers_path%/*}"
+    render_sudoers | write_protected_file "$sudoers_path" 440
+    return
+  fi
+  visudo=$(native_binary visudo) || die 69 'visudo is unavailable'
+  tmp=$(mktemp "${sudoers_path%/*}/.roundhouse-lane.XXXXXX")
+  render_sudoers >"$tmp"
+  chmod 440 "$tmp"
+  chown "0:$(protected_group)" "$tmp"
+  "$visudo" -cf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die 65 'the rendered sudoers grant did not pass visudo'; }
+  mv -f "$tmp" "$sudoers_path"
+  "$visudo" -c >/dev/null 2>&1 || { rm -f "$sudoers_path"; die 65 'sudoers failed validation after installing the grant'; }
+}
+run_as_owner() {
+  # run_as_owner COMMAND...: the enrollment canary exercises the lane exactly
+  # as the owner will. Natively that is `sudo -u OWNER`; in fixture mode the
+  # current user already is the owner.
+  if fixture_mode; then "$@"; else /usr/bin/sudo -n -u "#$id_owner_uid" "$@"; fi
+}
+canary_reason=
+canary_summary=
+canary_isolation=
+canary_wait() {
+  # The probe's wait, shortened only inside a fixture root so the self-test
+  # can prove a failed canary rolls the enrollment back without idling.
+  if fixture_mode && [[ ${ROUNDHOUSE_LANE_FIXTURE_CANARY_WAIT:-} =~ ^[1-9][0-9]{0,2}$ ]]; then
+    printf '%s\n' "$ROUNDHOUSE_LANE_FIXTURE_CANARY_WAIT"
+  else
+    printf '30\n'
+  fi
+}
+enrollment_canary() {
+  local probe out rc=0
+  canary_reason=
+  # 1. The exact grant works without a password and drains an empty queue.
+  if fixture_mode; then
+    out=$(run_as_owner "$installed_script" dispatch 2>&1) || rc=$?
+  else
+    out=$(run_as_owner /usr/bin/sudo -n "$lane_libexec/$lane_name" dispatch 2>&1) || rc=$?
+  fi
+  [ "$rc" -eq 0 ] && [ "$(printf '%s\n' "$out" | sed -n 1p)" = 'lane-dispatch|1' ] || {
+    canary_reason=positive_dispatch_failed; return 1; }
+  # 2. Any other argument is refused by sudo. An owner who already holds a
+  # broader passwordless grant (cloud images, dev boxes) is recorded, not
+  # refused: the lane's grant is still exactly one argument, and that broader
+  # authority predates it.
+  canary_isolation=isolated
+  if ! fixture_mode; then
+    rc=0
+    run_as_owner /usr/bin/sudo -n "$lane_libexec/$lane_name" status >/dev/null 2>&1 || rc=$?
+    [ "$rc" -ne 0 ] || canary_isolation=broad-sudo-present
+    rc=0
+    run_as_owner /usr/bin/sudo -n /bin/sh -c true >/dev/null 2>&1 || rc=$?
+    [ "$rc" -ne 0 ] || canary_isolation=broad-sudo-present
+  fi
+  # 3. A probe request completes end to end through the owner's path.
+  rc=0
+  probe=$(run_as_owner "$installed_script" request lane.probe.v1 --wait "$(canary_wait)" 2>&1) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'state|completed' <<<"$probe" || {
+    canary_reason=probe_request_failed; return 1; }
+  canary_summary="dispatch-grant,negative-argument:$canary_isolation,probe-completed"
+}
+# A re-enrollment keeps the previous script, identity and grant beside the
+# live files (same directory, same mode, root-owned; the sudoers copy carries
+# a `.` so sudo ignores it) until the new enrollment is on record.
+enroll_previous=
+enroll_previous_ingress_uid=
+backup_enrollment() {
+  local path
+  enroll_previous=
+  enroll_previous_ingress_uid=
+  # The ingress directory is not copied (its content is the owner's), but
+  # its owner is: a re-enrollment for another account chowns it, and a
+  # failed one must hand it back to the owner the restored identity names.
+  if [ -d "$ingress_dir" ] && [ ! -L "$ingress_dir" ]; then enroll_previous_ingress_uid=$(file_uid "$ingress_dir"); fi
+  for path in "$installed_script" "$identity_path" "$sudoers_path"; do
+    rm -f "$path.previous"
+    [ -f "$path" ] && [ ! -L "$path" ] || continue
+    write_protected_file "$path.previous" "$(file_mode "$path")" <"$path"
+    enroll_previous=true
+  done
+}
+rollback_enrollment() {
+  # First attempt: remove everything. Re-enrollment: put the previous files
+  # back by rename (atomic, same filesystem); a file that did not exist
+  # before is removed again.
+  local path
+  for path in "$installed_script" "$identity_path" "$sudoers_path"; do
+    if [ "$enroll_previous" = true ] && [ -f "$path.previous" ]; then
+      mv -f "$path.previous" "$path"
+    else
+      rm -f "$path" "$path.previous"
+    fi
+  done
+  if [ "$enroll_previous" = true ] && [ -n "$enroll_previous_ingress_uid" ] && [ -d "$ingress_dir" ]; then
+    chown "$enroll_previous_ingress_uid" "$ingress_dir" 2>/dev/null || :
+  fi
+}
+discard_enrollment_backup() {
+  rm -f "$installed_script.previous" "$identity_path.previous" "$sudoers_path.previous"
+}
+revoke_command() {
+  require_root revoke
+  # Never under a running dispatch: its native command would finish into
+  # directories that no longer exist. The lock is taken like a dispatch
+  # takes it, and a held lock is a refusal (75), not a wait.
+  if [ -d "$state_dir" ]; then
+    take_lock || die 75 'revoke: a dispatch is running; retry when it has finished'
+  fi
+  rm -f "$sudoers_path" "$installed_script" "$identity_path"
+  rm -rf "$ingress_dir" "$claims_dir" "$results_dir" "$lock_dir"
+  [ ! -d "$journal_dir" ] || printf 'event|%s|revoke|-|-|-|revoked|lane_removed|-|-\n' "$(now)" >>"$journal_path"
+  record 'lane-revocation|1' 'state|revoked' 'reason|grant_script_identity_and_queue_removed' \
+    'journal|retained' 'end-revocation|'
+}
+
+# --- journal, rate, claims ----------------------------------------------------
+journal_event() {
+  # journal_event KIND REQUEST-ID ACTION PACKAGE STATE REASON REQUEST-SHA RESULT-SHA
+  # (The fixture can make one KIND fail, to prove the callers roll back.)
+  if fixture_mode && [ "${ROUNDHOUSE_LANE_FIXTURE_FAIL_JOURNAL:-}" = "$1" ]; then return 1; fi
+  printf 'event|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$(now)" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" >>"$journal_path"
+}
+requests_in_last_hour() {
+  local since
+  since=$(( $(now) - 3600 ))
+  [ -f "$journal_path" ] || { printf '0\n'; return; }
+  awk -F '|' -v since="$since" '$1 == "event" && $3 == "request" && $2 >= since { n++ } END { print n + 0 }' "$journal_path"
+}
+compact_claims() {
+  local cutoff entry mtime
+  cutoff=$(( $(now) - retain_seconds ))
+  for entry in "$claims_dir"/request-* "$results_dir"/request-*.result; do
+    [ -e "$entry" ] || continue
+    mtime=$(file_mtime "$entry") || continue
+    [ "$mtime" -lt "$cutoff" ] || continue
+    rm -rf "$entry"
+  done
+}
+process_start() {
+  # process_start PID -> the process's start-time token (Linux: field 22 of
+  # /proc/PID/stat, after the parenthesised comm; elsewhere: ps lstart), or
+  # nothing when no such process runs. A pid plus its start time names one
+  # process: a reused pid carries a different token.
+  if [ -r "/proc/$1/stat" ]; then
+    sed 's/^[^)]*) //' "/proc/$1/stat" | awk '{ print $20 }'
+  else
+    ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'
+  fi
+}
+write_lock_identity() { printf '%s\n' "$$" >"$lock_dir/pid"; process_start "$$" >"$lock_dir/start"; }
+take_lock() {
+  local holder start stale
+  if mkdir "$lock_dir" 2>/dev/null; then
+    write_lock_identity
+    return 0
+  fi
+  holder=$(cat "$lock_dir/pid" 2>/dev/null || :)
+  start=$(cat "$lock_dir/start" 2>/dev/null || :)
+  if [[ $holder =~ ^[1-9][0-9]*$ ]]; then
+    # The holder is a competitor while the very process that took the lock
+    # is alive — pid and start time both match — however long its native
+    # command runs. A dead pid, or a live pid with another start time (a
+    # reuse), is a crashed dispatcher's lock.
+    [ "$(process_start "$holder")" != "${start:-?}" ] || return 1
+  else
+    # No pid yet: the holder is between mkdir and its pid write — a
+    # competitor, unless the directory has sat there far longer than any
+    # dispatch runs (a crash in that window).
+    [ $(( $(now) - $(file_mtime "$lock_dir") )) -gt 3600 ] || return 1
+  fi
+  # Takeover by rename: of two dispatchers that both judged the lock stale,
+  # only one moves it aside; the other's mv fails and it yields. Nothing is
+  # ever removed that this process did not rename itself.
+  stale=$lock_dir.stale.$$
+  mv "$lock_dir" "$stale" 2>/dev/null || return 1
+  rm -rf "$stale"
+  mkdir "$lock_dir" 2>/dev/null || return 1
+  write_lock_identity
+}
+release_lock() {
+  # Only the holder releases: a competitor that lost take_lock must never
+  # remove the winner's lock on its way out.
+  if [ "$(cat "$lock_dir/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$lock_dir"; fi
+}
+
+# --- dispatch -----------------------------------------------------------------
+dispatch_command() {
+  local self count=0 completed=0 rejected=0 failed=0 entry
+  require_root dispatch
+  if ! fixture_mode; then
+    self=$(script_self)
+    [ "$self" = "$installed_script" ] || die 65 "dispatch runs only from $installed_script"
+  fi
+  parse_identity "$identity_path" || die 74 'dispatch: lane identity is missing or drifted'
+  [ "$(sha256_file "$installed_script")" = "$id_sha256" ] || die 74 'dispatch: installed script digest drifted'
+  take_lock || die 75 'dispatch: another dispatch holds the lane lock'
+  # A signal ends the drain (a trap alone would resume the loop lock-less).
+  trap 'release_lock; trap - EXIT; exit 1' HUP INT TERM
+  trap 'release_lock' EXIT
+  compact_claims
+  for entry in "$ingress_dir"/request-*.request; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    [ "$count" -lt "$max_requests_per_dispatch" ] || break
+    count=$((count + 1))
+    case $(dispatch_one "$entry") in
+      completed) completed=$((completed + 1)) ;;
+      rejected) rejected=$((rejected + 1)) ;;
+      *) failed=$((failed + 1)) ;;
+    esac
+  done
+  release_lock
+  trap - EXIT HUP INT TERM
+  record 'lane-dispatch|1' "drained|$count" "completed|$completed" "rejected|$rejected" \
+    "failed|$failed" "lane-version|$id_version" 'end-dispatch|'
+}
+dispatch_one() {
+  # dispatch_one INGRESS-FILE -> prints the terminal state. Everything that
+  # can go wrong before the native command is a `rejected` result that names
+  # the reason; the owner never sees a silent drop.
+  local entry=$1 name id claim started finished reason state=rejected native_exit=- pre=- post=-
+  name=${entry##*/}
+  id=${name%.request}
+  started=$(now)
+  # Prime the request globals so a result can be rendered even when the file
+  # is unreadable: only the id (from the name) and the identity are known.
+  rq_id=$id; rq_host=$id_host; rq_owner=-; rq_plan=-; rq_plan_sha=-; rq_index=-; rq_action=-
+  rq_package=-; rq_version=-; rq_source=-; rq_payload_sha=-; rq_created=-; rq_expires=-; rq_sha=-
+  if ! valid_request_id "$id"; then
+    rm -f "$entry"
+    printf 'rejected\n'
+    return
+  fi
+  claim=$claims_dir/$id
+  if [ -e "$claim" ]; then
+    # A replay is journaled and dropped; the original result stays
+    # published so a lookup still returns what actually happened.
+    rm -f "$entry"
+    journal_event request "$id" - - rejected replayed_request - -
+    printf 'rejected\n'
+    return
+  fi
+  mkdir -m 700 "$claim" || { printf 'failed\n'; return; }
+  # Rename before read: once the file is below the root-only claim directory
+  # the owner can no longer replace it. A symlink moves as a symlink and is
+  # refused below; a hard link elsewhere is refused by the link count.
+  if ! mv -f "$entry" "$claim/request.owner" 2>/dev/null; then
+    rm -rf "$claim"; printf 'failed\n'; return
+  fi
+  # The rename moves the owner's inode, and an open descriptor the owner kept
+  # on it still writes through. Every check below the metadata ones, every
+  # hash and every read therefore uses a bounded snapshot copied into a file
+  # root created itself; the owner's inode is unlinked right after.
+  if [ -L "$claim/request.owner" ] || [ ! -f "$claim/request.owner" ]; then reason=request_not_regular_file
+  elif [ "$(file_links "$claim/request.owner")" != 1 ]; then reason=request_hard_linked
+  elif [ "$(file_uid "$claim/request.owner")" != "$id_owner_uid" ]; then reason=request_not_owned_by_enrolled_owner
+  elif [ "$(file_size "$claim/request.owner")" -gt "$max_request_bytes" ]; then reason=request_too_large
+  elif ! snapshot_owner_file "$claim/request.owner" "$claim/request" "$max_request_bytes"; then reason=request_snapshot_failed
+  elif ! parse_request "$claim/request"; then reason=invalid_request_record
+  elif [ "$rq_id" != "$id" ]; then reason=request_id_mismatch
+  elif [ "$rq_host" != "$id_host" ]; then reason=host_id_mismatch
+  elif [ "$rq_owner" != "$id_owner_uid" ]; then reason=owner_mismatch
+  elif ! action_known "$id_platform" "$rq_action"; then reason=unknown_action_for_platform
+  elif ! validate_action_parameters; then reason=invalid_action_parameters
+  elif ! sealed_mutation; then reason=unsealed_mutation_request
+  elif ! request_fresh; then reason=stale_request
+  elif [ "$(requests_in_last_hour)" -ge "$max_requests_per_hour" ]; then reason=rate_limited
+  else reason=
+  fi
+  if [ -n "$reason" ]; then
+    publish_result "$id" rejected "$reason" - - - "$started" "$(now)"
+    printf 'rejected\n'
+    return
+  fi
+  state=completed; reason=completed
+  execute_action "$claim" || :
+  finished=$(now)
+  publish_result "$id" "$state" "$reason" "$native_exit" "$pre" "$post" "$started" "$finished"
+  printf '%s\n' "$state"
+}
+request_fresh() {
+  local current
+  current=$(now)
+  [ "$rq_created" -le $((current + max_future_skew)) ] &&
+    [ $((current - rq_created)) -le "$max_request_age" ] &&
+    [ "$rq_expires" -gt "$current" ] &&
+    [ "$rq_expires" -gt "$rq_created" ] &&
+    [ $((rq_expires - rq_created)) -le "$max_request_ttl" ]
+}
+snapshot_owner_file() {
+  # snapshot_owner_file OWNER-FILE COPY MAX: copy at most MAX+1 bytes of the
+  # owner's (already moved) file into a new root-owned file, refuse if more
+  # arrived than the bound, and unlink the owner's inode.
+  local source=$1 copy=$2 maximum=$3
+  [ ! -e "$copy" ] && [ ! -L "$copy" ] || return 1
+  head -c "$((maximum + 1))" <"$source" >"$copy" || { rm -f "$copy"; return 1; }
+  chmod 600 "$copy"
+  rm -f "$source"
+  [ "$(file_size "$copy")" -le "$maximum" ]
+}
+publish_result() {
+  # publish_result ID STATE REASON NATIVE-EXIT PRE POST STARTED FINISHED —
+  # journals first, then publishes. Work the journal cannot record is not
+  # completed work: the published state becomes `failed` /
+  # `journal_write_failed`, and `state`/`reason` are rewritten in the
+  # caller's scope so dispatch counts it that way too.
+  local id=$1 result
+  result=$(render_result "$2" "$3" "$4" "$5" "$6" "$7" "$8")
+  if ! journal_event request "$id" "$rq_action" "$rq_package" "$2" "$3" "$rq_sha" \
+    "$(head -n 20 <<<"$result" | sha256_stream)"; then
+    state=failed; reason=journal_write_failed
+    result=$(render_result "$state" "$reason" "$4" "$5" "$6" "$7" "$8")
+  fi
+  [ -d "$claims_dir/$id" ] || mkdir -m 700 "$claims_dir/$id"
+  if ! { printf '%s\n' "$result" | write_protected_file "$claims_dir/$id/result" 600; } ||
+    ! { printf '%s\n' "$result" | write_protected_file "$results_dir/$id.result" 644; }; then
+    # A result the owner cannot read is not a completed request: the
+    # journal records the publication failure and the dispatch counts it
+    # as failed; a lookup finds either the failed record or nothing.
+    state=failed; reason=result_publish_failed
+    journal_event request "$id" "$rq_action" "$rq_package" "$state" "$reason" "$rq_sha" - 2>/dev/null || :
+    result=$(render_result "$state" "$reason" "$4" "$5" "$6" "$7" "$8")
+    { printf '%s\n' "$result" | write_protected_file "$claims_dir/$id/result" 600; } 2>/dev/null || :
+    { printf '%s\n' "$result" | write_protected_file "$results_dir/$id.result" 644; } 2>/dev/null || :
+  fi
+}
+
+# --- actions ------------------------------------------------------------------
+# Every action sets state/reason/native_exit/pre/post in the caller's scope.
+# The native command is fixed per action; the request contributes only the
+# validated package and version.
+native_env() {
+  # native_env COMMAND...: the one native command, under a clean environment
+  # and the system umask — this script's own 077 must not reach dpkg
+  # maintainer scripts, whose files would come out root-only.
+  (umask 022; exec env -i LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME="$(native_home)" DEBIAN_FRONTEND=noninteractive "$@" </dev/null)
+}
+apt_dpkg_options() {
+  # Never a conffile prompt: keep the local conffile, fall back to the
+  # package default, and let stdin stay closed.
+  printf '%s\n' -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+}
+native_home() { if fixture_mode; then printf '%s\n' "$fixture_root"; elif [ "$host_os" = Darwin ]; then printf '/var/root\n'; else printf '/root\n'; fi; }
+fail_action() { state=failed; reason=$1; return 1; }
+execute_action() {
+  local claim=$1
+  case $rq_action in
+    lane.probe.v1) state=completed; reason=probe_completed; native_exit=0 ;;
+    apt.update-metadata.v1) action_apt_update ;;
+    apt.upgrade-package.v1) action_apt_upgrade ;;
+    apt.install-package-version.v1) action_apt_install ;;
+    apt.autoremove.v1) action_apt_autoremove ;;
+    *) state=rejected; reason=unknown_action; return 1 ;;
+  esac
+}
+apt_policy_snapshot() {
+  # apt_policy_snapshot -> digest of `apt-cache policy` for the whole host
+  # (metadata actions) so a result can say whether anything changed.
+  local apt_cache
+  apt_cache=$(native_binary apt-cache) || return 1
+  native_env "$apt_cache" policy 2>/dev/null | sha256_stream
+}
+apt_candidate() {
+  # apt_candidate PACKAGE -> "INSTALLED CANDIDATE" from apt-cache policy.
+  local apt_cache installed candidate output
+  apt_cache=$(native_binary apt-cache) || return 1
+  output=$(native_env "$apt_cache" policy "$1" 2>/dev/null) || return 1
+  installed=$(awk '$1 == "Installed:" { print $2; exit }' <<<"$output")
+  candidate=$(awk '$1 == "Candidate:" { print $2; exit }' <<<"$output")
+  [ -n "$installed" ] && [ -n "$candidate" ] || return 1
+  printf '%s %s\n' "$installed" "$candidate"
+}
+dpkg_version() {
+  local dpkg_query
+  dpkg_query=$(native_binary dpkg-query) || return 1
+  native_env "$dpkg_query" -W -f '${Version}' "$1" 2>/dev/null
+}
+action_apt_update() {
+  local apt_get rc=0
+  apt_get=$(native_binary apt-get) || fail_action apt_get_unavailable || return 1
+  pre=$(apt_policy_snapshot) || pre=-
+  native_env "$apt_get" -q update >/dev/null 2>&1 || rc=$?
+  native_exit=$rc
+  [ "$rc" -eq 0 ] || { post=-; fail_action native_operation_failed; return 1; }
+  # A refresh whose post-state cannot be read is not a verified refresh.
+  post=$(apt_policy_snapshot) || { post=-; state=partial; reason=post_state_unavailable; return 1; }
+  state=completed; reason=metadata_refreshed
+}
+action_apt_upgrade() {
+  local apt_get policy installed candidate rc=0 after
+  apt_get=$(native_binary apt-get) || fail_action apt_get_unavailable || return 1
+  policy=$(apt_candidate "$rq_package") || { state=rejected; reason=package_unknown_to_apt; return 1; }
+  installed=${policy%% *}; candidate=${policy##* }
+  [ "$installed" != '(none)' ] || { state=rejected; reason=package_not_installed; return 1; }
+  [ "$candidate" = "$rq_version" ] || { state=rejected; reason=candidate_version_mismatch; return 1; }
+  [ "$installed" != "$rq_version" ] || { state=completed; reason=already_at_version; native_exit=0; return 0; }
+  pre=$(sha256_text "upgrade|$rq_package|$installed|$candidate")
+  # shellcheck disable=SC2046 # fixed option tokens, no whitespace
+  native_env "$apt_get" -q -y $(apt_dpkg_options) --no-remove --only-upgrade install "$rq_package=$rq_version" >/dev/null 2>&1 || rc=$?
+  native_exit=$rc
+  after=$(dpkg_version "$rq_package") || after=-
+  post=$(sha256_text "installed|$rq_package|$after")
+  [ "$rc" -eq 0 ] || fail_action native_operation_failed || return 1
+  [ "$after" = "$rq_version" ] || { state=partial; reason=post_state_mismatch; return 1; }
+  state=completed; reason=package_upgraded
+}
+action_apt_install() {
+  local apt_get rc=0 after spec
+  apt_get=$(native_binary apt-get) || fail_action apt_get_unavailable || return 1
+  spec=$rq_package
+  [ "$rq_version" = - ] || spec="$rq_package=$rq_version"
+  pre=$(sha256_text "install|$rq_package|$(dpkg_version "$rq_package" || printf -- '-')")
+  # shellcheck disable=SC2046 # fixed option tokens, no whitespace
+  native_env "$apt_get" -q -y $(apt_dpkg_options) --no-remove --no-install-recommends install "$spec" >/dev/null 2>&1 || rc=$?
+  native_exit=$rc
+  after=$(dpkg_version "$rq_package") || after=-
+  post=$(sha256_text "installed|$rq_package|$after")
+  [ "$rc" -eq 0 ] || fail_action native_operation_failed || return 1
+  [ "$after" != - ] && { [ "$rq_version" = - ] || [ "$after" = "$rq_version" ]; } ||
+    { state=partial; reason=post_state_mismatch; return 1; }
+  state=completed; reason=package_installed
+}
+action_apt_autoremove() {
+  local apt_get rc=0 remaining simulation
+  apt_get=$(native_binary apt-get) || fail_action apt_get_unavailable || return 1
+  pre=$(apt_policy_snapshot) || pre=-
+  native_env "$apt_get" -q -y autoremove >/dev/null 2>&1 || rc=$?
+  native_exit=$rc
+  [ "$rc" -eq 0 ] || { post=$(apt_policy_snapshot) || post=-; fail_action native_operation_failed || return 1; }
+  # Post-state: a simulation must run AND report nothing left to remove. The
+  # status is checked explicitly — errexit is off in this path and a failed
+  # simulation would otherwise read as "nothing remaining".
+  if ! simulation=$(native_env "$apt_get" -q --simulate autoremove 2>/dev/null); then
+    post=$(sha256_text 'autoremove|simulation|failed')
+    state=partial; reason=post_check_failed; return 1
+  fi
+  remaining=$(awk '$1 == "Remv" { n++ } END { print n + 0 }' <<<"$simulation")
+  post=$(sha256_text "autoremove|remaining|$remaining")
+  [ "$remaining" -eq 0 ] || { state=partial; reason=post_state_mismatch; return 1; }
+  state=completed; reason=autoremove_completed
+}
+# --- request (owner side) -----------------------------------------------------
+request_command() {
+  local action='' package=- version=- source=- payload_sha=- plan_id=- plan_sha=- index=- wait_seconds=600
+  local positional=0 id='' created expires request_file result_file deadline rc=0 state platform
+  local request_digest timeout_state timeout_reason timeout_rc
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+      --request-id) id=${2-}; shift 2 ;;
+      --plan-id) plan_id=${2-}; shift 2 ;;
+      --plan-sha256) plan_sha=${2-}; shift 2 ;;
+      --operation-index) index=${2-}; shift 2 ;;
+      --wait) wait_seconds=${2-}; shift 2 ;;
+      --*) die 64 "request: unknown option $1" ;;
+      *)
+        case $positional in
+          0) action=$1 ;; 1) package=$1 ;; 2) version=$1 ;; 3) source=$1 ;; 4) payload_sha=$1 ;;
+          *) die 64 'request: too many arguments' ;;
+        esac
+        positional=$((positional + 1)); shift ;;
+    esac
+  done
+  [ -n "$action" ] || die 64 'request: ACTION is required'
+  valid_uint "$wait_seconds" && [ "$wait_seconds" -le 3600 ] || die 64 'request: --wait must be 0..3600 seconds'
+  platform=$(platform_boundary)
+  lane_state
+  state=$st_state
+  [ "$state" = ready ] || {
+    record 'lane-result|1' "request-id|-" "host-id|${id_host:--}" 'plan-id|-' 'plan-sha256|-' 'operation-index|-' \
+      "action-id|$action" "package|$package" "version|$version" 'state|rejected' "reason|lane_$state" \
+      'native-exit|-' 'pre-state-sha256|-' 'post-state-sha256|-' "started-at|$(now)" "finished-at|$(now)" \
+      "lane-version|${id_version:--}" "lane-sha256|${id_sha256:--}" 'request-sha256|-' 'end-result|' 'result-sha256|-'
+    return 75
+  }
+  [ "$(id -u)" = "$id_owner_uid" ] || die 64 'request: only the enrolled owner can submit'
+  # A sealed plan supplies its own request id so a resubmitted plan is a
+  # replay on the host; an ad-hoc request gets a fresh one.
+  [ -n "$id" ] || id=request-$(random_hex 32)
+  valid_request_id "$id" || die 64 'request: --request-id must be request-<32 hex>'
+  [ ! -e "$results_dir/$id.result" ] && [ ! -e "$ingress_dir/$id.request" ] || {
+    record 'lane-result|1' "request-id|$id" "host-id|$id_host" "plan-id|$plan_id" "plan-sha256|$plan_sha" \
+      "operation-index|$index" "action-id|$action" "package|$package" "version|$version" 'state|rejected' \
+      'reason|replayed_request' 'native-exit|-' 'pre-state-sha256|-' 'post-state-sha256|-' "started-at|$(now)" \
+      "finished-at|$(now)" "lane-version|$id_version" "lane-sha256|$id_sha256" 'request-sha256|-' 'end-result|' 'result-sha256|-'
+    return 65
+  }
+  created=$(now)
+  expires=$((created + max_request_ttl))
+  render_request "$id" "$id_host" "$id_owner_uid" "$plan_id" "$plan_sha" "$index" "$action" "$package" \
+    "$version" "$source" "$payload_sha" "$created" "$expires" >"$ingress_dir/.$id.tmp"
+  chmod 600 "$ingress_dir/.$id.tmp"
+  parse_request "$ingress_dir/.$id.tmp" || { rm -f "$ingress_dir/.$id.tmp"; die 64 'request: arguments do not form a valid request'; }
+  action_known "$platform" "$action" || { rm -f "$ingress_dir/.$id.tmp"; die 64 "request: $action is not an action on $platform"; }
+  validate_action_parameters || { rm -f "$ingress_dir/.$id.tmp"; die 64 "request: invalid parameters for $action"; }
+  sealed_mutation || { rm -f "$ingress_dir/.$id.tmp"; die 64 "request: $action needs the sealed plan it came from (--plan-id plan-<16 hex> --plan-sha256 DIGEST --operation-index N); only lane.probe.v1 is ad hoc"; }
+  request_file=$ingress_dir/$id.request
+  mv -f "$ingress_dir/.$id.tmp" "$request_file"
+  # Trigger, in the background. The grant permits exactly this; a refusal
+  # means the lane has drifted since status said ready. The deadline bounds
+  # how long the OWNER waits, never how long root works: a native command
+  # that hangs (a package lock, a stalled mirror) keeps running under root
+  # and the owner reports the request as claimed-and-pending instead of
+  # hanging with it — an unattended run must get its turn back.
+  trigger_dispatch >/dev/null 2>&1 &
+  dispatch_pid=$!
+  result_file=$results_dir/$id.result
+  deadline=$(( $(now) + wait_seconds ))
+  until [ -f "$result_file" ] || [ "$(now)" -ge "$deadline" ]; do
+    sleep 0.5
+    if ! kill -0 "$dispatch_pid" 2>/dev/null; then
+      rc=0; wait "$dispatch_pid" || rc=$?
+      [ ! -f "$result_file" ] || break
+      # 75: another dispatch held the lock and may have drained this
+      # request too; trigger once more. Anything else is final.
+      [ "$rc" -eq 75 ] || break
+      rc=0
+      trigger_dispatch >/dev/null 2>&1 &
+      dispatch_pid=$!
+    fi
+  done
+  if [ ! -f "$result_file" ]; then
+    if mv -f "$request_file" "$ingress_dir/.$id.withdrawn" 2>/dev/null; then
+      # Never claimed: the dispatch did not run. The withdrawal is a rename,
+      # so a root claim that lands in the same instant takes the file first
+      # and this branch is not reached (root's own rename would then fail,
+      # and it publishes nothing for a request it never read).
+      request_digest=$(head -n 15 "$ingress_dir/.$id.withdrawn" | sha256_stream) || request_digest=-
+      rm -f "$ingress_dir/.$id.withdrawn"
+      timeout_state=rejected; timeout_reason=lane_dispatch_unavailable; timeout_rc=75
+    else
+      # Claimed by root but not yet answered (a long native command): the
+      # outcome is unknown, not refused — look it up later with `result`.
+      request_digest=-
+      timeout_state=partial; timeout_reason=claimed_result_pending_use_result_lookup; timeout_rc=71
+    fi
+    record 'lane-result|1' "request-id|$id" "host-id|$id_host" "plan-id|$plan_id" "plan-sha256|$plan_sha" \
+      "operation-index|$index" "action-id|$action" "package|$package" "version|$version" "state|$timeout_state" \
+      "reason|$timeout_reason" "native-exit|$rc" 'pre-state-sha256|-' 'post-state-sha256|-' \
+      "started-at|$created" "finished-at|$(now)" "lane-version|$id_version" "lane-sha256|$id_sha256" \
+      "request-sha256|$request_digest" 'end-result|' 'result-sha256|-'
+    return "$timeout_rc"
+  fi
+  parse_result "$result_file" || die 74 'request: the published result is malformed'
+  [ "$rs_request_id" = "$id" ] || die 74 'request: the published result answers a different request'
+  cat "$result_file"
+  case $rs_state in
+    completed) return 0 ;;
+    rejected) return 65 ;;
+    partial) return 71 ;;
+    *) return 70 ;;
+  esac
+}
+trigger_dispatch() {
+  # The one privileged invocation the owner makes.
+  if fixture_mode; then "$installed_script" dispatch; else /usr/bin/sudo -n "$lane_libexec/$lane_name" dispatch; fi
+}
+candidate_command() {
+  # candidate_command PACKAGE: the owner-side view of what apt would do,
+  # `lane-candidate|1` with installed and candidate versions (`-` when
+  # unknown). This is what the controller seals a precondition against and
+  # rechecks right before it submits; the root side checks the same thing
+  # again against its own apt-cache.
+  local policy installed candidate
+  valid_apt_package "$1" || die 64 'candidate: PACKAGE must be an apt package name'
+  native_binary apt-cache >/dev/null || die 69 'candidate: apt-cache is unavailable'
+  if policy=$(apt_candidate "$1"); then
+    installed=${policy%% *}
+    candidate=${policy##* }
+  else
+    installed=; candidate=
+  fi
+  [ "$installed" != '(none)' ] || installed=
+  [ "$candidate" != '(none)' ] || candidate=
+  record 'lane-candidate|1' "package|$1" "installed|${installed:--}" "candidate|${candidate:--}" 'end-candidate|'
+}
+result_command() {
+  # result_command REQUEST-ID: the published result for one request, owner
+  # readable, never a resubmission.
+  valid_request_id "$1" || die 64 'result: REQUEST-ID must be request-<32 hex>'
+  [ -f "$results_dir/$1.result" ] && parse_result "$results_dir/$1.result" ||
+    die 66 'result: no published result for that request'
+  cat "$results_dir/$1.result"
+  case $rs_state in completed) return 0 ;; rejected) return 65 ;; partial) return 71 ;; *) return 70 ;; esac
+}
+random_hex() {
+  local wanted=$1 value
+  value=$(od -An -N "$((wanted / 2))" -tx1 /dev/urandom | tr -d ' \n')
+  [ "${#value}" -eq "$wanted" ] || die 74 'cannot read /dev/urandom'
+  printf '%s\n' "$value"
+}
+
+# --- self-test ----------------------------------------------------------------
+self_test() {
+  local root bin self plugin_root version out rc id ingress_file
+  self=$(script_self)
+  root=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-lane-selftest.XXXXXX")
+  root=$(cd "$root" && pwd -P)
+  trap 'rm -rf "$root"' EXIT HUP INT TERM
+  version=$(plugin_version_of "$self") || { printf 'FAIL: cannot read plugin version\n' >&2; return 1; }
+  # A fixture plugin cache at the current version: enrollment reads the
+  # plugin version beside the script and records the cache root.
+  plugin_root=$root/cache/roundhouse
+  mkdir -p "$plugin_root/$version/scripts" "$plugin_root/$version/.codex-plugin"
+  cp "$self" "$plugin_root/$version/scripts/$lane_name"
+  printf '{\n  "name": "roundhouse",\n  "version": "%s"\n}\n' "$version" >"$plugin_root/$version/.codex-plugin/plugin.json"
+  # Native stubs: apt tools that behave, and record, deterministically.
+  bin=$root/bin
+  mkdir -p "$bin"
+  write_apt_stubs "$bin" "$root"
+  export ROUNDHOUSE_LANE_FIXTURE_ROOT="$root/fixture"
+  export ROUNDHOUSE_LANE_FIXTURE_BIN="$bin"
+  export ROUNDHOUSE_LANE_FIXTURE_PLATFORM=linux
+  mkdir -p "$root/fixture"
+  local lane=$plugin_root/$version/scripts/$lane_name
+  # Before enrollment: status says exactly one approval is needed.
+  rc=0; out=$("$lane" status) || rc=$?
+  [ "$rc" -eq 75 ] && grep -Fqx 'state|needs_one_time_approval' <<<"$out" || self_fail 'pre-enrollment status'
+  # A failed canary (here: a live dispatch lock the probe cannot take) must
+  # roll the whole enrollment back — no grant, no root copy, no identity —
+  # and report the failure with its own exit status.
+  mkdir -p "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid" &&
+    process_start "$$" >"$root/fixture$lane_state/lock/start" || self_fail 'lock fixture'
+  rc=0; out=$(ROUNDHOUSE_LANE_FIXTURE_CANARY_WAIT=2 "$lane" enroll --host-id test-host --owner "$(id -un)" --plugin-root "$plugin_root" 2>/dev/null) || rc=$?
+  [ "$rc" -eq 74 ] && grep -Fqx 'state|failed' <<<"$out" && grep -Eqx 'reason\|(positive_dispatch_failed|probe_request_failed)' <<<"$out" ||
+    self_fail "failed canary did not report failure (rc $rc): $out"
+  [ ! -e "$root/fixture$lane_sudoers" ] && [ ! -e "$root/fixture$lane_libexec/$lane_name" ] && [ ! -e "$root/fixture$lane_libexec/lane.identity" ] ||
+    self_fail 'failed canary left the grant, script or identity installed'
+  rc=0; out=$("$lane" status) || rc=$?
+  [ "$rc" -eq 75 ] || self_fail 'status after a failed canary is not needs_one_time_approval'
+  rm -rf "$root/fixture$lane_state/lock"
+  # Enrollment (fixture root, current user as the privileged side).
+  rc=0; out=$("$lane" enroll --host-id test-host --owner "$(id -un)" --plugin-root "$plugin_root") || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'state|enrolled' <<<"$out" || self_fail "enrollment: $out"
+  rc=0; out=$("$lane" status) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'state|ready' <<<"$out" || self_fail "post-enrollment status: $out"
+  local installed=$root/fixture$lane_libexec/$lane_name
+  [ "$(file_mode "$installed")" = 755 ] || self_fail 'installed script mode'
+  [ "$(file_mode "$root/fixture$lane_state/ingress")" = 700 ] || self_fail 'ingress mode'
+  grep -Fq "$(id -un) ALL=(root) NOPASSWD:NOSETENV: $lane_libexec/$lane_name dispatch" "$root/fixture$lane_sudoers" ||
+    self_fail 'sudoers grant text'
+  # Every mutating request below carries the sealed plan it (notionally)
+  # came from; only the probe is ad hoc.
+  sealed() { "$installed" request "$@" --plan-id plan-0123456789abcdef --plan-sha256 "$(sha256_text plan)" --operation-index 3; }
+  # A mutating request without its sealed plan never reaches the queue; the
+  # root side refuses one that was written by hand just the same.
+  rc=0; "$installed" request apt.update-metadata.v1 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 64 ] || self_fail 'an unsealed mutation request was accepted by the owner side'
+  rc=0; "$installed" request apt.update-metadata.v1 --plan-id fleet-run --plan-sha256 "$(sha256_text plan)" --operation-index 0 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 64 ] || self_fail 'a fleet-run placeholder plan id was accepted'
+  # Closed catalog: argv, shell and unknown actions never reach the queue.
+  rc=0; sealed 'apt.upgrade-package.v1' 'curl; rm -rf /' 1.0 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 64 ] || self_fail 'shell-shaped package accepted'
+  rc=0; sealed winget.install-machine-package.v1 Foo.Bar >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 64 ] || self_fail 'foreign-platform action accepted'
+  rc=0; sealed apt.update-metadata.v1 curl >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 64 ] || self_fail 'surplus parameter accepted'
+  rc=0; sealed apt.install-package-version.v1 curl- >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 64 ] || self_fail 'apt remove syntax (PKG-) accepted as a package name'
+  rc=0; out=$("$installed" candidate curl) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'installed|8.1.0-1' <<<"$out" && grep -Fqx 'candidate|8.2.0-1' <<<"$out" || self_fail "candidate record: $out"
+  rc=0; out=$("$installed" candidate nonexistent) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'candidate|-' <<<"$out" || self_fail "unknown candidate record: $out"
+  # apt actions through the stubs.
+  rc=0; out=$(sealed apt.update-metadata.v1) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'reason|metadata_refreshed' <<<"$out" &&
+    grep -Fqx 'plan-id|plan-0123456789abcdef' <<<"$out" &&
+    grep -Fqx 'operation-index|3' <<<"$out" || self_fail "apt update: $out"
+  grep -Fqx 'apt-get -q update' "$root/apt.log" || self_fail 'apt-get update argv'
+  # A refresh whose post-state cannot be read is partial, never completed.
+  : >"$root/apt-policy-fail"
+  rc=0; out=$(sealed apt.update-metadata.v1) || rc=$?
+  rm -f "$root/apt-policy-fail"
+  [ "$rc" -eq 71 ] && grep -Fqx 'reason|post_state_unavailable' <<<"$out" || self_fail "unreadable post-state reported as (rc $rc): $out"
+  # A native command that hangs does not hang the owner: the wait bounds the
+  # owner's side, the request is reported claimed-and-pending, and root
+  # finishes on its own so a later lookup finds the result.
+  : >"$root/apt-hang"
+  local hang_started hang_id
+  hang_started=$(now)
+  rc=0; out=$(sealed apt.update-metadata.v1 --wait 1) || rc=$?
+  rm -f "$root/apt-hang"
+  [ "$rc" -eq 71 ] && grep -Fqx 'reason|claimed_result_pending_use_result_lookup' <<<"$out" || self_fail "hung dispatch (rc $rc): $out"
+  [ $(( $(now) - hang_started )) -le 3 ] || self_fail 'the owner waited for the hung native command'
+  hang_id=$(sed -n 's/^request-id|//p' <<<"$out")
+  sleep 5
+  rc=0; out=$("$installed" result "$hang_id") || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'reason|metadata_refreshed' <<<"$out" || self_fail "hung dispatch never published (rc $rc): $out"
+  grep -Fqx 'umask 0022' "$root/umask.log" || self_fail "native command did not run under the system umask: $(cat "$root/umask.log")"
+  id=$(printf '%s\n' "$out" | sed -n 's/^request-id|//p')
+  rc=0; "$installed" result "$id" >"$root/lookup.out" || rc=$?
+  [ "$rc" -eq 0 ] && cmp -s "$root/lookup.out" "$root/fixture$lane_state/results/$id.result" || self_fail 'result lookup'
+  rc=0; "$installed" result request-00000000000000000000000000000000 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 66 ] || self_fail 'missing result lookup'
+  # Unjournaled work is never reported completed.
+  rc=0; out=$(ROUNDHOUSE_LANE_FIXTURE_FAIL_JOURNAL=request sealed apt.update-metadata.v1) || rc=$?
+  [ "$rc" -eq 70 ] && grep -Fqx 'state|failed' <<<"$out" && grep -Fqx 'reason|journal_write_failed' <<<"$out" ||
+    self_fail "unjournaled mutation reported as (rc $rc): $out"
+  rc=0; out=$(sealed apt.upgrade-package.v1 curl 8.2.0-1) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'reason|package_upgraded' <<<"$out" || self_fail "apt upgrade: $out"
+  grep -Fqx 'apt-get -q -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-remove --only-upgrade install curl=8.2.0-1' "$root/apt.log" || self_fail 'apt-get upgrade argv'
+  rc=0; out=$(sealed apt.upgrade-package.v1 curl 9.9.9) || rc=$?
+  [ "$rc" -eq 65 ] && grep -Fqx 'reason|candidate_version_mismatch' <<<"$out" || self_fail "apt wrong candidate: $out"
+  rc=0; out=$(sealed apt.upgrade-package.v1 nonexistent 1.0) || rc=$?
+  [ "$rc" -eq 65 ] && grep -Fqx 'reason|package_unknown_to_apt' <<<"$out" || self_fail "apt unknown: $out"
+  rc=0; out=$(sealed apt.install-package-version.v1 jq 1.7.1-3) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'reason|package_installed' <<<"$out" || self_fail "apt install: $out"
+  : >"$root/apt-remaining"
+  rc=0; out=$(sealed apt.autoremove.v1) || rc=$?
+  [ "$rc" -eq 71 ] && grep -Fqx 'reason|post_state_mismatch' <<<"$out" || self_fail "autoremove with leftovers was not partial (rc $rc)"
+  rm -f "$root/apt-remaining"
+  : >"$root/apt-simulate-fail"
+  rc=0; out=$(sealed apt.autoremove.v1) || rc=$?
+  [ "$rc" -eq 71 ] && grep -Fqx 'reason|post_check_failed' <<<"$out" || self_fail "a failed autoremove simulation was not a failed post-check (rc $rc)"
+  rm -f "$root/apt-simulate-fail"
+  # A lock held by a live process — pid and start time both match — is a
+  # competitor however old it is: a long apt run keeps its lock.
+  mkdir "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid" &&
+    process_start "$$" >"$root/fixture$lane_state/lock/start"
+  touch -t "$(date -u -v-2H +%Y%m%d%H%M 2>/dev/null || date -u -d '-2 hours' +%Y%m%d%H%M)" "$root/fixture$lane_state/lock"
+  rc=0; "$installed" dispatch >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 75 ] && [ "$(cat "$root/fixture$lane_state/lock/pid")" = "$$" ] || self_fail "a live holder's hours-old lock was broken (rc $rc)"
+  # The same pid with another start time is a reuse: the dispatcher that
+  # took the lock is gone, and the lock is taken over by rename.
+  printf 'reused\n' >"$root/fixture$lane_state/lock/start"
+  rc=0; "$installed" dispatch >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || self_fail "a lock carried by a reused pid was not reclaimed (rc $rc)"
+  [ "$(cat "$root/fixture$lane_state/lock/pid" 2>/dev/null)" != "$$" ] || self_fail 'the reused-pid lock was left in place'
+  ls -d "$root/fixture$lane_state"/lock.stale.* >/dev/null 2>&1 && self_fail 'a renamed stale lock was left behind'
+  rm -rf "$root/fixture$lane_state/lock"
+  # A dead pid is a crash: taken over by rename, and a competitor whose
+  # rename lost yields instead of removing the winner's fresh lock.
+  mkdir "$root/fixture$lane_state/lock" && printf '%s\n' 999999 >"$root/fixture$lane_state/lock/pid" && printf 'gone\n' >"$root/fixture$lane_state/lock/start"
+  rc=0; "$installed" dispatch >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || self_fail "a dead dispatcher's lock was not reclaimed (rc $rc)"
+  ls -d "$root/fixture$lane_state"/lock.stale.* >/dev/null 2>&1 && self_fail 'a renamed stale lock was left behind'
+  rm -rf "$root/fixture$lane_state/lock"
+  # A lock directory with no pid yet belongs to a dispatcher between mkdir
+  # and its pid write: a competitor, never a stale lock to break.
+  mkdir "$root/fixture$lane_state/lock"
+  rc=0; "$installed" dispatch >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 75 ] && [ -d "$root/fixture$lane_state/lock" ] || self_fail "a pid-less lock was broken (rc $rc)"
+  rmdir "$root/fixture$lane_state/lock"
+  : >"$root/apt-fail"
+  sealed apt.autoremove.v1 >"$root/autoremove.out" 2>&1 && self_fail 'failed native exit reported as success'
+  rm -f "$root/apt-fail"
+  grep -Fqx 'state|failed' "$root/autoremove.out" && grep -Fqx 'reason|native_operation_failed' "$root/autoremove.out" ||
+    self_fail 'failed native result record'
+  # Results carry the lane digest and round-trip through the parser.
+  id=$(sed -n 's/^request-id|//p' "$root/autoremove.out")
+  parse_result "$root/fixture$lane_state/results/$id.result" || self_fail 'result parse'
+  [ "$rs_native_exit" = 1 ] || self_fail 'native exit in result'
+  # Replay: the same id again is rejected without executing anything.
+  : >"$root/apt.log"
+  ingress_file=$root/fixture$lane_state/ingress/$id.request
+  render_request "$id" test-host "$(id -u)" fleet-run - - apt.update-metadata.v1 - - - - "$(now)" "$(( $(now) + 60 ))" >"$ingress_file"
+  "$installed" dispatch >/dev/null
+  grep -Fqx 'reason|native_operation_failed' "$root/fixture$lane_state/results/$id.result" || self_fail 'replay overwrote the published result'
+  grep -q "|request|$id|-|-|rejected|replayed_request|" "$root/fixture$lane_state/journal/events.log" || self_fail 'replay not journaled'
+  [ ! -s "$root/apt.log" ] || self_fail 'replayed request executed'
+  # An architecture-qualified name is a name; it reaches apt-get as written.
+  rc=0; out=$(sealed apt.install-package-version.v1 jq:amd64 1.7.1-3) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'reason|package_installed' <<<"$out" || self_fail "architecture-qualified install (rc $rc): $out"
+  grep -Fq 'install jq:amd64=1.7.1-3' "$root/apt.log" || self_fail 'architecture-qualified name did not reach apt-get as written'
+  rc=0; sealed apt.install-package-version.v1 'jq:AMD64!' >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 64 ] || self_fail 'a malformed architecture suffix was accepted'
+  rc=0; sealed apt.upgrade-package.v1 libstdc++6 1.0 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 65 ] || self_fail "apt package with + was not accepted by the grammar (rc $rc)"
+  # Owner binding: a request owned by the enrolled owner but claiming another
+  # uid, a stale request, and a bad digest are all rejected by name.
+  check_rejection "$installed" "$root" 'owner_mismatch' test-host 9999 apt.update-metadata.v1 - - "$(now)" "$(( $(now) + 60 ))"
+  check_rejection "$installed" "$root" 'host_id_mismatch' other-host "$(id -u)" apt.update-metadata.v1 - - "$(now)" "$(( $(now) + 60 ))"
+  check_rejection "$installed" "$root" 'stale_request' test-host "$(id -u)" apt.update-metadata.v1 - - "$(( $(now) - 7200 ))" "$(( $(now) - 3600 ))"
+  check_rejection "$installed" "$root" 'stale_request' test-host "$(id -u)" apt.update-metadata.v1 - - "$(now)" "$(( $(now) + 7200 ))"
+  check_rejection "$installed" "$root" 'unknown_action_for_platform' test-host "$(id -u)" macos.install-signed-pkg.v1 - - "$(now)" "$(( $(now) + 60 ))"
+  id=request-$(random_hex 32)
+  render_request "$id" test-host "$(id -u)" - - - apt.update-metadata.v1 - - - - "$(now)" "$(( $(now) + 60 ))" \
+    >"$root/fixture$lane_state/ingress/$id.request"
+  "$installed" dispatch >/dev/null
+  grep -Fqx 'reason|unsealed_mutation_request' "$root/fixture$lane_state/results/$id.result" || self_fail 'hand-written unsealed mutation not rejected by root'
+  id=request-$(random_hex 32)
+  render_request "$id" test-host "$(id -u)" plan-0123456789abcdef "$(sha256_text plan)" 3 apt.update-metadata.v1 - - - - "$(now)" "$(( $(now) + 60 ))" |
+    sed '$s/request-sha256|.*/request-sha256|0000000000000000000000000000000000000000000000000000000000000000/' \
+    >"$root/fixture$lane_state/ingress/$id.request"
+  "$installed" dispatch >/dev/null
+  grep -Fqx 'reason|invalid_request_record' "$root/fixture$lane_state/results/$id.result" || self_fail 'digest tamper not rejected'
+  # A symlink in ingress never gets read.
+  id=request-$(random_hex 32)
+  printf 'secret\n' >"$root/secret"
+  ln -s "$root/secret" "$root/fixture$lane_state/ingress/$id.request"
+  "$installed" dispatch >/dev/null
+  grep -Fqx 'reason|request_not_regular_file' "$root/fixture$lane_state/results/$id.result" || self_fail 'symlink request not rejected'
+  [ -f "$root/secret" ] || self_fail 'symlink target disturbed'
+  # Rate limit: the hour window holds at most max_requests_per_hour claims.
+  local n=0
+  while [ "$n" -lt "$max_requests_per_hour" ]; do
+    printf 'event|%s|request|request-%032d|lane.probe.v1|-|completed|probe_completed|-|-\n' "$(now)" "$n" >>"$root/fixture$lane_state/journal/events.log"
+    n=$((n + 1))
+  done
+  rc=0; out=$("$installed" request lane.probe.v1) || rc=$?
+  [ "$rc" -eq 65 ] && grep -Fqx 'reason|rate_limited' <<<"$out" || self_fail "rate limit: $out"
+  # A re-enrollment whose canary fails (here: the probe is rate-limited)
+  # restores the previous working lane — identity, script and grant exactly
+  # as they were — rather than rolling back to nothing: the owner's one
+  # approval is never spent twice.
+  local before_identity before_script before_grant
+  before_identity=$(cat "$root/fixture$lane_libexec/lane.identity")
+  before_script=$(sha256_file "$installed")
+  before_grant=$(cat "$root/fixture$lane_sudoers")
+  sleep 1
+  rc=0; out=$("$lane" enroll --host-id test-host --owner "$(id -un)" --plugin-root "$plugin_root" 2>/dev/null) || rc=$?
+  [ "$rc" -eq 74 ] && grep -Fqx 'reason|probe_request_failed' <<<"$out" || self_fail "rate-limited re-enrollment did not fail (rc $rc): $out"
+  [ "$(cat "$root/fixture$lane_libexec/lane.identity")" = "$before_identity" ] || self_fail 'failed re-enrollment did not restore the previous identity'
+  [ "$(sha256_file "$installed")" = "$before_script" ] || self_fail 'failed re-enrollment did not restore the previous script'
+  [ "$(cat "$root/fixture$lane_sudoers")" = "$before_grant" ] || self_fail 'failed re-enrollment did not restore the previous grant'
+  [ ! -e "$installed.previous" ] && [ ! -e "$root/fixture$lane_libexec/lane.identity.previous" ] && [ ! -e "$root/fixture$lane_sudoers.previous" ] ||
+    self_fail 'a backup copy was left behind'
+  rc=0; out=$("$installed" status) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'state|ready' <<<"$out" || self_fail "previous lane not ready after a failed re-enrollment: $out"
+  : >"$root/fixture$lane_state/journal/events.log"
+  rc=0; out=$("$installed" request lane.probe.v1) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'reason|probe_completed' <<<"$out" || self_fail "previous lane does not dispatch after a failed re-enrollment: $out"
+  [ "$(file_uid "$root/fixture$lane_state/ingress")" = "$(id -u)" ] && [ "$(file_mode "$root/fixture$lane_state/ingress")" = 700 ] ||
+    self_fail 'ingress ownership changed across a failed re-enrollment'
+  : >"$root/fixture$lane_state/journal/events.log"
+  # The owner cannot read root's 0440 grant file: status from the owner's
+  # seat still reports ready, because the grant is proved by `sudo -n -l`,
+  # never by reading the file. (The fixture user owns the file, so the
+  # unreadable case is made explicit here.)
+  chmod 000 "$root/fixture$lane_sudoers"
+  rc=0; out=$("$installed" status) || rc=$?
+  chmod 440 "$root/fixture$lane_sudoers"
+  [ "$rc" -eq 0 ] && grep -Fqx 'state|ready' <<<"$out" || self_fail "unreadable grant file reported as drift: $out"
+  # macOS is not a lane platform in this version: status says so with its
+  # own exit status and enrollment refuses before touching anything.
+  rc=0; out=$(ROUNDHOUSE_LANE_FIXTURE_PLATFORM=macos "$installed" status) || rc=$?
+  [ "$rc" -eq 69 ] && grep -Fqx 'state|unsupported' <<<"$out" && grep -Fq 'linux and wsl' <<<"$out" ||
+    self_fail "macos status: $out"
+  rc=0; out=$(ROUNDHOUSE_LANE_FIXTURE_ROOT="$root/mac" ROUNDHOUSE_LANE_FIXTURE_PLATFORM=macos "$lane" enroll --host-id mac-host --owner "$(id -un)" 2>&1) || rc=$?
+  [ "$rc" -eq 69 ] && [ ! -e "$root/mac$lane_sudoers" ] || self_fail "macos enrollment was not refused (rc $rc): $out"
+  # A protected regular file in the place of a lane directory is drift.
+  mv "$root/fixture$lane_state/results" "$root/fixture$lane_state/results.dir"
+  : >"$root/fixture$lane_state/results"; chmod 755 "$root/fixture$lane_state/results"
+  rc=0; out=$("$installed" status) || rc=$?
+  [ "$rc" -eq 74 ] && grep -Fqx 'state|drifted' <<<"$out" && grep -Fq 'not a protected directory' <<<"$out" ||
+    self_fail "results path replaced by a file reported as: $out"
+  rm -f "$root/fixture$lane_state/results"; mv "$root/fixture$lane_state/results.dir" "$root/fixture$lane_state/results"
+  # An enrollment whose journal entry cannot be written is rolled back,
+  # after the canary and all: nothing stays enrolled off the record.
+  rc=0; out=$(ROUNDHOUSE_LANE_FIXTURE_ROOT="$root/jfail" ROUNDHOUSE_LANE_FIXTURE_FAIL_JOURNAL=enrollment \
+    "$lane" enroll --host-id test-host --owner "$(id -un)" --plugin-root "$plugin_root" 2>/dev/null) || rc=$?
+  [ "$rc" -eq 74 ] && grep -Fqx 'reason|journal_write_failed' <<<"$out" || self_fail "journal failure not reported (rc $rc): $out"
+  [ ! -e "$root/jfail$lane_sudoers" ] && [ ! -e "$root/jfail$lane_libexec/$lane_name" ] && [ ! -e "$root/jfail$lane_libexec/lane.identity" ] ||
+    self_fail 'a journal failure left the grant, script or identity installed'
+  # A results directory the owner cannot read is drift, not ready.
+  chmod 700 "$root/fixture$lane_state/results"
+  rc=0; out=$("$installed" status) || rc=$?
+  [ "$rc" -eq 74 ] && grep -Fqx 'state|drifted' <<<"$out" || self_fail 'owner-inaccessible results dir reported as ready'
+  chmod 755 "$root/fixture$lane_state/results"
+  # A result the owner cannot read is never a completed request: the
+  # dispatch counts it failed and the journal says result_publish_failed.
+  id=request-$(random_hex 32)
+  render_request "$id" test-host "$(id -u)" plan-0123456789abcdef "$(sha256_text plan)" 3 lane.probe.v1 - - - - "$(now)" "$(( $(now) + 60 ))" \
+    >"$root/fixture$lane_state/ingress/$id.request"
+  chmod 500 "$root/fixture$lane_state/results"
+  rc=0; out=$("$installed" dispatch) || rc=$?
+  chmod 755 "$root/fixture$lane_state/results"
+  grep -Fqx 'failed|1' <<<"$out" && grep -Fqx 'completed|0' <<<"$out" || self_fail "unpublishable result counted as (rc $rc): $out"
+  grep -q "|request|$id|lane.probe.v1|-|failed|result_publish_failed|" "$root/fixture$lane_state/journal/events.log" ||
+    self_fail 'the publication failure was not journaled'
+  # Revocation under a running dispatch is refused, and removes nothing.
+  mkdir "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid" &&
+    process_start "$$" >"$root/fixture$lane_state/lock/start"
+  rc=0; out=$("$installed" revoke 2>&1) || rc=$?
+  [ "$rc" -eq 75 ] && [ -f "$installed" ] && [ -f "$root/fixture$lane_sudoers" ] && [ -d "$root/fixture$lane_state/ingress" ] ||
+    self_fail "revocation during a dispatch was not refused (rc $rc): $out"
+  rm -rf "$root/fixture$lane_state/lock"
+  # Revocation removes the grant, the script and the queue, keeps the journal.
+  rc=0; out=$("$installed" revoke) || rc=$?
+  [ "$rc" -eq 0 ] && [ ! -e "$root/fixture$lane_sudoers" ] && [ ! -e "$installed" ] &&
+    [ -f "$root/fixture$lane_state/journal/events.log" ] || self_fail 'revocation'
+  rc=0; out=$("$lane" status) || rc=$?
+  [ "$rc" -eq 75 ] || self_fail 'status after revoke'
+  # Nothing in this run touched a real root path.
+  [ ! -e "$lane_libexec/$lane_name.selftest" ] || self_fail 'real path touched'
+  trap - EXIT HUP INT TERM
+  rm -rf "$root"
+  printf 'PASS: privilege-lane-posix fixture-safe self-check\n'
+}
+self_fail() { printf 'FAIL: privilege-lane-posix self-test: %s\n' "$1" >&2; exit 1; }
+check_rejection() {
+  # check_rejection INSTALLED ROOT REASON HOST OWNER ACTION PACKAGE VERSION CREATED EXPIRES
+  local installed=$1 root=$2 want=$3 id
+  id=request-$(random_hex 32)
+  render_request "$id" "$4" "$5" plan-0123456789abcdef "$(sha256_text plan)" 3 "$6" "$7" "$8" - - "$9" "${10}" \
+    >"$root/fixture$lane_state/ingress/$id.request"
+  "$installed" dispatch >/dev/null
+  grep -Fqx "reason|$want" "$root/fixture$lane_state/results/$id.result" ||
+    self_fail "expected $want: $(cat "$root/fixture$lane_state/results/$id.result" 2>/dev/null)"
+}
+write_apt_stubs() {
+  local bin=$1 root=$2
+  cat >"$bin/apt-get" <<EOF
+#!/bin/sh
+printf 'apt-get %s\n' "\$*" >>"$root/apt.log"
+printf 'umask %s\n' "\$(umask)" >>"$root/umask.log"
+[ ! -e "$root/apt-hang" ] || sleep 4
+[ ! -e "$root/apt-fail" ] || exit 1
+case "\$*" in
+  *"--simulate autoremove"*) [ ! -e "$root/apt-simulate-fail" ] || exit 100; [ ! -e "$root/apt-remaining" ] || printf 'Remv old-kernel [1.0]\n'; exit 0 ;;
+  *"install curl=8.2.0-1"*) printf '8.2.0-1\n' >"$root/state-curl" ;;
+  *"install jq=1.7.1-3"*|*"install jq:amd64=1.7.1-3"*) printf '1.7.1-3\n' >"$root/state-jq" ;;
+esac
+exit 0
+EOF
+  cat >"$bin/apt-cache" <<EOF
+#!/bin/sh
+case "\$1 \$2" in
+  "policy curl") printf 'curl:\n  Installed: %s\n  Candidate: 8.2.0-1\n' "\$(cat "$root/state-curl" 2>/dev/null || printf '8.1.0-1')" ;;
+  "policy jq"|"policy jq:amd64") printf 'jq:\n  Installed: (none)\n  Candidate: 1.7.1-3\n' ;;
+  "policy ") [ ! -e "$root/apt-policy-fail" ] || exit 100; printf 'curl:\n  Installed: 8.1.0-1\n' ;;
+  *) exit 100 ;;
+esac
+EOF
+  cat >"$bin/dpkg-query" <<EOF
+#!/bin/sh
+case "\$4" in
+  curl) cat "$root/state-curl" 2>/dev/null || printf '8.1.0-1' ;;
+  jq|jq:amd64) cat "$root/state-jq" 2>/dev/null || exit 1 ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod 755 "$bin/apt-get" "$bin/apt-cache" "$bin/dpkg-query"
+}
+# --- dispatch table -----------------------------------------------------------
+command=${1:-}
+[ "$#" -eq 0 ] || shift
+case $command in
+  status) [ "$#" -eq 0 ] || die 64 'status takes no arguments'; status_command ;;
+  enroll) enroll_command "$@" ;;
+  revoke) [ "$#" -eq 0 ] || die 64 'revoke takes no arguments'; revoke_command ;;
+  dispatch) [ "$#" -eq 0 ] || die 64 'dispatch takes no arguments'; dispatch_command ;;
+  request) request_command "$@" ;;
+  result) [ "$#" -eq 1 ] || die 64 'result takes exactly one REQUEST-ID'; result_command "$1" ;;
+  candidate) [ "$#" -eq 1 ] || die 64 'candidate takes exactly one PACKAGE'; candidate_command "$1" ;;
+  actions) [ "$#" -eq 1 ] || die 64 'actions takes exactly one PLATFORM'; platform_actions "$1" || die 69 'unsupported platform' ;;
+  self-test) [ "$#" -eq 0 ] || die 64 'self-test takes no arguments'; self_test ;;
+  *)
+    printf 'usage: privilege-lane-posix status|enroll|revoke|dispatch|request|result|candidate|actions|self-test\n' >&2
+    exit 64
+    ;;
+esac

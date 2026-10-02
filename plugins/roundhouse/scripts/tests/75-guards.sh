@@ -738,15 +738,93 @@ JSONC
     printf '%s\n' "$(cli_function_body fleet_sweep_range)" |
       grep -q 'sweep_rc' ||
       fail "the redaction sweep does not capture the enumeration exit (empty range = clean)"
-    # §7.12.3 materialize tolerates LOCAL unpublished work: a sweep-refused or
-    # conflicted run advances reviewed-ref to a head it never pushed, and the
-    # §10.4 recovery (abandon / op restore + reset to main@origin) then leaves
-    # the next head a sibling of reviewed-ref. That is a local rewrite, not the
-    # rollback attack (a DIVERGENT origin), so the check is keyed on whether
-    # reviewed-ref descends from main@origin — refuse only when it does not.
+    # §7.12.3: ONE gate for both lanes, so the published-only reviewed-ref
+    # cannot be fixed in one and left wedging in the other — and the old
+    # carve-out ("allow when reviewed-ref descends from the current
+    # main@origin") is gone, because a pure rewind of origin satisfies it. The
+    # behaviour is asserted against real jj in tests/93-jj-run.sh and
+    # tests/95-jj-trustd.sh.
     printf '%s\n' "$(cli_function_body fleet_trust_materialize)" |
+      grep -q 'fleet_trust_reviewed_next "\$fleet_trust_ms" "\$fleet_trust_mrev"' &&
+      grep -q 'trustd_next=$(fleet_trust_reviewed_next "$trustd_store" "$trustd_rev")' \
+        "$script_dir/roundhouse-trustd" ||
+      fail "the run and trustd do not share fleet_trust_reviewed_next (§7.9 parity)"
+    ! printf '%s\n' "$(cli_function_body fleet_trust_materialize)" |
       grep -q 'present(main@origin) & ::' ||
-      fail "materialize's §7.12.3 check has no local-supersede tolerance; the documented recovery would brick every future materialize"
+      fail "materialize still carries the old main@origin carve-out, which a rewound origin satisfies"
+
+    # The op-log reader behind the legacy migration's proof 2, on captured
+    # `jj op log --op-diff` output (templates.commit_summary = commit_id): the
+    # main@origin ids under `Changed remote bookmarks`, both moves, nothing
+    # from local bookmarks or changed commits.
+    guard_oplog=$(cat <<'OPLOG'
+
+fetch from git remote(s) origin
+args: jj git fetch
+
+Changed commits:
++ 45020992adf9e9e3f7ee460aa1d8277d66c17d9b
+
+Changed local bookmarks:
+main:
++ (added) e420951c524e5c0dc4322d7e1b37038f78cf77f3
+- e420951c524e5c0dc4322d7e1b37038f78cf77f3
+
+Changed remote bookmarks:
+main@origin:
++ tracked 45020992adf9e9e3f7ee460aa1d8277d66c17d9b
+- tracked 7747914cd00b73b1b587a6f66a02766b373e3e12
+
+push to git remote(s) origin
+
+Changed remote bookmarks:
+main@origin:
++ tracked 7747914cd00b73b1b587a6f66a02766b373e3e12
+- untracked (absent)
+OPLOG
+)
+    [ "$(printf '%s\n' "$guard_oplog" | fleet_trust_seen_published_parse | tr '\n' ' ')" = \
+      '45020992adf9e9e3f7ee460aa1d8277d66c17d9b 7747914cd00b73b1b587a6f66a02766b373e3e12 ' ] ||
+      fail "the op-log reader did not return exactly the main@origin positions: $(printf '%s\n' "$guard_oplog" | fleet_trust_seen_published_parse | tr '\n' ' ')"
+    #   A jj that renders the lines differently yields nothing, never a guess.
+    [ -z "$(printf 'main@origin:\n+ tracked yxqk 4502099 fetch\n' | fleet_trust_seen_published_parse)" ] ||
+      fail "the op-log reader read an id out of a short-id rendering"
+
+    # The re-point command is pasteable on a path with a space and a quote, in
+    # both forms, and never truncates the mark when jj does not answer with
+    # one full id. jj and sudo are stand-ins: what is under test is the shell
+    # the operator pastes, not jj.
+    (
+      guard_sp="$guard_root/a b's"
+      guard_id=0123456789abcdef0123456789abcdef01234567
+      mkdir -p "$guard_sp/trust"
+      export ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_TRUST_ROOT="$guard_sp/trust"
+      jj() { printf '%s|' "$@" >"$guard_root/jj-args"; printf '%s\n' "$guard_jj_says"; }
+      sudo() { chmod u+w "$guard_sp/trust"; "$@"; }
+      guard_jj_says=$guard_id
+      guard_cmd=$(fleet_trust_repoint_hint "$guard_sp/store" "$guard_id")
+      eval "$guard_cmd" || fail "the re-point command does not run: $guard_cmd"
+      [ "$(cat "$guard_sp/trust/reviewed-ref")" = "$guard_id" ] &&
+        [ "$(cut -d'|' -f2 "$guard_root/jj-args")" = "$guard_sp/store" ] ||
+        fail "the re-point command split a path with a space: $guard_cmd"
+      guard_jj_says='Error: Revision is ambiguous'
+      eval "$guard_cmd" 2>/dev/null || :
+      [ "$(cat "$guard_sp/trust/reviewed-ref")" = "$guard_id" ] ||
+        fail "a failed jj lookup truncated the mark: $guard_cmd"
+      #   A mark this user cannot write is written through sudo tee.
+      chmod a-w "$guard_sp/trust/reviewed-ref" "$guard_sp/trust"
+      guard_jj_says=fedcba9876543210fedcba9876543210fedcba98
+      guard_cmd=$(fleet_trust_repoint_hint "$guard_sp/store" "$guard_id")
+      case $guard_cmd in *'| sudo tee '*) ;; *) fail "an unwritable mark's re-point is not a sudo tee: $guard_cmd" ;; esac
+      chmod u+w "$guard_sp/trust/reviewed-ref"
+      eval "$guard_cmd" || fail "the sudo re-point command does not run: $guard_cmd"
+      [ "$(cat "$guard_sp/trust/reviewed-ref")" = "$guard_jj_says" ] ||
+        fail "the sudo re-point command split a path with a space: $guard_cmd"
+      #   Under $HOME the tilde stays outside the quotes, so it still expands.
+      HOME=$guard_sp
+      guard_cmd=$(fleet_trust_repoint_hint "$guard_sp/store" "$guard_id")
+      case $guard_cmd in *"jj -R ~/'store' "*">~/'trust/reviewed-ref'") ;; *) fail "the re-point command does not keep ~ expandable: $guard_cmd" ;; esac
+    ) || fail "the re-point command quoting block failed"
 
     # --- §10.6 the private-remote posture, host-local by construction ---
     case $(fleet_posture_path) in
@@ -847,7 +925,7 @@ JSONC
     # shellcheck disable=SC2046 # deliberate word splitting over the file list
     ! grep -nE '"?schema(_version)?"? *:' $(cli_program_files) |
       grep -vE ':[0-9]+: *#' |
-      grep -vE 'roundhouse\.inventory|schema=|integrity|plan-|apply-commands|broker-|identity\.sh|inventory\.sh|interop\.sh|host\.sh|config\.sh' |
+      grep -vE 'roundhouse\.inventory|schema=|integrity|plan-|apply-commands|broker-|identity\.sh|inventory\.sh|interop\.sh|host\.sh|config\.sh|lane\.sh' |
       grep -q . ||
       fail "a DSC record still emits schema: or schema_version:"
   ) || fail "guards fixture block failed"

@@ -30,6 +30,9 @@ Usage:
   roundhouse approve-codex-plugin-hooks PLUGIN@MARKETPLACE
   roundhouse update-codex-plugin PLUGIN@MARKETPLACE
   roundhouse privilege-status TARGET OUTPUT.jsonl|-
+  roundhouse privilege-enroll TARGET
+  roundhouse privilege-lane-status TARGET OUTPUT.json|-
+  roundhouse privilege-lane-path
   roundhouse prepare-privilege-identity FLEET-DOMAIN NODE-ID ENDPOINT-PRINCIPALS SOURCE-CIDRS OUTPUT|-
   roundhouse prepare-privilege-enrollment TARGET OUTPUT.json|-
   roundhouse record-codex-readiness SNAPSHOT.jsonl METADATA.json OUTPUT.jsonl
@@ -58,6 +61,8 @@ Usage:
   roundhouse fleet-reroot [--authority-receipt RECEIPT]
   roundhouse fleet-explain [HOST] ITEM
   roundhouse fleet-run [--fast|--full]
+  roundhouse fleet-trigger [--fast|--full]
+  roundhouse fleet-schedule install|status|uninstall
   roundhouse fleet-seed
   roundhouse fleet-review ITEM pass|hold REASON
   roundhouse fleet-apply ITEM
@@ -103,12 +108,16 @@ EOF
 . "$script_dir/lib/plan-verify.sh"
 # shellcheck source=lib/plan-apply.sh
 . "$script_dir/lib/plan-apply.sh"
+# shellcheck source=lib/local-plan.sh
+. "$script_dir/lib/local-plan.sh"
 # shellcheck source=lib/broker-windows.sh
 . "$script_dir/lib/broker-windows.sh"
 # shellcheck source=lib/broker-posix.sh
 . "$script_dir/lib/broker-posix.sh"
 # shellcheck source=lib/interop.sh
 . "$script_dir/lib/interop.sh"
+# shellcheck source=lib/lane.sh
+. "$script_dir/lib/lane.sh"
 # shellcheck source=lib/apply-commands.sh
 . "$script_dir/lib/apply-commands.sh"
 # shellcheck source=lib/fleet-store.sh
@@ -131,12 +140,22 @@ EOF
 . "$script_dir/lib/fleet-vcs.sh"
 # shellcheck source=lib/fleet-trust.sh
 . "$script_dir/lib/fleet-trust.sh"
+# shellcheck source=lib/fleet-trust-migrate.sh
+. "$script_dir/lib/fleet-trust-migrate.sh"
 # shellcheck source=lib/fleet-resolve.sh
 . "$script_dir/lib/fleet-resolve.sh"
 # shellcheck source=lib/apply-claude.sh
 . "$script_dir/lib/apply-claude.sh"
 # shellcheck source=lib/fleet-publish-verbs.sh
 . "$script_dir/lib/fleet-publish-verbs.sh"
+# shellcheck source=lib/fleet-liveness.sh
+. "$script_dir/lib/fleet-liveness.sh"
+# shellcheck source=lib/fleet-schedule.sh
+. "$script_dir/lib/fleet-schedule.sh"
+# shellcheck source=lib/fleet-schedule-plan.sh
+. "$script_dir/lib/fleet-schedule-plan.sh"
+# shellcheck source=lib/fleet-trigger.sh
+. "$script_dir/lib/fleet-trigger.sh"
 # shellcheck source=lib/fleet-run.sh
 . "$script_dir/lib/fleet-run.sh"
 # shellcheck source=lib/fleet-doctor.sh
@@ -152,6 +171,16 @@ select_mikefarah_yq
 command=${1:-}
 [ -n "$command" ] || usage
 shift
+# Every verb that takes the run lock as a RUN leads a process group of its own,
+# so the lock's recorded pid is also a group that belongs to this run alone
+# (fleet_lock_lead_group; nothing changes under a terminal). Not fleet-lock:
+# its lock is `manual`, names the caller's shell rather than this process, and
+# is never judged by liveness or stopped.
+case $command in
+  fleet-run | fleet-age-evidence | fleet-compact-alerts | fleet-disown)
+    fleet_lock_lead_group "$0" "$command" "$@"
+    ;;
+esac
 case $command in
   validate-config) [ $# -eq 0 ] || usage; validate_config_file ;;
   validate-privilege-policy) [ $# -eq 1 ] || usage; validate_privilege_policy_file "$1" ;;
@@ -179,6 +208,9 @@ case $command in
     codex_plugin_hooks_command update "$1"
     ;;
   privilege-status) [ $# -eq 2 ] || usage; privilege_status_command "$1" "$2" ;;
+  privilege-enroll) [ $# -eq 1 ] || usage; privilege_enroll_command "$1" ;;
+  privilege-lane-status) [ $# -eq 2 ] || usage; lane_status_command "$1" "$2" ;;
+  privilege-lane-path) [ $# -eq 0 ] || usage; printf '%s\n' "$script_dir/privilege-lane-posix" ;;
   prepare-privilege-identity)
     [ $# -eq 5 ] || usage
     prepare_privilege_identity_command "$1" "$2" "$3" "$4" "$5"
@@ -222,6 +254,8 @@ case $command in
   fleet-reroot) [ $# -le 2 ] || usage; fleet_reroot_command "$@" ;;
   fleet-explain) [ $# -ge 1 ] && [ $# -le 2 ] || usage; fleet_explain_command "$@" ;;
   fleet-run) [ $# -le 1 ] || usage; fleet_run_command "$@" ;;
+  fleet-trigger) [ $# -le 1 ] || usage; fleet_trigger_command "$@" ;;
+  fleet-schedule) [ $# -eq 1 ] || usage; fleet_schedule_command "$1" ;;
   fleet-seed) [ $# -eq 0 ] || usage; fleet_seed_command ;;
   fleet-review) [ $# -eq 3 ] || usage; fleet_review_command "$1" "$2" "$3" ;;
   fleet-apply) [ $# -eq 1 ] || usage; fleet_apply_command "$1" ;;

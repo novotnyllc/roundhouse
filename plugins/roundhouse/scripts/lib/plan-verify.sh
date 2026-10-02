@@ -565,6 +565,10 @@ verify_preconditions_command() {
   require_jq
   check_mutation_config
   check_private_owned_file "$plan" "apply plan"
+  if plan_is_lane "$plan"; then
+    verify_lane_plan "$plan" "$snapshot"
+    return
+  fi
   if jq -e '.schema_version == 4' "$plan" >/dev/null 2>&1; then
     verify_mixed_privileged_preconditions_command "$plan" "$snapshot"
     return
@@ -689,6 +693,17 @@ verify_preconditions_command() {
         (.status | IN("present","absent")) and .data.path == $destination)
     ' "$snapshot" >/dev/null || {
       printf 'roundhouse: current snapshot is not bound to the launcher destination\n' >&2
+      exit 65
+    }
+  fi
+  if jq -e 'any(.operations[]; .id == "roundhouse:schedule")' "$plan" >/dev/null; then
+    schedule_operations_valid "$plan" "$HOME" || {
+      printf 'roundhouse: invalid fleet-schedule plan operation\n' >&2
+      exit 64
+    }
+    jq -e -s 'any(.[]; .kind == "agent_artifact" and .id == "roundhouse:schedule" and
+      (.status | IN("present","absent")))' "$snapshot" >/dev/null || {
+      printf 'roundhouse: current snapshot does not observe the scheduled jobs\n' >&2
       exit 65
     }
   fi
