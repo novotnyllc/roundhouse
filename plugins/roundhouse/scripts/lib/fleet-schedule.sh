@@ -535,10 +535,16 @@ fleet_schedule_interval() {
   # jittered from the host NAME, so the scheduler and the policy cannot
   # drift apart and two hosts do not fire on the same minute. The fold is the
   # working copy's, like fleet_run_stale_after's; a store with no policy reads
-  # the built-in defaults (20 ± 5 min, 12 h ± 90 min).
+  # the built-in defaults (20 ± 5 min, 12 h ± 90 min). A caller that already
+  # folded the store sets fleet_schedule_fold to that fold (the pass's drift
+  # check, which must not judge against defaults it fell back to).
   interval_host=$(fleet_host_name 2>/dev/null) || interval_host=
-  interval_fold=$(fleet_fold "$(fleet_store_path)" "$interval_host" 2>/dev/null) ||
-    interval_fold=
+  if [ -n "${fleet_schedule_fold:-}" ]; then
+    interval_fold=$fleet_schedule_fold
+  else
+    interval_fold=$(fleet_fold "$(fleet_store_path)" "$interval_host" 2>/dev/null) ||
+      interval_fold=
+  fi
   [ -n "$interval_fold" ] || interval_fold='{}'
   fleet_run_interval_seconds "$interval_fold" "$interval_host" "$1"
 }
@@ -638,6 +644,25 @@ fleet_schedule_same() {
   esac
 }
 
+fleet_schedule_differs() {
+  # fleet_schedule_differs fast|full — the file NAMES of MODE's definitions
+  # that exist and differ from what `install` writes now
+  # (fleet_schedule_render), one per line; silence when every one that exists
+  # matches. Never their content. What `status` reports as "differs" and the
+  # pass alerts on as drift. Exit 1 when it cannot compare at all.
+  differs_paths=$(fleet_schedule_def_paths "$1") || return 1
+  differs_rendered=$(mktemp "${TMPDIR:-/tmp}/roundhouse-schedule-def.XXXXXX") || return 1
+  while IFS= read -r differs_path; do
+    [ -n "$differs_path" ] && [ -f "$differs_path" ] || continue
+    fleet_schedule_render "$1" "$differs_path" >"$differs_rendered"
+    fleet_schedule_same "$differs_path" "$differs_rendered" ||
+      printf '%s\n' "${differs_path##*/}"
+  done <<EOF_DIFFERS
+$differs_paths
+EOF_DIFFERS
+  rm -f "$differs_rendered"
+}
+
 fleet_schedule_write_definition() {
   # fleet_schedule_write_definition PATH RENDERED-FILE — put one definition in
   # place. An existing one is KEPT as PATH.replaced first, and a backup that
@@ -714,20 +739,13 @@ fleet_schedule_status_facts() {
     fleet_schedule_facts_read "$status_facts"
     status_reachable=false
     [ "$sf_reachable" != 1 ] || status_reachable=true
-    : >"$status_dir/paths"
-    : >"$status_dir/differs"
     : >"$status_dir/absent"
     fleet_schedule_def_paths "$status_mode" >"$status_dir/paths"
     while IFS= read -r status_path; do
-      [ -n "$status_path" ] || continue
-      if [ ! -f "$status_path" ]; then
+      [ -z "$status_path" ] || [ -f "$status_path" ] ||
         printf '%s\n' "${status_path##*/}" >>"$status_dir/absent"
-        continue
-      fi
-      fleet_schedule_render "$status_mode" "$status_path" >"$status_dir/def"
-      fleet_schedule_same "$status_path" "$status_dir/def" ||
-        printf '%s\n' "${status_path##*/}" >>"$status_dir/differs"
     done <"$status_dir/paths"
+    fleet_schedule_differs "$status_mode" >"$status_dir/differs" || : >"$status_dir/differs"
     jq -cn --arg mode "$status_mode" --arg state "$status_state" \
       --arg last "$(fleet_schedule_last_state "$status_mode")" \
       --argjson reachable "$status_reachable" --argjson scheduled "$status_scheduled" \
@@ -777,28 +795,47 @@ fleet_schedule_status() {
 
 # --- the pass's own check ------------------------------------------------------
 
+fleet_schedule_alert() {
+  # fleet_schedule_alert STORE HOST KIND MODE HOLDS NOTE DETAIL — one of the
+  # check's keyed conditions for MODE's job: set (and NOTE said on stderr)
+  # while HOLDS is true, cleared when it is false.
+  [ "$5" != true ] || printf 'roundhouse: %s (%s alert)\n' "$6" "$3" >&2
+  fleet_alert_set "$1" "$2" "$3" "fleet-$4" "$5" "$7" || :
+}
+
 fleet_schedule_check() {
   # fleet_schedule_check STORE HOST — called by every pass. A job the operator
-  # disabled, or one that went missing, is ALERTED and left exactly as it is:
-  # an automatic pass never enables, loads or rewrites a job. Only
-  # `roundhouse fleet-schedule install` does, because a human ran it.
+  # disabled, one that went missing, or one whose definition drifted is
+  # ALERTED and left exactly as it is: an automatic pass never enables, loads
+  # or rewrites a job. Only `roundhouse fleet-schedule install` does, because
+  # a human ran it.
   #
-  # `schedule-disabled` and `schedule-missing` are store-scoped CONDITIONS
-  # (lib/fleet-alerts.sh), one keyed alert per job (`…--fleet-fast.yaml`):
-  # this check sets each while it holds and clears it the pass it ends — the
-  # job re-enabled or reinstalled, or the host opted out with
-  # `fleet-schedule uninstall`.
+  # `schedule-disabled`, `schedule-missing` and `schedule-drift` are
+  # store-scoped CONDITIONS (lib/fleet-alerts.sh), one keyed alert per job
+  # (`…--fleet-fast.yaml`): this check sets each while it holds and clears it
+  # the pass it ends, and an opted-out host (`fleet-schedule uninstall`)
+  # raises none.
   #
   # "Missing" needs evidence the host is meant to be scheduled — the install
   # marker, or the other job still present — so a host whose operator never
   # scheduled it raises nothing. An UNREACHABLE scheduler (no GUI domain over
-  # SSH: the ordinary state of a pass a trigger started) decides nothing, so
-  # both alerts are left as they stand.
+  # SSH: the ordinary state of a pass a trigger started) decides neither
+  # disabled nor missing, so those alerts are left as they stand.
+  #
+  # "Drift" is a definition on disk that is no longer what `install` writes
+  # now (fleet_schedule_differs): the store's cadence policy changed since
+  # the install, so the job still runs on the old interval, or roundhouse's
+  # template changed, or the file was edited by hand. It is read from the
+  # files, so it is judged while the scheduler cannot be reached, against
+  # the store's policy as this pass folds it: a fold that fails decides
+  # nothing (rendering against the built-in defaults would raise a false
+  # alert whose fix, `install`, writes the wrong cadence).
   case $(fleet_schedule_platform) in launchd | systemd) ;; *) return 0 ;; esac
   check_optout=false
   [ ! -e "$(fleet_schedule_optout_path)" ] || check_optout=true
   check_fast=$(fleet_schedule_job_state fast)
   check_full=$(fleet_schedule_job_state full)
+  check_fold=$(fleet_fold "$1" "$2" 2>/dev/null) || check_fold=
   for check_mode in $fleet_schedule_modes; do
     if [ "$check_mode" = fast ]; then
       check_state=$check_fast
@@ -807,6 +844,23 @@ fleet_schedule_check() {
       check_state=$check_full
       check_other=$check_fast
     fi
+    check_drift=false
+    if [ "$check_optout" != true ] && [ "$check_state" != missing ]; then
+      if [ -z "$check_fold" ]; then
+        check_drift=unknown
+      # A plain assignment inside the substitution, never a VAR=… prefix: a
+      # prefix would EXPORT the whole fold to every utility the compare runs,
+      # and a large one fails their exec (E2BIG).
+      elif check_differs=$(fleet_schedule_fold=$check_fold; fleet_schedule_differs "$check_mode"); then
+        [ -z "$check_differs" ] || check_drift=true
+      else
+        check_drift=unknown
+      fi
+    fi
+    [ "$check_drift" = unknown ] ||
+      fleet_schedule_alert "$1" "$2" schedule-drift "$check_mode" "$check_drift" \
+        "the fleet-$check_mode scheduled job differs from the definition install writes now" \
+        "the fleet-$check_mode scheduled job on $2 differs from the definition \`roundhouse fleet-schedule install\` writes now (the cadence policy changed since it was installed, roundhouse's template changed, or it was edited by hand); run \`roundhouse fleet-schedule install\` on $2"
     [ "$check_state" != unavailable ] || [ "$check_optout" = true ] || continue
     check_disabled=false
     check_missing=false
@@ -820,17 +874,11 @@ fleet_schedule_check() {
           ;;
       esac
     fi
-    [ "$check_disabled" != true ] ||
-      printf 'roundhouse: the fleet-%s scheduled job is disabled; a pass never re-enables it (schedule-disabled alert)\n' \
-        "$check_mode" >&2
-    [ "$check_missing" != true ] ||
-      printf 'roundhouse: the fleet-%s scheduled job is missing (schedule-missing alert)\n' \
-        "$check_mode" >&2
-    fleet_alert_set "$1" "$2" schedule-disabled "fleet-$check_mode" "$check_disabled" \
-      "the fleet-$check_mode scheduled job on $2 is disabled; passes will not re-enable it. Run \`roundhouse fleet-schedule install\` on $2 to re-enable it, or \`roundhouse fleet-schedule uninstall\` if it should not be scheduled" ||
-      :
-    fleet_alert_set "$1" "$2" schedule-missing "fleet-$check_mode" "$check_missing" \
-      "the fleet-$check_mode scheduled job on $2 is missing; run \`roundhouse fleet-schedule install\` on $2" ||
-      :
+    fleet_schedule_alert "$1" "$2" schedule-disabled "$check_mode" "$check_disabled" \
+      "the fleet-$check_mode scheduled job is disabled; a pass never re-enables it" \
+      "the fleet-$check_mode scheduled job on $2 is disabled; passes will not re-enable it. Run \`roundhouse fleet-schedule install\` on $2 to re-enable it, or \`roundhouse fleet-schedule uninstall\` if it should not be scheduled"
+    fleet_schedule_alert "$1" "$2" schedule-missing "$check_mode" "$check_missing" \
+      "the fleet-$check_mode scheduled job is missing" \
+      "the fleet-$check_mode scheduled job on $2 is missing; run \`roundhouse fleet-schedule install\` on $2"
   done
 }

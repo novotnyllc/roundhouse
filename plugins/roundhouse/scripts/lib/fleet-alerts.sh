@@ -64,8 +64,9 @@ fleet_alert_name_bound() {
 # A kind not listed — a legacy kind, or one a newer build raises — is an
 # EVENT: aging is the safe way for a notice nobody clears to end.
 #
-# `stale-host` (keyed by the silent peer), `schedule-disabled` and
-# `schedule-missing` (keyed by the job, `fleet-fast`/`fleet-full`) are
+# `stale-host` (keyed by the silent peer), `schedule-disabled`,
+# `schedule-missing` and `schedule-drift` (keyed by the job,
+# `fleet-fast`/`fleet-full`) are
 # store-scoped conditions their own checks set and clear every pass
 # (fleet_liveness_alerts, fleet_schedule_check).
 fleet_alert_lifecycle_rows='
@@ -93,6 +94,7 @@ inventory-timeout      condition  store
 stale-host             condition  store
 schedule-disabled      condition  store
 schedule-missing       condition  store
+schedule-drift         condition  store
 lock-takeover          event      store
 canary-override        event      item
 conflict               event      item

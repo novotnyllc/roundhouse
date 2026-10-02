@@ -384,7 +384,9 @@ Both intervals come from the same policy the run reads
 (`fast_interval_minutes` ± `fast_jitter_minutes`, `cadence_hours` ±
 `jitter_minutes`; 20 ± 5 min and 12 h ± 90 min by default), with the offset
 seeded from the host name, so each host's jobs fire on their own stable
-minute. Re-run `install` after changing those keys.
+minute. Re-run `install` after changing those keys: until it runs, every pass
+raises a `schedule-drift` alert for each job whose definition no longer
+matches.
 
 - **macOS** — two per-user launchd agents (launchd cannot run two commands
   from one), `~/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet-fast.plist`

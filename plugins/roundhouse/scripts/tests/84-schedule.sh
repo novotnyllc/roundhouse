@@ -1171,6 +1171,43 @@ fleet_run_command --fast'
     # The condition has ended: the next pass clears the alert.
     fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
     [ ! -e "$sched_alert" ] || fail "a re-enabled job's schedule-disabled alert was not cleared"
+    # A cadence policy change after the install leaves the job on the old
+    # interval: the pass alerts on the drift (the fast job's only), leaves
+    # the job alone, and clears the alert once the policy and the
+    # definition agree again. Each pass's fold is given here; one that fails
+    # decides nothing.
+    sched_drift="$ROUNDHOUSE_FLEET_STORE/alerts/vireo/schedule-drift--fleet-fast.yaml"
+    (
+      # A large fold (here ~300 KB of other desired state, past Linux's
+      # 128 KiB limit on one environment string) is judged too: it is never
+      # exported to the compare's utilities, whose exec it would fail.
+      sched_pad=$(head -c 300000 /dev/zero | tr '\0' x)
+      fleet_fold() { printf '{"policy":{"fast_interval_minutes":45},"pad":"%s"}\n' "$sched_pad"; }
+      : >"$SCHED_LOG"
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
+      [ -f "$sched_drift" ] || fail "a pass did not alert on a job installed before a cadence policy change"
+      [ "$(yq -r '.kind' "$sched_drift")" = schedule-drift ] || fail "the drift alert has the wrong kind"
+      [ -z "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" -name 'schedule-drift--fleet-full.yaml')" ] ||
+        fail "a pass alerted on drift of a job the policy change did not touch"
+      ! grep -Eq 'launchctl (bootstrap|bootout|enable|kickstart)' "$SCHED_LOG" ||
+        fail "a pass acted on a drifted job: $(cat "$SCHED_LOG")"
+      # Unreachable (over SSH): the files still say so.
+      rm -f "$SCHED_STATE/gui"
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
+      : >"$SCHED_STATE/gui"
+      [ -f "$sched_drift" ] || fail "an unreachable scheduler cleared a standing drift alert"
+    )
+    (
+      fleet_fold() { return 1; }
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
+      [ -f "$sched_drift" ] ||
+        fail "a pass whose policy fold failed judged drift against the built-in defaults"
+    )
+    (
+      fleet_fold() { printf '{}\n'; }
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
+      [ ! -e "$sched_drift" ] || fail "the drift alert outlived the policy change being undone"
+    )
     # Missing, with evidence the host is scheduled: alerted.
     rm -f "$sched_full"
     fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
@@ -1382,6 +1419,14 @@ fleet_run_command --fast'
       *'fleet-fast: installed, enabled, loaded, definition differs from what install writes (roundhouse-fleet-fast.service)'*) ;;
       *) fail "status did not report a hand-edited service: $("$cli" fleet-schedule status)" ;;
     esac
+    # …and the pass alerts on it as drift, though the timer still matches.
+    (
+      fleet_fold() { printf '{}\n'; }
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" wren 2>/dev/null
+      [ -f "$ROUNDHOUSE_FLEET_STORE/alerts/wren/schedule-drift--fleet-fast.yaml" ] &&
+        [ ! -e "$ROUNDHOUSE_FLEET_STORE/alerts/wren/schedule-drift--fleet-full.yaml" ] ||
+        fail "a pass did not alert on a hand-edited service alone as drift"
+    )
     rm -f "$sched_units/roundhouse-fleet-fast.service"
     case $("$cli" fleet-schedule status) in
       *'fleet-fast: missing, definition incomplete (roundhouse-fleet-fast.service absent)'*) ;;
@@ -1391,6 +1436,12 @@ fleet_run_command --fast'
       fail "the probe did not treat a missing service as a missing job"
     cp "$sched_root/fast.service.saved" "$sched_units/roundhouse-fleet-fast.service"
     fleet_schedule_job_state fast >/dev/null
+    (
+      fleet_fold() { printf '{}\n'; }
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" wren 2>/dev/null
+      [ ! -e "$ROUNDHOUSE_FLEET_STORE/alerts/wren/schedule-drift--fleet-fast.yaml" ] ||
+        fail "the drift alert outlived the restored service"
+    )
     # Without lingering, the timers die with the session: a PREFLIGHT, so
     # install says so and writes and enables nothing.
     rm -f "$SCHED_STATE/linger"
