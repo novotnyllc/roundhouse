@@ -101,6 +101,19 @@ fleet_schedule_paths_in_home() {
       *) return 1 ;;
     esac
     case /$home_path/ in */../* | */./*) return 1 ;; esac
+    # Lexically under $HOME is not enough: a symlinked ~/.config or
+    # LaunchAgents could carry the write elsewhere. The nearest existing
+    # parent, resolved, must sit under the resolved home too.
+    home_parent=$(dirname "$home_path")
+    while [ ! -d "$home_parent" ] && [ "$home_parent" != "$HOME" ]; do
+      home_parent=$(dirname "$home_parent")
+    done
+    home_real=$(CDPATH='' cd -P -- "$HOME" 2>/dev/null && pwd) || return 1
+    home_parent_real=$(CDPATH='' cd -P -- "$home_parent" 2>/dev/null && pwd) || return 1
+    case $home_parent_real/ in
+      "$home_real"/*) ;;
+      *) return 1 ;;
+    esac
   done
 }
 

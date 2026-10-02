@@ -1062,6 +1062,15 @@ fleet_run_command --fast'
       sched_status=$?
     [ "$sched_status" -eq 64 ] || fail "install wrote units outside HOME ($sched_status): $sched_out"
     [ ! -e "$sched_root/outside-home" ] || fail "install created files outside HOME"
+    # The same through a symlink: lexically under HOME, really outside it.
+    mkdir -p "$sched_root/outside-real"
+    ln -s "$sched_root/outside-real" "$HOME/linked-config"
+    sched_status=0
+    sched_out=$(XDG_CONFIG_HOME="$HOME/linked-config" sched_schedule install 2>&1) ||
+      sched_status=$?
+    [ "$sched_status" -eq 64 ] || fail "install followed a symlink out of HOME ($sched_status): $sched_out"
+    [ -z "$(ls -A "$sched_root/outside-real")" ] || fail "install wrote through a symlink outside HOME"
+    rm -f "$HOME/linked-config"
     # No user manager (WSL without systemd): written, and the fix is named.
     rm -f "$SCHED_STATE/usermgr"
     sched_status=0
