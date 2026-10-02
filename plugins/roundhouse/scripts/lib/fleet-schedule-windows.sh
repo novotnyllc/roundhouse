@@ -224,9 +224,13 @@ fleet_schedule_windows_status() {
 
 fleet_schedule_windows_verify() {
   # fleet_schedule_windows_verify — after an install: 0 when no obsolete
-  # one-shot task is still registered (or the Windows side could not be
-  # reached, which the plan already reported), else 75 with each one named.
-  verify_native=$(fleet_schedule_windows_inspect 2>/dev/null) || return 0
+  # one-shot task is still registered, else 75 with each one named. An
+  # inspection that fails AFTER the plan reached Windows proves nothing was
+  # removed, so it is 75 too, never a verified removal.
+  verify_native=$(fleet_schedule_windows_inspect 2>/dev/null) || {
+    printf 'roundhouse: native Windows: could not inspect the Task Scheduler after the install, so the obsolete one-shot tasks are unverified; re-run `roundhouse fleet-schedule install`\n' >&2
+    return 75
+  }
   verify_left=$(printf '%s\n' "$verify_native" |
     jq -r '.tasks[] | select(.class == "obsolete-oneshot") | .name')
   [ -n "$verify_left" ] || return 0

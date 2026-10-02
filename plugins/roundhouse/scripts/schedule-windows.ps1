@@ -118,7 +118,10 @@ function Get-TaskClass([string]$Name, [string]$Path, [string]$Xml, [string]$User
     if ($null -eq $CommandNode -or $null -eq $ArgumentsNode) { return "unknown" }
     $Leaf = @(([string]$CommandNode.InnerText).Trim('"') -split '[\\/]')[-1]
     if ($Leaf -inotin @("pwsh.exe", "powershell.exe")) { return "unknown" }
-    $FileMatch = [regex]::Match([string]$ArgumentsNode.InnerText, '(?i)(?:^|\s)-File\s+"(?<file>[^"]+)"')
+    # The WHOLE invocation: only these switches, then `-File "<path>"`, then
+    # nothing. Command-mode text that merely mentions `-File` is not a worker.
+    $FileMatch = [regex]::Match([string]$ArgumentsNode.InnerText,
+        '(?i)^\s*(?:-(?:NoLogo|NoProfile|NonInteractive)\s+)*-File\s+"(?<file>[^"]+)"\s*$')
     if (-not $FileMatch.Success) { return "unknown" }
     $File = $FileMatch.Groups["file"].Value
     $Root = $TempRoot.TrimEnd([char[]]@('\', '/'))
@@ -330,6 +333,7 @@ if ($SelfTest) {
             "Roundhouse-Two-00000000000000000000000000000005" = (New-FixtureXml -Extra "<Exec><Command>cmd.exe</Command></Exec>")
             "Roundhouse-Shell-00000000000000000000000000000006" = (New-FixtureXml -Command "C:\Windows\System32\cmd.exe")
             "Roundhouse-Escape-00000000000000000000000000000007" = (New-FixtureXml -Arguments "-File `"$Temp${Sep}roundhouse-release-gate.649j8Z${Sep}..${Sep}x.ps1`"")
+            "Roundhouse-Command-00000000000000000000000000000008" = (New-FixtureXml -Arguments "-Command Write-Output 'x -File `"$Temp${Sep}roundhouse-release-gate.649j8Z${Sep}w.ps1`"'")
             "RoundhouseFleetFast" = (New-FixtureXml)
         }
         foreach ($Key in $Cases.Keys) { $Fixture[$Key] = @{ Xml = $Cases[$Key]; State = "Ready" } }
