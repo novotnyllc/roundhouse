@@ -38,9 +38,13 @@
 91-jj-integrity	50
 92-jj-reconcile	19
 93-jj-run#1	160
-93-jj-run#2	150
-93-jj-run#3	200
-94-jj-doctor	197
+93-jj-run#2	80
+93-jj-run#3	60
+93-jj-run#4	95
+93-jj-run#5	65
+93-jj-run#6	60
+94-jj-doctor#1	165
+94-jj-doctor#2	35
 95-jj-trustd	20
 96-u20-chezmoi-absent	24
 97-jj-reenrollment	31

@@ -7,6 +7,10 @@
 # tests/90-jj-bootstrap.sh, whose key/roster/KRL fixture generator and real-jj
 # gate this section reuses; not a standalone test file.
 # shellcheck shell=bash
+#
+# Part 1 is the guards and doctor block; part 2 the batched sweep, so neither
+# nears the 10-minute test cap on a macOS runner.
+# roundhouse-test: parts=2
 
 docjj_root="$tmp/fleet-doctor-jj"
 mkdir -p "$docjj_root"
@@ -20,7 +24,7 @@ if [ "$real_jj_ok" != true ]; then
   printf '  §10.4 the sweep, §10.6 the guards and §10.7 doctor are UNVERIFIED.\n'
   printf '========================================================================\n'
   printf '\n'
-else
+elif section_part 1; then
   printf 'real-jj: §10.4 sweep, §10.6 guards, §10.7 doctor (jj %s)\n' "$real_jj_version"
   (
     set -eu
@@ -768,7 +772,7 @@ fi
 # one `jj file show`. Each is asserted against the per-commit / per-file walk
 # it replaced, over a range built to hit the edges, and the memo is asserted
 # to FAIL CLOSED: missing, corrupted or differently keyed, it is empty.
-if [ "$real_jj_ok" = true ]; then
+if [ "$real_jj_ok" = true ] && section_part 2; then
   printf 'real-jj: batched sweep and export against the per-commit walk (jj %s)\n' \
     "$real_jj_version"
   (

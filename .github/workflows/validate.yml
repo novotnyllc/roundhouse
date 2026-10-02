@@ -302,7 +302,7 @@ jobs:
           ROUNDHOUSE_TEST_SHARD: ${{ matrix.shard }}
           # Fail a hung unit with its log well inside the job timeout, rather
           # than losing every buffered log to a cancelled job.
-          ROUNDHOUSE_TEST_UNIT_TIMEOUT: '600'
+          ROUNDHOUSE_TEST_UNIT_TIMEOUT: '480'
           # Travels with the suite. Without it a real-jj section prints a NOTICE
           # and PASSES, so moving the suite here without this flag would have
           # silently stopped verifying the store's repository half.

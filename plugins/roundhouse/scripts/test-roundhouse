@@ -98,7 +98,7 @@ fi
 #   ROUNDHOUSE_TEST_LIST     true: print the selected units and weights; run
 #                            nothing.
 #   ROUNDHOUSE_TEST_UNIT_TIMEOUT  seconds before a unit is killed and failed
-#                            with its log (default 1200).
+#                            with its log (default 600: the 10-minute cap).
 #   ROUNDHOUSE_TEST_VERBOSE  true: print every unit's log, not only failures.
 #
 # Sections are discovered from tests/NN-*.sh; running needs no registration
@@ -242,7 +242,7 @@ rh_runner() {
     done
   fi
 
-  rh_timeout=${ROUNDHOUSE_TEST_UNIT_TIMEOUT:-1200}
+  rh_timeout=${ROUNDHOUSE_TEST_UNIT_TIMEOUT:-600}
   case $rh_timeout in ''|*[!0-9]*|0)
     printf 'FAIL: ROUNDHOUSE_TEST_UNIT_TIMEOUT must be a positive integer\n' >&2
     exit 64 ;;
