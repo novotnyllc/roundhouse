@@ -121,7 +121,9 @@ policy.
   <plugin>\scripts\apply-windows.ps1 -BootstrapNodeFnm -NodeMajor 26`. It is
   idempotent: fnm user-scope via winget, else the pinned SHA-256-verified
   release; `FNM_DIR`; the newest release in the major carrying every global
-  of the MSI's `%APPDATA%\npm`; the alias first on the user PATH. Rerunning
+  of the MSI's `%APPDATA%\npm` (an fnm default already in the major is left
+  as it is; the sealed lane moves it and runs the hooks); the alias first on
+  the user PATH. Rerunning
   it also restores a Windows switch left in flight. The machine PATH still
   puts the MSI's `node` first for a bare `node`/`npm` in new sessions;
   global bins and Roundhouse itself use fnm.
