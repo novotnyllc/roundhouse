@@ -330,7 +330,10 @@ failure. The holder is checked before the age: the lock records the holder's
 pid, process start time, command and a random nonce, and a lock whose holder is
 dead — the pid is gone, or now belongs to a process with a different start time
 or command — is taken over (renamed aside, verified by nonce, recreated) and
-raises a `lock-takeover` alert. A run releases the lock only while it still
+raises a `lock-takeover` alert. Every package- and agent-manager query a
+pass makes is bounded (about a minute for a listing, longer only for an
+install), so a manager that hangs makes only its own inventory unknown for
+that pass and raises an `inventory-timeout` alert. A run releases the lock only while it still
 carries that run's nonce. Exit 75 is the STALE-lock refusal — a lock past two
 full cadences whose holder cannot be shown dead, or one
 whose `meta.json` is missing so its age cannot be read — and it names the

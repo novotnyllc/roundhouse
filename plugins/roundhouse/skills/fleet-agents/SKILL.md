@@ -150,12 +150,19 @@ from one table (`fleet_alert_lifecycle_rows` in `lib/fleet-alerts.sh`):
 
 | Lifecycle | Scope | Kinds | Ends |
 | --- | --- | --- | --- |
-| condition | store | `removal-cap`, `integrity-store-wide`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render` | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
+| condition | store | `removal-cap`, `integrity-store-wide`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render`, `inventory-timeout` | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
 | condition | item | `integrity`, `config-key-collision`, `chezmoi-coownership`, `package-hold`, `enabled-but-untrusted`, `record-write`, `identity-unavailable`, `uninstall-deferred`, `package-deferred`, `runtime-hold`, `node-runtime-unverified` | the end-of-pass sweep (`fleet_alert_sweep`) clears it when the pass **checked** the item and did not raise it, or when the item has left the fold; an item the pass skipped (held, waiting on its canary) keeps it; never ages |
 | event | store or item | `stale-host`, `schedule-disabled`, `schedule-missing`, `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by its latest `at` after the evidence retention window |
 
 `stale-host`, `schedule-disabled` and `schedule-missing` are events until the
 loop-liveness work adds the checks that clear them; it moves them to condition.
+
+`inventory-timeout` is raised by the full pass's seed, one per manager
+(`inventory-timeout--packages-homebrew.yaml`, `--agents-jsm`, …), when the
+collector had to stop that manager's query: every package and agent manager
+query is bounded (about a minute for a listing, longer only for a real
+install), and one that hangs makes that manager's inventory unknown for the
+pass instead of stalling it. The next pass whose query answers clears it.
 
 `rm` on the file still resolves any alert by hand; a condition alert that is
 removed while its condition holds is raised again on the next pass.
