@@ -332,10 +332,10 @@ SH
       ["widget", "bare", "qual", "gadget", "current", "retired", "defined"] |
       map({key: "\(.)@m", value: [{scope: "user", version: "1.0.0", gitCommitSha: $a}]}) |
       from_entries)}' >"$HOME/.claude/plugins/installed_plugins.json"
-    jq -n --arg a "$pc_sha_a" --arg b "$pc_sha_b" '{available: (
+    jq -n --arg a "$pc_sha_a" --arg b "$pc_sha_b" '{available: ((
       ["widget", "bare", "qual", "gadget", "retired", "defined"] |
       map({pluginId: "\(.)@m", version: "1.1.0", source: {source: "git", sha: $b}})) +
-      [{pluginId: "current@m", version: "1.0.0", source: {source: "git", sha: $a}}]}' \
+      [{pluginId: "current@m", version: "1.0.0", source: {source: "git", sha: $a}}])}' \
       >"$pc/catalog.json"
     : >"$pc/actions"
     fleet_run_marketplace_repair_reset
