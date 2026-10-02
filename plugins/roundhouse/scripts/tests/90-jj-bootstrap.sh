@@ -397,6 +397,12 @@ if [ -n "$fleet_fixture_yq" ]; then
           *verb-hung* | *'sleep 594'* | 'sleep 593'* | 'sleep 1'*) kill -KILL "$verb_pid" 2>/dev/null || : ;;
         esac
       done
+      # The spawner's TERM helper is in neither set: it starts after the first
+      # look. Find it by the groups the run led, as the assertion below does.
+      for verb_pid in $(ps -A -o pid= -o pgid= -o command= 2>/dev/null | awk -v tree=" ${verb_hung_tree:-} " '
+        index(tree, " " $2 " ") && $3 == "sleep" && $4 == "594" { print $1 }'); do
+        kill -KILL "$verb_pid" 2>/dev/null || :
+      done
     }
     trap verb_cleanup EXIT
     verb_backdate() {
