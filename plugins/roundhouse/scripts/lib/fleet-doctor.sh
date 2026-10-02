@@ -1358,6 +1358,33 @@ fleet_doctor_command() (
         "roster generation $doctor_gen is BELOW this host's last-seen $doctor_gen_seen (§7.12.3)"
     fi
 
+    # REVIEWED-REF ON THE PUBLISHED LINE, the descendant gate's half of the same
+    # defence, read through the same state and hold text the gate uses. A
+    # holding host publishes nothing, so its keyed alert cannot leave it; this
+    # row is where the stuck state and its re-point command show on the host.
+    read -r doctor_rstate doctor_rref doctor_ranchor <<EOF
+$(fleet_trust_reviewed_state "$doctor_store")
+EOF
+    case $doctor_rstate in
+      none)
+        fleet_doctor_row ok reviewed-ref \
+          'no reviewed-ref yet; the first materialize after a publication records one'
+        ;;
+      unresolved)
+        fleet_doctor_row ok reviewed-ref \
+          "reviewed-ref $doctor_rref no longer resolves here (a local rewrite); the next materialize re-anchors it"
+        ;;
+      published)
+        fleet_doctor_row ok reviewed-ref \
+          "reviewed-ref $doctor_rref is on main@origin ($(fleet_trust_root)/reviewed-ref)"
+        ;;
+      *)
+        fleet_doctor_row finding reviewed-ref \
+          "$(fleet_trust_reviewed_hold_text "$doctor_store" "$doctor_rref" \
+            "$doctor_ranchor" long)"
+        ;;
+    esac
+
     # CLASS ENFORCEMENT, asserted rather than left in prose: an `ephemeral`
     # principal touching a fleet-shared path, and one touching the roster
     # itself, are both refused. "The class is the security boundary" is

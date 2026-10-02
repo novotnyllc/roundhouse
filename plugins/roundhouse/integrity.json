@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "9a1bd380283985bdf1f07518e78ac719eb17868c9a61ebd3080aed8e8c23cd2b"
+      "sha256": "dcb874126629a4f006d7a018eae410696fdd4d06549c8c87a5b028a34a016b28"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "f34f8c1bdc415bb5085993c2e13f9c33e579fe4cf1459738be7e01ec5d6d478e"
+      "sha256": "e4472739fca3b56afe11c0e597b90ba02f25e3f5c6107c3698960adcabd2d5a3"
     },
     {
       "path": "assets/icon.png",
@@ -122,7 +122,7 @@
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
-      "sha256": "13beec0d0dcc0c601f5894ebcdc86c75e0790228739486c0977bc84e75b4599c"
+      "sha256": "892cb3c849893fa8d912eae96ad29e37e77c6181517e0e987f2fe17e2cb6770c"
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
@@ -150,7 +150,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "ed450a86f365ba0e42918662e9b5f54d100b2b0132d28a88425a01801ba632c3"
+      "sha256": "b5b58b981655b2ee0c203063327edbc34ec0338e42b68b2a612b2447b5e9a186"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -169,12 +169,16 @@
       "sha256": "661c396637939a38e13687581655f56f263b5528f8732dad872d5a25e6a84435"
     },
     {
+      "path": "scripts/lib/fleet-trust-migrate.sh",
+      "sha256": "cbdeed820171b0606d34f2266e6f803fba0802a42c0be393ec024b5349413ced"
+    },
+    {
       "path": "scripts/lib/fleet-trust.sh",
-      "sha256": "b4dc868620b3aba538398352f082eb1d7f6dabcfe27f081686b32745a51783ee"
+      "sha256": "617ffb5f84ae1000e634f97ecf2eb0af362045000fdf3499b0010d60e0aa5187"
     },
     {
       "path": "scripts/lib/fleet-vcs.sh",
-      "sha256": "6f11091397f091a16be2ad92dae696ea7868986605f73177c2dc71b843455216"
+      "sha256": "2ef5b6df8aea0cc3f7d388923e07bced396a30d5c3a43e9fb3d2719177e46af7"
     },
     {
       "path": "scripts/lib/host.sh",
@@ -262,11 +266,11 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "b4a6b92da2f67fbfb364e9837677470511c88d014d60003f8198d1a510f48eb4"
+      "sha256": "00eaa5847a6cc29b05a1ba33a4c3749aeca4c8c109d7d05cc91289edbc5b97cd"
     },
     {
       "path": "scripts/roundhouse-trustd",
-      "sha256": "8ebd81f288ec2b4dad8efb4e90f7be2650eaa25c1ab58a2e58b0a5e214e26b34"
+      "sha256": "e4c9fa0e4378ba67b44c7d628abe3745a780cac1b8b5bf9de5393b4ac2ce6c29"
     },
     {
       "path": "scripts/select-sections",
@@ -357,5 +361,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.44"
+  "version": "0.9.45"
 }

@@ -3071,12 +3071,35 @@ fleet_run_pass() {
     # privileged helper that refuses) all come back non-zero here, and every
     # sibling hold in this function exits 65 and alerts — this one silently
     # converged on. Take the same branch the drift compare below takes.
-    if ! fleet_trust_materialize "$run_store" "$run_reference"; then
+    #
+    # A REVIEWED-REF OFF THE PUBLISHED LINE (exit 66) GETS ITS OWN KEYED ALERT,
+    # naming the mark and its newest published ancestor and pointing at the
+    # doctor row for the re-point command; the short hold text is sized under
+    # §10.4's cap by construction, so the alert cannot be refused and leave the
+    # hold silent. Every other refusal keeps the generic key. (A holding host
+    # publishes nothing, so peers learn of it from the stale-host alert, #42.)
+    run_mat_rc=0
+    fleet_trust_materialize "$run_store" "$run_reference" || run_mat_rc=$?
+    if [ "$run_mat_rc" -ne 0 ]; then
       run_reference_short=${run_reference:0:12}
-      fleet_alert_set "$run_store" "$run_host" materialization \
-        materialization-refused true \
-        "materialization refused for commit[$run_reference_short] (abbreviated commit id): a roster generation rollback or a non-descendant head (§7.12.3); holding everything" ||
-        :
+      if [ "$run_mat_rc" -eq 66 ]; then
+        read -r run_rstate run_rref run_ranchor <<EOF
+$(fleet_trust_reviewed_state "$run_store")
+EOF
+        fleet_alert_set "$run_store" "$run_host" materialization \
+          materialization-refused false ''
+        fleet_alert_set "$run_store" "$run_host" materialization \
+          reviewed-ref-unpublished true \
+          "$(fleet_trust_reviewed_hold_text "$run_store" "$run_rref" \
+            "${run_ranchor:--}" short)" || :
+      else
+        fleet_alert_set "$run_store" "$run_host" materialization \
+          reviewed-ref-unpublished false ''
+        fleet_alert_set "$run_store" "$run_host" materialization \
+          materialization-refused true \
+          "materialization refused for commit[$run_reference_short] (abbreviated commit id): a roster generation rollback or a non-descendant head (§7.12.3); holding everything" ||
+          :
+      fi
       printf 'roundhouse: materialization refused (§7.12.3); holding everything (§7.9)\n' >&2
       exit 65
     fi
@@ -3089,6 +3112,7 @@ fleet_run_pass() {
       exit 65
     }
     fleet_alert_set "$run_store" "$run_host" materialization materialization-refused false ''
+    fleet_alert_set "$run_store" "$run_host" materialization reviewed-ref-unpublished false ''
     fleet_alert_set "$run_store" "$run_host" materialization materialization false ''
   fi
 

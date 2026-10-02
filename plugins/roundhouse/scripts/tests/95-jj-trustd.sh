@@ -170,14 +170,20 @@ TOML
     # (a) DERIVATION — trustd writes the SAME roster the read path derives.
     tr_apply apply "$store" "$head" ||
       fail "trustd apply failed on a freshly enrolled store"
-    [ "$(cat "$trust/reviewed-ref")" = "$head" ] ||
-      fail "trustd did not record the reviewed ref"
+    # This fixture has no remote, so nothing is published and there is no
+    # high-water mark to record: reviewed-ref only ever names a commit this
+    # host saw on main@origin (§7.12.3). The revision trustd rendered rides in
+    # materialized-at, beside the instant, for the drift compare.
+    [ -f "$trust/reviewed-ref" ] && [ -z "$(fleet_trust_reviewed_ref)" ] ||
+      fail "trustd recorded an unpublished head as reviewed-ref: $(cat "$trust/reviewed-ref" 2>/dev/null)"
+    [ "$(fleet_trust_materialized_rev)" = "$head" ] ||
+      fail "trustd did not record the revision it rendered"
     [ -f "$trust/materialized-at" ] ||
       fail "trustd did not record the materialization instant"
     # Rendered at the instant trustd recorded, so the equality is exact even if a
     # TTL boundary would otherwise fall between two wall-clock reads.
     fleet_trust_roster_at_head "$store" "$head" "$tr/oracle" \
-      "$(cat "$trust/materialized-at")"
+      "$(fleet_trust_materialized_at)"
     cmp -s "$trust/allowed_signers" "$tr/oracle" ||
       fail "trustd's materialized roster differs from the roster the read path derives"
     [ -z "$(fleet_trust_materialization_drift "$store")" ] ||
@@ -203,7 +209,7 @@ TOML
 
     # (c) GENERATION MONOTONICITY — a high-water mark above the store's
     # generation makes trustd refuse rather than roll back (§7.12.3).
-    printf '%s\n' "$head" >"$trust/reviewed-ref"
+    : >"$trust/reviewed-ref"
     printf '99\n' >"$trust/generation"
     tr_reject apply "$store" "$head"
     # And with the high-water restored, the same apply is accepted again — the
@@ -308,6 +314,86 @@ TOML
     tr_doctor | grep -E '^ok +privileged-lane ' | grep -Fq DEGRADED ||
       fail "the doctor did not report seamless OK-degraded for a never-privileged host"
 
-    printf 'real-jj: trustd OK (derivation parity, fail-closed validation, generation monotonicity, degrade, symlink refusal, TRUSTD_HOME gating, install lane, hermetic materialize, forced-degrade finding)\n'
+    # (j) THE PUBLISHED-ONLY MARK, MIRRORED (§7.12.3, §7.9 parity). trustd
+    #     applies the same rule the run does, through the same library function:
+    #     reviewed-ref records the newest commit seen on main@origin, never the
+    #     adopted revision itself, so local work it materialized and that was
+    #     then abandoned cannot wedge it; a legacy mark on such work is
+    #     re-anchored only when proved; and a rewound origin still refuses.
+    "$REAL_GIT" init -q --bare -b main "$tr/remote.git"
+    jj -R "$store" git remote add origin "$tr/remote.git" >/dev/null
+    tr_commit() {
+      # tr_commit BASE TEXT -> one signed commit on BASE, as this host.
+      jj -R "$store" new "$1" >/dev/null 2>&1
+      printf 'probe: %s\n' "$2" >"$store/fleet.yaml"
+      jj -R "$store" describe -m "$2" >/dev/null 2>&1
+      jj -R "$store" log -r @ --no-graph -T commit_id
+    }
+    tr_publish() {
+      jj -R "$store" bookmark set main --allow-backwards -r "$1" >/dev/null 2>&1
+      jj -R "$store" git push --bookmark main >/dev/null 2>&1 ||
+        fail "the parity fixture could not publish $1"
+    }
+    rm -f "$trust/reviewed-ref" "$trust/generation" "$trust/materialized-at"
+    tr_pub=$(tr_commit "$head" 'published base')
+    tr_publish "$tr_pub"
+    tr_apply apply "$store" "$tr_pub" || fail "trustd refused a published head"
+    [ "$(fleet_trust_reviewed_ref)" = "$tr_pub" ] ||
+      fail "trustd did not record the published head it adopted"
+    tr_local=$(tr_commit "$tr_pub" 'local work that never publishes')
+    tr_apply apply "$store" "$tr_local" || fail "trustd refused local work atop main@origin"
+    [ "$(fleet_trust_reviewed_ref)" = "$tr_pub" ] ||
+      fail "trustd advanced reviewed-ref onto unpublished local work"
+    [ "$(fleet_trust_materialized_rev)" = "$tr_local" ] ||
+      fail "trustd did not record the local revision it rendered"
+    jj -R "$store" abandon -r "$tr_local" >/dev/null 2>&1
+    tr_moved=$(tr_commit "$tr_pub" 'origin moved on')
+    tr_publish "$tr_moved"
+    tr_apply apply "$store" "$tr_moved" ||
+      fail "REGRESSION (trustd): abandoned local work wedged the privileged lane"
+    [ "$(fleet_trust_reviewed_ref)" = "$tr_moved" ] ||
+      fail "trustd did not advance reviewed-ref to the published head"
+    #     THE PRIVILEGED LANE NEVER MIGRATES. The legacy state an older trustd
+    #     left — the rendered local head as the mark, a one-field
+    #     materialized-at — is refused even when it is this host's own work:
+    #     every input a migration proof reads is same-user state, which is
+    #     exactly what this helper does not trust. The operator re-points it.
+    tr_legacy=$(tr_commit "$tr_moved" 'a head an older trustd recorded')
+    printf '%s\n' "$tr_legacy" >"$trust/reviewed-ref"
+    fleet_now >"$trust/materialized-at"
+    jj -R "$store" abandon -r "$tr_legacy" >/dev/null 2>&1
+    tr_moved2=$(tr_commit "$tr_moved" 'origin moved on again')
+    tr_publish "$tr_moved2"
+    tr_status=0
+    tr_out=$(tr_apply apply "$store" "$tr_moved2" 2>&1) || tr_status=$?
+    [ "$tr_status" -eq 65 ] ||
+      fail "trustd re-anchored an unpublished mark from same-user evidence (got $tr_status): $tr_out"
+    case $tr_out in
+      *'is not on main@origin'*'re-point: '*) ;;
+      *) fail "trustd's unpublished-mark refusal does not name the re-point command: $tr_out" ;;
+    esac
+    [ "$(fleet_trust_reviewed_ref)" = "$tr_legacy" ] ||
+      fail "a refused trustd apply moved reviewed-ref"
+    printf '%s\n' "$tr_moved" >"$trust/reviewed-ref"
+    tr_apply apply "$store" "$tr_moved2" ||
+      fail "trustd refused the head once the mark was re-pointed"
+    #     A rewound origin: the hub goes back one commit, and trustd is asked to
+    #     adopt the head it went back to.
+    "$REAL_GIT" -C "$tr/remote.git" update-ref refs/heads/main "$tr_moved"
+    jj -R "$store" git fetch >/dev/null 2>&1
+    [ "$(jj -R "$store" log -r main@origin --no-graph -T commit_id)" = "$tr_moved" ] ||
+      fail "the rewound hub head did not arrive"
+    tr_status=0
+    tr_out=$(tr_apply apply "$store" "$tr_moved" 2>&1) || tr_status=$?
+    [ "$tr_status" -eq 65 ] ||
+      fail "REWIND (trustd): a rewound origin's head was materialized (got $tr_status): $tr_out"
+    case $tr_out in
+      *'is not on main@origin'*) ;;
+      *) fail "trustd's rewind refusal does not say the mark left main@origin: $tr_out" ;;
+    esac
+    [ "$(fleet_trust_reviewed_ref)" = "$tr_moved2" ] ||
+      fail "a refused trustd apply moved reviewed-ref"
+
+    printf 'real-jj: trustd OK (derivation parity, fail-closed validation, generation monotonicity, degrade, symlink refusal, TRUSTD_HOME gating, install lane, hermetic materialize, forced-degrade finding, published-only reviewed-ref)\n'
   )
 fi
