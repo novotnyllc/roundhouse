@@ -351,8 +351,12 @@ refused, and (c) a `lane.probe.v1` request completes end to end. On Windows
 the probe is submitted by the unelevated launcher after the elevated child
 returns, because a file created under the elevated token is owned by
 Administrators and the dispatcher would refuse it. Any failure before the
-canary passes rolls the installed pieces back on POSIX (an EXIT trap) and
-reports `needs_one_time_approval` again. Windows activates in two halves
+canary passes (or before the enrollment is journaled) rolls back on POSIX
+(an EXIT trap): a first enrollment to nothing, reporting
+`needs_one_time_approval` again; a re-enrollment of a working lane to the
+previous script, identity and grant, kept beside the live files until the
+new enrollment is on record, so a failed refresh never spends the owner's
+one approval twice. Windows activates in two halves
 instead: the elevated child installs with `activation|pending`, status
 reports `canary_pending`, the dispatcher executes nothing but
 `lane.probe.v1`, and the owner's own probe flips the identity to `passed`.

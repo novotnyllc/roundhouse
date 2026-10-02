@@ -549,7 +549,10 @@ enroll_command() {
   # update refreshes the root-owned copy and re-validates everything. Every
   # directory on the way down must be traversable by the owner (the lane's
   # umask is 077, so the parents are created explicitly at 755), and any
-  # failure from here until the canary passes rolls the installation back.
+  # failure from here until the enrollment is journaled rolls back: to the
+  # previous working installation when there was one (the owner's single
+  # approval must survive a failed refresh), to nothing on a first attempt.
+  backup_enrollment
   trap 'rollback_enrollment' EXIT
   (umask 022; mkdir -p "$libexec_dir" "$state_dir" "$claims_dir" "$results_dir" "$journal_dir") ||
     die 74 'enroll: cannot create the lane directories'
@@ -588,6 +591,7 @@ enroll_command() {
     return 74
   fi
   trap - EXIT
+  discard_enrollment_backup
   record 'lane-enrollment|1' 'state|enrolled' 'reason|one_time_approval_complete' "platform|$platform" \
     "host-id|$host" "owner-uid|$owner_uid" "owner-name|$owner" "lane-version|$version" "lane-sha256|$sha" \
     "plugin-root|$plugin_root" "canary|$canary_summary" 'end-enrollment|'
@@ -657,8 +661,35 @@ enrollment_canary() {
     canary_reason=probe_request_failed; return 1; }
   canary_summary="dispatch-grant,negative-argument:$canary_isolation,probe-completed"
 }
+# A re-enrollment keeps the previous script, identity and grant beside the
+# live files (same directory, same mode, root-owned; the sudoers copy carries
+# a `.` so sudo ignores it) until the new enrollment is on record.
+enroll_previous=
+backup_enrollment() {
+  local path
+  enroll_previous=
+  for path in "$installed_script" "$identity_path" "$sudoers_path"; do
+    rm -f "$path.previous"
+    [ -f "$path" ] && [ ! -L "$path" ] || continue
+    write_protected_file "$path.previous" "$(file_mode "$path")" <"$path"
+    enroll_previous=true
+  done
+}
 rollback_enrollment() {
-  rm -f "$sudoers_path" "$installed_script" "$identity_path"
+  # First attempt: remove everything. Re-enrollment: put the previous files
+  # back by rename (atomic, same filesystem); a file that did not exist
+  # before is removed again.
+  local path
+  for path in "$installed_script" "$identity_path" "$sudoers_path"; do
+    if [ "$enroll_previous" = true ] && [ -f "$path.previous" ]; then
+      mv -f "$path.previous" "$path"
+    else
+      rm -f "$path" "$path.previous"
+    fi
+  done
+}
+discard_enrollment_backup() {
+  rm -f "$installed_script.previous" "$identity_path.previous" "$sudoers_path.previous"
 }
 revoke_command() {
   require_root revoke
@@ -1269,6 +1300,27 @@ self_test() {
   done
   rc=0; out=$("$installed" request lane.probe.v1) || rc=$?
   [ "$rc" -eq 65 ] && grep -Fqx 'reason|rate_limited' <<<"$out" || self_fail "rate limit: $out"
+  # A re-enrollment whose canary fails (here: the probe is rate-limited)
+  # restores the previous working lane — identity, script and grant exactly
+  # as they were — rather than rolling back to nothing: the owner's one
+  # approval is never spent twice.
+  local before_identity before_script before_grant
+  before_identity=$(cat "$root/fixture$lane_libexec/lane.identity")
+  before_script=$(sha256_file "$installed")
+  before_grant=$(cat "$root/fixture$lane_sudoers")
+  sleep 1
+  rc=0; out=$("$lane" enroll --host-id test-host --owner "$(id -un)" --plugin-root "$plugin_root" 2>/dev/null) || rc=$?
+  [ "$rc" -eq 74 ] && grep -Fqx 'reason|probe_request_failed' <<<"$out" || self_fail "rate-limited re-enrollment did not fail (rc $rc): $out"
+  [ "$(cat "$root/fixture$lane_libexec/lane.identity")" = "$before_identity" ] || self_fail 'failed re-enrollment did not restore the previous identity'
+  [ "$(sha256_file "$installed")" = "$before_script" ] || self_fail 'failed re-enrollment did not restore the previous script'
+  [ "$(cat "$root/fixture$lane_sudoers")" = "$before_grant" ] || self_fail 'failed re-enrollment did not restore the previous grant'
+  [ ! -e "$installed.previous" ] && [ ! -e "$root/fixture$lane_libexec/lane.identity.previous" ] && [ ! -e "$root/fixture$lane_sudoers.previous" ] ||
+    self_fail 'a backup copy was left behind'
+  rc=0; out=$("$installed" status) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'state|ready' <<<"$out" || self_fail "previous lane not ready after a failed re-enrollment: $out"
+  : >"$root/fixture$lane_state/journal/events.log"
+  rc=0; out=$("$installed" request lane.probe.v1) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'reason|probe_completed' <<<"$out" || self_fail "previous lane does not dispatch after a failed re-enrollment: $out"
   : >"$root/fixture$lane_state/journal/events.log"
   # The owner cannot read root's 0440 grant file: status from the owner's
   # seat still reports ready, because the grant is proved by `sudo -n -l`,
