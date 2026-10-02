@@ -1792,7 +1792,18 @@ function Invoke-NodeSwitchCore {
             throw (New-NodeSwitchFailure ("$Message; could not restore the fnm default to $Old; the switch stays " +
                 "recorded as in flight ($(Get-NodeSwitchMarkerPath)); rerun the fnm bootstrap to restore it") $Tail)
         }
+        # No old default: remove the unverified one, provably, so a rerun
+        # never accepts it as already in the major.
         [void](& $script:NodeOps.Fnm $Root @("unalias", "default"))
+        $Alias = Get-FnmAliasDir $Root
+        $Left = Get-Item -LiteralPath $Alias -Force -ErrorAction SilentlyContinue
+        if ($null -ne $Left -and ($Left.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            try { [IO.Directory]::Delete($Alias, $false) } catch { }
+        }
+        if ($null -ne (Get-Item -LiteralPath $Alias -Force -ErrorAction SilentlyContinue)) {
+            throw (New-NodeSwitchFailure ("$Message; the unverified fnm default could not be removed: remove $Alias " +
+                "(fnm unalias default) before rerunning") $Tail)
+        }
         throw (New-NodeSwitchFailure "$Message; the fnm default was removed ($Target stays installed)" $Tail)
     }
     $script:LastOutputTail = [string[]]@()
@@ -2023,6 +2034,9 @@ function Invoke-NodeFnmMigration {
         }
     }
     if ($null -ne $Default -and (Get-NodeVersionMajor $Default) -eq $Major) {
+        if (-not (Test-NodeDefaultVerified $Root $Default)) {
+            throw "the fnm default $Default is not self-consistent (alias, node and npm prefix disagree); repair it (fnm default <version>) and rerun"
+        }
         return @{ Switched = $false; Old = $Default; Default = $Default; Carry = @() }
     }
     $Lines = & $script:NodeOps.FnmLines $Root @("list-remote")
@@ -2203,6 +2217,7 @@ $script:NodeSelfTestOps = @{
                 return 0
             }
             "unalias" {
+                if ($Fake.FailUnalias) { return 1 }
                 $Link = Get-FnmAliasDir $FnmRoot
                 if (Test-Path -LiteralPath $Link) { [IO.Directory]::Delete($Link, $false) }
                 return 0
@@ -2270,7 +2285,7 @@ function Reset-NodeSelfTestTree {
     $Fake = $script:NodeSelfTestFake
     Remove-Item -LiteralPath $Fake.Root -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $script:NodeSwitchStateDir -Recurse -Force -ErrorAction SilentlyContinue
-    foreach ($Key in @("FailInstall", "FailFnmInstall", "Linked", "ForeignPrefix")) { $Fake[$Key] = $false }
+    foreach ($Key in @("FailInstall", "FailFnmInstall", "FailUnalias", "Linked", "ForeignPrefix")) { $Fake[$Key] = $false }
     $Fake.HookExit = 0
     $Fake.DefaultOnly = $null
     $Fake.BundledNpm = "11.0.0"
@@ -2468,6 +2483,11 @@ function Invoke-NodeSwitchSelfTest([string]$Root) {
         $Fake.Log.Clear()
         $Again = Invoke-NodeFnmMigration -Root $Fnm -Major 26 -SourceNpm $MsiNpm
         if ($Again.Switched -or $Fake.Log.Count -ne 0) { throw "Node switch self-test: a bootstrap rerun was not idempotent" }
+        # A rerun never accepts an in-major default it cannot verify.
+        $Fake.ForeignPrefix = $true
+        Assert-NodeSelfTestThrows { [void](Invoke-NodeFnmMigration -Root $Fnm -Major 26 -SourceNpm $MsiNpm) } `
+            "*is not self-consistent*" "a bootstrap rerun over an unverified default"
+        $Fake.ForeignPrefix = $false
         # An alias that names no installed version is never read as "no
         # default": the bootstrap refuses rather than replace or unalias it.
         [IO.Directory]::Delete((Get-FnmAliasDir $Fnm), $false)
@@ -2485,6 +2505,18 @@ function Invoke-NodeSwitchSelfTest([string]$Root) {
         if ($null -ne (Get-FnmDefaultVersion $Fnm) -or $null -ne (Read-NodeSwitchMarker)) {
             throw "Node switch self-test: a failed first default was left behind"
         }
+        # A first default that sets but does not verify is removed even when
+        # `fnm unalias` itself fails: a rerun must not accept it.
+        $Fake.DefaultOnly = $null
+        $Fake.ForeignPrefix = $true
+        $Fake.FailUnalias = $true
+        Assert-NodeSelfTestThrows { [void](Invoke-NodeFnmMigration -Root $Fnm -Major 26 -SourceNpm $MsiNpm) } `
+            "*does not run under v26.10.0*the fnm default was removed*" "an unverified first default"
+        if ($null -ne (Get-Item -LiteralPath (Get-FnmAliasDir $Fnm) -Force -ErrorAction SilentlyContinue)) {
+            throw "Node switch self-test: an unverified first default survived a failed unalias"
+        }
+        $Fake.ForeignPrefix = $false
+        $Fake.FailUnalias = $false
 
         if ((Get-PathWithFirstEntry 'C:\a;C:\fnm\aliases\default\;C:\b;;C:\FNM\aliases\default' 'C:\fnm\aliases\default') -cne
             'C:\fnm\aliases\default;C:\a;C:\b') {
