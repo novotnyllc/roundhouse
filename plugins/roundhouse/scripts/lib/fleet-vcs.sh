@@ -393,6 +393,42 @@ fleet_vcs_path_summary() {
     }' | LC_ALL=C cut -c "1-$fleet_replicated_cap" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null
 }
 
+fleet_vcs_settle_proposals() {
+  # fleet_vcs_settle_proposals <store> <rev> — take origin's copy of every
+  # path under proposals/ that is conflicted at <rev>. proposals/ is
+  # regenerated on every full pass and each copy carries its writer's `by`
+  # and `at` (fleet_run_proposals), so two hosts that both ran a full pass
+  # since their last exchange conflict on every proposal. That is never a
+  # disagreement worth a resolution, and fleet_run_resolve_conflict only
+  # resolves layer items, so before this a proposals conflict left the host
+  # publication-silent until someone ran `jj restore` by hand. Origin's copy
+  # is what the fleet has already seen; the next full pass regenerates this
+  # host's own.
+  #
+  # Only CONFLICTED paths are restored, so a non-conflicting local change
+  # survives. A store that has never fetched has no origin to prefer and is
+  # left as it is. `file list -T` prints repo-relative paths from any
+  # directory; each path is passed as a quoted `root-file:` fileset, so a
+  # name like `promote-packages-openssl@3-to-fleet.yaml` is matched
+  # literally. Best effort: a failure is named on stderr and the merge stays
+  # conflicted, as it would have before.
+  fleet_vcs_settle_origin=$(fleet_vcs_head_origin "$1")
+  [ -n "$fleet_vcs_settle_origin" ] || return 0
+  fleet_vcs_settle_sets=()
+  while IFS= read -r fleet_vcs_settle_path; do
+    [ -n "$fleet_vcs_settle_path" ] || continue
+    fleet_vcs_settle_path=${fleet_vcs_settle_path//\\/\\\\}
+    fleet_vcs_settle_sets+=("root-file:\"${fleet_vcs_settle_path//\"/\\\"}\"")
+  done <<EOF
+$(jj -R "$1" file list -r "$2" -T 'if(conflict, path ++ "\n")' 'root:proposals' 2>/dev/null)
+EOF
+  [ "${#fleet_vcs_settle_sets[@]}" -gt 0 ] || return 0
+  jj -R "$1" restore --from "$fleet_vcs_settle_origin" --into "$2" \
+    "${fleet_vcs_settle_sets[@]}" >/dev/null 2>&1 ||
+    printf 'roundhouse: could not take origin'"'"'s copy of %s conflicted proposals; the merge stays conflicted\n' \
+      "${#fleet_vcs_settle_sets[@]}" >&2
+}
+
 fleet_vcs_reconcile() {
   # §8.2 steps 1-3: fleet_vcs_reconcile <store> <host> <session> <intent>
   # Prints `clean <M>` or `conflicted <M>`. On the clean path the bookmark
@@ -455,6 +491,12 @@ $(fleet_vcs_trailers "$fleet_vcs_host" interactive/human \
 $(fleet_vcs_trailers "$fleet_vcs_host" "$fleet_vcs_session" "$fleet_vcs_intent" -)" \
     "$@" >/dev/null
   fleet_vcs_merge=$(jj -R "$fleet_vcs_repo" log -r @ --no-graph -T 'commit_id')
+  # Settle proposals/ conflicts (origin's copy wins) before deciding clean vs
+  # conflicted. Restoring into the merge rewrites it, so read its id again.
+  if [ -n "$(fleet_vcs_conflicted "$fleet_vcs_repo" "$fleet_vcs_merge")" ]; then
+    fleet_vcs_settle_proposals "$fleet_vcs_repo" @
+    fleet_vcs_merge=$(jj -R "$fleet_vcs_repo" log -r @ --no-graph -T 'commit_id')
+  fi
 
   # Step 3. Workbench off the merge either way.
   jj -R "$fleet_vcs_repo" new "$fleet_vcs_merge" >/dev/null
@@ -487,6 +529,11 @@ fleet_vcs_fold_resolution() {
     jj -R "$1" describe -r "$fleet_vcs_merge" -m "$2" >/dev/null
     fleet_vcs_merge=$(jj -R "$1" log -r '@-' --no-graph -T 'commit_id')
   fi
+  # A merge made before reconcile settled proposals can still carry proposal
+  # conflicts; settle them in the workbench so the squash resolves them with
+  # whatever else was resolved. If origin has moved since that merge, the
+  # dominance check below still refuses and the next run reconciles afresh.
+  fleet_vcs_settle_proposals "$1" @
   jj -R "$1" squash --into "$fleet_vcs_merge" --use-destination-message >/dev/null
   fleet_vcs_merge=$(jj -R "$1" log -r '@-' --no-graph -T 'commit_id')
   # An empty workbench squashes to "Nothing changed" and leaves the merge
