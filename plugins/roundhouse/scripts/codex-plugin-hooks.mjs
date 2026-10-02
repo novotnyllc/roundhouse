@@ -660,6 +660,9 @@ async function main() {
         if (!atVerified || !active || resolve(active) !== resolve(codexTree)) {
           fail(`automatic approval refuses: ${pluginId} is no longer at the verified ${sha}`, 75);
         }
+        // Sealed first (umask 002 leaves it group-writable): bytes a group
+        // member could still change after this check are not verified bytes.
+        sealPluginCache(pluginId);
         if (!treesIdentical(codexTree, verifiedTree, { rejectEscapingLinks: true })) {
           fail(`automatic approval refuses: ${pluginId}'s Codex copy is not byte-identical to the verified tree`, 75);
         }

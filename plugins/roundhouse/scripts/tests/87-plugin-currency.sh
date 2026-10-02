@@ -572,11 +572,16 @@ SH
     pc_hooks_reset
     fleet_run_marketplace_repair_reset
     printf '%s\n' new >"$pc/hooks-state/version"
+    # Group-writable, as umask 002 leaves it: the copy is sealed before its
+    # bytes count as verified.
+    chmod -R g+w "$pc/codex-home/plugins/cache/m/widget"
     pc_status=0
     pc_hooks_apply || pc_status=$?
     [ "$pc_status" -eq 0 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:new ] &&
       ! grep -q codex-add "$pc/hooks-state/log" ||
       fail "a byte-verified advanced copy's changed hook was not carried to its new hash (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    [ -z "$(find "$pc/codex-home/plugins/cache/m/widget" -perm -g+w -print -quit)" ] ||
+      fail "automatic approval trusted a group-writable Codex cache without sealing it"
     # ...and the trust written is tied to the bytes verified: Codex
     # reinstalling the copy between the verification and the write (here,
     # on the helper's re-listing inside its one session) refuses with 75 and

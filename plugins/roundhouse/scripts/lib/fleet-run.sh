@@ -1922,7 +1922,7 @@ fleet_run_codex_hooks_settled() {
   fi
   fleet_run_hs_node=$(fleet_node_path) || return 75
   fleet_run_hs_status=$(bounded_query "$fleet_run_hs_node" "$script_dir/codex-plugin-hooks.mjs" \
-    status "$1" 2>/dev/null </dev/null) || return 75
+    status "$1" 2>/dev/null </dev/null) || return 74
   fleet_run_hs_counts=$(printf '%s\n' "$fleet_run_hs_status" |
     jq -er '"\(.modified | numbers) \(.untrusted | numbers)"' 2>/dev/null) || return 75
   case $fleet_run_hs_counts in

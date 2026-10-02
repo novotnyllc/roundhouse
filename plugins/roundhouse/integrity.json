@@ -50,7 +50,7 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
-      "sha256": "8e6d4d7c8b7b2260c881d11c9d9e455ba1e10acb74f5ba94c87c924bd3b26669"
+      "sha256": "a1d946f12ccb3613df95f6733899f105466c1fd253af57ff951a7b9a2818bce1"
     },
     {
       "path": "scripts/codex-plugin-hooks.ps1",
@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "49e823c1ab0c25c07b70d4be86af9aa541b5e3ccefb89d071ebc45aa38433cae"
+      "sha256": "e1fab625c0941a530816402db791d40c8d5f1c38c783a9354269cedb10a87214"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
