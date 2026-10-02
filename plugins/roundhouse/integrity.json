@@ -278,7 +278,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "06ad8ce06539366b9294c0ade7639e190cf7a131eead01dd2f1b3ac49000aa64"
+      "sha256": "b5717eeb0809d34adb90cd15472c77fd33734e01d0ad2babf765168ecf8d10c4"
     },
     {
       "path": "scripts/roundhouse-trustd",
