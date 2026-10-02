@@ -123,6 +123,13 @@ fleet_trigger_start_after_exit() {
   # pass, and it is bounded. DETACHED, with SIGHUP ignored: a trigger that
   # came over SSH (the push nudge, under a ten-second watchdog) returns at
   # once, and the session ending does not take the start with it.
+  #
+  # The job is judged AGAIN right before the start, by the trigger's own
+  # plan, and the plan is acted on as the trigger would: `start` starts,
+  # `detach` (the scheduler went away during the wait) takes the detached
+  # fallback, and anything else is an operator stop, which is final — a full
+  # request this trigger left for the stopped full job is dropped with it, as
+  # fleet_trigger_take_mode would drop it.
   await_limit=30
   if fleet_test_hook "${ROUNDHOUSE_TEST_TRIGGER_AWAIT_SECONDS:-}"; then
     await_limit=$ROUNDHOUSE_TEST_TRIGGER_AWAIT_SECONDS
@@ -133,7 +140,14 @@ fleet_trigger_start_after_exit() {
     while fleet_trigger_exit_pending "$1" && [ "$SECONDS" -lt "$await_until" ]; do
       sleep 0.1
     done
-    fleet_schedule_backend start "$1" || :
+    case $(fleet_trigger_plan "$1") in
+      start) fleet_schedule_backend start "$1" || : ;;
+      detach)
+        fleet_trigger_detach "$1" "fleet-$1's scheduler became unreachable while its run exited" ||
+          :
+        ;;
+      *) [ "$1" != full ] || rm -f "$(fleet_trigger_full_path)" ;;
+    esac
   ) </dev/null >/dev/null 2>&1 &
 }
 
