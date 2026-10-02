@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "3b3719fbdf21231a5e2690160464fe9025e7f71b6d40d3c0dec9edd7c7525736"
+      "sha256": "2479022573501963dc10e268bbb008a4cf5151c58cc611d645e95dac8cdfc06a"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "5d2c7f504330845ff81b4875ee975de45a8612ca14c12195a1b2a5476ed238c1"
+      "sha256": "8cc0ea26e0d90425a3f18d9d873969b0ff6f95118a6cc492aa91bbfb89bdb124"
     },
     {
       "path": "assets/icon.png",
@@ -58,7 +58,7 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "aa3b1e6d4eb21bc30631e9073c52b1c4526a4d1a500105eeeaed5e948336c12e"
+      "sha256": "e6d83f1a27f9403d04f799da13cd23c76fd13ca81c0002853365d43d03ba5f45"
     },
     {
       "path": "scripts/collect-windows.ps1",
@@ -66,7 +66,7 @@
     },
     {
       "path": "scripts/enroll-privilege-posix",
-      "sha256": "032b09bc61618ee72a61ffbf95faf0fa4e21237000a3e9e27a1219c43a53af07"
+      "sha256": "9a9ca677ec4087b265c8fb5cb3a8528e9a05d76bc2672e851256756ec49b5f0e"
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
@@ -158,7 +158,7 @@
     },
     {
       "path": "scripts/lib/fleet-store.sh",
-      "sha256": "89dc588461bc88097af2259a42fd72c3d29ae3b81c5d5afd0699629eabcee466"
+      "sha256": "b74d8a9c2ab05cbbbadc12ef1af9add7bb13f6c2291ed3802503ab6ec24928de"
     },
     {
       "path": "scripts/lib/fleet-trust.sh",
@@ -170,7 +170,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "f5c28be1e4eb2071286de25f67168cb3f994ef95368dab339c007437d84ea10b"
+      "sha256": "e14dcba73e87cab7000a9ce8343bce9ba26592bf19bed1a46addc21f4d16bd22"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -182,7 +182,7 @@
     },
     {
       "path": "scripts/lib/inventory.sh",
-      "sha256": "718a473bd3e3d40c66fdf34fb61419a67d3d969bee3ae7eace49b1e91deec5b8"
+      "sha256": "b196f20e4263646a495a04afd75c1fb0c799fc9ca2bfbea4d0017770047733de"
     },
     {
       "path": "scripts/lib/node-runtime.sh",
@@ -222,7 +222,7 @@
     },
     {
       "path": "scripts/preflight",
-      "sha256": "ece027b78daf3fd1cb7bfe83ba82cbf1d80861fcac87dfdeda5342727370237c"
+      "sha256": "e73e0dbb43bc7d3dfff0081e61af002ddf7627b9f237980a19a5aa2c7b921b5f"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -341,5 +341,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.32"
+  "version": "0.9.34"
 }
