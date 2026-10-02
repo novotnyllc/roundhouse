@@ -511,15 +511,17 @@ fleet_run_canary_passing() {
         $pairs | split("\n")[] | select(. != "") | split("\t") as [$item, $digest] |
         ($by_item[$item] // []) as $mine |
         select($indexable) |
-        (try ([$mine[] | select(.digest == $digest and
+        # As the gate asks it: the latest withdrawal, then the first
+        # identity-less evidence after it (the current clean run).
+        (try ([$mine[] | select(.outcome == "held" or .outcome == "reverted") |
+            .at | fromdateiso8601] | max) catch "error") as $withdrawn |
+        select($withdrawn != "error") |
+        (try ([$mine[] | select(.digest == $digest and (.identity // "") == "" and
             (.outcome == "applied" or .outcome == "satisfied")) |
-            .at | fromdateiso8601] | min) catch "error") as $applied_epoch |
+            .at | fromdateiso8601 | select($withdrawn == null or . > $withdrawn)] |
+            min) catch "error") as $applied_epoch |
         select($applied_epoch != "error" and $applied_epoch != null) |
         select(($applied_epoch + $ws) <= $now_epoch) |
-        (try ([$mine[] | select(.outcome == "held" or .outcome == "reverted") |
-            (.at | fromdateiso8601) | select(. > $applied_epoch)] | length)
-          catch -1) as $withdrawn |
-        select($withdrawn == 0) |
         select($latest != null and $latest >= ($applied_epoch + $ws)) |
         "\($item)\($us)\($digest)"' <"$fleet_run_cp_entries" 2>/dev/null || :
     fi
@@ -763,6 +765,10 @@ fleet_run_poll_floor() {
   # No stale-host scan owed (§6.3): only a pass that reaches the end runs it
   # (fleet_liveness_owed says what owes one).
   ! fleet_liveness_owed "$1" "$fleet_run_fetched" || return 1
+  # Last, because it is the one network question per marketplace: an
+  # upstream plugin marketplace that moved is work the store cannot show
+  # (fleet_plugins_probe, read-only `git ls-remote`).
+  ! fleet_plugins_probe || return 1
   if [ "$fleet_run_fetched" = "$fleet_run_converged" ]; then
     fleet_run_floor_note='nothing new on the remote'
   else
@@ -3258,6 +3264,15 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         '{item:$item,digest:"absent",outcome:"reverted",at:$at}')" || :
   done
 
+  # Plugins are always current: marketplaces whose upstream moved (fast), or
+  # all of them (full), are refreshed BEFORE the plan, so this pass's identity
+  # comparison sees the new catalog and updates the plugin items it owns
+  # (lib/fleet-plugins.sh). The stamp keeps the full pass from refreshing
+  # them a second time.
+  fleet_plugins_refresh "$run_store" "$run_host" "$run_fold" "$run_defs" \
+    "$run_mode" "$run_tmp" || :
+  : >"$run_tmp/plugins-refreshed"
+
   # The pass's whole item set, for the sweep's retired-item rule.
   awk 'NF >= 2 { print $2 }' "$run_tmp/verdicts" | fleet_alert_items "$run_ledger"
   # THE PLAN, not one lookup per item: every per-item read below — value,
@@ -3432,9 +3447,11 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fi
 
     # §10.1's gate, with the liveness term. Canary hosts are not gated by
-    # themselves, and a tombstone with nothing installed here is not a change
-    # here: its `satisfied` is true whatever the canaries have seen.
+    # themselves, a tombstone with nothing installed here is not a change
+    # here (its `satisfied` is true whatever the canaries have seen), and a
+    # plugin is never gated: plugins are always current (fleet_canary_exempt).
     if [ "$run_self_canary" != true ] && [ -s "$run_tmp/canaries" ] &&
+      ! fleet_canary_exempt "$run_item" &&
       { [ "$run_tombstone" != true ] || [ "$run_tomb_removal" = true ]; }; then
       # fleet_canary_gate's answer for every plan item was computed before
       # the loop (fleet_run_canary_passing): the canaries' journals do not
@@ -4213,28 +4230,12 @@ fleet_run_full_pass() (
   full_hold_dir=${6:-}
 
   # §10.5: one file per host per upstream. No leases, no CAS, no TTLs, no
-  # takeover — jitter is the coordination primitive.
-  fleet_run_plugin_marketplaces "$full_fold" "$full_defs" \
-    "${6:-}/sigholds" "${6:-}/verdicts" |
-    while IFS= read -r full_upstream; do
-    [ -n "$full_upstream" ] || continue
-    full_result=unavailable
-    if command -v claude >/dev/null 2>&1; then
-      full_result=failed
-      # `update` cannot refresh a marketplace that was never registered, and
-      # never refreshes one registered from another source than the declared
-      # one: that would pull whatever the new source serves under the name.
-      fleet_run_ensure_marketplace "$full_upstream" >/dev/null 2>&1 || :
-      if fleet_run_marketplace_source_ok "$full_upstream"; then
-        ! bounded_verb claude plugin marketplace update "$full_upstream" >/dev/null 2>&1 ||
-          full_result=ok
-      else
-        full_result=held
-        printf '  hold  marketplace %s — %s\n' "$full_upstream" "$fleet_run_repair_reason"
-      fi
-    fi
-    fleet_upstream_write "$full_store" "$full_upstream" "$full_host" "$full_result" || :
-  done
+  # takeover — jitter is the coordination primitive. The run refreshes
+  # plugin marketplaces BEFORE its item loop (fleet_plugins_refresh) and
+  # stamps the pass; this is the refresh for a caller that did not.
+  [ -e "${6:-}/plugins-refreshed" ] ||
+    fleet_plugins_refresh "$full_store" "$full_host" "$full_fold" "$full_defs" \
+      full "${6:-}" || :
 
   # §7.11.3's three aging policies, DELIBERATELY SEPARATE because they answer
   # different questions and have different natural periods. Both of the two that

@@ -3321,10 +3321,30 @@ its own measurement of jj on Windows. This design does not depend on one.
 A non-canary host applies item X at digest D only when, for some canary host `c`:
 
 1. `journal/c/` contains `outcome: applied` **or `outcome: satisfied`** for
-   `{X, D}`, at least `canary_wait_hours` ago, **and**
-2. no later record for X from `c` with `outcome: held` or `reverted`, **and**
+   `{X, D}` newer than `c`'s latest `held` or `reverted` record for X — the
+   **latest clean run** of evidence — and that run's first record is at least
+   `canary_wait_hours` old, **and**
+2. no record for X from `c` with `outcome: held` or `reverted` follows the
+   latest evidence, **and**
 3. **`c` has published *some* record — any item, or an `alive` heartbeat — dated
-   at or after `applied_at + canary_wait_hours`.**
+   at or after `applied_at + canary_wait_hours`**, where `applied_at` is that
+   run's first record.
+
+The latest clean run, not the first evidence: timing the wait from the
+canary's first `applied` and rejecting any hold after it made one transient
+hold (applied, applied, held, applied) void the evidence for as long as the
+journal kept it. The run is timed from its *first* record rather than its
+newest because a converged item is journaled again on every pass that reaches
+it, and timing from the newest would restart the soak every pass. Evidence may
+also be keyed on a resolved upstream identity (`identity`) as well as the
+digest, so evidence about one upstream release never passes another.
+
+**Plugins are exempt.** `plugins.*` and `definitions.plugins.*` items never
+wait on the canary: their digest names `name@marketplace` and state, not the
+upstream release it resolves to, so a new release could never earn evidence of
+its own, and the operator wants every plugin current on every host as soon as
+a pass sees the new upstream. Review, holds, the identity proof and the removal
+cap still apply.
 
 Condition 3 is new and it closes a lie by omission the reviewer found: a canary
 that applies an item, is wrecked by it, and stops journaling satisfies (1) and

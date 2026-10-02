@@ -180,7 +180,9 @@ plugin cache is the failure this prevents, so a second entry is never
 added: the desired-state run **absorbs** the older autoupdate entry rather
 than being given one of its own. Marketplace refresh and package updates are
 not a separate job — the full cadence does both, on the same convergence that
-applies everything else (see `roundhouse:fleet-agents`).
+applies everything else, and the fast cadence also refreshes any plugin
+marketplace whose upstream moved, so plugins stay current between full passes
+(see `roundhouse:fleet-agents`).
 
 Marketplace convergence compares resolved source bytes with the installed
 plugin identity; a same-version SHA change reinstalls, while a matching SHA is
@@ -221,8 +223,8 @@ The entry drives **two cadences from one owned slot**:
 
 | Cadence | Command | Default | Covers |
 | --- | --- | --- | --- |
-| Fast | `roundhouse fleet-run --fast` | every 20 min | converge desired state: fetch, review, apply, publish |
-| Full | `roundhouse fleet-run --full` | twice a day | the fast pass plus marketplace refresh, unpinned package updates, re-seed, promotion proposals, and `fleet-doctor` |
+| Fast | `roundhouse fleet-run --fast` | every 20 min | converge desired state: fetch, review, apply, publish; refresh plugin marketplaces whose upstream moved |
+| Full | `roundhouse fleet-run --full` | twice a day | the fast pass plus a refresh of every plugin marketplace, unpinned package updates, re-seed, promotion proposals, and `fleet-doctor` |
 
 The full cadence's package pass also covers npm globals the store declares.
 A logical package reaches npm only through a definition with an `npm:` entry

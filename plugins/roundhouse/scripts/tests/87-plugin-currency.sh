@@ -1,0 +1,257 @@
+# roundhouse self-check — plugins are always current (lib/fleet-plugins.sh):
+# the read-only upstream probe, the Codex marketplace refresh and its
+# hook-preserving updates, and the Claude refresh's handling of plugins the
+# fleet does not own.
+#
+# Every upstream is a local repository, every manager a stub; nothing here
+# reaches the network or a real harness. The run-level story (a non-canary host
+# applying a plugin with no canary evidence, the poll floor seeing a moved
+# marketplace) is tests/93-jj-run.sh's `plugins` scenario.
+#
+# Sourced by scripts/test-roundhouse in a fixed order; not a
+# standalone test file. See that driver for why.
+# shellcheck shell=bash
+
+if [ -n "$fleet_fixture_yq" ]; then
+  printf 'plugin currency: upstream probe, Codex refresh, unowned Claude updates\n'
+  (
+    set -eu
+    PATH=$fleet_fixture_path
+    export PATH
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+
+    pc="$tmp/plugin-currency"
+    rm -rf "$pc"
+    mkdir -p "$pc/store" "$pc/home/.claude/plugins" "$pc/bin"
+    ROUNDHOUSE_FLEET_STORE="$pc/store"
+    HOME="$pc/home"
+    CLAUDE_CONFIG_DIR="$HOME/.claude"
+    export ROUNDHOUSE_FLEET_STORE HOME CLAUDE_CONFIG_DIR
+    pc_git() {
+      "$REAL_GIT" -c user.name=x -c user.email=x@example.invalid \
+        -c commit.gpgsign=false -c tag.gpgsign=false "$@"
+    }
+    pc_upstream() {
+      # pc_upstream NAME -> a bare upstream with one commit on main
+      pc_git init -q --bare -b main "$pc/$1.git"
+      pc_git init -q -b main "$pc/$1-work"
+      pc_commit "$1" 'first'
+    }
+    pc_commit() {
+      pc_git -C "$pc/$1-work" commit -q --allow-empty -m "$2"
+      pc_git -C "$pc/$1-work" push -q "$pc/$1.git" main
+      pc_git -C "$pc/$1-work" rev-parse HEAD
+    }
+
+    # --- the upstream head: read-only, by branch, peeled tag or HEAD ---
+    pc_upstream heads >/dev/null
+    pc_head=$(pc_git -C "$pc/heads-work" rev-parse HEAD)
+    pc_git -C "$pc/heads-work" tag -a v1 -m 'release v1'
+    pc_git -C "$pc/heads-work" push -q "$pc/heads.git" v1
+    [ "$(fleet_plugins_remote_head "$pc/heads.git" '')" = "$pc_head" ] ||
+      fail "the upstream head at HEAD was not read"
+    [ "$(fleet_plugins_remote_head "$pc/heads.git" main)" = "$pc_head" ] ||
+      fail "the upstream head of a branch was not read"
+    [ "$(fleet_plugins_remote_head "$pc/heads.git" v1)" = "$pc_head" ] ||
+      fail "an annotated tag was not peeled to the commit it names"
+    ! fleet_plugins_remote_head "$pc/heads.git" nope >/dev/null ||
+      fail "a ref the upstream does not have answered a head"
+    ! fleet_plugins_remote_head "$pc/missing.git" '' >/dev/null 2>&1 ||
+      fail "an unreachable upstream answered a head"
+    for pc_bad in '-uhttps://x' 'has space' ''; do
+      ! fleet_plugins_remote_head "$pc_bad" '' >/dev/null 2>&1 ||
+        fail "an option-shaped or empty upstream URL was passed to git: $pc_bad"
+    done
+    ! fleet_plugins_remote_head "$pc/heads.git" '--upload-pack=x' >/dev/null 2>&1 ||
+      fail "an option-shaped ref was passed to git"
+
+    # --- Claude sources: only marketplaces with an installed plugin ---
+    pc_upstream claude-up >/dev/null
+    jq -n --arg url "$pc/claude-up.git" '{
+      "git-market": {source: {source: "git", url: $url}, installLocation: "/nowhere"},
+      "gh-market": {source: {source: "github", repo: "owner/repo", ref: "stable"}},
+      "dir-market": {source: {source: "directory", path: "/somewhere"}},
+      "idle-market": {source: {source: "git", url: $url}}}' \
+      >"$HOME/.claude/plugins/known_marketplaces.json"
+    printf '%s\n' '{"version":2,"plugins":{
+      "a@git-market":[{"scope":"user","version":"1"}],
+      "b@gh-market":[{"scope":"user","version":"1"}],
+      "c@dir-market":[{"scope":"user","version":"1"}],
+      "d@idle-market":[{"scope":"project","version":"1"}]}}' \
+      >"$HOME/.claude/plugins/installed_plugins.json"
+    us=$(printf '\037')
+    fleet_plugins_claude_sources | tr "$us" '|' | LC_ALL=C sort >"$pc/sources"
+    printf '%s\n' "claude|gh-market|https://github.com/owner/repo.git|stable|" \
+      "claude|git-market|$pc/claude-up.git||/nowhere" >"$pc/sources.want"
+    cmp -s "$pc/sources" "$pc/sources.want" ||
+      fail "the Claude marketplace sources were wrong: $(tr '\n' ' ' <"$pc/sources")"
+
+    # --- the probe: moved against the head this host last refreshed at ---
+    # Only the local upstream is probed from here on: a GitHub source would be
+    # a network call.
+    printf '%s\n' '{"version":2,"plugins":{"a@git-market":[{"scope":"user","version":"1"}]}}' \
+      >"$HOME/.claude/plugins/installed_plugins.json"
+    pc_claude_head=$(pc_git -C "$pc/claude-up-work" rev-parse HEAD)
+    fleet_plugins_probe ||
+      fail "a marketplace this host never refreshed did not read as moved"
+    [ "$fleet_plugins_probed" = true ] || fail "the probe did not say it ran"
+    [ "$(printf '%s' "$fleet_plugins_moved" | tr "$us" '|')" = \
+      "claude|git-market|$pc_claude_head|/nowhere" ] ||
+      fail "the probe's moved line was wrong: $fleet_plugins_moved"
+    fleet_plugins_memo_write claude git-market attempted "$pc_claude_head"
+    ! fleet_plugins_probe ||
+      fail "an upstream at the head this host refreshed at read as moved: $fleet_plugins_moved"
+    pc_claude_head=$(pc_commit claude-up 'a release')
+    fleet_plugins_probe || fail "an upstream that moved did not read as moved"
+    case $fleet_plugins_moved in
+      *"$pc_claude_head"*) ;;
+      *) fail "the probe did not report the new upstream head: $fleet_plugins_moved" ;;
+    esac
+    # Unreachable is "not known to have moved", never "moved": it must not
+    # keep every fast pass open while the network is down.
+    jq --arg url "$pc/gone.git" '."git-market".source.url = $url' \
+      "$HOME/.claude/plugins/known_marketplaces.json" >"$pc/known.next"
+    mv "$pc/known.next" "$HOME/.claude/plugins/known_marketplaces.json"
+    ! fleet_plugins_probe || fail "an unreachable upstream read as moved"
+
+    # --- Codex: the routine refresh, unattended ---
+    cat >"$pc/bin/codex" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'plugin marketplace list --json') cat "$PC_CODEX_MARKETS"; exit 0 ;;
+  'plugin list --json') cat "$PC_CODEX_PLUGINS"; exit 0 ;;
+esac
+if [ "$1 $2 $3" = 'plugin marketplace upgrade' ] && [ "${5:-}" = --json ]; then
+  printf 'upgrade %s\n' "$4" >>"$PC_CODEX_LOG"
+  [ "${PC_CODEX_UPGRADE_FAIL:-0}" != 1 ] || exit 1
+  jq -n --arg rev "$(cat "$PC_CODEX_NEXT_REV")" '{source_type: "git", ref_name: null, revision: $rev}' \
+    >"$PC_CODEX_ROOT/.codex-marketplace-install.json"
+  exit 0
+fi
+exit 64
+SH
+    cat >"$pc/bin/fake-node" <<'SH'
+#!/usr/bin/env bash
+printf 'helper %s %s\n' "$2" "$3" >>"$PC_CODEX_LOG"
+[ "$3" != "${PC_NODE_FAIL_ID:-}" ] || exit 1
+SH
+    chmod +x "$pc/bin/codex" "$pc/bin/fake-node"
+    mkdir -p "$pc/codex-root"
+    export PC_CODEX_MARKETS="$pc/codex-markets.json" PC_CODEX_PLUGINS="$pc/codex-plugins.json" \
+      PC_CODEX_LOG="$pc/codex.log" PC_CODEX_NEXT_REV="$pc/codex-next-rev" \
+      PC_CODEX_ROOT="$pc/codex-root"
+    jq -n --arg root "$pc/codex-root" '{marketplaces: [
+      {name: "novotnyllc", root: $root,
+       marketplaceSource: {sourceType: "git", source: "https://example.invalid/m.git"}},
+      {name: "openai-bundled", root: "/bundled", marketplaceSource: {sourceType: "local", source: "/bundled"}}]}' \
+      >"$PC_CODEX_MARKETS"
+    printf '%s\n' '{"installed":[
+      {"pluginId":"roundhouse@novotnyllc","marketplaceName":"novotnyllc","installed":true},
+      {"pluginId":"railyard@novotnyllc","marketplaceName":"novotnyllc","installed":true},
+      {"pluginId":"agent-utilities@novotnyllc","marketplaceName":"novotnyllc","installed":true},
+      {"pluginId":"tart-xcode-runner@novotnyllc","marketplaceName":"novotnyllc","installed":true},
+      {"pluginId":"gone@novotnyllc","marketplaceName":"novotnyllc","installed":false},
+      {"pluginId":"browser@openai-bundled","marketplaceName":"openai-bundled","installed":true}]}' \
+      >"$PC_CODEX_PLUGINS"
+    pc_rev1=1111111111111111111111111111111111111111
+    pc_rev2=2222222222222222222222222222222222222222
+    printf '%s\n' "$pc_rev1" >"$PC_CODEX_NEXT_REV"
+    (
+      PATH="$pc/bin:$PATH"
+      fleet_node_path() { printf '%s\n' "$pc/bin/fake-node"; }
+      # Local and remote-catalog marketplaces advance with Codex itself.
+      [ "$(fleet_plugins_codex_markets | tr "$us" '|')" = \
+        "novotnyllc|https://example.invalid/m.git||$pc/codex-root" ] ||
+        fail "the Codex Git marketplaces were wrong: $(fleet_plugins_codex_markets)"
+      # A full refresh: upgrade the Git marketplace, then every installed
+      # plugin from it through the hook-preserving helper, roundhouse last.
+      : >"$PC_CODEX_LOG"
+      pc_out=$(fleet_plugins_refresh "$pc/store" vireo '{}' '{}' full "$pc")
+      printf '%s\n' 'upgrade novotnyllc' 'helper update agent-utilities@novotnyllc' \
+        'helper update railyard@novotnyllc' 'helper update tart-xcode-runner@novotnyllc' \
+        'helper update roundhouse@novotnyllc' \
+        >"$pc/codex.want"
+      cmp -s "$PC_CODEX_LOG" "$pc/codex.want" ||
+        fail "the Codex refresh did not run the routine sequence: $(tr '\n' ';' <"$PC_CODEX_LOG")"
+      case $pc_out in
+        *'update plugin roundhouse@novotnyllc (codex)'*) ;;
+        *) fail "the Codex refresh did not report its updates: $pc_out" ;;
+      esac
+      [ "$(fleet_plugins_memo_read codex novotnyllc complete)" = "$pc_rev1" ] ||
+        fail "a completed Codex refresh did not remember its revision"
+      # The same revision again costs one upgrade and nothing more.
+      : >"$PC_CODEX_LOG"
+      fleet_plugins_codex_refresh novotnyllc "$pc/codex-root" >/dev/null
+      [ "$(cat "$PC_CODEX_LOG")" = 'upgrade novotnyllc' ] ||
+        fail "an unchanged Codex marketplace re-ran its plugin updates: $(tr '\n' ';' <"$PC_CODEX_LOG")"
+      # A new revision with one failing update: every plugin is still tried,
+      # and the revision is not recorded complete, so the next pass retries.
+      printf '%s\n' "$pc_rev2" >"$PC_CODEX_NEXT_REV"
+      : >"$PC_CODEX_LOG"
+      pc_out=$(PC_NODE_FAIL_ID=railyard@novotnyllc \
+        fleet_plugins_codex_refresh novotnyllc "$pc/codex-root" "$pc_rev2")
+      [ "$(grep -c '^helper update' "$PC_CODEX_LOG")" -eq 4 ] ||
+        fail "one failed Codex update stopped the rest: $(tr '\n' ';' <"$PC_CODEX_LOG")"
+      case $pc_out in
+        *'hold  plugin railyard@novotnyllc (codex)'*) ;;
+        *) fail "a failed Codex update was not reported as a hold: $pc_out" ;;
+      esac
+      [ "$(fleet_plugins_memo_read codex novotnyllc complete)" = "$pc_rev1" ] ||
+        fail "a Codex refresh with a failed update was recorded complete"
+      [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" = "$pc_rev2" ] ||
+        fail "the attempted upstream head was not remembered"
+      # A failed upgrade updates nothing.
+      : >"$PC_CODEX_LOG"
+      pc_out=$(PC_CODEX_UPGRADE_FAIL=1 \
+        fleet_plugins_codex_refresh novotnyllc "$pc/codex-root")
+      ! grep -q '^helper' "$PC_CODEX_LOG" ||
+        fail "plugins were updated from a marketplace whose upgrade failed"
+      case $pc_out in
+        *'hold  marketplace novotnyllc (codex)'*) ;;
+        *) fail "a failed Codex marketplace upgrade was not reported: $pc_out" ;;
+      esac
+    )
+
+    # --- Claude: plugins the fleet does not own are updated in place ---
+    pc_sha_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    pc_sha_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    pc_fold='{"plugins":{"widget":{"state":"enabled","marketplace":"m"},"bare":"enabled","qual@m":"enabled"}}'
+    fleet_plugins_claude_owned "$pc_fold" '{}' | LC_ALL=C sort >"$pc/owned"
+    printf '%s\n' 'id qual@m' 'id widget@m' 'name bare' >"$pc/owned.want"
+    cmp -s "$pc/owned" "$pc/owned.want" ||
+      fail "the fleet's own plugins were not named: $(tr '\n' ';' <"$pc/owned")"
+    jq -n --arg a "$pc_sha_a" '{version: 2, plugins: (
+      ["widget", "bare", "qual", "gadget", "current"] |
+      map({key: "\(.)@m", value: [{scope: "user", version: "1.0.0", gitCommitSha: $a}]}) |
+      from_entries)}' >"$HOME/.claude/plugins/installed_plugins.json"
+    jq -n --arg a "$pc_sha_a" --arg b "$pc_sha_b" '{available: (
+      ["widget", "bare", "qual", "gadget"] |
+      map({pluginId: "\(.)@m", version: "1.1.0", source: {source: "git", sha: $b}})) +
+      [{pluginId: "current@m", version: "1.0.0", source: {source: "git", sha: $a}}]}' \
+      >"$pc/catalog.json"
+    : >"$pc/actions"
+    fleet_run_marketplace_repair_reset
+    pc_out=$(CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog.json" CLAUDE_PLUGIN_ACTION_LOG="$pc/actions" \
+      fleet_plugins_claude_update_unowned '{}' m "$pc/owned")
+    [ "$(cat "$pc/actions")" = 'update gadget@m' ] ||
+      fail "the unowned update touched a fleet item or a current plugin: $(tr '\n' ';' <"$pc/actions")"
+    case $pc_out in
+      *'update plugin gadget@m (claude)'*) ;;
+      *) fail "the unowned update was not reported: $pc_out" ;;
+    esac
+    [ "$(jq -r '.plugins["gadget@m"][0].gitCommitSha' \
+      "$HOME/.claude/plugins/installed_plugins.json")" = "$pc_sha_b" ] ||
+      fail "the unowned plugin did not reach the catalog identity"
+    # An update the manager claims and does not deliver is a hold, not done.
+    jq --arg a "$pc_sha_a" '.plugins["gadget@m"][0].gitCommitSha = $a' \
+      "$HOME/.claude/plugins/installed_plugins.json" >"$pc/installed.next"
+    mv "$pc/installed.next" "$HOME/.claude/plugins/installed_plugins.json"
+    pc_out=$(CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog.json" CLAUDE_INSTALL_SKIP_RECORD=1 \
+      fleet_plugins_claude_update_unowned '{}' m "$pc/owned")
+    case $pc_out in
+      *'hold  plugin gadget@m — claude plugin update did not reach the catalog identity'*) ;;
+      *) fail "a no-op update read as done: $pc_out" ;;
+    esac
+  )
+fi

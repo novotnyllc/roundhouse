@@ -86,8 +86,8 @@ Two scheduled jobs per host run them, installed by
 
 | | Command | Default | Does |
 | --- | --- | --- | --- |
-| Fast | `roundhouse fleet-run --fast` | 20 min ± 5 jitter | poll floor, fetch, reconcile, promote gate, review → apply → journal, publish, peer nudge |
-| Full | `roundhouse fleet-run --full` | 12 h ± 90 min jitter | everything fast does, plus marketplace refresh, re-seed, promotion proposals, unpinned package updates, and `fleet-doctor` |
+| Fast | `roundhouse fleet-run --fast` | 20 min ± 5 jitter | poll floor (with the plugin upstream probe), fetch, reconcile, promote gate, refresh of moved plugin marketplaces, review → apply → journal, publish, peer nudge |
+| Full | `roundhouse fleet-run --full` | 12 h ± 90 min jitter | everything fast does, plus a refresh of every plugin marketplace, re-seed, promotion proposals, unpinned package updates, and `fleet-doctor` |
 
 The **poll floor** is one incremental fetch into a private ref and a tree
 compare: a fast run exits early when the desired-state paths at the fetched
@@ -95,8 +95,9 @@ remote head (`fleet.yaml`, `definitions.yaml`, `definitions/`, `fleet/`, `os/`,
 `groups/`, `hosts/`, `trust/`) match those of the reference this host last
 converged from, the fetched head descends from what it converged on, and it
 has nothing to push, a clean `@`, no heartbeat owed, no item waiting on canary
-evidence and no retry owed (a failed apply, an unreadable identity, or a
-`fleet-review` verdict not yet acted on). Peers' record commits (journal,
+evidence, no retry owed (a failed apply, an unreadable identity, or a
+`fleet-review` verdict not yet acted on), and no plugin marketplace whose
+upstream moved. Peers' record commits (journal,
 alerts, `applied/`) no longer force a full pass; the floor's fetch does not
 move `main@origin`, so the next full pass still signature-gates everything
 that arrived. Jitter is seeded from the host
@@ -172,6 +173,28 @@ enrolled host that has published no heartbeat within `liveness_alert_hours`
 (default 12, never less than twice `heartbeat_publish_hours`), naming its last
 published heartbeat, and clears it when the peer is heard from again. Both keys are ordinary store policy;
 `0` turns the throttle or the alert off.
+
+**Plugins are always current**, from every marketplace, in both harnesses,
+and never wait on the canary (`plugins.*` and `definitions.plugins.*` skip
+the gate; review, holds, the identity proof and the removal cap still apply).
+The fast pass's poll floor asks each plugin marketplace's upstream for its
+head with a read-only, bounded `git ls-remote` (in parallel; an unreachable
+one reads as unmoved), against the head this host last refreshed it at
+(`store.run/plugin-currency/`). A moved marketplace, or every marketplace on
+the full pass, is refreshed BEFORE the item loop, so the same pass's identity
+comparison updates the fleet's plugin items through review → apply →
+journal. Installed plugins the fleet does not own are updated in place
+afterwards: `claude plugin update` for user-scoped Claude plugins, and for
+each Codex Git marketplace `codex plugin marketplace upgrade` followed by the
+hook-preserving `codex-plugin-hooks.mjs update` for every installed plugin
+from it, `roundhouse@novotnyllc` last. Neither path installs, enables or
+removes anything. Directory and URL Claude sources have no head to ask and
+refresh on the full pass only.
+
+The canary gate (§10.1) times its wait from the first record of the canary's
+**latest clean run** of `applied`/`satisfied` evidence — the records after
+its newest `held` or `reverted` for the item — so one transient hold no longer
+voids the evidence for good, and a later withdrawal still withdraws it.
 
 An unpinned package is kept current by the full pass — that is what anyone
 gets by doing nothing. A `version:` key in `definitions.yaml` opts one
@@ -764,8 +787,11 @@ current; Codex will not. Once the on-disk marketplace content is current, Codex 
 advances installed plugin versions itself on the next `plugin/list` (which
 every TUI session issues routinely) — nothing needs to force reinstalls
 or invoke `codex plugin marketplace upgrade`, only to keep the checkout
-current. The 3h remote-catalog TTL and the startup git auto-upgrade are
-catalog-metadata-only and git-type-only respectively; neither gives local
+current. The scheduled run upgrades and updates through the hook-preserving
+helper anyway: a host where no Codex session starts never auto-upgrades a Git
+marketplace, and the helper re-trusts, at their new hashes, exactly the hooks
+this host already trusted. The 3h remote-catalog TTL and the startup git
+auto-upgrade are catalog-metadata-only and git-type-only respectively; neither gives local
 marketplaces any freshness guarantee.
 
 ## Routine marketplace refresh
@@ -797,9 +823,10 @@ an archive download), and an installed copy whose bytes are identical to the
 checkout's keeps its recorded SHA, so a marketplace commit that did not touch
 the plugin does not demand an update.
 
-The scheduled run applies the same comparison. When it cannot prove an
-installed plugin's identity — no catalog entry, or an entry with no SHA — it
-first repairs the marketplace, once per marketplace per pass, and asks again;
+The scheduled run applies the same comparison, after refreshing the
+marketplace first (see **Plugins are always current** above). When it cannot
+prove an installed plugin's identity — no catalog entry, or an entry with no
+SHA — it first repairs the marketplace, once per marketplace per pass, and asks again;
 only then does the plugin hold, as
 `installed marketplace identity unavailable (REASON)`. An unregistered
 marketplace is registered from its `extraKnownMarketplaces` declaration. A
