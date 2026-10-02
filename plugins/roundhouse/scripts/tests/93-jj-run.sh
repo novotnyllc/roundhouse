@@ -936,6 +936,18 @@ p0jj_ratchet_wedge() {
   [ "$(runjj_ref)" = "$(fleet_vcs_head_origin "$vireo")" ] ||
     fail "reviewed-ref is not the head this pass published"
   [ ! -e "$runjj_unpub" ] || fail "a healthy pass left the reviewed-ref alert"
+  #    Advancing the mark on a push must not move the drift compare: with a
+  #    one-field materialized-at, the rendered revision is known only through
+  #    reviewed-ref, so it is written into materialized-at first.
+  runjj_rendered=$(runjj_lib vireo fleet_trust_materialized_rev)
+  printf '%s\n' "$runjj_rendered" >"$rjj/vireo/reviewed-ref"
+  runjj_lib vireo fleet_now >"$rjj/vireo/materialized-at"
+  runjj_pushed=$(runjj_peer_push 2)
+  jj -R "$vireo" git fetch >/dev/null 2>&1
+  runjj_lib vireo fleet_trust_advance_published "$vireo" "$runjj_pushed"
+  [ "$(runjj_ref)" = "$runjj_pushed" ] &&
+    [ "$(runjj_lib vireo fleet_trust_materialized_rev)" = "$runjj_rendered" ] ||
+    fail "advancing a legacy-format mark moved the drift compare off the rendered revision"
 }
 
 p0jj_ratchet_legacy() {

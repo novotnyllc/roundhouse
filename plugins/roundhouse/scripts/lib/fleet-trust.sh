@@ -1011,14 +1011,30 @@ fleet_trust_advance_published() {
   # replays and verifies that range itself before it writes anything. Either
   # way this is best-effort: the publication already happened, and a refusal
   # here leaves the older mark, which the next pass advances.
+  #
+  # A drifted materialized roster is never overwritten here: re-materializing
+  # would erase the very mismatch the next run's drift compare alerts on, so the
+  # privileged re-ratchet is skipped and that alert stays the run's to raise.
   fleet_trust_privileged_lane=false
   if fleet_trust_privileged >/dev/null 2>&1; then
+    [ -z "$(fleet_trust_materialization_drift "$1")" ] || return 0
     fleet_trust_materialize "$1" "$2" 2>/dev/null || :
     return 0
   fi
   fleet_trust_adv=$(fleet_trust_reviewed_next "$1" "$2" 2>/dev/null) || return 0
   [ -n "$fleet_trust_adv" ] || return 0
   fleet_trust_adv_tmp=$(mktemp "${TMPDIR:-/tmp}/roundhouse-mark.XXXXXX")
+  # A one-field materialized-at names its rendered revision only through
+  # reviewed-ref (fleet_trust_materialized_rev). Moving the mark would move the
+  # drift compare off the revision the roster was rendered from, so that
+  # revision is written into materialized-at first.
+  fleet_trust_adv_at=$(fleet_trust_materialized_at)
+  if [ -n "$fleet_trust_adv_at" ] &&
+    [ "$(awk 'NR == 1 { print NF; exit }' "$(fleet_trust_root)/materialized-at")" = 1 ]; then
+    printf '%s %s\n' "$fleet_trust_adv_at" "$(fleet_trust_materialized_rev)" \
+      >"$fleet_trust_adv_tmp"
+    safe_output "$fleet_trust_adv_tmp" "$(fleet_trust_root)/materialized-at"
+  fi
   fleet_trust_generation_mark "$1" "$fleet_trust_adv" >"$fleet_trust_adv_tmp"
   safe_output "$fleet_trust_adv_tmp" "$(fleet_trust_root)/generation"
   printf '%s\n' "$fleet_trust_adv" >"$fleet_trust_adv_tmp"

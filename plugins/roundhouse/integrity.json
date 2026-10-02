@@ -158,11 +158,11 @@
     },
     {
       "path": "scripts/lib/fleet-trust.sh",
-      "sha256": "52ea25f15f4ce08226f7f2292bf114bf4a2bc6076277a30c55b4132302b5cd36"
+      "sha256": "617ffb5f84ae1000e634f97ecf2eb0af362045000fdf3499b0010d60e0aa5187"
     },
     {
       "path": "scripts/lib/fleet-vcs.sh",
-      "sha256": "b43dc93a647c2717a4cb69c6def54e6cf0044cf287d89013e77bb4b374e5393d"
+      "sha256": "7d71edf97c4cf151318c8799b7565a4eb16bd56178bf3855b9e255e873c8a014"
     },
     {
       "path": "scripts/lib/host.sh",

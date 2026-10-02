@@ -576,13 +576,15 @@ fleet_vcs_publish() {
   # line that keeps the §8.1 invariant true between runs, and it is what
   # preserves fleet-enroll's post-enrollment authorship: @ ends every run
   # empty, described by nothing, and parented on main.
-  jj -R "$1" new "$2" >/dev/null
+  fleet_vcs_reset_rc=0
+  jj -R "$1" new "$2" >/dev/null || fleet_vcs_reset_rc=$?
   # §7.12.3: the push SUCCEEDED, so what this host just published becomes the
   # rollback mark. Left at the fetched head, the mark lagged one publication
   # and an origin forked from below this push was accepted. Here, in the one
   # line that pushes, so every publisher advances it; a failed push returned
   # above and leaves the mark where it was.
   fleet_trust_advance_published "$1" "$2" || :
+  return "$fleet_vcs_reset_rc"
 }
 
 fleet_vcs_publish_refs() {
