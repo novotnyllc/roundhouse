@@ -30,11 +30,11 @@
     },
     {
       "path": "references/ssh-automation-identity.md",
-      "sha256": "d3a5887aecdef11b84ecbc4b073f53d4f9f62275d8491ca045b91f8696555754"
+      "sha256": "f0b67072ddf8b4245205a22f6ba95c5004d48872f0a1a85e0d8640df13871173"
     },
     {
       "path": "references/windows-sftp.md",
-      "sha256": "12238c2f1139de1963e7d4615b6f2221839569cf2582732959d1a954b334b937"
+      "sha256": "42c4df1cd15c8856f24dc61812ae7722c16606aab76bb7d7fed6250df4b7dca1"
     },
     {
       "path": "references/windows-winget-provider.lock",
@@ -186,7 +186,7 @@
     },
     {
       "path": "scripts/lib/identity.sh",
-      "sha256": "66b265b5ae84373c1251c8925d4a783b8bb9c0306a2bee19a57ca74806b3dc4a"
+      "sha256": "d731e76a505b07a206964626bde8fbad72ceee38c2ef9c92229be6896bb15414"
     },
     {
       "path": "scripts/lib/interop.sh",
@@ -198,7 +198,7 @@
     },
     {
       "path": "scripts/lib/lane.sh",
-      "sha256": "f6759ec3ff4a2555af17bf715b9ff7fb5aac717846491dd56e765a4c783add9c"
+      "sha256": "3f2da60766867fd6441dc18c9b436fdcad600c8eafeb5a7557ea71f2354cd14a"
     },
     {
       "path": "scripts/lib/local-plan.sh",
@@ -266,7 +266,11 @@
     },
     {
       "path": "scripts/privilege-lane-posix",
-      "sha256": "ca81b2b06c9044ca3ab7c1a255a312a88fa58fb6a37d09423515f4664656e0da"
+      "sha256": "d77233e0303c7156e1c9fa1ac06b4edeced0b32872fd85fe751003a3be1330cc"
+    },
+    {
+      "path": "scripts/privilege-lane-windows.ps1",
+      "sha256": "e6d3111ee3f1550c577cb89871d7353631fe8ed67c5294d16c34f4a408a1b722"
     },
     {
       "path": "scripts/profile-worker-windows.ps1",
@@ -286,7 +290,7 @@
     },
     {
       "path": "scripts/select-sections",
-      "sha256": "d51f05661b479241b2d2fb2a7cfbd37262e5c52e67c3c845c443fefbf54822f2"
+      "sha256": "97ece31b73df98ed66709312050ae3ac65ddab4f8a755387be6b22f93b29da70"
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",
@@ -294,7 +298,7 @@
     },
     {
       "path": "skills/fleet-agents/SKILL.md",
-      "sha256": "9df07856c58df75eeffa134a184fd8413ac336e618c5ed117d415810f222dbec"
+      "sha256": "07a5f60393adbb631b63e4c782ed453d9f4568635ad36a9470b354e33ef27029"
     },
     {
       "path": "skills/fleet-agents/agents/openai.yaml",
@@ -302,7 +306,7 @@
     },
     {
       "path": "skills/fleet-auth/SKILL.md",
-      "sha256": "b87528c7bc65ed747976bb11e5a4a8dc82cb044ba791d41fabac8ad947459814"
+      "sha256": "347339c51e549367332890dcbb2f5a3a633468ee2ddadf3d4a185a1efe0a043c"
     },
     {
       "path": "skills/fleet-auth/agents/openai.yaml",
@@ -310,7 +314,7 @@
     },
     {
       "path": "skills/fleet-hosts/SKILL.md",
-      "sha256": "e42887faacb9bad6138fb90b9f5a44cad8a3bc988200f9be04223dabbaa3a0f8"
+      "sha256": "f1ed5d42d4f61c7e2e8c1d8cc88f142c4251267dcd8d1319eb9ae32bf3f05182"
     },
     {
       "path": "skills/fleet-inventory/SKILL.md",
@@ -330,7 +334,7 @@
     },
     {
       "path": "skills/fleet-readiness/SKILL.md",
-      "sha256": "4b16fb1b71d67a3c96ff9f83b8edb92cd66965139fd1662cf7c35b4e7f1dc29f"
+      "sha256": "3737f0d3a04ad2b60f3d4bc0338a8b9758b76034df88c05c12956a78a2f3f269"
     },
     {
       "path": "skills/fleet-readiness/agents/openai.yaml",
@@ -338,7 +342,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "84063b23d2237d744d2f8ccee7368166120236406820ddbee95a52179ff2dd27"
+      "sha256": "d0eb3c152e95637210769c7725b0b1c228db973aaaa636f69644adaab512d222"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",
