@@ -239,6 +239,11 @@ jobs:
         shard: ${{ fromJSON(needs.select.outputs.shards) }}
     runs-on: ${{ matrix.os }}
     steps:
+      # The suite deadline counts from the job's start, so a hung unit is
+      # killed with its log a minute before the 10-minute job timeout,
+      # however long the setup below takes.
+      - name: Start the suite deadline
+        run: echo "ROUNDHOUSE_TEST_DEADLINE=$(( $(date +%s) + 540 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install OpenSSH server for scope validation
         if: runner.os == 'Linux'
@@ -300,8 +305,9 @@ jobs:
           ROUNDHOUSE_TEST_ONLY: ${{ needs.select.outputs.only }}
           ROUNDHOUSE_TEST_SCOPES: ${{ needs.select.outputs.scopes }}
           ROUNDHOUSE_TEST_SHARD: ${{ matrix.shard }}
-          # Fail a hung unit with its log well inside the job timeout, rather
-          # than losing every buffered log to a cancelled job.
+          # Fail a hung unit with its log inside the job timeout, rather
+          # than losing every buffered log to a cancelled job; the deadline
+          # set above bounds a unit that starts late.
           ROUNDHOUSE_TEST_UNIT_TIMEOUT: '480'
           # Travels with the suite. Without it a real-jj section prints a NOTICE
           # and PASSES, so moving the suite here without this flag would have
