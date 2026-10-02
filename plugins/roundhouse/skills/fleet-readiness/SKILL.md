@@ -56,33 +56,35 @@ applies; both run only the installed Windows Roundhouse that matches the
 controller's version and passes `-VerifyExecutor`, else fail closed with
 `executor_update_required`. The visible Codex task remains the
 lane for work needing the Desktop app surface, or when WSL is absent or
-unreachable — and it covers only ordinary native Windows work.
+unreachable — and it covers only ordinary native Windows work. Protected or logged-off Windows work requires fresh
+`privilege_broker` readiness from the enrolled `windows-sftp` route; never
+substitute the visible task, WSL, or another transport. That `windows-sftp`
+route is also the harness-neutral way to deliver dispatch prerequisites —
+marketplace desired-records and profile bundles — to a Windows target: any
+harness can stage them over SSH/SFTP (broker pickup within one minute), and
+only the in-session cache install and hook-trust convergence still needs the
+Codex task surface.
 
-Privileged work (apt, machine-scope winget, signed macOS packages) rides the
-**privilege lane**: a root/SYSTEM-owned helper behind an owner-only queue on
-each host, reached over the same ordinary transport (local shell, SSH as the
-user, or SSH into the WSL sibling for native Windows). `fleet-readiness`
-prints one `privilege-lane` row per host: `ok` when enrolled, `PENDING` with
-`needs_one_time_approval` and the exact command (`roundhouse privilege-enroll
-HOST`) until the host's single OS approval has happened — ordinary work
-proceeds without it — and a finding only when an enrolled lane has drifted.
-A native-Windows host reports `user_session_unavailable` when it has no
-configured WSL sibling or the interop token is elevated, and `unreachable`
-when the configured sibling does not answer (a logged-off Windows host
-usually stops the WSL VM); either way user-scope work
-(user-scope winget, fnm/Node, profile and agent configuration) runs only in
-the ordinary interop lane under the user's own logged-on session, machine-
-scope work only through the LocalSystem lane task, and no other identity is
-ever substituted. There is no S4U task, no request account and no SFTP
-route. `roundhouse privilege-status HOST OUT` returns the same state as a
-`privilege_broker`/`readiness` record for the sealed-plan verbs.
+Privileged apt work on Linux and WSL rides the **privilege lane**: a
+root-owned helper behind an owner-only queue on each host, reached over the
+same ordinary transport (local shell or SSH as the user) after the host's
+single OS approval. `fleet-readiness` prints one `privilege-lane` row per
+host from the raw state `roundhouse privilege-lane-status HOST OUT` reports:
+`ready` → `ok`; `needs_one_time_approval` → `PENDING` with the exact command
+(`roundhouse privilege-enroll HOST`), and ordinary work proceeds without it;
+`unreachable` → `PENDING`; `disabled` and `legacy` → `ok`; `unsupported`
+(macOS and native Windows in this version) → `ok  not yet supported`; and
+`drifted` → a finding, the only one, because an enrolled lane is broken.
+`partial` and `rejected` are operation-result states on a lane result, never
+readiness states. `roundhouse privilege-status HOST OUT` returns the same
+state as a `privilege_broker`/`readiness` record for the sealed-plan verbs.
 
-For macOS the host lane implements signed package installs
-(`macos.install-signed-pkg.v1`, Developer ID checked by Team ID), but sealed
-plans do not bind a payload digest yet, so the controller does not advertise
-that action: only `lane.probe.v1` seals on macOS in this version. SSH is not
-elevation; root Homebrew, arbitrary `sudo`, installer scripts, and arbitrary
-plist paths are unsupported.
+For macOS, report a separate root-broker state only when readiness advertises
+the owner-enrolled, default-disabled `macos.install-signed-pkg.v1` or
+`macos.apply-system-setting.v1` action of the optional CA lane; the privilege
+lane's own macOS action is not in this version. SSH is not elevation; root
+Homebrew, arbitrary `sudo`, installer scripts, and arbitrary plist paths are
+unsupported.
 
 Report the exact configured nodes checked, requirements, evidence, changes,
 unknowns, and any restart or saved-project action still required. When the

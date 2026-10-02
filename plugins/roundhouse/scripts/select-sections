@@ -55,7 +55,6 @@ plugins/roundhouse/scripts/prepare-ssh-identity	12 14
 plugins/roundhouse/scripts/certify-ssh-node	12 14
 plugins/roundhouse/scripts/enroll-privilege-posix	50
 plugins/roundhouse/scripts/privilege-lane-posix	16
-plugins/roundhouse/scripts/privilege-lane-windows.ps1	16
 plugins/roundhouse/scripts/privilege-broker-posix	50
 plugins/roundhouse/scripts/launcher-install	40
 plugins/roundhouse/scripts/update-integrity	00 60

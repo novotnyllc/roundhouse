@@ -1,6 +1,13 @@
 # Hands-off privilege lane — design
 
-Status: implemented in this change (v1) · 2026-10-01
+Status: design for every platform; **this change ships the Linux/WSL apt
+lane** (helper, controller, fleet-run routing, enrollment with canary
+rollback, readiness and doctor states). The Windows LocalSystem lane, the
+macOS signed-package action and the lane's self-upgrade are designed below,
+marked *deferred*, and land in the follow-up branch
+`feat/privilege-lane-windows`. Until then macOS and native Windows report
+the lane as `unsupported` ("not yet supported") and nothing half-built is
+reachable from a request. · 2026-10-01
 Owner: roundhouse (lane helpers, controller library, fleet-run, readiness)
 
 ## Purpose
@@ -60,20 +67,21 @@ What the lane still guarantees:
   root-only claim directory and append-only journal; results published to
   the owner carry the lane's own digest of the result lines and of the
   request they answer.
-- **Root never executes owner-owned bytes except at enrollment and at
-  self-upgrade**, and both copy to a root-owned temporary file and hash
-  that copy before use.
+- **Root never executes owner-owned bytes except at enrollment** (and, once
+  the deferred self-upgrade ships, at self-upgrade); both copy to a
+  root-owned temporary file and hash that copy before use.
 
 What it gives up, honestly: a compromised owner session can install any
-package the configured sources offer at machine scope, run apt metadata
-refreshes, and — through self-upgrade — replace the lane's root-owned
-script with any file that is accompanied by a self-consistent
-`integrity.json` claiming to be a newer Roundhouse release. That last item
-is the sharpest edge; see "Residual risks".
+package the configured sources offer at machine scope and run apt metadata
+refreshes. The deferred self-upgrade would add the ability to replace the
+lane's root-owned script with any file accompanied by a self-consistent
+`integrity.json` claiming to be a newer Roundhouse release; that is the
+sharpest edge of the full design and the reason it is not in this change —
+see "Self-upgrade (deferred)" and "Residual risks".
 
 ## Per-platform mechanism
 
-### POSIX (macOS, Linux, WSL): sudoers exact-binary grant
+### POSIX (Linux, WSL; macOS deferred): sudoers exact-binary grant
 
 The one approval installs, as root:
 
@@ -102,13 +110,18 @@ Why sudoers rather than a resident root daemon on every POSIX platform:
   logged-off daemon to do; a LaunchDaemon/systemd service would add a
   resident root process, log rotation and unit lifecycle for no
   functional gain.
-- One mechanism covers macOS, Linux and WSL (where systemd is often not
-  PID 1). The grant is a single readable line naming one root-owned binary
+- One mechanism covers Linux, WSL (where systemd is often not PID 1) and,
+  when its signed-package action ships, macOS. The grant is a single readable line naming one root-owned binary
   and one fixed argument; `visudo -cf` checks it before it is installed
   and the enrollment canary proves that any other argument is refused.
 - It is the shape the previous POSIX broker already proved on this fleet.
 
-### Windows: LocalSystem scheduled task over an owner-writable queue
+### Windows (deferred to the follow-up): LocalSystem scheduled task over an owner-writable queue
+
+> Not in this change. `privilege-lane-windows.ps1` and the controller's
+> WSL-interop transport for it live on `feat/privilege-lane-windows`; here
+> a native-Windows host reports `unsupported` and keeps whatever explicit
+> `privilege_broker.automation_transport` route it has.
 
 The one UAC consent installs:
 
@@ -238,12 +251,18 @@ it.
 | `apt.upgrade-package.v1` | linux, wsl | package, version | `apt-get -q -y --no-remove --only-upgrade install PKG=VER`, only when `apt-cache policy` names VER as the candidate and PKG is installed below it | `dpkg-query` version equals VER |
 | `apt.install-package-version.v1` | linux, wsl | package, version or `-` | `apt-get -q -y --no-install-recommends install PKG[=VER]` | PKG installed (at VER when given) |
 | `apt.autoremove.v1` | linux, wsl | — | `apt-get -q -y autoremove` | simulate reports nothing left |
-| `macos.install-signed-pkg.v1` | macos | package (pkg id), version, source (Team ID), payload-sha256 | copy owner-staged payload into the claim, verify digest, `pkgutil --check-signature` Developer ID Installer with the given Team ID, expanded `PackageInfo` identifier/version match, no scripts; `installer -pkg … -target /` | `pkgutil --pkg-info` version equals VER |
-| `winget.inventory-machine.v1` | windows | — | `Get-WinGetPackage` machine-scope listing | — |
-| `winget.install-machine-package.v1` | windows | package (id), version or `-`, source | `Install-WinGetPackage -Scope System -Mode Silent` | installed version equals VER |
-| `winget.upgrade-machine-package.v1` | windows | package (id), version, source | `Update-WinGetPackage -Scope System -Mode Silent` when installed < VER and VER is available | installed version equals VER |
-| `lane.probe.v1` | all | — | nothing | identity reported |
-| `lane.self-upgrade.v1` | all | version, payload-sha256 | see below | identity reports the new version |
+| `macos.install-signed-pkg.v1` (deferred) | macos | package (pkg id), version, source (Team ID), payload-sha256 | copy owner-staged payload into the claim, verify digest, `pkgutil --check-signature` Developer ID Installer with the given Team ID, expanded `PackageInfo` identifier/version match, no scripts; `installer -pkg … -target /` | `pkgutil --pkg-info` version equals VER |
+| `winget.inventory-machine.v1` (deferred) | windows | — | `Get-WinGetPackage` machine-scope listing | — |
+| `winget.install-machine-package.v1` (deferred) | windows | package (id), version or `-`, source | `Install-WinGetPackage -Scope System -Mode Silent` | installed version equals VER |
+| `winget.upgrade-machine-package.v1` (deferred) | windows | package (id), version, source | `Update-WinGetPackage -Scope System -Mode Silent` when installed < VER and VER is available | installed version equals VER |
+| `lane.probe.v1` | linux, wsl (all, once the other lanes ship) | — | nothing | identity reported |
+| `lane.self-upgrade.v1` (deferred) | all | version, payload-sha256 | see below | identity reports the new version |
+
+Shipped in this change: the four `apt.*` actions and `lane.probe.v1` on
+linux and wsl. The helper's `platform_actions`, the controller's
+`lane_actions_for_platform` and section 16 of the test suite agree on that
+list; a request naming any other action is `unknown_action_for_platform`,
+and `source` and `payload-sha256` must be `-` on every shipped action.
 
 Node runtime operations need no elevation on any platform in this fleet
 (fnm is user-space; winget `OpenJS.NodeJS` is an ordinary machine-scope
@@ -255,7 +274,14 @@ per-payload owner enrollment; routing them through
 `macos.install-signed-pkg.v1` is the intended follow-up and is listed under
 "Deferred".
 
-## Self-upgrade
+## Self-upgrade (deferred to the follow-up)
+
+> Not in this change, and not merely unadvertised: `lane.self-upgrade.v1`
+> is absent from the helper's catalog, so no owner-reachable path replaces
+> root's copy of the lane. The follow-up must bind the candidate to a
+> trusted release signature (a signed manifest verified against a key the
+> enrolled lane carries), not only to a self-consistent `integrity.json`;
+> the paragraph "Trust check" below records why.
 
 `lane.self-upgrade.v1` carries the target plugin version and the SHA-256 of
 the lane script at that version. The privileged side:
@@ -295,9 +321,10 @@ relays or stores a password or administrator credential.
 
 | Platform / transport | What happens | The one human action |
 | --- | --- | --- |
-| macOS / Linux / WSL, `transport: local` | `sudo -p … scripts/privilege-lane-posix enroll --host-id HOST --owner $(id -un) --plugin-root …` | type the sudo password in the terminal running the command |
-| macOS / Linux / WSL, `transport: ssh` | `ssh -t ALIAS "sudo -p … \"\$(roundhouse privilege-lane-path)\" enroll …"` | same, over the forwarded TTY |
-| Windows with `wsl_interop_via` | through the WSL sibling: `pwsh.exe -File <installed plugin>\scripts\privilege-lane-windows.ps1 -Enroll -HostId HOST`, which re-launches itself elevated with `Start-Process -Verb RunAs` | click **Yes** on the UAC consent dialog that appears on the console |
+| Linux / WSL, `transport: local` | `sudo -p … scripts/privilege-lane-posix enroll --host-id HOST --owner $(id -un) --plugin-root …` | type the sudo password in the terminal running the command |
+| Linux / WSL, `transport: ssh` | `ssh -t ALIAS "sudo -p … \"\$(roundhouse privilege-lane-path)\" enroll …"` | same, over the forwarded TTY |
+| macOS (deferred) | the same POSIX path once `macos.install-signed-pkg.v1` ships; until then `privilege-enroll` refuses with "not yet supported" and installs nothing | — |
+| Windows with `wsl_interop_via` (deferred) | through the WSL sibling: `pwsh.exe -File <installed plugin>\scripts\privilege-lane-windows.ps1 -Enroll -HostId HOST`, which re-launches itself elevated with `Start-Process -Verb RunAs` | click **Yes** on the UAC consent dialog that appears on the console |
 
 When the command runs without a terminal (an agent, a scheduled run) it does
 not attempt the prompt: it prints the exact command for the owner, exits 75,
@@ -328,16 +355,31 @@ probe — no second consent.
 
 ## Readiness and the scheduled run
 
-- `fleet-readiness` adds a `privilege-lane` row per host:
-  `ready`, `needs_one_time_approval` (with the exact command),
-  `user_session_unavailable` (Windows: the WSL sibling is unreachable or
-  the interop token is elevated), `disabled` (`privilege_lane: "disabled"`
-  in the machine entry), `legacy` (an explicit `automation_transport`
-  route is configured), `unreachable`, or `drifted`. The row is a finding
-  only when the lane is enrolled and broken; a host that is merely not yet
-  enrolled is reported as **pending** and does not block ordinary work.
+- `roundhouse privilege-lane-status HOST OUT.json` is the source of truth:
+  its `state` is one of the raw lane states below, and every other surface
+  presents that state. `partial`, `rejected`, `completed` and `failed` are
+  **operation-result** states (a lane result record, an apply record), never
+  readiness states.
+
+  | Raw state | Meaning | `fleet-readiness` row | `privilege-lane-status` exit |
+  | --- | --- | --- | --- |
+  | `ready` | enrolled, every check passes | `ok  enrolled, lane VERSION` | 0 |
+  | `needs_one_time_approval` | nothing installed yet | `PENDING  run \`roundhouse privilege-enroll HOST\` once` | 75 |
+  | `disabled` | `privilege_lane: "disabled"` in the machine entry | `ok  disabled by configuration` | 75 |
+  | `legacy` | an explicit `privilege_broker.automation_transport` route | `ok  legacy automation_transport route configured` | 75 |
+  | `unsupported` | macOS or native Windows in this version, or an unknown machine | `ok  not yet supported: …` | 69 |
+  | `unreachable` | the host did not answer the status probe | `PENDING  unreachable: …` (the `tools`/`roundhouse` rows already report the host) | 74 |
+  | `drifted` | enrolled, but the root copy, grant, identity, queue or host id no longer matches | `FINDING  drifted: …` | 74 |
+
+  The deferred Windows lane adds `canary_pending` (PENDING) and
+  `user_session_unavailable` (PENDING) to this table; neither exists in
+  this change. The row is a finding only when an enrolled lane is broken;
+  a host that is merely not yet enrolled is pending and does not block
+  ordinary work.
 - `fleet-doctor` reports the same state plus the installed lane version and
-  digest for the local host.
+  digest for the local host (`ok` for `ready`, `needs_one_time_approval` and
+  `unsupported`; a finding for `drifted` and for a helper that prints no
+  state).
 - `roundhouse fleet-run` (both cadences) routes privileged package work
   through the lane **automatically** when the host is enrolled: the fast
   pass installs a missing apt package through `apt.install-package-version.v1`,
@@ -360,25 +402,27 @@ probe — no second consent.
   and `lookup-privilege-result` reads the published result for an operation
   index without resubmitting.
 
-## Deferred (not in v1)
+## Deferred (not in this change)
 
-- The sealed lane plan does not bind a payload digest yet, so the
-  controller does not advertise `macos.install-signed-pkg.v1` or
-  `lane.self-upgrade.v1`: both are implemented and fixture-tested on the
-  host side (`privilege-lane-posix request … --payload`), but a plan naming
-  them is refused at sealing until the format carries the digest and stages
-  the bytes.
+Moved to the follow-up branch `feat/privilege-lane-windows`, which carries
+the implementation and its fixture tests:
 
+- **The Windows lane**: `privilege-lane-windows.ps1` (LocalSystem task,
+  owner-writable queue, pinned WinGet client module, two-phase activation)
+  and the controller's WSL-interop transport, `canary_pending` and
+  `user_session_unavailable` states, `winget.*` actions.
+- **`macos.install-signed-pkg.v1`** and the payload-bearing request path
+  (`--payload`, owner-staged bytes claimed and snapshotted by root); the
+  sealed lane plan must also bind the payload digest before the controller
+  can advertise it.
+- **`lane.self-upgrade.v1`**, which must additionally verify a trusted
+  release signature (see "Self-upgrade (deferred)"), and its wiring into the
+  fleet-run full cadence.
 - Homebrew cask root steps on macOS through the bridge hook.
 - fleet-run convergence of a native Windows sibling's winget packages: the
-  scheduled run converges only the host it runs on; Windows machine-scope
-  packages reach the lane through the controller's sealed plan.
-- `lane.self-upgrade.v1` is implemented and tested on POSIX and Windows in
-  fixture mode; wiring it into the fleet-run full cadence (upgrade the lane
-  when the installed plugin version is newer than the enrolled lane version)
-  is left for the follow-up that also pins the released digest fleet-wide.
-- Revocation is `privilege-lane-posix revoke` / `-Revoke` (root/UAC, one
-  approval); there is no remote revocation path by design.
+  scheduled run converges only the host it runs on.
+- Revocation is `privilege-lane-posix revoke` (root, one approval); there is
+  no remote revocation path by design.
 
 ## Residual risks
 
@@ -387,24 +431,26 @@ probe — no second consent.
    and refresh apt metadata. Package *content* trust rests entirely on the
    configured sources (apt sources with their keyrings, the winget `winget`
    / `msstore` sources, Developer ID signatures), not on Roundhouse.
-2. **Self-upgrade is unsigned.** See above. A signed release manifest would
-   close it; until then the fleet-wide version/digest report is the
-   detection control.
-3. **Windows task start right.** The owner's `GRGX` on the task is believed
-   sufficient for `schtasks /Run`; if a Windows build refuses it the lane
-   still works on the one-minute repetition, at the cost of latency.
-4. **drvfs ownership.** The design relies on files written through
-   `/mnt/c` carrying the Windows user's SID as NTFS owner. The enrollment
-   canary writes a probe request through the same path and refuses to
-   report `ready` unless the dispatcher saw the expected owner.
+2. **Self-upgrade is unsigned (deferred, and gated on fixing this).** The
+   follow-up ships it only with a trusted release signature; until then the
+   lane is upgraded by re-running `privilege-enroll` after a plugin update
+   (one approval), and `fleet-doctor` reports the installed lane version and
+   digest so a stale lane is visible.
+3. **Windows task start right (deferred).** The owner's `GRGX` on the task
+   is believed sufficient for `schtasks /Run`; if a Windows build refuses it
+   the lane still works on the one-minute repetition, at the cost of latency.
+4. **drvfs ownership (deferred).** The design relies on files written
+   through `/mnt/c` carrying the Windows user's SID as NTFS owner. The
+   enrollment canary writes a probe request through the same path and
+   refuses to report `ready` unless the dispatcher saw the expected owner.
 5. **TOCTOU on request files is closed by rename-then-read, but the owner
    can still delete or replace results they can read.** Results are
    advisory to the owner; the root-only journal is the record.
 6. **A stale `expires-at` clock skew of more than ten minutes between
    controller and host rejects every request.** This fails closed and is
    reported as `stale_request`.
-7. **Fixture coverage.** The Windows task registration, ACL application,
-   module download and WinGet cmdlets are exercised only through fixture
-   stubs on macOS/Linux CI and the `-SelfTest` on the Windows CI job; the
-   first real enrollment on `iris-windows` is the acceptance test for the
-   Windows-only pieces.
+7. **Fixture coverage.** The POSIX helper's root side runs under a
+   fixture prefix with stub `apt-get`/`apt-cache`/`dpkg-query` on CI; the
+   first real enrollment on a Linux or WSL host is the acceptance test for
+   the sudoers grant and the canary. (The Windows pieces, when they land,
+   carry the same caveat for their task and ACL calls.)

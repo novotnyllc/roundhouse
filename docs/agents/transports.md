@@ -19,18 +19,17 @@ they are Roundhouse's job, not a caller's.
 Narrow, enrolled paths carry the few operations that need privilege — never
 `sudo` sprinkled through scripts:
 
-- The default **privilege lane** (`privilege-lane-posix`,
-  `privilege-lane-windows.ps1`, `lib/lane.sh`): one OS approval per host via
-  `roundhouse privilege-enroll HOST`, then a root/SYSTEM-owned helper behind
-  an owner-only queue, reached over the host's ordinary transport. Closed
-  semantic catalog, digest-bound requests, journaled results, self-upgrade.
+- The default **privilege lane** (`privilege-lane-posix`, `lib/lane.sh`;
+  Linux and WSL in this version, macOS and Windows designed and deferred):
+  one OS approval per host via `roundhouse privilege-enroll HOST`, then a
+  root-owned helper behind an owner-only queue, reached over the host's
+  ordinary transport. Closed semantic apt catalog, digest-bound requests,
+  journaled results.
   Design: [`docs/specs/2026-10-01-hands-off-privilege-lane.md`](../specs/2026-10-01-hands-off-privilege-lane.md).
 - The optional CA-certificate lane, selected only by an explicit
   `automation_transport`: POSIX sudoers broker (`enroll-privilege-posix`,
   `privilege-broker-posix`) and Windows SFTP slots
   ([`plugins/roundhouse/references/windows-sftp.md`](../../plugins/roundhouse/references/windows-sftp.md)).
-  The S4U profile task is deprecated; user-scope Windows work runs in the
-  interop lane under the user's own session.
 
 Every mutation on these lanes rides the sealed-plan pipeline described in the
 root `AGENTS.md`.

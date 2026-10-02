@@ -1,8 +1,8 @@
 # Sourced by scripts/test-roundhouse — the local privilege lane: controller
-# status/enrollment/plan verbs over every transport, the readiness and doctor
-# rows, and the host-local routing fleet-run uses. The helpers' own
-# `self-test`/`-SelfTest` cover the root/SYSTEM side; this section covers
-# the controller around them with the POSIX helper in fixture mode.
+# status/enrollment/plan verbs over the local and SSH transports, the
+# readiness and doctor rows, and the host-local routing fleet-run uses. The
+# helper's own `self-test` covers the root side; this section covers the
+# controller around it with the POSIX helper in fixture mode.
 # shellcheck shell=bash
 
 lane_tmp=$tmp/lane
@@ -214,8 +214,8 @@ chmod 600 "$lane_tmp/unknown.json"
 lane_rc=0
 lane_env "$cli" lookup-privilege-result "$lane_tmp/unknown.json" 0 "$lane_tmp/unknown.result" >/dev/null 2>&1 || lane_rc=$?
 [ "$lane_rc" -eq 65 ] || fail "lookup of a tampered plan exited $lane_rc, expected 65"
-# The controller's catalog and the helpers' catalogs agree, per platform.
-for lane_platform in linux wsl macos; do
+# The controller's catalog and the helper's catalog agree, per platform.
+for lane_platform in linux wsl; do
   while IFS= read -r lane_action; do
     "$script_dir/privilege-lane-posix" actions "$lane_platform" | grep -Fqx "$lane_action" ||
       fail "the controller advertises $lane_action on $lane_platform but the POSIX helper does not implement it"
@@ -223,20 +223,31 @@ for lane_platform in linux wsl macos; do
 $(ROUNDHOUSE_LIB_ONLY=1 . "$cli"; lane_actions_for_platform "$lane_platform")
 EOF
 done
-# Payload-backed actions are implemented by the helpers but not sealable yet.
-for lane_platform in linux macos windows; do
-  if (ROUNDHOUSE_LIB_ONLY=1 . "$cli"; lane_actions_for_platform "$lane_platform") | grep -Eq 'macos.install-signed-pkg|lane.self-upgrade'; then
-    fail "the controller advertises a payload-backed action the sealed format cannot carry"
+# macOS and native Windows have no lane in this version: the controller
+# advertises nothing for them, status says so with its own exit status, the
+# readiness row is neither pending nor a finding, and enrollment refuses
+# before touching anything. (Their lanes are designed in the spec and arrive
+# in a follow-up.)
+for lane_platform in macos windows; do
+  if (ROUNDHOUSE_LIB_ONLY=1 . "$cli"; lane_actions_for_platform "$lane_platform") 2>/dev/null | grep -q .; then
+    fail "the controller advertises lane actions on $lane_platform"
   fi
 done
-lane_windows_actions=$(sed -n 's/^\$script:Actions = \[string\[\]\]@(\(.*\)$/\1/p' "$script_dir/privilege-lane-windows.ps1" |
-  tr -d '")' | tr ',' '\n' | sed 's/^ *//' | grep . ; sed -n '/^\$script:Actions = /,/)$/p' "$script_dir/privilege-lane-windows.ps1" | sed 1d | tr -d '")' | tr ',' '\n' | sed 's/^ *//' | grep .)
-while IFS= read -r lane_action; do
-  printf '%s\n' "$lane_windows_actions" | grep -Fqx "$lane_action" ||
-    fail "the controller advertises $lane_action on windows but the Windows helper does not implement it"
-done <<EOF
-$(ROUNDHOUSE_LIB_ONLY=1 . "$cli"; lane_actions_for_platform windows)
-EOF
+lane_rc=0
+"$cli" privilege-lane-status test-windows "$lane_tmp/win-status.json" >/dev/null 2>&1 || lane_rc=$?
+[ "$lane_rc" -eq 69 ] && jq -e '.state == "unsupported" and .route == "unsupported" and .platform == "windows" and
+  (.detail | contains("linux and wsl")) and .next_command == "-" and .actions == []' "$lane_tmp/win-status.json" >/dev/null ||
+  fail "a Windows host did not report the lane as unsupported (rc $lane_rc): $(cat "$lane_tmp/win-status.json")"
+"$cli" fleet-readiness test-windows >"$lane_tmp/win-readiness.txt" 2>/dev/null || :
+grep -Eq '^ok       test-windows +privilege-lane +not yet supported: the privilege lane covers linux and wsl' "$lane_tmp/win-readiness.txt" ||
+  fail "fleet-readiness did not explain the missing Windows lane: $(grep privilege-lane "$lane_tmp/win-readiness.txt")"
+lane_rc=0
+"$cli" privilege-enroll test-windows >/dev/null 2>"$lane_tmp/win-enroll.err" </dev/null || lane_rc=$?
+[ "$lane_rc" -eq 69 ] && grep -q 'linux and wsl' "$lane_tmp/win-enroll.err" || fail "privilege-enroll on a Windows host exited $lane_rc"
+lane_rc=0
+"$cli" privilege-lane-status test-ssh "$lane_tmp/mac-status.json" >/dev/null 2>&1 || lane_rc=$?
+[ "$lane_rc" -eq 69 ] && jq -e '.state == "unsupported" and .platform == "macos"' "$lane_tmp/mac-status.json" >/dev/null ||
+  fail "a macOS host did not report the lane as unsupported (rc $lane_rc): $(cat "$lane_tmp/mac-status.json")"
 
 # --- host-local routing used by fleet-run --------------------------------------
 # The fast pass installs apt packages through the lane; before enrollment
@@ -273,7 +284,7 @@ EOF
   : >"$lane_tmp/apt.log"; : >"$lane_tmp/apt-update-fail"; printf '8.1.0-1\n' >"$lane_tmp/state-curl"
   lane_apt_hold=$(lane_env lane_fleet_run_apt "$tmp/store" test-apt curl curl "" 2>/dev/null) || :
   rm -f "$lane_tmp/apt-update-fail"
-  printf '%s\n' "$lane_apt_hold" | grep -q 'apt metadata refresh did not complete' || fail "failed refresh did not hold: $lane_apt_hold"
+  grep -q 'apt metadata refresh did not complete' <<<"$lane_apt_hold" || fail "failed refresh did not hold: $lane_apt_hold"
   grep -q 'only-upgrade' "$lane_tmp/apt.log" && fail 'an upgrade ran after a failed metadata refresh'
   lane_fleet_apt_refreshed=; lane_fleet_apt_alerted=; lane_fleet_apt_refresh_failed=
   # A host-local plan whose version is not the candidate is refused at
@@ -301,144 +312,19 @@ EOF
 ) || exit 1
 
 # --- SSH transport ------------------------------------------------------------
-# test-ssh reaches `fake-host`; the stub runs the remote command locally, so
-# the same fixture lane answers through `roundhouse privilege-lane-path`.
+# A Linux host reached over `fake-host`; the stub runs the remote command
+# locally, so the same fixture lane answers through `roundhouse
+# privilege-lane-path`.
+jq '.machines["test-ssh-linux"] = {platform:"linux",transport:"ssh",ssh_alias:"fake-host",package_managers:["apt"]}' \
+  "$tmp/config.json" >"$lane_tmp/config-ssh.json"
+chmod 600 "$lane_tmp/config-ssh.json"
 : >"$lane_tmp/ssh.log"
-SSH_COMMAND_LOG="$lane_tmp/ssh.log" lane_env "$cli" privilege-lane-status test-ssh "$lane_tmp/ssh-status.json" >/dev/null 2>&1 || :
+ROUNDHOUSE_CONFIG="$lane_tmp/config-ssh.json" SSH_COMMAND_LOG="$lane_tmp/ssh.log" lane_env "$cli" privilege-lane-status test-ssh-linux "$lane_tmp/ssh-status.json" >/dev/null 2>&1 || :
 jq -e '.transport == "ssh fake-host" and (.state | IN("ready","drifted"))' "$lane_tmp/ssh-status.json" >/dev/null ||
   fail "lane status over ssh: $(cat "$lane_tmp/ssh-status.json")"
 grep -q 'fake-host' "$lane_tmp/ssh.log" && grep -q 'privilege-lane-path' "$lane_tmp/ssh.log" ||
   fail 'the ssh transport did not resolve the remote helper through roundhouse'
 grep -Eq 'RequestTTY=no' "$lane_tmp/ssh.log" || fail 'a lane status probe requested a TTY'
-
-# --- the Windows sibling over WSL interop --------------------------------------
-# A native-Windows machine is reached through its WSL sibling; the SYSTEM-side
-# helper answers through pwsh. A fake pwsh.exe stands in for the Windows side
-# and the drive root for /mnt/c.
-lane_interop_root=$lane_tmp/interop-root
-mkdir -p "$lane_interop_root/ProgramData/Roundhouse-Lane" "$lane_interop_root/Windows/System32"
-cat >"$lane_tmp/pwsh.exe" <<'SH'
-#!/bin/sh
-printf '%s\n' "$*" >>"${LANE_PWSH_LOG:?}"
-case "$*" in
-  *-Status*) cat "${LANE_PWSH_STATUS:?}" ;;
-  *-Request*) cat "${LANE_PWSH_RESULT:?}" ;;
-  *-Candidate*) printf '%s\n' 'lane-candidate|1' 'package|OpenJS.NodeJS' 'installed|26.0.0' "candidate|${LANE_PWSH_CANDIDATE:-26.1.0}" 'end-candidate|' ;;
-  *-Enroll*) cat "${LANE_PWSH_ENROLL:?}" ;;
-  *) exit 64 ;;
-esac
-SH
-chmod +x "$lane_tmp/pwsh.exe"
-cat >"$lane_interop_root/Windows/System32/cmd.exe" <<'SH'
-#!/bin/sh
-printf 'C:\\Users\\fixture\r\n'
-SH
-chmod +x "$lane_interop_root/Windows/System32/cmd.exe"
-jq '.machines["test-wsl"] = {platform:"wsl",transport:"ssh",ssh_alias:"fake-host",package_managers:["apt"],physical_host:"iris"} |
-    .machines["test-windows"].wsl_interop_via = "test-wsl" | .machines["test-windows"].physical_host = "iris"' \
-  "$tmp/config.json" >"$lane_tmp/config.json"
-chmod 600 "$lane_tmp/config.json"
-printf '%s\n' 'lane-status|1' 'state|ready' 'platform|windows' 'host-id|test-windows' 'owner-sid|S-1-12-1-1-2-3-4' \
-  'owner-name|AzureAD/owner' 'lane-version|9.9.9' 'lane-sha256|0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
-  'plugin-root|C:\Users\fixture\.claude\plugins\cache\novotnyllc\roundhouse' 'interop-token|limited' 'detail|-' 'next-command|-' 'end-status|' \
-  >"$lane_tmp/pwsh-status"
-printf '%s\n' 'lane-result|1' 'request-id|request-0123456789abcdef0123456789abcdef' 'host-id|test-windows' 'plan-id|fleet-run' \
-  'plan-sha256|-' 'operation-index|-' 'action-id|winget.upgrade-machine-package.v1' 'package|OpenJS.NodeJS' 'version|26.1.0' \
-  'state|completed' 'reason|package_upgraded' 'native-exit|0' 'pre-state-sha256|-' 'post-state-sha256|-' 'started-at|1' \
-  'finished-at|2' 'lane-version|9.9.9' 'lane-sha256|0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
-  'request-sha256|-' 'end-result|' 'result-sha256|-' >"$lane_tmp/pwsh-result"
-printf '%s\n' 'lane-enrollment|1' 'state|enrolled' 'reason|one_time_approval_complete' 'platform|windows' 'host-id|test-windows' \
-  'owner-sid|S-1-12-1-1-2-3-4' 'lane-version|9.9.9' 'lane-sha256|0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
-  'plugin-root|-' 'canary|task-registered,probe-completed' 'end-enrollment|' >"$lane_tmp/pwsh-enroll"
-lane_interop() {
-  ROUNDHOUSE_CONFIG="$lane_tmp/config.json" ROUNDHOUSE_INTEROP_ROOT="$lane_interop_root" \
-    ROUNDHOUSE_INTEROP_PWSH="$lane_tmp/pwsh.exe" LANE_PWSH_LOG="$lane_tmp/pwsh.log" \
-    LANE_PWSH_STATUS="$lane_tmp/pwsh-status" LANE_PWSH_RESULT="$lane_tmp/pwsh-result" \
-    LANE_PWSH_ENROLL="$lane_tmp/pwsh-enroll" PATH="$lane_tmp/bin:$PATH" "$@"
-}
-: >"$lane_tmp/pwsh.log"
-# Not yet enrolled: the WSL side answers without touching pwsh at all.
-lane_rc=0
-lane_interop "$cli" privilege-lane-status test-windows "$lane_tmp/win-status.json" >/dev/null 2>&1 || lane_rc=$?
-[ "$lane_rc" -eq 75 ] || fail "windows lane status before enrollment exited $lane_rc"
-jq -e '.state == "needs_one_time_approval" and .transport == "interop fake-host" and .platform == "windows"' \
-  "$lane_tmp/win-status.json" >/dev/null || fail "windows lane status: $(cat "$lane_tmp/win-status.json")"
-[ ! -s "$lane_tmp/pwsh.log" ] || fail 'the controller ran pwsh for an unenrolled Windows lane'
-lane_interop "$cli" fleet-readiness test-windows >"$lane_tmp/win-readiness.txt" 2>/dev/null || :
-grep -Eq '^PENDING  test-windows +privilege-lane +needs_one_time_approval' "$lane_tmp/win-readiness.txt" ||
-  fail "fleet-readiness did not report the pending Windows lane: $(cat "$lane_tmp/win-readiness.txt")"
-# Enrollment through the sibling: the user-side helper is located in the
-# Windows plugin cache at the controller's version and started with
-# -Enroll; it raises the UAC prompt itself.
-lane_version=$(jq -r '.version' "$script_dir/../.codex-plugin/plugin.json")
-mkdir -p "$lane_interop_root/Users/fixture/.claude/plugins/cache/novotnyllc/roundhouse/$lane_version/scripts"
-: >"$lane_interop_root/Users/fixture/.claude/plugins/cache/novotnyllc/roundhouse/$lane_version/scripts/privilege-lane-windows.ps1"
-lane_rc=0
-lane_interop "$cli" privilege-enroll test-windows >"$lane_tmp/win-enroll.json" 2>"$lane_tmp/win-enroll.err" </dev/null || lane_rc=$?
-[ "$lane_rc" -eq 0 ] || fail "windows privilege-enroll exited $lane_rc: $(cat "$lane_tmp/win-enroll.err")"
-jq -e '.state == "enrolled" and .lane_version == "9.9.9"' "$lane_tmp/win-enroll.json" >/dev/null ||
-  fail "windows enrollment report: $(cat "$lane_tmp/win-enroll.json")"
-grep -q -- "-File C:.Users.fixture..claude.plugins.cache.novotnyllc.roundhouse.$lane_version.scripts.privilege-lane-windows.ps1 -Enroll -HostId test-windows" \
-  "$lane_tmp/pwsh.log" || fail "windows enrollment command: $(cat "$lane_tmp/pwsh.log")"
-grep -q 'S4U\|RunAs\|-Credential' "$lane_tmp/pwsh.log" && fail 'the controller passed a credential or S4U argument'
-# Enrolled: status and requests go through the SYSTEM-owned copy.
-: >"$lane_interop_root/ProgramData/Roundhouse-Lane/privilege-lane-windows.ps1"
-: >"$lane_tmp/pwsh.log"
-lane_interop "$cli" privilege-lane-status test-windows "$lane_tmp/win-status.json" >/dev/null ||
-  fail 'windows lane status after enrollment'
-jq -e '.state == "ready" and .owner == "S-1-12-1-1-2-3-4" and .interop_token == "limited" and .lane_version == "9.9.9"' \
-  "$lane_tmp/win-status.json" >/dev/null || fail "windows lane status after enrollment: $(cat "$lane_tmp/win-status.json")"
-grep -q -- '-File C:\\ProgramData\\Roundhouse-Lane\\privilege-lane-windows.ps1 -Status' "$lane_tmp/pwsh.log" ||
-  fail "windows status command: $(cat "$lane_tmp/pwsh.log")"
-lane_interop "$cli" privilege-status test-windows "$lane_tmp/win-readiness.jsonl" >/dev/null || fail 'windows privilege-status'
-"$cli" validate "$lane_tmp/win-readiness.jsonl" >/dev/null || fail 'windows lane readiness failed validation'
-{
-  cat "$lane_tmp/win-readiness.jsonl"
-  jq -cn --arg s "$(jq -r '.snapshot_id' "$lane_tmp/win-readiness.jsonl")" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-    {schema:"roundhouse.inventory",schema_version:1,snapshot_id:$s,host_id:"test-windows",kind:"package",id:"winget:OpenJS.NodeJS",
-     observed_at:$at,status:"present",confidence:"high",
-     data:{manager:"winget",name:"OpenJS.NodeJS",installed_version:"26.0.0",candidate_version:"26.1.0",update_available:true},
-     evidence:[],errors:[]}'
-} >"$lane_tmp/win-snapshot.jsonl"
-cat >"$lane_tmp/win-draft.json" <<'JSON'
-{"domain":"updates","target":"test-windows","lane":"local","operations":[
-  {"type":"semantic-action","kind":"privileged_action","id":"winget.upgrade-machine-package.v1","package":"OpenJS.NodeJS","version":"26.1.0","source":"winget"}]}
-JSON
-lane_interop "$cli" seal-plan "$lane_tmp/win-draft.json" "$lane_tmp/win-snapshot.jsonl" "$lane_tmp/win-plan.json" >/dev/null ||
-  fail 'seal-plan refused the Windows lane draft'
-chmod 600 "$lane_tmp/win-plan.json"
-# A user-scope-only action never seals for the SYSTEM lane: the catalog is machine scope.
-jq '.operations[0].id = "winget.upgrade-user-package.v1"' "$lane_tmp/win-draft.json" >"$lane_tmp/win-bad-draft.json"
-lane_rc=0
-lane_interop "$cli" seal-plan "$lane_tmp/win-bad-draft.json" "$lane_tmp/win-snapshot.jsonl" "$lane_tmp/win-bad-plan.json" >/dev/null 2>&1 || lane_rc=$?
-[ "$lane_rc" -eq 64 ] || fail "seal-plan accepted an action outside the Windows lane catalog (rc $lane_rc)"
-: >"$lane_tmp/pwsh.log"
-lane_interop "$cli" submit-privilege-plan "$lane_tmp/win-plan.json" "$(jq -r '.plan_id' "$lane_tmp/win-plan.json")" \
-  "$lane_tmp/win-apply.jsonl" >/dev/null 2>"$lane_tmp/win-apply.err" || fail "windows submit: $(cat "$lane_tmp/win-apply.err")"
-grep -q -- "-Request -Action winget.upgrade-machine-package.v1 -Package OpenJS.NodeJS -Version 26.1.0 -Source winget -PayloadSha256 - -PlanId $(jq -r '.plan_id' "$lane_tmp/win-plan.json")" \
-  "$lane_tmp/pwsh.log" || fail "windows request command: $(cat "$lane_tmp/pwsh.log")"
-jq -e -s '.[0].data.operation_status == "completed" and .[0].data.transport == "local-lane"' "$lane_tmp/win-apply.jsonl" >/dev/null ||
-  fail "windows apply records: $(cat "$lane_tmp/win-apply.jsonl")"
-# The Windows candidate moved after sealing: apply refuses before any request.
-lane_interop "$cli" seal-plan "$lane_tmp/win-draft.json" "$lane_tmp/win-snapshot.jsonl" "$lane_tmp/win-drift-plan.json" >/dev/null ||
-  fail 'seal-plan for the Windows drift plan'
-chmod 600 "$lane_tmp/win-drift-plan.json"
-: >"$lane_tmp/pwsh.log"
-lane_rc=0
-LANE_PWSH_CANDIDATE=26.2.0 lane_interop "$cli" submit-privilege-plan "$lane_tmp/win-drift-plan.json" \
-  "$(jq -r '.plan_id' "$lane_tmp/win-drift-plan.json")" "$lane_tmp/win-drift-apply.jsonl" >/dev/null 2>"$lane_tmp/win-drift.err" || lane_rc=$?
-[ "$lane_rc" -eq 65 ] && grep -q 'preconditions drifted' "$lane_tmp/win-drift.err" || fail "windows apply submitted despite a candidate drift (rc $lane_rc)"
-grep -q -- '-Request' "$lane_tmp/pwsh.log" && fail 'a drifted Windows plan reached the SYSTEM side'
-# No sibling means no session: readiness says so and nothing is attempted.
-jq 'del(.machines["test-windows"].wsl_interop_via)' "$lane_tmp/config.json" >"$lane_tmp/config-nosibling.json"
-chmod 600 "$lane_tmp/config-nosibling.json"
-lane_rc=0
-ROUNDHOUSE_CONFIG="$lane_tmp/config-nosibling.json" "$cli" privilege-lane-status test-windows "$lane_tmp/win-status.json" >/dev/null 2>&1 || lane_rc=$?
-[ "$lane_rc" -eq 75 ] && jq -e '.state == "user_session_unavailable"' "$lane_tmp/win-status.json" >/dev/null ||
-  fail "a Windows host without a WSL sibling did not report user_session_unavailable: $(cat "$lane_tmp/win-status.json")"
-ROUNDHOUSE_CONFIG="$lane_tmp/config-nosibling.json" "$cli" prepare-privilege-enrollment test-windows "$lane_tmp/win-prep.json" >/dev/null 2>&1 || :
-jq -e '.state == "user_session_unavailable" and .next_command == "-" and (.next_action | contains("user_session"))' "$lane_tmp/win-prep.json" >/dev/null ||
-  fail "prepare-privilege-enrollment rewrote user_session_unavailable: $(cat "$lane_tmp/win-prep.json")"
 
 # --- configuration -------------------------------------------------------------
 # A machine may opt out; a legacy route still wins; anything else is rejected.
@@ -475,6 +361,6 @@ for lane_skill in fleet-hosts fleet-readiness fleet-update fleet-auth; do
   esac
 done
 assert_contains "$(cat "$script_dir/../skills/fleet-update/SKILL.md")" 'needs_one_time_approval'
-assert_contains "$(cat "$script_dir/../skills/fleet-readiness/SKILL.md")" 'user_session_unavailable'
+assert_contains "$(cat "$script_dir/../skills/fleet-readiness/SKILL.md")" 'not yet supported'
 rm -rf "$lane_tmp"
 printf 'section 16 ok: privilege lane\n'

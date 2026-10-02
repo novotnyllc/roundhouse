@@ -422,17 +422,14 @@ environment, a shell, or an elevation control:
 
 | Platform | Actions |
 | --- | --- |
-| linux, wsl | `apt.update-metadata.v1`, `apt.upgrade-package.v1` (package, candidate version), `apt.install-package-version.v1`, `apt.autoremove.v1` |
-| macos | `lane.probe.v1` only in this version: `macos.install-signed-pkg.v1` exists on the host side but the sealed format does not bind its payload digest yet, so plans cannot name it |
-| windows | `winget.inventory-machine.v1`, `winget.install-machine-package.v1`, `winget.upgrade-machine-package.v1` (machine scope, `winget` or `msstore` source; this is also the only lane for a machine-scope Node.js `OpenJS.NodeJS` upgrade) |
-| all | `lane.probe.v1` (`lane.self-upgrade.v1` is host-side only for the same reason) |
+| linux, wsl | `apt.update-metadata.v1`, `apt.upgrade-package.v1` (package, candidate version), `apt.install-package-version.v1`, `apt.autoremove.v1`, `lane.probe.v1` |
+| macos, windows | none in this version: readiness reports the lane as `not yet supported`, and machine-scope winget or signed macOS package work holds unless the host has the optional CA lane configured (`privilege_broker.automation_transport`), whose own `winget.*` / `macos.*` actions and vocabulary then apply |
 
 User-scope winget packages, fnm/Node and profile configuration are not lane
-work: they run in the ordinary lane as the user (on Windows, through the WSL
-interop lane under the user's own logged-on session). Never use root
-Homebrew, arbitrary `sudo`, arbitrary installer scripts, or arbitrary plist
-paths; Homebrew cask steps that reach Homebrew's own `sudo` are not routed
-through the lane in this version and hold.
+work: they run in the ordinary lane as the user. Never use root Homebrew,
+arbitrary `sudo`, arbitrary installer scripts, or arbitrary plist paths;
+Homebrew cask steps that reach Homebrew's own `sudo` are not routed through
+the lane in this version and hold.
 
 To drive it from a plan: `"$CLI" privilege-status HOST SNAPSHOT` (a
 `privilege_broker`/`readiness` record whose `lifecycle_status` must be
@@ -444,12 +441,13 @@ immediately before `submit-privilege-plan`, and use
 `lookup-privilege-result PLAN INDEX OUTPUT` for recovery without
 resubmission: every operation carries a sealed request id that the host
 accepts exactly once. `prepare-privilege-enrollment HOST OUT` reports
-`ready`, `needs_one_time_approval` with the exact command, `disabled`, or
-`user_session_unavailable`; `prepare-privilege-identity`,
+`ready`, `needs_one_time_approval` with the exact command, `disabled`,
+`drifted`, or `unreachable`; `prepare-privilege-identity`,
 `preview-privilege-upgrade`, and `preview-privilege-revocation` belong to
-the optional CA lane and are not needed here. Preserve `ready`,
-`needs_one_time_approval`, `user_session_unavailable`, `drifted`,
-`unreachable`, `partial`, and `rejected` exactly; perform no fallback.
+the optional CA lane and are not needed here. Preserve the readiness states
+`ready`, `needs_one_time_approval`, `unsupported`, `drifted`, and
+`unreachable`, and the operation-result states `partial` and `rejected`,
+exactly; perform no fallback.
 Never ask for or relay a sudo or Administrator password: the one approval is
 typed or clicked by the owner at the host's own prompt, and the agent's job
 when it is missing is to report `needs_one_time_approval` and the command.

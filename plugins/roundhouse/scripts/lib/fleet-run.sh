@@ -3559,7 +3559,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
           run_retry_owed=true
         run_holds_grew=true
         fleet_run_apply_held "$run_store" "$run_host" "$run_defs" "$run_item" \
-          "$run_category" "$run_digest" "$run_status" "$run_tmp" "$run_now" || {
+          "$run_category" "$run_digest" "$run_status" "$run_tmp" "$run_now" "$run_managers" || {
           fleet_run_batch_close "$run_store" "$run_host"
           exit 65
         }
@@ -3965,7 +3965,7 @@ fleet_run_hold_owes_retry() {
 }
 
 fleet_run_apply_held() {
-  # fleet_run_apply_held STORE HOST DEFS ITEM CATEGORY DIGEST STATUS TMP NOW —
+  # fleet_run_apply_held STORE HOST DEFS ITEM CATEGORY DIGEST STATUS TMP NOW MANAGERS —
   # the run loop's answer to an apply that neither applied (0) nor was
   # satisfied (70): the run-local hold the full cadence consumes, the alert
   # that names why, the `held` journal entry, and the line. STATUS 73 is a
@@ -3979,7 +3979,7 @@ fleet_run_apply_held() {
   [ "$7" -ne 75 ] || [ "$5" != packages ] ||
     fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-hold \
       "package-hold-$(printf '%s' "$4" | tr './' '--')" \
-      "$(lane_package_hold_detail "$4" "$2" "$(fleet_resolve_package "$3" "${4#packages.}" apt 2>/dev/null | jq -r '.manager // "none"')")" "$4" ||
+      "$(lane_package_hold_detail "$4" "$2" "$(fleet_run_resolve_package "$3" "${4#packages.}" "${10}" 2>/dev/null | jq -r '.manager // "none"')")" "$4" ||
     :
   [ "$7" -ne 73 ] || [ "$5" != packages ] ||
     fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-deferred \

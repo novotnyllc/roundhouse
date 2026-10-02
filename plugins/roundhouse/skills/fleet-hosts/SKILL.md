@@ -29,23 +29,23 @@ lane. Validation requires that sibling to be a configured `platform: wsl`,
    `${XDG_CONFIG_HOME:-$HOME/.config}/roundhouse/config.json` (scaffold from
    the plugin's `config.example.json` if absent) and require
    `"$CLI" validate-config` to pass.
-3. **Privilege lane** (consent; the one OS prompt) — `"$CLI" privilege-enroll
-   HOST`. On macOS, Linux and WSL that is a single `sudo` password typed in
-   the terminal running the command (over `ssh -t` for a remote host); on
-   Windows it is a single UAC consent on the console, raised through the
-   WSL sibling. The approval installs a root/SYSTEM-owned copy of the lane
-   helper, an owner-only request queue and (POSIX) one exact sudoers grant
-   or (Windows) one LocalSystem scheduled task; after it, every privileged
-   package action the fleet needs runs unattended, including upgrades of
-   the lane itself. Without a terminal the command does not prompt: it
-   prints the exact command for the owner and readiness reports
-   `needs_one_time_approval` until it has run. Never ask for or relay the
-   sudo or Administrator password. The lane is on by default; set
-   `privilege_lane: "disabled"` in the machine entry to opt a host out.
-   The former CA-certificate lane (`prepare-ssh-identity`,
-   `certify-ssh-node`, `enroll-ssh-posix`, the `windows-sftp` route) is an
-   optional high-assurance mode selected only by an explicit
-   `privilege_broker.automation_transport`; it is not part of adding a host.
+3. **Privilege lane** (consent; the one OS prompt; Linux and WSL hosts) —
+   `"$CLI" privilege-enroll HOST`: a single `sudo` password typed in the
+   terminal running the command (over `ssh -t` for a remote host). The
+   approval installs a root-owned copy of the lane helper, an owner-only
+   request queue and one exact sudoers grant; after it, every privileged
+   apt action the fleet needs runs unattended. Without a terminal the
+   command does not prompt: it prints the exact command for the owner and
+   readiness reports `needs_one_time_approval` until it has run. Never ask
+   for or relay the sudo or Administrator password. The lane is on by
+   default; set `privilege_lane: "disabled"` in the machine entry to opt a
+   host out. On macOS and native Windows this step does not apply in this
+   version: readiness reports the lane as `not yet supported`, and the
+   command refuses without installing anything. The CA-certificate lane
+   (`prepare-ssh-identity`, `certify-ssh-node`, `enroll-ssh-posix`, the
+   `windows-sftp` route) is an optional high-assurance mode selected only
+   by an explicit `privilege_broker.automation_transport`; it is not part
+   of adding a host.
 4. **Prerequisites on the target** (consent, via the target's own managers) —
    `tmux` and `jq` through `roundhouse:fleet-update`; agent harnesses
    verified and user-authorized plugin/marketplace desired state supplied by
@@ -63,9 +63,10 @@ lane. Validation requires that sibling to be a configured `platform: wsl`,
    secrets, since the store is a trusted-write surface on every fleet
    machine.
 6. **Lane check** — `"$CLI" privilege-lane-status HOST OUT.json` must report
-   `ready` (or `disabled` when the host opted out). `drifted` means the
-   root/SYSTEM copy, grant or queue no longer matches its identity record:
-   run `privilege-enroll` again (one more approval) rather than editing the
+   `ready` (or `disabled` when the host opted out; `unsupported` on macOS
+   and native Windows in this version). `drifted` means the root copy,
+   grant or queue no longer matches its identity record: run
+   `privilege-enroll` again (one more approval) rather than editing the
    protected tree.
 7. **Verify** — finish with `roundhouse:fleet-readiness` for the new host and
    report the go/no-go table. A host is not "added" until readiness reports
@@ -81,10 +82,9 @@ Order matters: clean up over SSH while access still works, revoke second.
    enrolled artifacts via the enroll scripts' own uninstall/revoke paths
    (never raw deletion of the protected trees).
 2. **Revoke trust** — remove the privilege lane on the departing host:
-   `sudo /usr/local/libexec/roundhouse-lane/privilege-lane revoke` (POSIX)
-   or an elevated `privilege-lane-windows.ps1 -Revoke` (Windows), each one
-   local approval; it removes the grant or task, the protected copy and the
-   queue and keeps the journal. A host on the optional CA lane follows
+   `sudo /usr/local/libexec/roundhouse-lane/privilege-lane revoke`, one
+   local approval; it removes the grant, the root copy and the queue and
+   keeps the journal. A host on the optional CA lane follows
    `"$SKILL_DIR/../../references/windows-sftp.md"` instead.
    **Revoke the store credential alongside SSH trust**:
    delete the host's deploy key or token at the remote in the same step, so

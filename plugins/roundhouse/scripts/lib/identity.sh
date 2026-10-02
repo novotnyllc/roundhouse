@@ -293,25 +293,19 @@ prepare_privilege_enrollment_command() (
     jq -S --arg target "$target" --arg platform "$platform" '{
       schema:"roundhouse.privilege-enrollment-preparation",schema_version:1,
       target:$target,platform:$platform,route:"local-lane",
-      state:(if .state | IN("ready","disabled","user_session_unavailable","drifted","unreachable","canary_pending")
+      state:(if .state | IN("ready","disabled","drifted","unreachable")
              then .state else "needs_one_time_approval" end),
       reason:(if .state == "ready" then "lane_enrolled" elif .state == "disabled" then "privilege_lane_disabled"
-              elif .state == "user_session_unavailable" then "no_user_session_on_the_windows_host"
               elif .state == "drifted" then "lane_drifted_re_enroll" elif .state == "unreachable" then "host_unreachable"
-              elif .state == "canary_pending" then "enrollment_canary_not_yet_passed"
               else "one_os_approval_required" end),
       lane_state:.state,detail:.detail,activation_performed:false,
       credential_handling:"agent_never_requests_or_relays_a_password_or_administrator_credential",
-      fixed_entrypoints:[
-        (if $platform == "windows" then
-          {path:"scripts/privilege-lane-windows.ps1",mode:"Enroll",elevation:"single_uac_consent"}
-         else {path:"scripts/privilege-lane-posix",mode:"enroll",elevation:"single_sudo"} end)],
+      fixed_entrypoints:[{path:"scripts/privilege-lane-posix",mode:"enroll",elevation:"single_sudo"}],
       required_public_artifacts:["release-integrity"],
       next_action:(if .state | IN("ready","disabled") then "none"
-                   elif .state == "user_session_unavailable" then "start_a_user_session_on_the_windows_host_and_retry"
                    elif .state == "unreachable" then "restore_reachability_and_retry"
                    else "run_roundhouse_privilege_enroll" end),
-      next_command:(if .state | IN("ready","disabled","user_session_unavailable","unreachable") then "-"
+      next_command:(if .state | IN("ready","disabled","unreachable") then "-"
                     else ("roundhouse privilege-enroll " + $target) end)
     }' "$tmp/lane-status.json" >"$tmp/preparation"
     safe_output "$tmp/preparation" "$output"
