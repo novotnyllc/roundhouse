@@ -253,7 +253,8 @@ rh_runner() {
     printf 'FAIL: ROUNDHOUSE_TEST_UNIT_TIMEOUT must be a positive integer\n' >&2
     exit 64 ;;
   esac
-  rh_deadline=${ROUNDHOUSE_TEST_DEADLINE:-$(($(date +%s) + 600))}
+  # The default keeps ten seconds of the cap for watchdog latency and reaping.
+  rh_deadline=${ROUNDHOUSE_TEST_DEADLINE:-$(($(date +%s) + 590))}
   case $rh_deadline in ''|*[!0-9]*|0)
     printf 'FAIL: ROUNDHOUSE_TEST_DEADLINE must be epoch seconds\n' >&2
     exit 64 ;;
@@ -426,7 +427,7 @@ rh_runner() {
         return 0
       fi
       rh_now=$(rh_now_ms)
-      rh_killed=
+      rh_expired='' rh_expired_pids=''
       rh_i=1
       while [ "$rh_i" -le "$rh_count" ]; do
         if [ "${rh_state[rh_i]}" = running ]; then
@@ -445,23 +446,26 @@ rh_runner() {
           fi
           if [ "${rh_gone[rh_i]:-}" != 1 ] &&
             [ $(((rh_now - rh_t0[rh_i]) / 1000)) -ge "$rh_timeout" ]; then
-            rh_kill_tree "$rh_p"
             printf '\nFAIL: unit exceeded ROUNDHOUSE_TEST_UNIT_TIMEOUT=%ss and was killed\n' \
               "$rh_timeout" >>"$rh_root/$rh_i/log"
-            rh_finish "$rh_i" 124 "$(rh_now_ms)"
-            rh_killed=1
+            rh_expired="$rh_expired $rh_i" rh_expired_pids="$rh_expired_pids $rh_p"
           elif [ "${rh_gone[rh_i]:-}" != 1 ] && [ "$rh_now" -ge "$rh_deadline_ms" ]; then
-            rh_kill_tree "$rh_p"
             printf '\nFAIL: the suite passed ROUNDHOUSE_TEST_DEADLINE (the 10-minute cap); unit killed\n' \
               >>"$rh_root/$rh_i/log"
-            rh_finish "$rh_i" 124 "$(rh_now_ms)"
-            rh_killed=1
+            rh_expired="$rh_expired $rh_i" rh_expired_pids="$rh_expired_pids $rh_p"
           fi
         fi
         rh_i=$((rh_i + 1))
       done
-      # Every expired unit goes in one scan, so a deadline drains at once.
-      [ -z "$rh_killed" ] || return 0
+      # Every expired unit is reaped in one scan and one signal round, so a
+      # deadline drains at once rather than a second per worker.
+      if [ -n "$rh_expired" ]; then
+        # shellcheck disable=SC2086 # deliberate: one pid per word
+        rh_kill_tree $rh_expired_pids
+        rh_dend=$(rh_now_ms)
+        for rh_i in $rh_expired; do rh_finish "$rh_i" 124 "$rh_dend"; done
+        return 0
+      fi
     done
     printf 'FAIL: roundhouse self-check: lost the unit completion channel\n' >&2
     exit 1
