@@ -104,32 +104,33 @@ policy.
   `partial`. Old
   versions are never removed (a service may still run from one); they are
   reported. The sealed lane moves within the current major; a major change is
-  a store edit (`runtimes.node`, below). On native Windows fnm is the
-  runtime source too, once the host is migrated: the collector reports the
-  same `fnm:node` record (root from `%FNM_DIR%`, `%APPDATA%\fnm` or
+  a store edit (`runtimes.node`, below). Native Windows has two cases.
+- Node on a Windows host migrated to fnm: the collector reports the same
+  `fnm:node` record (root from `%FNM_DIR%`, `%APPDATA%\fnm` or
   `%LOCALAPPDATA%\fnm`; default from the `aliases\default` junction; npm
   records from that default's `npm.cmd`), and the same sealed switch runs
   through `apply-interop-plan` in `apply-windows.ps1`, in the user's own
   session, never elevated, with the same carry rule, hooks (projected to
-  Windows workers too), in-flight record and post-state. The winget MSI
+  Windows workers too), in-flight record and post-state. List `npm` in the
+  host's `package_managers` so the record is collected. The winget MSI
   (`OpenJS.NodeJS`) may stay installed; its record then shows `shadowed_by:
   "fnm:node"`, `managed: false`, `update_available: false`, and `seal-plan`
   refuses its upgrade (`hold: Node.js (winget OpenJS.NodeJS) is shadowed by
   fnm …`): never plan one. Migrate a host once, as its own user, from a
   non-elevated PowerShell 7: `pwsh -NoProfile -File
-  <plugin>\scripts\apply-windows.ps1 -BootstrapNodeFnm -NodeMajor 26`
-  (idempotent: fnm user-scope via winget, else the pinned SHA-256-verified
+  <plugin>\scripts\apply-windows.ps1 -BootstrapNodeFnm -NodeMajor 26`. It is
+  idempotent: fnm user-scope via winget, else the pinned SHA-256-verified
   release; `FNM_DIR`; the newest release in the major carrying every global
-  of the MSI's `%APPDATA%\npm`; the alias first on the user PATH; a switch
-  left in flight restored first). List `npm` in that host's
-  `package_managers` so the record is collected. The machine PATH still
+  of the MSI's `%APPDATA%\npm`; the alias first on the user PATH. Rerunning
+  it also restores a Windows switch left in flight. The machine PATH still
   puts the MSI's `node` first for a bare `node`/`npm` in new sessions;
-  global bins and Roundhouse itself use fnm. On a host without fnm the MSI
-  rules stand: its record carries the gating `pin` (`winget pin add --id
-  OpenJS.NodeJS --version 26.*`), `line` and `install_scope` (from the
-  package's HKLM/HKCU uninstall registration, never from PATH; ambiguous is
-  null, treated as machine scope); a machine-scope upgrade holds (`hold:
-  Node.js … needs elevation`) unless readiness advertises the protected
+  global bins and Roundhouse itself use fnm.
+- Node on a Windows host without fnm: the MSI rules stand. Its record
+  carries the gating `pin` (`winget pin add --id OpenJS.NodeJS --version
+  26.*`), `line` and `install_scope` (from the package's HKLM/HKCU uninstall
+  registration, never from PATH; ambiguous is null, treated as machine
+  scope). A machine-scope upgrade holds (`hold: Node.js … needs elevation`)
+  unless readiness advertises the protected
   `winget.upgrade-machine-package.v1` action for that channel. Never trigger
   a UAC prompt.
 

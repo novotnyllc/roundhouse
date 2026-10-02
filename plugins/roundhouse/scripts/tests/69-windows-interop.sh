@@ -433,7 +433,11 @@ JSON
     cat >"$ifn_root/template/bin/node" <<'SH'
 #!/usr/bin/env bash
 self=$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd -P)
-[ "${1:-}" != --version ] || basename -- "$(dirname -- "$(dirname -- "$self")")"
+case ${1:-} in
+  --version) basename -- "$(dirname -- "$(dirname -- "$self")")" ;;
+  # npm replacing itself runs as `node <prefix>/.../npm-cli.js ...`.
+  */npm-cli.js) shift; exec "$self/npm" "$@" ;;
+esac
 SH
     cat >"$ifn_root/template/bin/npm" <<'SH'
 #!/usr/bin/env bash
@@ -466,6 +470,7 @@ case "$1 ${2:-}" in
   "install --global")
     shift 2
     for spec in "$@"; do
+      case $spec in --*) continue ;; esac
       case $spec in @*) name="@${spec#@}"; name="${name%@*}" ;; *) name="${spec%@*}" ;; esac
       jq --arg n "$name" --arg v "${spec##*@}" '.[$n] = $v' "$state" >"$state.next" && mv "$state.next" "$state"
       mkdir -p "$prefix/lib/node_modules/$name" "$prefix/bin"

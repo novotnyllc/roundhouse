@@ -244,21 +244,14 @@ start time reads the same under any TZ, `node-switch-clear` refuses without a
 verified default and clears a backoff), the hook-failure backoff (including
 the run loop deferring a backed-off switch to the same run's full pass), npm mutations refused while a switch is in flight (fast
 install, seal, apply), and, under pwsh, the Windows pin and scope record and
-the machine-scope hold, and the Windows fnm arm: the collector's `fnm:node`
-record in the POSIX shape with the npm records under the fnm default, the MSI
-shadowed and its upgrade refused, and the Windows switch sealed with its
-configured hooks. `collect-windows.ps1 -SelfTest` covers the pin parser, fnm
-root and default discovery, the release list, the global split and the record
-shape. `scripts/tests/69-windows-interop.sh` runs a sealed Windows switch end
-to end over the interop lane against a stub fnm: a failed hook restored and
-partial, then a reseal that carries before the flip and runs the hook under
-the new node. `apply-windows.ps1 -SelfTest` covers the switch phases with
-in-memory fnm and npm (carry before flip, a refused invented carry, a failed
-carry, a restored hook failure, an unverified restore that stays recorded and
-blocks npm, recovery, the lock), the carry rule and operation shape, the
-post-state, and the bootstrap's migration from the MSI's npm (a linked global
-refused, a rerun idempotent, a failed first default removed), its PATH edit
-and its archive check.
+the machine-scope hold, and the Windows fnm arm (the collector's `fnm:node`
+record, the shadowed MSI and its refused upgrade, the switch sealed for a
+Windows target). `scripts/tests/69-windows-interop.sh` runs a sealed Windows
+switch end to end over the interop lane against a stub fnm. The `-SelfTest`s
+of `node-fnm-windows.ps1` (discovery), `collect-windows.ps1` (the record) and
+`apply-windows.ps1` (the switch phases, carry rule, post-state and bootstrap
+over in-memory fnm and npm) cover the rest; `collect-windows.ps1 -SelfTest`
+also covers the pin parser.
 
 ## 6. Known limits
 
@@ -345,14 +338,20 @@ same `fnm:node` record, in the same shape, next to the `npm:*` records, which
 then come from the fnm default's npm. The root is the first of `%FNM_DIR%`
 (the process, then the user's own setting), `%APPDATA%\fnm` and
 `%LOCALAPPDATA%\fnm` whose `aliases\default` junction holds `npm.cmd` and
-`node.exe`; `installed_version` is read from that junction's target, fnm
-itself is `fnm.exe` on PATH or where the bootstrap puts it (winget's
+`node.exe` (discovery lives in `node-fnm-windows.ps1`, which the collector
+and the executor both dot-source); `installed_version` is read from that
+junction's target, fnm itself is `fnm.exe` on PATH or where the bootstrap puts it (winget's
 `%LOCALAPPDATA%\Microsoft\WinGet\Links`, `%LOCALAPPDATA%\fnm`, or beside a
 root), and `globals`/`globals_unpinnable` come from the same `npm ls` as the
 npm records. `switch_inflight` is the Windows switch's record reduced to
 `{old, target, at}`. The `winget:OpenJS.NodeJS` record then carries
 `shadowed_by: "fnm:node"`, `managed: false` and `update_available: false`:
-the MSI stays installed but is unmanaged, never drift to upgrade.
+the MSI stays installed but is unmanaged, never drift to upgrade. Two cases
+are reported, never read as "no fnm": a default alias that names no installed
+version (`packages:fnm`, `fnm_default_unreadable`), and an fnm default whose
+npm reports a global prefix outside fnm, from an npmrc `prefix=` or
+`NPM_CONFIG_PREFIX` (`packages:fnm-node`, `fnm_npm_prefix_foreign`; no
+`fnm:node` record, so no switch seals).
 
 Without fnm, the `winget:OpenJS.NodeJS` record carries `shadowed_by: null`
 and `managed: true`, and gains `pin` (`{type:"Gating",version:"26.*"}` from `winget pin list`),
@@ -662,21 +661,29 @@ arm is new. The worker:
   with every `required` hook among them;
 - runs §7.3's phases: PREFLIGHT (the carry is installed at exactly those
   versions, every hook a bin of a carried package under the current prefix);
-  STAGING (`fnm install`, the target's npm brought up to the installed one
-  when older, one exact `npm --prefix <target> install --global a@x …`,
-  leftovers uninstalled, the set verified); the FLIP (the in-flight record,
-  `fnm default`, verify, each hook re-proved and run through the alias so a
-  service it registers names a path that survives later switches, verify
-  again, clear the record). A failure after the flip restores the old
-  default and verifies it, or leaves the record;
+  STAGING (`fnm install`; the target's npm brought up to the installed one
+  when older, run by the target's `node.exe` from its own `npm-cli.js` with
+  `--force`, because it overwrites the `npm.cmd` shims Node ships and must
+  not run through them; one exact `npm --prefix <target> install --global
+  a@x …`; leftovers uninstalled; the set verified); the FLIP (the in-flight
+  record, `fnm default`, verify, each hook re-proved and run through the
+  alias so a service it registers names a path that survives later
+  switches, verify again, clear the record). Verifying a default also
+  requires its npm's `prefix --global` to be fnm's. A failure after the flip
+  restores the old default and verifies it, or leaves the record. Every
+  failure carries the failing command's own output tail, as a failed sealed
+  argv does;
 - checks the post-state as §7.6 does (exactly the carry, nothing unpinnable,
   no record), and refuses every `npm:*` upgrade while a record exists.
 
 The lock is `node-switch.lock` held open exclusively for the whole switch;
 the OS releases it however the holder exits, so a killed switch leaves no
-stale lock, only the record. Nothing on Windows runs the desired-state
-recovery; rerunning the bootstrap restores a recorded switch (verified) before
-anything else, and refuses when the recorded old version is gone.
+stale lock, only the record, which also names the fnm root the switch used.
+Nothing on Windows runs the desired-state recovery, the hook-failure backoff
+or `node-switch-clear` (no desired-state run reaches native Windows):
+rerunning the bootstrap restores a recorded switch in its recorded root
+(verified) before anything else, and refuses when the recorded old version
+is gone, which leaves the record to a person.
 
 **Bootstrap** (once per host, by its user, never elevated; idempotent):
 
@@ -725,6 +732,10 @@ first on the user PATH, ahead of `%APPDATA%\npm`, and every npm shim runs the
 root itself, never PATH. Removing the MSI, or prepending the alias in a shell
 profile, is the operator's own step; the bootstrap reports which `node.exe`
 a new session finds.
+
+**Unbounded Windows calls.** `fnm install`, `fnm list-remote`, the npm calls
+and the hooks run without lib/timeout.sh's ceilings on Windows, like every
+other native call the Windows executor makes.
 
 **Windows hooks and daemons.** A hook runs through the executor's captured
 native call, like a package updater. `ocx service` registers a scheduled
