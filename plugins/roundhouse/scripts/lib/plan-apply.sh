@@ -664,6 +664,9 @@ EOF
             printf 'roundhouse: unsafe Claude plugin update argv\n' >&2
             return 64
           }
+          "$@" || return
+          plugin_cache_seal_permissions "$plugin_id" || return 65
+          return
           ;;
         *)
           printf 'roundhouse: this agent manager has no safe native update command\n' >&2

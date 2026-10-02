@@ -434,12 +434,20 @@ JSON
     # approval follows an actual enable, not a manager no-op.
     printf '%s\n' '{"example@test-market":false}' >"$run_plugin_enabled_file"
     : >"$run_plugin_order_log"
+    # #56: the manager writes the cache under its caller's umask, and 002 (the
+    # WSL default) leaves it group-writable. The update path seals it.
+    run_plugin_cache="$HOME/.claude/plugins/cache/test-market/example"
+    mkdir -p "$run_plugin_cache/1.2.3/scripts"
+    printf '#!/bin/sh\n' >"$run_plugin_cache/1.2.3/scripts/tool"
+    chmod -R g+w,o+w "$run_plugin_cache"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "same-version/new-SHA plugin apply failed"
+    [ -z "$(find "$run_plugin_cache" ! -type l \( -perm -020 -o -perm -002 \) -print)" ] ||
+      fail "the plugin update left a group- or world-writable cache"
     grep -qx 'example@test-market' "$run_plugin_install_marker" ||
       fail "same-version/new-SHA plugin was not reinstalled"
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
