@@ -241,10 +241,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       # The suite deadline counts from the job's start, so a hung unit is
-      # killed with its log a minute before the 10-minute job timeout,
-      # however long the setup below takes.
+      # killed with its log 30 seconds before the 10-minute job timeout,
+      # however long the setup below takes. Setup is bounded too, so it
+      # cannot eat a passing shard's budget: macOS has only the 1-minute
+      # jj/yq step (setup normally takes ~5s; the heaviest unit is 440s),
+      # and Linux shards are under 4 minutes beside their OpenSSH step.
       - name: Start the suite deadline
-        run: echo "ROUNDHOUSE_TEST_DEADLINE=$(( $(date +%s) + 540 ))" >> "$GITHUB_ENV"
+        run: echo "ROUNDHOUSE_TEST_DEADLINE=$(( $(date +%s) + 570 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install OpenSSH server for scope validation
         if: runner.os == 'Linux'
@@ -272,7 +275,7 @@ jobs:
           printf 'could not install openssh-server\n' >&2
           exit 1
       - name: Install jj and yq for the real-jj sections
-        timeout-minutes: 3
+        timeout-minutes: 1
         shell: bash
         run: |
           set -eu

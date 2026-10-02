@@ -13,8 +13,8 @@ parallel runner.
 The workflow also runs `actionlint`, native `windows` checks, and the stable
 `ci-ok` gate over all results. Every job has a `timeout-minutes`, and the
 runner fails a hung unit with its log after `ROUNDHOUSE_TEST_UNIT_TIMEOUT`
-seconds, or at `ROUNDHOUSE_TEST_DEADLINE`, which CI sets a minute before the
-job timeout. Reproduce the relevant gates locally before pushing
+seconds, or at `ROUNDHOUSE_TEST_DEADLINE`, which CI sets 30 seconds before
+the job timeout. Reproduce the relevant gates locally before pushing
 plugin changes.
 
 ## POSIX gates
