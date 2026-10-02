@@ -147,10 +147,11 @@ SH
       {name: "openai-bundled", root: "/bundled", marketplaceSource: {sourceType: "local", source: "/bundled"}}]}' \
       >"$PC_CODEX_MARKETS"
     printf '%s\n' '{"installed":[
-      {"pluginId":"roundhouse@novotnyllc","marketplaceName":"novotnyllc","installed":true},
-      {"pluginId":"railyard@novotnyllc","marketplaceName":"novotnyllc","installed":true},
-      {"pluginId":"agent-utilities@novotnyllc","marketplaceName":"novotnyllc","installed":true},
-      {"pluginId":"tart-xcode-runner@novotnyllc","marketplaceName":"novotnyllc","installed":true},
+      {"pluginId":"roundhouse@novotnyllc","marketplaceName":"novotnyllc","installed":true,"enabled":true},
+      {"pluginId":"railyard@novotnyllc","marketplaceName":"novotnyllc","installed":true,"enabled":true},
+      {"pluginId":"agent-utilities@novotnyllc","marketplaceName":"novotnyllc","installed":true,"enabled":true},
+      {"pluginId":"tart-xcode-runner@novotnyllc","marketplaceName":"novotnyllc","installed":true,"enabled":true},
+      {"pluginId":"dormant@novotnyllc","marketplaceName":"novotnyllc","installed":true,"enabled":false},
       {"pluginId":"gone@novotnyllc","marketplaceName":"novotnyllc","installed":false},
       {"pluginId":"browser@openai-bundled","marketplaceName":"openai-bundled","installed":true}]}' \
       >"$PC_CODEX_PLUGINS"
@@ -164,8 +165,20 @@ SH
       [ "$(fleet_plugins_codex_markets | tr "$us" '|')" = \
         "novotnyllc|https://example.invalid/m.git||$pc/codex-root" ] ||
         fail "the Codex Git marketplaces were wrong: $(fleet_plugins_codex_markets)"
-      # A full refresh: upgrade the Git marketplace, then every installed
-      # plugin from it through the hook-preserving helper, roundhouse last.
+      # A full refresh: upgrade the Git marketplace, then every installed,
+      # enabled plugin from it through the hook-preserving helper, roundhouse
+      # last. A fleet item is the item loop's — held or not, a tombstone
+      # (`railyard: absent`, outside the fold) or a definition — and a
+      # disabled install is never handed to a helper that rewrites hook trust.
+      : >"$PC_CODEX_LOG"
+      pc_out=$(fleet_plugins_refresh "$pc/store" vireo '{}' \
+        '{"plugins":{"agent-utilities":{"marketplace":"novotnyllc"}}}' full "$pc" \
+        '{"plugins":{"railyard":"absent"}}')
+      printf '%s\n' 'upgrade novotnyllc' 'helper update tart-xcode-runner@novotnyllc' \
+        'helper update roundhouse@novotnyllc' >"$pc/codex.want"
+      cmp -s "$PC_CODEX_LOG" "$pc/codex.want" ||
+        fail "the Codex refresh touched a fleet item or a disabled install: $(tr '\n' ';' <"$PC_CODEX_LOG")"
+      rm -f "$(fleet_plugins_memo_path codex novotnyllc complete)"
       : >"$PC_CODEX_LOG"
       pc_out=$(fleet_plugins_refresh "$pc/store" vireo '{}' '{}' full "$pc")
       printf '%s\n' 'upgrade novotnyllc' 'helper update agent-utilities@novotnyllc' \
@@ -201,6 +214,27 @@ SH
         fail "a Codex refresh with a failed update was recorded complete"
       [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" = "$pc_rev2" ] ||
         fail "the attempted upstream head was not remembered"
+      # A listing that exits 0 but is not the documented shape fails CLOSED:
+      # no upgrade, and neither memo moves, so the revision is never recorded
+      # complete with nothing updated.
+      pc_rev3=3333333333333333333333333333333333333333
+      printf '%s\n' "$pc_rev3" >"$PC_CODEX_NEXT_REV"
+      cp "$PC_CODEX_PLUGINS" "$pc/codex-plugins.good"
+      for pc_bad_list in '{"installed":"nope"}' '{invalid' '[]' '{"installed":["x"]}'; do
+        printf '%s\n' "$pc_bad_list" >"$PC_CODEX_PLUGINS"
+        : >"$PC_CODEX_LOG"
+        pc_out=$(fleet_plugins_codex_refresh novotnyllc "$pc/codex-root" "$pc_rev3")
+        [ ! -s "$PC_CODEX_LOG" ] ||
+          fail "a malformed codex plugin list ($pc_bad_list) still upgraded or updated: $(tr '\n' ';' <"$PC_CODEX_LOG")"
+        case $pc_out in
+          *'hold  marketplace novotnyllc (codex) — codex plugin list is unreadable'*) ;;
+          *) fail "a malformed codex plugin list ($pc_bad_list) was not held: $pc_out" ;;
+        esac
+        [ "$(fleet_plugins_memo_read codex novotnyllc complete)" = "$pc_rev1" ] &&
+          [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" = "$pc_rev2" ] ||
+          fail "a malformed codex plugin list ($pc_bad_list) advanced a memo"
+      done
+      cp "$pc/codex-plugins.good" "$PC_CODEX_PLUGINS"
       # A failed upgrade updates nothing.
       : >"$PC_CODEX_LOG"
       pc_out=$(PC_CODEX_UPGRADE_FAIL=1 \
@@ -213,27 +247,38 @@ SH
       esac
     )
 
+    # The run hands the refresh its whole desired universe (fleet_run_desired:
+    # the fold plus tombstones), not the bare fold, which drops `absent`.
+    cli_function_body fleet_run_pass | tr -d '\\\n' |
+      grep -Fq '"$run_mode" "$run_tmp" "$run_desired"' ||
+      fail "the pass does not name its tombstones to the plugin refresh"
+
     # --- Claude: plugins the fleet does not own are updated in place ---
     pc_sha_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     pc_sha_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-    pc_fold='{"plugins":{"widget":{"state":"enabled","marketplace":"m"},"bare":"enabled","qual@m":"enabled"}}'
-    fleet_plugins_claude_owned "$pc_fold" '{}' | LC_ALL=C sort >"$pc/owned"
-    printf '%s\n' 'id qual@m' 'id widget@m' 'name bare' >"$pc/owned.want"
+    # DESIRED is the fold plus its tombstones (`retired: absent`): a
+    # tombstone whose uninstall is held is still the fleet's, not an
+    # unowned plugin to update. A definition is a fleet item too.
+    pc_fold='{"plugins":{"widget":{"state":"enabled","marketplace":"m"},"bare":"enabled","qual@m":"enabled","retired":{"state":"absent","marketplace":"m"}}}'
+    pc_defs='{"plugins":{"defined":{"marketplace":"m"}}}'
+    fleet_plugins_owned "$pc_fold" "$pc_defs" | LC_ALL=C sort >"$pc/owned"
+    printf '%s\n' 'id qual@m' 'id retired@m' 'id widget@m' 'name bare' 'name defined' \
+      >"$pc/owned.want"
     cmp -s "$pc/owned" "$pc/owned.want" ||
       fail "the fleet's own plugins were not named: $(tr '\n' ';' <"$pc/owned")"
     jq -n --arg a "$pc_sha_a" '{version: 2, plugins: (
-      ["widget", "bare", "qual", "gadget", "current"] |
+      ["widget", "bare", "qual", "gadget", "current", "retired", "defined"] |
       map({key: "\(.)@m", value: [{scope: "user", version: "1.0.0", gitCommitSha: $a}]}) |
       from_entries)}' >"$HOME/.claude/plugins/installed_plugins.json"
     jq -n --arg a "$pc_sha_a" --arg b "$pc_sha_b" '{available: (
-      ["widget", "bare", "qual", "gadget"] |
+      ["widget", "bare", "qual", "gadget", "retired", "defined"] |
       map({pluginId: "\(.)@m", version: "1.1.0", source: {source: "git", sha: $b}})) +
       [{pluginId: "current@m", version: "1.0.0", source: {source: "git", sha: $a}}]}' \
       >"$pc/catalog.json"
     : >"$pc/actions"
     fleet_run_marketplace_repair_reset
     pc_out=$(CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog.json" CLAUDE_PLUGIN_ACTION_LOG="$pc/actions" \
-      fleet_plugins_claude_update_unowned '{}' m "$pc/owned")
+      fleet_plugins_claude_update_unowned "$pc_defs" m "$pc/owned")
     [ "$(cat "$pc/actions")" = 'update gadget@m' ] ||
       fail "the unowned update touched a fleet item or a current plugin: $(tr '\n' ';' <"$pc/actions")"
     case $pc_out in
@@ -248,7 +293,7 @@ SH
       "$HOME/.claude/plugins/installed_plugins.json" >"$pc/installed.next"
     mv "$pc/installed.next" "$HOME/.claude/plugins/installed_plugins.json"
     pc_out=$(CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog.json" CLAUDE_INSTALL_SKIP_RECORD=1 \
-      fleet_plugins_claude_update_unowned '{}' m "$pc/owned")
+      fleet_plugins_claude_update_unowned "$pc_defs" m "$pc/owned")
     case $pc_out in
       *'hold  plugin gadget@m — claude plugin update did not reach the catalog identity'*) ;;
       *) fail "a no-op update read as done: $pc_out" ;;

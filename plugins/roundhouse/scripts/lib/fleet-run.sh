@@ -3270,7 +3270,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   # (lib/fleet-plugins.sh). The stamp keeps the full pass from refreshing
   # them a second time.
   fleet_plugins_refresh "$run_store" "$run_host" "$run_fold" "$run_defs" \
-    "$run_mode" "$run_tmp" || :
+    "$run_mode" "$run_tmp" "$run_desired" || :
   : >"$run_tmp/plugins-refreshed"
 
   # The pass's whole item set, for the sweep's retired-item rule.
