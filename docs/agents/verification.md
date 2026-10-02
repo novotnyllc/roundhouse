@@ -36,7 +36,9 @@ plugin changes.
    `scripts/lib/*.sh` are the CLI's sourced units and `scripts/tests/*.sh` the
    self-check's sourced sections. Neither is executable on its own.
 
-2. **Lint** — `shellcheck --severity=warning -x -P SCRIPTDIR` (Linux job only)
+2. **Lint** — `shellcheck --extended-analysis=false --severity=warning -x -P SCRIPTDIR`
+   (Linux job only; shellcheck 0.10+, pinned to 0.11.0 in CI — with data-flow
+   analysis on, the one-program lint of `test-roundhouse` needs ~17 GB)
    on the five substantial scripts: `roundhouse`, `collect-posix`,
    `launcher-install`, `privilege-lane-posix`, `test-roundhouse`, `update-integrity`. `-x` follows the `# shellcheck
    source=` directives, so `lib/` and `tests/` are analysed as part of the

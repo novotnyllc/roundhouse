@@ -28,6 +28,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # A pinned shellcheck new enough for --extended-analysis=false: with
+      # data-flow analysis on, linting test-roundhouse as one program peaks
+      # near 17 GB and the 16 GB runner is shut down mid-step.
+      - name: Install shellcheck
+        if: runner.os == 'Linux'
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -eu
+          curl -fsSL -o /tmp/shellcheck.tar.xz \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo '8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  /tmp/shellcheck.tar.xz' |
+            sha256sum -c -
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+          sudo install -m 0755 /tmp/shellcheck-v0.11.0/shellcheck /usr/local/bin/shellcheck
+          shellcheck --version
       - name: Validate Bash and integrity
         shell: bash
         run: |
@@ -63,7 +79,7 @@ jobs:
             # -x follows the `# shellcheck source=` directives in the CLI and in
             # the self-check driver, so the sourced units and sections are
             # analysed as the one program each becomes.
-            shellcheck --severity=warning -x -P SCRIPTDIR \
+            shellcheck --extended-analysis=false --severity=warning -x -P SCRIPTDIR \
               plugins/roundhouse/scripts/roundhouse \
               plugins/roundhouse/scripts/collect-posix \
               plugins/roundhouse/scripts/privilege-lane-posix \
