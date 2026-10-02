@@ -435,6 +435,26 @@ matches.
   refuses the interop session ("Access is denied"), `install` still installs
   the timers, exits 75, and names the `Unregister-ScheduledTask` command to
   run from the user's own desktop session.
+- **Windows plugin currency** — the one native task `install` registers is
+  `\RoundhousePluginCurrency`: per-user, unelevated, no window, every 20
+  minutes, stopped after 15. It runs a content-addressed copy of this
+  version's `scripts/plugins-windows.ps1` and hook helper under
+  `%LOCALAPPDATA%\Roundhouse\plugin-currency\bundles\`, and each `install`
+  that ships new bytes re-points it. Each run, inside a 13-minute bound:
+  `claude plugin marketplace update` then `claude plugin update ID --scope
+  user` for every installed user-scope plugin (never an install, enable or
+  removal); Codex's own Git-marketplace sync (`codex-plugin-hooks.mjs sync`);
+  `codex plugin add` for every enabled Codex copy whose source SHA is not its
+  catalog's (Codex reinstalls only when a clone moves, so a clone already at
+  the latest revision can still hold an old copy); byte-verified hook
+  approval for the fleet's own `novotnyllc` plugins under the POSIX run's
+  verified-identity contract; and a status file that `fleet-schedule status`
+  reports. Third-party hooks that change upstream stay untrusted until the
+  operator approves them, as Codex leaves them. Node is resolved PATH first,
+  then Codex's bundled runtime
+  (`%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe`),
+  then Claude's. A refused registration is reported and `install` exits 75
+  with the timers installed; `uninstall` removes the task.
 
 ```bash
 roundhouse fleet-run --fast    # the fast slot

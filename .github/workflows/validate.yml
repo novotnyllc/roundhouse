@@ -360,6 +360,7 @@ jobs:
             "plugins/roundhouse/scripts/interop-windows.ps1",
             "plugins/roundhouse/scripts/mcp-siding-windows.ps1",
             "plugins/roundhouse/scripts/node-fnm-windows.ps1",
+            "plugins/roundhouse/scripts/plugins-windows.ps1",
             "plugins/roundhouse/scripts/privilege-broker-windows.ps1",
             "plugins/roundhouse/scripts/profile-worker-windows.ps1",
             "plugins/roundhouse/scripts/register-profile-task-windows.ps1",

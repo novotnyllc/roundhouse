@@ -498,12 +498,15 @@ EOF_ARGV
         ;;
       unregister)
         # The native half (lib/fleet-schedule-windows.sh): an obsolete
-        # one-shot task in the Windows root folder of the sealed configured
-        # Windows machine, by its sealed digest, and only on the WSL side of
-        # a machine. The Windows side checks its identity and re-checks the
-        # task before it removes anything.
-        jq -e --arg oneshot "$fleet_schedule_windows_oneshot_re" '
-          .mode == "native" and .path == "\\" and (.name | test($oneshot)) and
+        # one-shot task (install) or the plugin currency task (uninstall) in
+        # the Windows root folder of the sealed configured Windows machine, by
+        # its sealed digest, and only on the WSL side of a machine. The
+        # Windows side checks its identity and re-checks the task before it
+        # removes anything.
+        jq -e --arg oneshot "$fleet_schedule_windows_oneshot_re" \
+          --arg currency "$fleet_schedule_windows_currency" --arg action "$(jq -r '.argv[2]' "$execute_op")" '
+          .mode == "native" and .path == "\\" and
+          (if $action == "install" then .name | test($oneshot) else .name == $currency end) and
           (.machine | type == "string" and test("^[A-Za-z0-9._-]+$")) and
           (.digest | test("^[0-9a-f]{64}$"))' "$execute_tmp/step.json" >/dev/null &&
           fleet_schedule_windows_host || {
@@ -512,6 +515,21 @@ EOF_ARGV
         }
         fleet_schedule_native unregister "$(jq -r '.machine' "$execute_tmp/step.json")" \
           "$(jq -r '.name' "$execute_tmp/step.json")" "$(jq -r '.digest' "$execute_tmp/step.json")"
+        ;;
+      register)
+        # The plugin currency task, on install only, at the sealed bundle
+        # (re-derived from this plugin's own bytes before anything is sent).
+        jq -e --arg currency "$fleet_schedule_windows_currency" '
+          .mode == "native" and .path == "\\" and .name == $currency and
+          (.machine | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+          (.bundle | test("^[0-9a-f]{64}$")) and (.before == null or (.before | test("^[0-9a-f]{64}$")))' \
+          "$execute_tmp/step.json" >/dev/null &&
+          [ "$(jq -r '.argv[2]' "$execute_op")" = install ] && fleet_schedule_windows_host || {
+          printf 'roundhouse: a sealed fleet-schedule step registers a native task this host does not reach\n' >&2
+          exit 64
+        }
+        fleet_schedule_native register "$(jq -r '.machine' "$execute_tmp/step.json")" \
+          "$(jq -r '.before // ""' "$execute_tmp/step.json")" "$(jq -r '.bundle' "$execute_tmp/step.json")"
         ;;
       *) exit 64 ;;
     esac
@@ -585,14 +603,13 @@ fleet_schedule_verify() {
 fleet_schedule_native_partial() {
   # fleet_schedule_native_partial APPLY-WORKDIR OPERATION-JSON — true when a
   # failed sealed apply failed ONLY in its native half: every operation ran,
-  # the post-change collect completed, the operation unregisters a native
-  # task, and every local postcondition holds in that collect. A refused or
-  # failed native removal is then the operator's to finish (75), never a
-  # failed install of the local jobs; anything else is.
+  # the post-change collect completed, the operation has a native step, and
+  # every local postcondition holds in that collect. A refused or
+  # failed native step is then the operator's to finish (75), never a
+  # failed install or uninstall of the local jobs; anything else is.
   native_partial_plan=$(jq -r '.plan_id // empty' "$1/plan.json" 2>/dev/null) || return 1
   [ -n "$native_partial_plan" ] && [ -f "$1/result.jsonl" ] || return 1
-  printf '%s
-' "$2" | jq -e 'any(.steps[]; .action == "unregister")' >/dev/null || return 1
+  printf '%s\n' "$2" | jq -e 'any(.steps[]; .mode == "native")' >/dev/null || return 1
   jq -s -e --arg plan "$native_partial_plan" '
     any(.[]; type == "object" and .kind == "operation" and .id == ("apply:" + $plan) and
       .data.operation_status == "partial" and .data.failed_operation_index == null and
@@ -711,7 +728,9 @@ fleet_schedule_record() {
       # before it reports, when the scheduler shows both jobs gone and let
       # go. Any other failure changes nothing here, and a job still there is
       # never opted out.
-      if [ "$2" -ne 0 ]; then
+      # A 75 is the native half alone (fleet_schedule_sealed): the local
+      # jobs are verified gone, so the host is opted out all the same.
+      if [ "$2" -ne 0 ] && [ "$2" -ne 75 ]; then
         [ -n "${3:-}" ] && fleet_schedule_verify uninstall false 2>/dev/null || return "$2"
       fi
       # The opt-out: from here on a trigger stamps and starts nothing, and a
@@ -819,19 +838,20 @@ fleet_schedule_sealed() (
   # operator's to remove from the desktop session: 75, named, after the local
   # jobs are verified in place.
   sealed_native=0
-  if [ "$sealed_action" = install ] &&
-    [ "$(printf '%s\n' "$sealed_record" | jq -r '.native.reachable == true')" = true ]; then
-    fleet_schedule_native verify || sealed_native=$?
+  if [ "$(printf '%s\n' "$sealed_record" | jq -r '.native.reachable == true')" = true ]; then
+    fleet_schedule_native verify "$sealed_action" || sealed_native=$?
   fi
-  # The apply's own postcondition found a native task it unregistered still
-  # there (or could not inspect it): never a clean install, even should a
-  # fresh look now find it gone.
+  # The apply's own postcondition found a native step not done (or could
+  # not inspect it): never a clean install or uninstall, even should a fresh
+  # look now find it done.
   if [ "$sealed_native_partial" = true ] && [ "$sealed_native" -eq 0 ]; then
-    printf 'roundhouse: native Windows: the apply could not confirm the removal of every obsolete one-shot task; re-run `roundhouse fleet-schedule install`\n' >&2
+    printf 'roundhouse: native Windows: the apply could not confirm every native step; re-run `roundhouse fleet-schedule %s`\n' \
+      "$sealed_action" >&2
     sealed_native=75
   fi
   # An install the scheduler could not take yet is 75 (written, loads later);
-  # an uninstall has removed what it could see either way.
+  # an uninstall has removed what it could see either way (a native task
+  # that would not go is its 75, after the local jobs are gone).
   [ "$sealed_action" != install ] || [ "$sealed_reachable" = true ] || {
     [ "$(fleet_schedule_platform)" != systemd ] || fleet_schedule_manager_unreachable_note
     exit 75

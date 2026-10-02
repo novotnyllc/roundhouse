@@ -8,22 +8,34 @@
 # (docs/specs/2026-08-06-dsc-storage-design-v2.md §9.2, KTD15). A native
 # task running `roundhouse fleet-run` would have nothing to run. So the
 # schedule for such a machine is its WSL distribution's own systemd timer
-# pair, and this backend gives that schedule the Windows side's view:
+# pair, and this backend gives that schedule the Windows side's view.
+#
+# What native Windows DOES get is one task that needs no roundhouse runtime:
+# RoundhousePluginCurrency, per-user and unelevated, which runs the shipped
+# scripts/plugins-windows.ps1 every 20 minutes to keep this user's Claude
+# Code and Codex plugins current (third-party ones too). Its action runs a
+# content-addressed copy of the current plugin version's script and hook
+# helper (the "bundle", fleet_schedule_windows_bundle), so each install that
+# ships new bytes re-points it.
 #
 #   observe   every Roundhouse* task in the configured Windows machine's Task
-#             Scheduler, each with the
-#             SHA-256 of its exported definition and a class decided by
-#             scripts/schedule-windows.ps1 (privilege-lane, obsolete-oneshot,
-#             unknown) — into the sealed roundhouse:schedule record as
-#             `native`, so the plan's precondition covers it;
+#             Scheduler, each with the SHA-256 of its exported definition and
+#             a class decided by scripts/schedule-windows.ps1
+#             (privilege-lane, obsolete-oneshot, plugin-currency with the
+#             bundle it runs, unknown) — into the sealed roundhouse:schedule
+#             record as `native`, so the plan's precondition covers it;
 #   plan      `install` unregisters each obsolete-oneshot task (a release-gate
-#             session's trigger-less leftover) and nothing else;
-#   apply     one native unregister per sealed step, which the Windows side
-#             performs only while the task still hashes to the sealed digest,
-#             still classifies as obsolete and is not running — its definition
-#             kept first;
-#   verify    a fresh inspect: an obsolete task still registered is reported
-#             with the fix, and `install` exits 75.
+#             session's trigger-less leftover) and registers the plugin
+#             currency task unless it already runs this version's bundle;
+#             `uninstall` unregisters the plugin currency task; nothing else;
+#   apply     one native step per sealed step, which the Windows side performs
+#             only while the task still hashes to the sealed digest (or is
+#             still absent): an unregister also while it still classifies and
+#             is not running, its definition kept first; a register only with
+#             bundle bytes that hash to the sealed bundle;
+#   verify    a fresh inspect: an obsolete task still registered, or a plugin
+#             currency task not (or still) registered, is reported with the
+#             fix, and the command exits 75.
 #
 # The Windows half is the inventory's, not whatever answers on interop: the
 # one configured `platform: windows` machine whose `wsl_interop_via` names
@@ -52,6 +64,17 @@
 
 fleet_schedule_windows_result_marker='roundhouse-schedule-result '
 fleet_schedule_windows_oneshot_re='^Roundhouse-[A-Za-z0-9]{1,32}-[0-9a-f]{32}$'
+fleet_schedule_windows_currency=RoundhousePluginCurrency
+
+fleet_schedule_windows_bundle() {
+  # The digest of the plugin currency bundle this plugin version ships:
+  # plugins-windows.ps1 and the hook helper it runs, in that order — the
+  # same text scripts/schedule-windows.ps1 Get-BundleDigest hashes.
+  bundle_script=$(sha256_file "$script_dir/plugins-windows.ps1") &&
+    bundle_helper=$(sha256_file "$script_dir/codex-plugin-hooks.mjs") || return 70
+  printf 'plugins-windows.ps1 %s\ncodex-plugin-hooks.mjs %s\n' "$bundle_script" "$bundle_helper" |
+    sha256_stream
+}
 
 fleet_schedule_native() {
   # fleet_schedule_native VERB [ARG...] — fleet_schedule_windows_VERB on a WSL
@@ -167,21 +190,30 @@ fleet_schedule_windows_result_valid() {
   # and no task definition's content travels at all. A task roundhouse does
   # not recognise may carry any bounded name and folder (it is only ever
   # reported); a class it acts on keeps the strict root-folder names.
-  jq -e --arg oneshot "$fleet_schedule_windows_oneshot_re" '
+  jq -e --arg oneshot "$fleet_schedule_windows_oneshot_re" --arg currency "$fleet_schedule_windows_currency" '
     def text($n): type == "string" and length <= $n and (test("[[:cntrl:]]") | not);
-    (keys == ["backup","host","message","mode","outcome","schema","schema_version","state","tasks","user","user_sid"]) and
+    (keys == ["backup","currency","host","message","mode","outcome","schema","schema_version","state","tasks","user","user_sid"]) and
     .schema == "roundhouse.schedule-windows-result" and .schema_version == 1 and
-    (.mode | IN("inspect","unregister","")) and (.state | IN("completed","failed")) and
+    (.mode | IN("inspect","unregister","register","")) and (.state | IN("completed","failed")) and
     (.message | text(1024)) and (.user_sid | text(184)) and (.backup | text(512)) and
     (.host | text(253)) and (.user | text(128)) and
-    (.outcome | IN("","removed","absent","refused","changed","not-obsolete","running","failed")) and
+    (.outcome | IN("","removed","registered","absent","refused","changed","not-obsolete","running","failed")) and
+    (.currency == null or (.currency | type == "object" and
+      keys == ["finished_at","held","messages","started_at","state","updated","version"] and
+      (.state | IN("running","current","held","timeout","failed")) and
+      (.version | type == "string" and test("^([0-9A-Za-z.+-]{1,64})?$")) and
+      ([.started_at, .finished_at] | all(type == "string" and test("^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z)?$"))) and
+      ([.updated, .held] | all(type == "number" and . >= 0 and . <= 100000 and floor == .)) and
+      (.messages | type == "array" and length <= 32 and all(.[]; text(256))))) and
     (.tasks | type == "array" and length <= 64 and all(.[];
       type == "object" and
-      (keys == ["class","digest","last_result","last_run","name","path","state"]) and
+      (keys == ["bundle","class","digest","last_result","last_run","name","path","state"]) and
       (.name | type == "string" and test("^[^\\\\/[:cntrl:]]{1,128}$")) and
       (.path | type == "string" and length <= 256 and test("^\\\\([^\\\\/[:cntrl:]]{1,64}\\\\){0,8}$")) and
       ((.name | test("^Roundhouse"; "i")) or (.path | test("^\\\\Roundhouse"; "i"))) and
-      (.class | IN("privilege-lane","obsolete-oneshot","unknown")) and
+      (.class | IN("privilege-lane","obsolete-oneshot","plugin-currency","unknown")) and
+      (.bundle | type == "string" and test("^([0-9a-f]{64})?$")) and
+      (if .class == "plugin-currency" then .name == $currency else .bundle == "" end) and
       (.digest | type == "string" and test("^[0-9a-f]{64}$")) and
       (.state | text(32)) and
       (.last_run | type == "string" and test("^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z)?$")) and
@@ -239,7 +271,7 @@ fleet_schedule_windows_observe() {
   if observe_native=$(fleet_schedule_windows_inspect "$observe_sibling" 2>&1); then
     printf '%s\n' "$observe_native" | jq -c --arg machine "$observe_machine" \
       '{lane:"wsl-interop",machine:$machine,reachable:true,reason:null,
-        tasks:[.tasks[] | {name,path,class,digest}]}'
+        tasks:[.tasks[] | {name,path,class,digest,bundle}]}'
     return 0
   fi
   jq -cn --arg machine "$observe_machine" --arg reason "$(printf '%s\n' "$observe_native" | head -n 1)" \
@@ -249,15 +281,27 @@ fleet_schedule_windows_observe() {
 }
 
 fleet_schedule_windows_plan() {
-  # fleet_schedule_windows_plan ACTION RECORD — the native steps: on install,
-  # one `unregister` per obsolete one-shot task the record observed on its
-  # configured Windows machine; on uninstall none (this host's jobs are its
-  # systemd timers, and no native task is one of them).
-  [ "$1" = install ] || return 0
-  printf '%s\n' "$2" | jq -c '
+  # fleet_schedule_windows_plan ACTION RECORD — the native steps, on the
+  # configured Windows machine the record observed: on install, one
+  # `unregister` per obsolete one-shot task, then a `register` of the plugin
+  # currency task unless it already runs this version's bundle (bound to the
+  # definition observed, or to its absence); on uninstall, an `unregister`
+  # of the plugin currency task. Nothing else: no native task is one of this
+  # host's fleet-run jobs.
+  plan_bundle=$(fleet_schedule_windows_bundle) || return 70
+  printf '%s\n' "$2" | jq -c --arg action "$1" --arg bundle "$plan_bundle" \
+    --arg currency "$fleet_schedule_windows_currency" '
     (.native // {}) as $n | select($n.reachable == true and ($n.machine | type == "string")) |
-    $n.tasks[] | select(.class == "obsolete-oneshot") |
-    {action:"unregister",mode:"native",machine:$n.machine,name,path,digest}'
+    (first($n.tasks[] | select(.name == $currency and .path == "\\")) // null) as $c |
+    if $action == "install" then
+      ($n.tasks[] | select(.class == "obsolete-oneshot") |
+        {action:"unregister",mode:"native",machine:$n.machine,name,path,digest}),
+      (if $c != null and $c.class == "plugin-currency" and $c.bundle == $bundle then empty
+       else {action:"register",mode:"native",machine:$n.machine,name:$currency,path:"\\",
+         bundle:$bundle,before:($c.digest // null)} end)
+    elif $c != null then
+      {action:"unregister",mode:"native",machine:$n.machine,name:$currency,path:"\\",digest:$c.digest}
+    else empty end'
 }
 
 fleet_schedule_windows_unregister() {
@@ -294,6 +338,52 @@ fleet_schedule_windows_unregister() {
     end' >&2
 }
 
+fleet_schedule_windows_register() {
+  # fleet_schedule_windows_register MACHINE BEFORE BUNDLE — the plugin
+  # currency task, on the configured Windows machine MACHINE only, running
+  # BUNDLE: this plugin's bundle bytes, which must still hash to the sealed
+  # digest, travel with the request, and the Windows side writes them, checks
+  # them again, and registers the task only while it is still the definition
+  # the plan observed (BEFORE, empty for absent). Returns 0 once the request
+  # is decided, as an unregister does: apply's postcondition reports a task
+  # that is not registered.
+  register_sibling=$(fleet_schedule_windows_sibling "$1" 2>&1) || {
+    printf 'roundhouse: native Windows: %s was not registered: %s\n' "$fleet_schedule_windows_currency" \
+      "$(printf '%s\n' "$register_sibling" | head -n 1)" >&2
+    return 0
+  }
+  [ "$(fleet_schedule_windows_bundle)" = "$3" ] || {
+    printf 'roundhouse: native Windows: %s was not registered: this plugin'"'"'s bundle changed since the plan was sealed; create a new plan\n' \
+      "$fleet_schedule_windows_currency" >&2
+    return 0
+  }
+  register_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-schedule-register.XXXXXX") || return 0
+  interop_base64_file "$script_dir/plugins-windows.ps1" >"$register_tmp/script.b64"
+  interop_base64_file "$script_dir/codex-plugin-hooks.mjs" >"$register_tmp/helper.b64"
+  register_fields=$(jq -cn --arg name "$fleet_schedule_windows_currency" --arg before "$2" \
+    --arg bundle "$3" --arg version "$(jq -r '.version' "$script_dir/../.claude-plugin/plugin.json")" \
+    --rawfile script "$register_tmp/script.b64" --rawfile helper "$register_tmp/helper.b64" '
+    {name:$name,before:$before,bundle:$bundle,version:$version,
+      files:{"plugins-windows.ps1":($script | rtrimstr("\n")),"codex-plugin-hooks.mjs":($helper | rtrimstr("\n"))}}')
+  rm -rf "$register_tmp"
+  register_result=$(fleet_schedule_windows_call \
+    "$(fleet_schedule_windows_request "$register_sibling" register "$register_fields")" 2>&1) || {
+    printf 'roundhouse: native Windows: %s was not registered: %s\n' "$fleet_schedule_windows_currency" \
+      "$(printf '%s\n' "$register_result" | head -n 1)" >&2
+    return 0
+  }
+  printf '%s\n' "$register_result" | jq -r --arg name "$fleet_schedule_windows_currency" '
+    if .state != "completed" then
+      "roundhouse: native Windows: \($name) was not registered: \(.message)"
+    elif .outcome == "registered" then
+      "roundhouse: native Windows: registered \($name), which keeps this user'"'"'s plugins current every 20 minutes"
+    elif .outcome == "refused" then
+      "roundhouse: native Windows: \($name) was not registered: \(.message). Registering it needs the user'"'"'s own desktop session: run `roundhouse fleet-schedule install` from a WSL terminal there"
+    else
+      "roundhouse: native Windows: \($name) was not registered (\(.outcome)): \(.message)"
+    end' >&2
+}
+
 fleet_schedule_windows_status() {
   # `fleet-schedule status`'s native lines, read-only. Returns 0 even when the
   # Windows side cannot be reached or is not configured: the reason is the
@@ -310,32 +400,64 @@ fleet_schedule_windows_status() {
   }
   printf 'native Windows: %s — no fleet-run task, by design — roundhouse has no native runtime; the timers above are this machine'"'"'s one scheduled runner, and they converge this WSL side (native Windows changes only through the interop lane)\n' \
     "$(printf '%s\n' "$status_sibling" | jq -r '.machine')"
-  printf '%s\n' "$status_native" | jq -r '
-    .tasks[] |
+  printf '%s\n' "$status_native" | jq -r --arg bundle "$(fleet_schedule_windows_bundle)" \
+    --arg currency "$fleet_schedule_windows_currency" '
+    (.tasks[] |
     (if .last_run == "" then "never run" else "last run \(.last_run), result \(.last_result)" end) as $run |
     "native Windows: \(.path)\(.name) — " +
     (if .class == "privilege-lane" then
        "the privilege lane'"'"'s task (enroll-privilege-windows), not a schedule job; left alone"
      elif .class == "obsolete-oneshot" then
        "an obsolete one-shot release-gate task (no trigger, \($run)); `fleet-schedule install` removes it"
+     elif .class == "plugin-currency" then
+       "keeps this user'"'"'s plugins current every 20 minutes (\(.state), \($run)); " +
+       (if .bundle == $bundle then "runs this version'"'"'s bundle"
+        else "not this version'"'"'s definition; `fleet-schedule install` re-points it" end)
      else
        "not a task roundhouse recognises (\(.state), \($run)); reported, never changed"
-     end)'
+     end)),
+    (if any(.tasks[]; .class == "plugin-currency") | not then
+       "native Windows: no \($currency) task; `fleet-schedule install` registers it" else empty end),
+    (.currency // empty |
+      "native Windows: plugin currency: " +
+      (if .state == "running" then "running since \(.started_at)"
+       else "last run \(.finished_at): \(.state) (\(.updated) updated, \(.held) held)" end) +
+      (if .version == "" then "" else ", roundhouse \(.version)" end)),
+    (.currency // empty | .messages[] | select(startswith("hold ")) |
+      "native Windows: plugin currency: \(.)")'
 }
 
 fleet_schedule_windows_verify() {
-  # fleet_schedule_windows_verify — after an install: 0 when no obsolete
-  # one-shot task is still registered, else 75 with each one named. An
-  # inspection that fails AFTER the plan reached Windows proves nothing was
-  # removed, so it is 75 too, never a verified removal.
+  # fleet_schedule_windows_verify [install|uninstall] — after an install: 0
+  # when no obsolete one-shot task is still registered and the plugin
+  # currency task runs this version's bundle; after an uninstall: 0 when the
+  # plugin currency task is gone. Else 75 with each one named. An inspection
+  # that fails AFTER the plan reached Windows proves nothing, so it is 75
+  # too, never a verified change.
+  verify_action=${1:-install}
   verify_native=$(fleet_schedule_windows_sibling 2>/dev/null) &&
     verify_native=$(fleet_schedule_windows_inspect "$verify_native" 2>/dev/null) || {
-    printf 'roundhouse: native Windows: could not inspect the Task Scheduler after the install, so the obsolete one-shot tasks are unverified; re-run `roundhouse fleet-schedule install`\n' >&2
+    printf 'roundhouse: native Windows: could not inspect the Task Scheduler after the %s, so its native steps are unverified; re-run `roundhouse fleet-schedule %s`\n' \
+      "$verify_action" "$verify_action" >&2
     return 75
+  }
+  verify_currency=$(printf '%s\n' "$verify_native" | jq -r --arg currency "$fleet_schedule_windows_currency" \
+    'first(.tasks[] | select(.name == $currency and .path == "\\") | .bundle) // "absent"')
+  if [ "$verify_action" = uninstall ]; then
+    [ "$verify_currency" != absent ] || return 0
+    printf 'roundhouse: native Windows: %s is still registered; from the user'"'"'s own desktop session run `Unregister-ScheduledTask -TaskName %s -TaskPath \\ -Confirm:$false`, or re-run `roundhouse fleet-schedule uninstall`\n' \
+      "$fleet_schedule_windows_currency" "$fleet_schedule_windows_currency" >&2
+    return 75
+  fi
+  verify_status=0
+  [ "$verify_currency" = "$(fleet_schedule_windows_bundle)" ] || {
+    printf 'roundhouse: native Windows: %s does not run this version'"'"'s plugin currency bundle, so native Windows plugins are not kept current; re-run `roundhouse fleet-schedule install` from a WSL terminal in the user'"'"'s own desktop session\n' \
+      "$fleet_schedule_windows_currency" >&2
+    verify_status=75
   }
   verify_left=$(printf '%s\n' "$verify_native" |
     jq -r '.tasks[] | select(.class == "obsolete-oneshot") | .name')
-  [ -n "$verify_left" ] || return 0
+  [ -n "$verify_left" ] || return "$verify_status"
   printf '%s\n' "$verify_left" | while IFS= read -r verify_name; do
     printf 'roundhouse: native Windows: the obsolete one-shot task %s is still registered; from the user'"'"'s own desktop session run `Unregister-ScheduledTask -TaskName %s -TaskPath \\ -Confirm:$false`, or re-run `roundhouse fleet-schedule install`\n' \
       "$verify_name" "$verify_name" >&2
