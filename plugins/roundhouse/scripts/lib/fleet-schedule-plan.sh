@@ -564,13 +564,15 @@ fleet_schedule_command() (
   case $1 in
     status) fleet_schedule_status ;;
     uninstall)
-      # A systemd user manager this session cannot reach still enables a timer
-      # through its timers.target.wants link, which only that manager can
-      # disable; removing the units would orphan the link. Refuse first.
+      # A scheduler this session cannot reach may still hold the job: launchd
+      # with no GUI domain (over SSH) cannot say whether a present agent is
+      # loaded, and a systemd user manager out of reach still enables a timer
+      # through its timers.target.wants link. Removing the definitions then
+      # would leave a job running with no file. Refuse first.
       for uninstall_mode in $fleet_schedule_modes; do
         fleet_schedule_facts_read "$(fleet_schedule_facts "$uninstall_mode")"
-        [ "$sf_reachable" = 1 ] || [ "$sf_wants" != 1 ] || {
-          printf 'roundhouse: the %s timer is still enabled but the systemd user manager is not reachable from this session; run uninstall from a login session (or with lingering on). Nothing was changed.\n' \
+        [ "$sf_reachable" = 1 ] || { [ "$sf_wants" != 1 ] && [ "$sf_present" != 1 ]; } || {
+          printf 'roundhouse: the %s job is still installed but its scheduler is not reachable from this session (no GUI domain over SSH, or no systemd user manager); run uninstall from a login session. Nothing was changed.\n' \
             "$uninstall_mode" >&2
           exit 75
         }
