@@ -919,9 +919,9 @@ unrelated marketplaces, runtimes, settings, skills, provenance, or
 configuration. Manager output is progress evidence, not post-state. Recapture
 the bounded `agents` inventory after each harness attempt. Require every
 frozen marketplace plugin record to remain installed with its enabled state
-and Claude scope preserved; require every outside-marketplace record to be
-unchanged. Report before/after versions per plugin, and any Codex hooks left
-untrusted. A failure in one plugin or harness does not erase other evidence or
+and Claude scope preserved; require every
+outside-marketplace record to be unchanged. Report before/after versions per
+plugin, and any Codex hooks left untrusted. A failure in one plugin or harness does not erase other evidence or
 stop the remaining marketplace plugins from being attempted.
 
 Plugin dependencies belong to the workflow that declares them. Execute only
@@ -932,8 +932,8 @@ or reinstall a removed plugin merely because a workflow previously used it.
 
 The only pre-helper fallback is a separately approved self-update of
 `roundhouse@novotnyllc` from an integrity-verified release that lacks
-`codex-plugin-hooks.mjs sync`: run exactly `codex plugin add
-roundhouse@novotnyllc --json`, recapture inventory, reload the new
+`codex-plugin-hooks.mjs sync`: run exactly
+`codex plugin add roundhouse@novotnyllc --json`, recapture inventory, reload the new
 target-native plugin, and require its integrity verification before any other
 mutation. Never use that raw-add fallback for another plugin or once the
 helper command is available.

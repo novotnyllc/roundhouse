@@ -40,9 +40,12 @@ assert_contains "$fleet_agents_text" 'freeze a'
 assert_contains "$fleet_agents_text" 'outside-marketplace record to be unchanged'
 assert_contains "$fleet_agents_text" 'Update `roundhouse@novotnyllc` last'
 assert_contains "$fleet_agents_text" 'Report before/after versions per'
+# Codex follows its own startup sync: the routine triggers it and never
+# upgrades then "updates" (the upgrade already reinstalled the plugins).
 assert_ordered "$fleet_agents_skill" \
-  'codex plugin marketplace upgrade MARKETPLACE --json' \
-  'update-codex-plugin EACH_INSTALLED_PLUGIN@MARKETPLACE'
+  'codex plugin marketplace list --json' \
+  'codex-plugin-hooks.mjs" sync ROOT REVISION'
+assert_contains "$fleet_agents_text" 'Do not run `codex plugin marketplace upgrade` followed by'
 assert_contains "$fleet_agents_text" 'never send or interpolate'
 assert_contains "$fleet_agents_text" '"$TARGET_CLI" verify-executor'
 assert_contains "$fleet_agents_text" 'previously resolved and verified `"$TARGET_CLI"`'
