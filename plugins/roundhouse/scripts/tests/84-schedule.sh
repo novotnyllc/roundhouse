@@ -367,6 +367,35 @@ fleet_schedule_command "$@"'
       fail "the waiter started a job the operator stopped during its wait"
     rm -f "$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-fast"
     : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-fast"
+    # …and a FULL trigger's request goes with the stop: a later install or
+    # enable must not inherit it as a full pass nobody still wants.
+    sched_running_full="$SCHED_STATE/running.com.novotnyllc.roundhouse.fleet-full"
+    printf '30\n' >"$sched_running_full"
+    "$cli" fleet-trigger --full >/dev/null
+    [ -e "$(fleet_trigger_full_path)" ] ||
+      fail "a full trigger waiting on its job's exit recorded no full request"
+    : >"$SCHED_LOG"
+    rm -f "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-full"
+    : >"$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-full"
+    sched_wait_log "launchctl print-disabled gui/$sched_uid" ||
+      fail "the full job's waiter never judged it again before its start"
+    sleep 0.5
+    [ ! -e "$(fleet_trigger_full_path)" ] ||
+      fail "a full request survived the operator stopping the full job during the wait"
+    rm -f "$sched_running_full" "$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-full"
+    : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-full"
+    # A scheduler that goes away during the wait (a console logout) is not a
+    # stop: the waiter takes the detached fallback, as the trigger would.
+    rm -f "$SCHED_STATE/runner"
+    printf '30\n' >"$sched_running"
+    "$cli" fleet-trigger --fast >/dev/null
+    rm -f "$SCHED_STATE/gui"
+    sched_wait_runner ||
+      fail "the waiter dropped the trigger when the scheduler became unreachable during its wait"
+    [ "$(cat "$SCHED_STATE/runner")" = 'fleet-run --fast' ] ||
+      fail "the waiter's fallback ran something other than fleet-run --fast: $(cat "$SCHED_STATE/runner")"
+    rm -f "$SCHED_STATE/runner" "$sched_running"
+    : >"$SCHED_STATE/gui"
     # The waiter is bounded: a job that never ends is started anyway.
     : >"$SCHED_LOG"
     printf '999\n' >"$sched_running"
