@@ -741,27 +741,29 @@ EOF_STATUS
 
 fleet_schedule_uninstall() {
   for uninstall_mode in $fleet_schedule_modes; do
-    uninstall_def=$(fleet_schedule_def_path "$uninstall_mode")
     case $(fleet_schedule_platform) in
       launchd)
         launchctl bootout "$(fleet_schedule_gui_domain)/$(fleet_schedule_label "$uninstall_mode")" \
           >/dev/null 2>&1 || :
-        uninstall_files=$uninstall_def
         ;;
       systemd)
         ! fleet_schedule_user_manager ||
           systemctl --user disable --now "$(fleet_schedule_unit "$uninstall_mode").timer" \
             >/dev/null 2>&1 || :
-        uninstall_files="$uninstall_def ${uninstall_def%.timer}.service"
         ;;
     esac
+    # One path per line, each used quoted: a HOME or XDG_CONFIG_HOME with a
+    # space in it is a path, never two words.
+    uninstall_files=$(fleet_schedule_def_paths "$uninstall_mode")
     uninstall_any=false
-    for uninstall_file in $uninstall_files; do
-      [ -f "$uninstall_file" ] || continue
+    while IFS= read -r uninstall_file; do
+      [ -n "$uninstall_file" ] && [ -f "$uninstall_file" ] || continue
       rm -f "$uninstall_file"
       uninstall_any=true
       printf 'fleet-%s: removed %s\n' "$uninstall_mode" "$uninstall_file"
-    done
+    done <<EOF_UNINSTALL
+$uninstall_files
+EOF_UNINSTALL
     [ "$uninstall_any" = true ] || printf 'fleet-%s: not installed\n' "$uninstall_mode"
   done
   [ "$(fleet_schedule_platform)" != systemd ] || ! fleet_schedule_user_manager ||

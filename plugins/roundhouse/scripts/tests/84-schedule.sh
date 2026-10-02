@@ -730,6 +730,44 @@ STUB
     case $sched_out in *'no systemd user manager is reachable'*'wsl.conf'*) ;; *) fail "install with no user manager named no fix: $sched_out" ;; esac
     case $sched_out in *'enable-linger'*) fail "an unreachable manager on a lingering account was blamed on lingering: $sched_out" ;; esac
 
+    # A HOME and an XDG_CONFIG_HOME with spaces in them: every definition is
+    # one path, installed and then removed whole, on both platforms.
+    (
+      HOME="$sched_root/home with space"
+      XDG_CONFIG_HOME="$HOME/config dir"
+      export HOME XDG_CONFIG_HOME
+      mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.local/bin"
+      printf '#!/bin/sh\n' >"$HOME/.local/bin/roundhouse"
+      chmod +x "$HOME/.local/bin/roundhouse"
+      for sched_uname in Darwin Linux; do
+        SCHED_UNAME=$sched_uname
+        export SCHED_UNAME
+        rm -rf "$SCHED_STATE" "$(fleet_schedule_optout_path)"
+        mkdir -p "$SCHED_STATE"
+        : >"$SCHED_STATE/gui"
+        : >"$SCHED_STATE/usermgr"
+        : >"$SCHED_STATE/linger"
+        "$cli" fleet-schedule install >/dev/null 2>&1 ||
+          fail "install under a spaced HOME failed on $sched_uname"
+        sched_spaced=$(fleet_schedule_def_paths fast; fleet_schedule_def_paths full)
+        while IFS= read -r sched_spaced_path; do
+          case $sched_spaced_path in *' '*) ;; *) fail "the spaced fixture produced an unspaced path: $sched_spaced_path" ;; esac
+          [ -f "$sched_spaced_path" ] || fail "install under a spaced HOME wrote no $sched_spaced_path"
+        done <<EOF_SPACED
+$sched_spaced
+EOF_SPACED
+        sched_out=$("$cli" fleet-schedule uninstall 2>&1) ||
+          fail "uninstall under a spaced HOME failed on $sched_uname: $sched_out"
+        while IFS= read -r sched_spaced_path; do
+          [ ! -e "$sched_spaced_path" ] ||
+            fail "uninstall under a spaced HOME left $sched_spaced_path on $sched_uname: $sched_out"
+        done <<EOF_SPACED
+$sched_spaced
+EOF_SPACED
+        case $sched_out in *'not installed'*) fail "uninstall under a spaced HOME found nothing: $sched_out" ;; esac
+      done
+    )
+
     # Native Windows is out of scope, and says so; bad arguments never reach a job.
     SCHED_UNAME=MINGW64_NT-10.0
     sched_status=0
