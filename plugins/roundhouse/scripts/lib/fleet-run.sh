@@ -1794,15 +1794,24 @@ fleet_run_approve_plugin_hooks() {
   # carries that trust only for bytes PROVEN to be the verified upstream ones
   # (fleet_run_codex_bytes_verified); otherwise the helper refuses a modified
   # hook, and a never-trusted hook is refused either way.
-  fleet_run_hook_bytes=0
+  # The verified IDENTITY goes to the helper, not a bare yes: it re-checks
+  # the SHA and the two trees, and that the hooks it writes are the ones it
+  # listed, inside the one app server session that writes trust.
+  fleet_run_hook_sha=
+  fleet_run_hook_tree=
+  fleet_run_hook_codex_tree=
   fleet_run_bytes_reason=
   if [ -n "$fleet_run_expected_sha" ] &&
     fleet_run_codex_bytes_verified "$1" "$fleet_run_expected_sha"; then
-    fleet_run_hook_bytes=1
+    fleet_run_hook_sha=$fleet_run_expected_sha
+    fleet_run_hook_tree=$fleet_run_bv_claude_path
+    fleet_run_hook_codex_tree=$fleet_run_bv_codex_path
   fi
   fleet_run_cli_invalidate
   ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
-    ROUNDHOUSE_AUTOMATIC_HOOK_BYTES_VERIFIED=$fleet_run_hook_bytes \
+    ROUNDHOUSE_VERIFIED_SHA=$fleet_run_hook_sha \
+    ROUNDHOUSE_VERIFIED_TREE=$fleet_run_hook_tree \
+    ROUNDHOUSE_CODEX_TREE=$fleet_run_hook_codex_tree \
     "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
     >/dev/null || {
     [ -z "$fleet_run_bytes_reason" ] ||

@@ -178,7 +178,10 @@ plugins, so the helper's trust snapshot sees their changed hooks as
 rather than report trust it did not carry. `ROOT` is the marketplace's root
 from `codex plugin marketplace list --json` and `REVISION` its upstream head
 from `git ls-remote`; `sync` holds a Codex app server open until the root
-records that revision (30s at most) and exits 75 if it did not.
+records that revision AND every enabled plugin installed from it is
+reinstalled at that revision's catalog identity (a pinned entry's SHA, an
+in-repo entry's version; Codex records the revision before it reinstalls),
+30s at most, and exits 75 if either did not happen.
 `RESOLVED-CODEX-EXE` is the native Codex executable the task resolved (the
 same one `apply-windows.ps1` resolves for hook approval). Re-list afterwards;
 manager output is not post-state.

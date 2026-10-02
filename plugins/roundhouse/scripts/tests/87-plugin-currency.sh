@@ -129,12 +129,26 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
     case $(printf '%s\n' "$req" | jq -r '.method // empty') in
       initialize)
         # The sync runs in the background, announces nothing, and is cut off
-        # when the app server is closed before it finishes, as Codex's is.
+        # when the app server is closed before it finishes, as Codex's is. It
+        # records the marketplace revision (and its catalog) FIRST, and only
+        # then — PC_CODEX_REINSTALL_DELAY seconds later — reinstalls the
+        # pinned plugin at that revision's catalog SHA.
         server=$$
         [ ! -s "$PC_CODEX_SYNC_TO" ] || (sleep 1
           kill -0 "$server" 2>/dev/null || exit 0
-          jq -n --arg rev "$(cat "$PC_CODEX_SYNC_TO")" '{source_type: "git", revision: $rev}' \
-            >"$PC_CODEX_ROOT/.codex-marketplace-install.json") >/dev/null 2>&1 </dev/null &
+          rev=$(cat "$PC_CODEX_SYNC_TO")
+          mkdir -p "$PC_CODEX_ROOT/.agents/plugins"
+          jq -n --arg rev "$rev" '{name: "novotnyllc", plugins: [
+            {name: "demo", source: {source: "git-subdir", url: "https://example.invalid/demo.git", path: "plugins/demo", sha: $rev}},
+            {name: "loose", source: {source: "url", url: "https://example.invalid/loose.git"}}]}' \
+            >"$PC_CODEX_ROOT/.agents/plugins/marketplace.json"
+          jq -n --arg rev "$rev" '{source_type: "git", revision: $rev}' \
+            >"$PC_CODEX_ROOT/.codex-marketplace-install.json"
+          sleep "${PC_CODEX_REINSTALL_DELAY:-0}"
+          kill -0 "$server" 2>/dev/null || exit 0
+          jq --arg rev "$rev" '(.installed[] | select(.name == "demo") | .source.sha) = $rev' \
+            "$PC_CODEX_INSTALLED" >"$PC_CODEX_INSTALLED.next" &&
+            mv "$PC_CODEX_INSTALLED.next" "$PC_CODEX_INSTALLED") >/dev/null 2>&1 </dev/null &
         jq -cn --argjson id "$id" '{id:$id,result:{}}'
         ;;
     esac
@@ -143,6 +157,7 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
 fi
 case "$*" in
   'plugin marketplace list --json') cat "$PC_CODEX_MARKETS"; exit 0 ;;
+  'plugin list --json') cat "$PC_CODEX_INSTALLED"; exit 0 ;;
 esac
 # Roundhouse must never drive Codex's own updates.
 printf 'FORBIDDEN %s\n' "$*" >>"$PC_CODEX_LOG"
@@ -153,7 +168,14 @@ SH
     pc_codex_head=$(pc_git -C "$pc/codex-up-work" rev-parse HEAD)
     mkdir -p "$pc/codex-root"
     export PC_CODEX_MARKETS="$pc/codex-markets.json" PC_CODEX_LOG="$pc/codex.log" \
-      PC_CODEX_SYNC_TO="$pc/codex-sync-to" PC_CODEX_ROOT="$pc/codex-root"
+      PC_CODEX_SYNC_TO="$pc/codex-sync-to" PC_CODEX_ROOT="$pc/codex-root" \
+      PC_CODEX_INSTALLED="$pc/codex-installed.json"
+    # demo is pinned (waited on until reinstalled); loose is an unpinned
+    # remote entry with no identity in the catalog (not waited on).
+    printf '%s\n' '{"installed":[
+      {"pluginId":"demo@novotnyllc","name":"demo","marketplaceName":"novotnyllc","version":"1","installed":true,"enabled":true,"source":{"source":"git-subdir","sha":"old"}},
+      {"pluginId":"loose@novotnyllc","name":"loose","marketplaceName":"novotnyllc","version":"1","installed":true,"enabled":true,"source":{"source":"url"}}]}' \
+      >"$PC_CODEX_INSTALLED"
     jq -n --arg root "$pc/codex-root" --arg url "$pc/codex-up.git" '{marketplaces: [
       {name: "novotnyllc", root: $root, marketplaceSource: {sourceType: "git", source: $url}},
       {name: "openai-bundled", root: "/bundled", marketplaceSource: {sourceType: "local", source: "/bundled"}}]}' \
@@ -197,6 +219,29 @@ SH
       fleet_plugins_refresh "$pc/store" vireo '{}' '{}' fast "$pc" >/dev/null
       [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" = "$pc_codex_head" ] ||
         fail "a fast-pass Codex sync was not remembered"
+      # Codex records the revision before it reinstalls: a sync whose
+      # reinstall is still running at the deadline is NOT done. Nothing is
+      # remembered and the pass says so; a slower reinstall inside the
+      # deadline is waited for.
+      pc_codex_head=$(pc_commit codex-up 'a slow release')
+      printf '%s\n' "$pc_codex_head" >"$PC_CODEX_SYNC_TO"
+      pc_status=0
+      pc_out=$(PC_CODEX_REINSTALL_DELAY=6 ROUNDHOUSE_CODEX_SYNC_WAIT_MS=2500 \
+        node "$script_dir/codex-plugin-hooks.mjs" sync "$pc/codex-root" "$pc_codex_head") ||
+        pc_status=$?
+      [ "$pc_status" -eq 75 ] ||
+        fail "a sync reported done while the plugin was still being reinstalled (got $pc_status): $pc_out"
+      [ "$(jq -r '.installed[] | select(.name == "demo") | .source.sha' "$PC_CODEX_INSTALLED")" != \
+        "$pc_codex_head" ] || fail "the slow-reinstall fixture reinstalled inside the deadline"
+      pc_out=$(PC_CODEX_REINSTALL_DELAY=6 ROUNDHOUSE_CODEX_SYNC_WAIT_MS=2500 \
+        fleet_plugins_refresh "$pc/store" vireo '{}' '{}' full "$pc")
+      [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" != "$pc_codex_head" ] ||
+        fail "a sync whose reinstall had not finished was remembered as done"
+      pc_out=$(PC_CODEX_REINSTALL_DELAY=2 \
+        node "$script_dir/codex-plugin-hooks.mjs" sync "$pc/codex-root" "$pc_codex_head") ||
+        fail "a sync whose reinstall finished inside the deadline failed: $pc_out"
+      [ "$(jq -r '.installed[] | select(.name == "demo") | .source.sha' "$PC_CODEX_INSTALLED")" = \
+        "$pc_codex_head" ] || fail "sync returned before the plugin was reinstalled"
       ! grep -q FORBIDDEN "$PC_CODEX_LOG" ||
         fail "Roundhouse drove a Codex upgrade or install: $(tr '\n' ';' <"$PC_CODEX_LOG")"
     )
@@ -243,7 +288,8 @@ SH
     : >"$pc/actions"
     fleet_run_marketplace_repair_reset
     pc_out=$(CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog.json" CLAUDE_PLUGIN_ACTION_LOG="$pc/actions" \
-      fleet_plugins_claude_update_unowned "$pc_defs" m "$pc/owned")
+      fleet_plugins_claude_update_unowned "$pc_defs" m "$pc/owned") ||
+      fail "a marketplace whose unowned plugins all converged did not report converged: $pc_out"
     [ "$(cat "$pc/actions")" = 'update gadget@m' ] ||
       fail "the unowned update touched a fleet item or a current plugin: $(tr '\n' ';' <"$pc/actions")"
     case $pc_out in
@@ -257,12 +303,33 @@ SH
     jq --arg a "$pc_sha_a" '.plugins["gadget@m"][0].gitCommitSha = $a' \
       "$HOME/.claude/plugins/installed_plugins.json" >"$pc/installed.next"
     mv "$pc/installed.next" "$HOME/.claude/plugins/installed_plugins.json"
+    pc_status=0
     pc_out=$(CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog.json" CLAUDE_INSTALL_SKIP_RECORD=1 \
-      fleet_plugins_claude_update_unowned "$pc_defs" m "$pc/owned")
+      fleet_plugins_claude_update_unowned "$pc_defs" m "$pc/owned") || pc_status=$?
+    [ "$pc_status" -ne 0 ] ||
+      fail "an unowned update that did not converge reported the marketplace converged"
     case $pc_out in
       *'hold  plugin gadget@m — claude plugin update did not reach the catalog identity'*) ;;
       *) fail "a no-op update read as done: $pc_out" ;;
     esac
+    # The pass remembers a Claude marketplace's head only once every update
+    # from it converged: a failed one leaves it unremembered, so the next
+    # fast pass retries instead of waiting for another upstream commit.
+    pc_claude_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    rm -f "$(fleet_plugins_memo_path claude m attempted)"
+    pc_moved="claude${us}m${us}$pc_claude_head$us"
+    (
+      fleet_plugins_probed=true fleet_plugins_moved="$pc_moved
+"
+      CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog.json" CLAUDE_INSTALL_SKIP_RECORD=1 \
+        fleet_plugins_refresh "$pc/store" vireo '{}' '{}' fast "$pc" >/dev/null
+      [ -z "$(fleet_plugins_memo_read claude m attempted)" ] ||
+        fail "a marketplace whose unowned update failed was remembered as caught up"
+      CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog.json" \
+        fleet_plugins_refresh "$pc/store" vireo '{}' '{}' fast "$pc" >/dev/null
+      [ "$(fleet_plugins_memo_read claude m attempted)" = "$pc_claude_head" ] ||
+        fail "a marketplace whose unowned updates all converged was not remembered"
+    )
 
     # --- the fleet's own plugins: source-verified approval of Codex's copy ---
     # The item loop updates Claude's copy; automatic approval reads Codex's.
@@ -288,6 +355,15 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
       initialize) jq -cn --argjson id "$id" '{id:$id,result:{}}' ;;
       hooks/list)
         cwd=$(printf '%s\n' "$req" | jq -r '.params.cwds[0]')
+        # PC advance-at: Codex reinstalls the copy at `newer` on the Nth
+        # listing, as its background sync can at any moment.
+        lists=$(( $(cat "$st/lists" 2>/dev/null || echo 0) + 1 ))
+        printf '%s\n' "$lists" >"$st/lists"
+        if [ "$lists" = "$(cat "$st/advance-at" 2>/dev/null)" ]; then
+          printf '%s\n' newer >"$st/version"
+          printf 'codex-advance\n' >>"$st/log"
+        fi
+        ver=$(cat "$st/version")
         current="sha256:$ver"
         trusted=$(cat "$st/trusted" 2>/dev/null || :)
         status=untrusted
@@ -332,7 +408,8 @@ SH
       printf '%s\n' '{"source":"git","url":"https://example.invalid/widget.git"}' \
         >"$pc/hooks-state/source"
       printf '%s\n' '{"marketplaces":[]}' >"$pc/hooks-state/markets"
-      rm -f "$pc/hooks-state/pending"
+      rm -f "$pc/hooks-state/pending" "$pc/hooks-state/lists" "$pc/hooks-state/advance-at"
+      printf '%s\n' cccccccccccccccccccccccccccccccccccccccc >"$pc/hooks-state/sha-newer"
       : >"$pc/hooks-state/log"
       jq -n --arg a "$pc_sha_a" '{version: 2, plugins: {"widget@m":
         [{scope: "user", version: "1.0.0", gitCommitSha: $a}]}}' \
@@ -398,6 +475,21 @@ SH
     [ "$pc_status" -eq 0 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:new ] &&
       ! grep -q codex-add "$pc/hooks-state/log" ||
       fail "a byte-verified advanced copy's changed hook was not carried to its new hash (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    # ...and the trust written is tied to the bytes verified: Codex
+    # reinstalling the copy between the verification and the write (here,
+    # on the helper's re-listing inside its one session) refuses with 75 and
+    # writes nothing — revision B is never trusted on revision A's proof.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    printf '%s\n' 2 >"$pc/hooks-state/advance-at"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+      ! grep -q '^trust' "$pc/hooks-state/log" ||
+      fail "trust was written after Codex advanced the copy under the check (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
+    grep -q 'changed under the trust check' "$pc/hooks-err" ||
+      fail "the refusal did not say the hooks changed under the check: $(tr '\n' ';' <"$pc/hooks-err")"
     # ...a ONE-BYTE local edit in Codex's tree is not the verified bytes.
     pc_hooks_reset
     fleet_run_marketplace_repair_reset

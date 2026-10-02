@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -9,8 +10,47 @@ const TIMEOUT_MS = 15_000;
 const PLUGIN_ID = /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/;
 const CODEX_EXECUTABLE_FLAG = "--codex-executable";
 
-function fail(message) {
-  throw new Error(`codex-plugin-hooks: ${message}`);
+function fail(message, exitCode = 1) {
+  const error = new Error(`codex-plugin-hooks: ${message}`);
+  error.exitCode = exitCode;
+  throw error;
+}
+
+function treeEntries(root) {
+  // Every regular file (bytes and owner-execute bit) and symlink (target, not
+  // followed) under ROOT, by relative path — the same tree, with the same
+  // exclusions, that apply-claude.sh's fleet_run_tree_digest hashes: any
+  // `.git` is pruned, and Claude's `.in_use` / `.orphaned_at` markers at the
+  // root are not plugin content. Throws when the tree cannot be read.
+  const entries = new Map();
+  const walk = (dir, rel) => {
+    for (const name of readdirSync(dir)) {
+      if (name === ".git") continue;
+      const relPath = rel ? `${rel}/${name}` : name;
+      if (!rel && (name === ".in_use" || name === ".orphaned_at")) continue;
+      const full = join(dir, name);
+      const stat = lstatSync(full);
+      if (stat.isSymbolicLink()) entries.set(relPath, `link ${readlinkSync(full)}`);
+      else if (stat.isDirectory()) walk(full, relPath);
+      else if (stat.isFile()) {
+        const digest = createHash("sha256").update(readFileSync(full)).digest("hex");
+        entries.set(relPath, `file ${stat.mode & 0o100 ? "x" : "-"} ${digest}`);
+      }
+    }
+  };
+  walk(root, "");
+  if (!entries.size) throw new Error(`empty tree: ${root}`);
+  return entries;
+}
+
+function treesIdentical(left, right) {
+  try {
+    const a = treeEntries(left);
+    const b = treeEntries(right);
+    return a.size === b.size && [...a].every(([path, value]) => b.get(path) === value);
+  } catch {
+    return false;
+  }
 }
 
 function spawnCodex(codexExecutable, args, options) {
@@ -280,18 +320,104 @@ function marketplaceRevision(root) {
   }
 }
 
+function codexJson(codexExecutable, args) {
+  // A CLI listing (`codex plugin list`, `codex plugin marketplace list`):
+  // neither starts an app server, so neither runs Codex's sync.
+  return new Promise((resolve, reject) => {
+    const child = spawnCodex(codexExecutable, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    let out = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+      if (out.length > 4 * 1024 * 1024) terminateCodexChild(child);
+    });
+    const timer = setTimeout(() => {
+      terminateCodexChild(child);
+      reject(new Error(`codex ${args.join(" ")} timed out`));
+    }, TIMEOUT_MS);
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(`codex ${args.join(" ")} failed (${code ?? "signal"})`));
+      try {
+        resolve(JSON.parse(out));
+      } catch {
+        reject(new Error(`codex ${args.join(" ")} returned invalid JSON`));
+      }
+    });
+  });
+}
+
+function catalogPluginsCurrent(root, marketplaceName, installed) {
+  // Every ENABLED installed plugin from this marketplace is at the identity
+  // the catalog at ROOT names for it: a pinned entry's `source.sha`, or an
+  // in-repo entry's own `.codex-plugin/plugin.json` version. An unpinned
+  // remote entry names no identity to wait for, and is not waited on.
+  let catalog;
+  try {
+    catalog = JSON.parse(readFileSync(join(root, ".agents", "plugins", "marketplace.json"), "utf8"));
+  } catch {
+    return false;
+  }
+  const entries = new Map((Array.isArray(catalog?.plugins) ? catalog.plugins : []).map((entry) => [entry?.name, entry]));
+  for (const record of installed) {
+    if (record?.marketplaceName !== marketplaceName || record?.installed === false || record?.enabled !== true) continue;
+    const entry = entries.get(record.name);
+    if (!entry) continue;
+    const source = entry.source;
+    if (source && typeof source === "object" && typeof source.sha === "string") {
+      if (record.source?.sha !== source.sha) return false;
+      continue;
+    }
+    const relative = typeof source === "string" ? source : source?.source === "local" ? source.path : null;
+    if (typeof relative !== "string") continue;
+    try {
+      const manifest = JSON.parse(readFileSync(join(root, relative, ".codex-plugin", "plugin.json"), "utf8"));
+      if (record.version !== manifest?.version) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 async function syncMarketplaces(targets, waitMs, codexExecutable) {
   // Codex syncs its Git marketplaces — and reinstalls the plugins installed
   // from them — in the background when an app server starts, and announces
-  // nothing when it is done. Hold one open until every target root records
-  // its expected revision, or the deadline passes. Read-only on our side:
-  // no request here changes anything.
+  // nothing when it is done. It records the marketplace revision BEFORE it
+  // reinstalls, so a root at its revision is not yet done: hold the server
+  // open until each root records its revision AND every enabled plugin
+  // installed from it is at that revision's catalog identity, or the
+  // deadline passes. Read-only on our side: no request here changes anything.
+  let names = new Map();
+  try {
+    const listed = await codexJson(codexExecutable, ["plugin", "marketplace", "list", "--json"]);
+    const markets = Array.isArray(listed) ? listed : listed?.marketplaces ?? [];
+    names = new Map(markets.map((market) => [market?.root, market?.name]));
+  } catch {
+    // An unreadable listing names no marketplace: every target stays missing.
+  }
   return withAppServer(async () => {
     const deadline = Date.now() + waitMs;
     for (;;) {
-      const missing = targets.filter(([root, revision]) => marketplaceRevision(root) !== revision);
-      if (!missing.length || Date.now() >= deadline) return missing.map(([root]) => root);
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      let installed = null;
+      const missing = [];
+      for (const [root, revision] of targets) {
+        if (marketplaceRevision(root) !== revision || !names.get(root)) {
+          missing.push(root);
+          continue;
+        }
+        if (installed === null) {
+          try {
+            installed = (await codexJson(codexExecutable, ["plugin", "list", "--json"]))?.installed;
+          } catch {
+            installed = undefined;
+          }
+        }
+        if (!Array.isArray(installed) || !catalogPluginsCurrent(root, names.get(root), installed)) missing.push(root);
+      }
+      if (!missing.length || Date.now() >= deadline) return missing;
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }, codexExecutable);
 }
@@ -384,25 +510,66 @@ async function main() {
     fail("usage: codex-plugin-hooks.mjs approve|update PLUGIN@MARKETPLACE");
   }
   const cwd = process.cwd();
+  if (command === "approve" && process.env.ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL === "1") {
+    // Automatic approval CARRIES EXISTING TRUST; it never grants new trust,
+    // and it writes only hashes it verified. A hook never trusted before is
+    // refused, always. A `modified` hook (trusted once, its bytes since
+    // changed) is carried to its new hash only for the identity the caller
+    // verified: ROUNDHOUSE_VERIFIED_SHA, and the Codex copy byte-identical to
+    // ROUNDHOUSE_VERIFIED_TREE. Everything is decided in ONE app server
+    // session, immediately before the write: the record's SHA, the two
+    // trees, and a re-listing whose every hash must equal the snapshot's —
+    // Codex may advance the copy at any moment, and the write records the
+    // snapshot's hashes, never whatever is current. Any mismatch is 75 with
+    // nothing written.
+    const outcome = await withAppServer(async (server) => {
+      const listNow = async () =>
+        matchingPluginHooks(validateHooks(await server.request("hooks/list", { cwds: [cwd] }), cwd, pluginId), pluginId);
+      const hooks = await listNow();
+      if (hooks.some((hook) => hook.trustStatus === "untrusted")) {
+        fail(`automatic approval refuses a hook that was never trusted: ${pluginId}`, 75);
+      }
+      if (hooks.some((hook) => hook.trustStatus === "modified")) {
+        const sha = process.env.ROUNDHOUSE_VERIFIED_SHA;
+        const verifiedTree = process.env.ROUNDHOUSE_VERIFIED_TREE;
+        const codexTree = process.env.ROUNDHOUSE_CODEX_TREE;
+        if (!sha || !verifiedTree || !codexTree) {
+          fail(`automatic approval refuses a locally modified hook: ${pluginId}`, 75);
+        }
+        const record = await installedRecord(pluginId, codexExecutable);
+        if (!record || JSON.parse(record).sha !== sha) {
+          fail(`automatic approval refuses: ${pluginId} is no longer at the verified ${sha}`, 75);
+        }
+        if (!treesIdentical(codexTree, verifiedTree)) {
+          fail(`automatic approval refuses: ${pluginId}'s Codex copy is not byte-identical to the verified tree`, 75);
+        }
+      }
+      if (!hooks.length) return { hooks };
+      const again = await listNow();
+      const snapshot = new Map(hooks.map((hook) => [hook.key, hook.currentHash]));
+      if (again.length !== hooks.length || again.some((hook) => snapshot.get(hook.key) !== hook.currentHash)) {
+        fail(`automatic approval refuses: ${pluginId}'s hooks changed under the trust check`, 75);
+      }
+      await server.request("config/batchWrite", {
+        edits: hooks.map((hook) => ({ keyPath: hookKeyPath(hook.key), value: hook.currentHash, mergeStrategy: "replace" })),
+        filePath: null,
+        expectedVersion: null,
+        reloadUserConfig: true,
+      });
+      return { hooks };
+    }, codexExecutable);
+    if (!outcome.hooks.length) {
+      if (!(await pluginInstalled(pluginId, codexExecutable))) fail(`plugin not installed: ${pluginId}`);
+      process.stdout.write(`${JSON.stringify({ pluginId, approved: 0 })}\n`);
+      return;
+    }
+    const keys = outcome.hooks.map((hook) => hook.key);
+    await verifyTrust(pluginId, cwd, keys, false, true, codexExecutable);
+    process.stdout.write(`${JSON.stringify({ pluginId, approved: keys.length })}\n`);
+    return;
+  }
   if (command === "approve") {
     const hooks = await listHooks(pluginId, cwd, codexExecutable);
-    if (process.env.ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL === "1") {
-      // Automatic approval CARRIES EXISTING TRUST; it never grants new trust.
-      // A hook never trusted before is refused, always. A `modified` hook —
-      // trusted once, its bytes since changed — is carried to its new hash
-      // only when the caller proved the installed bytes are the verified
-      // upstream ones (ROUNDHOUSE_AUTOMATIC_HOOK_BYTES_VERIFIED=1: same source,
-      // same SHA, a byte-identical tree); a local edit is refused.
-      if (hooks.some((hook) => hook.trustStatus === "untrusted")) {
-        fail(`automatic approval refuses a hook that was never trusted: ${pluginId}`);
-      }
-      if (
-        hooks.some((hook) => hook.trustStatus === "modified") &&
-        process.env.ROUNDHOUSE_AUTOMATIC_HOOK_BYTES_VERIFIED !== "1"
-      ) {
-        fail(`automatic approval refuses a locally modified hook: ${pluginId}`);
-      }
-    }
     if (!hooks.length) {
       // A hookless plugin is the normal case, not an error: approve means
       // "trust whatever hooks this plugin currently ships", and zero is a
@@ -459,5 +626,5 @@ async function main() {
 
 main().catch((error) => {
   process.stderr.write(`${error.message}\n`);
-  process.exitCode = 1;
+  process.exitCode = error.exitCode ?? 1;
 });

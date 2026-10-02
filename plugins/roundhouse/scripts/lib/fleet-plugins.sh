@@ -269,13 +269,17 @@ fleet_plugins_claude_update_unowned() {
   # user-scoped Claude plugin from MARKET that is not a fleet item (OWNED,
   # fleet_plugins_owned) and whose installed bytes are not the
   # catalog's: `claude plugin update`, then the same identity proof the item
-  # path requires before it reads the update as done.
-  fleet_plugins_cu_map=$(fleet_run_installed_plugins 2>/dev/null) || return 0
+  # path requires before it reads the update as done. Exit 0 only when every
+  # one CONVERGED (current, or updated and proven); any hold, or an installed
+  # list that cannot be read, is 1, so the caller does not remember the
+  # marketplace as caught up and the next pass retries.
+  fleet_plugins_cu_map=$(fleet_run_installed_plugins 2>/dev/null) || return 1
   fleet_plugins_cu_ids=$(printf '%s\n' "$fleet_plugins_cu_map" | jq -r --arg m "$2" '
     to_entries[] | select(any((.value // [])[]?; .scope == "user")) |
     .key | select(test("^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$")) |
-    select(split("@")[1] == $m)' 2>/dev/null) || return 0
+    select(split("@")[1] == $m)' 2>/dev/null) || return 1
   fleet_plugins_cu_ids=$(printf '%s\n' "$fleet_plugins_cu_ids" | fleet_plugins_order)
+  fleet_plugins_cu_converged=0
   # Read on fd 9: the body runs `claude`, and a greedy child must not eat
   # the rest of the list.
   while IFS= read -r fleet_plugins_cu_id <&9; do
@@ -293,6 +297,7 @@ fleet_plugins_claude_update_unowned() {
       *)
         printf '  hold  plugin %s — installed marketplace identity unavailable (%s)\n' \
           "$fleet_plugins_cu_id" "${fleet_run_identity_reason:-unproven}"
+        fleet_plugins_cu_converged=1
         continue
         ;;
     esac
@@ -309,10 +314,12 @@ fleet_plugins_claude_update_unowned() {
     else
       printf '  hold  plugin %s — claude plugin update did not reach the catalog identity\n' \
         "$fleet_plugins_cu_id"
+      fleet_plugins_cu_converged=1
     fi
   done 9<<EOF
 $fleet_plugins_cu_ids
 EOF
+  return "$fleet_plugins_cu_converged"
 }
 
 fleet_plugins_order() {
@@ -343,13 +350,24 @@ fleet_plugins_codex_sync() {
     fleet_plugins_cs_args+=("$fleet_plugins_cs_root" "$fleet_plugins_cs_head")
   done <"$1"
   [ "${#fleet_plugins_cs_args[@]}" -gt 0 ] || return 0
-  run_bounded 45 "$fleet_plugins_cs_node" "$script_dir/codex-plugin-hooks.mjs" sync \
-    "${fleet_plugins_cs_args[@]}" >/dev/null 2>&1 </dev/null || :
+  # The helper reports which roots it saw reach their revision WITH their
+  # installed plugins reinstalled at it (Codex records the revision first).
+  # A root counts only when the helper says so: a marker an earlier, cut-off
+  # sync left at the head proves nothing about the plugins.
+  fleet_plugins_cs_out=$(run_bounded 45 "$fleet_plugins_cs_node" \
+    "$script_dir/codex-plugin-hooks.mjs" sync "${fleet_plugins_cs_args[@]}" 2>/dev/null </dev/null) || :
+  fleet_plugins_cs_missing='*unknown*'
+  [ -z "$fleet_plugins_cs_out" ] ||
+    fleet_plugins_cs_missing=$(printf '%s\n' "$fleet_plugins_cs_out" |
+      jq -r '.missing | if type == "array" then .[] else error("shape") end' 2>/dev/null) ||
+    fleet_plugins_cs_missing='*unknown*'
   while IFS=$fleet_run_sep read -r fleet_plugins_cs_m fleet_plugins_cs_head \
     fleet_plugins_cs_root; do
     fleet_upstream_id_valid "$fleet_plugins_cs_m" && [ -n "$fleet_plugins_cs_head" ] || continue
-    if [ "$(fleet_plugins_codex_revision "$fleet_plugins_cs_root" 2>/dev/null)" = \
-      "$fleet_plugins_cs_head" ]; then
+    if [ "$fleet_plugins_cs_missing" != '*unknown*' ] &&
+      ! printf '%s\n' "$fleet_plugins_cs_missing" | grep -Fqx -- "$fleet_plugins_cs_root" &&
+      [ "$(fleet_plugins_codex_revision "$fleet_plugins_cs_root" 2>/dev/null)" = \
+        "$fleet_plugins_cs_head" ]; then
       fleet_plugins_memo_write codex "$fleet_plugins_cs_m" attempted "$fleet_plugins_cs_head" || :
     else
       printf '  hold  marketplace %s (codex) — Codex did not sync it to %s this pass\n' \
@@ -423,9 +441,12 @@ fleet_plugins_refresh() (
           fleet_plugins_r_head=$(fleet_run_marketplace_commit "$fleet_plugins_r_loc") ||
           fleet_plugins_r_head=
       fi
-      fleet_plugins_memo_write claude "$fleet_plugins_r_m" attempted "$fleet_plugins_r_head" || :
+      # Remember the head only once every plugin from it converged: a failed
+      # or unproven update leaves the marketplace unremembered, and the next
+      # fast pass retries it.
       fleet_plugins_claude_update_unowned "$fleet_plugins_r_defs" "$fleet_plugins_r_m" \
-        "$fleet_plugins_r_tmp/owned" || :
+        "$fleet_plugins_r_tmp/owned" || continue
+      fleet_plugins_memo_write claude "$fleet_plugins_r_m" attempted "$fleet_plugins_r_head" || :
     done 9<"$fleet_plugins_r_tmp/claude"
   fi
 

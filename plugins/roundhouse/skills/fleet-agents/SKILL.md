@@ -194,8 +194,10 @@ the full pass, is handled BEFORE the item loop:
   them, whatever anyone holds. Roundhouse never upgrades or reinstalls a
   Codex plugin. On a host where Codex may never run, it only TRIGGERS that
   sync (`codex-plugin-hooks.mjs sync`, an app server held open until each
-  moved marketplace records the probed head, at most 30s) and remembers the
-  head only once Codex reached it. Per-plugin holds were never enforceable on
+  moved marketplace records the probed head and its enabled installed plugins
+  are reinstalled at that revision's catalog identity, at most 30s) and
+  remembers the head only once Codex reached both. A Claude marketplace's
+  head is remembered only once every update from it converged. Per-plugin holds were never enforceable on
   the Codex side and are not attempted.
 - **Hook trust:** after Claude installs or updates an enabled fleet plugin
   that Codex also has installed and enabled, the item loop verifies that
@@ -880,8 +882,9 @@ codex plugin list --json
 
 where each `ROOT` is a Git marketplace's root from the listing and `REVISION`
 its upstream head (`git ls-remote`). The helper holds a Codex app server open
-until each root records its revision (30s at most) and exits 75 for any it
-did not reach.
+until each root records its revision and every enabled plugin installed from
+it is at that revision's catalog identity (30s at most; Codex records the
+revision before it reinstalls), and exits 75 for any it did not reach.
 
 Hook trust then follows two rules:
 
