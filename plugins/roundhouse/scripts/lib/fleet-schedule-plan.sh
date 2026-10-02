@@ -570,6 +570,19 @@ fleet_schedule_command() (
       # sealed uninstall that fails takes it back, so either both change or
       # neither does — never a removed scheduler without the opt-out it
       # promised, nor an opt-out beside jobs that are still installed.
+      # A systemd user manager this session cannot reach still enables a timer
+      # through its timers.target.wants link, which only that manager can
+      # disable; removing the units would orphan the link. Refuse first.
+      for uninstall_mode in $fleet_schedule_modes; do
+        fleet_schedule_facts_read "$(fleet_schedule_facts "$uninstall_mode")"
+        [ "$sf_reachable" = 1 ] || [ "$sf_wants" != 1 ] || {
+          printf 'roundhouse: the %s timer is still enabled but the systemd user manager is not reachable from this session; run uninstall from a login session (or with lingering on). Nothing was changed.\n' \
+            "$uninstall_mode" >&2
+          exit 75
+        }
+      done
+      uninstall_optout_was=false
+      [ ! -e "$(fleet_schedule_optout_path)" ] || uninstall_optout_was=true
       { mkdir -p "$(dirname "$(fleet_schedule_optout_path)")" &&
         printf 'uninstalled_at: %s\n' "$(fleet_now)" >"$(fleet_schedule_optout_path)"; } || {
         printf 'roundhouse: could not record the schedule opt-out (%s); nothing was changed\n' \
@@ -578,7 +591,8 @@ fleet_schedule_command() (
       }
       errexit_capture uninstall_status fleet_schedule_sealed uninstall
       [ "$uninstall_status" -eq 0 ] || {
-        rm -f "$(fleet_schedule_optout_path)"
+        # Take back only the opt-out THIS run wrote; an earlier one stands.
+        [ "$uninstall_optout_was" = true ] || rm -f "$(fleet_schedule_optout_path)"
         exit "$uninstall_status"
       }
       rm -f "$(fleet_schedule_marker)"
@@ -608,6 +622,11 @@ fleet_schedule_command() (
           printf 'platform: %s\ninstalled_at: %s\n' "$(fleet_schedule_platform)" \
             "$(fleet_now)" >"$(fleet_schedule_marker)"
           rm -f "$(fleet_schedule_optout_path)"
+          # Remember what the verified install left, so a later trigger with
+          # no GUI domain to ask (over SSH) still knows the job is loaded.
+          for install_mode in $fleet_schedule_modes; do
+            fleet_schedule_job_state "$install_mode" >/dev/null || :
+          done
           ;;
       esac
       exit "$install_status"
