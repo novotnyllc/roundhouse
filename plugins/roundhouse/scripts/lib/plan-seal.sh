@@ -197,7 +197,7 @@ seal_plan_command() {
       if .domain == "updates" then
         [.operations[] |
           .type == "package-upgrade" and .kind == "package" and
-          ((.id | startswith("winget:")) or (.id | startswith("npm:")))
+          ((.id | startswith("winget:")) or (.id | startswith("npm:")) or .id == "fnm:node")
         ] | all
       elif .domain == "agents" then
         [.operations[] | .type == "agent-update"] | all
@@ -213,10 +213,24 @@ seal_plan_command() {
     }
   fi
   if [ "$platform" = windows ]; then
-    # Node on Windows is winget's OpenJS.NodeJS MSI, installed machine-wide:
-    # its upgrade needs elevation (UAC), which the ordinary lane never
-    # attempts. Only a user-scope install observed as such may upgrade here;
-    # a machine-scope one goes through the protected
+    # Once fnm has a default on the host it is the Node runtime source, and
+    # the winget MSI it shadows is unmanaged: never an upgrade, whatever its
+    # scope. `runtimes.node` converges through `fnm:node` instead.
+    jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
+      all($draft[0].operations[];
+        if .type == "package-upgrade" and .id == "winget:OpenJS.NodeJS" then
+          . as $operation |
+          any($records[]; .kind == "package" and .id == $operation.id and
+            (.data.shadowed_by // null) == "fnm:node") | not
+        else true end)
+    ' >/dev/null || {
+      printf 'roundhouse: hold: Node.js (winget OpenJS.NodeJS) is shadowed by fnm, this host'"'"'s Node runtime source; the MSI is unmanaged and never upgraded (the fnm:node switch carries runtimes.node)\n' >&2
+      exit 69
+    }
+    # Without fnm, Node on Windows is winget's OpenJS.NodeJS MSI, installed
+    # machine-wide: its upgrade needs elevation (UAC), which the ordinary lane
+    # never attempts. Only a user-scope install observed as such may upgrade
+    # here; a machine-scope one goes through the protected
     # winget.upgrade-machine-package.v1 action when readiness advertises it,
     # and is otherwise a hold. Unknown scope is machine scope.
     jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '

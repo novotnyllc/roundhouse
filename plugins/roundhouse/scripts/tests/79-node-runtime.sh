@@ -938,7 +938,7 @@ printf '%s\n' 'packages:' \
   '  plain: {npm: plain}' '  brewonly: {homebrew: brewonly}' >"$nrt_store/definitions.yaml"
 [ -z "$fleet_fixture_yq" ] || ln -sfn "$fleet_fixture_yq" "$nrt_bin/yq"
 # Configuration: hooks are argv lists; the worker projection carries them to
-# POSIX targets only.
+# every target (fnm is the runtime source on native Windows too).
 for nrt_bad_config in \
   '.node_switch_hooks = {"npm:@example/svc":["svc","service"]}' \
   '.node_switch_hooks = {"npm:@example/svc":[["svc; rm"]]}' \
@@ -955,8 +955,8 @@ nrt_cli worker-config test-host updates "$tmp/node-worker-config.json"
 [ "$(jq -c '.node_switch_hooks["npm:@example/svc"]' "$tmp/node-worker-config.json")" = '[["svc","service"]]' ] ||
   fail "the bounded worker configuration dropped the post-switch hooks"
 nrt_cli worker-config test-windows updates "$tmp/node-windows-worker-config.json"
-[ "$(jq -c '.node_switch_hooks' "$tmp/node-windows-worker-config.json")" = '{}' ] ||
-  fail "post-switch hooks were projected to a Windows target"
+[ "$(jq -c '.node_switch_hooks' "$tmp/node-windows-worker-config.json")" = '{"npm:@example/svc":[["svc","service"]]}' ] ||
+  fail "the bounded worker configuration dropped the post-switch hooks for a Windows target"
 
 if [ -z "$fleet_fixture_yq" ]; then
   printf 'NOTICE: the sealed Node switch reads store definitions and needs yq; skipped\n'
@@ -1230,7 +1230,7 @@ else
   )
 fi
 
-# --- Windows: machine-scope Node holds instead of prompting UAC ---------------
+# --- Windows without fnm: machine-scope Node holds instead of prompting UAC ---
 if [ -n "$pwsh_command" ]; then
   mkdir -p "$nrt_root/winget-bin"
   cat >"$nrt_root/winget-bin/winget" <<'SH'
@@ -1257,8 +1257,8 @@ SH
     -Sections packages >"$tmp/node-windows.jsonl"
   "$cli" validate "$tmp/node-windows.jsonl"
   [ "$(jq -c 'select(.kind == "package" and .id == "winget:OpenJS.NodeJS") | .data |
-    [.installed_version,.line,.pin,.pin_query,.install_scope]' "$tmp/node-windows.jsonl")" = \
-    '["26.7.0","26",{"type":"Gating","version":"26.*"},"ok",null]' ] ||
+    [.installed_version,.line,.pin,.pin_query,.install_scope,.shadowed_by,.managed]' "$tmp/node-windows.jsonl")" = \
+    '["26.7.0","26",{"type":"Gating","version":"26.*"},"ok",null,null,true]' ] ||
     fail "the Windows collector did not report the Node runtime pin and scope"
   jq -c 'if .kind == "package" and .id == "winget:OpenJS.NodeJS" then
     .data.candidate_version = "26.8.0" | .data.update_available = true else . end' \
@@ -1275,4 +1275,75 @@ SH
   "$cli" seal-plan "$tmp/node-windows-draft.json" "$tmp/node-windows-user.jsonl" \
     "$tmp/node-windows-user-plan.json" >/dev/null ||
     fail "a user-scope Windows Node upgrade did not seal on the ordinary lane"
+fi
+
+# --- Windows with fnm: the runtime source, the MSI shadowed -------------------
+# The native collector finds fnm's default alias (the fixture tree, in the
+# POSIX layout pwsh uses off Windows), reports `fnm:node` in the POSIX shape
+# with the npm records under the fnm default, and marks the MSI shadowed and
+# unmanaged; sealing then takes the fnm:node switch for a Windows target and
+# refuses an MSI upgrade outright.
+if [ -n "$pwsh_command" ] && [ -n "$fleet_fixture_yq" ]; then
+  nrt_reset
+  jq '.machines["test-windows"].package_managers = ["winget","npm"]' "$tmp/node-config.json" \
+    >"$tmp/node-windows-fnm-config.json"
+  chmod 600 "$tmp/node-windows-fnm-config.json"
+  ROUNDHOUSE_CONFIG="$tmp/node-windows-fnm-config.json" "$cli" worker-config test-windows inventory \
+    "$tmp/node-windows-fnm-inventory.json"
+  nrt_env HOME="$tmp/home" PATH="$nrt_root/winget-bin:$nrt_bin:$PATH" "$pwsh_command" -NoLogo -NoProfile \
+    -File "$script_dir/collect-windows.ps1" -ConfigPath "$tmp/node-windows-fnm-inventory.json" \
+    -HostId test-windows \
+    -ControllerConfigDigest "$(shasum -a 256 "$tmp/node-windows-fnm-config.json" | awk '{print $1}')" \
+    -Sections packages >"$tmp/node-windows-fnm.jsonl"
+  "$cli" validate "$tmp/node-windows-fnm.jsonl"
+  [ "$(jq -c --arg root "$nrt_fnm" 'select(.kind == "package" and .id == "fnm:node") | .data |
+    [.manager,.installed_version,.candidate_version,.update_available,.line,.installed_versions,
+     .stale_versions,(.fnm_dir == $root),(.prefix == ($root + "/node-versions/v26.0.0/installation")),
+     .globals,.globals_unpinnable,.switch_inflight,.switch_hooks_unproven]' "$tmp/node-windows-fnm.jsonl")" = \
+    '["fnm","v26.0.0","v26.10.0",true,"26",["v26.0.0"],[],true,true,{"@example/svc":"1.0.0","npm":"11.0.0","plain":"2.0.0","unmanaged":"0.1.0"},[],null,[]]' ] ||
+    fail "the Windows collector did not report fnm:node in the POSIX record shape"
+  [ "$(jq -r 'select(.kind == "package" and .id == "npm:plain") | .data.node_version' \
+    "$tmp/node-windows-fnm.jsonl")" = v26.0.0 ] ||
+    fail "the Windows npm records were not taken from the fnm default"
+  [ "$(jq -c 'select(.kind == "package" and .id == "winget:OpenJS.NodeJS") | .data |
+    [.shadowed_by,.managed,.update_available]' "$tmp/node-windows-fnm.jsonl")" = '["fnm:node",false,false]' ] ||
+    fail "the Windows collector did not record the MSI Node as shadowed and unmanaged"
+  # fnm is the source whatever the managers list says: without `npm` there is
+  # no fnm:node record (it carries the npm globals), but the MSI is shadowed.
+  nrt_env HOME="$tmp/home" PATH="$nrt_root/winget-bin:$nrt_bin:$PATH" "$pwsh_command" -NoLogo -NoProfile \
+    -File "$script_dir/collect-windows.ps1" -ConfigPath "$tmp/node-windows-inventory.json" \
+    -HostId test-windows \
+    -ControllerConfigDigest "$(shasum -a 256 "$tmp/config.json" | awk '{print $1}')" \
+    -Sections packages >"$tmp/node-windows-fnm-nonpm.jsonl"
+  [ "$(jq -s -c '[(map(select(.id == "fnm:node")) | length),
+    (.[] | select(.id == "winget:OpenJS.NodeJS") | .data.shadowed_by)]' "$tmp/node-windows-fnm-nonpm.jsonl")" = \
+    '[0,"fnm:node"]' ] ||
+    fail "the Windows collector did not shadow the MSI on an fnm host that lists no npm"
+  # The MSI is never an upgrade once fnm is the source, even user-scoped
+  # and even with a candidate forced into the snapshot.
+  jq -c 'if .kind == "package" and .id == "winget:OpenJS.NodeJS" then
+    .data.candidate_version = "26.8.0" | .data.update_available = true | .data.install_scope = "user" else . end' \
+    "$tmp/node-windows-fnm.jsonl" >"$tmp/node-windows-fnm-msi.jsonl"
+  if nrt_env ROUNDHOUSE_CONFIG="$tmp/node-windows-fnm-config.json" "$cli" seal-plan \
+    "$tmp/node-windows-draft.json" "$tmp/node-windows-fnm-msi.jsonl" "$tmp/node-windows-fnm-msi-plan.json" \
+    >"$tmp/node-windows-fnm-msi.log" 2>&1; then
+    fail "an MSI Node upgrade sealed although fnm shadows it"
+  fi
+  assert_contains "$(cat "$tmp/node-windows-fnm-msi.log")" 'hold: Node.js (winget OpenJS.NodeJS) is shadowed by fnm'
+  # The switch seals for a Windows target on the carry rule, with the hooks
+  # this host's configuration declares; a hook mismatch is still refused.
+  jq -n --argjson required "$nrt_required" --argjson hooks "$nrt_hooks" \
+    --argjson carry '[{"name":"@example/svc","version":"1.0.0"},{"name":"plain","version":"2.0.0"},{"name":"unmanaged","version":"0.1.0"}]' \
+    '{domain:"updates",target:"test-windows",operations:[{type:"package-upgrade",kind:"package",id:"fnm:node",
+      candidate_version:"v26.10.0",argv:["fnm","default","v26.10.0"],carry:$carry,hooks:$hooks,required:$required}]}' \
+    >"$tmp/node-windows-fnm-draft.json"
+  nrt_env ROUNDHOUSE_CONFIG="$tmp/node-windows-fnm-config.json" "$cli" seal-plan \
+    "$tmp/node-windows-fnm-draft.json" "$tmp/node-windows-fnm.jsonl" "$tmp/node-windows-fnm-plan.json" ||
+    fail "a Windows fnm:node switch did not seal"
+  jq '.operations[0].hooks = []' "$tmp/node-windows-fnm-draft.json" >"$tmp/node-windows-fnm-nohooks.json"
+  if nrt_env ROUNDHOUSE_CONFIG="$tmp/node-windows-fnm-config.json" "$cli" seal-plan \
+    "$tmp/node-windows-fnm-nohooks.json" "$tmp/node-windows-fnm.jsonl" "$tmp/node-windows-fnm-nohooks-plan.json" \
+    >/dev/null 2>&1; then
+    fail "a Windows fnm:node switch sealed without its configured post-switch hook"
+  fi
 fi
