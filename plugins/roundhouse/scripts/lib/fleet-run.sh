@@ -2794,30 +2794,31 @@ fleet_run_command() (
   printf '%s\n' "$run_op" >"$(fleet_run_state_dir)/starting-operation"
 
   # §6.1: the pass, and its in-process re-runs while triggers land mid-pass.
-  # errexit is OFF around the loop, not `|| status=$?`: that would switch it
-  # off inside every pass too, and the loop turns it on per pass itself.
-  run_errexit=false
-  case $- in *e*) run_errexit=true ;; esac
-  set +e
-  fleet_trigger_converge fleet_run_pass
-  run_status=$?
-  [ "$run_errexit" != true ] || set -e
+  # Called plainly: each pass keeps errexit live (fleet_trigger_converge), and
+  # the worst pass status comes back in fleet_trigger_status.
+  fleet_trigger_converge fleet_run_pass "$run_tmp" "$run_mode"
+  run_status=$fleet_trigger_status
   # Released HERE rather than by the EXIT trap, so the stamp can be compared
   # once more with the lock free (fleet_trigger_handoff).
   fleet_lock_release "$run_lock" "$run_lock_nonce" || :
   trap 'rm -rf "$run_tmp"' EXIT HUP INT TERM
-  fleet_trigger_handoff "$converge_handoff_stamp"
+  fleet_trigger_handoff "$fleet_trigger_last_stamp"
   exit "$run_status"
 )
 
 fleet_run_pass() (
-  # One observe/converge pass, under fleet_run_command's lock, run by
-  # fleet_trigger_converge. PER RUN, from the caller: run_mode (fast on a
-  # re-run), run_store, run_host, run_lock and its nonce, run_op. PER PASS: a
-  # fresh run_tmp and run_ledger (the alert ledger the end-of-pass sweep
-  # reads), the marketplace repair memo (reset below), and everything this
-  # body computes. A subshell, so every `exit` below ends THIS pass and hands
-  # its status back to the loop.
+  # fleet_run_pass PASS-TMP MODE — one observe/converge pass, under
+  # fleet_run_command's lock, run by fleet_trigger_converge. Its arguments are
+  # PER PASS: a fresh scratch directory holding this pass's alert ledger (the
+  # one the end-of-pass sweep reads), and the cadence (fast on a re-run). PER
+  # RUN, from the caller: run_store, run_host, run_lock and its nonce, run_op.
+  # Everything else — the marketplace repair memo (reset below) and all this
+  # body computes — is the pass's own. A subshell, so every `exit` below ends
+  # THIS pass and hands its status back to the loop.
+  errexit_require fleet_run_pass
+  run_tmp=$1
+  run_mode=$2
+  run_ledger="$run_tmp/alert-ledger"
   # Captured BEFORE any fetch: what arrives is what §7.7 has to gate, and after
   # the fetch there is no other way to tell new from known. (The poll floor's
   # own fetch lands in a private ref and does not move main@origin.)

@@ -260,7 +260,7 @@ seal_plan_command() {
     }
   fi
   if jq -e 'any(.operations[]; .id == "roundhouse:schedule")' "$draft" >/dev/null; then
-    schedule_operations_valid "$draft" || {
+    schedule_operations_valid "$draft" "$HOME" || {
       printf 'roundhouse: invalid fleet-schedule plan operation\n' >&2
       exit 64
     }

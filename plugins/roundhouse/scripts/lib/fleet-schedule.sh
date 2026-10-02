@@ -1,32 +1,32 @@
-# roundhouse — the per-host scheduled jobs, and the stamp-and-kick trigger.
+# roundhouse — the per-host scheduled jobs: what they are made of, what state
+# they are in, and the pass's own check on them.
 #
 # §6.1 of the agent-settings loop design. Two jobs per host run the two
-# cadences, and every other wake-up (the push nudge, later the SessionStart
-# hook) is a TRIGGER:
+# cadences: a pair of LaunchAgents on macOS, a pair of systemd user
+# service+timer units on Linux and WSL. The trigger that kicks them is
+# lib/fleet-trigger.sh; `fleet-schedule install|uninstall`, which change them
+# through the sealed-plan pipeline, is lib/fleet-schedule-plan.sh.
 #
-#   1. touch the dirty stamp under store.run/;
-#   2. start the scheduled job — `launchctl kickstart` on macOS,
-#      `systemctl --user start` on Linux — or, ONLY when that job is known to
-#      be installed and enabled but its GUI domain or user manager cannot be
-#      reached (a Mac over SSH with nobody at the console, a Linux user whose
-#      manager does not linger), a detached `nohup roundhouse fleet-run`;
-#   3. return.
+# ONE observation, ONE state. Each job's raw facts — its definition files,
+# whether its scheduler can be reached, loaded/disabled (launchd) or
+# enabled/active/linger (systemd) — are read once per command
+# (fleet_schedule_facts), and its state word comes from those facts alone
+# (fleet_schedule_state_word, a pure function). The trigger, the pass check,
+# `status`, and the collector the sealed plan is built from all read the same
+# two, so they cannot disagree about a job.
 #
-# A trigger never runs a pass in its own process. A kickstart for a job that
-# is already running is a no-op, which is why the stamp exists: the running
-# pass re-runs in-process while the stamp has moved since that pass began
-# (fleet_run_command), so a trigger that lands mid-pass is never lost.
-#
-# AN OPERATOR STOP IS FINAL TO EVERYTHING BUT `install`. A job the operator
-# disabled or unloaded, a host whose jobs were uninstalled (the opt-out
-# marker), a host that never had them: the trigger stamps and starts nothing,
-# and a pass alerts (a disabled or missing job) and changes nothing. Only an explicit
-# `roundhouse fleet-schedule install` enables.
+# Platform specifics live in fleet_schedule_launchd_* and
+# fleet_schedule_systemd_*, reached through fleet_schedule_backend.
 #
 # Sourced by scripts/roundhouse; carries definitions only.
 # shellcheck shell=bash
 
 fleet_schedule_modes='fast full'
+
+# The superseded launchd entries fleet-update's absorb rule names: the old
+# autoupdate agent and the one-plist fleet agent. The ONE list; every reader
+# (the observation, the absorb plan, the executor's allowlist) derives from it.
+fleet_schedule_legacy_labels='com.novotnyllc.roundhouse.autoupdate com.novotnyllc.roundhouse.fleet'
 
 fleet_schedule_platform() {
   # launchd | systemd | windows | unsupported. WSL is Linux, and gets the
@@ -36,6 +36,16 @@ fleet_schedule_platform() {
     Linux) printf 'systemd\n' ;;
     MINGW* | MSYS* | CYGWIN* | Windows_NT) printf 'windows\n' ;;
     *) printf 'unsupported\n' ;;
+  esac
+}
+
+fleet_schedule_backend() {
+  # fleet_schedule_backend VERB [ARG...] — fleet_schedule_<platform>_VERB, the
+  # one dispatcher to the per-backend functions. 69 on a platform with none.
+  backend_platform=$(fleet_schedule_platform)
+  case $backend_platform in
+    launchd | systemd) "fleet_schedule_${backend_platform}_$1" "${@:2}" ;;
+    *) return 69 ;;
   esac
 }
 
@@ -54,26 +64,44 @@ fleet_schedule_unit_dir() {
   printf '%s/systemd/user\n' "${XDG_CONFIG_HOME:-$HOME/.config}"
 }
 
+fleet_schedule_gui_domain() {
+  printf 'gui/%s\n' "$(id -u)"
+}
+
 fleet_schedule_def_path() {
-  # fast|full -> the file whose presence means "this job is installed": the
-  # LaunchAgent plist, or the systemd timer.
-  case $(fleet_schedule_platform) in
-    launchd) printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$(fleet_schedule_label "$1")" ;;
-    systemd) printf '%s/%s.timer\n' "$(fleet_schedule_unit_dir)" "$(fleet_schedule_unit "$1")" ;;
-  esac
+  # fast|full -> the file whose presence names the job: the LaunchAgent plist,
+  # or the systemd timer.
+  fleet_schedule_backend def_path "$1"
 }
 
 fleet_schedule_def_paths() {
   # fast|full -> EVERY file the job is made of, one per line: the plist, or
   # the systemd `.service` and its `.timer`. A job missing any of them is
   # missing — a timer whose service is gone fires into nothing.
-  case $(fleet_schedule_platform) in
-    launchd) fleet_schedule_def_path "$1" ;;
-    systemd)
-      printf '%s/%s.service\n' "$(fleet_schedule_unit_dir)" "$(fleet_schedule_unit "$1")"
-      fleet_schedule_def_path "$1"
-      ;;
-  esac
+  fleet_schedule_backend def_paths "$1"
+}
+
+fleet_schedule_legacy_plists() {
+  # The superseded entries (fleet_schedule_legacy_labels) that exist, one path
+  # per line.
+  for legacy_label in $fleet_schedule_legacy_labels; do
+    [ ! -f "$HOME/Library/LaunchAgents/$legacy_label.plist" ] ||
+      printf '%s\n' "$HOME/Library/LaunchAgents/$legacy_label.plist"
+  done
+}
+
+fleet_schedule_paths_in_home() {
+  # True when every path on stdin (one per line) is strictly under $HOME. A
+  # definition is per-user state: an XDG_CONFIG_HOME pointing elsewhere must
+  # not turn `install` into a write outside the account's own tree.
+  while IFS= read -r home_path; do
+    [ -n "$home_path" ] || continue
+    case $home_path in
+      "$HOME"/?*) ;;
+      *) return 1 ;;
+    esac
+    case /$home_path/ in */../* | */./*) return 1 ;; esac
+  done
 }
 
 fleet_schedule_render() {
@@ -85,21 +113,6 @@ fleet_schedule_render() {
     *.timer) fleet_schedule_timer_render "$1" ;;
     *) return 1 ;;
   esac
-}
-
-fleet_schedule_defs_present() {
-  # True when every one of MODE's definition files exists.
-  defs_present_list=$(fleet_schedule_def_paths "$1")
-  [ -n "$defs_present_list" ] || return 1
-  while IFS= read -r defs_present_path; do
-    [ -f "$defs_present_path" ] || return 1
-  done <<EOF_DEFS
-$defs_present_list
-EOF_DEFS
-}
-
-fleet_schedule_gui_domain() {
-  printf 'gui/%s\n' "$(id -u)"
 }
 
 fleet_schedule_user_manager() {
@@ -118,6 +131,182 @@ fleet_schedule_lingers() {
     return 0
   [ "$schedule_linger" != no ]
 }
+
+# --- launchd -------------------------------------------------------------------
+
+fleet_schedule_launchd_def_path() {
+  printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$(fleet_schedule_label "$1")"
+}
+
+fleet_schedule_launchd_def_paths() {
+  fleet_schedule_launchd_def_path "$1"
+}
+
+fleet_schedule_launchd_facts() {
+  # The scheduler half of fleet_schedule_facts: the GUI domain, then — only
+  # where it answers — the job's disabled flag and whether it is loaded. Both
+  # spellings of disabled: `=> disabled` on current macOS, `=> true` older.
+  launchd_domain=$(fleet_schedule_gui_domain)
+  launchd_label=$(fleet_schedule_label "$1")
+  if ! launchctl print "$launchd_domain" >/dev/null 2>&1; then
+    printf 'reachable=0 loaded=0 disabled=0\n'
+    return 0
+  fi
+  launchd_disabled=0
+  ! launchctl print-disabled "$launchd_domain" 2>/dev/null |
+    grep -Eq "\"$launchd_label\" => (disabled|true)" || launchd_disabled=1
+  launchd_loaded=0
+  ! launchctl print "$launchd_domain/$launchd_label" >/dev/null 2>&1 || launchd_loaded=1
+  printf 'reachable=1 loaded=%s disabled=%s\n' "$launchd_loaded" "$launchd_disabled"
+}
+
+fleet_schedule_launchd_start() {
+  launchctl kickstart "$(fleet_schedule_gui_domain)/$(fleet_schedule_label "$1")"
+}
+
+# --- systemd -------------------------------------------------------------------
+
+fleet_schedule_systemd_def_path() {
+  printf '%s/%s.timer\n' "$(fleet_schedule_unit_dir)" "$(fleet_schedule_unit "$1")"
+}
+
+fleet_schedule_systemd_def_paths() {
+  printf '%s/%s.service\n' "$(fleet_schedule_unit_dir)" "$(fleet_schedule_unit "$1")"
+  fleet_schedule_systemd_def_path "$1"
+}
+
+fleet_schedule_systemd_facts() {
+  # The scheduler half of fleet_schedule_facts. With no manager to ask,
+  # `enable` is a symlink on disk (timers.target.wants), so that is read
+  # instead; lingering is logind's, and is read either way.
+  systemd_timer="$(fleet_schedule_unit "$1").timer"
+  systemd_lingers=1
+  fleet_schedule_lingers || systemd_lingers=0
+  if ! fleet_schedule_user_manager; then
+    systemd_wants=0
+    [ ! -L "$(fleet_schedule_unit_dir)/timers.target.wants/$systemd_timer" ] || systemd_wants=1
+    printf 'reachable=0 enabled=0 disabled=0 active=0 wants=%s lingers=%s\n' \
+      "$systemd_wants" "$systemd_lingers"
+    return 0
+  fi
+  systemd_enabled=0
+  systemd_disabled=0
+  case $(systemctl --user is-enabled "$systemd_timer" 2>/dev/null || :) in
+    enabled) systemd_enabled=1 ;;
+    disabled | masked | masked-runtime) systemd_disabled=1 ;;
+  esac
+  systemd_active=0
+  ! systemctl --user is-active --quiet "$systemd_timer" 2>/dev/null || systemd_active=1
+  printf 'reachable=1 enabled=%s disabled=%s active=%s wants=0 lingers=%s\n' \
+    "$systemd_enabled" "$systemd_disabled" "$systemd_active" "$systemd_lingers"
+}
+
+fleet_schedule_systemd_start() {
+  systemctl --user start --no-block "$(fleet_schedule_unit "$1").service"
+}
+
+# --- the facts, and the one state derived from them -----------------------------
+
+fleet_schedule_facts() {
+  # fleet_schedule_facts fast|full -> ONE line of `key=value` words, read-only:
+  #
+  #   platform   launchd | systemd
+  #   present    1 when EVERY definition file exists (fleet_schedule_def_paths)
+  #   reachable  the GUI domain / user manager answers
+  #   loaded disabled                      (launchd; 0 when unreachable)
+  #   enabled disabled active wants lingers (systemd)
+  #
+  # Values never carry spaces; fleet_schedule_facts_read splits them.
+  facts_platform=$(fleet_schedule_platform)
+  case $facts_platform in launchd | systemd) ;; *) return 69 ;; esac
+  facts_present=1
+  facts_paths=$(fleet_schedule_def_paths "$1")
+  while IFS= read -r facts_path; do
+    [ -n "$facts_path" ] || continue
+    [ -f "$facts_path" ] || facts_present=0
+  done <<EOF_FACTS
+$facts_paths
+EOF_FACTS
+  printf 'platform=%s present=%s %s\n' "$facts_platform" "$facts_present" \
+    "$(fleet_schedule_backend facts "$1")"
+}
+
+fleet_schedule_facts_read() {
+  # fleet_schedule_facts_read FACTS — split a facts line into sf_<key>
+  # globals (absent keys read as 0). Pure: no process, no scheduler query.
+  sf_platform= sf_present=0 sf_reachable=0 sf_loaded=0 sf_disabled=0
+  sf_enabled=0 sf_active=0 sf_wants=0 sf_lingers=1
+  for facts_word in $1; do
+    case $facts_word in
+      platform=*) sf_platform=${facts_word#*=} ;;
+      present=*) sf_present=${facts_word#*=} ;;
+      reachable=*) sf_reachable=${facts_word#*=} ;;
+      loaded=*) sf_loaded=${facts_word#*=} ;;
+      disabled=*) sf_disabled=${facts_word#*=} ;;
+      enabled=*) sf_enabled=${facts_word#*=} ;;
+      active=*) sf_active=${facts_word#*=} ;;
+      wants=*) sf_wants=${facts_word#*=} ;;
+      lingers=*) sf_lingers=${facts_word#*=} ;;
+    esac
+  done
+}
+
+fleet_schedule_state_word() {
+  # fleet_schedule_state_word FACTS -> one word, a PURE function of the facts:
+  #
+  #   missing      a job definition is not on disk (the plist; on systemd the
+  #                `.timer` OR its `.service`)
+  #   disabled     the operator disabled it
+  #   unloaded     present and not disabled, but not loaded/active
+  #   loaded       present, enabled, loaded (launchd) or active (systemd timer)
+  #   unavailable  installed, but there is no GUI domain / reachable, lingering
+  #                user manager to ask or to start it in. On systemd this means
+  #                ENABLED (the timers.target.wants link says so); on launchd
+  #                the enablement is unknown and the last observed state rules.
+  #
+  # A timer the operator STOPPED (inactive, still enabled) is unloaded whether
+  # or not the account lingers: only an ACTIVE timer without lingering is
+  # unavailable, so a trigger never runs behind a stop.
+  fleet_schedule_facts_read "$1"
+  if [ "$sf_present" != 1 ]; then
+    printf 'missing\n'
+    return 0
+  fi
+  case $sf_platform in
+    launchd)
+      if [ "$sf_reachable" != 1 ]; then printf 'unavailable\n'
+      elif [ "$sf_disabled" = 1 ]; then printf 'disabled\n'
+      elif [ "$sf_loaded" = 1 ]; then printf 'loaded\n'
+      else printf 'unloaded\n'
+      fi
+      ;;
+    systemd)
+      if [ "$sf_reachable" != 1 ]; then
+        if [ "$sf_wants" = 1 ]; then printf 'unavailable\n'; else printf 'disabled\n'; fi
+      elif [ "$sf_disabled" = 1 ]; then printf 'disabled\n'
+      elif [ "$sf_active" != 1 ]; then printf 'unloaded\n'
+      elif [ "$sf_lingers" != 1 ]; then printf 'unavailable\n'
+      else printf 'loaded\n'
+      fi
+      ;;
+    *) printf 'unavailable\n' ;;
+  esac
+}
+
+fleet_schedule_still_scheduled() {
+  # fleet_schedule_still_scheduled FACTS — true while the scheduler still
+  # holds the job: loaded (launchd), or enabled or active (systemd). What an
+  # uninstall must have ended before it may report done.
+  fleet_schedule_facts_read "$1"
+  [ "$sf_loaded" = 1 ] || [ "$sf_enabled" = 1 ] || [ "$sf_active" = 1 ]
+}
+
+fleet_schedule_probe() {
+  # fleet_schedule_probe fast|full -> the state word, read-only.
+  fleet_schedule_state_word "$(fleet_schedule_facts "$1")"
+}
+
+# --- the remembered state ------------------------------------------------------
 
 fleet_schedule_state_path() {
   # fast|full -> that job's remembered state: ONE file per job, so a fast and a
@@ -144,81 +333,17 @@ fleet_schedule_last_state() {
   head -n 1 "$(fleet_schedule_state_path "$1")" 2>/dev/null || :
 }
 
-fleet_schedule_probe() {
-  # fleet_schedule_probe fast|full -> one word, read-only:
-  #
-  #   missing      a job definition is not on disk (the plist; on systemd the
-  #                `.timer` OR its `.service`)
-  #   disabled     the operator disabled it
-  #   unloaded     present and not disabled, but not loaded/active
-  #   loaded       present, enabled, loaded (launchd) or active (systemd timer)
-  #   unavailable  installed, but there is no GUI domain / reachable, lingering
-  #                user manager to ask or to start it in. On systemd this means
-  #                ENABLED (the timers.target.wants link says so); on launchd
-  #                the enablement is unknown and the last observed state rules.
-  fleet_schedule_defs_present "$1" || {
-    printf 'missing\n'
-    return 0
-  }
-  case $(fleet_schedule_platform) in
-    launchd)
-      probe_domain=$(fleet_schedule_gui_domain)
-      launchctl print "$probe_domain" >/dev/null 2>&1 || {
-        printf 'unavailable\n'
-        return 0
-      }
-      # Both spellings: `=> disabled` on current macOS, `=> true` on older.
-      if launchctl print-disabled "$probe_domain" 2>/dev/null |
-        grep -Eq "\"$(fleet_schedule_label "$1")\" => (disabled|true)"; then
-        printf 'disabled\n'
-      elif launchctl print "$probe_domain/$(fleet_schedule_label "$1")" >/dev/null 2>&1; then
-        printf 'loaded\n'
-      else
-        printf 'unloaded\n'
-      fi
-      ;;
-    systemd)
-      probe_timer="$(fleet_schedule_unit "$1").timer"
-      if ! fleet_schedule_user_manager; then
-        # No manager to ask: `enable` is a symlink on disk, so read that.
-        if [ -L "$(fleet_schedule_unit_dir)/timers.target.wants/$probe_timer" ]; then
-          printf 'unavailable\n'
-        else
-          printf 'disabled\n'
-        fi
-        return 0
-      fi
-      case $(systemctl --user is-enabled "$probe_timer" 2>/dev/null || :) in
-        disabled | masked | masked-runtime)
-          printf 'disabled\n'
-          return 0
-          ;;
-      esac
-      # A timer the operator STOPPED (inactive, still enabled) is unloaded
-      # whether or not the account lingers: only an ACTIVE timer without
-      # lingering is unavailable, so a trigger never runs behind a stop.
-      if ! systemctl --user is-active --quiet "$probe_timer" 2>/dev/null; then
-        printf 'unloaded\n'
-      elif ! fleet_schedule_lingers; then
-        printf 'unavailable\n'
-      else
-        printf 'loaded\n'
-      fi
-      ;;
-    *) printf 'unavailable\n' ;;
-  esac
-}
-
 fleet_schedule_job_state() {
-  # The probe, remembered: every state actually observed is written to
-  # store.run/schedule-state.MODE, and `unavailable` never overwrites one. That
-  # memory is what lets a trigger over SSH (no GUI domain to ask) still honour
-  # an operator's disable it can no longer see.
+  # fleet_schedule_job_state fast|full [FACTS] — the state word, remembered:
+  # every state actually observed is written to store.run/schedule-state.MODE,
+  # and `unavailable` never overwrites one. That memory is what lets a trigger
+  # over SSH (no GUI domain to ask) still honour an operator's disable it can
+  # no longer see. FACTS, when the caller already read them, are not re-read.
   #
   # Written whole through a temporary file UNIQUE to this writer and renamed
   # into place, so two triggers racing on one job leave one complete state,
   # never a torn file or another writer's half-written temporary.
-  job_state=$(fleet_schedule_probe "$1")
+  job_state=$(fleet_schedule_state_word "${2:-$(fleet_schedule_facts "$1")}")
   if [ "$job_state" != unavailable ] && [ "$(fleet_schedule_last_state "$1")" != "$job_state" ]; then
     job_state_path=$(fleet_schedule_state_path "$1")
     if mkdir -p "$(dirname "$job_state_path")" &&
@@ -228,192 +353,6 @@ fleet_schedule_job_state() {
     fi
   fi
   printf '%s\n' "$job_state"
-}
-
-fleet_schedule_start() {
-  # Start MODE's job in its scheduler, without waiting for the pass.
-  case $(fleet_schedule_platform) in
-    launchd) launchctl kickstart "$(fleet_schedule_gui_domain)/$(fleet_schedule_label "$1")" ;;
-    systemd) systemctl --user start --no-block "$(fleet_schedule_unit "$1").service" ;;
-    *) return 1 ;;
-  esac >/dev/null 2>&1
-}
-
-# --- the dirty stamp -----------------------------------------------------------
-
-fleet_trigger_stamp_path() {
-  printf '%s/dirty-stamp\n' "$(fleet_run_state_dir)"
-}
-
-fleet_trigger_stamp() {
-  # Touch the stamp. Its CONTENT is unique per trigger (time, pid, a random
-  # draw), so the content alone is the comparison and no mtime is read.
-  trigger_stamp=$(fleet_trigger_stamp_path)
-  mkdir -p "$(dirname "$trigger_stamp")" || return 1
-  printf '%s %s %s\n' "$(fleet_now)" "$$" "${RANDOM:-0}" \
-    >"$trigger_stamp.next.$$" || return 1
-  mv -f "$trigger_stamp.next.$$" "$trigger_stamp"
-}
-
-fleet_trigger_stamp_state() {
-  cat "$(fleet_trigger_stamp_path)" 2>/dev/null || printf 'absent\n'
-}
-
-# --- the kick ------------------------------------------------------------------
-
-fleet_trigger_runner() {
-  # The `roundhouse` a detached pass runs: this one (a self-check may stand in
-  # its own).
-  if fleet_test_hook "${ROUNDHOUSE_FLEET_TRIGGER_RUNNER:-}"; then
-    printf '%s\n' "$ROUNDHOUSE_FLEET_TRIGGER_RUNNER"
-  else
-    printf '%s/roundhouse\n' "$script_dir"
-  fi
-}
-
-fleet_trigger_detach() {
-  # fleet_trigger_detach fast|full REASON — the unreachable-scheduler
-  # fallback. No `setsid`: macOS has none. `nohup` with every stream closed is
-  # what lets an SSH session that started it end without waiting on it or
-  # taking it down.
-  trigger_runner=$(fleet_trigger_runner)
-  nohup "$trigger_runner" fleet-run "--$1" </dev/null >/dev/null 2>&1 &
-  printf 'roundhouse: %s; started a detached fleet-run --%s\n' "$2" "$1"
-}
-
-fleet_trigger_kick() {
-  # fleet_trigger_kick fast|full — start MODE's job, fall back, or decline.
-  # Returns as soon as the start is requested; never waits for a pass.
-  [ "$(fleet_schedule_platform)" != windows ] || {
-    printf 'roundhouse: fleet-trigger does not run on native Windows; the operated instance is driven from its WSL operator host\n' >&2
-    return 69
-  }
-  if [ -e "$(fleet_schedule_optout_path)" ]; then
-    printf 'roundhouse: this host was taken off the schedule (fleet-schedule uninstall); stamped, not started\n'
-    return 0
-  fi
-  case $(fleet_schedule_job_state "$1") in
-    loaded)
-      if fleet_schedule_start "$1"; then
-        printf 'roundhouse: stamped and started fleet-%s\n' "$1"
-      else
-        printf 'roundhouse: the scheduler refused to start fleet-%s; stamped, the next scheduled run picks it up\n' "$1"
-      fi
-      ;;
-    unavailable)
-      # Detached only when the job is KNOWN installed and enabled: systemd
-      # says so from its wants link; launchd from the last state observed
-      # while its domain was reachable.
-      if [ "$(fleet_schedule_platform)" = systemd ] ||
-        [ "$(fleet_schedule_last_state "$1")" = loaded ]; then
-        fleet_trigger_detach "$1" "fleet-$1 is installed and enabled but its scheduler is unreachable from here"
-      else
-        printf 'roundhouse: fleet-%s cannot be reached and was not last seen running; stamped, not started\n' "$1"
-      fi
-      ;;
-    disabled | unloaded)
-      printf 'roundhouse: fleet-%s is stopped by the operator (fleet-schedule status); stamped, not started\n' "$1"
-      ;;
-    *)
-      printf 'roundhouse: no fleet-%s job is installed (roundhouse fleet-schedule install); stamped, not started\n' "$1"
-      ;;
-  esac
-}
-
-fleet_trigger_command() (
-  # `roundhouse fleet-trigger [--fast|--full]` — §6.1's one trigger: stamp,
-  # kick, return. The push nudge sends exactly this to a peer over SSH.
-  trigger_mode=fast
-  while [ $# -gt 0 ]; do
-    case $1 in
-      --fast) trigger_mode=fast ;;
-      --full) trigger_mode=full ;;
-      *)
-        printf 'roundhouse: unknown fleet-trigger option: %s\n' "$1" >&2
-        exit 64
-        ;;
-    esac
-    shift
-  done
-  exec </dev/null
-  fleet_trigger_stamp || {
-    printf 'roundhouse: could not write the trigger stamp at %s\n' \
-      "$(fleet_trigger_stamp_path)" >&2
-    exit 73
-  }
-  fleet_trigger_kick "$trigger_mode"
-)
-
-# --- the running pass's re-loop -------------------------------------------------
-
-fleet_trigger_converge() {
-  # fleet_trigger_converge PASS-FUNCTION — run one pass, then again in-process
-  # while the dirty stamp moved since that pass began. Called by
-  # fleet_run_command under its lock, with its run_tmp and run_mode.
-  #
-  # A trigger that lands while a pass holds the lock starts a second run that
-  # finds the lock and exits, so the trigger rides the stamp instead. Bounded —
-  # three extra passes — so a trigger storm cannot pin the lock; anything later
-  # waits for the next scheduled run. An extra pass is a FAST one, floor
-  # included: a trigger says "go look", and repeating a full pass's
-  # marketplace refresh and package updates is not looking.
-  #
-  # Each pass gets its own run_tmp and its own alert ledger: a re-run pass that
-  # inherited the previous pass's `raised` lines would keep an alert its own
-  # check no longer raises. Each pass runs with errexit ON — `PASS || …` would
-  # switch it off for the whole body — and the return status is the WORST of
-  # the passes, so a later clean pass does not launder an earlier hold.
-  #
-  # It leaves the stamp its LAST comparison read in converge_handoff_stamp,
-  # for fleet_trigger_handoff once the lock is released.
-  converge_root=$run_tmp
-  converge_extra=0
-  converge_handoff_stamp=
-  converge_status=0
-  converge_errexit=false
-  case $- in *e*) converge_errexit=true ;; esac
-  while :; do
-    converge_seen=$(fleet_trigger_stamp_state)
-    mkdir -p "$converge_root/pass-$converge_extra"
-    : >"$converge_root/pass-$converge_extra/alert-ledger"
-    set +e
-    (
-      set -e
-      run_tmp="$converge_root/pass-$converge_extra"
-      run_ledger="$run_tmp/alert-ledger"
-      "$1"
-    )
-    converge_pass_status=$?
-    [ "$converge_errexit" != true ] || set -e
-    [ "$converge_pass_status" -le "$converge_status" ] ||
-      converge_status=$converge_pass_status
-    converge_now=$(fleet_trigger_stamp_state)
-    converge_handoff_stamp=$converge_now
-    [ "$converge_extra" -lt 3 ] || break
-    [ "$converge_now" != "$converge_seen" ] || break
-    converge_extra=$((converge_extra + 1))
-    run_mode=fast
-    printf 'roundhouse: a trigger arrived during the pass; converging again in-process (%s of 3)\n' \
-      "$converge_extra"
-  done
-  return "$converge_status"
-}
-
-fleet_trigger_handoff() {
-  # fleet_trigger_handoff STAMP — the last word of a run, called by
-  # fleet_run_command AFTER it released the run lock, with the stamp the
-  # loop's final comparison read.
-  #
-  # A trigger that lands after that comparison but before the release is
-  # otherwise lost: its own run found the lock and exited, and on systemd a
-  # `start` of a oneshot that is still active queues nothing. So the stamp is
-  # compared once more with the lock free, and a move starts ONE detached
-  # fast pass. That pass takes the lock like any run — two follow-ups, or a
-  # follow-up and a scheduled run, cannot both run a pass; the loser exits.
-  [ "$(fleet_trigger_stamp_state)" != "$1" ] || return 0
-  handoff_runner=$(fleet_trigger_runner)
-  nohup "$handoff_runner" fleet-run --fast </dev/null >/dev/null 2>&1 &
-  printf 'roundhouse: a trigger arrived as this run released its lock; started a detached fleet-run --fast\n'
 }
 
 # --- the job definitions -------------------------------------------------------
@@ -532,14 +471,7 @@ fleet_schedule_write_definition() {
   # place. An existing one is KEPT as PATH.replaced first, and a backup that
   # cannot be made is a replacement that does not happen: the existing
   # definition stays exactly as it was and this fails.
-  if [ -f "$1" ]; then
-    cp -p "$1" "$1.replaced" 2>/dev/null && cmp -s "$1" "$1.replaced" || {
-      printf 'roundhouse: could not keep the previous definition as %s.replaced; %s was left in place, unchanged\n' \
-        "$1" "$1" >&2
-      return 1
-    }
-    printf 'roundhouse: the previous definition is kept as %s.replaced\n' "$1" >&2
-  fi
+  fleet_schedule_keep_copy "$1" replaced || return 1
   mkdir -p "$(dirname "$1")" || return 1
   write_next=$(mktemp "$1.next.XXXXXX") || return 1
   cp "$2" "$write_next" && chmod 0644 "$write_next" && mv -f "$write_next" "$1" || {
@@ -548,13 +480,18 @@ fleet_schedule_write_definition() {
   }
 }
 
-fleet_schedule_legacy_plists() {
-  # The superseded entries fleet-update's absorb rule names, where they exist:
-  # the old autoupdate agent and the one-plist fleet agent.
-  for legacy_label in com.novotnyllc.roundhouse.autoupdate com.novotnyllc.roundhouse.fleet; do
-    [ ! -f "$HOME/Library/LaunchAgents/$legacy_label.plist" ] ||
-      printf '%s\n' "$HOME/Library/LaunchAgents/$legacy_label.plist"
-  done
+fleet_schedule_keep_copy() {
+  # fleet_schedule_keep_copy PATH SUFFIX — keep an existing definition as
+  # PATH.SUFFIX (`replaced` before install overwrites it, `removed` before
+  # uninstall deletes it), verified byte-equal. Nothing to keep is success; a
+  # copy that cannot be made fails, and the caller must leave PATH alone.
+  [ -f "$1" ] || return 0
+  cp -p "$1" "$1.$2" 2>/dev/null && cmp -s "$1" "$1.$2" || {
+    printf 'roundhouse: could not keep the previous definition as %s.%s; %s was left in place, unchanged\n' \
+      "$1" "$2" "$1" >&2
+    return 1
+  }
+  printf 'roundhouse: the previous definition is kept as %s.%s\n' "$1" "$2" >&2
 }
 
 fleet_schedule_lingers_preflight() {
@@ -574,671 +511,96 @@ fleet_schedule_manager_unreachable_note() {
   printf 'roundhouse: the units are written but no systemd user manager is reachable (`systemctl --user`); under WSL enable systemd in /etc/wsl.conf (`[boot] systemd=true`) and restart the distribution, otherwise start the user manager, then re-run `roundhouse fleet-schedule install`\n' >&2
 }
 
-# --- install and uninstall ride the sealed-plan pipeline -----------------------
-#
-# AGENTS.md: every mutation rides the sealed-plan pipeline, and these two are
-# mutations of this host. So `install` and `uninstall` never act on what they
-# see; they PLAN from what the collector observed, seal that plan, and apply
-# only the sealed plan (local_plan_seal_apply, the helper launcher-install
-# uses too):
-#
-#   observe   the collector's `agent_artifact roundhouse:schedule` record
-#             (fleet_schedule_observe): every definition file's sha256 or its
-#             absence, each job's loaded/disabled/enabled/active state, the
-#             superseded entries, the scheduler's reachability;
-#   plan      fleet_schedule_plan_steps turns that record into the EXACT
-#             steps — each file to write (with its rendered sha256), keep,
-#             remove or absorb, and each scheduler command, in order;
-#   seal      the record is the plan's precondition, and the target's
-#             hostname and user are bound to the configured local machine;
-#   recheck   a fresh collect must match the sealed preconditions immediately
-#             before anything changes — an operator who disabled a job or
-#             edited a definition in between gets a refusal, not a surprise;
-#   apply     fleet_schedule_execute performs exactly the sealed steps, a
-#             rendered definition only when it still hashes to the sealed
-#             digest, a command only when it is one this host's jobs own;
-#   verify    apply's post-change collect must show every written file at its
-#             sealed digest and every removed one gone, and `status` must
-#             then report the jobs as the plan left them.
-#
-# `status` stays read-only and unsealed.
+# --- status: structured facts, rendered -----------------------------------------
 
-fleet_schedule_observe() {
-  # One JSON object, read-only: the collector's roundhouse:schedule record.
-  observe_platform=$(fleet_schedule_platform)
-  observe_domain=$(fleet_schedule_gui_domain)
-  observe_reachable=false
-  case $observe_platform in
-    launchd) ! launchctl print "$observe_domain" >/dev/null 2>&1 || observe_reachable=true ;;
-    systemd) ! fleet_schedule_user_manager || observe_reachable=true ;;
-    *)
-      printf 'roundhouse: fleet-schedule observes launchd or systemd only\n' >&2
-      return 69
-      ;;
-  esac
-  observe_lingers=true
-  [ "$observe_platform" != systemd ] || fleet_schedule_lingers || observe_lingers=false
-  observe_optout=false
-  [ ! -e "$(fleet_schedule_optout_path)" ] || observe_optout=true
-  observe_files='[]'
-  observe_jobs='[]'
-  for observe_mode in $fleet_schedule_modes; do
-    observe_paths=$(fleet_schedule_def_paths "$observe_mode")
-    while IFS= read -r observe_path; do
-      [ -n "$observe_path" ] || continue
-      observe_digest=
-      [ ! -f "$observe_path" ] || observe_digest=$(sha256_file "$observe_path")
-      observe_files=$(printf '%s\n' "$observe_files" | jq -c --arg mode "$observe_mode" \
-        --arg form "${observe_path##*.}" --arg path "$observe_path" --arg digest "$observe_digest" \
-        '. + [{mode:$mode,form:$form,path:$path,
-          digest:(if $digest == "" then null else $digest end)}]')
-    done <<EOF_OBSERVE
-$observe_paths
-EOF_OBSERVE
-    observe_loaded=false
-    observe_disabled=false
-    observe_enabled=false
-    observe_active=false
-    if [ "$observe_reachable" = true ]; then
-      case $observe_platform in
-        launchd)
-          observe_label=$(fleet_schedule_label "$observe_mode")
-          ! launchctl print "$observe_domain/$observe_label" >/dev/null 2>&1 ||
-            observe_loaded=true
-          ! launchctl print-disabled "$observe_domain" 2>/dev/null |
-            grep -Eq "\"$observe_label\" => (disabled|true)" || observe_disabled=true
-          ;;
-        systemd)
-          observe_timer="$(fleet_schedule_unit "$observe_mode").timer"
-          [ "$(systemctl --user is-enabled "$observe_timer" 2>/dev/null || :)" != enabled ] ||
-            observe_enabled=true
-          ! systemctl --user is-active --quiet "$observe_timer" 2>/dev/null ||
-            observe_active=true
-          ;;
-      esac
-    fi
-    observe_jobs=$(printf '%s\n' "$observe_jobs" | jq -c --arg mode "$observe_mode" \
-      --arg state "$(fleet_schedule_probe "$observe_mode")" \
-      --argjson loaded "$observe_loaded" --argjson disabled "$observe_disabled" \
-      --argjson enabled "$observe_enabled" --argjson active "$observe_active" \
-      '. + [{mode:$mode,state:$state,loaded:$loaded,disabled:$disabled,
-        enabled:$enabled,active:$active}]')
-  done
-  observe_legacy='[]'
-  if [ "$observe_platform" = launchd ]; then
-    observe_legacy_list=$(fleet_schedule_legacy_plists)
-    while IFS= read -r observe_path; do
-      [ -n "$observe_path" ] || continue
-      observe_legacy=$(printf '%s\n' "$observe_legacy" | jq -c --arg path "$observe_path" \
-        --arg digest "$(sha256_file "$observe_path")" '. + [{path:$path,digest:$digest}]')
-    done <<EOF_OBSERVE
-$observe_legacy_list
-EOF_OBSERVE
-  fi
-  jq -cn --arg platform "$observe_platform" --arg domain "$observe_domain" \
-    --argjson reachable "$observe_reachable" --argjson lingers "$observe_lingers" \
-    --argjson opted_out "$observe_optout" --argjson files "$observe_files" \
-    --argjson jobs "$observe_jobs" --argjson legacy "$observe_legacy" \
-    '{id:"roundhouse:schedule",artifact_kind:"schedule",platform:$platform,
-      domain:(if $platform == "launchd" then $domain else null end),
-      scheduler_reachable:$reachable,lingers:$lingers,opted_out:$opted_out,
-      files:$files,jobs:$jobs,legacy:$legacy}'
-}
-
-fleet_schedule_plan_steps() {
-  # fleet_schedule_plan_steps install|uninstall RECORD-JSON WORKDIR — the
-  # sealed plan's exact steps, as one JSON array, decided from the OBSERVED
-  # record alone (never a fresh look: the record is what gets sealed and
-  # rechecked). A definition that exists and differs is reported with its
-  # diff here, before anything is sealed, so a hand edit is never replaced
-  # silently.
-  plan_action=$1
-  plan_record=$2
-  plan_work=$3
-  plan_platform=$(printf '%s\n' "$plan_record" | jq -r '.platform')
-  plan_reachable=$(printf '%s\n' "$plan_record" | jq -r '.scheduler_reachable')
-  plan_domain=$(fleet_schedule_gui_domain)
-  plan_steps='[]'
-  plan_changed=false
-  plan_add() {
-    plan_steps=$(printf '%s\n' "$plan_steps" | jq -c --argjson step "$1" '. + [$step]')
-  }
-  plan_run() {
-    # plan_run MODE REQUIRED ARG... — one scheduler command.
-    plan_run_mode=$1
-    plan_run_required=$2
-    shift 2
-    # One argument per line, read back with -R: jq takes a `--user` among
-    # `--args` for an option of its own.
-    plan_run_argv=$(printf '%s\n' "$@" | jq -Rnc '[inputs]')
-    plan_add "$(jq -cn --arg mode "$plan_run_mode" --argjson required "$plan_run_required" \
-      --argjson argv "$plan_run_argv" '{action:"run",mode:$mode,required:$required,argv:$argv}')"
-  }
-  plan_job() {
-    printf '%s\n' "$plan_record" | jq -r --arg mode "$1" --arg key "$2" \
-      'first(.jobs[] | select(.mode == $mode)) | .[$key]'
-  }
-  plan_mode_files() {
-    printf '%s\n' "$plan_record" | jq -c --arg mode "$1" '.files[] | select(.mode == $mode)'
-  }
-  for plan_mode in $fleet_schedule_modes; do
-    plan_mode_written=false
-    plan_files=$(plan_mode_files "$plan_mode")
-    while IFS= read -r plan_file; do
-      [ -n "$plan_file" ] || continue
-      plan_path=$(printf '%s\n' "$plan_file" | jq -r '.path')
-      plan_form=$(printf '%s\n' "$plan_file" | jq -r '.form')
-      plan_before=$(printf '%s\n' "$plan_file" | jq -r '.digest // empty')
-      if [ "$plan_action" = uninstall ]; then
-        [ -z "$plan_before" ] ||
-          plan_add "$(jq -cn --arg mode "$plan_mode" --arg form "$plan_form" \
-            --arg path "$plan_path" --arg before "$plan_before" \
-            '{action:"remove",mode:$mode,form:$form,path:$path,before:$before}')"
-        continue
-      fi
-      plan_rendered="$plan_work/${plan_path##*/}"
-      fleet_schedule_render "$plan_mode" "$plan_path" >"$plan_rendered" || return 70
-      plan_digest=$(sha256_file "$plan_rendered")
-      if [ -n "$plan_before" ] && [ -f "$plan_path" ] &&
-        fleet_schedule_same "$plan_path" "$plan_rendered"; then
-        plan_add "$(jq -cn --arg mode "$plan_mode" --arg form "$plan_form" \
-          --arg path "$plan_path" --arg digest "$plan_before" \
-          '{action:"keep",mode:$mode,form:$form,path:$path,digest:$digest}')"
-        continue
-      fi
-      if [ -n "$plan_before" ] && [ -f "$plan_path" ]; then
-        printf 'roundhouse: %s differs from the definition fleet-schedule writes; replacing it:\n' \
-          "$plan_path" >&2
-        diff -u "$plan_path" "$plan_rendered" | sed 's/^/  /' >&2 || :
-      fi
-      plan_add "$(jq -cn --arg mode "$plan_mode" --arg form "$plan_form" \
-        --arg path "$plan_path" --arg digest "$plan_digest" --arg before "$plan_before" \
-        '{action:"write",mode:$mode,form:$form,path:$path,digest:$digest,
-          before:(if $before == "" then null else $before end)}')"
-      plan_mode_written=true
-      plan_changed=true
-    done <<EOF_PLAN
-$plan_files
-EOF_PLAN
-    [ "$plan_reachable" = true ] || continue
-    case $plan_platform:$plan_action in
-      launchd:install)
-        # The ONE place a disabled job is re-enabled: the operator asked for
-        # it. A job can stay LOADED through a disable, and bootstrapping a
-        # loaded job is an error, so loaded-ness is the observed flag, not a
-        # guess from the disable.
-        plan_label=$(fleet_schedule_label "$plan_mode")
-        [ "$(plan_job "$plan_mode" disabled)" != true ] ||
-          plan_run "$plan_mode" true launchctl enable "$plan_domain/$plan_label"
-        if [ "$(plan_job "$plan_mode" loaded)" = true ] && [ "$plan_mode_written" = true ]; then
-          plan_run "$plan_mode" false launchctl bootout "$plan_domain/$plan_label"
-        fi
-        if [ "$(plan_job "$plan_mode" loaded)" != true ] || [ "$plan_mode_written" = true ]; then
-          plan_run "$plan_mode" true launchctl bootstrap "$plan_domain" \
-            "$(fleet_schedule_def_path "$plan_mode")"
-        fi
-        ;;
-      launchd:uninstall)
-        [ "$(plan_job "$plan_mode" loaded)" != true ] ||
-          plan_run "$plan_mode" false launchctl bootout \
-            "$plan_domain/$(fleet_schedule_label "$plan_mode")"
-        ;;
-      systemd:uninstall)
-        if [ "$(plan_job "$plan_mode" enabled)" = true ] ||
-          [ "$(plan_job "$plan_mode" active)" = true ]; then
-          plan_run "$plan_mode" false systemctl --user disable --now \
-            "$(fleet_schedule_unit "$plan_mode").timer"
-          plan_changed=true
-        fi
-        ;;
-    esac
-  done
-  case $plan_platform:$plan_action:$plan_reachable in
-    launchd:install:*)
-      # Absorb, never duplicate (fleet-update): only after the new pair, and
-      # renamed BEFORE it is unloaded — a rename that fails leaves the
-      # superseded entry on disk and running. The new name is sealed too.
-      plan_legacy=$(printf '%s\n' "$plan_record" | jq -c '.legacy[]')
-      while IFS= read -r plan_file; do
-        [ -n "$plan_file" ] || continue
-        plan_path=$(printf '%s\n' "$plan_file" | jq -r '.path')
-        plan_to="$plan_path.absorbed"
-        [ ! -e "$plan_to" ] || plan_to="$plan_path.absorbed.$(date -u +%Y%m%dT%H%M%SZ)"
-        plan_add "$(printf '%s\n' "$plan_file" | jq -c --arg to "$plan_to" \
-          '{action:"absorb",path,before:.digest,to:$to}')"
-        [ "$plan_reachable" != true ] ||
-          plan_run legacy false launchctl bootout \
-            "$plan_domain/$(basename "$plan_path" .plist)"
-      done <<EOF_PLAN
-$plan_legacy
-EOF_PLAN
-      ;;
-    systemd:install:true)
-      [ "$plan_changed" != true ] || plan_run all false systemctl --user daemon-reload
-      for plan_mode in $fleet_schedule_modes; do
-        plan_timer="$(fleet_schedule_unit "$plan_mode").timer"
-        if [ "$(plan_job "$plan_mode" enabled)" = true ] &&
-          [ "$(plan_job "$plan_mode" active)" = true ]; then
-          [ "$plan_changed" != true ] ||
-            plan_run "$plan_mode" false systemctl --user restart "$plan_timer"
-        else
-          # The ONE place a disabled timer is re-enabled: the operator asked.
-          plan_run "$plan_mode" true systemctl --user enable --now "$plan_timer"
-        fi
-      done
-      ;;
-    systemd:uninstall:true)
-      [ "$plan_changed" != true ] &&
-        [ "$(printf '%s\n' "$plan_steps" | jq '[.[] | select(.action == "remove")] | length')" -eq 0 ] ||
-        plan_run all false systemctl --user daemon-reload
-      ;;
-  esac
-  printf '%s\n' "$plan_steps"
-}
-
-fleet_schedule_allowed_commands() {
-  # The scheduler commands a sealed fleet-schedule step may run on THIS host:
-  # its own two jobs (and the superseded entries) in its own domain, nothing
-  # else. A JSON array of argv arrays.
-  allowed_domain=$(fleet_schedule_gui_domain)
-  {
-    case $(fleet_schedule_platform) in
-      launchd)
-        for allowed_mode in $fleet_schedule_modes; do
-          allowed_label=$(fleet_schedule_label "$allowed_mode")
-          jq -cn --arg target "$allowed_domain/$allowed_label" \
-            '["launchctl","enable",$target], ["launchctl","bootout",$target]'
-          jq -cn --arg domain "$allowed_domain" --arg plist "$(fleet_schedule_def_path "$allowed_mode")" \
-            '["launchctl","bootstrap",$domain,$plist]'
-        done
-        for allowed_label in com.novotnyllc.roundhouse.autoupdate com.novotnyllc.roundhouse.fleet; do
-          jq -cn --arg target "$allowed_domain/$allowed_label" '["launchctl","bootout",$target]'
-        done
-        ;;
-      systemd)
-        jq -cn '["systemctl","--user","daemon-reload"]'
-        for allowed_mode in $fleet_schedule_modes; do
-          jq -cn --arg timer "$(fleet_schedule_unit "$allowed_mode").timer" '
-            ["systemctl","--user","restart",$timer],
-            ["systemctl","--user","enable","--now",$timer],
-            ["systemctl","--user","disable","--now",$timer]'
-        done
-        ;;
-    esac
-  } | jq -cs .
-}
-
-fleet_schedule_execute() (
-  # fleet_schedule_execute OPERATION.json — apply-plan's executor for the
-  # sealed `roundhouse:schedule` operation: its steps, exactly and in order.
-  # Every path is re-derived and must be one this host's jobs own; a written
-  # definition is rendered again and must hash to the sealed digest; a command
-  # must be on fleet_schedule_allowed_commands. Anything else refuses.
-  execute_op=$1
-  jq -e '(.argv | length) == 3 and .argv[0] == "roundhouse" and
-    .argv[1] == "fleet-schedule" and (.argv[2] | IN("install","uninstall")) and
-    (.steps | type == "array")' "$execute_op" >/dev/null || {
-    printf 'roundhouse: unsafe fleet-schedule plan operation\n' >&2
-    exit 64
-  }
-  execute_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-schedule-apply.XXXXXX") || exit 73
-  trap 'rm -rf "$execute_tmp"' EXIT HUP INT TERM
-  execute_allowed=$(fleet_schedule_allowed_commands)
-  execute_legacy=$(printf '%s\n' \
-    "$HOME/Library/LaunchAgents/com.novotnyllc.roundhouse.autoupdate.plist" \
-    "$HOME/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist" | jq -Rnc '[inputs]')
-  execute_count=$(jq '.steps | length' "$execute_op")
-  execute_index=0
-  while [ "$execute_index" -lt "$execute_count" ]; do
-    jq -c ".steps[$execute_index]" "$execute_op" >"$execute_tmp/step.json"
-    execute_index=$((execute_index + 1))
-    execute_action=$(jq -r '.action' "$execute_tmp/step.json")
-    case $execute_action in
-      write | keep | remove)
-        execute_mode=$(jq -r '.mode' "$execute_tmp/step.json")
-        execute_path=$(jq -r '.path' "$execute_tmp/step.json")
-        case $execute_mode in fast | full) ;; *) exit 64 ;; esac
-        fleet_schedule_def_paths "$execute_mode" | grep -Fqx -- "$execute_path" &&
-          [ "${execute_path##*.}" = "$(jq -r '.form' "$execute_tmp/step.json")" ] || {
-          printf 'roundhouse: a sealed fleet-schedule step names %s, which is not a fleet-%s definition on this host\n' \
-            "$execute_path" "$execute_mode" >&2
-          exit 64
-        }
-        case $execute_action in
-          write)
-            fleet_schedule_render "$execute_mode" "$execute_path" >"$execute_tmp/definition" || exit 70
-            [ "$(sha256_file "$execute_tmp/definition")" = "$(jq -r '.digest' "$execute_tmp/step.json")" ] || {
-              printf 'roundhouse: the fleet-%s definition no longer renders to the sealed digest (the store policy or this host changed); create a new plan\n' \
-                "$execute_mode" >&2
-              exit 65
-            }
-            fleet_schedule_write_definition "$execute_path" "$execute_tmp/definition" || {
-              printf 'roundhouse: could not write %s\n' "$execute_path" >&2
-              exit 73
-            }
-            ;;
-          remove)
-            rm -f -- "$execute_path" || exit 73
-            ;;
-        esac
-        ;;
-      absorb)
-        execute_path=$(jq -r '.path' "$execute_tmp/step.json")
-        execute_to=$(jq -r '.to' "$execute_tmp/step.json")
-        printf '%s\n' "$execute_legacy" | jq -e --arg path "$execute_path" 'index($path) != null' \
-          >/dev/null || {
-          printf 'roundhouse: a sealed absorb names %s, which is not a superseded entry\n' "$execute_path" >&2
-          exit 64
-        }
-        case $execute_to in
-          "$execute_path.absorbed" | "$execute_path".absorbed.[0-9]*) ;;
-          *) exit 64 ;;
-        esac
-        [ ! -e "$execute_to" ] && mv "$execute_path" "$execute_to" 2>/dev/null || {
-          printf 'roundhouse: could not keep the superseded %s as %s; it was left in place and loaded\n' \
-            "$execute_path" "$execute_to" >&2
-          exit 73
-        }
-        ;;
-      run)
-        execute_argv=$(jq -c '.argv' "$execute_tmp/step.json")
-        printf '%s\n' "$execute_allowed" | jq -e --argjson argv "$execute_argv" \
-          'index([$argv]) != null' >/dev/null || {
-          printf 'roundhouse: a sealed fleet-schedule step runs %s, which is not a command this host'"'"'s jobs own\n' \
-            "$execute_argv" >&2
-          exit 64
-        }
-        set --
-        while IFS= read -r execute_arg; do
-          set -- "$@" "$execute_arg"
-        done <<EOF_ARGV
-$(jq -r '.argv[]' "$execute_tmp/step.json")
-EOF_ARGV
-        if ! "$@" >/dev/null 2>&1; then
-          [ "$(jq -r '.required' "$execute_tmp/step.json")" != true ] || {
-            printf 'roundhouse: %s failed\n' "$*" >&2
-            exit 70
-          }
-        fi
-        ;;
-      *) exit 64 ;;
-    esac
-  done
-)
-
-fleet_schedule_status() {
-  # One line per job: installed or missing, enabled or disabled, loaded or
-  # not, and whether the definition on disk is the one `install` writes.
+fleet_schedule_status_facts() {
+  # One JSON object per job, read-only apart from the remembered state:
   #
-  # Every file the job is made of is rendered and compared — on systemd both
-  # the `.timer` and its `.service` — so a hand-edited or missing service
-  # never hides behind a matching timer.
+  #   mode state last   the state word and the last one remembered
+  #   reachable         the scheduler answered
+  #   scheduled         the scheduler still holds the job (loaded; or enabled
+  #                     or active)
+  #   paths             every definition file, in fleet_schedule_def_paths order
+  #   present           how many of them exist
+  #   differs absent    the file names that differ from what install writes,
+  #                     and the ones that do not exist
+  #   opted_out         the host was taken off the schedule
+  #
+  # `status` renders these; `install` and `uninstall` verify against them.
+  # Every file the job is made of is compared — on systemd both the `.timer`
+  # and its `.service` — so a hand-edited or missing service never hides
+  # behind a matching timer.
   status_dir=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-schedule.XXXXXX") || return 1
+  status_optout=false
+  [ ! -e "$(fleet_schedule_optout_path)" ] || status_optout=true
   for status_mode in $fleet_schedule_modes; do
-    status_paths=$(fleet_schedule_def_paths "$status_mode")
-    status_present=0
-    status_absent=
-    status_differs=
+    status_facts=$(fleet_schedule_facts "$status_mode")
+    status_state=$(fleet_schedule_job_state "$status_mode" "$status_facts")
+    status_scheduled=false
+    ! fleet_schedule_still_scheduled "$status_facts" || status_scheduled=true
+    fleet_schedule_facts_read "$status_facts"
+    status_reachable=false
+    [ "$sf_reachable" != 1 ] || status_reachable=true
+    : >"$status_dir/paths"
+    : >"$status_dir/differs"
+    : >"$status_dir/absent"
+    fleet_schedule_def_paths "$status_mode" >"$status_dir/paths"
     while IFS= read -r status_path; do
       [ -n "$status_path" ] || continue
       if [ ! -f "$status_path" ]; then
-        status_absent="$status_absent ${status_path##*/}"
+        printf '%s\n' "${status_path##*/}" >>"$status_dir/absent"
         continue
       fi
-      status_present=$((status_present + 1))
       fleet_schedule_render "$status_mode" "$status_path" >"$status_dir/def"
       fleet_schedule_same "$status_path" "$status_dir/def" ||
-        status_differs="$status_differs ${status_path##*/}"
-    done <<EOF_STATUS
-$status_paths
-EOF_STATUS
-    status_def=
-    if [ "$status_present" -gt 0 ]; then
-      if [ -n "$status_differs" ]; then
-        status_def=", definition differs from what install writes (${status_differs# })"
-      elif [ -z "$status_absent" ]; then
-        status_def=', definition matches'
-      fi
-      [ -z "$status_absent" ] ||
-        status_def="$status_def, definition incomplete (${status_absent# } absent)"
-    fi
-    status_path=$(printf '%s\n' "$status_paths" |
-      awk 'NR > 1 { printf " and " } { printf "%s", $0 } END { print "" }')
-    case $(fleet_schedule_job_state "$status_mode") in
-      missing) status_text='missing' ;;
-      disabled) status_text='installed, disabled' ;;
-      unloaded) status_text='installed, enabled, not loaded' ;;
-      loaded) status_text='installed, enabled, loaded' ;;
-      *)
-        status_last=$(fleet_schedule_last_state "$status_mode")
-        status_text="installed, scheduler unreachable (no GUI domain, or no lingering user manager); last seen ${status_last:-never}"
-        ;;
-    esac
-    printf 'fleet-%s: %s%s — %s\n' "$status_mode" "$status_text" "$status_def" "$status_path"
+        printf '%s\n' "${status_path##*/}" >>"$status_dir/differs"
+    done <"$status_dir/paths"
+    jq -cn --arg mode "$status_mode" --arg state "$status_state" \
+      --arg last "$(fleet_schedule_last_state "$status_mode")" \
+      --argjson reachable "$status_reachable" --argjson scheduled "$status_scheduled" \
+      --argjson opted_out "$status_optout" \
+      --rawfile paths "$status_dir/paths" --rawfile differs "$status_dir/differs" \
+      --rawfile absent "$status_dir/absent" '
+      def lines: split("\n") | map(select(length > 0));
+      ($paths | lines) as $p | ($absent | lines) as $a |
+      {mode:$mode,state:$state,last:$last,reachable:$reachable,scheduled:$scheduled,
+        paths:$p,present:(($p | length) - ($a | length)),differs:($differs | lines),
+        absent:$a,opted_out:$opted_out}'
   done
-  [ ! -e "$(fleet_schedule_optout_path)" ] ||
-    printf 'this host is opted out of scheduling (fleet-schedule uninstall); triggers only stamp\n'
   rm -rf "$status_dir"
 }
 
-fleet_schedule_report() {
-  # fleet_schedule_report install|uninstall OPERATION-JSON REACHABLE — what the
-  # applied plan did, one line per definition, read from the sealed steps.
-  report_platform=$(fleet_schedule_platform)
-  for report_mode in $fleet_schedule_modes; do
-    report_steps=$(printf '%s\n' "$2" | jq -c --arg mode "$report_mode" \
-      '[.steps[] | select(.mode == $mode)]')
-    if [ "$1" = uninstall ]; then
-      report_removed=$(printf '%s\n' "$report_steps" | jq -r '.[] | select(.action == "remove") | .path')
-      if [ -z "$report_removed" ]; then
-        printf 'fleet-%s: not installed\n' "$report_mode"
-      else
-        printf '%s\n' "$report_removed" | while IFS= read -r report_path; do
-          printf 'fleet-%s: removed %s\n' "$report_mode" "$report_path"
-        done
-      fi
-      continue
-    fi
-    ! printf '%s\n' "$report_steps" | jq -e 'any(.[]; .action == "run" and .argv[1] == "enable" and .argv[0] == "launchctl")' >/dev/null ||
-      printf 'fleet-%s: re-enabled (it was disabled)\n' "$report_mode"
-    printf '%s\n' "$report_steps" | jq -r '.[] | select(.action == "write" or .action == "keep") |
-      [(if .action == "write" then "written" else "unchanged" end), .path] | @tsv' |
-      while IFS="$(printf '\t')" read -r report_result report_path; do
-        if [ "$report_platform" = launchd ]; then
-          ! printf '%s\n' "$report_steps" | jq -e 'any(.[]; .action == "run" and .argv[1] == "bootstrap")' >/dev/null ||
-            report_result="$report_result, loaded"
-          if [ "$3" = true ]; then
-            printf 'fleet-%s: %s %s\n' "$report_mode" "$report_result" "$report_path"
-          else
-            printf 'fleet-%s: %s %s; no GUI launchd domain for this user, so it loads at the next console login\n' \
-              "$report_mode" "$report_result" "$report_path"
-          fi
-        else
-          printf 'fleet-%s: %s %s\n' "$report_mode" "$report_result" "$report_path"
-        fi
-      done
-    printf '%s\n' "$report_steps" | jq -r '.[] | select(.action == "run" and .argv[2] == "enable") | .argv[4]' |
-      while IFS= read -r report_timer; do
-        printf 'fleet-%s: enabled and started %s\n' "$report_mode" "$report_timer"
-      done
-  done
-  printf '%s\n' "$2" | jq -r '.steps[] | select(.action == "absorb") | [.path, .to] | @tsv' |
-    while IFS="$(printf '\t')" read -r report_path report_to; do
-      printf 'roundhouse: absorbed the superseded %s entry (kept as %s)\n' \
-        "$(basename "$report_path" .plist)" "$report_to"
-    done
+fleet_schedule_status_render() {
+  # fleet_schedule_status_render FACTS — FACTS is fleet_schedule_status_facts'
+  # output; stdout: one line per job, then the opt-out notice.
+  printf '%s\n' "$1" | jq -r '
+    (if .state == "missing" then "missing"
+     elif .state == "disabled" then "installed, disabled"
+     elif .state == "unloaded" then "installed, enabled, not loaded"
+     elif .state == "loaded" then "installed, enabled, loaded"
+     else "installed, scheduler unreachable (no GUI domain, or no lingering user manager); last seen " +
+       (if .last == "" then "never" else .last end)
+     end) as $text |
+    (if .present == 0 then ""
+     elif (.differs | length) > 0 then
+       ", definition differs from what install writes (" + (.differs | join(" ")) + ")"
+     elif (.absent | length) == 0 then ", definition matches"
+     else "" end) as $def |
+    (if .present > 0 and (.absent | length) > 0 then
+       ", definition incomplete (" + (.absent | join(" ")) + " absent)"
+     else "" end) as $incomplete |
+    "fleet-\(.mode): \($text)\($def)\($incomplete) — \(.paths | join(" and "))"'
+  ! printf '%s\n' "$1" | jq -se 'any(.[]; .opted_out)' >/dev/null ||
+    printf 'this host is opted out of scheduling (fleet-schedule uninstall); triggers only stamp\n'
 }
 
-fleet_schedule_verify() {
-  # fleet_schedule_verify install|uninstall REACHABLE — the post-change check
-  # through `status`, the operator's own view: an install leaves every
-  # definition matching (and loaded, where the scheduler could be reached);
-  # an uninstall leaves both jobs missing.
-  verify_status=$(fleet_schedule_status)
-  for verify_mode in $fleet_schedule_modes; do
-    verify_line=$(printf '%s\n' "$verify_status" | grep "^fleet-$verify_mode: " || true)
-    verify_ok=true
-    case $1 in
-      install)
-        case $verify_line in *', definition matches'*) ;; *) verify_ok=false ;; esac
-        [ "$2" != true ] || case $verify_line in
-          *': installed, enabled, loaded'*) ;;
-          *) verify_ok=false ;;
-        esac
-        ;;
-      uninstall)
-        case $verify_line in "fleet-$verify_mode: missing"*) ;; *) verify_ok=false ;; esac
-        ;;
-    esac
-    [ "$verify_ok" = true ] || {
-      printf 'roundhouse: the sealed fleet-schedule %s applied, but status does not show it:\n%s\n' \
-        "$1" "$verify_status" >&2
-      return 70
-    }
-  done
+fleet_schedule_status() {
+  # `fleet-schedule status`: one line per job — installed or missing, enabled
+  # or disabled, loaded or not, and whether the definition on disk is the one
+  # `install` writes. Read-only and unsealed.
+  status_all=$(fleet_schedule_status_facts) || return 1
+  fleet_schedule_status_render "$status_all"
 }
-
-fleet_schedule_sealed() (
-  # fleet_schedule_sealed install|uninstall — observe, plan, seal, recheck,
-  # apply, verify (the section comment above). Returns install's 0 or 75.
-  sealed_action=$1
-  check_mutation_config
-  sealed_target=$(local_plan_target "fleet-schedule $sealed_action") || exit $?
-  sealed_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-schedule-plan.XXXXXX") || exit 73
-  trap 'rm -rf "$sealed_tmp"' EXIT HUP INT TERM
-  mkdir "$sealed_tmp/render" "$sealed_tmp/apply"
-  ROUNDHOUSE_SCHEDULE_OBSERVE=1
-  export ROUNDHOUSE_SCHEDULE_OBSERVE
-  # The collect, seal and apply below stop on their first failed check through
-  # errexit, so each runs as `( set -e; … )` with errexit off AROUND it: a
-  # `… || …` would switch it off inside them too.
-  set +e
-  ( set -e; collect_command --target "$sealed_target" --section agents \
-    --output "$sealed_tmp/planning.jsonl" )
-  sealed_status=$?
-  set -e
-  [ "$sealed_status" -eq 0 ] || {
-    printf 'roundhouse: could not observe this host'"'"'s scheduled jobs; nothing was changed\n' >&2
-    exit 70
-  }
-  sealed_record=$(jq -c 'select(.kind == "agent_artifact" and .id == "roundhouse:schedule") | .data' \
-    "$sealed_tmp/planning.jsonl")
-  [ -n "$sealed_record" ] || {
-    printf 'roundhouse: the collector returned no roundhouse:schedule record; nothing was changed\n' >&2
-    exit 70
-  }
-  sealed_reachable=$(printf '%s\n' "$sealed_record" | jq -r '.scheduler_reachable')
-  sealed_steps=$(fleet_schedule_plan_steps "$sealed_action" "$sealed_record" "$sealed_tmp/render") ||
-    exit $?
-  jq -n --arg target "$sealed_target" --arg action "$sealed_action" --argjson steps "$sealed_steps" '
-    {domain:"agents",target:$target,operations:[{
-      type:"agent-update",kind:"agent_artifact",id:"roundhouse:schedule",
-      argv:["roundhouse","fleet-schedule",$action],steps:$steps
-    }]}' >"$sealed_tmp/draft.json"
-  set +e
-  local_plan_seal_apply "$sealed_tmp/draft.json" "$sealed_tmp/planning.jsonl" \
-    "$sealed_tmp/apply"
-  sealed_status=$?
-  set -e
-  [ "$sealed_status" -eq 0 ] || {
-    printf 'roundhouse: the sealed fleet-schedule %s did not complete; nothing past the failing step was changed\n' \
-      "$sealed_action" >&2
-    exit 70
-  }
-  fleet_schedule_report "$sealed_action" "$(jq -c '.operations[0]' "$sealed_tmp/draft.json")" \
-    "$sealed_reachable"
-  fleet_schedule_verify "$sealed_action" "$sealed_reachable" || exit $?
-  # An install the scheduler could not take yet is 75 (written, loads later);
-  # an uninstall has removed what it could see either way.
-  [ "$sealed_action" != install ] || [ "$sealed_reachable" = true ] || {
-    [ "$(fleet_schedule_platform)" != systemd ] || fleet_schedule_manager_unreachable_note
-    exit 75
-  }
-)
-
-fleet_schedule_command() (
-  # `roundhouse fleet-schedule install|status|uninstall` — this host's two
-  # scheduled jobs. Host-local and operator-run: it never reaches another
-  # host, and `install` is the only path in the system that enables a job.
-  # `install` and `uninstall` ride the sealed-plan pipeline (above); `status`
-  # is read-only.
-  [ $# -eq 1 ] || {
-    printf 'roundhouse: fleet-schedule takes one of install, status, uninstall\n' >&2
-    exit 64
-  }
-  case $1 in
-    install | status | uninstall) ;;
-    *)
-      printf 'roundhouse: unknown fleet-schedule action: %s\n' "$1" >&2
-      exit 64
-      ;;
-  esac
-  exec </dev/null
-  case $(fleet_schedule_platform) in
-    launchd | systemd) ;;
-    windows)
-      printf 'roundhouse: fleet-schedule does not manage native Windows; the operated Windows instance is scheduled by its Task Scheduler task and driven from its WSL operator host\n' >&2
-      exit 69
-      ;;
-    *)
-      printf 'roundhouse: fleet-schedule supports launchd (macOS) and systemd user units (Linux, WSL); not %s\n' \
-        "$(uname -s)" >&2
-      exit 69
-      ;;
-  esac
-  [ "$(id -u)" != 0 ] || {
-    printf 'roundhouse: fleet-schedule installs per-user jobs; run it as the user whose fleet store this is, not root\n' >&2
-    exit 64
-  }
-  case $1 in
-    status) fleet_schedule_status ;;
-    uninstall)
-      # Plainly or under `set +e`, never `|| exit $?` (fleet_schedule_sealed).
-      set +e
-      fleet_schedule_sealed uninstall
-      uninstall_status=$?
-      set -e
-      [ "$uninstall_status" -eq 0 ] || exit "$uninstall_status"
-      rm -f "$(fleet_schedule_marker)"
-      for uninstall_mode in $fleet_schedule_modes; do
-        rm -f "$(fleet_schedule_state_path "$uninstall_mode")"
-      done
-      # The opt-out: from here on a trigger stamps and starts nothing, and a
-      # pass raises no schedule alert, until `install` is run again.
-      mkdir -p "$(dirname "$(fleet_schedule_optout_path)")"
-      printf 'uninstalled_at: %s\n' "$(fleet_now)" >"$(fleet_schedule_optout_path)"
-      ;;
-    install)
-      [ -x "$HOME/.local/bin/roundhouse" ] || {
-        printf 'roundhouse: %s is not installed; run `roundhouse launcher-install` first — the scheduled jobs run that shim\n' \
-          "$HOME/.local/bin/roundhouse" >&2
-        exit 69
-      }
-      # A superseded job that WORKS is not retired for a pair that would only
-      # fail: the new jobs converge the fleet store, so it must be enrolled.
-      if [ -n "$(fleet_schedule_legacy_plists)" ] &&
-        ! fleet_vcs_store_ready "$(fleet_store_path)" >/dev/null 2>&1; then
-        printf 'roundhouse: a superseded scheduler entry is still installed (%s) and this host has no enrolled fleet store for the new jobs to converge; enroll it (roundhouse fleet-init / fleet-enroll), then re-run install. Nothing was changed.\n' \
-          "$(fleet_schedule_legacy_plists | tr '\n' ' ')" >&2
-        exit 69
-      fi
-      [ "$(fleet_schedule_platform)" != systemd ] || fleet_schedule_lingers_preflight || exit $?
-      set +e
-      fleet_schedule_sealed install
-      install_status=$?
-      set -e
-      case $install_status in
-        0 | 75)
-          mkdir -p "$(dirname "$(fleet_schedule_marker)")"
-          printf 'platform: %s\ninstalled_at: %s\n' "$(fleet_schedule_platform)" \
-            "$(fleet_now)" >"$(fleet_schedule_marker)"
-          rm -f "$(fleet_schedule_optout_path)"
-          ;;
-      esac
-      exit "$install_status"
-      ;;
-  esac
-)
 
 # --- the pass's own check ------------------------------------------------------
 

@@ -70,6 +70,8 @@ case $verb in
     : >"$SCHED_STATE/loaded.$label"
     ;;
   bootout)
+    # SCHED_BOOTOUT_FAIL: a scheduler that refuses to let go of a job.
+    [ -z "${SCHED_BOOTOUT_FAIL:-}" ] || exit 5
     case $1 in
       gui/*/*) label=${1##*/} ;;
       *) label=$(basename "$2" .plist) ;;
@@ -110,6 +112,8 @@ case $1 in
     ln -sf "../$2" "$wants/$2"
     ;;
   disable)
+    # SCHED_DISABLE_FAIL: a manager that refuses to disable the timer.
+    [ -z "${SCHED_DISABLE_FAIL:-}" ] || exit 1
     [ "$2" = --now ] && shift
     rm -f "$SCHED_STATE/enabled.$2" "$SCHED_STATE/active.$2" "$wants/$2"
     ;;
@@ -181,7 +185,7 @@ ROUNDHOUSE_LIB_ONLY=1
 case $1 in
   fast)
     local_plan_seal_apply() {
-      schedule_operations_valid "$1"
+      schedule_operations_valid "$1" "$HOME"
       jq ".operations[0]" "$1" >"$3/operation.json"
       fleet_schedule_execute "$3/operation.json"
     }
@@ -379,6 +383,8 @@ fleet_schedule_command "$@"'
     # --- the running pass re-loops in-process while the stamp moved ---
     (
       # The pass itself is stubbed: what is under test is the loop around it.
+      # fleet_run_command and its loop depend on errexit, so they are run the
+      # way the CLI runs them — never inside `|| …` (errexit_capture).
       fleet_vcs_store_ready() { return 0; }
       fleet_vcs_op_id() {
         printf 'op\n' >>"$sched_root/op-calls"
@@ -386,14 +392,20 @@ fleet_schedule_command "$@"'
       }
       fleet_host_name() { printf 'vireo\n'; }
       sched_calls="$sched_root/pass-calls"
+      sched_run() {
+        # sched_run ARG... — fleet_run_command, its status in sched_status and
+        # its output in $sched_root/run.out.
+        errexit_capture sched_status fleet_run_command "$@" >"$sched_root/run.out" 2>&1
+      }
       fleet_run_pass() (
+        run_tmp=$1
+        run_mode=$2
         printf '%s %s\n' "$run_mode" "$run_tmp" >>"$sched_calls"
         [ -d "$run_tmp" ] || exit 70
         # PER PASS: a fresh, empty alert ledger inside this pass's run_tmp,
         # whatever the previous pass wrote to its own.
-        [ "$run_ledger" = "$run_tmp/alert-ledger" ] && [ -f "$run_ledger" ] &&
-          [ ! -s "$run_ledger" ] || exit 71
-        printf 'raised\tx\ty\n' >>"$run_ledger"
+        [ -f "$run_tmp/alert-ledger" ] && [ ! -s "$run_tmp/alert-ledger" ] || exit 71
+        printf 'raised\tx\ty\n' >>"$run_tmp/alert-ledger"
         sched_n=$(grep -c . "$sched_calls")
         # Triggers "arrive" during the first SCHED_TRIGGERS passes.
         [ "$sched_n" -gt "${SCHED_TRIGGERS:-0}" ] || fleet_trigger_stamp
@@ -404,8 +416,9 @@ fleet_schedule_command "$@"'
       for sched_case in '0 1' '1 2' '2 3' '9 4'; do
         : >"$sched_calls"
         SCHED_TRIGGERS=${sched_case% *}
-        fleet_run_command --fast >/dev/null ||
-          fail "the looping run failed with $SCHED_TRIGGERS mid-pass triggers"
+        sched_run --fast
+        [ "$sched_status" -eq 0 ] ||
+          fail "the looping run failed with $SCHED_TRIGGERS mid-pass triggers: $(cat "$sched_root/run.out")"
         [ "$(grep -c . "$sched_calls")" -eq "${sched_case#* }" ] ||
           fail "$SCHED_TRIGGERS mid-pass triggers ran $(grep -c . "$sched_calls") passes, not ${sched_case#* }"
       done
@@ -437,12 +450,13 @@ STUB
       }
       : >"$sched_calls"
       SCHED_TRIGGERS=0
-      sched_out=$(fleet_run_command --fast) || fail "the run with a late trigger failed"
+      sched_run --fast
+      [ "$sched_status" -eq 0 ] || fail "the run with a late trigger failed"
       [ "$(grep -c . "$sched_calls")" -eq 1 ] ||
         fail "a trigger after the last comparison was run in-process, inside the lock"
-      case $sched_out in
+      case $(cat "$sched_root/run.out") in
         *'released its lock; started a detached fleet-run --fast'*) ;;
-        *) fail "the run did not hand a late trigger off: $sched_out" ;;
+        *) fail "the run did not hand a late trigger off: $(cat "$sched_root/run.out")" ;;
       esac
       sched_wait_runner || fail "a trigger that landed as the lock was released was lost"
       [ "$(cat "$SCHED_STATE/runner")" = 'free fleet-run --fast' ] ||
@@ -455,7 +469,8 @@ STUB
       : >"$sched_root/op-calls"
       : >"$sched_calls"
       SCHED_TRIGGERS=9
-      fleet_run_command --fast >/dev/null || fail "the four-pass run failed"
+      sched_run --fast
+      [ "$sched_status" -eq 0 ] || fail "the four-pass run failed"
       [ "$(grep -c . "$sched_root/op-calls")" -eq 1 ] ||
         fail "a four-pass run captured $(grep -c . "$sched_root/op-calls") starting operations, not one"
       [ "$(cat "$(fleet_run_state_dir)/starting-operation")" = op-fixture ] ||
@@ -464,7 +479,8 @@ STUB
       # marketplace refresh and package updates".
       : >"$sched_calls"
       SCHED_TRIGGERS=1
-      fleet_run_command --full >/dev/null || fail "the looping full run failed"
+      sched_run --full
+      [ "$sched_status" -eq 0 ] || fail "the looping full run failed"
       [ "$(cut -d' ' -f1 "$sched_calls" | tr '\n' ' ')" = 'full fast ' ] ||
         fail "an in-process re-run repeated the full pass: $(cut -d' ' -f1 "$sched_calls" | tr '\n' ' ')"
       # The run's status is the WORST pass's: a clean re-run does not launder
@@ -473,8 +489,7 @@ STUB
       SCHED_TRIGGERS=1
       SCHED_PASS_STATUS_1=65
       export SCHED_PASS_STATUS_1
-      sched_status=0
-      fleet_run_command --fast >/dev/null 2>&1 || sched_status=$?
+      sched_run --fast
       [ "$sched_status" -eq 65 ] || fail "a later clean pass laundered an earlier hold ($sched_status)"
       unset SCHED_PASS_STATUS_1
       # Every pass runs under errexit: an unguarded failure ends the pass.
@@ -483,13 +498,18 @@ STUB
         printf 'reached\n' >>"$sched_calls"
       )
       : >"$sched_calls"
-      set +e
-      fleet_run_command --fast >/dev/null 2>&1
-      sched_status=$?
-      set -e
+      sched_run --fast
       [ "$sched_status" -ne 0 ] || fail "a pass whose command failed reported success"
       ! grep -q reached "$sched_calls" ||
         fail "a pass ran on past an unguarded failure (errexit was off)"
+      # …and the loop REFUSES a caller that suppresses errexit, rather than
+      # running every pass with it silently off.
+      sched_status=0
+      fleet_run_command --fast >"$sched_root/run.out" 2>&1 || sched_status=$?
+      [ "$sched_status" -eq 70 ] &&
+        grep -q 'ran where errexit is suppressed' "$sched_root/run.out" ||
+        fail "the run loop accepted an errexit-suppressed caller ($sched_status): $(cat "$sched_root/run.out")"
+      [ ! -e "$(fleet_lock_path)" ] || fail "the refused run left its lock behind"
     )
 
     # --- fleet-schedule on macOS: install, idempotence, status, uninstall ---
@@ -533,7 +553,7 @@ STUB
     esac
     # Idempotent: a second install changes nothing and touches no job.
     : >"$SCHED_LOG"
-    sched_out=$(sched_schedule install 2>&1) || fail "a repeat install failed"
+    sched_out=$(sched_schedule install 2>&1) || fail "a repeat install failed: $sched_out"
     case $sched_out in
       *'fleet-fast: unchanged'*'fleet-full: unchanged'*) ;;
       *) fail "a repeat install did not report the jobs unchanged: $sched_out" ;;
@@ -594,9 +614,11 @@ STUB
       # The executor runs only what this host's jobs own, wherever the plan
       # came from: a foreign command or path refuses.
       for sched_bad_step in \
-        '{"action":"run","mode":"fast","required":true,"argv":["launchctl","bootout","gui/'"$sched_uid"'/com.apple.Finder"]}' \
-        '{"action":"run","mode":"fast","required":true,"argv":["systemctl","--user","stop","dbus.service"]}' \
-        '{"action":"remove","mode":"fast","form":"plist","path":"'"$HOME"'/Library/LaunchAgents/com.apple.Finder.plist","before":"'"$(printf '%064d' 0)"'"}'; do
+        '{"action":"run","mode":"fast","effect":"unload","required":true,"argv":["launchctl","bootout","gui/'"$sched_uid"'/com.apple.Finder"]}' \
+        '{"action":"run","mode":"fast","effect":"disable-stop","required":true,"argv":["systemctl","--user","stop","dbus.service"]}' \
+        '{"action":"run","mode":"fast","effect":"load","required":true,"argv":["launchctl","bootout","gui/'"$sched_uid"'/com.novotnyllc.roundhouse.fleet-fast"]}' \
+        '{"action":"remove","mode":"fast","form":"plist","path":"'"$HOME"'/Library/LaunchAgents/com.apple.Finder.plist","before":"'"$(printf '%064d' 0)"'"}' \
+        '{"action":"write","mode":"fast","form":"timer","path":"/etc/systemd/user/roundhouse-fleet-fast.timer","digest":"'"$(printf '%064d' 0)"'","before":null}'; do
         jq -n --argjson step "$sched_bad_step" '{type:"agent-update",kind:"agent_artifact",
           id:"roundhouse:schedule",argv:["roundhouse","fleet-schedule","install"],steps:[$step]}' \
           >"$sched_seal_dir/bad.json"
@@ -604,14 +626,33 @@ STUB
         fleet_schedule_execute "$sched_seal_dir/bad.json" >/dev/null 2>&1 || sched_status=$?
         [ "$sched_status" -eq 64 ] || fail "the executor ran a step this host's jobs do not own ($sched_status): $sched_bad_step"
       done
+      # The plan contract itself refuses a definition path outside HOME.
+      jq -n '{operations:[{type:"agent-update",kind:"agent_artifact",
+        id:"roundhouse:schedule",argv:["roundhouse","fleet-schedule","install"],
+        steps:[{action:"write",mode:"fast",form:"timer",
+          path:"/etc/systemd/user/roundhouse-fleet-fast.timer",
+          digest:("0" * 64),before:null}]}]}' >"$sched_seal_dir/outside.json"
+      ! schedule_operations_valid "$sched_seal_dir/outside.json" "$HOME" ||
+        fail "the plan contract accepted a definition path outside HOME"
       # status is read-only and unsealed: it needs no mutation configuration.
-      ROUNDHOUSE_CONFIG="$sched_root/no-such-config.json" fleet_schedule_command status >/dev/null ||
+      ROUNDHOUSE_CONFIG="$sched_root/no-such-config.json" "$cli" fleet-schedule status >/dev/null ||
         fail "status required the sealed-plan configuration"
       sched_status=0
-      ROUNDHOUSE_CONFIG="$sched_root/no-such-config.json" fleet_schedule_command install \
+      ROUNDHOUSE_CONFIG="$sched_root/no-such-config.json" "$cli" fleet-schedule install \
         >/dev/null 2>&1 || sched_status=$?
       [ "$sched_status" -ne 0 ] || fail "install ran without a mutation configuration to seal against"
-    ) || fail "the sealed fleet-schedule checks failed"
+      # A mutation configuration others can write is refused BEFORE planning,
+      # not noticed and ignored (the check's status used to be dropped).
+      cp "$ROUNDHOUSE_CONFIG" "$sched_root/open-config.json"
+      chmod 666 "$sched_root/open-config.json"
+      sched_status=0
+      sched_out=$(ROUNDHOUSE_CONFIG="$sched_root/open-config.json" "$cli" fleet-schedule install 2>&1) ||
+        sched_status=$?
+      [ "$sched_status" -eq 64 ] ||
+        fail "install sealed against a group/world-writable configuration ($sched_status): $sched_out"
+      case $sched_out in *'group/world writable'*) ;; *) fail "the writable configuration was not named: $sched_out" ;; esac
+      rm -f "$sched_root/open-config.json"
+    )
     : >"$SCHED_LOG"
 
     # A job a previous session installed, in the shape install writes, is
@@ -630,14 +671,21 @@ STUB
       fail "install reloaded an existing identical job"
     [ "$(find "$HOME/Library/LaunchAgents" -name '*fleet-fast*' | grep -c .)" -eq 1 ] ||
       fail "install duplicated an existing job"
-    # A job that DIFFERS is reported with its diff, then replaced and reloaded.
-    sed 's/<integer>[0-9]*</<integer>7</' "$sched_fast" >"$sched_fast.edit"
+    # A job that DIFFERS is reported by path, with where the old one is kept,
+    # then replaced and reloaded — and its CONTENT is never printed: a
+    # hand-added environment variable in it may be a secret.
+    sed 's/<integer>[0-9]*</<integer>7</; s#<key>RunAtLoad</key>#<key>EnvironmentVariables</key><dict><key>TOKEN</key><string>sched-secret-sentinel</string></dict><key>RunAtLoad</key>#' \
+      "$sched_fast" >"$sched_fast.edit"
     mv "$sched_fast.edit" "$sched_fast"
     : >"$SCHED_LOG"
     sched_out=$(sched_schedule install 2>&1) || fail "install over a differing job failed"
     case $sched_out in
-      *'differs from the definition fleet-schedule writes'*'-'*'<integer>7<'*'+'*) ;;
+      *"$sched_fast differs from the definition fleet-schedule writes"*"$sched_fast.replaced"*) ;;
       *) fail "a differing job was replaced without reporting the difference: $sched_out" ;;
+    esac
+    case $sched_out in
+      *sched-secret-sentinel* | *'<integer>7<'*)
+        fail "install printed the content of a definition it replaced: $sched_out" ;;
     esac
     ! grep -Fq '<integer>7</integer>' "$sched_fast" || fail "the differing job was not replaced"
     grep -Fqx "launchctl bootout gui/$sched_uid/com.novotnyllc.roundhouse.fleet-fast" "$SCHED_LOG" &&
@@ -766,11 +814,23 @@ STUB
       fail "a pass did not alert on a missing job"
     [ -z "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" -name 'schedule-*--fleet-fast.yaml')" ] ||
       fail "a pass alerted on a healthy job"
+    # An uninstall the scheduler refuses is not done: a job it still holds
+    # keeps its definition, the host is not opted out, and the exit is not 0.
+    sched_status=0
+    sched_out=$(SCHED_BOOTOUT_FAIL=1 sched_schedule uninstall 2>&1) || sched_status=$?
+    [ "$sched_status" -ne 0 ] || fail "uninstall reported success while launchd still held the job"
+    [ -f "$sched_fast" ] && [ -e "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-fast" ] ||
+      fail "an uninstall whose unload failed still removed the definition: $sched_out"
+    [ ! -e "$(fleet_schedule_optout_path)" ] ||
+      fail "an uninstall whose unload failed still opted the host out"
     # Uninstall removes both, unloads, and opts the host out: from then on a
-    # trigger only stamps and a pass raises nothing.
+    # trigger only stamps and a pass raises nothing. A removed definition is
+    # kept, as .removed.
     : >"$SCHED_LOG"
     "$cli" fleet-schedule uninstall >/dev/null || fail "fleet-schedule uninstall failed"
     [ ! -e "$sched_fast" ] && [ ! -e "$sched_full" ] || fail "uninstall left a job behind"
+    [ -f "$sched_fast.removed" ] || fail "uninstall kept no .removed copy of the definition"
+    rm -f "$sched_fast.removed"
     grep -Fqx "launchctl bootout gui/$sched_uid/com.novotnyllc.roundhouse.fleet-fast" "$SCHED_LOG" ||
       fail "uninstall did not unload the fast job"
     [ ! -e "$(fleet_schedule_marker)" ] || fail "uninstall left the install marker"
@@ -876,10 +936,27 @@ STUB
       fail "a pass did not alert on an operator-disabled Linux timer"
     ! grep -Eq 'systemctl --user (enable|start|restart)' "$SCHED_LOG" ||
       fail "a pass re-enabled an operator-disabled timer: $(cat "$SCHED_LOG")"
+    # A manager that will not disable a timer it still has enabled leaves the
+    # uninstall undone.
+    sched_status=0
+    SCHED_DISABLE_FAIL=1 sched_schedule uninstall >/dev/null 2>&1 || sched_status=$?
+    [ "$sched_status" -ne 0 ] || fail "uninstall reported success while systemd still held the timer"
+    [ -f "$sched_units/roundhouse-fleet-full.timer" ] ||
+      fail "an uninstall whose disable failed still removed the unit"
     "$cli" fleet-schedule uninstall >/dev/null || fail "the Linux uninstall failed"
+    [ -f "$sched_units/roundhouse-fleet-full.timer.removed" ] &&
+      [ -f "$sched_units/roundhouse-fleet-full.service.removed" ] ||
+      fail "the Linux uninstall kept no .removed copies"
     [ ! -e "$sched_units/roundhouse-fleet-fast.timer" ] &&
       [ ! -e "$sched_units/roundhouse-fleet-full.service" ] ||
       fail "the Linux uninstall left a unit behind"
+    # An XDG_CONFIG_HOME outside HOME would put the units outside the
+    # account's own tree: install refuses and writes nothing there.
+    sched_status=0
+    sched_out=$(XDG_CONFIG_HOME="$sched_root/outside-home" sched_schedule install 2>&1) ||
+      sched_status=$?
+    [ "$sched_status" -eq 64 ] || fail "install wrote units outside HOME ($sched_status): $sched_out"
+    [ ! -e "$sched_root/outside-home" ] || fail "install created files outside HOME"
     # No user manager (WSL without systemd): written, and the fix is named.
     rm -f "$SCHED_STATE/usermgr"
     sched_status=0

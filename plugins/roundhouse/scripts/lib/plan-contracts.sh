@@ -24,16 +24,18 @@ precondition_digest() {
 }
 
 schedule_operations_valid() {
-  # schedule_operations_valid DRAFT-OR-PLAN — the closed shape of the sealed
-  # `roundhouse:schedule` operation (fleet-schedule install|uninstall), shared
-  # by seal-plan and verify-preconditions: at most one, its exact argv, and
-  # steps that only write, keep, remove or absorb an absolute definition path
-  # or run a launchctl/systemctl argv. Which paths and commands THIS host's
-  # jobs own is fleet_schedule_execute's to check where they run.
-  jq -e '
+  # schedule_operations_valid DRAFT-OR-PLAN HOME — the closed shape of the
+  # sealed `roundhouse:schedule` operation (fleet-schedule install|uninstall),
+  # shared by seal-plan and verify-preconditions: at most one, its exact argv,
+  # and steps that only write, keep, remove or absorb an absolute definition
+  # path UNDER HOME, or run a launchctl/systemctl argv for a named effect.
+  # Which paths and commands THIS host's jobs own is fleet_schedule_execute's
+  # to check where they run.
+  jq -e --arg home "$2" '
     def abs: type == "string" and length > 0 and length <= 1024 and
       startswith("/") and (contains("\\") | not) and
       (test("(^|/)\\.\\.?(/|$)") | not);
+    def in_home: abs and ($home | length) > 1 and startswith($home + "/");
     def hex: type == "string" and test("^[0-9a-f]{64}$");
     def exact($k): (keys | sort) == ($k | sort);
     ([.operations[] | select(.id == "roundhouse:schedule")] | length) <= 1 and
@@ -48,23 +50,24 @@ schedule_operations_valid() {
         if .action == "write" then
           $action == "install" and exact(["action","before","digest","form","mode","path"]) and
           (.mode | IN("fast","full")) and (.form | IN("plist","service","timer")) and
-          (.path | abs) and (.path | endswith("." + $s.form)) and (.digest | hex) and
+          (.path | in_home) and (.path | endswith("." + $s.form)) and (.digest | hex) and
           (.before == null or (.before | hex))
         elif .action == "keep" then
           $action == "install" and exact(["action","digest","form","mode","path"]) and
           (.mode | IN("fast","full")) and (.form | IN("plist","service","timer")) and
-          (.path | abs) and (.path | endswith("." + $s.form)) and (.digest | hex)
+          (.path | in_home) and (.path | endswith("." + $s.form)) and (.digest | hex)
         elif .action == "remove" then
           $action == "uninstall" and exact(["action","before","form","mode","path"]) and
           (.mode | IN("fast","full")) and (.form | IN("plist","service","timer")) and
-          (.path | abs) and (.path | endswith("." + $s.form)) and (.before | hex)
+          (.path | in_home) and (.path | endswith("." + $s.form)) and (.before | hex)
         elif .action == "absorb" then
           $action == "install" and exact(["action","before","path","to"]) and
-          (.path | abs) and (.path | endswith(".plist")) and (.before | hex) and
-          (.to | abs) and (.to | startswith($s.path + ".absorbed"))
+          (.path | in_home) and (.path | endswith(".plist")) and (.before | hex) and
+          (.to | in_home) and (.to | startswith($s.path + ".absorbed"))
         elif .action == "run" then
-          exact(["action","argv","mode","required"]) and
+          exact(["action","argv","effect","mode","required"]) and
           (.mode | IN("fast","full","legacy","all")) and (.required | type == "boolean") and
+          (.effect | IN("enable","load","unload","reload","restart","enable-start","disable-stop")) and
           (.argv | type == "array" and length >= 2 and length <= 6) and
           all(.argv[]; type == "string" and length > 0 and length <= 1024) and
           (.argv[0] | IN("launchctl","systemctl"))

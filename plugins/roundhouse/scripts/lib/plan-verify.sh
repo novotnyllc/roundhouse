@@ -693,7 +693,7 @@ verify_preconditions_command() {
     }
   fi
   if jq -e 'any(.operations[]; .id == "roundhouse:schedule")' "$plan" >/dev/null; then
-    schedule_operations_valid "$plan" || {
+    schedule_operations_valid "$plan" "$HOME" || {
       printf 'roundhouse: invalid fleet-schedule plan operation\n' >&2
       exit 64
     }

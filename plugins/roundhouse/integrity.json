@@ -150,15 +150,23 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "28f4b3f0568fe55c8a83d6006f03ceeb4b9058ed6854abb1e2926b8f84832a53"
+      "sha256": "cfbd2174dcb5792f23c3ec8d8b1557345098e33f4d7a50f187ac591b76003409"
+    },
+    {
+      "path": "scripts/lib/fleet-schedule-plan.sh",
+      "sha256": "ba8568fb0e001766f3cbb97ccfc287640087036feee20cfe54b82f4ccd25c6d8"
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
-      "sha256": "2c5926302ba3e493551a721be82aa0fc76e8bc5d18d206d88fc2b83b45b3fd5f"
+      "sha256": "a8ea3abb7f51d8fd251542b5c1a6c443df42566ec1bb107ee884f10e23ef7a9d"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
       "sha256": "a9a3391290f38cc9e14b23739b4471b1bf2f2304988c5514e1c97ada39d0a62e"
+    },
+    {
+      "path": "scripts/lib/fleet-trigger.sh",
+      "sha256": "1c1c726dab279c017bbad9aec801eb817b03c65610ae05215981a6743e1f8b2d"
     },
     {
       "path": "scripts/lib/fleet-trust.sh",
@@ -202,15 +210,15 @@
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
-      "sha256": "ca2949071015e8112554bf9ea75c2d073648984aa5d8d1899061f5446a25729c"
+      "sha256": "48d3d132942167f723b29265dba41deba48d26551cc07b90daf31dff55a0d152"
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "f502f1bcb86075d7e5719a911c3bee76ae9f787789e1ce7957081172b0f92637"
+      "sha256": "de8927c132908f6279010ece7109dd89664456be5c4cb07a573314393534fade"
     },
     {
       "path": "scripts/lib/plan-verify.sh",
-      "sha256": "51df9a10ef519829978f98b90fa25ea94d58efe8b3e5417eceb2006f81f9b288"
+      "sha256": "60e42fcaa3ce598fca8519bb9b1c2a3b1990cb25989ee688599b803ab75159b7"
     },
     {
       "path": "scripts/lib/timeout.sh",
@@ -254,7 +262,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "be2429b2102877b275bef1ecbced5d0afc5ad7bc9d1078f0395a545c40f54a5b"
+      "sha256": "18f8a126c491b0a12f5fd6a9f13920fbd1abb11e187cacb240f1266280749176"
     },
     {
       "path": "scripts/roundhouse-trustd",
