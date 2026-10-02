@@ -150,8 +150,9 @@ fleet_run_item_plan() {
   done <"$plan_tmp/items"
   : >"$plan_tmp/holds"
   if [ "$plan_ok" = true ] && [ -s "$plan_tmp/verdict-files" ]; then
+    # xargs execs yq, bypassing the function: see select_mikefarah_yq.
     cut -f1 "$plan_tmp/verdict-files" | tr '\n' '\0' |
-      xargs -0 yq -o=json -I=0 '{"f": filename, "v": (.verdict // ""), "d": (.digest // "")}' \
+      xargs -0 "${ROUNDHOUSE_YQ:-yq}" -o=json -I=0 '{"f": filename, "v": (.verdict // ""), "d": (.digest // "")}' \
         >"$plan_tmp/verdicts.json" 2>/dev/null || plan_ok=false
     [ "$plan_ok" = false ] ||
       jq -r 'select(.v == "hold" and .d != "") | "\(.f)\t\(.d | tostring)"' \
@@ -3831,8 +3832,9 @@ fleet_run_review_holds() {
   rh_ok=true
   : >"$rh_tmp/holds"
   if [ -s "$rh_tmp/files" ]; then
+    # xargs execs yq, bypassing the function: see select_mikefarah_yq.
     cut -f1 "$rh_tmp/files" | tr '\n' '\0' |
-      xargs -0 yq -o=json -I=0 '{"f": filename, "v": (.verdict // ""), "d": (.digest // "")}' \
+      xargs -0 "${ROUNDHOUSE_YQ:-yq}" -o=json -I=0 '{"f": filename, "v": (.verdict // ""), "d": (.digest // "")}' \
         >"$rh_tmp/verdicts.json" 2>/dev/null || rh_ok=false
     [ "$rh_ok" = false ] ||
       jq -r 'select(.v == "hold" and .d != "") | "\(.f)\t\(.d | tostring)"' \

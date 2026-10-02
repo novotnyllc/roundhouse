@@ -158,6 +158,11 @@ trustd_pin_toolchain() {
     trustd_root_owned "$trustd_tool_abs" && [ -x "$trustd_tool_abs" ] ||
       trustd_die "pinned $trustd_tool is not a root-owned executable: $trustd_tool_abs" 77
     eval "$trustd_tool() { \"$trustd_tool_abs\" \"\$@\"; }"
+    # An exec'd yq (xargs) names ROUNDHOUSE_YQ, not the function: pin it too.
+    if [ "$trustd_tool" = yq ]; then
+      ROUNDHOUSE_YQ=$trustd_tool_abs
+      export ROUNDHOUSE_YQ
+    fi
   done
 }
 
