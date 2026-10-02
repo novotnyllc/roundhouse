@@ -1071,8 +1071,11 @@ p0jj_ratchet_init() {
     runjj_lib vireo fleet_now >"$rjj/vireo/materialized-at"
   }
   runjj_run() {
+    # runjj_run — a converging pass (--full): these scenarios are about what a
+    # pass that materializes does to the ratchet, and a fast pass rightly
+    # stops at the poll floor when only records moved on the remote.
     runjj_status=0
-    runjj_out=$(runjj vireo "$cli" fleet-run --fast 2>&1) || runjj_status=$?
+    runjj_out=$(runjj vireo "$cli" fleet-run --full 2>&1) || runjj_status=$?
   }
 }
 
