@@ -35,11 +35,21 @@ its ceremonies.
 
 ## Trust model, stated plainly
 
-Per host, the lane trusts **the owning user**. Anything that can run as that
-user (an SSH session, an agent, a scheduled task, malware with the user's
-token) can ask the lane to perform any of its allowlisted actions. The lane
-does not try to distinguish "the user" from "a process the user runs"; the
-offline CA that used to make that distinction is the thing being removed.
+Per host, the lane trusts **the owning user account**. Anything that can
+run as that user (an SSH session, an agent, a scheduled task, malware with
+the user's token) can ask the lane to perform any of its allowlisted
+actions. The lane does not try to distinguish "the user" from "a process
+the user runs"; the offline CA that used to make that distinction is the
+thing being removed.
+
+Stated plainly: an owner-level process can submit catalog actions directly,
+including by fabricating the sealed-plan fields a request carries (they are
+checked for shape, not bound to a plan root can verify). What it can do is
+bounded to the closed apt catalog against the host's configured
+repositories and keyrings — install, upgrade, refresh, autoremove — which
+is the same authority as a narrow `NOPASSWD` sudoers line for `apt-get`.
+Binding requests to an unforgeable root-held capability is a possible
+hardening, tracked separately; it is deliberately not part of this design.
 
 What the lane still guarantees:
 

@@ -713,6 +713,12 @@ discard_enrollment_backup() {
 }
 revoke_command() {
   require_root revoke
+  # Never under a running dispatch: its native command would finish into
+  # directories that no longer exist. The lock is taken like a dispatch
+  # takes it, and a held lock is a refusal (75), not a wait.
+  if [ -d "$state_dir" ]; then
+    take_lock || die 75 'revoke: a dispatch is running; retry when it has finished'
+  fi
   rm -f "$sudoers_path" "$installed_script" "$identity_path"
   rm -rf "$ingress_dir" "$claims_dir" "$results_dir" "$lock_dir"
   [ ! -d "$journal_dir" ] || printf 'event|%s|revoke|-|-|-|revoked|lane_removed|-|-\n' "$(now)" >>"$journal_path"
@@ -751,8 +757,10 @@ take_lock() {
   fi
   holder=$(cat "$lock_dir/pid" 2>/dev/null || :)
   if [[ $holder =~ ^[1-9][0-9]*$ ]]; then
-    # A live holder is a competitor; a dead one is a crash.
-    ! kill -0 "$holder" 2>/dev/null || return 1
+    # A live holder is a competitor; a dead one is a crash. A lock older
+    # than any dispatch ever runs is a crash too, whatever process now
+    # happens to carry its pid.
+    if kill -0 "$holder" 2>/dev/null && [ $(( $(now) - $(file_mtime "$lock_dir") )) -le 3600 ]; then return 1; fi
   else
     # No pid yet: the holder is between mkdir and its pid write — a
     # competitor, unless the directory has sat there far longer than any
@@ -1288,6 +1296,14 @@ self_test() {
   rc=0; out=$(sealed apt.autoremove.v1) || rc=$?
   [ "$rc" -eq 71 ] && grep -Fqx 'reason|post_check_failed' <<<"$out" || self_fail "a failed autoremove simulation was not a failed post-check (rc $rc)"
   rm -f "$root/apt-simulate-fail"
+  # A lock whose pid is alive but whose age is beyond any dispatch is a
+  # crashed dispatcher's lock carried by a reused pid: reclaimed.
+  mkdir "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid"
+  touch -t "$(date -u -v-2H +%Y%m%d%H%M 2>/dev/null || date -u -d '-2 hours' +%Y%m%d%H%M)" "$root/fixture$lane_state/lock"
+  rc=0; "$installed" dispatch >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || self_fail "an hours-old lock with a reused live pid was not reclaimed (rc $rc)"
+  [ "$(cat "$root/fixture$lane_state/lock/pid" 2>/dev/null)" != "$$" ] || self_fail 'the stale lock was left in place'
+  rm -rf "$root/fixture$lane_state/lock"
   # A lock directory with no pid yet belongs to a dispatcher between mkdir
   # and its pid write: a competitor, never a stale lock to break.
   mkdir "$root/fixture$lane_state/lock"
@@ -1410,6 +1426,12 @@ self_test() {
   rc=0; out=$("$installed" status) || rc=$?
   [ "$rc" -eq 74 ] && grep -Fqx 'state|drifted' <<<"$out" || self_fail 'owner-inaccessible results dir reported as ready'
   chmod 755 "$root/fixture$lane_state/results"
+  # Revocation under a running dispatch is refused, and removes nothing.
+  mkdir "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid"
+  rc=0; out=$("$installed" revoke 2>&1) || rc=$?
+  [ "$rc" -eq 75 ] && [ -f "$installed" ] && [ -f "$root/fixture$lane_sudoers" ] && [ -d "$root/fixture$lane_state/ingress" ] ||
+    self_fail "revocation during a dispatch was not refused (rc $rc): $out"
+  rm -rf "$root/fixture$lane_state/lock"
   # Revocation removes the grant, the script and the queue, keeps the journal.
   rc=0; out=$("$installed" revoke) || rc=$?
   [ "$rc" -eq 0 ] && [ ! -e "$root/fixture$lane_sudoers" ] && [ ! -e "$installed" ] &&
