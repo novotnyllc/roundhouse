@@ -224,7 +224,9 @@ JSON
     run_repair_identity
     [ "$(grep -c . "$run_repair_updates")" -eq 2 ] ||
       fail "a new pass did not retry a marketplace repair an earlier pass failed"
-    cli_function_body fleet_run_command | grep -B4 'fleet_run_marketplace_repair_reset' |
+    # The pass body is fleet_run_pass: fleet_run_command takes the lock and
+    # runs it, re-running it in-process when a trigger lands mid-pass.
+    cli_function_body fleet_run_pass | grep -B4 'fleet_run_marketplace_repair_reset' |
       grep -q 'review -> verdict -> apply' ||
       fail "the repair memo is no longer reset at the start of each pass's apply step"
     printf '%s\n' "$run_repair_saved_settings" >"$HOME/.claude/settings.json"
@@ -386,6 +388,33 @@ JSON
       printf '%s\n' "$run_claude_line" | fleet_run_claude_cmdline_match ||
         fail "a running claude CLI was not recognised: $run_claude_line"
     done
+    # #40 review (c): argv[0] itself may carry spaces — a node under a home
+    # directory with one, or an nvm tree — and is read as the longest leading
+    # path whose basename is node.
+    for run_claude_line in \
+      '/Users/First Last/.nvm/versions/node/v24.1.0/bin/node /Users/First Last/.nvm/versions/node/v24.1.0/bin/claude --resume' \
+      '/Users/First Last/.nvm/versions/node/v24.1.0/bin/node /Users/First Last/.nvm/versions/node/v24.1.0/lib/node_modules/@anthropic-ai/claude-code/cli.js' \
+      '/opt/my tools/node22 /opt/my tools/bin/claude' \
+      '/Users/First Last/.nvm/versions/node/v24.1.0/bin/node /Users/First Last/.npm-global/bin/claude --worktree /Users/First Last/src/my node'; do
+      printf '%s\n' "$run_claude_line" | fleet_run_claude_cmdline_match ||
+        fail "a claude CLI under a node path with spaces was not recognised: $run_claude_line"
+    done
+    # A LATER argument whose basename is node never becomes argv[0]: the
+    # first node boundary is argv[0], and the script follows it.
+    for run_claude_line in \
+      '/usr/local/bin/node /usr/local/bin/claude --worktree /tmp/node' \
+      '/usr/local/bin/node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js --add-dir /srv/node' \
+      'node /Users/x/.npm-global/bin/claude --worktree /tmp/node' \
+      '/opt/node22 /opt/bin/claude -p hi /var/lib/node22'; do
+      printf '%s\n' "$run_claude_line" | fleet_run_claude_cmdline_match ||
+        fail "a later argument named node replaced argv[0]: $run_claude_line"
+    done
+    for run_claude_line in \
+      '/Users/First Last/.nvm/versions/node/v24.1.0/bin/node /srv/app/server.js claude' \
+      '/Users/First Last/bin/python /tmp/node /x/claude-notes'; do
+      ! printf '%s\n' "$run_claude_line" | fleet_run_claude_cmdline_match ||
+        fail "something that is not the claude CLI read as one: $run_claude_line"
+    done
     for run_claude_line in '/Applications/Claude.app/Contents/MacOS/Claude' \
       'grep claude' 'awk { exe == "claude" }' 'node /srv/app/server.js claude' \
       'vim /tmp/claude-notes'; do
@@ -520,6 +549,80 @@ JSON
     [ "$run_status" -eq 75 ] ||
       fail "an unresolvable tombstone definition did not hold (got $run_status)"
     ) || exit 1
+    # #40 review (d): a ps that FAILS is "unknown", never "no session" — an
+    # enabled plugin is not uninstalled out from under a session nobody could
+    # see. A subshell, because the probe is replaced again below.
+    (
+      run_ps_bin="$run_root/ps-fail-bin"
+      mkdir -p "$run_ps_bin"
+      printf '#!/bin/sh\nexit 1\n' >"$run_ps_bin/ps"
+      chmod +x "$run_ps_bin/ps"
+      run_status=0
+      PATH="$run_ps_bin:$PATH" fleet_run_claude_running || run_status=$?
+      [ "$run_status" -eq 75 ] ||
+        fail "a failed process probe did not read as unknown (got $run_status)"
+      run_tomb_installed
+      printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+      rm -rf "$(fleet_run_state_dir)/deferrals"
+      : >"$run_plugin_order_log"
+      PATH="$run_ps_bin:$PATH"
+      run_tomb_apply '"absent"'
+      [ "$run_status" -eq 75 ] && grep -q 'cannot tell whether a claude session is running' \
+        "$run_root/tomb-out" ||
+        fail "a failed process probe did not hold the uninstall (got $run_status): $(cat "$run_root/tomb-out")"
+      ! grep -q uninstall "$run_plugin_order_log" ||
+        fail "a failed process probe let the uninstall through"
+    ) || exit 1
+
+    # #40 review (b): a declared `url` source with a ref registers WITH the
+    # ref, so the registration reads back as its own declaration, not as a
+    # same-name repoint held forever.
+    (
+      run_url_dir="$run_root/url-config"
+      mkdir -p "$run_url_dir"
+      CLAUDE_CONFIG_DIR=$run_url_dir
+      export CLAUDE_CONFIG_DIR
+      printf '%s\n' '{"extraKnownMarketplaces":{"url-market":{"source":{"source":"url","url":"https://example.invalid/market.json","ref":"stable"}}}}' \
+        >"$run_url_dir/settings.json"
+      [ "$(fleet_run_marketplace_source url-market)" = \
+        'https://example.invalid/market.json#stable' ] ||
+        fail "a declared url source with a ref registers without it: $(fleet_run_marketplace_source url-market || :)"
+      run_url_list="$run_root/url-marketplaces.json"
+      for run_url_entry in \
+        '{"name":"url-market","source":"url","url":"https://example.invalid/market.json#stable"}' \
+        '{"name":"url-market","source":"url","url":"https://example.invalid/market.json","ref":"stable"}'; do
+        printf '[%s]\n' "$run_url_entry" >"$run_url_list"
+        fleet_run_marketplace_repair_reset
+        CLAUDE_PLUGIN_MARKETPLACE_FILE=$run_url_list fleet_run_marketplace_source_ok url-market ||
+          fail "a url marketplace registered from its own declaration read as a repoint ($fleet_run_repair_reason): $run_url_entry"
+      done
+      # …while a registration that lost the ref, or names another URL, is one.
+      for run_url_entry in \
+        '{"name":"url-market","source":"url","url":"https://example.invalid/market.json"}' \
+        '{"name":"url-market","source":"url","url":"https://elsewhere.invalid/market.json#stable"}'; do
+        printf '[%s]\n' "$run_url_entry" >"$run_url_list"
+        fleet_run_marketplace_repair_reset
+        ! CLAUDE_PLUGIN_MARKETPLACE_FILE=$run_url_list fleet_run_marketplace_source_ok url-market ||
+          fail "a url marketplace registered from another source was accepted: $run_url_entry"
+      done
+      fleet_run_marketplace_repair_reset
+    ) || exit 1
+
+    # #40 review (a): a plugin whose definition does not resolve HOLDS. It
+    # used to fall through to the unqualified id and install from the
+    # manager's default marketplace.
+    run_unresolved_installs="$run_root/unresolved-installs"
+    : >"$run_unresolved_installs"
+    : >"$run_plugin_order_log"
+    run_status=0
+    CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_unresolved_installs" \
+      fleet_run_apply_item "$run_store" vireo '{"plugins":{"solo":"not-a-map"}}' \
+      plugins.solo '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "a plugin with an unresolvable definition was not held (got $run_status)"
+    [ ! -s "$run_unresolved_installs" ] && ! grep -q 'install' "$run_plugin_order_log" ||
+      fail "a plugin with an unresolvable definition was installed from the default marketplace"
+
     # `absent` stays HELD where there is no uninstall verb.
     for run_tomb_other in skills.tdd packages.jj agents.triage-bot; do
       run_status=0

@@ -244,7 +244,11 @@ fleet_run_marketplace_source() {
   fleet_run_msource=
   fleet_run_msettings=$(fleet_run_settings_path)
   # A declared ref (branch or tag) is kept with `#ref`, so registration
-  # resolves the revision the user pinned rather than the default branch.
+  # resolves the revision the user pinned rather than the default branch —
+  # for EVERY source kind the locator gives a ref to, `url` included. A `url`
+  # registered without it was always read back as a repoint of its own
+  # declaration (fleet_run_marketplace_locator_filter appends the ref) and
+  # held forever.
   [ ! -f "$fleet_run_msettings" ] ||
     fleet_run_msource=$(jq -er --arg n "$1" '
       .extraKnownMarketplaces[$n].source // empty |
@@ -252,7 +256,7 @@ fleet_run_marketplace_source() {
       if .source == "github" then .repo + $ref
       elif .source == "git" then .url + $ref
       elif .source == "directory" then .path
-      elif .source == "url" then .url
+      elif .source == "url" then .url + $ref
       else empty end
     ' "$fleet_run_msettings" 2>/dev/null) || fleet_run_msource=
   case $fleet_run_msource in
@@ -564,11 +568,18 @@ fleet_run_claude_running() {
   # view misses one install: `comm` names the native binary even when its path
   # carries spaces (the desktop-bundled copy), but an npm-installed `claude` is
   # `node …/cli.js` and its comm is `node` — only the command line shows that.
-  ps -A -o comm= 2>/dev/null | awk '
+  #
+  # Exit 0 running, 1 not running, 75 UNKNOWN. A `ps` that fails — absent,
+  # denied, a flag this platform does not take — has answered nothing, and
+  # reading that as "no session" uninstalled plugins under a live one; the
+  # caller holds instead.
+  fleet_run_ps_out=$(ps -A -o comm= 2>/dev/null) || return 75
+  printf '%s\n' "$fleet_run_ps_out" | awk '
     { name = $0; sub(/.*\//, "", name) }
     name == "claude" { found = 1; exit }
     END { exit(found ? 0 : 1) }' && return 0
-  ps -A -ww -o command= 2>/dev/null | fleet_run_claude_cmdline_match
+  fleet_run_ps_out=$(ps -A -ww -o command= 2>/dev/null) || return 75
+  printf '%s\n' "$fleet_run_ps_out" | fleet_run_claude_cmdline_match
 }
 
 fleet_run_claude_cmdline_match() {
@@ -583,12 +594,35 @@ fleet_run_claude_cmdline_match() {
   # space), so the script is read as everything after argv[0], not as one
   # field. That can over-match a later argument ending in `/claude` — which
   # only DEFERS an uninstall, the safe direction.
+  #
+  # argv[0] may carry spaces too: `/Users/First Last/.nvm/…/bin/node`. It is
+  # read as the SHORTEST leading run of fields whose basename is `node` (or
+  # `nodeNN`) — a bare `node`, or an absolute path — and the script is what
+  # follows it. `ps` joins argv with single spaces, so the lengths line up.
+  # The FIRST such boundary wins and nothing after it can move it: a later
+  # argument that merely ends in `/node` (`--worktree /tmp/node`) is an
+  # argument, and taking it as argv[0] hid the script and read a live session
+  # as none. An earlier boundary only lengthens what is searched for the
+  # script, which over-matches — the safe direction.
   awk '
     { exe = $1; sub(/.*\//, "", exe) }
     exe == "claude" { found = 1; exit }
-    exe ~ /^node([0-9.]*)?$/ {
-      rest = substr($0, length($1) + 2)
-      if (rest ~ /\/@anthropic-ai\/claude-code\// || rest ~ /(^|\/)claude( |$)/) { found = 1; exit }
+    {
+      argv0 = 0
+      prefix = ""
+      for (i = 1; i <= NF; i++) {
+        prefix = (i == 1 ? $1 : prefix " " $i)
+        base = prefix
+        sub(/.*\//, "", base)
+        if (base ~ /^node([0-9.]*)?$/ && (i == 1 || prefix ~ /^\//)) {
+          argv0 = length(prefix)
+          break
+        }
+      }
+      if (argv0 > 0) {
+        rest = substr($0, argv0 + 2)
+        if (rest ~ /\/@anthropic-ai\/claude-code\// || rest ~ /(^|\/)claude( |$)/) { found = 1; exit }
+      }
     }
     END { exit(found ? 0 : 1) }'
 }
@@ -647,7 +681,19 @@ fleet_run_uninstall_plugin() {
   command -v claude >/dev/null 2>&1 || return 75
   fleet_run_uninstall_enabled=$(fleet_run_plugin_enabled \
     "$fleet_run_uninstall_target" true) || return 75
-  if [ "$fleet_run_uninstall_enabled" != false ] && fleet_run_claude_running; then
+  # A session probe that could not answer HOLDS: "no session" would uninstall
+  # an enabled plugin out from under one that is running.
+  fleet_run_uninstall_live=1
+  if [ "$fleet_run_uninstall_enabled" != false ]; then
+    fleet_run_uninstall_live=0
+    fleet_run_claude_running || fleet_run_uninstall_live=$?
+  fi
+  if [ "$fleet_run_uninstall_live" -eq 75 ]; then
+    printf '  hold  %s — cannot tell whether a claude session is running (the process probe failed); %s stays installed\n' \
+      "$2" "$fleet_run_uninstall_target"
+    return 75
+  fi
+  if [ "$fleet_run_uninstall_live" -eq 0 ]; then
     fleet_run_uninstall_digest=$(printf '%s\n' "$4" | fleet_value_digest "$2")
     fleet_run_uninstall_first=$(awk -v d="$fleet_run_uninstall_digest" \
       '$1 == d { print $2; exit }' "$fleet_run_uninstall_deferral" 2>/dev/null)

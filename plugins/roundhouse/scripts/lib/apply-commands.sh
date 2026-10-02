@@ -617,6 +617,20 @@ apply_plan_command() {
           any($records[]; .kind == "chezmoi_state" and .id == "live" and
             .status == "present" and .data.drift_count == 0)
         end
+      elif .type == "agent-update" and .id == "roundhouse:schedule" then
+        # Every definition a step wrote or kept is on disk at its sealed
+        # digest, and every one it removed or absorbed is gone.
+        . as $operation |
+        any($records[];
+          .kind == "agent_artifact" and .id == "roundhouse:schedule" and
+          (.status | IN("present","absent")) and
+          (((.data.files // []) + (.data.legacy // [])) as $files |
+            all($operation.steps[]; . as $s |
+              if .action == "write" or .action == "keep" then
+                any($files[]; .path == $s.path and .digest == $s.digest)
+              elif .action == "remove" or .action == "absorb" then
+                all($files[]; .path != $s.path or .digest == null)
+              else true end)))
       elif .type == "agent-update" and .id == "roundhouse:launcher" then
         . as $operation |
         any($records[];

@@ -27,6 +27,27 @@ if [ -n "$fleet_fixture_yq" ]; then
     export ROUNDHOUSE_FLEET_STORE HOME
     mkdir -p "$HOME"
 
+    # --- which held applies keep the poll floor open (retry-owed) ---
+    # Transient holds (a tombstone's live-session deferral or failed probe, a
+    # plugin's bounded install or unresolved marketplace) and every failure
+    # are retried every pass; standing capability holds are left to the full
+    # cadence.
+    for run_retry_case in '75 true plugins' '75 false plugins' '75 true skills' \
+      '1 false plugins' '65 false packages' '73 false packages' '64 false skills'; do
+      # shellcheck disable=SC2086 # deliberate: status, tombstone, category
+      fleet_run_hold_owes_retry $run_retry_case ||
+        fail "a transient hold ($run_retry_case) left the poll floor free to skip its retry"
+    done
+    for run_retry_case in '75 false packages' '75 false hooks' '75 false skills'; do
+      # shellcheck disable=SC2086 # deliberate: status, tombstone, category
+      ! fleet_run_hold_owes_retry $run_retry_case ||
+        fail "a standing capability hold ($run_retry_case) held the poll floor open"
+    done
+    # A plugin hold on a host with no claude at all is standing: the fixture
+    # stubs claude into its PATH, so this case runs on a PATH without it.
+    ! PATH=/usr/bin:/bin fleet_run_hold_owes_retry 75 false plugins ||
+      fail "a plugin hold on a host with no claude held the poll floor open"
+
     # --- §6.1 the two cadences and the jitter that spreads them ---
     # Seeded from the host NAME. A fleet whose hosts re-roll their offset every
     # run converges on the same minute as often as it spreads out, and jitter
@@ -1407,8 +1428,12 @@ STUB
       fail "the nudge never reached the peer"
     ! grep -q 'rh-vireo' "$ROUNDHOUSE_NUDGE_LOG" ||
       fail "the pushing host nudged itself"
-    grep -q 'fleet-run --fast' "$ROUNDHOUSE_NUDGE_LOG" ||
+    # §6.1: the nudge is the peer's trigger, never its pass — a pass inside
+    # this ten-second channel is what the watchdog used to kill mid-apply.
+    grep -q 'fleet-trigger --fast' "$ROUNDHOUSE_NUDGE_LOG" ||
       fail "the nudge carried something other than \"go look\""
+    ! grep -q 'fleet-run' "$ROUNDHOUSE_NUDGE_LOG" ||
+      fail "the nudge still runs the peer's pass inside the SSH channel"
     grep -Fqx wren "$(fleet_run_state_dir)/nudge-unreachable" ||
       fail "an unreachable peer was not remembered for the interval"
     # Remembered for ONE interval only, so a peer that comes back is retried.

@@ -196,6 +196,45 @@ check_owner_only_file() {
   }
 }
 
+# --- errexit, where callers depend on it -----------------------------------------
+#
+# bash IGNORES `set -e` inside anything run as part of `… || …`, `… && …`,
+# `if …`, `while …` or `! …` — and inside every function and subshell that runs
+# there, even one that says `set -e` itself. Code that stops on its first
+# failed check through errexit (seal-plan, apply-plan, a converge pass) then
+# carries on past the failure. These two make that a refusal, not a surprise.
+
+errexit_require() {
+  # errexit_require WHAT — exit 70 when called where errexit is suppressed.
+  # Probe: a subshell that turns errexit on and fails; it stops at `false`
+  # only where errexit can take effect. (bash 3.2 and 5.x alike.)
+  errexit_require_was=$-
+  set +e
+  ( set -e; false; true )
+  errexit_require_status=$?
+  case $errexit_require_was in *e*) set -e ;; esac
+  [ "$errexit_require_status" -ne 0 ] || {
+    printf 'roundhouse: internal error: %s ran where errexit is suppressed (an `|| …`, `&& …`, `if` or `!` caller); refusing rather than running on past a failed check\n' \
+      "$1" >&2
+    exit 70
+  }
+}
+
+errexit_capture() {
+  # errexit_capture VAR COMMAND [ARG...] — run COMMAND in a subshell with
+  # errexit LIVE inside it and its exit status in VAR: the one way to keep
+  # errexit for COMMAND while taking its status. The caller's errexit setting
+  # is restored as it was. COMMAND's variable assignments stay in its subshell.
+  errexit_capture_var=$1
+  shift
+  errexit_capture_was=$-
+  set +e
+  ( set -e; "$@" )
+  errexit_capture_status=$?
+  case $errexit_capture_was in *e*) set -e ;; esac
+  printf -v "$errexit_capture_var" '%s' "$errexit_capture_status"
+}
+
 check_mutation_config() {
   validate_config_file
   check_private_owned_file "$(config_path)" "mutation configuration"

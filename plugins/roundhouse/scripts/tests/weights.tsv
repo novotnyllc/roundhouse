@@ -28,6 +28,10 @@
 79-node-runtime	131
 80-alerts	9
 83-apply-claude	15
+84-schedule#1	41
+84-schedule#2	150
+84-schedule#3	87
+85-liveness	5
 86-publish-verbs	9
 90-jj-bootstrap	15
 91-jj-integrity	50
