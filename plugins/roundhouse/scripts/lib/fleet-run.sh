@@ -1582,12 +1582,22 @@ fleet_run_publish() {
   # working-copy commit of its own; naming the target is what makes @ a child
   # of the bookmark instead of a child of that leftover, and it is the line
   # that keeps §8.1's invariant true between runs.
+  #
+  # A bookmark move that jj REFUSES is a failed publish, never a silent one: jj
+  # will not move main sideways or backwards (an @ that descends from a stale
+  # local head, not from main), and pushing the unmoved main afterwards pushes
+  # nothing while the caller reports success and the work sits in an orphan.
+  # No --allow-backwards: a move that would drop main's own commits is exactly
+  # what must not happen quietly.
   if [ "$(jj -R "$1" log -r @ --no-graph -T 'if(empty,"y","n")')" = n ]; then
     jj -R "$1" describe -r @ -m "${6:-converge on $2}
 
 $(fleet_vcs_trailers "$2" "$3" "$4" "$5")" >/dev/null
     jj -R "$1" bookmark set main \
-      -r "$(jj -R "$1" log -r @ --no-graph -T 'commit_id')" >/dev/null
+      -r "$(jj -R "$1" log -r @ --no-graph -T 'commit_id')" >/dev/null || {
+      printf 'roundhouse: could not move main to the new commit (it does not descend from main); nothing published\n' >&2
+      return 65
+    }
   fi
   fleet_run_target=$(fleet_vcs_heads_local "$1" | head -1)
   [ -n "$fleet_run_target" ] || return 65

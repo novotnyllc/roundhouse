@@ -866,6 +866,31 @@ p0jj_disown() {
   esac
   ! runjj_outcomes "$runjj_hostonly" | grep -qx reverted ||
     fail "a disowned item was journaled reverted"
+  # A bookmark move jj refuses is a FAILED publish. An @ that descends from a
+  # stale head — here main's parent — is sideways from main; jj will not move
+  # main there, and the publish must say so and fail rather than push the
+  # unmoved main and report success while the work sits in an orphan.
+  runjj_main=$(fleet_vcs_heads_local "$vireo")
+  jj -R "$vireo" new "$runjj_main-" >/dev/null
+  printf 'orphan: probe\n' >"$vireo/orphan-probe.yaml"
+  runjj_status=0
+  runjj_out=$(runjj_lib vireo fleet_run_publish "$vireo" vireo interactive/human \
+    'a publish from a stale head' 'orphan-probe' 'stale-head probe' 2>&1) ||
+    runjj_status=$?
+  [ "$runjj_status" -eq 65 ] ||
+    fail "a publish whose bookmark move jj refused did not fail with 65 (got $runjj_status): $runjj_out"
+  case $runjj_out in
+    *'could not move main to the new commit'*'nothing published'*) ;;
+    *) fail "a refused bookmark move was not reported: $runjj_out" ;;
+  esac
+  [ "$(fleet_vcs_heads_local "$vireo")" = "$runjj_main" ] ||
+    fail "main moved although the publish failed"
+  [ "$(fleet_vcs_head_origin "$vireo")" = "$runjj_main" ] ||
+    fail "the remote moved although the publish failed"
+  runjj_orphan=$(jj -R "$vireo" log -r @ --no-graph -T 'commit_id')
+  jj -R "$vireo" new "$runjj_main" >/dev/null
+  jj -R "$vireo" abandon "$runjj_orphan" >/dev/null
+  [ ! -e "$vireo/orphan-probe.yaml" ] || fail "the stale-head probe left its file in the working copy"
 }
 
 p0jj_aging() {
