@@ -117,6 +117,8 @@ EOF
 . "$script_dir/lib/fleet-store.sh"
 # shellcheck source=lib/fleet-init.sh
 . "$script_dir/lib/fleet-init.sh"
+# shellcheck source=lib/timeout.sh
+. "$script_dir/lib/timeout.sh"
 # shellcheck source=lib/npm.sh
 . "$script_dir/lib/npm.sh"
 # shellcheck source=lib/node-runtime.sh

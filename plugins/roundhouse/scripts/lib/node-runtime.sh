@@ -91,9 +91,18 @@ node_fnm_run() (
   # `node_fnm_run ROOT ARG...` — fnm pinned to the root the globals live in,
   # stdin closed (these run inside `while read` loops).
   node_fnm=$(node_fnm_bin) || exit 69
+  # Bounded like every manager call (lib/timeout.sh, where loaded): `install`
+  # downloads a runtime and gets the install ceiling, the rest the listing one.
   node_run_root=$1
   shift
-  FNM_DIR=$node_run_root exec "$node_fnm" "$@" </dev/null
+  FNM_DIR=$node_run_root
+  export FNM_DIR
+  command -v run_bounded >/dev/null 2>&1 || exec "$node_fnm" "$@" </dev/null
+  case ${1:-} in
+    install) node_run_kind=install ;;
+    *) node_run_kind=list ;;
+  esac
+  run_bounded "$(run_bounded_seconds "$node_run_kind")" "$node_fnm" "$@" </dev/null
 )
 
 node_fnm_default() (

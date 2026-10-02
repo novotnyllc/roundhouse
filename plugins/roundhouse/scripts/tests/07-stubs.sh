@@ -120,6 +120,9 @@ cat >"$tmp/bin/jsm" <<'SH'
   [ -z "${AGENT_EXEC_MARKER:-}" ] || : >"$AGENT_EXEC_MARKER"
   exit 64
 }
+# A manager that never answers, the way one held a run for ~37 hours: the
+# sleep is a CHILD, so only a whole-group stop ends it.
+[ "${JSM_HANG:-0}" != 1 ] || { sleep 587 & wait; exit 0; }
 [ "${JSM_INVALID:-0}" != 1 ] || { printf '{invalid\n'; exit 0; }
 [ "${JSM_INVALID_SHAPE:-0}" != 1 ] || { printf '%s\n' '{"skills":{"name":"bogus"}}'; exit 0; }
 if [ "${JSM_OPTION_NAME:-0}" = 1 ]; then

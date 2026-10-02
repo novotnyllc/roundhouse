@@ -49,6 +49,23 @@ fleet_sweep_range() {
   # sweep, so the caller published unswept history. Capture the exit and REFUSE
   # on nonzero (the callers refuse on any output, so a diagnostic line suffices,
   # and the nonzero return says the same to a caller that checks it).
+  #
+  # STILL PER COMMIT, NO LONGER PER PROCESS. The walk below reads every commit
+  # it sweeps in three batched jj reads (descriptions, the findings/alerts
+  # patches, and each commit's changed paths) and runs the secret predicate
+  # over every line in ONE awk (fleet_sweep_predicate_awk). A backlog of ~150
+  # unpublished commits took minutes as one jj call per commit and per file
+  # plus ~7 processes per swept line; it now takes seconds.
+  #
+  # AND IT REMEMBERS WHAT IT SWEPT CLEAN. A commit id names its description
+  # and its tree, so a commit swept clean once is clean for as long as the
+  # predicate is the same; store.run/sweep-clean records the commits of the
+  # current range that swept clean, under a key over the predicate's own code.
+  # It FAILS CLOSED: a missing, unreadable, corrupted (its header carries the
+  # sha256 of its body) or differently-keyed record is empty, so every commit
+  # is swept; only a commit that produced no finding is
+  # ever added; and the record keeps only commits of the range it was written
+  # for, so it never grows past what is unpublished.
   sweep_commits=$(mktemp "${TMPDIR:-/tmp}/roundhouse-sweep.XXXXXX") || return 65
   sweep_rc=0
   jj -R "$1" log -r "$2" --no-graph -T 'commit_id ++ "\n"' \
@@ -59,6 +76,61 @@ fleet_sweep_range() {
       "$2" "$sweep_rc"
     return 65
   }
+  sweep_dir=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-sweep.XXXXXX") || {
+    rm -f "$sweep_commits"
+    return 65
+  }
+  sweep_cache=$(fleet_run_state_dir)/sweep-clean
+  sweep_key=$(fleet_sweep_key) || sweep_key=
+  : >"$sweep_dir/cached"
+  [ -z "$sweep_key" ] ||
+    fleet_run_memo_read "$sweep_cache" "$sweep_key" >"$sweep_dir/cached" ||
+    : >"$sweep_dir/cached"
+  # The commits still to sweep, in walk order.
+  grep -E '^[0-9a-f]{40}$' "$sweep_commits" >"$sweep_dir/walk" || :
+  LC_ALL=C awk 'FILENAME == ARGV[1] { c[$0] = 1; next } !($0 in c)' \
+    "$sweep_dir/cached" "$sweep_dir/walk" >"$sweep_dir/todo"
+  : >"$sweep_dir/findings"
+  : >"$sweep_dir/dirty"
+  # Anything the walk printed that is not a commit id is swept the old way.
+  grep -vE '^[0-9a-f]{40}$' "$sweep_commits" | grep . >"$sweep_dir/odd" || :
+  sweep_ok=true
+  if [ -s "$sweep_dir/todo" ] && ! fleet_sweep_batch "$1" "$sweep_dir"; then
+    sweep_ok=false
+  fi
+  if [ "$sweep_ok" = true ]; then
+    cat "$sweep_dir/findings"
+    [ ! -s "$sweep_dir/odd" ] || fleet_sweep_commits_slow "$1" <"$sweep_dir/odd"
+    # Clean = swept here with no finding, or remembered; bounded by the range.
+    [ -z "$sweep_key" ] ||
+      LC_ALL=C awk 'FILENAME == ARGV[1] { dirty[$1] = 1; next } !($1 in dirty)' \
+        "$sweep_dir/dirty" "$sweep_commits" | grep -E '^[0-9a-f]{40}$' |
+      LC_ALL=C sort -u | fleet_run_memo_write "$sweep_cache" "$sweep_key"
+  else
+    # A batched read failed: the original walk, over everything not remembered.
+    cat "$sweep_dir/todo" "$sweep_dir/odd" | fleet_sweep_commits_slow "$1"
+  fi
+  rm -rf "$sweep_dir"
+  rm -f "$sweep_commits"
+}
+
+fleet_sweep_key() {
+  # The record's key: the code of the predicate and of this walk. A change to
+  # either is a different key, so nothing swept by an older predicate counts.
+  {
+    printf 'sweep v1 cap %s\n' "$fleet_replicated_cap"
+    declare -f fleet_quote_is_secret fleet_quote_is_content_address \
+      fleet_sweep_range fleet_sweep_batch fleet_sweep_commits_slow
+    printf '%s\n' "$fleet_sweep_predicate_awk"
+    # …and all of the code, as the signature memo keys it: whatever changes,
+    # nothing an older build swept counts.
+    cat "$script_dir/roundhouse" "$script_dir"/lib/*.sh
+  } | sha256_stream
+}
+
+fleet_sweep_commits_slow() {
+  # fleet_sweep_commits_slow STORE < commit ids — the original per-commit,
+  # per-process walk, kept verbatim as the path every batch failure takes.
   while IFS= read -r sweep_commit; do
       [ -n "$sweep_commit" ] || continue
       jj -R "$1" log -r "$sweep_commit" --no-graph -T 'description' 2>/dev/null |
@@ -122,8 +194,185 @@ fleet_sweep_range() {
               done
             }
         done
-    done <"$sweep_commits"
-  rm -f "$sweep_commits"
+    done
+}
+
+# fleet_quote_is_secret, line by line over a whole sweep, in ONE awk. The
+# patterns are its patterns (POSIX ERE, intervals spelled out so every awk
+# accepts them) under LC_ALL=C, as grep matches them on ASCII text; its
+# maximal-run entropy candidates are found the way `grep -oE` finds them.
+# Prints, per input record `KEY\tTEXT`: `KEY\tS` for a secret, `KEY\tC\tT…`
+# when the only candidates are 40-hex tokens that need fleet_quote_is_
+# content_address's repository proof, and nothing when clean. TWIN of
+# fleet_quote_is_secret (lib/fleet-store.sh): a class added there must be
+# added here, and tests/72-records.sh asserts the two agree line for line over
+# every class, boundary and exemption shape.
+fleet_sweep_predicate_awk='
+  function rep(s, n,   r, i) { r = ""; for (i = 0; i < n; i++) r = r s; return r }
+  BEGIN {
+    jwt = "eyJ[A-Za-z0-9_=-]*\\.[A-Za-z0-9_=-]+\\.[A-Za-z0-9_=-]*"
+    tok = "(^|[^A-Za-z0-9_-])(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|xoxb-|xoxp-)" rep("[A-Za-z0-9_-]", 8)
+    sk = "(^|[^A-Za-z0-9_-])sk-" rep("[A-Za-z0-9]", 16)
+    akia = "(^|[^A-Za-z0-9])AKIA" rep("[0-9A-Z]", 16)
+    run = rep("[A-Za-z0-9_]", 32) "[A-Za-z0-9_]*"
+  }
+  {
+    i = index($0, "\t"); key = substr($0, 1, i - 1); t = substr($0, i + 1)
+    if (index(t, "-----BEGIN") || t ~ jwt || t ~ tok || t ~ sk || t ~ akia) {
+      print key "\tS"; next
+    }
+    pending = ""; secret = 0; rest = t
+    while (match(rest, run)) {
+      w = substr(rest, RSTART, RLENGTH); rest = substr(rest, RSTART + RLENGTH)
+      if (!((w ~ /[0-9]/ && w ~ /[A-Za-z]/) || (w ~ /[a-z]/ && w ~ /[A-Z]/))) continue
+      if (length(w) == 40 && w !~ /[^0-9a-f]/) pending = pending "\t" w
+      else { secret = 1; break }
+    }
+    if (secret) print key "\tS"
+    else if (pending != "") print key "\tC" pending
+  }'
+
+fleet_sweep_batch() {
+  # fleet_sweep_batch STORE DIR — sweep DIR/todo's commits; findings to
+  # DIR/findings in the walk's order, the commits that had one to DIR/dirty.
+  # Non-zero, and nothing is trusted, when any batched read fails.
+  sb_store=$1
+  sb_dir=$2
+  : >"$sb_dir/findings"
+  : >"$sb_dir/dirty"
+  # A revset naming exactly the commits to sweep.
+  sb_revset=$(paste -sd'|' "$sb_dir/todo") || return 1
+  # Descriptions, one JSON string per commit, split into numbered lines as the
+  # `read` loop numbered them (a trailing newline ends the last line).
+  jj --ignore-working-copy -R "$sb_store" log -r "$sb_revset" --no-graph \
+    -T 'commit_id ++ "\t" ++ description.escape_json() ++ "\n"' \
+    >"$sb_dir/desc.raw" 2>/dev/null || return 1
+  jq -r -R '.[0:40] as $c | (.[41:] | fromjson) as $d | ($d | split("\n")) as $l |
+    (if ($d | endswith("\n")) then $l[:-1] else $l end) | to_entries[] |
+    "\($c)\t\(.key + 1)\t\(.value)"' <"$sb_dir/desc.raw" >"$sb_dir/desc.lines" || return 1
+  # EVERY stage's own status is checked, here and below (no pipefail in this
+  # shell): a stage that fails partway would hand the predicate a truncated
+  # input, sweep it "clean" and remember it.
+  LC_ALL=C tr -d '\000' <"$sb_dir/desc.lines" >"$sb_dir/desc" || return 1
+  # Changed paths, per commit: the very `jj diff --name-only` the walk read.
+  # jj's OWN status is the one checked (not a pipe's last stage): a commit
+  # whose paths could not be read must fail the batch, never be swept as one
+  # that touched nothing and remembered clean.
+  while IFS= read -r sb_commit; do
+    (cd "$sb_store" && jj --ignore-working-copy diff -r "$sb_commit" --name-only) \
+      >"$sb_dir/names" 2>/dev/null || return 1
+    LC_ALL=C awk -v c="$sb_commit" '/^(findings|alerts)\/./ { print c "\t" NR "\t" $0 }' \
+      "$sb_dir/names" || return 1
+  done <"$sb_dir/todo" >"$sb_dir/paths" || return 1
+  # Every findings/ and alerts/ file those commits touch, with its whole
+  # content as hunk context, in one call; content lines are numbered from the
+  # hunk header exactly as `jj file show` numbers them.
+  sb_rs=$(printf '\036')
+  jj --ignore-working-copy -R "$sb_store" log -r "$sb_revset" --no-graph -p --git \
+    --context 100000000 -T '"\x1eRHC " ++ commit_id ++ "\n"' \
+    -- 'root-glob:"findings/**"' 'root-glob:"alerts/**"' >"$sb_dir/patch" \
+    2>/dev/null || return 1
+  LC_ALL=C tr -d '\000' <"$sb_dir/patch" >"$sb_dir/patch.clean" || return 1
+  LC_ALL=C awk -v rs="$sb_rs" -v dir="$sb_dir" '
+    index($0, rs "RHC ") == 1 { c = substr($0, 6); state = ""; next }
+    /^diff --git / { state = "head"; path = ""; old = ""; next }
+    state == "head" && /^--- / {
+      if (substr($0, 1, 6) == "--- a/") old = substr($0, 7)
+      next
+    }
+    state == "head" && /^\+\+\+ / {
+      # A deleted file has no content at the commit; `jj file show` of it
+      # printed nothing, and asking it per deleted path is the cost a mass
+      # deletion (an evidence compaction) must not pay.
+      if ($0 == "+++ /dev/null") {
+        if (old != "") print c "\t" old > (dir "/gone")
+        state = "gone"; next
+      }
+      if (substr($0, 1, 6) == "+++ b/") path = substr($0, 7)
+      else { print c > (dir "/unparsed"); state = ""; next }
+      print c "\t" path > (dir "/patched")
+      next
+    }
+    (state == "head" || state == "hunk") && /^@@ / {
+      if (path == "") { print c > (dir "/unparsed"); state = ""; next }
+      h = $0; sub(/^@@ -[0-9,]+ \+/, "", h); n = h + 0; if (n == 0) n = 1
+      state = "hunk"; next
+    }
+    state == "hunk" && /^[ +]/ { print c "\t" path "\t" n "\t" substr($0, 2) > (dir "/files"); n++; next }
+  ' "$sb_dir/patch.clean" || return 1
+  [ ! -s "$sb_dir/unparsed" ] || return 1
+  touch "$sb_dir/files" "$sb_dir/patched" "$sb_dir/gone"
+  # A changed path whose content the patch did not carry (a mode-only change,
+  # a binary or renamed file) is read the walk's own way.
+  cat "$sb_dir/patched" "$sb_dir/gone" >"$sb_dir/covered"
+  # A read that fails here fails the batch too (the per-commit walk then
+  # sweeps the range, and nothing is remembered).
+  LC_ALL=C awk -F'\t' 'FILENAME == ARGV[1] { p[$1 "\t" $2] = 1; next } !(($1 "\t" $3) in p)' \
+    "$sb_dir/covered" "$sb_dir/paths" >"$sb_dir/uncovered" || return 1
+  while IFS='	' read -r sb_c sb_n sb_p; do
+    jj --ignore-working-copy -R "$sb_store" file show -r "$sb_c" "root:$sb_p" \
+      >"$sb_dir/one" 2>/dev/null || return 1
+    LC_ALL=C tr -d '\000' <"$sb_dir/one" >"$sb_dir/one.clean" || return 1
+    LC_ALL=C awk -v c="$sb_c" -v p="$sb_p" '{ print c "\t" p "\t" NR "\t" $0 }' \
+      "$sb_dir/one.clean" || return 1
+  done <"$sb_dir/uncovered" >>"$sb_dir/files" || return 1
+  # Records: KEY = commit order, kind (0 description, 1 file), path order,
+  # line — the walk's own output order — then commit and the finding's
+  # location, FS-separated; then a tab and the text.
+  sb_fs=$(printf '\034')
+  LC_ALL=C awk -F'\t' -v OFS='\t' -v fs="$sb_fs" '
+    FILENAME == ARGV[1] { order[$1] = FNR; next }
+    FILENAME == ARGV[2] { porder[$1 "\t" $3] = $2; next }
+    FILENAME == ARGV[3] {
+      t = $0; sub(/^[^\t]*\t[^\t]*\t/, "", t)
+      print order[$1] fs 0 fs 0 fs $2 fs $1 fs $2, t; next
+    }
+    ($1 "\t" $2) in porder {
+      t = $0; sub(/^[^\t]*\t[^\t]*\t[^\t]*\t/, "", t)
+      print order[$1] fs 1 fs porder[$1 "\t" $2] fs $3 fs $1 fs $2 ":" $3, t
+    }
+  ' "$sb_dir/todo" "$sb_dir/paths" "$sb_dir/desc" "$sb_dir/files" >"$sb_dir/records" ||
+    return 1
+  LC_ALL=C awk "$fleet_sweep_predicate_awk" <"$sb_dir/records" >"$sb_dir/verdicts" ||
+    return 1
+  # The one exemption, PROVED per distinct token exactly as the predicate
+  # proves it (fleet_quote_is_content_address), asked once per token.
+  : >"$sb_dir/proved"
+  awk -F'\t' '$2 == "C" { for (i = 3; i <= NF; i++) print $i }' "$sb_dir/verdicts" |
+    LC_ALL=C sort -u | while IFS= read -r sb_token; do
+      ! fleet_quote_is_content_address "$sb_token" "$sb_store" ||
+        printf '%s\n' "$sb_token"
+    done >"$sb_dir/proved"
+  # The findings, in order: a secret line, then (descriptions) its cap line.
+  LC_ALL=C awk -F'\t' -v cap="$fleet_replicated_cap" -v fs="$sb_fs" '
+    FILENAME == ARGV[1] { proved[$1] = 1; next }
+    FILENAME == ARGV[2] {
+      if ($2 == "S") bad[$1] = 1
+      else { for (i = 3; i <= NF; i++) if (!($i in proved)) { bad[$1] = 1; break } }
+      next
+    }
+    {
+      key = $1; t = substr($0, length($1) + 2)
+      split(key, k, fs)
+      if (k[2] == "0") {
+        if (key in bad) printf "%s%s%s description line %s matches a secret class\n", key, fs, k[5], k[4]
+        if (t ~ /^roundhouse-/ && index(t, ": ")) {
+          v = substr(t, index(t, ": ") + 2)
+          if (length(v) > cap) {
+            name = t; sub(/:.*/, "", name)
+            printf "%s%s%s description line %s: trailer %s exceeds %s bytes\n", key, fs, k[5], k[4], name, cap
+          }
+        }
+      } else if (key in bad) printf "%s%s%s %s matches a secret class\n", key, fs, k[5], k[6]
+    }
+  ' "$sb_dir/proved" "$sb_dir/verdicts" "$sb_dir/records" >"$sb_dir/findings.raw" ||
+    return 1
+  LC_ALL=C sort -t "$sb_fs" -k1,1n -k2,2n -k3,3n -k4,4n -s "$sb_dir/findings.raw" \
+    >"$sb_dir/findings.sorted" || return 1
+  cut -d "$sb_fs" -f7- "$sb_dir/findings.sorted" >"$sb_dir/findings" || return 1
+  # A commit with any finding is never remembered as clean.
+  LC_ALL=C awk '{ print $1 }' "$sb_dir/findings" >"$sb_dir/dirty.raw" || return 1
+  LC_ALL=C sort -u "$sb_dir/dirty.raw" >"$sb_dir/dirty" || return 1
 }
 
 fleet_sweep_gate() {
@@ -963,6 +1212,10 @@ fleet_doctor_command() (
 
   # --- §7.1/§7.3 the gate, observed to reject ---
   if [ -n "$doctor_target" ] && [ -n "$doctor_krl" ]; then
+    # The ratchet reads below share one memo of commit times and parsed
+    # rosters (lib/fleet-trust.sh): pure functions of a commit and of a file's
+    # bytes, asked of the same commits and the same roster again and again.
+    fleet_trust_memo=$doctor_tmp/trust-memo
     doctor_reviewed=$doctor_tmp/reviewed-roster
     fleet_trust_roster_at_head "$doctor_store" "$doctor_target" "$doctor_reviewed"
     for doctor_head in $doctor_heads; do
@@ -992,6 +1245,7 @@ fleet_doctor_command() (
       doctor_replay=$doctor_range
     fi
     : >"$doctor_tmp/replay"
+    fleet_trust_memo_times "$doctor_store" "$doctor_replay"
     jj -R "$doctor_store" log -r "$doctor_replay" --no-graph \
       -T 'commit_id ++ "\n"' 2>/dev/null | while IFS= read -r doctor_replay_c; do
       [ -n "$doctor_replay_c" ] || continue
@@ -1437,7 +1691,10 @@ fleet_doctor_command() (
   fi
 
   # --- §10.8 every canary bypass in fleet_journal_override_window_days ---
-  doctor_overrides=$(fleet_journal_entries "$doctor_store" "$doctor_host" 2>/dev/null |
+  # The journals through the run's content-addressed parse cache
+  # (fleet_run_journal_entries): the same entries, without re-parsing every
+  # day of every host on every doctor.
+  doctor_overrides=$(fleet_run_journal_entries "$doctor_store" "$doctor_host" 2>/dev/null |
     jq -r --arg since "$(fleet_doctor_days_ago "$fleet_journal_override_window_days")" \
       'select(.override == "canary" and .at >= $since) |
        "\(.at) \(.item)"' 2>/dev/null || true)
@@ -1526,7 +1783,7 @@ fleet_doctor_command() (
     [ -d "$doctor_journal" ] || continue
     doctor_peer=${doctor_journal%/}
     doctor_peer=${doctor_peer##*/}
-    fleet_journal_entries "$doctor_store" "$doctor_peer" 2>/dev/null |
+    fleet_run_journal_entries "$doctor_store" "$doctor_peer" 2>/dev/null |
       jq -r --arg now "$(fleet_now)" \
         'select(.at != null) | select((.at | fromdateiso8601) - ($now | fromdateiso8601) > 300) |
          "\(.at)"' 2>/dev/null | sed "s|^|$doctor_peer |"

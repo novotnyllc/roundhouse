@@ -88,6 +88,7 @@ uninstall-deferred     condition  item
 package-deferred       condition  item
 runtime-hold           condition  item
 node-runtime-unverified condition item
+inventory-timeout      condition  store
 stale-host             condition  store
 schedule-disabled      condition  store
 schedule-missing       condition  store

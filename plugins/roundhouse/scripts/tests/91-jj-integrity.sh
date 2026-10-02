@@ -1304,6 +1304,35 @@ YAML
       fleet_vcs_revert_signature 91ac33bad000 ||
       fail "§10.8 fired on the currently applied digest (a promotion re-reviews nothing)"
 
+
+    # 14. THE CLEAN-COMMIT MEMO the signature walk keeps (store.run/
+    #     sigholds-clean) changes nothing it answers. A commit that printed a
+    #     hold is never remembered; a remembered walk prints what a cold one
+    #     printed; a corrupted or differently keyed memo is empty.
+    sig_memo="$(fleet_run_state_dir)/sigholds-clean"
+    rm -f "$sig_memo"
+    sig_walk() {
+      fleet_run_signature_holds "$store" \
+        "$integrity_pre..$integrity_c2" "$rjj/selfenrol-hosts" "$rjj/selfenrol-layers" \
+        vireo "${1:-}" "$rjj/memo-work.$$" 2>/dev/null || :
+    }
+    sig_walk >"$rjj/memo-cold"
+    grep -q '^!hold ' "$rjj/memo-cold" || fail "the memo fixture holds nothing, so it proves nothing"
+    [ -f "$sig_memo" ] || fail "the signature walk kept no memo"
+    ! grep -qx "$integrity_c1" "$sig_memo" ||
+      fail "a commit that produced a store-wide hold was remembered as clean"
+    sig_walk >"$rjj/memo-warm"
+    cmp -s "$rjj/memo-cold" "$rjj/memo-warm" ||
+      fail "the remembered signature walk answered differently from the cold one"
+    printf '%s\n' "$integrity_c1" >>"$sig_memo"
+    sig_walk | grep -q "$integrity_c1" ||
+      fail "a corrupted signature memo was trusted"
+    sig_walk "$rjj/selfenrol-hosts" >/dev/null
+    sig_key_reviewed=$(sed -n 1p "$sig_memo")
+    sig_walk >/dev/null
+    [ "$(sed -n 1p "$sig_memo")" != "$sig_key_reviewed" ] ||
+      fail "the signature memo key ignores the reviewed roster rule 4 reads"
+
     printf 'real-jj: OK (ratchet discrimination, every-parent merge, monotonicity, possession proof, item-scoped class hold, soak, TTL freeze, checkpoint tag, missing archive, KRL, row 1/row 2, genesis pin, revert predicate)\n'
   ) || fail "real-jj integrity block failed (see the FAIL: real-jj: line above)"
 fi

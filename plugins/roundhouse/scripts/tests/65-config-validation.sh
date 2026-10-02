@@ -636,6 +636,54 @@ set -e
 [ "$invalid_jsm_rc" -eq 2 ] || fail "invalid JSM JSON did not produce partial inventory"
 assert_contains "$(cat "$tmp/invalid-jsm.jsonl")" '"id":"agents:jsm"'
 
+# A manager that NEVER answers is stopped at the query ceiling (shortened here
+# by the self-check hook) with everything it started, its inventory is
+# UNKNOWN (`manager_query_timeout`), and the collection finishes with every
+# other manager read: one hung `jsm` once held a run for ~37 hours.
+hung_started=$(date +%s)
+set +e
+JSM_HANG=1 ROUNDHOUSE_TEST_QUERY_TIMEOUT=2 "$cli" collect --target test-host \
+  --section agents --section packages --output "$tmp/hung-jsm.jsonl"
+hung_jsm_rc=$?
+set -e
+hung_elapsed=$(($(date +%s) - hung_started))
+[ "$hung_jsm_rc" -eq 2 ] || fail "a hung manager did not produce partial inventory (rc $hung_jsm_rc)"
+[ "$hung_elapsed" -lt 30 ] || fail "a hung manager held the collection for ${hung_elapsed}s"
+"$cli" validate "$tmp/hung-jsm.jsonl"
+jq -se 'any(.[]; .id == "agents:jsm" and .status == "unavailable" and
+  any(.errors[]; .code == "manager_query_timeout"))' "$tmp/hung-jsm.jsonl" >/dev/null ||
+  fail "a hung manager was not reported as a query timeout"
+jq -se 'all(.[]; .id != "jsm:example-jsm") and
+  any(.[]; .kind == "package" and .data.manager == "homebrew")' "$tmp/hung-jsm.jsonl" >/dev/null ||
+  fail "a hung manager's timeout did not leave the other managers' inventory intact"
+! pgrep -f 'sleep 587' >/dev/null 2>&1 || fail "a hung manager's child outlived its timeout"
+# …and the full pass's seed turns it into a keyed `inventory-timeout` alert
+# (a store-scoped CONDITION), cleared by the next collection that answers.
+if [ -n "$fleet_fixture_yq" ]; then
+  (
+    set -eu
+    PATH=$fleet_fixture_path
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+    it_store="$tmp/inventory-timeout-store"
+    mkdir -p "$it_store"
+    [ "$(fleet_alert_lifecycle inventory-timeout)" = condition ] &&
+      fleet_alert_condition_kinds store | grep -Fqx inventory-timeout ||
+      fail "inventory-timeout is not a store-scoped condition in the lifecycle table"
+    fleet_seed_inventory_timeouts "$it_store" test-host "$tmp/hung-jsm.jsonl"
+    it_alert="$it_store/alerts/test-host/inventory-timeout--agents-jsm.yaml"
+    [ -f "$it_alert" ] || fail "a manager timeout raised no inventory-timeout alert"
+    grep -q 'timed out after 2s' "$it_alert" || fail "the inventory-timeout alert does not name the bound"
+    [ "$(find "$it_store/alerts/test-host" -type f | wc -l | tr -d ' ')" = 1 ] ||
+      fail "a manager timeout raised alerts for managers that answered"
+    "$cli" collect --target test-host --section agents --output "$tmp/answered-jsm.jsonl" || :
+    jq -se 'any(.[]; .id == "jsm:example-jsm")' "$tmp/answered-jsm.jsonl" >/dev/null ||
+      fail "the answering collection did not read jsm"
+    fleet_seed_inventory_timeouts "$it_store" test-host "$tmp/answered-jsm.jsonl"
+    [ ! -f "$it_alert" ] || fail "an answering manager did not clear its inventory-timeout alert"
+  ) || exit 1
+fi
+
 cp "$tmp/skill-lock-fixture.json" "$tmp/home/.agents/.skill-lock.json"
 jq '.skills["--danger"] = {
   source:"fixture",sourceUrl:"fixture",skillPath:"skills/danger",

@@ -633,6 +633,9 @@ fleet_quote_is_content_address() {
 }
 
 fleet_quote_is_secret() {
+  # TWIN: fleet_sweep_predicate_awk (lib/fleet-doctor.sh) is this predicate in
+  # one awk for the batched sweep. Change both; tests/72-records.sh fails when
+  # they disagree.
   # fleet_quote_is_secret TEXT [STORE] — mechanical backstop to agent-side
   # redaction, not the primary control: named secret classes plus one bounded
   # high-entropy check. Every field a record replicates passes through here,
