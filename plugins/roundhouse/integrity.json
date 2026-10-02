@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "697050dd5a2cda2a48eb15ada75678392b3111e2932627306b51cd77c403142a"
+      "sha256": "177acf3224419ea3eb6be3ff5cb9b9f46c3aca04b521c03258e840b10ff9d4d4"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "f2e9a5604575e361e73ffa9d5bdee3fe265d944afb348f89401321adf0654a25"
+      "sha256": "87cbec18b4d243db7dce676bae20c96ff4c2eaaad40d346dda7d3916cafddfa9"
     },
     {
       "path": "assets/icon.png",
@@ -50,7 +50,7 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
-      "sha256": "a09e5b2adcbb061f0849a1ad9accd98e3716ec6bcc9bb120a077ae5eeac63b3b"
+      "sha256": "762b9e67916bb72688ae15768ef0fbb6a72266fda76f1d1d9db7129dc6c8a6e1"
     },
     {
       "path": "scripts/codex-plugin-hooks.ps1",
@@ -150,7 +150,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "4e6abe759c7d9fe7ec3361807ccbf408ce8ffdaa03fbb40b62ad43cb2e350502"
+      "sha256": "944677cdedabfc6fe37a356f0dd90cf51108f3e658afb8672ad6a6d3f5278e60"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -182,7 +182,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "8eaf8d75a8620ffe111e9b393dbfb2ac194b80ca2a2ed6ef8a34693df6cfa750"
+      "sha256": "b898da576c4b3f9d2983d247e3a599ca5a20814abbe70d9a721ba80e40ff66fb"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -214,7 +214,7 @@
     },
     {
       "path": "scripts/lib/plan-apply.sh",
-      "sha256": "315d952a90c1295d4d97c663312c1868a97fb3aeb6fdf31c273c7f054844d198"
+      "sha256": "f35f850c3f8ff19e248c201e95ceb0f4ab3d13d032c2c3eda8f7f580c8d894dd"
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
@@ -373,5 +373,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.63"
+  "version": "0.9.65"
 }
