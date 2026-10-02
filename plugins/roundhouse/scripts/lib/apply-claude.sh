@@ -590,9 +590,14 @@ fleet_run_claude_cmdline_match() {
   # only DEFERS an uninstall, the safe direction.
   #
   # argv[0] may carry spaces too: `/Users/First Last/.nvm/…/bin/node`. It is
-  # read as the LONGEST leading run of fields whose basename is `node` (or
+  # read as the SHORTEST leading run of fields whose basename is `node` (or
   # `nodeNN`) — a bare `node`, or an absolute path — and the script is what
   # follows it. `ps` joins argv with single spaces, so the lengths line up.
+  # The FIRST such boundary wins and nothing after it can move it: a later
+  # argument that merely ends in `/node` (`--worktree /tmp/node`) is an
+  # argument, and taking it as argv[0] hid the script and read a live session
+  # as none. An earlier boundary only lengthens what is searched for the
+  # script, which over-matches — the safe direction.
   awk '
     { exe = $1; sub(/.*\//, "", exe) }
     exe == "claude" { found = 1; exit }
@@ -603,7 +608,10 @@ fleet_run_claude_cmdline_match() {
         prefix = (i == 1 ? $1 : prefix " " $i)
         base = prefix
         sub(/.*\//, "", base)
-        if (base ~ /^node([0-9.]*)?$/ && (i == 1 || prefix ~ /^\//)) argv0 = length(prefix)
+        if (base ~ /^node([0-9.]*)?$/ && (i == 1 || prefix ~ /^\//)) {
+          argv0 = length(prefix)
+          break
+        }
       }
       if (argv0 > 0) {
         rest = substr($0, argv0 + 2)

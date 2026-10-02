@@ -394,9 +394,20 @@ JSON
     for run_claude_line in \
       '/Users/First Last/.nvm/versions/node/v24.1.0/bin/node /Users/First Last/.nvm/versions/node/v24.1.0/bin/claude --resume' \
       '/Users/First Last/.nvm/versions/node/v24.1.0/bin/node /Users/First Last/.nvm/versions/node/v24.1.0/lib/node_modules/@anthropic-ai/claude-code/cli.js' \
-      '/opt/my tools/node22 /opt/my tools/bin/claude'; do
+      '/opt/my tools/node22 /opt/my tools/bin/claude' \
+      '/Users/First Last/.nvm/versions/node/v24.1.0/bin/node /Users/First Last/.npm-global/bin/claude --worktree /Users/First Last/src/my node'; do
       printf '%s\n' "$run_claude_line" | fleet_run_claude_cmdline_match ||
         fail "a claude CLI under a node path with spaces was not recognised: $run_claude_line"
+    done
+    # A LATER argument whose basename is node never becomes argv[0]: the
+    # first node boundary is argv[0], and the script follows it.
+    for run_claude_line in \
+      '/usr/local/bin/node /usr/local/bin/claude --worktree /tmp/node' \
+      '/usr/local/bin/node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js --add-dir /srv/node' \
+      'node /Users/x/.npm-global/bin/claude --worktree /tmp/node' \
+      '/opt/node22 /opt/bin/claude -p hi /var/lib/node22'; do
+      printf '%s\n' "$run_claude_line" | fleet_run_claude_cmdline_match ||
+        fail "a later argument named node replaced argv[0]: $run_claude_line"
     done
     for run_claude_line in \
       '/Users/First Last/.nvm/versions/node/v24.1.0/bin/node /srv/app/server.js claude' \

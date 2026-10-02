@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/apply-claude.sh",
-      "sha256": "c955fa0d43a1b6d815f2edca28b40001f33b224d96e935474248f965913d8e26"
+      "sha256": "85054ee6b681e5087a933679d0e14cf745ba76dd5f6c71c338dbdbae4cf1bde5"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
