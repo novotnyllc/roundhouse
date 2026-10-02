@@ -119,7 +119,7 @@ The one UAC consent installs:
 | `…\lane.identity` | SYSTEM F, BA F, owner R | identity record |
 | `…\queue\ingress\` | SYSTEM F, BA F, owner Modify | request files |
 | `…\queue\results\` | SYSTEM F, BA F, owner R (list, read) | results |
-| `…\claims\`, `…\journal\` | SYSTEM F, BA F | claims and journal |
+| `…\claims\`, `…\journal\` | SYSTEM F, BA F, owner READ_CONTROL (directory only, no inheritance) | claims and journal; the owner can read the descriptor to verify it, nothing inside |
 | `…\winget\Microsoft.WinGet.Client\` | SYSTEM F, BA F, owner R | pinned WinGet client module |
 | task `\RoundhouseLaneV1` | `O:SYG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;OWNER)` | LocalSystem, ServiceAccount logon, PT1M repetition, StartWhenAvailable |
 

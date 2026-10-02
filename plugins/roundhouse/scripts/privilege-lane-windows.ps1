@@ -262,7 +262,11 @@ function New-NativeBoundary {
         }
         ReadSddl = {
             param([string]$Path)
-            return [string](Get-Acl -LiteralPath $Path).GetSecurityDescriptorSddlForm("DAO")
+            # Owner, group and DACL: the enum, never the SDDL section letters.
+            $Sections = [Security.AccessControl.AccessControlSections]::Owner -bor
+                [Security.AccessControl.AccessControlSections]::Group -bor
+                [Security.AccessControl.AccessControlSections]::Access
+            return [string](Get-Acl -LiteralPath $Path).GetSecurityDescriptorSddlForm($Sections)
         }
         SetDirectorySddl = {
             param([string]$Path, [string]$Sddl)
@@ -395,7 +399,11 @@ function Assert-WinGetModuleTree([string]$Root, [object]$Lock) {
 }
 
 # --- layout and contracts -----------------------------------------------------
-function Get-ProtectedSddl { return "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" }
+# Claims and journal are SYSTEM/Administrators only, plus a non-inherited
+# READ_CONTROL for the lane owner on the directory itself: the owner's
+# limited token cannot use the Administrators ACE, and status must be able to
+# read these descriptors to prove they are intact. Nothing inside is readable.
+function Get-ProtectedSddl([string]$OwnerSid) { return "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;RC;;;$OwnerSid)" }
 function Get-OwnerReadSddl([string]$OwnerSid) { return "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;$OwnerSid)" }
 function Get-IngressSddl([string]$OwnerSid) { return "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;$OwnerSid)" }
 function Get-ResultFileSddl([string]$OwnerSid) { return "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120089;;;$OwnerSid)" }
@@ -440,26 +448,30 @@ function Test-ProtectedOwner([object]$Descriptor) {
     # nothing: the owner must be SYSTEM or Administrators.
     return [string]$Descriptor.Owner -cin @($script:SystemSid, $script:AdministratorsSid)
 }
-function Test-ProtectedAcl([string]$Sddl, [string]$OwnerSid, [bool]$OwnerMayRead) {
+# What the lane owner may hold on a protected object. Read: the generic and
+# specific read/execute bits (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE and
+# their generic forms). Control: READ_CONTROL alone, on the directory only.
+$script:OwnerReadMask = [long](0x1200A9 -bor 0x80000000 -bor 0x20000000)
+$script:OwnerControlMask = [long]0x20000
+function Test-ProtectedAcl([string]$Sddl, [string]$OwnerSid, [long]$OwnerAllowedMask) {
     # Owner SYSTEM/Administrators; SYSTEM and Administrators must hold allow
-    # ACEs; no other principal may hold any write/delete/change-permission
-    # bit, and the lane owner may hold at most read bits (only on
-    # owner-readable paths). The service rewrites generic rights, so masks
-    # are inspected, never compared for equality. The same parser runs in
-    # the fixture, against the SDDL strings the install wrote.
+    # ACEs; no other principal may hold any bit, and the lane owner may hold
+    # only bits inside OwnerAllowedMask (never a write, delete or
+    # change-permission bit; a READ_CONTROL-only ACE must not inherit). The
+    # service rewrites generic rights, so masks are inspected, never compared
+    # for equality. The same parser runs in the fixture, against the SDDL
+    # strings the install wrote.
     try { $Descriptor = ConvertFrom-LaneSddl $Sddl } catch { return $false }
     if (-not (Test-ProtectedOwner $Descriptor)) { return $false }
-    # GENERIC_WRITE, GENERIC_ALL, WRITE_DATA/ADD_FILE, APPEND/ADD_SUBDIR,
-    # WRITE_EA, WRITE_ATTRIBUTES, DELETE_CHILD, DELETE, WRITE_DAC, WRITE_OWNER.
-    [long]$WriteBits = 0x40000000 -bor 0x10000000 -bor 0x00000002 -bor 0x00000004 -bor 0x00000010 -bor 0x00000100 -bor 0x00000040 -bor 0x00010000 -bor 0x00040000 -bor 0x00080000
     $Seen = @{}
     foreach ($Ace in @($Descriptor.Aces)) {
         if ($Ace.Type -cne "A") { continue }
         $Sid = [string]$Ace.Sid
         $Seen[$Sid] = $true
         if ($Sid -cin @($script:SystemSid, $script:AdministratorsSid)) { continue }
-        if ($Sid -ceq $OwnerSid -and $OwnerMayRead) {
-            if (([long]$Ace.Mask -band $WriteBits) -ne 0) { return $false }
+        if ($Sid -ceq $OwnerSid -and $OwnerAllowedMask -ne 0) {
+            if (([long]$Ace.Mask -band -bnot $OwnerAllowedMask) -ne 0) { return $false }
+            if ($OwnerAllowedMask -eq $script:OwnerControlMask -and [string]$Ace.Flags -cne "") { return $false }
             continue
         }
         return $false
@@ -572,7 +584,8 @@ function Get-LaneState {
     # The task runs this copy as LocalSystem: an ACL that lets anyone but
     # SYSTEM/Administrators write the script, the identity, the module, the
     # claims or the journal is arbitrary SYSTEM execution, so it is drift.
-    foreach ($Protected in @(@($Paths.Claims, $false), @($Paths.Journal, $false), @($Paths.Root, $true), @($Paths.Script, $true), @($Paths.Identity, $true), @($Paths.Module, $true))) {
+    foreach ($Protected in @(@($Paths.Claims, $script:OwnerControlMask), @($Paths.Journal, $script:OwnerControlMask), @($Paths.Root, $script:OwnerReadMask),
+            @($Paths.Script, $script:OwnerReadMask), @($Paths.Identity, $script:OwnerReadMask), @($Paths.Module, $script:OwnerReadMask))) {
         $Path = $Protected[0]
         if (-not ([IO.File]::Exists($Path) -or [IO.Directory]::Exists($Path))) { continue }
         $Sddl = ""
@@ -645,8 +658,8 @@ function Install-Lane([string]$TargetHost, [string]$Sid, [string]$Root, [string]
     & $script:Native.SetDirectorySddl $Paths.Root (Get-OwnerReadSddl $Sid)
     & $script:Native.SetDirectorySddl $Paths.Ingress (Get-IngressSddl $Sid)
     & $script:Native.SetDirectorySddl $Paths.Results (Get-OwnerReadSddl $Sid)
-    & $script:Native.SetDirectorySddl $Paths.Claims (Get-ProtectedSddl)
-    & $script:Native.SetDirectorySddl $Paths.Journal (Get-ProtectedSddl)
+    & $script:Native.SetDirectorySddl $Paths.Claims (Get-ProtectedSddl $Sid)
+    & $script:Native.SetDirectorySddl $Paths.Journal (Get-ProtectedSddl $Sid)
     $ScriptBytes = [IO.File]::ReadAllBytes($SelfPath)
     Write-ProtectedBytes $Paths.Script $ScriptBytes (Get-OwnerReadSddl $Sid)
     $Sha = Get-Sha256Bytes $ScriptBytes
@@ -1269,7 +1282,14 @@ function Invoke-SelfTest {
         Assert-SelfTest ([IO.File]::Exists((Get-LanePaths).ModuleLock)) "module lock copied into the lane root"
         Assert-SelfTest ((Get-LaneState).State -ceq "ready") "post-enrollment state"
         Assert-SelfTest ($World.Sddl[$Paths.Ingress] -ceq (Get-IngressSddl $World.Sid)) "ingress ACL"
-        Assert-SelfTest ($World.Sddl[$Paths.Claims] -ceq (Get-ProtectedSddl)) "claims ACL"
+        Assert-SelfTest ($World.Sddl[$Paths.Claims] -ceq (Get-ProtectedSddl $World.Sid) -and $World.Sddl[$Paths.Journal] -ceq (Get-ProtectedSddl $World.Sid)) "claims and journal ACL"
+        # The native SDDL reader asks for sections by enum, not by SDDL letters
+        # (a string argument throws on Windows and would make every lane drift).
+        $RealReader = (New-NativeBoundary).ReadSddl
+        $ReaderCalls = @($RealReader.Ast.FindAll({ param($Node) $Node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+            [string]$Node.Member.Value -ceq "GetSecurityDescriptorSddlForm" }, $true))
+        Assert-SelfTest ($ReaderCalls.Count -eq 1 -and -not ($ReaderCalls[0].Arguments[0] -is [Management.Automation.Language.StringConstantExpressionAst]) -and
+            $RealReader.ToString().Contains("AccessControlSections]::Owner") -and $RealReader.ToString().Contains("AccessControlSections]::Access")) "native SDDL reader uses the sections enum"
         Assert-SelfTest ($World.Task.Sddl -ceq (Get-TaskSddl $World.Sid)) "task security"
         Assert-SelfTest ($World.Task.Xml -match '<UserId>S-1-5-18</UserId><LogonType>ServiceAccount</LogonType>' -and $World.Task.Xml -notmatch 'S4U|InteractiveToken|<Password>') "task principal is LocalSystem without S4U"
         Assert-SelfTest ($World.Task.Xml -match '-Dispatch</Arguments>') "task action"
@@ -1381,6 +1401,22 @@ function Invoke-SelfTest {
         Assert-SelfTest ((Get-LaneState).State -ceq "drifted" -and (Get-LaneState).Detail.Contains("protected ACL drifted")) "owner-writable script is drift"
         $World.Sddl[$Paths.Script] = $SavedSddl
         Assert-SelfTest ((Get-LaneState).State -ceq "ready") "restored ACL is ready again"
+        # Claims and journal: the owner may hold READ_CONTROL on the directory
+        # itself (status reads the descriptor from a limited token) and nothing
+        # more; a read bit, a write bit, or an inheriting ACE is drift.
+        $SavedClaims = $World.Sddl[$Paths.Claims]
+        foreach ($Bad in @("O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1200a9;;;$($World.Sid))",
+                "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;RCFR;;;$($World.Sid))",
+                "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;RCWD;;;$($World.Sid))",
+                "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;RC;;;$($World.Sid))",
+                "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;RC;;;S-1-5-32-545)")) {
+            $World.Sddl[$Paths.Claims] = $Bad
+            Assert-SelfTest ((Get-LaneState).State -ceq "drifted") "claims ACL drift not detected: $Bad"
+        }
+        $World.Sddl[$Paths.Claims] = "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+        Assert-SelfTest ((Get-LaneState).State -ceq "ready") "claims without the owner's READ_CONTROL still verifies from SYSTEM"
+        $World.Sddl[$Paths.Claims] = $SavedClaims
+        Assert-SelfTest ((Get-LaneState).State -ceq "ready") "installed claims ACL is ready"
         # A request SYSTEM already claimed but has not answered is pending, not rejected.
         $Claimed = "request-" + ("{0:x32}" -f 777)
         [void][IO.Directory]::CreateDirectory((Join-Path $Paths.Claims $Claimed))
