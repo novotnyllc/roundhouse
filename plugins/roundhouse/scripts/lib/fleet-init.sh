@@ -684,9 +684,10 @@ fleet_enroll_seed_host_facts() {
   # The remote fleet-seed later adds observed items; this small sponsor-side
   # seed is the durable machine truth already present in config.json.
   #
-  # package_managers is deliberately NOT seeded here. Existing facts win the
-  # merge, so a sponsor-written list would permanently override the one the
-  # newcomer's own fleet-seed derives from its own config.json.
+  # package_managers is deliberately NOT seeded here. The newcomer's own
+  # fleet-seed refreshes it from its own config.json on every full run; a
+  # sponsor-written copy would be redundant at best, and would outlive a
+  # newcomer config that states no list.
   seed_store=$1
   seed_host=$2
   seed_file="$seed_store/hosts/$seed_host.yaml"
