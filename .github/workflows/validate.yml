@@ -200,7 +200,9 @@ jobs:
 
           # Enough shards that each holds ~900 weighted seconds (weights are
           # macOS runner seconds): over its three workers that is ~5 minutes
-          # of tests, well inside the 10-minute cap, plus setup.
+          # of tests, well inside the 10-minute cap, plus setup. At most ten:
+          # the whole suite (~10,900) at eight left its fullest shard ~5s
+          # inside the deadline.
           total=$(ROUNDHOUSE_TEST_ONLY="$only" ROUNDHOUSE_TEST_SCOPES="$scopes" \
             ROUNDHOUSE_TEST_LIST=true plugins/roundhouse/scripts/test-roundhouse |
             awk '{ s += $2 } END { print s + 0 }')
@@ -208,7 +210,7 @@ jobs:
             ROUNDHOUSE_TEST_LIST=true plugins/roundhouse/scripts/test-roundhouse | grep -c .)
           count=$(( (total + 899) / 900 ))
           [ "$count" -ge 1 ] || count=1
-          [ "$count" -le 8 ] || count=8
+          [ "$count" -le 10 ] || count=10
           # An empty shard fails, so never ask for more shards than units.
           [ "$count" -le "$units" ] || count=$units
           shards=$(seq 1 "$count" | jq -Rsc --arg k "$count" \
