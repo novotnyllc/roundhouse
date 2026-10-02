@@ -398,8 +398,16 @@ rh_runner() {
   rh_finish() {
     rh_fu=$1
     [ "${rh_state[rh_fu]:-}" = running ] || return 0
-    rh_ms[rh_fu]=$(($3 - rh_t0[rh_fu])) rh_rc[rh_fu]=$2
-    if [ "$2" -eq 0 ]; then
+    rh_frc=$2
+    # A pass that lands after the deadline, between watchdog ticks, is still
+    # over the cap.
+    if [ "$rh_frc" -eq 0 ] && [ "$3" -ge "$rh_deadline_ms" ]; then
+      printf '\nFAIL: the unit finished after ROUNDHOUSE_TEST_DEADLINE (the 10-minute cap)\n' \
+        >>"$rh_root/$rh_fu/log"
+      rh_frc=124
+    fi
+    rh_ms[rh_fu]=$(($3 - rh_t0[rh_fu])) rh_rc[rh_fu]=$rh_frc
+    if [ "$rh_frc" -eq 0 ]; then
       rh_state[rh_fu]=pass
     else
       rh_state[rh_fu]=fail
