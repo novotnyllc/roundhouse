@@ -301,8 +301,16 @@ JSON
 "$cli" seal-plan "$tmp/codex-plugin-agent-plan-draft.json" "$tmp/snapshot.jsonl" \
   "$tmp/codex-plugin-agent-plan.json"
 codex_plugin_agent_plan_id=$(jq -r '.plan_id' "$tmp/codex-plugin-agent-plan.json")
-"$cli" apply-plan "$tmp/codex-plugin-agent-plan.json" \
+# #56: a manager under umask 002 leaves its cache group-writable; the sealed
+# update seals it, for Codex here and for Claude below.
+plan_codex_cache="$HOME/.codex/plugins/cache/test-market/example"
+mkdir -p "$plan_codex_cache/1.3.0"
+printf 'x\n' >"$plan_codex_cache/1.3.0/file"
+chmod -R g+w,o+w "$plan_codex_cache"
+CODEX_HOME="$HOME/.codex" "$cli" apply-plan "$tmp/codex-plugin-agent-plan.json" \
   "$codex_plugin_agent_plan_id" "$tmp/codex-plugin-agent-result.jsonl"
+[ -z "$(find "$plan_codex_cache" ! -type l \( -perm -020 -o -perm -002 \) -print)" ] ||
+  fail "the sealed Codex plugin update left a group- or world-writable cache"
 [ "$(jq -s 'map(select(.kind == "plugin" and .id == "codex:test-market:example:1.3.0")) | length' \
   "$tmp/codex-plugin-agent-result.jsonl")" -eq 1 ] ||
   fail "Codex plugin update did not execute the exact native manager command"
@@ -325,8 +333,15 @@ JSON
 "$cli" seal-plan "$tmp/plugin-agent-plan-draft.json" "$tmp/snapshot.jsonl" \
   "$tmp/plugin-agent-plan.json"
 plugin_agent_plan_id=$(jq -r '.plan_id' "$tmp/plugin-agent-plan.json")
-CLAUDE_MANAGER_STDOUT=1 "$cli" apply-plan "$tmp/plugin-agent-plan.json" \
+plan_claude_cache="$HOME/.claude/plugins/cache/test-market/claude-example"
+mkdir -p "$plan_claude_cache/3.0.0"
+printf 'x\n' >"$plan_claude_cache/3.0.0/file"
+chmod -R g+w,o+w "$plan_claude_cache"
+CLAUDE_MANAGER_STDOUT=1 CLAUDE_CONFIG_DIR="$HOME/.claude" \
+  "$cli" apply-plan "$tmp/plugin-agent-plan.json" \
   "$plugin_agent_plan_id" "$tmp/plugin-agent-result.jsonl"
+[ -z "$(find "$plan_claude_cache" ! -type l \( -perm -020 -o -perm -002 \) -print)" ] ||
+  fail "the sealed Claude plugin update left a group- or world-writable cache"
 "$cli" validate "$tmp/plugin-agent-result.jsonl"
 [ "$(jq -s 'map(select(.kind == "plugin" and .id == "claude:test-market:claude-example:3.0.0")) | length' \
   "$tmp/plugin-agent-result.jsonl")" -eq 1 ] ||

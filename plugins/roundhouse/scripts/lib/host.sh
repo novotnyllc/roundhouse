@@ -463,6 +463,54 @@ check_safe_owned_directory() {
   check_safe_owned_path "$1" "$2" directory
 }
 
+plugin_root_seal_permissions() {
+  # plugin_root_seal_permissions DIR — remove group and other write bits from
+  # a plugin tree before roundhouse trusts it. A plugin manager running under
+  # umask 002 (the WSL default) leaves a fresh cache group-writable, and
+  # check_safe_owned_path then refuses it. This only tightens modes and runs
+  # before any check, so the checks themselves stay strict. It applies to an
+  # absolute, non-symlink directory owned by the current user; `chmod -R`
+  # does not follow symlinks inside the tree. Anything it cannot change is
+  # left for the verifier to report. A change is named on stderr, so a tree
+  # that really was writable by others does not go unnoticed.
+  case $1 in /*) ;; *) return 0 ;; esac
+  [ -d "$1" ] && [ ! -L "$1" ] || return 0
+  [ "$(file_owner "$1")" = "$(id -un)" ] || return 0
+  [ -n "$(find "$1" ! -type l \( -perm -020 -o -perm -002 \) -print 2>/dev/null |
+    head -n 1)" ] || return 0
+  printf 'roundhouse: removing group/world write permission under %s\n' "$1" >&2
+  chmod -R go-w "$1" 2>/dev/null || :
+}
+
+plugin_cache_seal_permissions() {
+  # plugin_cache_seal_permissions claude|codex NAME[@MARKETPLACE] — seal a
+  # plugin's harness cache right after roundhouse installed or updated it.
+  # For roundhouse itself this is the tree executor_status_command will
+  # trust; for any other plugin it is code (hooks, MCP servers) that the
+  # harness runs as this user, which a group member must not be able to edit.
+  # The zero-config form, with no marketplace, seals every marketplace's copy
+  # of NAME, since sealing only tightens.
+  case $1 in
+    claude) seal_cache=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache ;;
+    codex) seal_cache=${CODEX_HOME:-$HOME/.codex}/plugins/cache ;;
+    *) return 0 ;;
+  esac
+  seal_name=${2%%@*}
+  case $seal_name in ''|.|..|*[!A-Za-z0-9._-]*) return 0 ;; esac
+  case $2 in
+    *@*)
+      seal_market=${2#*@}
+      case $seal_market in ''|.|..|*[!A-Za-z0-9._-]*) return 0 ;; esac
+      plugin_root_seal_permissions "$seal_cache/$seal_market/$seal_name"
+      ;;
+    *)
+      for seal_dir in "$seal_cache"/*/"$seal_name"; do
+        plugin_root_seal_permissions "$seal_dir"
+      done
+      ;;
+  esac
+}
+
 check_enrolled_trust_file() {
   # Trust material the CA enrollment installs (the fleet CA public key, the
   # KRL): root-owned under /etc on a real host, self-owned in fixtures. Every
@@ -477,6 +525,9 @@ executor_status_command() (
   output=${1:--}
   require_jq
   integrity=$plugin_root/integrity.json
+  # Seal first, then verify: a manager update under umask 002 must not leave
+  # this host refusing every sealed install until someone runs chmod by hand.
+  plugin_root_seal_permissions "$plugin_root"
   check_safe_owned_directory "$plugin_root" "plugin root"
   check_private_owned_file "$integrity" "executor integrity manifest"
   jq -e '

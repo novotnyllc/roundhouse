@@ -628,7 +628,9 @@ EOF
             printf 'roundhouse: Node.js is required for Codex plugin hook refresh\n' >&2
             return 69
           }
-          "$plan_node" "$script_dir/codex-plugin-hooks.mjs" update "$plugin_id" >/dev/null
+          "$plan_node" "$script_dir/codex-plugin-hooks.mjs" update "$plugin_id" >/dev/null ||
+            return
+          plugin_cache_seal_permissions codex "$plugin_id"
           return
           ;;
         roundhouse:schedule)
@@ -664,6 +666,9 @@ EOF
             printf 'roundhouse: unsafe Claude plugin update argv\n' >&2
             return 64
           }
+          "$@" || return
+          plugin_cache_seal_permissions claude "$plugin_id"
+          return
           ;;
         *)
           printf 'roundhouse: this agent manager has no safe native update command\n' >&2
