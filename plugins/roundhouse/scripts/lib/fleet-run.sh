@@ -1748,12 +1748,14 @@ fleet_run_approve_plugin_hooks() {
   # a false hold. If Codex is present, a malformed/failed list is a real
   # inability to prove ownership and remains held.
   command -v codex >/dev/null 2>&1 || return 0
-  fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" '') || return 75
+  # A failed listing is transient (74): kept, so the next fast pass retries.
+  fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" '') || return $?
   [ "$fleet_run_codex_plugin_state" != absent ] || return 0
   # Codex's registration is the operator's, not the item's: a Codex copy
   # someone DISABLED runs no hooks, so there is nothing to approve, and it is
   # never reinstalled (`codex plugin add` would re-enable it).
-  fleet_run_codex_enabled=$(fleet_run_codex_record "$1" | jq -r '.enabled == true') ||
+  fleet_run_codex_rec=$(fleet_run_codex_record "$1") || return $?
+  fleet_run_codex_enabled=$(printf '%s\n' "$fleet_run_codex_rec" | jq -r '.enabled == true') ||
     return 75
   [ "$fleet_run_codex_enabled" = true ] || return 0
   fleet_run_hooks_node=$(fleet_node_path) || {
@@ -1901,7 +1903,7 @@ fleet_run_codex_hooks_settled() {
   # (75) with its reason, so the next pass asks again.
   case ${1:-} in *@*) ;; *) return 0 ;; esac
   command -v codex >/dev/null 2>&1 || return 0
-  fleet_run_hs_record=$(fleet_run_codex_record "$1") || return 75
+  fleet_run_hs_record=$(fleet_run_codex_record "$1") || return $?
   [ "$(printf '%s\n' "$fleet_run_hs_record" | jq -r '.enabled == true')" = true ] || return 0
   if [ -n "${2:-}" ] && [ "$(printf '%s\n' "$fleet_run_hs_record" | jq -r '.source.sha // ""')" != "$2" ]; then
     # A local (in-marketplace) record has no SHA: it is synced when it is
@@ -2705,7 +2707,7 @@ EOF
       # untrusted for good (fleet_run_codex_hooks_settled).
       if [ "$fleet_run_want_enabled" = true ] && [ "$fleet_run_actual_enabled" = true ] &&
         [ "$fleet_run_plugin_mutated" != true ] && [ "$fleet_run_enable_attempted" != true ]; then
-        fleet_run_codex_hooks_settled "$fleet_run_id" "${fleet_run_resolved_sha:-}" || return 75
+        fleet_run_codex_hooks_settled "$fleet_run_id" "${fleet_run_resolved_sha:-}" || return $?
       fi
       ;;
     skills)

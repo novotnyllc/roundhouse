@@ -138,7 +138,7 @@
     },
     {
       "path": "scripts/lib/fleet-plugins.sh",
-      "sha256": "ba5d6ea969e2feeca5320c3f5db17c977a8a64cf58e87f6ddd5e20f4507808d2"
+      "sha256": "225bca94d201a35942b0f46d48b3f90dcccb5d15a1c9a31b821983930dc82998"
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "ebca7de963dde9d0936da1a91bd7baa2b3bff101edf2d116502816fd612ed41f"
+      "sha256": "49e823c1ab0c25c07b70d4be86af9aa541b5e3ccefb89d071ebc45aa38433cae"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
