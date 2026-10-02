@@ -92,6 +92,25 @@ lane_rc=0
 lane_env "$cli" seal-plan "$lane_tmp/draft.json" "$lane_tmp/readiness.jsonl" "$lane_tmp/plan.json" >/dev/null 2>&1 || lane_rc=$?
 [ "$lane_rc" -eq 65 ] || fail "seal-plan sealed a lane plan against an unenrolled lane (rc $lane_rc)"
 
+# The host must answer as the configured identity before anything is
+# enrolled under its name: a mismatch, or no configured identity at all, is
+# a refusal that runs nothing.
+jq '.machines["test-apt"].expected_hostname = "elsewhere.example"' "$tmp/config.json" >"$lane_tmp/config-wrong-host.json"
+chmod 600 "$lane_tmp/config-wrong-host.json"
+lane_rc=0
+ROUNDHOUSE_CONFIG="$lane_tmp/config-wrong-host.json" ROUNDHOUSE_LANE_ENROLL_COMMAND="exit 99" lane_env "$cli" privilege-enroll test-apt \
+  >"$lane_tmp/enroll-wrong.json" 2>/dev/null </dev/null || lane_rc=$?
+[ "$lane_rc" -eq 65 ] && jq -e '.state == "failed" and .reason == "identity_mismatch" and (.detail | contains("elsewhere.example"))' \
+  "$lane_tmp/enroll-wrong.json" >/dev/null || fail "enrollment under the wrong identity was not refused (rc $lane_rc): $(cat "$lane_tmp/enroll-wrong.json")"
+jq 'del(.machines["test-apt"].expected_user)' "$tmp/config.json" >"$lane_tmp/config-no-identity.json"
+chmod 600 "$lane_tmp/config-no-identity.json"
+lane_rc=0
+ROUNDHOUSE_CONFIG="$lane_tmp/config-no-identity.json" ROUNDHOUSE_LANE_ENROLL_COMMAND="exit 99" lane_env "$cli" privilege-enroll test-apt \
+  >"$lane_tmp/enroll-noid.json" 2>/dev/null </dev/null || lane_rc=$?
+[ "$lane_rc" -eq 65 ] && jq -e '.reason == "identity_unverifiable"' "$lane_tmp/enroll-noid.json" >/dev/null ||
+  fail "enrollment without a configured identity was not refused (rc $lane_rc)"
+[ ! -e "$lane_tmp/fixture/etc/sudoers.d/roundhouse-lane" ] || fail 'a refused enrollment installed the grant'
+
 # --- the one approval, through the test hook ----------------------------------
 # The hook stands in for `sudo …/privilege-lane-posix enroll`; the helper's
 # own self-test covers what that enrollment does on the host.

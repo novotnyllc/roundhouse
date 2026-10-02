@@ -246,6 +246,7 @@ privilege_enroll_command() (
       exit 75
       ;;
     local)
+      lane_enroll_identity_check "$target" "$tr" || exit $?
       if fleet_test_hook "${ROUNDHOUSE_LANE_ENROLL_COMMAND:-}"; then
         sh -c "$ROUNDHOUSE_LANE_ENROLL_COMMAND" "lane-enroll" "$target" >"$tmp/out" 2>"$tmp/err" || rc=$?
       elif [ -t 0 ] && [ -t 1 ]; then
@@ -261,6 +262,7 @@ privilege_enroll_command() (
       ;;
     ssh\ *)
       alias=${tr#* }
+      lane_enroll_identity_check "$target" "$tr" || exit $?
       if fleet_test_hook "${ROUNDHOUSE_LANE_ENROLL_COMMAND:-}"; then
         sh -c "$ROUNDHOUSE_LANE_ENROLL_COMMAND" "lane-enroll" "$target" >"$tmp/out" 2>"$tmp/err" || rc=$?
       elif [ -t 0 ] && [ -t 1 ]; then
@@ -284,6 +286,40 @@ privilege_enroll_command() (
       ;;
   esac
 )
+lane_enroll_identity_check() {
+  # lane_enroll_identity_check TARGET TRANSPORT: the host at the other end
+  # of the transport must answer as the configured expected_hostname and
+  # expected_user before anything is enrolled under TARGET's name. The
+  # identity record is written from the controller's --host-id, so an alias
+  # that lands on the wrong machine would otherwise enroll that machine as
+  # TARGET and every later status check would agree with it. Status 0 when
+  # the identity matches; otherwise the failed enrollment record and 65.
+  lane_eic_expected_host=$(jq -r --arg t "$1" '.machines[$t].expected_hostname // empty' "$(config_path)")
+  lane_eic_expected_user=$(jq -r --arg t "$1" '.machines[$t].expected_user // empty' "$(config_path)")
+  lane_eic_reason=
+  if [ -z "$lane_eic_expected_host" ] || [ -z "$lane_eic_expected_user" ]; then
+    lane_eic_reason=identity_unverifiable
+    lane_eic_detail="config.json has no expected_hostname/expected_user for $1; set both before enrolling"
+  else
+    lane_eic_answer=$(lane_remote_sh "$2" 'printf "%s\n%s\n" "$(hostname)" "$(id -un)"' </dev/null 2>/dev/null | tr -d '\r') || lane_eic_answer=
+    lane_eic_host=$(sed -n 1p <<<"$lane_eic_answer")
+    lane_eic_user=$(sed -n 2p <<<"$lane_eic_answer")
+    if [ -z "$lane_eic_host" ] || [ -z "$lane_eic_user" ]; then
+      lane_eic_reason=identity_unverifiable
+      lane_eic_detail="$2 did not answer the identity probe"
+    elif [ "$lane_eic_host" != "$lane_eic_expected_host" ] || [ "$lane_eic_user" != "$lane_eic_expected_user" ]; then
+      lane_eic_reason=identity_mismatch
+      lane_eic_detail="$2 answers as $lane_eic_user@$lane_eic_host; config expects $lane_eic_expected_user@$lane_eic_expected_host"
+    fi
+  fi
+  [ -n "$lane_eic_reason" ] || return 0
+  jq -S -n --arg target "$1" --arg reason "$lane_eic_reason" --arg detail "$lane_eic_detail" '
+    {schema:"roundhouse.privilege-enrollment",schema_version:1,target:$target,state:"failed",
+     reason:$reason,detail:$detail,next_command:"-",
+     credential_handling:"never_requests_or_relays_a_password_or_administrator_credential"}'
+  printf 'roundhouse: %s: enrollment refused: %s\n' "$1" "$lane_eic_detail" >&2
+  return 65
+}
 lane_report_pending() {
   # lane_report_pending TARGET STATE DETAIL — the human-facing one-time step.
   jq -S -n --arg target "$1" --arg state "$2" --arg detail "$3" '

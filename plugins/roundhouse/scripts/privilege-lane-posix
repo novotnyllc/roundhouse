@@ -445,8 +445,11 @@ lane_state() {
     [ "$(file_mode "$ingress_dir")" != 700 ]; then
     st_detail='ingress directory ownership or mode drifted'; return 0
   fi
+  # Each must be a real directory: a protected regular file in the place of
+  # the results directory would pass every ownership check and then swallow
+  # the result of a mutation that already ran.
   for d in "$claims_dir" "$journal_dir" "$results_dir"; do
-    protected_path "$d" || { st_detail="$d unprotected"; return 0; }
+    [ -d "$d" ] && [ ! -L "$d" ] && protected_path "$d" || { st_detail="$d is not a protected directory"; return 0; }
   done
   # The owner must be able to reach the helper and read its results: a
   # root-only 0700 on any of these is protected but unusable, so it is drift.
@@ -576,8 +579,15 @@ enroll_command() {
     record 'lane-enrollment|1' 'state|failed' "reason|$canary_reason" "platform|$platform" 'end-enrollment|'
     return 74
   fi
+  # Rollback stays armed until the enrollment is on record: a journal the
+  # lane cannot append to is a lane that cannot account for what it does.
+  if ! journal_event enrollment - - - completed "version=$version" - -; then
+    rollback_enrollment
+    trap - EXIT
+    record 'lane-enrollment|1' 'state|failed' 'reason|journal_write_failed' "platform|$platform" 'end-enrollment|'
+    return 74
+  fi
   trap - EXIT
-  journal_event enrollment - - - completed "version=$version" - -
   record 'lane-enrollment|1' 'state|enrolled' 'reason|one_time_approval_complete' "platform|$platform" \
     "host-id|$host" "owner-uid|$owner_uid" "owner-name|$owner" "lane-version|$version" "lane-sha256|$sha" \
     "plugin-root|$plugin_root" "canary|$canary_summary" 'end-enrollment|'
@@ -662,6 +672,8 @@ revoke_command() {
 # --- journal, rate, claims ----------------------------------------------------
 journal_event() {
   # journal_event KIND REQUEST-ID ACTION PACKAGE STATE REASON REQUEST-SHA RESULT-SHA
+  # (The fixture can make one KIND fail, to prove the callers roll back.)
+  if fixture_mode && [ "${ROUNDHOUSE_LANE_FIXTURE_FAIL_JOURNAL:-}" = "$1" ]; then return 1; fi
   printf 'event|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$(now)" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" >>"$journal_path"
 }
 requests_in_last_hour() {
@@ -1245,6 +1257,20 @@ self_test() {
     self_fail "macos status: $out"
   rc=0; out=$(ROUNDHOUSE_LANE_FIXTURE_ROOT="$root/mac" ROUNDHOUSE_LANE_FIXTURE_PLATFORM=macos "$lane" enroll --host-id mac-host --owner "$(id -un)" 2>&1) || rc=$?
   [ "$rc" -eq 69 ] && [ ! -e "$root/mac$lane_sudoers" ] || self_fail "macos enrollment was not refused (rc $rc): $out"
+  # A protected regular file in the place of a lane directory is drift.
+  mv "$root/fixture$lane_state/results" "$root/fixture$lane_state/results.dir"
+  : >"$root/fixture$lane_state/results"; chmod 755 "$root/fixture$lane_state/results"
+  rc=0; out=$("$installed" status) || rc=$?
+  [ "$rc" -eq 74 ] && grep -Fqx 'state|drifted' <<<"$out" && grep -Fq 'not a protected directory' <<<"$out" ||
+    self_fail "results path replaced by a file reported as: $out"
+  rm -f "$root/fixture$lane_state/results"; mv "$root/fixture$lane_state/results.dir" "$root/fixture$lane_state/results"
+  # An enrollment whose journal entry cannot be written is rolled back,
+  # after the canary and all: nothing stays enrolled off the record.
+  rc=0; out=$(ROUNDHOUSE_LANE_FIXTURE_ROOT="$root/jfail" ROUNDHOUSE_LANE_FIXTURE_FAIL_JOURNAL=enrollment \
+    "$lane" enroll --host-id test-host --owner "$(id -un)" --plugin-root "$plugin_root" 2>/dev/null) || rc=$?
+  [ "$rc" -eq 74 ] && grep -Fqx 'reason|journal_write_failed' <<<"$out" || self_fail "journal failure not reported (rc $rc): $out"
+  [ ! -e "$root/jfail$lane_sudoers" ] && [ ! -e "$root/jfail$lane_libexec/$lane_name" ] && [ ! -e "$root/jfail$lane_libexec/lane.identity" ] ||
+    self_fail 'a journal failure left the grant, script or identity installed'
   # A results directory the owner cannot read is drift, not ready.
   chmod 700 "$root/fixture$lane_state/results"
   rc=0; out=$("$installed" status) || rc=$?

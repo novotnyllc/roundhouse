@@ -318,7 +318,13 @@ the fleet's released version is visible.
 ## Enrollment: one approval, triggered by Roundhouse
 
 `roundhouse privilege-enroll HOST` is the single command. It never asks for,
-relays or stores a password or administrator credential.
+relays or stores a password or administrator credential. Before it runs
+anything it asks the host, over the same transport, for `hostname` and
+`id -un` and requires both to equal the machine entry's `expected_hostname`
+and `expected_user` (refusing with `identity_mismatch`, or
+`identity_unverifiable` when they are not configured or not answered):
+the identity record is written from the controller's `--host-id`, so an
+alias that lands on the wrong machine must be caught before, not after.
 
 | Platform / transport | What happens | The one human action |
 | --- | --- | --- |

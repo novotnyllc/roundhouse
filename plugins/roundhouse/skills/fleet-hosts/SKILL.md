@@ -31,7 +31,9 @@ lane. Validation requires that sibling to be a configured `platform: wsl`,
    `"$CLI" validate-config` to pass.
 3. **Privilege lane** (consent; the one OS prompt; Linux and WSL hosts) —
    `"$CLI" privilege-enroll HOST`: a single `sudo` password typed in the
-   terminal running the command (over `ssh -t` for a remote host). The
+   terminal running the command (over `ssh -t` for a remote host). It
+   first checks that the host answers as the entry's `expected_hostname`
+   and `expected_user` (both must be configured) and refuses otherwise. The
    approval installs a root-owned copy of the lane helper, an owner-only
    request queue and one exact sudoers grant; after it, every privileged
    apt action the fleet needs runs unattended. Without a terminal the
