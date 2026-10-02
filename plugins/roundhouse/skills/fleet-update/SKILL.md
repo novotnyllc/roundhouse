@@ -362,7 +362,14 @@ same step that installs the fleet entry; `install` does this for both macOS
 labels. A replaced definition that differed is kept as `.replaced`, and one
 `uninstall` removes as `.removed`; a backup that cannot be made stops the step.
 `uninstall` unloads a job the scheduler still holds before it removes the file,
-and is not done until the scheduler has let go of it. It also opts the host
+and is not done until the scheduler has let go of it. A scheduler this session
+cannot reach (no GUI domain over SSH, or a systemd user manager that runs but
+cannot be asked) may still hold the job, so `uninstall` refuses with 75 there,
+even when the definitions were deleted by hand but the job was last seen
+loaded or disabled (that memory is kept until a scheduler is seen to have let
+go). With no systemd user manager running at all (WSL without systemd, say),
+nothing holds the timer but its `timers.target.wants` link on disk, which the
+sealed plan removes with the units. It also opts the host
 out of triggers: after `uninstall`, a trigger or peer nudge only stamps and
 starts no pass until `install` runs again. A host carrying both
 is the exact double-runner this rule exists to prevent. `install` is also the only thing that enables a job: a scheduled pass

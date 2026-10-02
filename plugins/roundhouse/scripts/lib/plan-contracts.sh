@@ -28,7 +28,8 @@ schedule_operations_valid() {
   # sealed `roundhouse:schedule` operation (fleet-schedule install|uninstall),
   # shared by seal-plan and verify-preconditions: at most one, its exact argv,
   # and steps that only write, keep, remove or absorb an absolute definition
-  # path UNDER HOME, or run a launchctl/systemctl argv for a named effect.
+  # path UNDER HOME, unlink a fleet timer's timers.target.wants link under
+  # HOME, or run a launchctl/systemctl argv for a named effect.
   # Which paths and commands THIS host's jobs own is fleet_schedule_execute's
   # to check where they run.
   jq -e --arg home "$2" '
@@ -60,6 +61,10 @@ schedule_operations_valid() {
           $action == "uninstall" and exact(["action","before","form","mode","path"]) and
           (.mode | IN("fast","full")) and (.form | IN("plist","service","timer")) and
           (.path | in_home) and (.path | endswith("." + $s.form)) and (.before | hex)
+        elif .action == "unlink" then
+          $action == "uninstall" and exact(["action","mode","path"]) and
+          (.mode | IN("fast","full")) and (.path | in_home) and
+          (.path | test("/timers\\.target\\.wants/[^/]+\\.timer$"))
         elif .action == "absorb" then
           $action == "install" and exact(["action","before","path","to"]) and
           (.path | in_home) and (.path | endswith(".plist")) and (.before | hex) and

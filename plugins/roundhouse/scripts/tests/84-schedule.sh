@@ -169,6 +169,14 @@ printf 'loginctl %s\n' "$*" >>"$SCHED_LOG"
 [ "$1" = show-user ] || exit 64
 if [ -e "$SCHED_STATE/linger" ]; then printf 'yes\n'; else printf 'no\n'; fi
 STUB
+    cat >"$sched_bin/pgrep" <<'STUB'
+#!/bin/sh
+# The process table, for a systemd user manager only: manager-process says
+# one runs (out of this session's reach when usermgr is absent). The system
+# counts as booted with systemd (ROUNDHOUSE_TEST_SYSTEMD_BOOTED, below).
+printf 'pgrep %s\n' "$*" >>"$SCHED_LOG"
+[ -e "$SCHED_STATE/manager-process" ]
+STUB
     cat >"$sched_bin/runner" <<'STUB'
 #!/bin/sh
 # Stands in for `roundhouse` in the detached fallback. With SCHED_RUNNER_HOLD
@@ -199,7 +207,8 @@ STUB
     HOME="$sched_root/home"
     XDG_CONFIG_HOME="$HOME/.config"
     SCHED_UNAME=Darwin
-    export PATH ROUNDHOUSE_SELFTEST ROUNDHOUSE_FLEET_TRIGGER_RUNNER \
+    ROUNDHOUSE_TEST_SYSTEMD_BOOTED=1
+    export PATH ROUNDHOUSE_SELFTEST ROUNDHOUSE_FLEET_TRIGGER_RUNNER ROUNDHOUSE_TEST_SYSTEMD_BOOTED \
       ROUNDHOUSE_FLEET_STORE HOME XDG_CONFIG_HOME SCHED_UNAME
     mkdir -p "$ROUNDHOUSE_FLEET_STORE" "$HOME/Library/LaunchAgents" \
       "$HOME/.local/bin"
@@ -247,6 +256,7 @@ ROUNDHOUSE_LIB_ONLY=1
 case $1 in
   fast)
     local_plan_seal_apply() {
+      [ -z "${SCHED_KEEP_DRAFT:-}" ] || cp "$1" "$SCHED_KEEP_DRAFT"
       schedule_operations_valid "$1" "$HOME"
       jq ".operations[0]" "$1" >"$3/operation.json"
       fleet_schedule_execute "$3/operation.json"
@@ -1180,6 +1190,23 @@ fleet_run_command --fast'
     case $sched_out in *'loads at the next console login'*) ;; *) fail "install over SSH was not explained: $sched_out" ;; esac
     [ -f "$sched_fast" ] || fail "install with no GUI domain wrote no job"
     [ ! -e "$(fleet_schedule_optout_path)" ] || fail "install did not lift the opt-out"
+    # Still no GUI domain, and the plists deleted by hand: launchd may still
+    # hold a job last seen loaded, so uninstall refuses rather than reporting
+    # it gone.
+    printf 'loaded\n' >"$(fleet_schedule_state_path fast)"
+    rm -f "$sched_fast" "$sched_full"
+    # (A trigger or pass in between sees the job missing, but does not forget
+    # it was loaded while launchd cannot be asked whether it let go.)
+    fleet_schedule_job_state fast >/dev/null
+    [ "$(fleet_schedule_last_state fast)" = loaded ] ||
+      fail "an unreachable probe forgot a job last seen loaded when its plist was deleted by hand"
+    sched_status=0
+    sched_out=$(sched_schedule uninstall 2>&1) || sched_status=$?
+    [ "$sched_status" -eq 75 ] ||
+      fail "an unreachable uninstall of a job last seen loaded, its plist deleted by hand, was not refused ($sched_status): $sched_out"
+    case $sched_out in *'fast job is still installed, or was last seen loaded'*'Nothing was changed'*) ;;
+      *) fail "the refused unreachable uninstall did not say why: $sched_out" ;; esac
+    [ ! -e "$(fleet_schedule_optout_path)" ] || fail "a refused unreachable uninstall opted the host out"
 
     # --- one install or uninstall at a time ---
     # A live holder of the schedule lock (another install or uninstall, here
@@ -1386,6 +1413,67 @@ fleet_run_command --fast'
     [ "$sched_status" -eq 75 ] || fail "install with no user manager did not say so ($sched_status)"
     case $sched_out in *'no systemd user manager is reachable'*'wsl.conf'*) ;; *) fail "install with no user manager named no fix: $sched_out" ;; esac
     case $sched_out in *'enable-linger'*) fail "an unreachable manager on a lingering account was blamed on lingering: $sched_out" ;; esac
+    # Still no user manager, and the fast timer enabled (its wants link on
+    # disk). While a manager process runs out of this session's reach it may
+    # run the timer, so uninstall refuses and changes nothing…
+    mkdir -p "$sched_units/timers.target.wants"
+    ln -s ../roundhouse-fleet-fast.timer "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer"
+    : >"$SCHED_STATE/manager-process"
+    sched_status=0
+    sched_out=$(sched_schedule uninstall 2>&1) || sched_status=$?
+    [ "$sched_status" -eq 75 ] || fail "uninstall beside an unreachable running manager was not refused ($sched_status): $sched_out"
+    [ -L "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" ] &&
+      [ -f "$sched_units/roundhouse-fleet-fast.timer" ] ||
+      fail "an uninstall refused beside an unreachable running manager changed something"
+    # The plan refuses too, link or no link: another session may have started
+    # the disabled timer by hand, and removing its units would not stop it.
+    mv "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" "$sched_root/fast.wants"
+    mkdir -p "$sched_root/plan-work"
+    ! fleet_schedule_plan_steps uninstall "$(fleet_schedule_observe)" "$sched_root/plan-work" >/dev/null 2>&1 ||
+      fail "the uninstall plan removed units an unreachable running manager may still run"
+    mv "$sched_root/fast.wants" "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer"
+    # …and with no manager running at all, the sealed plan removes the link
+    # with the units, instead of refusing — unless a manager has started by
+    # the time the executor reaches the link (the sealed step, run directly).
+    rm -f "$SCHED_STATE/manager-process"
+    jq -n --arg link "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" '
+      {type:"agent-update",kind:"agent_artifact",id:"roundhouse:schedule",
+       argv:["roundhouse","fleet-schedule","uninstall"],
+       steps:[{action:"unlink",mode:"fast",path:$link}]}' >"$sched_root/unlink-op.json"
+    : >"$SCHED_STATE/manager-process"
+    sched_status=0
+    fleet_schedule_execute "$sched_root/unlink-op.json" >/dev/null 2>&1 || sched_status=$?
+    [ "$sched_status" -eq 65 ] && [ -L "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" ] ||
+      fail "the executor unlinked a wants link after a user manager started ($sched_status)"
+    rm -f "$SCHED_STATE/manager-process"
+    sched_out=$(SCHED_KEEP_DRAFT="$sched_root/unlink-draft.json" sched_schedule uninstall 2>&1) ||
+      fail "uninstall with no user manager running failed: $sched_out"
+    jq -e --arg link "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" '
+      any(.operations[0].steps[]; .action == "unlink" and .mode == "fast" and .path == $link)' \
+      "$sched_root/unlink-draft.json" >/dev/null ||
+      fail "the uninstall plan did not carry the wants link as a sealed step: $(cat "$sched_root/unlink-draft.json")"
+    [ ! -e "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" ] &&
+      [ ! -L "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" ] ||
+      fail "uninstall with no user manager running left the timer's wants link"
+    [ ! -e "$sched_units/roundhouse-fleet-fast.timer" ] && [ ! -e "$sched_units/roundhouse-fleet-full.service" ] &&
+      [ -e "$(fleet_schedule_optout_path)" ] ||
+      fail "uninstall with no user manager running did not remove the units and opt out: $sched_out"
+    case $sched_out in *'fleet-fast: disabled (no user manager is running'*) ;;
+      *) fail "uninstall did not report the removed wants link: $sched_out" ;; esac
+    # A unit deleted by hand while an unreachable manager last ran it: refused.
+    printf 'loaded\n' >"$(fleet_schedule_state_path full)"
+    : >"$SCHED_STATE/manager-process"
+    fleet_schedule_job_state full >/dev/null
+    sched_status=0
+    sched_schedule uninstall >/dev/null 2>&1 || sched_status=$?
+    [ "$sched_status" -eq 75 ] ||
+      fail "an unreachable uninstall of a timer last seen loaded, deleted by hand, was not refused ($sched_status)"
+    # Seen by a reachable manager that no longer holds it, it is forgotten.
+    : >"$SCHED_STATE/usermgr"
+    fleet_schedule_job_state full >/dev/null
+    [ "$(fleet_schedule_last_state full)" = missing ] ||
+      fail "a reachable manager that let go of a deleted timer did not forget it was loaded"
+    rm -f "$SCHED_STATE/manager-process" "$SCHED_STATE/usermgr"
 
     # A HOME and an XDG_CONFIG_HOME with spaces in them: every definition is
     # one path, installed and then removed whole, on both platforms.
