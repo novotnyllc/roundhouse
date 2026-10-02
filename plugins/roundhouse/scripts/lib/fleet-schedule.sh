@@ -177,6 +177,13 @@ fleet_schedule_launchd_start() {
   launchctl kickstart "$(fleet_schedule_gui_domain)/$(fleet_schedule_label "$1")"
 }
 
+fleet_schedule_launchd_running() {
+  # True while the job has a live process: a kickstart now would be a no-op.
+  # A live read for fleet_trigger_exit_pending, not one of the facts.
+  launchctl print "$(fleet_schedule_gui_domain)/$(fleet_schedule_label "$1")" \
+    2>/dev/null | grep -Eq '^[[:space:]]*state = running$'
+}
+
 # --- systemd -------------------------------------------------------------------
 
 fleet_schedule_systemd_def_path() {
@@ -216,6 +223,18 @@ fleet_schedule_systemd_facts() {
 
 fleet_schedule_systemd_start() {
   systemctl --user start --no-block "$(fleet_schedule_unit "$1").service"
+}
+
+fleet_schedule_systemd_running() {
+  # True while a start would merge into the run already going: the oneshot
+  # is `activating` for the whole run. (While `deactivating`, systemd queues
+  # the start for after the stop, so there is nothing to wait for.) A live
+  # read for fleet_trigger_exit_pending, not one of the facts.
+  case $(systemctl --user show -p ActiveState --value \
+    "$(fleet_schedule_unit "$1").service" 2>/dev/null) in
+    activating | active) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # --- the facts, and the one state derived from them -----------------------------

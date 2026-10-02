@@ -131,7 +131,11 @@ of the still-active oneshot queues nothing — is caught by one more comparison
 once the lock is free: the run takes the lock back in-process (non-blocking)
 and converges again, at most twice — never a detached pass, which the
 scheduler would kill with the job's process group. If another run holds the
-lock by then, that run sees the stamp. A signal (SIGTERM from the scheduler,
+lock by then, that run sees the stamp. One that lands after even that last
+comparison, while the job is still exiting, is the trigger's to catch: while
+its job runs with no lock held, the trigger returns at once and leaves a
+detached waiter that starts the job when it ends or a run takes the lock (at
+most thirty seconds). A signal (SIGTERM from the scheduler,
 SIGINT to the group) ends the run after the pass it interrupts, releases the
 lock and starts nothing further; a pass that is cut short still records the
 items it already applied.

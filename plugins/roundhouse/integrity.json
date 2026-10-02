@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "b4f91c4175cc3d7ad26897572d682589bd36d89dee4666305e666f6155835492"
+      "sha256": "9c8e88e735cca7eaf4aed0454ba1971b2bf328a697bd4ae5d8c044ab268f000d"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "2ddf59cc0eccd659d2b3b60b31f1b39acdc1506ca55b3d316c7e462c3af1d9fb"
+      "sha256": "aaeb97537962efa6e71fc36d8be0cc3d77a30ebd1e122144fc910564a8debe9d"
     },
     {
       "path": "assets/icon.png",
@@ -150,7 +150,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "9690f4fa191525970f1f280239be1f14b7f01ceeca03e2c7a8a8e44ee5b76001"
+      "sha256": "c004d8da4105d9548b40d6847332751edb592708136b9c3402ca83fdeed949b7"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -158,7 +158,7 @@
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
-      "sha256": "e826e26d1ceccaff3c9a59fa2560d945f9ef8bfd84daebbc129bbf470b3565e3"
+      "sha256": "59763c7ae5837b8bb87e2fdcb2fea30da1ffa85609122a6ed3306e5a1af47e49"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -166,7 +166,7 @@
     },
     {
       "path": "scripts/lib/fleet-trigger.sh",
-      "sha256": "b071249668532f67daf4f8e95fee9353cdcd25e925171b73a476d365adb88c96"
+      "sha256": "ee1f9c14f919b398c327eafec6857c4bc14770f6252871ee2dfbea826bdfc980"
     },
     {
       "path": "scripts/lib/fleet-trust-migrate.sh",
@@ -294,7 +294,7 @@
     },
     {
       "path": "skills/fleet-agents/SKILL.md",
-      "sha256": "388ae40b9f5c613428f8272b46378b82444194877cc7cf5653d11dcb3673d6d2"
+      "sha256": "6e3c8ff25646802928f24645e2ebee3de33da6f4f50eff5628b5ab1b2a577d77"
     },
     {
       "path": "skills/fleet-agents/agents/openai.yaml",
@@ -373,5 +373,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.57"
+  "version": "0.9.58"
 }
