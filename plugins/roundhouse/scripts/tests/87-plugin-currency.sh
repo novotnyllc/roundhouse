@@ -419,6 +419,12 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
           '{id:$id,result:{data:[{cwd:$cwd,warnings:[],errors:[],hooks:[{
             key:"widget@m:hooks/hooks.json:stop:0:0",pluginId:"widget@m",
             currentHash:$h,trustStatus:$s,enabled:true}]}]}}'
+        # PC advance-after: Codex reinstalls the copy right AFTER answering
+        # the Nth listing — between that listing and the trust write.
+        if [ "$lists" = "$(cat "$st/advance-after" 2>/dev/null)" ]; then
+          printf '%s\n' newer >"$st/version"
+          printf 'codex-advance\n' >>"$st/log"
+        fi
         ;;
       config/batchWrite)
         printf '%s\n' "$req" | jq -r '.params.edits[0].value' >"$st/trusted"
@@ -454,7 +460,8 @@ SH
       printf '%s\n' '{"source":"git","url":"https://example.invalid/widget.git"}' \
         >"$pc/hooks-state/source"
       printf '%s\n' '{"marketplaces":[]}' >"$pc/hooks-state/markets"
-      rm -f "$pc/hooks-state/pending" "$pc/hooks-state/lists" "$pc/hooks-state/advance-at"
+      rm -f "$pc/hooks-state/pending" "$pc/hooks-state/lists" "$pc/hooks-state/advance-at" \
+        "$pc/hooks-state/advance-after"
       printf '%s\n' cccccccccccccccccccccccccccccccccccccccc >"$pc/hooks-state/sha-newer"
       : >"$pc/hooks-state/log"
       jq -n --arg a "$pc_sha_a" '{version: 2, plugins: {"widget@m":
@@ -540,6 +547,33 @@ SH
       fail "trust was written after Codex advanced the copy under the check (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
     grep -q 'changed under the trust check' "$pc/hooks-err" ||
       fail "the refusal did not say the hooks changed under the check: $(tr '\n' ';' <"$pc/hooks-err")"
+    # ...and again when Codex reinstalls it after that last listing, right
+    # before the write: the identity and tree are checked once more.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    printf '%s\n' 2 >"$pc/hooks-state/advance-after"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+      ! grep -q '^trust' "$pc/hooks-state/log" ||
+      fail "trust was written after Codex advanced the copy past the last listing (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
+    # An approval refused because Codex had not synced is RETRIED: Claude is
+    # current by the next pass, so only a steady-state check finds it. Pass
+    # one holds; Codex syncs; pass two approves and the item applies.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] || fail "an unsynced Codex copy did not hold the first pass (got $pc_status)"
+    printf '%s\n' new >"$pc/hooks-state/version"
+    : >"$pc/hooks-state/log"
+    fleet_run_marketplace_repair_reset
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 0 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:new ] ||
+      fail "the next pass did not retry the approval once Codex synced (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    ! grep -q codex-add "$pc/hooks-state/log" || fail "the retry reinstalled Codex's copy"
     # ...a ONE-BYTE local edit in Codex's tree is not the verified bytes.
     pc_hooks_reset
     fleet_run_marketplace_repair_reset

@@ -881,7 +881,7 @@ trigger Codex's own sync and wait for it:
 
 ```text
 codex plugin marketplace list --json
-node "$SKILL_DIR/../../scripts/codex-plugin-hooks.mjs" sync ROOT REVISION [ROOT REVISION ...]
+node "$(dirname "$TARGET_CLI")/codex-plugin-hooks.mjs" sync ROOT REVISION [ROOT REVISION ...]
 codex plugin list --json
 ```
 
@@ -889,7 +889,10 @@ where each `ROOT` is a Git marketplace's root from the listing and `REVISION`
 its upstream head (`git ls-remote`). The helper holds a Codex app server open
 until each root records its revision and every enabled plugin installed from
 it is at that revision's catalog identity (30s at most; Codex records the
-revision before it reinstalls), and exits 75 for any it did not reach.
+revision before it reinstalls), and exits 75 for any it did not reach. The
+helper is the verified target's own, beside `"$TARGET_CLI"`; never send the
+controller's `SKILL_DIR` copy over SSH. Unpinned remote catalog entries carry
+no identity to wait on; Codex's own startup sync completes them.
 
 Hook trust then follows two rules:
 

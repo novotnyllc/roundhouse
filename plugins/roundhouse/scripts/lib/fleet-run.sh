@@ -1869,6 +1869,38 @@ EOF
   }
 }
 
+fleet_run_codex_hooks_settled() {
+  # fleet_run_codex_hooks_settled ID SHA — exit 0 when Codex's copy of an
+  # enabled fleet plugin needs nothing: Codex does not have it (or has it
+  # disabled), or its copy is at SHA with every hook trusted. Read-only until
+  # it finds work: a `modified` hook retries the byte-verified approval; a
+  # copy not at SHA, or a hook never trusted (which needs the operator), holds
+  # (75) with its reason, so the next pass asks again.
+  case ${1:-} in *@*) ;; *) return 0 ;; esac
+  command -v codex >/dev/null 2>&1 || return 0
+  fleet_run_hs_record=$(fleet_run_codex_record "$1") || return 75
+  [ "$(printf '%s\n' "$fleet_run_hs_record" | jq -r '.enabled == true')" = true ] || return 0
+  if [ -n "${2:-}" ] && [ "$(printf '%s\n' "$fleet_run_hs_record" | jq -r '.source.sha // ""')" != "$2" ]; then
+    printf 'roundhouse: Codex hooks for %s are not approved: Codex has not synced to %s yet; the next pass retries\n' \
+      "$1" "$2" >&2
+    return 75
+  fi
+  fleet_run_hs_node=$(fleet_node_path) || return 75
+  fleet_run_hs_status=$(bounded_query "$fleet_run_hs_node" "$script_dir/codex-plugin-hooks.mjs" \
+    status "$1" 2>/dev/null </dev/null) || return 75
+  fleet_run_hs_counts=$(printf '%s\n' "$fleet_run_hs_status" |
+    jq -er '"\(.modified | numbers) \(.untrusted | numbers)"' 2>/dev/null) || return 75
+  case $fleet_run_hs_counts in
+    '0 0') return 0 ;;
+    *' 0') fleet_run_approve_plugin_hooks "$1" "${2:-}" refresh ;;
+    *)
+      printf 'roundhouse: Codex hooks for %s are not approved: a hook was never trusted; approve it explicitly (approve-codex-plugin-hooks)\n' \
+        "$1" >&2
+      return 75
+      ;;
+  esac
+}
+
 fleet_run_codex_record() {
   # fleet_run_codex_record ID -> Codex's installed record for ID as compact
   # JSON (`{}` when there is none). Exit 75 when the list cannot be read.
@@ -2605,6 +2637,14 @@ EOF
         [ "$fleet_run_actual_enabled" = true ]; then
         fleet_run_approve_plugin_hooks "$fleet_run_id" \
           "${fleet_run_resolved_sha:-}" || return 75
+      fi
+      # Steady state (nothing installed, updated or enabled this pass): an
+      # approval an earlier pass could not make — Codex had not synced yet —
+      # is retried here, or Claude reads converged and the changed hooks stay
+      # untrusted for good (fleet_run_codex_hooks_settled).
+      if [ "$fleet_run_want_enabled" = true ] && [ "$fleet_run_actual_enabled" = true ] &&
+        [ "$fleet_run_plugin_mutated" != true ] && [ "$fleet_run_enable_attempted" != true ]; then
+        fleet_run_codex_hooks_settled "$fleet_run_id" "${fleet_run_resolved_sha:-}" || return 75
       fi
       ;;
     skills)

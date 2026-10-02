@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const TIMEOUT_MS = 15_000;
@@ -515,6 +515,16 @@ async function main() {
     fail("usage: codex-plugin-hooks.mjs approve|update PLUGIN@MARKETPLACE");
   }
   const cwd = process.cwd();
+  if (command === "status") {
+    // Read-only: how many of the plugin's hooks are trusted, modified (trusted
+    // once, bytes since changed) and never trusted. Writes nothing.
+    const hooks = await listHooks(pluginId, cwd, codexExecutable);
+    const count = (status) => hooks.filter((hook) => hook.trustStatus === status).length;
+    process.stdout.write(
+      `${JSON.stringify({ pluginId, hooks: hooks.length, trusted: count("trusted"), modified: count("modified"), untrusted: count("untrusted") })}\n`,
+    );
+    return;
+  }
   if (command === "approve" && process.env.ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL === "1") {
     // Automatic approval CARRIES EXISTING TRUST; it never grants new trust,
     // and it writes only hashes it verified. A hook never trusted before is
@@ -534,27 +544,39 @@ async function main() {
       if (hooks.some((hook) => hook.trustStatus === "untrusted")) {
         fail(`automatic approval refuses a hook that was never trusted: ${pluginId}`, 75);
       }
-      if (hooks.some((hook) => hook.trustStatus === "modified")) {
-        const sha = process.env.ROUNDHOUSE_VERIFIED_SHA;
-        const verifiedTree = process.env.ROUNDHOUSE_VERIFIED_TREE;
-        const codexTree = process.env.ROUNDHOUSE_CODEX_TREE;
-        if (!sha || !verifiedTree || !codexTree) {
-          fail(`automatic approval refuses a locally modified hook: ${pluginId}`, 75);
-        }
+      const carrying = hooks.some((hook) => hook.trustStatus === "modified");
+      const sha = process.env.ROUNDHOUSE_VERIFIED_SHA;
+      const verifiedTree = process.env.ROUNDHOUSE_VERIFIED_TREE;
+      const codexTree = process.env.ROUNDHOUSE_CODEX_TREE;
+      if (carrying && (!sha || !verifiedTree || !codexTree)) {
+        fail(`automatic approval refuses a locally modified hook: ${pluginId}`, 75);
+      }
+      const verifyIdentity = async () => {
+        // Still the verified copy: the record at the verified SHA, its active
+        // cache path the verified one, and its tree byte-identical.
         const record = await installedRecord(pluginId, codexExecutable);
-        if (!record || JSON.parse(record).sha !== sha) {
+        const parsed = record ? JSON.parse(record) : null;
+        const [name, marketplace] = pluginId.split("@");
+        const active = parsed && typeof parsed.version === "string"
+          ? join(process.env.CODEX_HOME || join(homedir(), ".codex"), "plugins", "cache", marketplace, name, parsed.version)
+          : null;
+        if (!parsed || parsed.sha !== sha || !active || resolve(active) !== resolve(codexTree)) {
           fail(`automatic approval refuses: ${pluginId} is no longer at the verified ${sha}`, 75);
         }
         if (!treesIdentical(codexTree, verifiedTree)) {
           fail(`automatic approval refuses: ${pluginId}'s Codex copy is not byte-identical to the verified tree`, 75);
         }
-      }
+      };
+      if (carrying) await verifyIdentity();
       if (!hooks.length) return { hooks };
       const again = await listNow();
       const snapshot = new Map(hooks.map((hook) => [hook.key, hook.currentHash]));
       if (again.length !== hooks.length || again.some((hook) => snapshot.get(hook.key) !== hook.currentHash)) {
         fail(`automatic approval refuses: ${pluginId}'s hooks changed under the trust check`, 75);
       }
+      if (carrying) await verifyIdentity();
+      // A sub-second window remains between this last check and the write;
+      // closing it would need a lock on Codex itself, which no Codex API offers.
       await server.request("config/batchWrite", {
         edits: hooks.map((hook) => ({ keyPath: hookKeyPath(hook.key), value: hook.currentHash, mergeStrategy: "replace" })),
         filePath: null,
@@ -626,7 +648,7 @@ async function main() {
     );
     return;
   }
-  fail("usage: codex-plugin-hooks.mjs approve|update PLUGIN@MARKETPLACE | sync ROOT REVISION...");
+  fail("usage: codex-plugin-hooks.mjs approve|update|status PLUGIN@MARKETPLACE | sync ROOT REVISION...");
 }
 
 main().catch((error) => {

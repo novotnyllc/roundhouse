@@ -416,7 +416,8 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_plugin_identity_matches \
       "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
       fail "same-version/same-SHA ownership identity did not match"
-    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+    # Codex's copy is at the same bytes (a steady state checks it).
+    CODEX_PLUGIN_SHA="$run_sha_old" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
@@ -520,12 +521,17 @@ JSON
     rm -f "$CODEX_HOOK_WRITES_FILE"
     printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.4.0","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
     printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    # It HOLDS — its Codex hooks are not trusted, which only the operator can
+    # fix — and nothing is approved or written.
+    run_status=0
     CODEX_HOOK_SCENARIO=approve \
       CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
-        '"enabled"' '' >/dev/null || fail "steady-state plugin apply failed"
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "a steady-state plugin with untrusted Codex hooks read as converged (got $run_status)"
     [ ! -s "$run_plugin_order_log" ] ||
       fail "steady-state enable invoked automatic hook approval"
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
