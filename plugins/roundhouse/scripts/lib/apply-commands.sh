@@ -633,8 +633,14 @@ apply_plan_command() {
             all($operation.steps[]; . as $s |
               if .action == "write" or .action == "keep" then
                 any($files[]; .path == $s.path and .digest == $s.digest)
-              elif .action == "remove" or .action == "absorb" then
+              elif .action == "remove" then
                 all($files[]; .path != $s.path or .digest == null)
+              elif .action == "absorb" then
+                # An absorbed definition may have been bootstrapped after the
+                # precondition recheck: it is gone AND launchd holds no legacy
+                # job, whether or not a bootout step was planned.
+                all($files[]; .path != $s.path or .digest == null) and
+                  all($legacy[]; (.loaded // false) | not)
               elif .action == "run" and .mode == "legacy" then
                 all($legacy[]; (.loaded // false) | not)
               else true end)))

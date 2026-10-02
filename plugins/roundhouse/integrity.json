@@ -102,7 +102,7 @@
     },
     {
       "path": "scripts/lib/apply-commands.sh",
-      "sha256": "6d114b1d076224101341a5849d58ebadc8179c9edcf371a229cff260a3057980"
+      "sha256": "0f22754d1df0794344f517b16db8e9df87309b34c142495cc2c431ef090fcc98"
     },
     {
       "path": "scripts/lib/broker-posix.sh",
