@@ -26,7 +26,7 @@ Facts the design rests on:
 - Native Windows got Node from winget (`OpenJS.NodeJS`, the Current line,
   pinned with `winget pin add --id OpenJS.NodeJS --version 26.*`), whose
   global prefix, `%APPDATA%\npm`, survives Node upgrades. The MSI installs
-  machine-wide, so every upgrade needs elevation; since 0.9.44 Windows
+  machine-wide, so every upgrade needs elevation; since 0.9.47 Windows
   runs fnm too (§7.7). Windows is reached through the WSL interop lane.
 - Some global packages ship their own transactional updater that does more
   than replace files. opencodex's `ocx update` also restarts its background
@@ -471,7 +471,7 @@ than special-case a package, a package declares hooks from its own bins:
 - Local configuration (trust root): top-level `node_switch_hooks` in
   `config.json`, `{"npm:@bitkyc08/opencodex": [["ocx","service"]]}`, validated
   with the same grammar and projected into the bounded worker configuration
-  for every target (Windows included since 0.9.44: fnm switches there
+  for every target (Windows included since 0.9.47: fnm switches there
   too, and `ocx service` re-registers opencodex's scheduled task).
 
 The store can only *require* a hook. A switch runs exactly the hooks the
@@ -632,7 +632,7 @@ argv is the marker only; the executor knows no other `fnm` shape. `carry`,
   new `prefix`/`node_version`, so npm plans sealed before a switch stop
   verifying after it.
 
-### 7.7 Windows (fnm since 0.9.44)
+### 7.7 Windows (fnm since 0.9.47)
 
 The operator's decision (2026-10-01) is one runtime manager everywhere: fnm
 is the Node runtime source on native Windows too, with no UAC and no ceremony
