@@ -622,28 +622,9 @@ apply_plan_command() {
             .status == "present" and .data.drift_count == 0)
         end
       elif .type == "agent-update" and .id == "roundhouse:schedule" then
-        # Every definition a step wrote or kept is on disk at its sealed
-        # digest, every one it removed or absorbed is gone, and once a
-        # superseded job was unloaded, launchd holds none of them.
-        . as $operation |
-        any($records[];
-          .kind == "agent_artifact" and .id == "roundhouse:schedule" and
-          (.status | IN("present","absent")) and
-          ((.data.legacy // []) as $legacy | ((.data.files // []) + $legacy) as $files |
-            all($operation.steps[]; . as $s |
-              if .action == "write" or .action == "keep" then
-                any($files[]; .path == $s.path and .digest == $s.digest)
-              elif .action == "remove" then
-                all($files[]; .path != $s.path or .digest == null)
-              elif .action == "absorb" then
-                # An absorbed definition may have been bootstrapped after the
-                # precondition recheck: it is gone AND launchd holds no legacy
-                # job, whether or not a bootout step was planned.
-                all($files[]; .path != $s.path or .digest == null) and
-                  all($legacy[]; (.loaded // false) | not)
-              elif .action == "run" and .mode == "legacy" then
-                all($legacy[]; (.loaded // false) | not)
-              else true end)))
+        # Checked below by schedule_postconditions_hold, shared with
+        # fleet-schedule install.
+        true
       elif .type == "agent-update" and .id == "roundhouse:launcher" then
         . as $operation |
         any($records[];
@@ -678,6 +659,14 @@ apply_plan_command() {
       else true end)
   ' >/dev/null; then
     printf 'roundhouse: post-change state did not satisfy the sealed plan\n' >&2
+    apply_status=partial
+  fi
+  if [ "$apply_status" = completed ] &&
+    jq -e 'any(.operations[]; .id == "roundhouse:schedule")' "$plan" >/dev/null &&
+    ! schedule_postconditions_hold \
+      "$(jq -c 'first(.operations[] | select(.id == "roundhouse:schedule"))' "$plan")" \
+      "$work/post.jsonl"; then
+    printf 'roundhouse: post-change state did not satisfy the sealed fleet-schedule plan\n' >&2
     apply_status=partial
   fi
   if [ "$apply_status" = completed ] && ! check_chezmoi_target_postconditions "$plan"; then

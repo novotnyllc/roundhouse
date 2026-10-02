@@ -10,7 +10,8 @@
 # schedule for such a machine is its WSL distribution's own systemd timer
 # pair, and this backend gives that schedule the Windows side's view:
 #
-#   observe   every Roundhouse* task in the Task Scheduler, each with the
+#   observe   every Roundhouse* task in the configured Windows machine's Task
+#             Scheduler, each with the
 #             SHA-256 of its exported definition and a class decided by
 #             scripts/schedule-windows.ps1 (privilege-lane, obsolete-oneshot,
 #             unknown) — into the sealed roundhouse:schedule record as
@@ -23,6 +24,16 @@
 #             kept first;
 #   verify    a fresh inspect: an obsolete task still registered is reported
 #             with the fix, and `install` exits 75.
+#
+# The Windows half is the inventory's, not whatever answers on interop: the
+# one configured `platform: windows` machine whose `wsl_interop_via` names
+# this host's own local WSL record (fleet_schedule_windows_sibling). Every
+# request carries that machine's expected hostname and user, the Windows side
+# refuses a session that is not it before it reads anything, and the result's
+# identity is checked again here. A machine with no such sibling has its
+# native half reported as not inspected and skipped; the local jobs never
+# wait on it. (Interop reaches only this hardware's own Windows, so this is
+# consistency with the inventory, not a reachability fix.)
 #
 # Everything on the Windows side runs as a native process holding the
 # logged-in user's token, started from this distribution exactly as the
@@ -60,6 +71,52 @@ fleet_schedule_windows_host() {
   fi
   [ "$(uname -s)" = Linux ] || return 1
   grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null
+}
+
+fleet_schedule_windows_sibling() {
+  # fleet_schedule_windows_sibling [MACHINE] — the configured Windows half of
+  # this machine, as one {machine,expected_hostname,expected_user} line: the
+  # ONE `platform: windows` entry whose wsl_interop_via names the ONE local
+  # WSL entry whose expected hostname and user are this host's (the record a
+  # host-local plan binds to, local_plan_target). With MACHINE it must be
+  # that entry. Otherwise 69, with the reason on stderr; nothing is guessed.
+  sibling_found=$(jq -c --arg hostname "$(hostname)" --arg user "$(id -un)" --arg want "${1:-}" '
+    [.machines // {} | to_entries[] | select(.value.platform == "wsl" and
+      .value.transport == "local" and .value.expected_hostname == $hostname and
+      .value.expected_user == $user) | .key] as $self |
+    if ($self | length) != 1 then
+      {reason:"no single configured local WSL machine is this host (\($hostname), \($user))"}
+    else
+      [.machines | to_entries[] | select(.value.platform == "windows" and
+        (.value.wsl_interop_via // null) == $self[0])] as $windows |
+      if ($windows | length) != 1 then
+        {reason:"no single configured Windows machine names \($self[0]) as its wsl_interop_via sibling"}
+      elif $want != "" and $windows[0].key != $want then
+        {reason:"the configured Windows half of \($self[0]) is \($windows[0].key), not \($want)"}
+      elif ($windows[0].value.expected_hostname | type == "string" and test("^[A-Za-z0-9._-]{1,253}$") | not) or
+        ($windows[0].value.expected_user | type == "string" and test("^[A-Za-z0-9._@-]{1,128}$") | not) then
+        {reason:"the configured Windows machine \($windows[0].key) has no expected_hostname and expected_user"}
+      else
+        {machine:$windows[0].key,expected_hostname:$windows[0].value.expected_hostname,
+          expected_user:$windows[0].value.expected_user}
+      end
+    end' "$(config_path)" 2>/dev/null) || sibling_found='{"reason":"the roundhouse config could not be read"}'
+  if [ "$(printf '%s\n' "$sibling_found" | jq -r 'has("machine")')" = true ]; then
+    printf '%s\n' "$sibling_found"
+    return 0
+  fi
+  printf '%s\n' "$sibling_found" | jq -r '.reason' >&2
+  return 69
+}
+
+fleet_schedule_windows_request() {
+  # fleet_schedule_windows_request SIBLING MODE [FIELDS-JSON] — one request
+  # for the configured Windows machine SIBLING names.
+  request_fields=${3:-}
+  [ -n "$request_fields" ] || request_fields='{}'
+  jq -cn --argjson sibling "$1" --arg mode "$2" --argjson fields "$request_fields" '
+    {schema:"roundhouse.schedule-windows-request",schema_version:1,mode:$mode,
+      expected_hostname:$sibling.expected_hostname,expected_user:$sibling.expected_user} + $fields'
 }
 
 fleet_schedule_windows_call() {
@@ -107,86 +164,123 @@ exec "$2" -NoLogo -NoProfile -NonInteractive -EncodedCommand "$3"
 fleet_schedule_windows_result_valid() {
   # The closed shape of one schedule-windows.ps1 result. Nothing from the
   # Windows side is believed beyond it: names, paths and digests are bounded,
-  # and no task definition's content travels at all.
+  # and no task definition's content travels at all. A task roundhouse does
+  # not recognise may carry any bounded name and folder (it is only ever
+  # reported); a class it acts on keeps the strict root-folder names.
   jq -e --arg oneshot "$fleet_schedule_windows_oneshot_re" '
     def text($n): type == "string" and length <= $n and (test("[[:cntrl:]]") | not);
-    (keys == ["backup","message","mode","outcome","schema","schema_version","state","tasks","user_sid"]) and
+    (keys == ["backup","host","message","mode","outcome","schema","schema_version","state","tasks","user","user_sid"]) and
     .schema == "roundhouse.schedule-windows-result" and .schema_version == 1 and
     (.mode | IN("inspect","unregister","")) and (.state | IN("completed","failed")) and
     (.message | text(1024)) and (.user_sid | text(184)) and (.backup | text(512)) and
+    (.host | text(253)) and (.user | text(128)) and
     (.outcome | IN("","removed","absent","refused","changed","not-obsolete","running","failed")) and
     (.tasks | type == "array" and length <= 64 and all(.[];
       type == "object" and
       (keys == ["class","digest","last_result","last_run","name","path","state"]) and
-      (.name | type == "string" and test("^Roundhouse[A-Za-z0-9._-]{0,118}$"; "i")) and
-      (.path | type == "string" and test("^\\\\([A-Za-z0-9 ._-]{1,64}\\\\){0,4}$")) and
+      (.name | type == "string" and test("^[^\\\\/[:cntrl:]]{1,128}$")) and
+      (.path | type == "string" and length <= 256 and test("^\\\\([^\\\\/[:cntrl:]]{1,64}\\\\){0,8}$")) and
+      ((.name | test("^Roundhouse"; "i")) or (.path | test("^\\\\Roundhouse"; "i"))) and
       (.class | IN("privilege-lane","obsolete-oneshot","unknown")) and
       (.digest | type == "string" and test("^[0-9a-f]{64}$")) and
       (.state | text(32)) and
       (.last_run | type == "string" and test("^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z)?$")) and
       (.last_result == null or (.last_result | type == "number")) and
-      (if .class == "obsolete-oneshot" then .path == "\\" and (.name | test($oneshot)) else true end)))
+      (if .class == "unknown" then true
+       else .path == "\\" and (.name | test("^Roundhouse[A-Za-z0-9._-]{0,118}$")) end) and
+      (if .class == "obsolete-oneshot" then .name | test($oneshot) else true end) and
+      (if .class == "privilege-lane" then .name | IN("RoundhouseBrokerV1","RoundhouseProfileV1") else true end)))
   ' "$1" >/dev/null 2>&1
 }
 
+fleet_schedule_windows_identity_holds() {
+  # fleet_schedule_windows_identity_holds SIBLING RESULT — the session that
+  # answered is the configured machine and account (Windows compares them
+  # without case, as it names them).
+  printf '%s\n' "$2" | jq -e --argjson sibling "$1" '
+    (.host | ascii_downcase) == ($sibling.expected_hostname | ascii_downcase) and
+    (.user | ascii_downcase) == ($sibling.expected_user | ascii_downcase)' >/dev/null
+}
+
 fleet_schedule_windows_inspect() {
-  # The native Task Scheduler's Roundhouse tasks: the inspect result object,
-  # or a failure with the reason on stderr.
-  inspect_result=$(fleet_schedule_windows_call \
-    '{"schema":"roundhouse.schedule-windows-request","schema_version":1,"mode":"inspect"}') ||
+  # fleet_schedule_windows_inspect SIBLING — the configured Windows machine's
+  # Roundhouse tasks: the inspect result object, or a failure with the reason
+  # on stderr.
+  inspect_result=$(fleet_schedule_windows_call "$(fleet_schedule_windows_request "$1" inspect)") ||
     return $?
   [ "$(printf '%s\n' "$inspect_result" | jq -r '.state')" = completed ] || {
     printf 'the native Task Scheduler could not be read: %s\n' \
       "$(printf '%s\n' "$inspect_result" | jq -r '.message')" >&2
     return 70
   }
+  fleet_schedule_windows_identity_holds "$1" "$inspect_result" || {
+    printf 'the native Task Scheduler answered as %s, not the configured %s\n' \
+      "$(printf '%s\n' "$inspect_result" | jq -r '"\(.host)\\\(.user)"')" \
+      "$(printf '%s\n' "$1" | jq -r '"\(.machine) (\(.expected_hostname)\\\(.expected_user))"')" >&2
+    return 70
+  }
   printf '%s\n' "$inspect_result"
 }
 
 fleet_schedule_windows_observe() {
-  # The `native` half of the roundhouse:schedule record. Only what is stable
-  # between the seal and the apply goes in — a task's last run time does
-  # not — because the record is the plan's precondition.
+  # The `native` half of the roundhouse:schedule record: the configured
+  # Windows machine it is, and its tasks. Only what is stable between the
+  # seal and the apply goes in — a task's last run time does not — because
+  # the record is the plan's precondition. A sibling the inventory does not
+  # configure is observed as unreachable, with the reason, and planned for
+  # by no step.
+  observe_sibling=$(fleet_schedule_windows_sibling 2>&1) || {
+    jq -cn --arg reason "$(printf '%s\n' "$observe_sibling" | head -n 1)" \
+      '{lane:"wsl-interop",machine:null,reachable:false,reason:$reason,tasks:[]}'
+    return 0
+  }
+  observe_machine=$(printf '%s\n' "$observe_sibling" | jq -r '.machine')
   # On success the inspect prints only its result; on failure only its reason.
-  if observe_native=$(fleet_schedule_windows_inspect 2>&1); then
-    printf '%s\n' "$observe_native" | jq -c '{lane:"wsl-interop",reachable:true,reason:null,
-      tasks:[.tasks[] | {name,path,class,digest}]}'
+  if observe_native=$(fleet_schedule_windows_inspect "$observe_sibling" 2>&1); then
+    printf '%s\n' "$observe_native" | jq -c --arg machine "$observe_machine" \
+      '{lane:"wsl-interop",machine:$machine,reachable:true,reason:null,
+        tasks:[.tasks[] | {name,path,class,digest}]}'
     return 0
   fi
-  jq -cn --arg reason "$(printf '%s\n' "$observe_native" | head -n 1)" \
-    '{lane:"wsl-interop",reachable:false,
+  jq -cn --arg machine "$observe_machine" --arg reason "$(printf '%s\n' "$observe_native" | head -n 1)" \
+    '{lane:"wsl-interop",machine:$machine,reachable:false,
       reason:(if $reason == "" then "the native Task Scheduler could not be reached" else $reason end),
       tasks:[]}'
 }
 
 fleet_schedule_windows_plan() {
   # fleet_schedule_windows_plan ACTION RECORD — the native steps: on install,
-  # one `unregister` per obsolete one-shot task the record observed; on
-  # uninstall none (this host's jobs are its systemd timers, and no native
-  # task is one of them).
+  # one `unregister` per obsolete one-shot task the record observed on its
+  # configured Windows machine; on uninstall none (this host's jobs are its
+  # systemd timers, and no native task is one of them).
   [ "$1" = install ] || return 0
   printf '%s\n' "$2" | jq -c '
-    (.native // {}) as $n | select($n.reachable == true) |
+    (.native // {}) as $n | select($n.reachable == true and ($n.machine | type == "string")) |
     $n.tasks[] | select(.class == "obsolete-oneshot") |
-    {action:"unregister",mode:"native",name,path,digest}'
+    {action:"unregister",mode:"native",machine:$n.machine,name,path,digest}'
 }
 
 fleet_schedule_windows_unregister() {
-  # fleet_schedule_windows_unregister NAME DIGEST — the executor's one native
-  # mutation. The Windows side re-reads the task and removes it only while
-  # it is still the sealed definition of an obsolete one-shot task. Always
-  # returns 0 once the request went out: a refusal is the operator's to
-  # resolve and does not undo the local jobs the same plan installed; the
-  # verify after apply reports what is left.
-  unregister_request=$(jq -cn --arg name "$1" --arg digest "$2" \
-    '{schema:"roundhouse.schedule-windows-request",schema_version:1,mode:"unregister",
-      name:$name,digest:$digest}')
+  # fleet_schedule_windows_unregister MACHINE NAME DIGEST — the executor's one
+  # native mutation, on the configured Windows machine MACHINE only. The
+  # Windows side refuses a session that is not that machine, re-reads the
+  # task and removes it only while it is still the sealed definition of an
+  # obsolete one-shot task. Always returns 0 once the request is decided: a
+  # refusal is the operator's to resolve and does not undo the local jobs the
+  # same plan installed; apply's postcondition reports what is left.
+  unregister_sibling=$(fleet_schedule_windows_sibling "$1" 2>&1) || {
+    printf 'roundhouse: native Windows: %s was not removed: %s\n' "$2" \
+      "$(printf '%s\n' "$unregister_sibling" | head -n 1)" >&2
+    return 0
+  }
+  unregister_request=$(fleet_schedule_windows_request "$unregister_sibling" unregister \
+    "$(jq -cn --arg name "$2" --arg digest "$3" '{name:$name,digest:$digest}')")
   unregister_result=$(fleet_schedule_windows_call "$unregister_request" 2>&1) || {
-    printf 'roundhouse: native Windows: %s was not removed: %s\n' "$1" \
+    printf 'roundhouse: native Windows: %s was not removed: %s\n' "$2" \
       "$(printf '%s\n' "$unregister_result" | head -n 1)" >&2
     return 0
   }
-  printf '%s\n' "$unregister_result" | jq -r --arg name "$1" '
+  printf '%s\n' "$unregister_result" | jq -r --arg name "$2" '
     if .state != "completed" then
       "roundhouse: native Windows: \($name) was not removed: \(.message)"
     elif .outcome == "removed" then
@@ -202,13 +296,20 @@ fleet_schedule_windows_unregister() {
 
 fleet_schedule_windows_status() {
   # `fleet-schedule status`'s native lines, read-only. Returns 0 even when the
-  # Windows side cannot be reached: the reason is the line.
-  status_native=$(fleet_schedule_windows_inspect 2>&1) || {
+  # Windows side cannot be reached or is not configured: the reason is the
+  # line.
+  status_sibling=$(fleet_schedule_windows_sibling 2>&1) || {
+    printf 'native Windows: Task Scheduler not inspected — %s\n' \
+      "$(printf '%s\n' "$status_sibling" | head -n 1)"
+    return 0
+  }
+  status_native=$(fleet_schedule_windows_inspect "$status_sibling" 2>&1) || {
     printf 'native Windows: Task Scheduler not inspected — %s\n' \
       "$(printf '%s\n' "$status_native" | head -n 1)"
     return 0
   }
-  printf 'native Windows: no fleet-run task, by design — roundhouse has no native runtime; the timers above are this machine'"'"'s one scheduled runner, and they converge this WSL side (native Windows changes only through the interop lane)\n'
+  printf 'native Windows: %s — no fleet-run task, by design — roundhouse has no native runtime; the timers above are this machine'"'"'s one scheduled runner, and they converge this WSL side (native Windows changes only through the interop lane)\n' \
+    "$(printf '%s\n' "$status_sibling" | jq -r '.machine')"
   printf '%s\n' "$status_native" | jq -r '
     .tasks[] |
     (if .last_run == "" then "never run" else "last run \(.last_run), result \(.last_result)" end) as $run |
@@ -227,7 +328,8 @@ fleet_schedule_windows_verify() {
   # one-shot task is still registered, else 75 with each one named. An
   # inspection that fails AFTER the plan reached Windows proves nothing was
   # removed, so it is 75 too, never a verified removal.
-  verify_native=$(fleet_schedule_windows_inspect 2>/dev/null) || {
+  verify_native=$(fleet_schedule_windows_sibling 2>/dev/null) &&
+    verify_native=$(fleet_schedule_windows_inspect "$verify_native" 2>/dev/null) || {
     printf 'roundhouse: native Windows: could not inspect the Task Scheduler after the install, so the obsolete one-shot tasks are unverified; re-run `roundhouse fleet-schedule install`\n' >&2
     return 75
   }

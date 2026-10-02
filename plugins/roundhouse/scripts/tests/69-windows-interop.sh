@@ -23,7 +23,7 @@ ROUNDHOUSE_CONFIG="$interop_config" "$cli" validate-config ||
 for interop_invalid in \
   '.machines["test-windows"].wsl_interop_via = "missing-machine"' \
   '.machines["test-windows"].wsl_interop_via = "test-ssh"' \
-  '.machines["test-wsl"].transport = "local" | del(.machines["test-wsl"].ssh_alias)' \
+  '.machines["test-wsl"].transport = "codex-remote-control"' \
   '.machines["test-windows"].wsl_interop_via = "../test-wsl"' \
   '.machines["test-windows"].wsl_interop_via = ["test-wsl"]' \
   '.machines["test-windows"].physical_host = "other-hardware"' \
@@ -34,6 +34,22 @@ for interop_invalid in \
     fail "config validation accepted an invalid WSL interop sibling: $interop_invalid"
   fi
 done
+# The WSL side's own config names itself `local`: a valid sibling for
+# fleet-schedule's native half, but no interop lane — only an SSH sibling
+# carries one.
+jq '.machines["test-wsl"].transport = "local" | del(.machines["test-wsl"].ssh_alias)' \
+  "$interop_config" >"$tmp/interop-local-config.json"
+chmod 600 "$tmp/interop-local-config.json"
+ROUNDHOUSE_CONFIG="$tmp/interop-local-config.json" "$cli" validate-config ||
+  fail "a native-Windows entry naming the local WSL side as its sibling was rejected"
+(
+  # shellcheck source=/dev/null
+  ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+  ! wsl_interop_alias "$tmp/interop-local-config.json" test-windows >/dev/null ||
+    fail "a local WSL sibling was given an SSH interop lane"
+  wsl_interop_alias "$interop_config" test-windows >/dev/null ||
+    fail "an SSH WSL sibling lost its interop lane"
+)
 # The bounded worker config carries only its own target, so its dangling
 # sibling reference is expected there and must still validate.
 ROUNDHOUSE_CONFIG="$interop_config" "$cli" worker-config test-windows inventory \

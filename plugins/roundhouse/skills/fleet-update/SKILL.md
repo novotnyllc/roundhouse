@@ -418,16 +418,23 @@ matches.
   timer pair; its native side changes only through the interop lane
   (`collect` / `apply-interop-plan`). On the WSL side, `fleet-schedule status`
   and `install` also read the native Task Scheduler over interop, as the
-  logged-in user and unelevated: `status` lists every `Roundhouse*` task by
+  logged-in user and unelevated, of the Windows machine the WSL side's own
+  config names: the one `platform: windows` entry whose `wsl_interop_via` is
+  that host's `local` WSL entry. Every request carries that entry's
+  `expected_hostname` and `expected_user`, and a session that is not it is
+  refused. With no such entry the native half is reported as not inspected
+  and skipped; the timers still install. `status` lists every `Roundhouse*` task by
   class (the privilege lane's `RoundhouseBrokerV1`/`RoundhouseProfileV1`,
   obsolete one-shot release-gate tasks named `Roundhouse-<word>-<32 hex>`
-  with no trigger, or unknown), and `install` removes only the obsolete
-  one-shot tasks, each bound to its sealed definition digest and kept first
-  under `%LOCALAPPDATA%\Roundhouse\schedule-removed\`. Unknown tasks are
-  reported and never changed. If the Task Scheduler refuses the interop
-  session ("Access is denied"), `install` still installs the timers, exits
-  75, and names the `Unregister-ScheduledTask` command to run from the user's
-  own desktop session.
+  with no trigger, or unknown, under any bounded name in a `\Roundhouse*`
+  folder), and `install` removes only the obsolete one-shot tasks, each bound
+  to its sealed definition digest, checked again after its definition is kept
+  under `%LOCALAPPDATA%\Roundhouse\schedule-removed\` (in the UTF-16 its XML
+  declares). Unknown tasks are reported and never changed. A native removal
+  that does not happen leaves the apply partial; if the Task Scheduler
+  refuses the interop session ("Access is denied"), `install` still installs
+  the timers, exits 75, and names the `Unregister-ScheduledTask` command to
+  run from the user's own desktop session.
 
 ```bash
 roundhouse fleet-run --fast    # the fast slot
