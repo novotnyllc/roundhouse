@@ -416,9 +416,10 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
         [ -z "$trusted" ] || status=modified
         [ "$trusted" != "$current" ] || status=trusted
         jq -cn --argjson id "$id" --arg cwd "$cwd" --arg h "$current" --arg s "$status" \
-          '{id:$id,result:{data:[{cwd:$cwd,warnings:[],errors:[],hooks:[{
+          --argjson none "$([ -e "$st/nohooks" ] && echo true || echo false)" \
+          '{id:$id,result:{data:[{cwd:$cwd,warnings:[],errors:[],hooks:(if $none then [] else [{
             key:"widget@m:hooks/hooks.json:stop:0:0",pluginId:"widget@m",
-            currentHash:$h,trustStatus:$s,enabled:true}]}]}}'
+            currentHash:$h,trustStatus:$s,enabled:true}] end)}]}}'
         # PC advance-after: Codex reinstalls the copy right AFTER answering
         # the Nth listing — between that listing and the trust write.
         if [ "$lists" = "$(cat "$st/advance-after" 2>/dev/null)" ]; then
@@ -440,7 +441,8 @@ case "$*" in
     jq -cn --arg v "$ver" --arg sha "$(cat "$st/sha-$ver")" \
       --argjson src "$(cat "$st/source")" --argjson on "$(cat "$st/enabled")" '{installed:[{
       pluginId:"widget@m",name:"widget",marketplaceName:"m",version:$v,
-      installed:true,enabled:$on,source:($src + {sha:$sha})}]}'
+      installed:true,enabled:$on,
+      source:($src + (if $src.source == "local" then {} else {sha:$sha} end))}]}'
     ;;
   'plugin marketplace list --json') cat "$st/markets" ;;
   'plugin add widget@m --json')
@@ -461,7 +463,8 @@ SH
         >"$pc/hooks-state/source"
       printf '%s\n' '{"marketplaces":[]}' >"$pc/hooks-state/markets"
       rm -f "$pc/hooks-state/pending" "$pc/hooks-state/lists" "$pc/hooks-state/advance-at" \
-        "$pc/hooks-state/advance-after"
+        "$pc/hooks-state/advance-after" "$pc/hooks-state/nohooks"
+      pc_claude_markets=
       printf '%s\n' cccccccccccccccccccccccccccccccccccccccc >"$pc/hooks-state/sha-newer"
       : >"$pc/hooks-state/log"
       jq -n --arg a "$pc_sha_a" '{version: 2, plugins: {"widget@m":
@@ -485,6 +488,7 @@ SH
         >"$pc/codex-home/plugins/cache/m/widget/old/hooks/hooks.json"
     }
     pc_hooks_apply() {
+      CLAUDE_PLUGIN_MARKETPLACE_FILE="$pc_claude_markets" \
       CODEX_HOME="$pc/codex-home" CLAUDE_INSTALL_PATH_ROOT="$pc/claude-installs" \
         PATH="$pc/hooks-bin:$PATH" PC_HOOKS_STATE="$pc/hooks-state" \
         CLAUDE_PLUGIN_CATALOG_FILE="$pc/hooks-catalog.json" \
@@ -605,6 +609,47 @@ SH
       fail "a modified hook was trusted with no Claude install to compare against (got $pc_status)"
     grep -q 'no Claude install of widget@m' "$pc/hooks-err" ||
       fail "the refusal did not name the missing Claude install: $(tr '\n' ';' <"$pc/hooks-err")"
+    # --- an IN-MARKETPLACE plugin: Codex records `source: local`, no SHA ---
+    # Its identity is its path inside the verified Codex marketplace root and
+    # its bytes, never a SHA comparison that cannot match.
+    pc_local_setup() {
+      pc_hooks_reset
+      fleet_run_marketplace_repair_reset
+      jq -n --arg b "$pc_sha_b" '{available: [{pluginId: "widget@m", version: "1.1.0",
+        source: {source: "relative", path: "./plugins/widget", sha: $b}}]}' >"$pc/hooks-catalog.json"
+      printf '%s\n' '[{"name":"m","source":"github","repo":"owner/mkt"}]' >"$pc/claude-markets.json"
+      pc_claude_markets="$pc/claude-markets.json"
+      printf '%s\n' '{"marketplaces":[{"name":"m","root":"/codex/m","marketplaceSource":{"sourceType":"git","source":"https://github.com/Owner/mkt.git"}}]}' \
+        >"$pc/hooks-state/markets"
+      printf '%s\n' '{"source":"local","path":"/codex/m/plugins/widget"}' >"$pc/hooks-state/source"
+      printf '%s\n' new >"$pc/hooks-state/version"
+    }
+    # ...converged with NO hooks is not held, now or on the next pass.
+    pc_local_setup
+    : >"$pc/hooks-state/nohooks"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 0 ] ||
+      fail "an in-repo plugin with no hooks was held (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 0 ] ||
+      fail "a converged in-repo plugin with no hooks was held on the next pass (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    # ...with modified hooks and a byte-identical tree: approved.
+    pc_local_setup
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 0 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:new ] ||
+      fail "an in-repo plugin's byte-verified modified hook was not carried (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    # ...with a one-byte edit in Codex's copy: refused, nothing written.
+    pc_local_setup
+    printf 'widget 1.1.1\n' >"$pc/codex-home/plugins/cache/m/widget/new/README.md"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+      fail "an edited in-repo Codex copy had its modified hook trusted (got $pc_status)"
+    grep -q "differs byte-for-byte" "$pc/hooks-err" ||
+      fail "the in-repo refusal did not name the byte mismatch: $(tr '\n' ';' <"$pc/hooks-err")"
     # The helper's update NEVER reports trust it did not carry: when Codex's
     # startup sync advances the copy under its snapshot (trusted hooks then
     # read modified), it says so and fails, and writes nothing.

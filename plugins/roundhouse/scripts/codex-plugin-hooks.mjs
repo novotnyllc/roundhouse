@@ -304,7 +304,16 @@ function installedRecord(pluginId, codexExecutable) {
         const installed = JSON.parse(out)?.installed;
         if (!Array.isArray(installed)) throw new Error("shape");
         const record = installed.find((p) => p?.pluginId === pluginId && p?.installed !== false);
-        resolve(record ? JSON.stringify({ version: record.version ?? null, sha: record.source?.sha ?? null }) : null);
+        resolve(
+          record
+            ? JSON.stringify({
+                version: record.version ?? null,
+                sha: record.source?.sha ?? null,
+                kind: record.source?.source ?? null,
+                path: record.source?.path ?? null,
+              })
+            : null,
+        );
       } catch {
         reject(new Error("codex plugin list returned invalid JSON"));
       }
@@ -560,7 +569,14 @@ async function main() {
         const active = parsed && typeof parsed.version === "string"
           ? join(process.env.CODEX_HOME || join(homedir(), ".codex"), "plugins", "cache", marketplace, name, parsed.version)
           : null;
-        if (!parsed || parsed.sha !== sha || !active || resolve(active) !== resolve(codexTree)) {
+        // A git-sourced record names its SHA. A local (in-marketplace) one
+        // names none: it must still be the source path the caller verified
+        // inside the marketplace root, and the tree check below is its proof.
+        const sourcePath = process.env.ROUNDHOUSE_CODEX_SOURCE_PATH;
+        const atVerified = parsed && (parsed.sha === sha ||
+          (parsed.kind === "local" && !parsed.sha && sourcePath && typeof parsed.path === "string" &&
+            resolve(parsed.path) === resolve(sourcePath)));
+        if (!atVerified || !active || resolve(active) !== resolve(codexTree)) {
           fail(`automatic approval refuses: ${pluginId} is no longer at the verified ${sha}`, 75);
         }
         if (!treesIdentical(codexTree, verifiedTree)) {

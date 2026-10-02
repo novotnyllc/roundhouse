@@ -1774,11 +1774,21 @@ fleet_run_approve_plugin_hooks() {
   fi
   fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" \
     "$fleet_run_expected_sha") || return 75
-  [ "$fleet_run_codex_plugin_state" = match ] || {
-    printf 'roundhouse: automatic hook approval for %s refused: Codex has not synced to %s yet; the next pass retries\n' \
-      "$1" "${fleet_run_expected_sha:-the expected bytes}" >&2
-    return 75
-  }
+  case $fleet_run_codex_plugin_state in
+    match) ;;
+    local)
+      fleet_run_codex_bytes_verified "$1" "$fleet_run_expected_sha" || {
+        printf 'roundhouse: automatic hook approval for %s refused: %s\n' \
+          "$1" "$fleet_run_bytes_reason" >&2
+        return 75
+      }
+      ;;
+    *)
+      printf 'roundhouse: automatic hook approval for %s refused: Codex has not synced to %s yet; the next pass retries\n' \
+        "$1" "${fleet_run_expected_sha:-the expected bytes}" >&2
+      return 75
+      ;;
+  esac
   # Codex advances its own copies (its startup sync), so a hook this host
   # trusted reads `modified` once upstream changed it. Automatic approval
   # carries that trust only for bytes PROVEN to be the verified upstream ones
@@ -1790,18 +1800,21 @@ fleet_run_approve_plugin_hooks() {
   fleet_run_hook_sha=
   fleet_run_hook_tree=
   fleet_run_hook_codex_tree=
+  fleet_run_hook_source_path=
   fleet_run_bytes_reason=
   if [ -n "$fleet_run_expected_sha" ] &&
     fleet_run_codex_bytes_verified "$1" "$fleet_run_expected_sha"; then
     fleet_run_hook_sha=$fleet_run_expected_sha
     fleet_run_hook_tree=$fleet_run_bv_claude_path
     fleet_run_hook_codex_tree=$fleet_run_bv_codex_path
+    fleet_run_hook_source_path=$fleet_run_bv_local_path
   fi
   fleet_run_cli_invalidate
   ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
     ROUNDHOUSE_VERIFIED_SHA=$fleet_run_hook_sha \
     ROUNDHOUSE_VERIFIED_TREE=$fleet_run_hook_tree \
     ROUNDHOUSE_CODEX_TREE=$fleet_run_hook_codex_tree \
+    ROUNDHOUSE_CODEX_SOURCE_PATH=$fleet_run_hook_source_path \
     "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
     >/dev/null || {
     [ -z "$fleet_run_bytes_reason" ] ||
@@ -1829,16 +1842,24 @@ fleet_run_codex_bytes_verified() {
     return 1
   }
   fleet_run_bv_fields=$(printf '%s\n' "$fleet_run_bv_record" | jq -r '
-    [(.source.sha // ""), (.marketplaceName // ""), (.name // ""), (.version // "")] |
+    [(.source.sha // ""), (.marketplaceName // ""), (.name // ""), (.version // ""),
+      (.source.source // ""), (.source.path // "")] |
     map(tostring) | join("\u001f")') || fleet_run_bv_fields=
   IFS=$fleet_run_sep read -r fleet_run_bv_sha fleet_run_bv_market fleet_run_bv_name \
-    fleet_run_bv_version <<EOF
+    fleet_run_bv_version fleet_run_bv_kind fleet_run_bv_srcpath <<EOF
 $fleet_run_bv_fields
 EOF
-  [ "$fleet_run_bv_sha" = "$2" ] || {
+  # A git-sourced record carries the SHA it was installed at. A local
+  # (in-marketplace) one carries none: its path inside the verified
+  # marketplace root was proven above (fleet_run_codex_source_ok), and the
+  # byte comparison below is its identity.
+  fleet_run_bv_local_path=
+  if [ "$fleet_run_bv_kind" = local ] && [ -z "$fleet_run_bv_sha" ]; then
+    fleet_run_bv_local_path=$fleet_run_bv_srcpath
+  elif [ "$fleet_run_bv_sha" != "$2" ]; then
     fleet_run_bytes_reason="Codex's copy is at ${fleet_run_bv_sha:-no SHA}, not $2"
     return 1
-  }
+  fi
   fleet_run_bv_claude=$(fleet_run_installed_plugin "$1" 2>/dev/null) || fleet_run_bv_claude='{}'
   fleet_run_bv_claude_path=$(printf '%s\n' "$fleet_run_bv_claude" | jq -r --arg sha "$2" '
     if (.gitCommitSha // "") == $sha then (.installPath // "") else "" end') ||
@@ -1881,9 +1902,19 @@ fleet_run_codex_hooks_settled() {
   fleet_run_hs_record=$(fleet_run_codex_record "$1") || return 75
   [ "$(printf '%s\n' "$fleet_run_hs_record" | jq -r '.enabled == true')" = true ] || return 0
   if [ -n "${2:-}" ] && [ "$(printf '%s\n' "$fleet_run_hs_record" | jq -r '.source.sha // ""')" != "$2" ]; then
-    printf 'roundhouse: Codex hooks for %s are not approved: Codex has not synced to %s yet; the next pass retries\n' \
-      "$1" "$2" >&2
-    return 75
+    # A local (in-marketplace) record has no SHA: it is synced when it is
+    # from the verified source and byte-identical to Claude's install.
+    if [ "$(fleet_run_codex_record_state "$1" "$2")" = local ]; then
+      fleet_run_codex_bytes_verified "$1" "$2" || {
+        printf 'roundhouse: Codex hooks for %s are not approved: %s; the next pass retries\n' \
+          "$1" "$fleet_run_bytes_reason" >&2
+        return 75
+      }
+    else
+      printf 'roundhouse: Codex hooks for %s are not approved: Codex has not synced to %s yet; the next pass retries\n' \
+        "$1" "$2" >&2
+      return 75
+    fi
   fi
   fleet_run_hs_node=$(fleet_node_path) || return 75
   fleet_run_hs_status=$(bounded_query "$fleet_run_hs_node" "$script_dir/codex-plugin-hooks.mjs" \
@@ -1995,6 +2026,10 @@ fleet_run_codex_record_state() {
       if ($matches | length) == 0 then "absent"
       elif $expected_sha == "" or any($matches[]; .source.sha == $expected_sha)
       then "match"
+      # An in-marketplace plugin: Codex records `source: local` with no SHA,
+      # so its identity is its path and bytes (fleet_run_codex_bytes_verified).
+      elif any($matches[]; .source.source == "local" and (.source.sha // "") == "")
+      then "local"
       else "mismatch"
       end
   ' 2>/dev/null || return 75
