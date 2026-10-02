@@ -49,9 +49,9 @@ function treeEntries(root, { rejectEscapingLinks = false } = {}) {
             throw new Error(`symlink does not resolve: ${relPath}`);
           }
           const inside = to.startsWith(base + sep) ? to.slice(base.length + 1) : null;
-          const top = inside === null ? null : inside.split(sep)[0];
-          if (inside === null || top === ".git" || top === ".in_use" || top === ".orphaned_at" ||
-            top === ".codex-marketplace-install.json") {
+          const parts = inside === null ? [] : inside.split(sep);
+          if (inside === null || parts.includes(".git") || [".in_use", ".orphaned_at",
+            ".codex-marketplace-install.json"].includes(parts[0])) {
             throw new Error(`symlink escapes the compared plugin tree: ${relPath}`);
           }
         }

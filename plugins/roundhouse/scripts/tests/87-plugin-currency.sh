@@ -622,6 +622,22 @@ SH
     [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
       ! grep -q '^trust' "$pc/hooks-state/log" ||
       fail "a symlink escaping through an excluded marker had its modified hook trusted (got $pc_status)"
+    # ...or into a nested `.git`, which the comparison skips at every depth.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    pc_n=0
+    for pc_tree in "$pc/claude-installs/widget@m/1.1.0" "$pc/codex-home/plugins/cache/m/widget/new"; do
+      pc_n=$((pc_n + 1))
+      mkdir -p "$pc_tree/vendor/.git"
+      printf '%s\n' "{\"hooks\":{\"Stop\":[{\"command\":\"echo $pc_n\"}]}}" >"$pc_tree/vendor/.git/hooks.json"
+      ln -s ../vendor/.git/hooks.json "$pc_tree/hooks/extra.json"
+    done
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+      ! grep -q '^trust' "$pc/hooks-state/log" ||
+      fail "a symlink into a nested .git had its modified hook trusted (got $pc_status)"
     # ...a hook that was NEVER trusted is not carried over: no new grants.
     pc_hooks_reset
     fleet_run_marketplace_repair_reset
