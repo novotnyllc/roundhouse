@@ -276,18 +276,7 @@ fleet_schedule_command "$@"'
       "$(fleet_schedule_state_path full)"
     "$cli" fleet-trigger --fast >/dev/null
     sched_no_runner || fail "a job never seen running was started blind"
-    # The combined file an earlier release wrote still answers, for one
-    # release, for a job that has no file of its own…
-    printf 'fast loaded\nfull disabled\n' >"$(fleet_schedule_legacy_state_path)"
-    [ "$(fleet_schedule_last_state fast)" = loaded ] &&
-      [ "$(fleet_schedule_last_state full)" = disabled ] ||
-      fail "the combined legacy schedule-state file was not read as a fallback"
-    # …and the per-job file wins once there is one.
-    printf 'unloaded\n' >"$(fleet_schedule_state_path full)"
-    [ "$(fleet_schedule_last_state full)" = unloaded ] ||
-      fail "the legacy combined file overrode a job's own state file"
-    rm -f "$(fleet_schedule_legacy_state_path)" "$(fleet_schedule_state_path full)" \
-      "$SCHED_STATE/runner"
+    rm -f "$SCHED_STATE/runner"
     # Concurrent fast and full triggers each replace only their OWN job's
     # state, through their own temporary file: neither loses the other's.
     : >"$SCHED_STATE/gui"

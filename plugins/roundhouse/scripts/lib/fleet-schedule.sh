@@ -126,12 +126,6 @@ fleet_schedule_state_path() {
   printf '%s/schedule-state.%s\n' "$(fleet_run_state_dir)" "$1"
 }
 
-fleet_schedule_legacy_state_path() {
-  # The combined `MODE STATE` file written before the per-job files. Read as a
-  # fallback for one release, never written, removed by `uninstall`.
-  printf '%s/schedule-state\n' "$(fleet_run_state_dir)"
-}
-
 fleet_schedule_optout_path() {
   # Left by `fleet-schedule uninstall`: the operator took this host off the
   # schedule, so nothing but `install` may start a pass here.
@@ -146,15 +140,8 @@ fleet_schedule_marker() {
 }
 
 fleet_schedule_last_state() {
-  # The last state OBSERVED for MODE (never `unavailable`), or nothing. The
-  # per-job file wins; the combined legacy file answers only for a job that has
-  # no file of its own yet.
-  last_state_path=$(fleet_schedule_state_path "$1")
-  if [ -f "$last_state_path" ]; then
-    head -n 1 "$last_state_path" 2>/dev/null
-    return 0
-  fi
-  awk -v m="$1" '$1 == m { print $2; exit }' "$(fleet_schedule_legacy_state_path)" 2>/dev/null
+  # The last state OBSERVED for MODE (never `unavailable`), or nothing.
+  head -n 1 "$(fleet_schedule_state_path "$1")" 2>/dev/null || :
 }
 
 fleet_schedule_probe() {
@@ -1212,7 +1199,7 @@ fleet_schedule_command() (
       uninstall_status=$?
       set -e
       [ "$uninstall_status" -eq 0 ] || exit "$uninstall_status"
-      rm -f "$(fleet_schedule_marker)" "$(fleet_schedule_legacy_state_path)"
+      rm -f "$(fleet_schedule_marker)"
       for uninstall_mode in $fleet_schedule_modes; do
         rm -f "$(fleet_schedule_state_path "$uninstall_mode")"
       done
