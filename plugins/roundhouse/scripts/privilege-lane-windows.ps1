@@ -589,6 +589,23 @@ function Invoke-Enroll {
     if (-not $Elevated) {
         $Sid = & $script:Native.CurrentSid
         if ($Sid -cmatch '-500$') { throw "built_in_administrator_forbidden" }
+        $Pending = Get-LaneState
+        if ($Pending.State -ceq "canary_pending" -and $null -ne $Pending.Identity -and
+            $Pending.Identity.'owner-sid' -ceq $Sid -and $Pending.Identity.'lane-version' -ceq (Get-PluginVersionBeside $Self)) {
+            # Everything is installed at this version; only the owner's probe
+            # is missing, and that needs no consent at all.
+            $Probe = Submit-Request "lane.probe.v1" "-" "-" "-" "-" "enroll-canary" "-" "-" 120
+            if ($Probe.state -cne "completed") {
+                Write-Record @("lane-enrollment|1", "state|failed", "reason|enrollment_canary_failed:$($Probe.reason)",
+                    "platform|windows", "lane-state|canary_pending", "next-command|roundhouse privilege-enroll $HostId", "end-enrollment|")
+                return 74
+            }
+            Write-Record @("lane-enrollment|1", "state|enrolled", "reason|owner_probe_activated_pending_lane", "platform|windows",
+                "host-id|$($Pending.Identity.'host-id')", "owner-sid|$Sid", "lane-version|$($Pending.Identity.'lane-version')",
+                "lane-sha256|$($Pending.Identity.'lane-sha256')", "plugin-root|$($Pending.Identity.'plugin-root')",
+                "canary|task-registered,probe-completed", "end-enrollment|")
+            return 0
+        }
         if (-not $script:Fixture -and -not (& $script:Native.IsElevated)) {
             # The one approval: re-launch this script elevated. UAC consent is a
             # GUI dialog on the console; the receipt file carries the outcome back.
@@ -756,7 +773,12 @@ function Invoke-DispatchOne([IO.FileInfo]$Entry, [object]$Identity, [string]$Lan
         $Activated = @{}
         foreach ($Name in $script:IdentityFields) { $Activated[$Name] = $Identity[$Name] }
         $Activated.activation = "passed"
-        Write-ProtectedBytes $Paths.Identity (Render-Identity $Activated) ""
+        $Written = $false
+        for ($Attempt = 0; $Attempt -lt 5 -and -not $Written; $Attempt++) {
+            try { Write-ProtectedBytes $Paths.Identity (Render-Identity $Activated) ""; $Written = $true }
+            catch { Start-Sleep -Milliseconds 200 }
+        }
+        if (-not $Written) { throw "identity_activation_write_failed" }
         $Identity.activation = "passed"
         Write-Journal "activation" $Id "lane.probe.v1" "-" "completed" "owner_probe_passed" "-" "-"
     }
@@ -945,24 +967,37 @@ function Submit-Request([string]$ActionId, [string]$PackageId, [string]$WantedVe
     $Result['bytes'] = [IO.File]::ReadAllBytes($ResultPath)
     return $Result
 }
-function Invoke-Candidate {
-    # The owner-side view of a package's installed and available versions
-    # (`-` when unknown), from winget.exe under the user's own token. The
-    # controller seals its precondition against this and rechecks it right
-    # before submitting; the SYSTEM side checks availability again itself.
-    if (-not (Test-WinGetId $Package) -or $Source -cnotin @("winget", "msstore")) { throw "invalid_candidate_arguments" }
+function Compare-WinGetVersion([string]$Left, [string]$Right) {
+    # Highest available version: numeric dotted compare when both parse as
+    # [Version], ordinal otherwise (the SYSTEM side re-checks availability).
+    $L = $null; $R = $null
+    if ([Version]::TryParse($Left, [ref]$L) -and [Version]::TryParse($Right, [ref]$R)) { return $L.CompareTo($R) }
+    return [StringComparer]::Ordinal.Compare($Left, $Right)
+}
+function Get-CandidateRecord([string]$Id, [string]$SourceName) {
+    # The owner-side view of a package's installed and highest available
+    # versions (`-` when unknown), through the lane's pinned WinGet client
+    # module under the user's own token — never by parsing winget.exe's
+    # table. The controller seals its precondition against this and rechecks
+    # it right before submitting; the SYSTEM side checks availability again.
+    if (-not (Test-WinGetId $Id) -or $SourceName -cnotin @("winget", "msstore")) { throw "invalid_candidate_arguments" }
     $Installed = "-"; $Available = "-"
     try {
-        $Listed = & winget.exe list --id $Package --exact --source $Source --accept-source-agreements --disable-interactivity 2>$null
-        $Row = @($Listed | Where-Object { $_ -match ('(^|\s)' + [regex]::Escape($Package) + '\s') }) | Select-Object -Last 1
-        if ($null -ne $Row) {
-            $Columns = @([regex]::Split([string]$Row, '\s{2,}') | Where-Object { $_.Length -gt 0 })
-            if ($Columns.Count -ge 3 -and (Test-VersionToken $Columns[2])) { $Installed = $Columns[2] }
-            if ($Columns.Count -ge 4 -and (Test-VersionToken $Columns[3])) { $Available = $Columns[3] }
+        Import-LaneWinGetModule
+        $Have = @(& $script:Native.WinGetInstalled $Id $SourceName)
+        if ($Have.Count -eq 1 -and (Test-VersionToken ([string]$Have[0].InstalledVersion))) { $Installed = [string]$Have[0].InstalledVersion }
+        $Found = @(& $script:Native.WinGetFind $Id $SourceName)
+        if ($Found.Count -eq 1) {
+            foreach ($Version in @($Found[0].AvailableVersions)) {
+                if (-not (Test-VersionToken ([string]$Version))) { continue }
+                if ($Available -ceq "-" -or (Compare-WinGetVersion ([string]$Version) $Available) -gt 0) { $Available = [string]$Version }
+            }
         }
-    } catch { }
-    if ($Available -ceq "-") { $Available = $Installed }
-    Write-Record @("lane-candidate|1", "package|$Package", "installed|$Installed", "candidate|$Available", "end-candidate|")
+    } catch { $Installed = "-"; $Available = "-" }
+    return [string[]]@("lane-candidate|1", "package|$Id", "installed|$Installed", "candidate|$Available", "end-candidate|")
+}
+function Invoke-Candidate {
+    Write-Record (Get-CandidateRecord $Package $Source)
     return 0
 }
 function Invoke-Lookup {
@@ -1113,6 +1148,10 @@ function Invoke-SelfTest {
             Assert-SelfTest $Rejected "closed catalog: $($Bad -join ' ')"
         }
         # WinGet actions through the fixture provider.
+        $CandidateLines = Get-CandidateRecord "Example.Tool" "winget"
+        Assert-SelfTest (($CandidateLines -join "`n") -ceq "lane-candidate|1`npackage|Example.Tool`ninstalled|1.0.0`ncandidate|2.0.0`nend-candidate|") "candidate record: $($CandidateLines -join ' ')"
+        $CandidateLines = Get-CandidateRecord "Example.Missing" "winget"
+        Assert-SelfTest (($CandidateLines -join "`n").Contains("installed|-`ncandidate|-")) "unknown candidate record"
         $R = Invoke-FixtureRequest "winget.inventory-machine.v1" "-" "-" "-"
         Assert-SelfTest ($R.state -ceq "completed" -and $R.reason -ceq "inventory_verified" -and $R.'plan-id' -ceq "plan-0123456789abcdef" -and $R.'operation-index' -ceq "2") "inventory result"
         $R = Invoke-FixtureRequest "winget.upgrade-machine-package.v1" "Example.Tool" "1.1.0" "winget"

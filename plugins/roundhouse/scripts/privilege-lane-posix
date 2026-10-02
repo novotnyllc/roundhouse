@@ -1120,6 +1120,7 @@ candidate_command() {
   installed=$(printf '%s\n' "$output" | awk '$1 == "Installed:" { print $2; exit }')
   candidate=$(printf '%s\n' "$output" | awk '$1 == "Candidate:" { print $2; exit }')
   [ "$installed" != '(none)' ] || installed=
+  [ "$candidate" != '(none)' ] || candidate=
   record 'lane-candidate|1' "package|$1" "installed|${installed:--}" "candidate|${candidate:--}" 'end-candidate|'
 }
 result_command() {
