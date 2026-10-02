@@ -595,6 +595,20 @@ SH
       fail "a locally edited Codex copy had its modified hook trusted (got $pc_status)"
     grep -q "differs byte-for-byte from Claude's verified install" "$pc/hooks-err" ||
       fail "the refusal did not name the byte mismatch: $(tr '\n' ';' <"$pc/hooks-err")"
+    # ...an identical symlink that LEAVES the plugin root is not verified bytes:
+    # the same link text can resolve to different files in each install.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    printf '%s\n' '{"hooks":{"Stop":[{"command":"echo elsewhere"}]}}' >"$pc/outside-hooks.json"
+    for pc_tree in "$pc/claude-installs/widget@m/1.1.0" "$pc/codex-home/plugins/cache/m/widget/new"; do
+      ln -s "$pc/outside-hooks.json" "$pc_tree/hooks/extra.json"
+    done
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+      ! grep -q '^trust' "$pc/hooks-state/log" ||
+      fail "a Codex copy with a symlink escaping the plugin root had its modified hook trusted (got $pc_status)"
     # ...a hook that was NEVER trusted is not carried over: no new grants.
     pc_hooks_reset
     fleet_run_marketplace_repair_reset

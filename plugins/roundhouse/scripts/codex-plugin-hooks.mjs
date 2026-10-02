@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 
 const TIMEOUT_MS = 15_000;
@@ -17,7 +17,7 @@ function fail(message, exitCode = 1) {
   throw error;
 }
 
-function treeEntries(root) {
+function treeEntries(root, { rejectEscapingLinks = false } = {}) {
   // Every regular file (bytes and owner-execute bit) and symlink (target, not
   // followed) under ROOT, by relative path — the same tree, with the same
   // exclusions, that apply-claude.sh's fleet_run_tree_digest hashes: any
@@ -34,7 +34,20 @@ function treeEntries(root) {
         name === ".codex-marketplace-install.json")) continue;
       const full = join(dir, name);
       const stat = lstatSync(full);
-      if (stat.isSymbolicLink()) entries.set(relPath, `link ${readlinkSync(full)}`);
+      if (stat.isSymbolicLink()) {
+        const target = readlinkSync(full);
+        // Two installs can hold the same escaping link text and still resolve
+        // it to different bytes, so carrying trust refuses any link that
+        // leaves the plugin root.
+        if (rejectEscapingLinks) {
+          const base = resolve(root);
+          const to = isAbsolute(target) ? target : resolve(dirname(full), target);
+          if (to !== base && !to.startsWith(base + sep)) {
+            throw new Error(`symlink escapes the plugin root: ${relPath}`);
+          }
+        }
+        entries.set(relPath, `link ${target}`);
+      }
       else if (stat.isDirectory()) walk(full, relPath);
       else if (stat.isFile()) {
         const digest = createHash("sha256").update(readFileSync(full)).digest("hex");
@@ -47,10 +60,10 @@ function treeEntries(root) {
   return entries;
 }
 
-function treesIdentical(left, right) {
+function treesIdentical(left, right, options = {}) {
   try {
-    const a = treeEntries(left);
-    const b = treeEntries(right);
+    const a = treeEntries(left, options);
+    const b = treeEntries(right, options);
     return a.size === b.size && [...a].every(([path, value]) => b.get(path) === value);
   } catch {
     return false;
@@ -582,7 +595,7 @@ async function main() {
         if (!atVerified || !active || resolve(active) !== resolve(codexTree)) {
           fail(`automatic approval refuses: ${pluginId} is no longer at the verified ${sha}`, 75);
         }
-        if (!treesIdentical(codexTree, verifiedTree)) {
+        if (!treesIdentical(codexTree, verifiedTree, { rejectEscapingLinks: true })) {
           fail(`automatic approval refuses: ${pluginId}'s Codex copy is not byte-identical to the verified tree`, 75);
         }
       };
