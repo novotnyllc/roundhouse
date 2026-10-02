@@ -339,7 +339,15 @@ a definition edited in between gets a refusal, not a surprise — then runs only
 those steps (a definition only while it still renders to the sealed digest, a
 command only when it names this host's own jobs), checks every written file is
 at its sealed digest and every removed one is gone, and `status` must then
-report the result. `status` is read-only and unsealed. On Linux, lingering is
+report the result. `status` is read-only and unsealed. One `install` or
+`uninstall` runs at a time: each holds the schedule lock
+(`store.run/schedule.lock`) from its first look at the jobs to its last
+bookkeeping write, and a second one exits 75 having changed nothing (a lock
+whose holder died is taken over). A HUP, INT or TERM never leaves an
+`uninstall` with the jobs gone and the opt-out unwritten: once the sealed step
+has begun the signal is held, the opt-out is recorded whenever `status` then
+shows both jobs gone and let go, and the command exits with the signal. On
+Linux, lingering is
 checked before anything is planned: without it `install` exits 75 with the
 `loginctl enable-linger` fix and writes nothing.
 

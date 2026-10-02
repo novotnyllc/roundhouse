@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "614bb0208543e44f7251f2a7eca93dce0971a83c2b12678476d8ea24c165b33a"
+      "sha256": "e3c8bff6a4b51a45ad18b8db006dc5f3f3ed814d7d308f462e2b0e0f8f544aef"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "ea8e5fb5835cfa9668970ad086828a2ae208738f56f7618dccfe7645282c4d2f"
+      "sha256": "b71d242044163c588c145284c6e253676330981053d5a2fb116a29ab6c7417c8"
     },
     {
       "path": "assets/icon.png",
@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
-      "sha256": "95b1e3105c377692618a2fb5f23799853c614d95cf2ff035ca561d1f131f250a"
+      "sha256": "14a9d59dbbd5f962843aa66835c104ddad10a7717a59757a5b093e37b115f8d7"
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
@@ -278,7 +278,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "b60a915b360fccf9c17edde8f657be40d8486d0bf1553da49b4be32d79dfa0ad"
+      "sha256": "06ad8ce06539366b9294c0ade7639e190cf7a131eead01dd2f1b3ac49000aa64"
     },
     {
       "path": "scripts/roundhouse-trustd",
@@ -338,7 +338,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "e6043b75e8b4c3a8210e5b5b6cb43c64ac9e8d8247f219b3f738a9dc54f2da43"
+      "sha256": "79b1924ff84cdec920a50af47948905af46539eb64abcb69beaba1c3a8fca77d"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",
@@ -373,5 +373,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.60"
+  "version": "0.9.61"
 }

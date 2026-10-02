@@ -221,6 +221,19 @@ STUB
 ROUNDHOUSE_LIB_ONLY=1
 . "$0"
 [ -z "${SCHED_STORE_READY:-}" ] || fleet_vcs_store_ready() { return 0; }
+# SCHED_SIGNAL_IN_SEALED: once the sealed step has applied its plan, the
+# signal goes to the whole process group (as Ctrl-C does), before the step
+# verifies and returns. Run the driver in a group of its own for this.
+[ -z "${SCHED_SIGNAL_IN_SEALED:-}" ] || {
+  eval "sched_verify_real() $(declare -f fleet_schedule_verify | tail -n +2)"
+  fleet_schedule_verify() {
+    if [ ! -e "$SCHED_STATE/signalled" ]; then
+      : >"$SCHED_STATE/signalled"
+      kill -"$SCHED_SIGNAL_IN_SEALED" 0
+    fi
+    sched_verify_real "$@"
+  }
+}
 case $1 in
   fast)
     local_plan_seal_apply() {
@@ -1157,6 +1170,56 @@ fleet_run_command --fast'
     case $sched_out in *'loads at the next console login'*) ;; *) fail "install over SSH was not explained: $sched_out" ;; esac
     [ -f "$sched_fast" ] || fail "install with no GUI domain wrote no job"
     [ ! -e "$(fleet_schedule_optout_path)" ] || fail "install did not lift the opt-out"
+
+    # --- one install or uninstall at a time ---
+    # A live holder of the schedule lock (another install or uninstall, here
+    # this shell) refuses both, before either looks at a job: nothing changes.
+    : >"$SCHED_STATE/gui"
+    sched_schedule install >/dev/null 2>&1 || fail "the install before the lock checks failed"
+    fleet_lock_acquire "$(fleet_schedule_lock_path)" || fail "the test could not hold the schedule lock"
+    sched_lock_nonce=$fleet_lock_nonce_held
+    : >"$SCHED_LOG"
+    sched_status=0
+    sched_out=$(sched_schedule uninstall 2>&1) || sched_status=$?
+    [ "$sched_status" -eq 75 ] || fail "an uninstall ran beside another holding the schedule lock ($sched_status): $sched_out"
+    case $sched_out in *'another fleet-schedule install or uninstall'*) ;;
+      *) fail "the held schedule lock was not named: $sched_out" ;; esac
+    [ -f "$sched_fast" ] && [ -f "$sched_full" ] && [ ! -e "$(fleet_schedule_optout_path)" ] &&
+      [ -f "$(fleet_schedule_marker)" ] || fail "an uninstall refused at the schedule lock changed something"
+    rm -f "$sched_full"
+    sched_status=0
+    sched_schedule install >/dev/null 2>&1 || sched_status=$?
+    [ "$sched_status" -eq 75 ] && [ ! -e "$sched_full" ] ||
+      fail "an install ran beside another holding the schedule lock ($sched_status)"
+    ! grep -Eq 'launchctl (bootstrap|bootout|enable)' "$SCHED_LOG" ||
+      fail "a mutation refused at the schedule lock ran a scheduler command: $(cat "$SCHED_LOG")"
+    fleet_lock_release "$(fleet_schedule_lock_path)" "$sched_lock_nonce" ||
+      fail "the test could not release the schedule lock"
+    # A dead holder's lock (a crashed install or uninstall) is taken over.
+    sh -c 'exit 0' &
+    sched_dead_pid=$!
+    wait "$sched_dead_pid"
+    fleet_lock_acquire "$(fleet_schedule_lock_path)" "$sched_dead_pid" ||
+      fail "the test could not leave a dead holder's schedule lock"
+    sched_schedule install >/dev/null 2>&1 || fail "install did not take over a dead holder's schedule lock"
+    [ -f "$sched_full" ] && [ ! -e "$(fleet_schedule_lock_path)" ] ||
+      fail "the install that took over the schedule lock did not complete and release it"
+    # A signal to the whole group (Ctrl-C) once the sealed uninstall has
+    # removed the jobs ends the sealed step early, but not the bookkeeping:
+    # the scheduler shows both jobs gone, so the opt-out and marker writes
+    # happen, then the command exits with the signal.
+    fleet_trigger_request_full
+    rm -f "$SCHED_STATE/signalled"
+    sched_status=0
+    sched_out=$(SCHED_SIGNAL_IN_SEALED=TERM perl -e '$SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; setpgrp(0, 0); exec @ARGV or die' \
+      bash -c "$sched_driver" "$cli" fast uninstall 2>&1) || sched_status=$?
+    [ -e "$SCHED_STATE/signalled" ] || fail "the signal fixture never signalled the sealed uninstall"
+    [ "$sched_status" -eq 143 ] || fail "a signalled uninstall exited $sched_status, not 143: $sched_out"
+    [ ! -e "$sched_fast" ] && [ ! -e "$sched_full" ] || fail "the signalled uninstall left a job: $sched_out"
+    [ -e "$(fleet_schedule_optout_path)" ] && [ ! -e "$(fleet_schedule_marker)" ] &&
+      [ ! -e "$(fleet_trigger_full_path)" ] ||
+      fail "a signal during the sealed uninstall left the jobs removed without the opt-out bookkeeping: $sched_out"
+    [ ! -e "$(fleet_schedule_lock_path)" ] || fail "the signalled uninstall left the schedule lock behind"
 
     fi
 

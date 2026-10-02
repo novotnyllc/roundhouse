@@ -467,6 +467,147 @@ fleet_schedule_verify() {
   return 70
 }
 
+# --- one mutation at a time ---------------------------------------------------------------
+
+fleet_schedule_lock_path() {
+  # The schedule lock: held by one `fleet-schedule install|uninstall` from its
+  # first look at the jobs to its last bookkeeping write, so two overlapping
+  # runs never interleave the opt-out and marker writes. Host-local run state,
+  # beside them; not the run lock, which a pass holds for minutes.
+  printf '%s/schedule.lock\n' "$(fleet_run_state_dir)"
+}
+
+fleet_schedule_lock_take() {
+  # fleet_schedule_lock_take — take the schedule lock (fleet_lock_take's
+  # shape: a dead holder, a crashed install or uninstall, is taken over; a
+  # live one refuses). Sets fleet_schedule_lock_nonce for the release. Exit 75
+  # when another install or uninstall holds it, or it cannot be judged.
+  # Called directly, never in a command substitution.
+  schedule_lock=$(fleet_schedule_lock_path)
+  mkdir -p "$(dirname "$schedule_lock")" || return 73
+  schedule_lock_rc=0
+  # No ceiling: a mutation is never stopped from outside. A lock whose holder
+  # cannot be judged is waited out for ten minutes (an install takes seconds),
+  # then refused with its path for the operator to remove.
+  fleet_lock_take "$schedule_lock" 600 || schedule_lock_rc=$?
+  case $schedule_lock_rc in
+    0 | 11) fleet_schedule_lock_nonce=$fleet_lock_nonce_held ;;
+    10)
+      printf 'roundhouse: another fleet-schedule install or uninstall holds %s on this host; nothing was changed — retry when it finishes\n' \
+        "$schedule_lock" >&2
+      return 75
+      ;;
+    *) return 75 ;;
+  esac
+}
+
+fleet_schedule_signals_defer() {
+  # From the sealed step to the last bookkeeping write, a HUP, INT or TERM is
+  # held here, not acted on. The sealed step's own processes may still die of
+  # it (Ctrl-C signals the whole group), which is why the bookkeeping is
+  # decided from what the scheduler shows afterwards, not from the step's
+  # status alone (fleet_schedule_record). fleet_schedule_signals_replay exits
+  # with the held signal once the writes are done.
+  fleet_schedule_signal=
+  trap 'fleet_schedule_signal=129' HUP
+  trap 'fleet_schedule_signal=130' INT
+  trap 'fleet_schedule_signal=143' TERM
+}
+
+fleet_schedule_signals_replay() {
+  # A signal held by fleet_schedule_signals_defer ends the command now.
+  fleet_lock_signals_exit
+  [ -z "${fleet_schedule_signal:-}" ] || exit "$fleet_schedule_signal"
+}
+
+fleet_schedule_preflight() {
+  # fleet_schedule_preflight install|uninstall — the refusals that come
+  # before anything is planned. Nothing is changed by any of them.
+  case $1 in
+    uninstall)
+      # A scheduler this session cannot reach may still hold the job: launchd
+      # with no GUI domain (over SSH) cannot say whether a present agent is
+      # loaded, and a systemd user manager out of reach still enables a timer
+      # through its timers.target.wants link. Removing the definitions then
+      # would leave a job running with no file. Refuse first.
+      for preflight_mode in $fleet_schedule_modes; do
+        fleet_schedule_facts_read "$(fleet_schedule_facts "$preflight_mode")"
+        [ "$sf_reachable" = 1 ] || { [ "$sf_wants" != 1 ] && [ "$sf_present" != 1 ]; } || {
+          printf 'roundhouse: the %s job is still installed but its scheduler is not reachable from this session (no GUI domain over SSH, or no systemd user manager); run uninstall from a login session. Nothing was changed.\n' \
+            "$preflight_mode" >&2
+          return 75
+        }
+      done
+      ;;
+    install)
+      [ -x "$HOME/.local/bin/roundhouse" ] || {
+        printf 'roundhouse: %s is not installed; run `roundhouse launcher-install` first — the scheduled jobs run that shim\n' \
+          "$HOME/.local/bin/roundhouse" >&2
+        return 69
+      }
+      # A superseded job that WORKS is not retired for a pair that would only
+      # fail: the new jobs converge the fleet store, so it must be enrolled.
+      if [ -n "$(fleet_schedule_legacy_plists)" ] &&
+        ! fleet_vcs_store_ready "$(fleet_store_path)" >/dev/null 2>&1; then
+        printf 'roundhouse: a superseded scheduler entry is still installed (%s) and this host has no enrolled fleet store for the new jobs to converge; enroll it (roundhouse fleet-init / fleet-enroll), then re-run install. Nothing was changed.\n' \
+          "$(fleet_schedule_legacy_plists | tr '\n' ' ')" >&2
+        return 69
+      fi
+      [ "$(fleet_schedule_platform)" != systemd ] || fleet_schedule_lingers_preflight
+      ;;
+  esac
+}
+
+fleet_schedule_record() {
+  # fleet_schedule_record install|uninstall SEALED-STATUS — the host-local
+  # bookkeeping after the sealed step; its exit is the command's. It is this
+  # host's own run state (store.run), like schedule-state, not a target the
+  # sealed plan mutates. A write that fails is reported, never swallowed
+  # (73). Called directly, so a held signal waits for it.
+  case $1 in
+    uninstall)
+      # Done when the scheduler shows both jobs gone and let go — whatever
+      # the sealed step's status: a signal can end that step after its
+      # removals and before it reports. A job still there is not opted out.
+      [ "$2" -eq 0 ] || fleet_schedule_verify uninstall false 2>/dev/null || return "$2"
+      # The opt-out: from here on a trigger stamps and starts nothing, and a
+      # pass raises no schedule alert, until `install` is run again. If it
+      # cannot be written the jobs are still gone, and re-running uninstall —
+      # a no-op for the scheduler — records it.
+      { mkdir -p "$(dirname "$(fleet_schedule_optout_path)")" &&
+        printf 'uninstalled_at: %s\n' "$(fleet_now)" >"$(fleet_schedule_optout_path)"; } || {
+        printf 'roundhouse: the scheduled jobs are removed, but the opt-out could not be recorded (%s); re-run `roundhouse fleet-schedule uninstall`\n' \
+          "$(fleet_schedule_optout_path)" >&2
+        return 73
+      }
+      rm -f "$(fleet_schedule_marker)"
+      for record_mode in $fleet_schedule_modes; do
+        rm -f "$(fleet_schedule_state_path "$record_mode")"
+      done
+      # A full request no pass took yet goes with the jobs it was made of: a
+      # later install must not inherit it as a full pass nobody asked for.
+      rm -f "$(fleet_trigger_full_path)"
+      ;;
+    install)
+      case $2 in 0 | 75) ;; *) return "$2" ;; esac
+      { mkdir -p "$(dirname "$(fleet_schedule_marker)")" &&
+        printf 'platform: %s\ninstalled_at: %s\n' "$(fleet_schedule_platform)" \
+          "$(fleet_now)" >"$(fleet_schedule_marker)" &&
+        rm -f "$(fleet_schedule_optout_path)"; } || {
+        printf 'roundhouse: the scheduled jobs are installed, but the install could not be recorded (%s); re-run `roundhouse fleet-schedule install`\n' \
+          "$(fleet_schedule_marker)" >&2
+        return 73
+      }
+      # Remember what the verified install left, so a later trigger with
+      # no GUI domain to ask (over SSH) still knows the job is loaded.
+      for record_mode in $fleet_schedule_modes; do
+        fleet_schedule_job_state "$record_mode" >/dev/null || :
+      done
+      ;;
+  esac
+  return "$2"
+}
+
 # --- the command -----------------------------------------------------------------------
 
 fleet_schedule_sealed() (
@@ -561,74 +702,21 @@ fleet_schedule_command() (
     printf 'roundhouse: fleet-schedule installs per-user jobs; run it as the user whose fleet store this is, not root\n' >&2
     exit 64
   }
-  case $1 in
-    status) fleet_schedule_status ;;
-    uninstall)
-      # A scheduler this session cannot reach may still hold the job: launchd
-      # with no GUI domain (over SSH) cannot say whether a present agent is
-      # loaded, and a systemd user manager out of reach still enables a timer
-      # through its timers.target.wants link. Removing the definitions then
-      # would leave a job running with no file. Refuse first.
-      for uninstall_mode in $fleet_schedule_modes; do
-        fleet_schedule_facts_read "$(fleet_schedule_facts "$uninstall_mode")"
-        [ "$sf_reachable" = 1 ] || { [ "$sf_wants" != 1 ] && [ "$sf_present" != 1 ]; } || {
-          printf 'roundhouse: the %s job is still installed but its scheduler is not reachable from this session (no GUI domain over SSH, or no systemd user manager); run uninstall from a login session. Nothing was changed.\n' \
-            "$uninstall_mode" >&2
-          exit 75
-        }
-      done
-      errexit_capture uninstall_status fleet_schedule_sealed uninstall
-      [ "$uninstall_status" -eq 0 ] || exit "$uninstall_status"
-      # The opt-out: from here on a trigger stamps and starts nothing, and a
-      # pass raises no schedule alert, until `install` is run again. It is
-      # this host's own run state (store.run), like schedule-state, not a
-      # target the sealed plan mutates. A write that fails is reported, never
-      # swallowed: the jobs are gone, and re-running uninstall — a no-op for
-      # the scheduler — records it.
-      { mkdir -p "$(dirname "$(fleet_schedule_optout_path)")" &&
-        printf 'uninstalled_at: %s\n' "$(fleet_now)" >"$(fleet_schedule_optout_path)"; } || {
-        printf 'roundhouse: the scheduled jobs are removed, but the opt-out could not be recorded (%s); re-run `roundhouse fleet-schedule uninstall`\n' \
-          "$(fleet_schedule_optout_path)" >&2
-        exit 73
-      }
-      rm -f "$(fleet_schedule_marker)"
-      for uninstall_mode in $fleet_schedule_modes; do
-        rm -f "$(fleet_schedule_state_path "$uninstall_mode")"
-      done
-      # A full request no pass took yet goes with the jobs it was made of: a
-      # later install must not inherit it as a full pass nobody asked for.
-      rm -f "$(fleet_trigger_full_path)"
-      ;;
-    install)
-      [ -x "$HOME/.local/bin/roundhouse" ] || {
-        printf 'roundhouse: %s is not installed; run `roundhouse launcher-install` first — the scheduled jobs run that shim\n' \
-          "$HOME/.local/bin/roundhouse" >&2
-        exit 69
-      }
-      # A superseded job that WORKS is not retired for a pair that would only
-      # fail: the new jobs converge the fleet store, so it must be enrolled.
-      if [ -n "$(fleet_schedule_legacy_plists)" ] &&
-        ! fleet_vcs_store_ready "$(fleet_store_path)" >/dev/null 2>&1; then
-        printf 'roundhouse: a superseded scheduler entry is still installed (%s) and this host has no enrolled fleet store for the new jobs to converge; enroll it (roundhouse fleet-init / fleet-enroll), then re-run install. Nothing was changed.\n' \
-          "$(fleet_schedule_legacy_plists | tr '\n' ' ')" >&2
-        exit 69
-      fi
-      [ "$(fleet_schedule_platform)" != systemd ] || fleet_schedule_lingers_preflight || exit $?
-      errexit_capture install_status fleet_schedule_sealed install
-      case $install_status in
-        0 | 75)
-          mkdir -p "$(dirname "$(fleet_schedule_marker)")"
-          printf 'platform: %s\ninstalled_at: %s\n' "$(fleet_schedule_platform)" \
-            "$(fleet_now)" >"$(fleet_schedule_marker)"
-          rm -f "$(fleet_schedule_optout_path)"
-          # Remember what the verified install left, so a later trigger with
-          # no GUI domain to ask (over SSH) still knows the job is loaded.
-          for install_mode in $fleet_schedule_modes; do
-            fleet_schedule_job_state "$install_mode" >/dev/null || :
-          done
-          ;;
-      esac
-      exit "$install_status"
-      ;;
-  esac
+  if [ "$1" = status ]; then
+    fleet_schedule_status
+    exit 0
+  fi
+  # One install or uninstall at a time, held from the first look at the jobs
+  # to the last bookkeeping write; a signal before the sealed step ends the
+  # command and releases it.
+  fleet_schedule_lock_take || exit $?
+  trap 'fleet_lock_release "$(fleet_schedule_lock_path)" "$fleet_schedule_lock_nonce" || :' EXIT
+  fleet_lock_signals_exit
+  fleet_schedule_preflight "$1" || exit $?
+  fleet_schedule_signals_defer
+  errexit_capture command_sealed_status fleet_schedule_sealed "$1"
+  command_status=0
+  fleet_schedule_record "$1" "$command_sealed_status" || command_status=$?
+  fleet_schedule_signals_replay
+  exit "$command_status"
 )
