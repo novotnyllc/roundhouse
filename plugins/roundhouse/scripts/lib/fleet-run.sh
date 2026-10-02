@@ -2811,9 +2811,7 @@ fleet_run_command() {
   # (Each pass closes its own apply batch on its way out, fleet_run_pass.)
   trap '[ "$run_lock_held" != true ] || fleet_lock_release "$run_lock" "$run_lock_nonce" || :
     rm -rf "$run_tmp"' EXIT
-  trap 'fleet_trigger_signal=HUP; exit 129' HUP
-  trap 'fleet_trigger_signal=INT; exit 130' INT
-  trap 'fleet_trigger_signal=TERM; exit 143' TERM
+  fleet_lock_signals_exit
   # §8.6: the abort button for a bad local apply, captured ONCE per run,
   # before its first pass and deliberately WITHOUT --ignore-working-copy (that
   # flag suppresses the colocated auto-import, so restoring to the newest
@@ -2844,7 +2842,7 @@ fleet_run_command() {
       "$run_lock" "$run_lock_nonce"
     [ "$fleet_trigger_status" -le "$run_status" ] || run_status=$fleet_trigger_status
     [ "$fleet_trigger_status" -lt 128 ] || exit "$fleet_trigger_status"
-    fleet_lock_release "$run_lock" "$run_lock_nonce" || :
+    fleet_lock_release "$run_lock" "$run_lock_nonce" || break
     run_lock_held=false
     [ "$(fleet_trigger_stamp_state)" != "$fleet_trigger_last_stamp" ] || break
     [ "$run_round" -lt 2 ] || {
@@ -2874,7 +2872,7 @@ fleet_run_command() {
   exit "$run_status"
 }
 
-fleet_run_pass() (
+fleet_run_pass() {
   # fleet_run_pass PASS-TMP MODE — one observe/converge pass, under
   # fleet_run_command's lock, run by fleet_trigger_converge. Its arguments are
   # PER PASS: a fresh scratch directory holding this pass's alert ledger (the
@@ -2893,9 +2891,7 @@ fleet_run_pass() (
   # it. HERE, in the pass's own subshell, because the batch is: a trap in
   # fleet_run_command never saw it open. A signal exits 128+N, which runs it.
   trap '[ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :' EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  fleet_lock_signals_exit
   # Captured BEFORE any fetch: what arrives is what §7.7 has to gate, and after
   # the fetch there is no other way to tell new from known. (The poll floor's
   # own fetch lands in a private ref and does not move main@origin.)
@@ -3633,7 +3629,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       fleet_run_nudge "$run_store" "$run_host" "$run_layers" \
         "$(fleet_run_interval_seconds "$run_fold" "$run_host" fast)" || :
   fi
-)
+}
 
 fleet_run_resolve_conflict() (
   # fleet_run_resolve_conflict STORE HOST TMP FOLD HEADS
@@ -3940,7 +3936,8 @@ fleet_run_hold_owes_retry() {
   # alert, and the full cadence re-reads them.
   [ "$1" = 75 ] || return 0
   [ "$2" != true ] || return 0
-  [ "$3" = plugins ]
+  # A plugin hold on a host with no `claude` at all is standing, not transient.
+  [ "$3" = plugins ] && command -v claude >/dev/null 2>&1
 }
 
 fleet_run_apply_held() {

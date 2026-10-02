@@ -145,7 +145,7 @@ fleet_trigger_converge() {
   # marketplace refresh and package updates is not looking.
   #
   # It STOPS, without another pass, when a pass ended on a signal (status
-  # 128 and above), when the run was signalled (fleet_trigger_signal), and
+  # 128 and above; a signal to the run itself exits it outright), and
   # when LOCK no longer carries NONCE — another run took it over, and a pass
   # outside the lock is exactly what the lock exists to prevent.
   #
@@ -175,7 +175,7 @@ fleet_trigger_converge() {
     [ "$converge_pass_status" -le "$fleet_trigger_status" ] ||
       fleet_trigger_status=$converge_pass_status
     fleet_trigger_last_stamp=$(fleet_trigger_stamp_state)
-    [ "$converge_pass_status" -lt 128 ] && [ -z "${fleet_trigger_signal:-}" ] || break
+    [ "$converge_pass_status" -lt 128 ] || break
     [ "$converge_extra" -lt 3 ] || break
     [ "$fleet_trigger_last_stamp" != "$converge_seen" ] || break
     [ "$(fleet_lock_identity "$converge_lock")" = "$converge_nonce" ] || {
