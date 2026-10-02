@@ -9,6 +9,10 @@
 # is present and that the doctor rows key on root ownership. The only
 # actual-root behaviour lives behind trustd_own, gated on `id -u` and the
 # ROUNDHOUSE_TRUSTD_FIXTURE hook, and its inertness off-root is asserted below.
+# #62's rule — root never runs a binary the user can replace — is exercised by
+# entering the library's root branch with roundhouse_is_root overridden, against
+# same-user decoy yq files that log when run, and by checking trustd's and the
+# library's ownership rule agree on real paths (trustd's selftest-trusted hook).
 #
 # Sourced by scripts/test-roundhouse in a fixed order, after
 # tests/94-jj-doctor.sh; reuses tests/90-jj-bootstrap.sh's real-jj gate. Not a
@@ -93,6 +97,158 @@ enroll_bin="$script_dir/enroll-privilege-posix"
     [ "$trustd_own_out" = "$(id -un)" ] ||
       fail "§7.9: the trustd ownership gate is not inert off-root (got owner '$trustd_own_out')"
   fi
+)
+
+# --- #62: root never runs a binary the user can replace: no store required ----
+(
+  # shellcheck source=/dev/null
+  ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+
+  # ROOT NEVER RUNS A BINARY THE USER CAN REPLACE. Sourcing the library
+  # runs select_mikefarah_yq, and choosing a yq means running its `--version`.
+  # As root that probe ran Homebrew's, Linuxbrew's or the first-on-PATH yq
+  # before trustd's pin applied. The suite is not root, so the root branch is
+  # entered by overriding roundhouse_is_root; the ownership rule itself is the
+  # real one, and the decoys are ordinary same-user files, which is exactly
+  # what a user-writable Homebrew yq is.
+  [ "$(head -1 "$trustd_bin")" = '#!/bin/bash -p' ] ||
+    fail "#62: trustd's interpreter is found on PATH or imports BASH_ENV and functions"
+  grep -q '^  trustd_uid=\$(/usr/bin/id -u 2>/dev/null) || return 0$' "$trustd_bin" ||
+    fail "#62: trustd decides it is root from something the environment can supply"
+  # bash takes EUID from the environment, so it must never decide rootness.
+  ry_euid=$(env EUID=0 /bin/bash -c '. "$1"; roundhouse_is_root && echo root || echo user' _ \
+    "$script_dir/lib/host.sh")
+  [ "$(id -u)" -eq 0 ] || [ "$ry_euid" = user ] ||
+    fail "#62: an EUID=0 in the environment makes the library think it is root"
+  # Every root jj call (the library's too) goes through trustd's wrapper, which
+  # neutralises every program-bearing jj key whatever config jj loads.
+  for ry_flag in trustd_jj_guard --ignore-working-copy signing.backends.gpg.program \
+    signing.backends.gpgsm.program signing.behavior fsmonitor.backend ui.paginate; do
+    sed -n '/^trustd_pin_toolchain() {$/,/^}$/p' "$trustd_bin" | grep -Fq -- "$ry_flag" ||
+      fail "#62: trustd's root jj wrapper does not pin $ry_flag"
+  done
+  grep -q '^  trustd_envs=\$(compgen -e)' "$trustd_bin" &&
+    grep -q '^    darwin\*) HOME=/var/root ;;$' "$trustd_bin" ||
+    fail "#62: a root trustd keeps the caller's environment (HOME picks jj's config)"
+  ! grep -n 'jj -R ' "$trustd_bin" | grep -v ':[[:space:]]*#' | grep -q . ||
+    fail "#62: trustd runs a jj that snapshots (and may sign) the same-user working copy"
+  trustd_pin_line=$(grep -n '^trustd_pin_toolchain$' "$trustd_bin" | cut -d: -f1)
+  trustd_src_line=$(grep -n '^ROUNDHOUSE_LIB_ONLY=1 \. ' "$trustd_bin" | cut -d: -f1)
+  [ -n "$trustd_pin_line" ] && [ -n "$trustd_src_line" ] &&
+    [ "$trustd_pin_line" -lt "$trustd_src_line" ] ||
+    fail "#62: trustd sources the library (and its yq probes) before pinning the toolchain"
+  # A store config that slips past the check dies with a per-run jj HOME
+  # instead of persisting in root's own config dir.
+  grep -q '^    trustd_jj_home=\$(mktemp -d "\$HOME/' "$trustd_bin" ||
+    fail "#62: root jj keeps a HOME that outlives the run (migrated store config persists)"
+  grep -q '^    trustd_tool_real=\$(trustd_trusted_path ' "$trustd_bin" ||
+    fail "#62: trustd pins a tool without checking every directory above it"
+
+  ry="$trustd_root/root-yq"
+  mkdir -p "$ry/path" "$ry/hb/bin" "$ry/linuxbrew/.linuxbrew/bin" \
+    "$ry/opt/homebrew/bin" "$ry/usr/local/bin" "$ry/pin"
+  # Every decoy claims to be mikefarah yq and leaves a mark when it runs, so a
+  # probe of any of them is visible whether or not it would have been chosen.
+  for ry_decoy in path hb/bin linuxbrew/.linuxbrew/bin opt/homebrew/bin usr/local/bin pin; do
+    printf '#!/bin/sh\necho "%s" >>"%s"\necho "yq (https://github.com/mikefarah/yq/) version v4.44.3"\n' \
+      "$ry_decoy" "$ry/ran" >"$ry/$ry_decoy/yq"
+    chmod 755 "$ry/$ry_decoy/yq"
+  done
+  ry_root() {
+    # A root context: the decoys first on PATH and at the Homebrew/Linuxbrew
+    # locations, and nothing of the suite's own yq selection inherited.
+    unset -f yq
+    unset ROUNDHOUSE_YQ
+    roundhouse_is_root() { return 0; }
+    yq_known_locations() {
+      printf '%s\n' "$ry/hb/bin/yq" "$ry/linuxbrew/.linuxbrew/bin/yq" \
+        "$ry/opt/homebrew/bin/yq" "$ry/usr/local/bin/yq"
+    }
+  }
+
+  # No trusted yq at all: PATH holds only the decoy, so the outcome is fixed.
+  # Selection runs nothing, `yq` refuses, and require_yq fails closed.
+  : >"$ry/ran"
+  ry_out=$(
+    ry_root
+    PATH=$ry/path
+    select_mikefarah_yq
+    [ -z "${ROUNDHOUSE_YQ:-}" ] || printf 'selected %s\n' "$ROUNDHOUSE_YQ"
+    yq --version 2>&1 && printf 'yq answered\n'
+    (require_yq) 2>&1 && printf 'require_yq passed\n'
+    :
+  )
+  [ ! -s "$ry/ran" ] ||
+    fail "#62: root-context yq selection ran a same-user yq: $(tr '\n' ' ' <"$ry/ran")"
+  case $ry_out in
+    *selected* | *'yq answered'* | *'require_yq passed'*)
+      fail "#62: root-context yq selection did not fail closed: $ry_out" ;;
+  esac
+  case $ry_out in
+    *'no root-owned mikefarah yq'*) ;;
+    *) fail "#62: the root-context yq refusal names no reason: $ry_out" ;;
+  esac
+
+  # A forged pin: ROUNDHOUSE_YQ naming a same-user yq is neither run nor kept.
+  : >"$ry/ran"
+  ry_out=$(
+    ry_root
+    PATH=$ry/path
+    ROUNDHOUSE_YQ=$ry/pin/yq
+    select_mikefarah_yq
+    [ -z "${ROUNDHOUSE_YQ:-}" ] || printf 'selected %s\n' "$ROUNDHOUSE_YQ"
+    :
+  )
+  [ ! -s "$ry/ran" ] && [ -z "$ry_out" ] ||
+    fail "#62: root-context selection trusted a same-user ROUNDHOUSE_YQ: $ry_out $(tr '\n' ' ' <"$ry/ran")"
+
+  # The pin trustd makes before sourcing: root_trusted_path vouches for the pin
+  # alone (the suite cannot make a root-owned file) and stays the real rule for
+  # every decoy. The pin is kept, `yq` reaches it, and no decoy ever runs.
+  : >"$ry/ran"
+  ry_out=$(
+    ry_root
+    PATH=$ry/path:/usr/bin:/bin
+    # Keep the real rule as real_root_trusted_path and vouch only for the pin.
+    eval "real_$(declare -f root_trusted_path)"
+    root_trusted_path() {
+      if [ "$1" = "$ry/pin/yq" ]; then printf '%s\n' "$1"; else real_root_trusted_path "$1"; fi
+    }
+    ROUNDHOUSE_YQ=$ry/pin/yq
+    export ROUNDHOUSE_YQ
+    select_mikefarah_yq
+    printf 'selected %s\n' "${ROUNDHOUSE_YQ:-}"
+    yq --version >/dev/null
+    (require_yq) || printf 'require_yq refused\n'
+  )
+  [ "$ry_out" = "selected $ry/pin/yq" ] ||
+    fail "#62: root-context selection did not keep the pinned yq: $ry_out"
+  [ "$(sort -u "$ry/ran")" = pin ] ||
+    fail "#62: root-context selection with a pin ran: $(sort -u "$ry/ran" | tr '\n' ' ')"
+
+  # The rule itself, in both copies (lib/host.sh's, and trustd's own, which must
+  # run before that library is sourced): a root-owned system binary passes with
+  # its physical path; a same-user file, a symlink to a trusted binary, a
+  # root-owned but world-writable directory (the physical /tmp: on macOS /tmp
+  # itself is a symlink) and a relative path do not. The walk over ancestors is
+  # exercised here only where it accepts: the suite cannot make a root-owned
+  # file under a directory the user can write.
+  ln -s /usr/bin/env "$ry/env-link"
+  ry_tmp=$(CDPATH='' cd -P /tmp && pwd -P)
+  for ry_path in /usr/bin/env "$ry/path/yq" "$ry/env-link" "$ry_tmp" /usr/bin/../bin/env relative/yq; do
+    ry_lib=$(root_trusted_path "$ry_path" 2>/dev/null) || ry_lib=refused
+    ry_trustd=$("$trustd_bin" selftest-trusted "$ry_path" 2>/dev/null) || ry_trustd=refused
+    [ "$ry_lib" = "$ry_trustd" ] ||
+      fail "#62: trustd and the library disagree on $ry_path ($ry_trustd vs $ry_lib)"
+    case $ry_path in
+      /usr/bin/env)
+        [ "$ry_lib" = /usr/bin/env ] || fail "#62: root_trusted_path refused root-owned /usr/bin/env" ;;
+      /usr/bin/../bin/env)
+        [ "$ry_lib" = /usr/bin/env ] || fail "#62: root_trusted_path did not resolve the physical path" ;;
+      *)
+        [ "$ry_lib" = refused ] || fail "#62: root_trusted_path accepted $ry_path as $ry_lib" ;;
+    esac
+  done
 )
 
 # --- derivation, validation, monotonicity, degrade: real jj required ----------
@@ -202,6 +358,30 @@ TOML
     tr_reject apply "$store" 'x y'            # whitespace in the token
     tr_reject apply "$store" 'no-such-commit' # unresolvable revision
     tr_reject unknown-subcommand              # unknown verb
+    # (#62) A store whose own jj config jj would migrate (an in-store
+    # config.toml with no config id) is refused, never handed to jj, which
+    # would copy it into the caller's HOME and run the programs it names — as
+    # root, the user's choice of binary. A store that only has the id is fine.
+    for tr_cfg in repo/config workspace-config; do
+      case $tr_cfg in
+        repo/config) tr_cfg_id=$store/.jj/repo/config-id ;;
+        *) tr_cfg_id=$store/.jj/workspace-config-id ;;
+      esac
+      tr_had_id=false
+      [ ! -f "$tr_cfg_id" ] || { tr_had_id=true; mv "$tr_cfg_id" "$tr/cfg-id-aside"; }
+      printf '[ui]\npager = "%s/never-run"\n' "$tr" >"$store/.jj/$tr_cfg.toml"
+      tr_reject apply "$store" "$head"
+      [ ! -e "$tr/never-run" ] || fail "trustd ran a program named in the store's own jj config"
+      rm -f "$store/.jj/$tr_cfg.toml"
+      [ "$tr_had_id" = false ] || mv "$tr/cfg-id-aside" "$tr_cfg_id"
+    done
+    # .jj/repo as a file is a secondary workspace pointing at another repo,
+    # whose config the check above never sees: refused.
+    mv "$store/.jj/repo" "$tr/repo-aside"
+    printf '%s\n' "$tr/repo-aside" >"$store/.jj/repo"
+    tr_reject apply "$store" "$head"
+    rm -f "$store/.jj/repo"
+    mv "$tr/repo-aside" "$store/.jj/repo"
     # A revision that does not descend from the genesis pin is refused: the
     # store's virtual root is an ANCESTOR of the genesis, never a descendant.
     tr_root=$(jj -R "$store" log -r 'root()' --no-graph -T 'commit_id ++ "\n"' | head -1)
@@ -394,6 +574,6 @@ TOML
     [ "$(fleet_trust_reviewed_ref)" = "$tr_moved2" ] ||
       fail "a refused trustd apply moved reviewed-ref"
 
-    printf 'real-jj: trustd OK (derivation parity, fail-closed validation, generation monotonicity, degrade, symlink refusal, TRUSTD_HOME gating, install lane, hermetic materialize, forced-degrade finding, published-only reviewed-ref)\n'
+    printf 'real-jj: trustd OK (derivation parity, fail-closed validation, store-config refusal, generation monotonicity, degrade, symlink refusal, TRUSTD_HOME gating, install lane, hermetic materialize, forced-degrade finding, published-only reviewed-ref)\n'
   )
 fi
