@@ -2935,37 +2935,32 @@ fleet_run_command() (
     # sibling hold in this function exits 65 and alerts — this one silently
     # converged on. Take the same branch the drift compare below takes.
     #
-    # A REVIEWED-REF OFF THE PUBLISHED LINE GETS ITS OWN KEYED ALERT, naming the
-    # mark, its newest published ancestor and the one command that re-points it
-    # (fleet_trust_reviewed_next composes all three). The generic
-    # `materialization-refused` text said "a rollback or a non-descendant head"
-    # and nothing an operator could act on, and a host held there for days
-    # published nothing while it read like any other transient hold. The detail
-    # is replicated, so it must clear §10.4's floor; a refused write falls back
-    # to a shorter text rather than to no alert at all.
-    if ! fleet_trust_materialize "$run_store" "$run_reference"; then
+    # A REVIEWED-REF OFF THE PUBLISHED LINE (exit 66) GETS ITS OWN KEYED ALERT,
+    # naming the mark and its newest published ancestor and pointing at the
+    # doctor row for the re-point command; the short hold text is sized under
+    # §10.4's cap by construction, so the alert cannot be refused and leave the
+    # hold silent. Every other refusal keeps the generic key. (A holding host
+    # publishes nothing, so peers learn of it from the stale-host alert, #42.)
+    run_mat_rc=0
+    fleet_trust_materialize "$run_store" "$run_reference" || run_mat_rc=$?
+    if [ "$run_mat_rc" -ne 0 ]; then
       run_reference_short=${run_reference:0:12}
-      if [ "${fleet_trust_refusal_key:-}" = reviewed-ref-unpublished ]; then
+      if [ "$run_mat_rc" -eq 66 ]; then
+        read -r run_rstate run_rref run_ranchor <<EOF
+$(fleet_trust_reviewed_state "$run_store")
+EOF
         fleet_alert_set "$run_store" "$run_host" materialization \
           materialization-refused false ''
         fleet_alert_set "$run_store" "$run_host" materialization \
-          reviewed-ref-unpublished true "$fleet_trust_refusal" ||
-          fleet_alert_set "$run_store" "$run_host" materialization \
-            reviewed-ref-unpublished true \
-            "${fleet_trust_refusal%%. If origin was not rewound*}. If origin was not rewound, \`roundhouse fleet-doctor\` prints the re-point command (reviewed-ref row)" ||
-          fleet_alert_set "$run_store" "$run_host" materialization \
-            reviewed-ref-unpublished true \
-            "reviewed-ref is not on main@origin and is not provably local-only work; holding everything (§7.12.3). \`roundhouse fleet-doctor\` names the re-point command (reviewed-ref row)" ||
-          :
+          reviewed-ref-unpublished true \
+          "$(fleet_trust_reviewed_hold_text "$run_store" "$run_rref" \
+            "${run_ranchor:--}" short)" || :
       else
         fleet_alert_set "$run_store" "$run_host" materialization \
           reviewed-ref-unpublished false ''
         fleet_alert_set "$run_store" "$run_host" materialization \
           materialization-refused true \
-          "materialization refused for commit[$run_reference_short] (abbreviated commit id): ${fleet_trust_refusal:-a roster generation rollback or a non-descendant head} (§7.12.3); holding everything" ||
-          fleet_alert_set "$run_store" "$run_host" materialization \
-            materialization-refused true \
-            "materialization refused for commit[$run_reference_short] (abbreviated commit id): a roster generation rollback or a non-descendant head (§7.12.3); holding everything" ||
+          "materialization refused for commit[$run_reference_short] (abbreviated commit id): a roster generation rollback or a non-descendant head (§7.12.3); holding everything" ||
           :
       fi
       printf 'roundhouse: materialization refused (§7.12.3); holding everything (§7.9)\n' >&2

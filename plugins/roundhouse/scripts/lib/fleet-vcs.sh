@@ -577,6 +577,12 @@ fleet_vcs_publish() {
   # preserves fleet-enroll's post-enrollment authorship: @ ends every run
   # empty, described by nothing, and parented on main.
   jj -R "$1" new "$2" >/dev/null
+  # §7.12.3: the push SUCCEEDED, so what this host just published becomes the
+  # rollback mark. Left at the fetched head, the mark lagged one publication
+  # and an origin forked from below this push was accepted. Here, in the one
+  # line that pushes, so every publisher advances it; a failed push returned
+  # above and leaves the mark where it was.
+  fleet_trust_advance_published "$1" "$2" || :
 }
 
 fleet_vcs_publish_refs() {

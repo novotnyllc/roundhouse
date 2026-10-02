@@ -299,16 +299,15 @@ trustd_apply() {
   # 4. THE DESCENDANT GATE, §7.12.3's other half, and the high-water mark to
   #    record. The new head must descend from trustd's own root-owned
   #    reviewed-ref, and reviewed-ref only ever records a commit this host saw
-  #    PUBLISHED — the newest ancestor of the adopted revision on main@origin,
-  #    never the revision itself, which may be a local reconcile a hung or
-  #    refused publish left on no remote (a mark naming one refused every later
-  #    apply, forever). A mark that is not on main@origin — one an older build
-  #    wrote, or an origin that dropped it — is refused unless proved to be this
-  #    host's own unpublished work. ONE shared function,
-  #    fleet_trust_reviewed_next, is what fleet_trust_materialize applies
-  #    unprivileged; trustd recomputes it from its own root-owned copy of the
-  #    library and its own root-owned mark, so the two lanes agree by
-  #    construction rather than by parallel edits.
+  #    PUBLISHED — never the adopted revision itself, which may be local work no
+  #    remote has. ONE shared function, fleet_trust_reviewed_next, is what
+  #    fleet_trust_materialize applies unprivileged; trustd recomputes it from
+  #    its own root-owned copy of the library and its own root-owned mark.
+  #    trustd IS the privileged lane, so a mark off the published line is a
+  #    plain refusal here, never a migration: every input a migration proof
+  #    reads is same-user state (lib/fleet-trust-migrate.sh).
+  # shellcheck disable=SC2034 # read by lib/fleet-trust-migrate.sh, sourced at run time
+  fleet_trust_privileged_lane=true
   trustd_ref=$(fleet_trust_reviewed_ref)
   trustd_next=$(fleet_trust_reviewed_next "$trustd_store" "$trustd_rev") ||
     trustd_die "$trustd_next; refusing (§7.12.3)" 65
@@ -351,7 +350,7 @@ EOF
   # rides in materialized-at's second field, which is what the drift compare
   # re-renders (fleet_trust_materialized_rev).
   printf '%s\n' "$trustd_next" >"$trustd_tmp/reviewed-ref"
-  printf '%s\n' "$trustd_gen" >"$trustd_tmp/generation"
+  fleet_trust_generation_mark "$trustd_store" "$trustd_next" >"$trustd_tmp/generation"
   printf '%s %s\n' "$trustd_at" "$trustd_rev" >"$trustd_tmp/materialized-at"
   trustd_install "$trustd_tmp/roster" "$(fleet_trust_materialized_path)" 0644
   trustd_install "$trustd_tmp/reviewed-ref" "$trustd_dest/reviewed-ref" 0644

@@ -738,31 +738,93 @@ JSONC
     printf '%s\n' "$(cli_function_body fleet_sweep_range)" |
       grep -q 'sweep_rc' ||
       fail "the redaction sweep does not capture the enumeration exit (empty range = clean)"
-    # §7.12.3 materialize can never wedge on LOCAL unpublished work: a run
-    # materializes before it publishes, so a hung, killed or refused publish
-    # used to leave reviewed-ref naming a commit no remote has, and every later
-    # head was its sibling. reviewed-ref now records only the newest PUBLISHED
-    # ancestor, through ONE function both lanes call — the run and trustd — so
-    # the rule cannot be fixed in one and left wedging in the other. The
-    # behaviour itself is asserted against real jj in tests/93-jj-run.sh.
+    # §7.12.3: ONE gate for both lanes, so the published-only reviewed-ref
+    # cannot be fixed in one and left wedging in the other — and the old
+    # carve-out ("allow when reviewed-ref descends from the current
+    # main@origin") is gone, because a pure rewind of origin satisfies it. The
+    # behaviour is asserted against real jj in tests/93-jj-run.sh and
+    # tests/95-jj-trustd.sh.
     printf '%s\n' "$(cli_function_body fleet_trust_materialize)" |
-      grep -q 'fleet_trust_reviewed_next "\$fleet_trust_ms" "\$fleet_trust_mrev"' ||
-      fail "materialize's §7.12.3 gate does not go through fleet_trust_reviewed_next; local work can wedge reviewed-ref again"
-    printf '%s\n' "$(cli_function_body fleet_trust_materialize)" |
-      grep -q 'printf .%s\\n. "\$fleet_trust_mnext" >"\$fleet_trust_mtmp/reviewed-ref"' ||
-      fail "the same-user lane records something other than the published mark as reviewed-ref"
-    grep -q 'trustd_next=$(fleet_trust_reviewed_next "$trustd_store" "$trustd_rev")' \
-      "$script_dir/roundhouse-trustd" ||
-      fail "trustd does not mirror the published-reviewed-ref gate (§7.9 parity)"
-    grep -q 'printf .%s\\n. "$trustd_next" >"$trustd_tmp/reviewed-ref"' \
-      "$script_dir/roundhouse-trustd" ||
-      fail "trustd records something other than the published mark as reviewed-ref"
-    # The legacy carve-out is GONE, not kept beside the new gate: "allow when
-    # reviewed-ref descends from the current main@origin" also allows a pure
-    # rewind of origin to an ancestor of reviewed-ref.
+      grep -q 'fleet_trust_reviewed_next "\$fleet_trust_ms" "\$fleet_trust_mrev"' &&
+      grep -q 'trustd_next=$(fleet_trust_reviewed_next "$trustd_store" "$trustd_rev")' \
+        "$script_dir/roundhouse-trustd" ||
+      fail "the run and trustd do not share fleet_trust_reviewed_next (§7.9 parity)"
     ! printf '%s\n' "$(cli_function_body fleet_trust_materialize)" |
       grep -q 'present(main@origin) & ::' ||
       fail "materialize still carries the old main@origin carve-out, which a rewound origin satisfies"
+
+    # The op-log reader behind the legacy migration's proof 2, on captured
+    # `jj op log --op-diff` output (templates.commit_summary = commit_id): the
+    # main@origin ids under `Changed remote bookmarks`, both moves, nothing
+    # from local bookmarks or changed commits.
+    guard_oplog=$(cat <<'OPLOG'
+
+fetch from git remote(s) origin
+args: jj git fetch
+
+Changed commits:
++ 45020992adf9e9e3f7ee460aa1d8277d66c17d9b
+
+Changed local bookmarks:
+main:
++ (added) e420951c524e5c0dc4322d7e1b37038f78cf77f3
+- e420951c524e5c0dc4322d7e1b37038f78cf77f3
+
+Changed remote bookmarks:
+main@origin:
++ tracked 45020992adf9e9e3f7ee460aa1d8277d66c17d9b
+- tracked 7747914cd00b73b1b587a6f66a02766b373e3e12
+
+push to git remote(s) origin
+
+Changed remote bookmarks:
+main@origin:
++ tracked 7747914cd00b73b1b587a6f66a02766b373e3e12
+- untracked (absent)
+OPLOG
+)
+    [ "$(printf '%s\n' "$guard_oplog" | fleet_trust_seen_published_parse | tr '\n' ' ')" = \
+      '45020992adf9e9e3f7ee460aa1d8277d66c17d9b 7747914cd00b73b1b587a6f66a02766b373e3e12 ' ] ||
+      fail "the op-log reader did not return exactly the main@origin positions: $(printf '%s\n' "$guard_oplog" | fleet_trust_seen_published_parse | tr '\n' ' ')"
+    #   A jj that renders the lines differently yields nothing, never a guess.
+    [ -z "$(printf 'main@origin:\n+ tracked yxqk 4502099 fetch\n' | fleet_trust_seen_published_parse)" ] ||
+      fail "the op-log reader read an id out of a short-id rendering"
+
+    # The re-point command is pasteable on a path with a space and a quote, in
+    # both forms, and never truncates the mark when jj does not answer with
+    # one full id. jj and sudo are stand-ins: what is under test is the shell
+    # the operator pastes, not jj.
+    (
+      guard_sp="$guard_root/a b's"
+      guard_id=0123456789abcdef0123456789abcdef01234567
+      mkdir -p "$guard_sp/trust"
+      export ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_TRUST_ROOT="$guard_sp/trust"
+      jj() { printf '%s|' "$@" >"$guard_root/jj-args"; printf '%s\n' "$guard_jj_says"; }
+      sudo() { chmod u+w "$guard_sp/trust"; "$@"; }
+      guard_jj_says=$guard_id
+      guard_cmd=$(fleet_trust_repoint_hint "$guard_sp/store" "$guard_id")
+      eval "$guard_cmd" || fail "the re-point command does not run: $guard_cmd"
+      [ "$(cat "$guard_sp/trust/reviewed-ref")" = "$guard_id" ] &&
+        [ "$(cut -d'|' -f2 "$guard_root/jj-args")" = "$guard_sp/store" ] ||
+        fail "the re-point command split a path with a space: $guard_cmd"
+      guard_jj_says='Error: Revision is ambiguous'
+      eval "$guard_cmd" 2>/dev/null || :
+      [ "$(cat "$guard_sp/trust/reviewed-ref")" = "$guard_id" ] ||
+        fail "a failed jj lookup truncated the mark: $guard_cmd"
+      #   A mark this user cannot write is written through sudo tee.
+      chmod a-w "$guard_sp/trust/reviewed-ref" "$guard_sp/trust"
+      guard_jj_says=fedcba9876543210fedcba9876543210fedcba98
+      guard_cmd=$(fleet_trust_repoint_hint "$guard_sp/store" "$guard_id")
+      case $guard_cmd in *'| sudo tee '*) ;; *) fail "an unwritable mark's re-point is not a sudo tee: $guard_cmd" ;; esac
+      chmod u+w "$guard_sp/trust/reviewed-ref"
+      eval "$guard_cmd" || fail "the sudo re-point command does not run: $guard_cmd"
+      [ "$(cat "$guard_sp/trust/reviewed-ref")" = "$guard_jj_says" ] ||
+        fail "the sudo re-point command split a path with a space: $guard_cmd"
+      #   Under $HOME the tilde stays outside the quotes, so it still expands.
+      HOME=$guard_sp
+      guard_cmd=$(fleet_trust_repoint_hint "$guard_sp/store" "$guard_id")
+      case $guard_cmd in *"jj -R ~/'store' "*">~/'trust/reviewed-ref'") ;; *) fail "the re-point command does not keep ~ expandable: $guard_cmd" ;; esac
+    ) || fail "the re-point command quoting block failed"
 
     # --- §10.6 the private-remote posture, host-local by construction ---
     case $(fleet_posture_path) in

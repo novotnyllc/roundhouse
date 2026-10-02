@@ -2589,23 +2589,30 @@ materializes *before* it publishes, so recording the materialized head let a
 hung, killed or refused publish leave the mark on a local reconcile no remote
 has; once that commit was abandoned or origin moved past its base, every later
 head was its sibling and the descendant gate refused every pass (observed on
-two hosts, 2026-09-28 onward, with nothing published for days). The mark is
-now the newest ancestor of the materialized head that is in `::main@origin` as
-fetched, and it only ever moves forward (a candidate that does not descend from
-the current mark leaves it in place). The rendered head rides in
-`materialized-at`'s second field for the §7.9 drift compare. A mark that is not
-on `main@origin` — one an older build wrote over local work, or an origin that
-dropped what it published — is re-anchored only when two independent proofs
-hold: every commit between it and its newest published ancestor verifies as
-signed by this host's own key alone (a peer's commit there can only be
-published history the remote dropped), and every position the jj operation log
-records for `main@origin` is still in `::main@origin` (nothing this host ever
-saw published is missing). Otherwise the run holds and raises the keyed
-`materialization`/`reviewed-ref-unpublished` alert naming the mark, its newest
-published ancestor and the re-point command; `fleet-doctor`'s `reviewed-ref`
-row shows the same on the host. `roundhouse-trustd` applies the same function
-from its own root-owned library copy; an installed helper older than the
-plugin keeps the old rule until its install lane re-runs.
+mac-studio and iris-wsl from 2026-09-28, each publishing nothing for days). The
+mark is now the newest ancestor of the materialized head that is in
+`::main@origin` as fetched, and after a successful push it advances to the
+pushed head — otherwise it lags one publication and an origin forked from
+below that push still descends from it. It only ever moves forward. The
+`generation` high-water mark is recorded from the same published mark, for the
+same reason. The rendered head rides in `materialized-at`'s second field for
+the §7.9 drift compare.
+
+A mark that is not on `main@origin` is a plain refusal: the run holds and
+raises the keyed `materialization`/`reviewed-ref-unpublished` alert naming the
+mark and its newest published ancestor, and `fleet-doctor`'s `reviewed-ref`
+row prints the re-point command (through `sudo tee` where the mark is
+root-owned). The one exception is a mark an *older* build wrote — recognisable
+by its one-field `materialized-at` — on the **same-user lane only**: it is
+re-anchored when two independent proofs hold. Every commit between it and its
+newest published ancestor verifies as signed by this host's own key alone (a
+peer's commit there can only be published history the remote dropped), and
+every position the jj operation log records for `main@origin` is still on it
+(nothing this host ever saw published is missing). Both proofs read same-user
+state, so they guard only against a hub-only attacker; `roundhouse-trustd`
+never migrates, because a same-user process can rewrite everything the proofs
+read. An installed trustd older than the plugin keeps the old rule until its
+install lane re-runs.
 
 #### 7.12.4 The first-host TOFU window
 

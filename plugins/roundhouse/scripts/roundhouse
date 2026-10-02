@@ -131,6 +131,8 @@ EOF
 . "$script_dir/lib/fleet-vcs.sh"
 # shellcheck source=lib/fleet-trust.sh
 . "$script_dir/lib/fleet-trust.sh"
+# shellcheck source=lib/fleet-trust-migrate.sh
+. "$script_dir/lib/fleet-trust-migrate.sh"
 # shellcheck source=lib/fleet-resolve.sh
 . "$script_dir/lib/fleet-resolve.sh"
 # shellcheck source=lib/apply-claude.sh

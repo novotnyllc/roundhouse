@@ -209,7 +209,7 @@ TOML
 
     # (c) GENERATION MONOTONICITY — a high-water mark above the store's
     # generation makes trustd refuse rather than roll back (§7.12.3).
-    printf '%s\n' "$head" >"$trust/reviewed-ref"
+    : >"$trust/reviewed-ref"
     printf '99\n' >"$trust/generation"
     tr_reject apply "$store" "$head"
     # And with the high-water restored, the same apply is accepted again — the
@@ -353,16 +353,30 @@ TOML
       fail "REGRESSION (trustd): abandoned local work wedged the privileged lane"
     [ "$(fleet_trust_reviewed_ref)" = "$tr_moved" ] ||
       fail "trustd did not advance reviewed-ref to the published head"
-    #     The legacy mark an older trustd wrote: the rendered local head itself.
+    #     THE PRIVILEGED LANE NEVER MIGRATES. The legacy state an older trustd
+    #     left — the rendered local head as the mark, a one-field
+    #     materialized-at — is refused even when it is this host's own work:
+    #     every input a migration proof reads is same-user state, which is
+    #     exactly what this helper does not trust. The operator re-points it.
     tr_legacy=$(tr_commit "$tr_moved" 'a head an older trustd recorded')
     printf '%s\n' "$tr_legacy" >"$trust/reviewed-ref"
+    fleet_now >"$trust/materialized-at"
     jj -R "$store" abandon -r "$tr_legacy" >/dev/null 2>&1
     tr_moved2=$(tr_commit "$tr_moved" 'origin moved on again')
     tr_publish "$tr_moved2"
+    tr_status=0
+    tr_out=$(tr_apply apply "$store" "$tr_moved2" 2>&1) || tr_status=$?
+    [ "$tr_status" -eq 65 ] ||
+      fail "trustd re-anchored an unpublished mark from same-user evidence (got $tr_status): $tr_out"
+    case $tr_out in
+      *'is not on main@origin'*'re-point: '*) ;;
+      *) fail "trustd's unpublished-mark refusal does not name the re-point command: $tr_out" ;;
+    esac
+    [ "$(fleet_trust_reviewed_ref)" = "$tr_legacy" ] ||
+      fail "a refused trustd apply moved reviewed-ref"
+    printf '%s\n' "$tr_moved" >"$trust/reviewed-ref"
     tr_apply apply "$store" "$tr_moved2" ||
-      fail "MIGRATION (trustd): a provable legacy mark on own abandoned work was not re-anchored"
-    [ "$(fleet_trust_reviewed_ref)" = "$tr_moved2" ] ||
-      fail "trustd did not re-anchor the legacy mark on the published head"
+      fail "trustd refused the head once the mark was re-pointed"
     #     A rewound origin: the hub goes back one commit, and trustd is asked to
     #     adopt the head it went back to.
     "$REAL_GIT" -C "$tr/remote.git" update-ref refs/heads/main "$tr_moved"
@@ -374,8 +388,8 @@ TOML
     [ "$tr_status" -eq 65 ] ||
       fail "REWIND (trustd): a rewound origin's head was materialized (got $tr_status): $tr_out"
     case $tr_out in
-      *'main@origin once held'*) ;;
-      *) fail "trustd's rewind refusal does not name what origin dropped: $tr_out" ;;
+      *'is not on main@origin'*) ;;
+      *) fail "trustd's rewind refusal does not say the mark left main@origin: $tr_out" ;;
     esac
     [ "$(fleet_trust_reviewed_ref)" = "$tr_moved2" ] ||
       fail "a refused trustd apply moved reviewed-ref"
