@@ -305,10 +305,11 @@ construction**, so no host re-reviews anything. Promotion moves *where* a value
 is written, never *what* it is.
 
 Neither re-seeding nor promotion writes the agent keys. Seeding skips `plugins`
-and `skills` (packages, `platform`, `groups` and `package_managers` seed as
-before), and promotion never proposes a `plugins.*` or `skills.*` item: a
-machine snapshot in the narrowest layer re-added every retired plugin and
-overrode every change made anywhere else. Agent items are edited in the layer
+and `skills` (packages, `platform` and `groups` seed as before, and
+`package_managers` refreshes from the host's own config.json), and promotion
+never proposes a `plugins.*` or `skills.*` item: a machine snapshot in the
+narrowest layer re-added every retired plugin and overrode every change made
+anywhere else. Agent items are edited in the layer
 that declares them.
 
 ### Conflicts, and who resolves them
