@@ -18,9 +18,11 @@
 #                evidence deadline, so §10.1's gate is never left waiting on a
 #                throttled record (see fleet_heartbeat_publish).
 #
-# The stale-host alert is the other half: every pass checks the PUBLISHED
-# heartbeats of every other enrolled host, and a host with none inside
-# `liveness_alert_hours` (default 12, two publication windows) is alerted on.
+# The stale-host alert is the other half: every pass that reaches its end
+# checks the PUBLISHED heartbeats of every other enrolled host, and a host with
+# none inside `liveness_alert_hours` (default 12, two publication windows) is
+# alerted on. The floor does not exit past a check that is owed
+# (fleet_liveness_owed).
 # The window is never shorter than TWO publication windows
 # (2 × heartbeat_publish_hours): a shorter one would alert on every healthy,
 # quiet host between its heartbeats.
@@ -132,7 +134,7 @@ fleet_liveness_last_alive() {
 }
 
 fleet_liveness_alerts() {
-  # fleet_liveness_alerts STORE HOST HOSTS-FILE ROSTER-FILE FOLD NOW-ISO
+  # fleet_liveness_alerts STORE HOST HOSTS-FILE ROSTER-FILE FOLD NOW-ISO [SCANNED-REV]
   #
   # Every OTHER enrolled host — and, when the reviewed roster is readable, only
   # those still in it, so a retired or expired member is not a silent one — is
@@ -149,9 +151,13 @@ fleet_liveness_alerts() {
   # peer's LAST published heartbeat, a fixed fact, never the moving cutoff; an
   # alert already standing is left exactly as it is, so the unbounded read
   # that detail needs happens once per silence, not once per pass.
-  # Prints `stale <host>` per silent host.
+  # Prints `stale <host>` per silent host, and records when the scan is next
+  # owed (fleet_liveness_record) against SCANNED-REV, the commit whose journal
+  # it read.
   liveness_hours=$(fleet_policy_int "$5" liveness_alert_hours)
   liveness_checked=" "
+  liveness_heard=
+  liveness_watch=
   liveness_dir="$1/alerts/$2"
   if [ "$liveness_hours" -gt 0 ] 2>/dev/null; then
     liveness_floor=$(($(fleet_policy_int "$5" heartbeat_publish_hours) * 2))
@@ -168,8 +174,16 @@ fleet_liveness_alerts() {
       liveness_slug=$(printf '%s' "$liveness_peer" | tr -c 'A-Za-z0-9._-' '-')
       liveness_checked="$liveness_checked$liveness_slug "
       liveness_status=0
-      fleet_liveness_last_alive "$1" "$liveness_peer" "$liveness_cutoff" \
-        >/dev/null || liveness_status=$?
+      liveness_seen=$(fleet_liveness_last_alive "$1" "$liveness_peer" \
+        "$liveness_cutoff") || liveness_status=$?
+      if [ "$liveness_status" -eq 0 ]; then
+        liveness_heard="$liveness_heard$liveness_seen
+"
+      else
+        # Silent or never heard from: what changes either arrives as records.
+        liveness_watch="$liveness_watch$liveness_peer
+"
+      fi
       if [ "$liveness_status" -ne 1 ]; then
         fleet_alert_set "$1" "$2" stale-host "$liveness_slug" false '' || :
         continue
@@ -191,4 +205,62 @@ fleet_liveness_alerts() {
     case $liveness_checked in *" $liveness_slug "*) continue ;; esac
     fleet_alert_clear "$1" "$2" stale-host "$liveness_slug" || :
   done
+  fleet_liveness_record "$liveness_heard" "$liveness_watch" "$liveness_hours" \
+    "${7:-}"
+}
+
+fleet_liveness_record() {
+  # fleet_liveness_record HEARD WATCH HOURS SCANNED-REV — store.run/liveness.json,
+  # what the poll floor needs to know when the scan is next owed:
+  #
+  #   due    the first instant a peer heard from now (HEARD, its newest
+  #          heartbeat per line) ages past the HOURS window; null when none
+  #          was, so time alone owes nothing. An `at` that does not parse is
+  #          left out: the scan compares it as a string, so time cannot
+  #          change that peer's answer either.
+  #   watch  the peers that were silent or never heard from: their next
+  #          journal record is what changes the answer.
+  #   base   SCANNED-REV, the commit whose journal the scan read.
+  liveness_state_dir=$(fleet_run_state_dir)
+  mkdir -p "$liveness_state_dir"
+  jq -cn --arg heard "$1" --arg watch "$2" --argjson span "$(($3 * 3600))" \
+    --arg base "$4" '
+      {due: ([$heard | splits("\n") | select(length > 0)
+              | (try fromdateiso8601 catch empty)]
+             | if length == 0 then null else min + $span end),
+       watch: [$watch | splits("\n") | select(length > 0)],
+       base: $base}' >"$liveness_state_dir/liveness.json.next" &&
+    mv -f "$liveness_state_dir/liveness.json.next" "$liveness_state_dir/liveness.json"
+}
+
+fleet_liveness_owed() {
+  # fleet_liveness_owed STORE FETCHED [NOW-EPOCH] — true when the stale-host
+  # scan must run again, so the poll floor may not exit. Only a pass that
+  # reaches its end runs the scan, and two things change its answer without
+  # touching desired state:
+  #
+  #   time     a heard peer ages out of the window (`due`);
+  #   records  a watched peer journals again, in a records-only commit the
+  #            floor fetched and did not import: the scan's `base` and FETCHED
+  #            differ under journal/<peer>.
+  #
+  # Absent or unreadable state is "owed now", like the heartbeat's, and so is
+  # a git error (an unreadable commit): the safe direction.
+  liveness_state=$(jq -c 'objects' "$(fleet_run_state_dir)/liveness.json" \
+    2>/dev/null) || return 0
+  [ -n "$liveness_state" ] || return 0
+  ! printf '%s\n' "$liveness_state" | jq -e --argjson now "${3:-$(date +%s)}" \
+    '(.due | numbers) <= $now' >/dev/null 2>&1 || return 0
+  liveness_base=$(printf '%s\n' "$liveness_state" | jq -r '.base // ""')
+  [ "$liveness_base" != "$2" ] || return 1
+  # Prints a peer whose journal moved; the caller only tests for output.
+  liveness_moved=$(printf '%s\n' "$liveness_state" | jq -r '.watch[]? | strings' |
+    while IFS= read -r liveness_peer; do
+      git -C "$1" diff --quiet "$liveness_base" "$2" -- \
+        ":(literal)journal/$liveness_peer" 2>/dev/null || {
+        printf '%s\n' "$liveness_peer"
+        break
+      }
+    done)
+  [ -n "$liveness_moved" ]
 }

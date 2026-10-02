@@ -760,6 +760,9 @@ fleet_run_poll_floor() {
     "$fleet_run_fetched" 2>/dev/null || return 1
   [ "$(fleet_vcs_desired_digest "$1" "$fleet_run_fetched" 2>/dev/null)" = \
     "$(cat "$(fleet_run_state_dir)/converged-desired")" ] || return 1
+  # No stale-host scan owed (§6.3): only a pass that reaches the end runs it
+  # (fleet_liveness_owed says what owes one).
+  ! fleet_liveness_owed "$1" "$fleet_run_fetched" || return 1
   if [ "$fleet_run_fetched" = "$fleet_run_converged" ]; then
     fleet_run_floor_note='nothing new on the remote'
   else
@@ -3607,7 +3610,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   # §6.3's other half: a peer with no published heartbeat inside
   # `liveness_alert_hours` is alerted on, from this store's journal alone.
   fleet_liveness_alerts "$run_store" "$run_host" "$run_tmp/hosts" \
-    "$run_tmp/reviewed-roster" "$run_fold" "$run_alive_at" |
+    "$run_tmp/reviewed-roster" "$run_fold" "$run_alive_at" \
+    "$(fleet_vcs_heads_local "$run_store" | head -1)" |
     while read -r _ run_silent; do
       printf 'roundhouse: %s has published no heartbeat within liveness_alert_hours (stale-host alert)\n' \
         "$run_silent" >&2
