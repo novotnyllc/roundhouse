@@ -23,10 +23,11 @@ Facts the design rests on:
 - fnm's `fnm_multishells/<pid>/bin` directories are per-shell and deleted when
   the shell's session ends. A scheduler, SSH worker or tool that remembers one
   of those paths later fails or runs a Node nobody selected.
-- Native Windows gets Node from winget (`OpenJS.NodeJS`, the Current line,
-  pinned with `winget pin add --id OpenJS.NodeJS --version 26.*`). Its global
-  prefix, `%APPDATA%\npm`, survives Node upgrades. Windows is reached through
-  the WSL interop lane.
+- Native Windows got Node from winget (`OpenJS.NodeJS`, the Current line,
+  pinned with `winget pin add --id OpenJS.NodeJS --version 26.*`), whose
+  global prefix, `%APPDATA%\npm`, survives Node upgrades. The MSI installs
+  machine-wide, so every upgrade needs elevation; since 0.9.44 Windows
+  runs fnm too (§7.7). Windows is reached through the WSL interop lane.
 - Some global packages ship their own transactional updater that does more
   than replace files. opencodex's `ocx update` also restarts its background
   service, and `npm install -g` over it leaves the old service running.
@@ -199,7 +200,8 @@ npm is opt-in per package:
   blind `@latest` reinstall twice a day would be churn, and it would bounce
   opencodex's service on every cadence.
 - DSC does not run on native Windows (the design routes it through the WSL
-  sibling). Windows npm globals converge through the sealed interop lane.
+  sibling). Windows npm globals, and the fnm Node runtime under them (§7.7),
+  converge through the sealed interop lane.
 
 ## 5. Tests
 
@@ -231,7 +233,7 @@ run), convergence on the reviewed apply and the
 full cadence (in-line no-op, newest in line, exact pin both ways, a new
 major, unreachable release list, unusable value, no fnm), the category arm,
 the full cadence ordering the switch before the npm pass and skipping a held
-item, config validation and the POSIX-only worker projection, the `fnm:node`
+item, config validation and the worker projection (Windows included), the `fnm:node`
 collector record, sealing refusals (omitted, extra or unproven hooks, a wrong
 carry, argv, candidate or runtime id), a failed sealed switch that restores
 and reports `partial` and invalidates its plan, a completed sealed switch with
@@ -242,7 +244,21 @@ start time reads the same under any TZ, `node-switch-clear` refuses without a
 verified default and clears a backoff), the hook-failure backoff (including
 the run loop deferring a backed-off switch to the same run's full pass), npm mutations refused while a switch is in flight (fast
 install, seal, apply), and, under pwsh, the Windows pin and scope record and
-the machine-scope hold. `collect-windows.ps1 -SelfTest` covers the pin parser.
+the machine-scope hold, and the Windows fnm arm: the collector's `fnm:node`
+record in the POSIX shape with the npm records under the fnm default, the MSI
+shadowed and its upgrade refused, and the Windows switch sealed with its
+configured hooks. `collect-windows.ps1 -SelfTest` covers the pin parser, fnm
+root and default discovery, the release list, the global split and the record
+shape. `scripts/tests/69-windows-interop.sh` runs a sealed Windows switch end
+to end over the interop lane against a stub fnm: a failed hook restored and
+partial, then a reseal that carries before the flip and runs the hook under
+the new node. `apply-windows.ps1 -SelfTest` covers the switch phases with
+in-memory fnm and npm (carry before flip, a refused invented carry, a failed
+carry, a restored hook failure, an unverified restore that stays recorded and
+blocks npm, recovery, the lock), the carry rule and operation shape, the
+post-state, and the bootstrap's migration from the MSI's npm (a linked global
+refused, a rerun idempotent, a failed first default removed), its PATH edit
+and its archive check.
 
 ## 6. Known limits
 
@@ -324,8 +340,22 @@ Both come from one `npm ls`, so they cannot disagree; when it fails both are
 null, which means unknown, and the carry rule holds on unknown rather than
 reading it as "none unpinnable".
 
-Windows (`collect-windows.ps1`): the existing `winget:OpenJS.NodeJS` record
-gains `pin` (`{type:"Gating",version:"26.*"}` from `winget pin list`),
+Windows (`collect-windows.ps1`), once fnm has a default there (§7.7): the
+same `fnm:node` record, in the same shape, next to the `npm:*` records, which
+then come from the fnm default's npm. The root is the first of `%FNM_DIR%`
+(the process, then the user's own setting), `%APPDATA%\fnm` and
+`%LOCALAPPDATA%\fnm` whose `aliases\default` junction holds `npm.cmd` and
+`node.exe`; `installed_version` is read from that junction's target, fnm
+itself is `fnm.exe` on PATH or where the bootstrap puts it (winget's
+`%LOCALAPPDATA%\Microsoft\WinGet\Links`, `%LOCALAPPDATA%\fnm`, or beside a
+root), and `globals`/`globals_unpinnable` come from the same `npm ls` as the
+npm records. `switch_inflight` is the Windows switch's record reduced to
+`{old, target, at}`. The `winget:OpenJS.NodeJS` record then carries
+`shadowed_by: "fnm:node"`, `managed: false` and `update_available: false`:
+the MSI stays installed but is unmanaged, never drift to upgrade.
+
+Without fnm, the `winget:OpenJS.NodeJS` record carries `shadowed_by: null`
+and `managed: true`, and gains `pin` (`{type:"Gating",version:"26.*"}` from `winget pin list`),
 `pin_query`, `line`, and `install_scope`. The scope comes from the package's
 own uninstall registration, never from PATH (a per-user `node` earlier on PATH,
 from fnm, Volta or a local copy, says nothing about the MSI winget manages): a
@@ -406,7 +436,8 @@ rule holds, every lane refuses a new switch, every npm mutation is refused
 restoring the recorded old default (§7.5).
 
 **Where.** The lock, the record and the backoff record (§7.5) live at one
-fixed path, `$HOME/.local/state/roundhouse/`, never under `XDG_STATE_HOME`:
+fixed path, `$HOME/.local/state/roundhouse/` (`%USERPROFILE%\.local\state\roundhouse\`
+on Windows, §7.7), never under `XDG_STATE_HOME`:
 launchd, an SSH worker and an interactive shell disagree on that variable,
 and every lane must see the same record. The runtime they guard is the
 account's own fnm default, under the same `$HOME`.
@@ -441,7 +472,8 @@ than special-case a package, a package declares hooks from its own bins:
 - Local configuration (trust root): top-level `node_switch_hooks` in
   `config.json`, `{"npm:@bitkyc08/opencodex": [["ocx","service"]]}`, validated
   with the same grammar and projected into the bounded worker configuration
-  for POSIX targets only.
+  for every target (Windows included since 0.9.44: fnm switches there
+  too, and `ocx service` re-registers opencodex's scheduled task).
 
 The store can only *require* a hook. A switch runs exactly the hooks the
 host's own `config.json` declares for the carried packages, and holds before
@@ -582,8 +614,9 @@ argv is the marker only; the executor knows no other `fnm` shape. `carry`,
   exactly the sealed `carry` and `hooks`, and every sealed `required` hook
   must be among the hooks. It needs no store: the carry is the installed set,
   and `required` is bound by the plan digest. No lane reads a store at apply.
-  The interop lane never carries a switch: `fnm:node` does not seal for a
-  Windows target.
+  A Windows target seals the same operation on the ordinary lane (the WSL
+  interop sibling or the Codex control project), and `apply-windows.ps1`
+  runs the same checks natively (§7.7).
 - Executor: re-checks the argv marker and the hooks against its own (worker)
   configuration, then runs §7.3. Seal and apply-time verification share one
   validator for the operation's shape (`node_switch_operations_valid`: at
@@ -600,22 +633,103 @@ argv is the marker only; the executor knows no other `fnm` shape. `carry`,
   new `prefix`/`node_version`, so npm plans sealed before a switch stop
   verifying after it.
 
-### 7.7 Windows
+### 7.7 Windows (fnm since 0.9.44)
 
-winget `OpenJS.NodeJS` already resolves through the winget manager, and
-`%APPDATA%\npm` survives Node upgrades, so Windows needs no carry-over and no
-hooks. The Node MSI installs machine-wide, and a machine-scope upgrade needs
-elevation. Unattended runs never attempt it (DSC does not run on native
-Windows at all), and `seal-plan` refuses an ordinary-lane
+The operator's decision (2026-10-01) is one runtime manager everywhere: fnm
+is the Node runtime source on native Windows too, with no UAC and no ceremony
+per upgrade. fnm installs per user, so every step runs in the user's own,
+non-elevated session.
+
+**Layout.** fnm keeps one prefix per version,
+`<FNM_DIR>\node-versions\vX\installation`, holding `node.exe`, the npm shims
+and `node_modules`. The release zip fnm installs carries no `npmrc` (the MSI
+adds one pointing the prefix at `%APPDATA%\npm`), so that directory is also
+the version's npm global prefix: a switch starts with an empty global set and
+carries every global, exactly as on POSIX. `aliases\default` is a junction to
+one of them.
+
+**The switch** (`apply-windows.ps1`, the sealed `fnm:node` operation over the
+existing interop apply path). The plan format is POSIX's; only the executor
+arm is new. The worker:
+
+- accepts the operation's exact shape (`argv` the fixed marker, `carry`,
+  `hooks`, `required` in the npm grammar, at most one switch, before every
+  `npm:*` upgrade) and requires `hooks` to equal what its worker
+  configuration declares for the carried packages, in carry order;
+- re-derives the carry rule (§7.5) over its fresh inventory, after the
+  precondition digest: nothing may hold (unknown or unpinnable globals, a
+  switch in flight), and `carry` and `hooks` must be exactly the sealed ones,
+  with every `required` hook among them;
+- runs §7.3's phases: PREFLIGHT (the carry is installed at exactly those
+  versions, every hook a bin of a carried package under the current prefix);
+  STAGING (`fnm install`, the target's npm brought up to the installed one
+  when older, one exact `npm --prefix <target> install --global a@x …`,
+  leftovers uninstalled, the set verified); the FLIP (the in-flight record,
+  `fnm default`, verify, each hook re-proved and run through the alias so a
+  service it registers names a path that survives later switches, verify
+  again, clear the record). A failure after the flip restores the old
+  default and verifies it, or leaves the record;
+- checks the post-state as §7.6 does (exactly the carry, nothing unpinnable,
+  no record), and refuses every `npm:*` upgrade while a record exists.
+
+The lock is `node-switch.lock` held open exclusively for the whole switch;
+the OS releases it however the holder exits, so a killed switch leaves no
+stale lock, only the record. Nothing on Windows runs the desired-state
+recovery; rerunning the bootstrap restores a recorded switch (verified) before
+anything else, and refuses when the recorded old version is gone.
+
+**Bootstrap** (once per host, by its user, never elevated; idempotent):
+
+```powershell
+pwsh -NoProfile -File <plugin>\scripts\apply-windows.ps1 -BootstrapNodeFnm -NodeMajor 26
+```
+
+1. fnm, user scope: `winget install --id Schniz.fnm --exact --scope user`,
+   else the pinned official release (`fnm-windows.zip` v1.39.0, SHA-256
+   `8183bed4…001e10`, checked before anything is unpacked) into
+   `%LOCALAPPDATA%\fnm`. An elevated session is refused.
+2. `FNM_DIR`, a user variable: an existing one, else a root that already holds
+   versions, else `%LOCALAPPDATA%\fnm` (machine-local, never roamed).
+3. The newest release in the major as the fnm default, carrying every global
+   the current npm lists (on the first run the MSI's `%APPDATA%\npm`: npm,
+   `@bitkyc08/opencodex` and the rest) at its exact version, through the same
+   staging and flip as the sealed switch. A default already in the major is
+   left alone; a linked or `file:` global refuses, naming it.
+4. `<FNM_DIR>\aliases\default` first on the user `Path` (read raw, so `%VAR%`
+   entries and the value kind survive).
+
+The MSI and `%APPDATA%\npm` stay (removing the MSI needs elevation). The
+collector then reports the MSI shadowed and unmanaged, `seal-plan` refuses
+any `winget:OpenJS.NodeJS` upgrade (`hold: Node.js (winget OpenJS.NodeJS) is
+shadowed by fnm …`), and `runtimes.node` converges through `fnm:node`. A
+service a global installed before the migration (opencodex's scheduled task)
+still runs on the MSI's Node until its own repair runs (`ocx service`).
+
+**Without fnm** (a host not yet migrated), the earlier rules stand: the MSI
+installs machine-wide, a machine-scope upgrade needs elevation, unattended
+runs never attempt it, and `seal-plan` refuses an ordinary-lane
 `winget:OpenJS.NodeJS` upgrade unless the record shows `install_scope:
 "user"`, with `hold: Node.js (winget OpenJS.NodeJS) is installed machine-wide
-and needs elevation`. The elevation path the repository already supports is
-the protected `winget.upgrade-machine-package.v1` semantic action, which runs
-as LocalSystem through the enrolled broker within the channel its policy token
-enrolls; where readiness advertises it, that is the lane. Otherwise the answer
-is the hold, never a UAC prompt.
+and needs elevation`. The protected `winget.upgrade-machine-package.v1`
+semantic action, where readiness advertises it, is the only elevated lane;
+otherwise the answer is the hold, never a UAC prompt.
 
 ### 7.8 Known limits
+
+**PATH precedence on Windows.** Windows builds a new process's PATH as the
+machine `Path` followed by the user's, so the MSI's `C:\Program Files\nodejs\`
+(machine PATH) still answers a bare `node`, `npm` or `npx` in a new session
+after the bootstrap. Global bins resolve to the fnm default (its alias is
+first on the user PATH, ahead of `%APPDATA%\npm`, and every npm shim runs the
+`node.exe` beside it), and Roundhouse resolves npm and node through the fnm
+root itself, never PATH. Removing the MSI, or prepending the alias in a shell
+profile, is the operator's own step; the bootstrap reports which `node.exe`
+a new session finds.
+
+**Windows hooks and daemons.** A hook runs through the executor's captured
+native call, like a package updater. `ocx service` registers a scheduled
+task, whose process is not the hook's child; a hook that started a daemon of
+its own could hold the worker's output open, as on POSIX before the hook log.
 
 **Install source.** `globals_unpinnable` is only as good as what npm reports. npm 12 reports no
 install source for globals: `npm ls --global --json` (with or without
@@ -647,7 +761,8 @@ its local hooks. Sealing on the target itself works too.
 
 ### 7.9 Deferred
 
-- **Windows pin reconciliation.** The collector reports the gating pin; nothing
+- **Windows pin reconciliation** (hosts without fnm only; on a migrated host
+  the MSI is unmanaged). The collector reports the gating pin; nothing
   yet sets `winget pin add --id OpenJS.NodeJS --version <major>.*` from
   `runtimes.node`, and nothing compares the two. That needs a sealed
   native-Windows pin operation and belongs with the WSL sibling's view of the

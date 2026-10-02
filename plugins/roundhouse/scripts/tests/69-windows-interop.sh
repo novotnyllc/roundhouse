@@ -420,5 +420,161 @@ JSON
   ' "$tmp/interop-chezmoi-result.jsonl" >/dev/null ||
     fail "the chezmoi drift record did not carry the apply output and remaining status"
   interop_stage_clean apply-chezmoi-drift
+
+  # The Node runtime switch over the interop lane. fnm in the "Windows"
+  # profile (the POSIX layout pwsh uses off Windows) owns the npm globals;
+  # the sealed fnm:node runs in apply-windows.ps1 with lib/node-runtime.sh's
+  # semantics: carried into the target prefix before the flip, the hook run
+  # under the new node, a failed hook restored and reported partial.
+  if [ -n "$fleet_fixture_yq" ]; then
+    ifn_root="$tmp/interop-fnm"
+    ifn_dir="$ifn_root/fnm"
+    mkdir -p "$ifn_root/bin" "$ifn_root/template/bin" "$ifn_root/store"
+    cat >"$ifn_root/template/bin/node" <<'SH'
+#!/usr/bin/env bash
+self=$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd -P)
+[ "${1:-}" != --version ] || basename -- "$(dirname -- "$(dirname -- "$self")")"
+SH
+    cat >"$ifn_root/template/bin/npm" <<'SH'
+#!/usr/bin/env bash
+set -eu
+prefix=$(dirname -- "$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd -P)")
+args=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --prefix) prefix=$(CDPATH='' cd -P -- "$2" && pwd -P); shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]}"
+state=$prefix/globals.json
+[ -f "$state" ] || printf '{}\n' >"$state"
+default=$(basename -- "$(dirname -- "$(CDPATH='' cd -P -- "$IFN_DIR/aliases/default" && pwd -P)")")
+printf 'npm %s default=%s\n' "$*" "$default" >>"$IFN_LOG"
+case "$1 ${2:-}" in
+  "prefix --global") printf '%s\n' "$prefix" ;;
+  "root --global") printf '%s/lib/node_modules\n' "$prefix" ;;
+  "ls --global") jq -c '{dependencies:with_entries(.value = {version:.value})}' "$state" ;;
+  "outdated --global") printf '{}\n' ;;
+  "uninstall --global")
+    shift 2
+    for name in "$@"; do
+      jq --arg n "$name" 'del(.[$n])' "$state" >"$state.next" && mv "$state.next" "$state"
+      rm -rf "${prefix:?}/lib/node_modules/$name"
+    done
+    ;;
+  "install --global")
+    shift 2
+    for spec in "$@"; do
+      case $spec in @*) name="@${spec#@}"; name="${name%@*}" ;; *) name="${spec%@*}" ;; esac
+      jq --arg n "$name" --arg v "${spec##*@}" '.[$n] = $v' "$state" >"$state.next" && mv "$state.next" "$state"
+      mkdir -p "$prefix/lib/node_modules/$name" "$prefix/bin"
+      if [ "$name" = @example/svc ]; then
+        printf '{"name":"%s","bin":{"svc":"cli.js"}}\n' "$name" >"$prefix/lib/node_modules/$name/package.json"
+        cp "$IFN_HOOK" "$prefix/bin/svc"
+      else
+        printf '{"name":"%s"}\n' "$name" >"$prefix/lib/node_modules/$name/package.json"
+      fi
+    done
+    ;;
+  *) exit 64 ;;
+esac
+SH
+    cat >"$ifn_root/svc" <<'SH'
+#!/usr/bin/env bash
+printf 'bin svc %s node=%s\n' "$*" "$(node --version)" >>"$IFN_LOG"
+[ "${IFN_HOOK_FAIL:-0}" != 1 ]
+SH
+    cat >"$ifn_root/bin/fnm" <<'SH'
+#!/usr/bin/env bash
+set -eu
+printf 'fnm %s\n' "$*" >>"$IFN_LOG"
+case ${1:-} in
+  list-remote) printf '%s\n' 'v24.2.0   (Krypton)' v26.0.0 v26.10.0 ;;
+  install)
+    dest=$FNM_DIR/node-versions/$2/installation
+    if [ ! -d "$dest" ]; then
+      mkdir -p "$dest/lib/node_modules/npm"
+      cp -R "$IFN_TEMPLATE/bin" "$dest/bin"
+      printf '{"name":"npm","version":"11.0.0"}\n' >"$dest/lib/node_modules/npm/package.json"
+      printf '{"npm":"11.0.0"}\n' >"$dest/globals.json"
+    fi
+    ;;
+  default)
+    [ -d "$FNM_DIR/node-versions/$2/installation" ] || exit 1
+    mkdir -p "$FNM_DIR/aliases"
+    ln -sfn "$FNM_DIR/node-versions/$2/installation" "$FNM_DIR/aliases/default"
+    ;;
+  unalias) rm -f "$FNM_DIR/aliases/default" ;;
+  *) exit 64 ;;
+esac
+SH
+    chmod 755 "$ifn_root/template/bin/node" "$ifn_root/template/bin/npm" "$ifn_root/svc" "$ifn_root/bin/fnm"
+    printf '%s\n' 'packages:' '  svc: {npm: {name: "@example/svc", node_switch: [[svc, service]]}}' \
+      >"$ifn_root/store/definitions.yaml"
+    jq '.machines["test-windows"].package_managers = ["winget","npm"] |
+      .node_switch_hooks = {"npm:@example/svc":[["svc","service"]]}' "$interop_config" >"$ifn_root/config.json"
+    chmod 600 "$ifn_root/config.json"
+    ifn_env() {
+      env FNM_DIR="$ifn_dir" IFN_DIR="$ifn_dir" IFN_LOG="$ifn_root/calls.log" IFN_HOOK="$ifn_root/svc" \
+        IFN_TEMPLATE="$ifn_root/template" ROUNDHOUSE_FLEET_STORE="$ifn_root/store" \
+        ROUNDHOUSE_CONFIG="$ifn_root/config.json" \
+        PATH="$ifn_root/bin:$(dirname -- "$fleet_fixture_yq"):$PATH" "$@"
+    }
+    ifn_default() {
+      basename -- "$(dirname -- "$(CDPATH='' cd -P -- "$ifn_dir/aliases/default" && pwd -P)")"
+    }
+    ifn_marker="$INTEROP_WINDOWS_HOME/.local/state/roundhouse/node-switch-inflight.json"
+    ifn_env "$ifn_root/bin/fnm" install v26.0.0
+    ifn_env "$ifn_root/bin/fnm" default v26.0.0
+    ifn_env "$ifn_dir/aliases/default/bin/npm" install --global @example/svc@1.0.0 plain@2.0.0 npm@12.1.0
+    ifn_env "$interop_cli" collect --target test-windows --section packages \
+      --output "$tmp/ifn-snapshot.jsonl" || fail "the interop Node inventory did not complete"
+    [ "$(jq -c 'select(.kind == "package" and .id == "fnm:node") | .data |
+      [.installed_version,.candidate_version,.globals]' "$tmp/ifn-snapshot.jsonl")" = \
+      '["v26.0.0","v26.10.0",{"@example/svc":"1.0.0","npm":"12.1.0","plain":"2.0.0"}]' ] ||
+      fail "the native Windows collector did not report fnm:node over the interop lane"
+    jq -n '{domain:"updates",target:"test-windows",operations:[{type:"package-upgrade",kind:"package",
+      id:"fnm:node",candidate_version:"v26.10.0",argv:["fnm","default","v26.10.0"],
+      carry:[{name:"@example/svc",version:"1.0.0"},{name:"plain",version:"2.0.0"}],
+      hooks:[{package:"npm:@example/svc",argv:["svc","service"]}],
+      required:[{package:"npm:@example/svc",argv:["svc","service"]}]}]}' >"$tmp/ifn-draft.json"
+    ifn_env "$interop_cli" seal-plan "$tmp/ifn-draft.json" "$tmp/ifn-snapshot.jsonl" "$tmp/ifn-plan.json" ||
+      fail "a Windows Node switch did not seal over the interop lane"
+    t_next_second
+    # A failed hook: the old default is restored and verified, nothing stays
+    # recorded in flight, and the apply is partial.
+    if ifn_env IFN_HOOK_FAIL=1 "$interop_cli" apply-interop-plan "$tmp/ifn-plan.json" \
+      "$(jq -r '.plan_id' "$tmp/ifn-plan.json")" "$tmp/ifn-failed.jsonl" 2>"$tmp/ifn-failed.err"; then
+      fail "a Windows Node switch whose hook failed was reported complete"
+    else
+      interop_rc=$?
+    fi
+    [ "$interop_rc" -eq 70 ] && [ "$(ifn_default)" = v26.0.0 ] && [ ! -e "$ifn_marker" ] ||
+      fail "a failed Windows Node switch did not restore the old default (exit $interop_rc)"
+    assert_contains "$(cat "$tmp/ifn-failed.err")" 'fnm default restored to v26.0.0'
+    interop_stage_clean apply-node-hook-failure
+    # v26.10.0 stays installed, which the record binds: re-collect and reseal.
+    ifn_env "$interop_cli" collect --target test-windows --section packages \
+      --output "$tmp/ifn-snapshot-2.jsonl" || fail "the second interop Node inventory did not complete"
+    ifn_env "$interop_cli" seal-plan "$tmp/ifn-draft.json" "$tmp/ifn-snapshot-2.jsonl" "$tmp/ifn-plan-2.json" ||
+      fail "the Windows Node switch did not reseal"
+    t_next_second
+    : >"$ifn_root/calls.log"
+    ifn_env "$interop_cli" apply-interop-plan "$tmp/ifn-plan-2.json" "$(jq -r '.plan_id' "$tmp/ifn-plan-2.json")" \
+      "$tmp/ifn-apply.jsonl" || fail "the sealed Windows Node switch did not complete over the interop lane"
+    [ "$(ifn_default)" = v26.10.0 ] && [ ! -e "$ifn_marker" ] &&
+      [ "$(jq -c . "$ifn_dir/node-versions/v26.10.0/installation/globals.json")" = \
+        '{"npm":"12.1.0","@example/svc":"1.0.0","plain":"2.0.0"}' ] ||
+      fail "the Windows Node switch did not carry every global into the new default"
+    ! grep '^npm install' "$ifn_root/calls.log" | grep -qv 'default=v26.0.0' ||
+      fail "the Windows Node switch installed into the target after the flip"
+    grep -Fqx 'bin svc service node=v26.10.0' "$ifn_root/calls.log" ||
+      fail "the Windows Node switch did not run its hook under the new node"
+    [ "$(jq -c 'select(.kind == "package" and .id == "fnm:node") | [.data.installed_version,.data.globals]' \
+      "$tmp/ifn-apply.jsonl")" = '["v26.10.0",{"@example/svc":"1.0.0","npm":"12.1.0","plain":"2.0.0"}]' ] ||
+      fail "the Windows Node switch post-inventory did not show the carried globals under the new default"
+    interop_stage_clean apply-node-switch
+  fi
   unset WINGET_STATE_FILE INTEROP_WINDOWS_HOME ROUNDHOUSE_INTEROP_ROOT ROUNDHOUSE_INTEROP_PWSH
 fi

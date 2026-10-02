@@ -635,10 +635,9 @@ worker_config_command() (
       ),
       package_updaters:(if ($domain == "updates" or $domain == "inventory") then
         (.package_updaters // {}) else {} end),
-      # POSIX only: Windows Node comes from winget and its globals survive an
-      # upgrade, so there is nothing to carry and no hook to run.
-      node_switch_hooks:(if ($domain == "updates" or $domain == "inventory") and
-        .machines[$target].platform != "windows" then
+      # Every platform: fnm is the Node runtime source on native Windows too,
+      # and its switch runs the same configured hooks (apply-windows.ps1).
+      node_switch_hooks:(if ($domain == "updates" or $domain == "inventory") then
         (.node_switch_hooks // {}) else {} end),
       capabilities:(if ($domain == "agents" or $domain == "inventory") then (.capabilities // {}) else {} end),
       skill_roots:(if ($domain == "agents" or $domain == "inventory") then (.skill_roots // []) else [] end),

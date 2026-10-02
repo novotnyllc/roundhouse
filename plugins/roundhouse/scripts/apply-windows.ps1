@@ -19,6 +19,9 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = "ApproveHooks")]
     [ValidatePattern("^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$")]
     [string]$ApproveCodexPluginHooks,
+    [Parameter(Mandatory = $true, ParameterSetName = "BootstrapNodeFnm")][switch]$BootstrapNodeFnm,
+    [Parameter(Mandatory = $true, ParameterSetName = "BootstrapNodeFnm")]
+    [ValidateRange(1, 999)][int]$NodeMajor,
     [Parameter(Mandatory = $true, ParameterSetName = "SelfTest")][switch]$SelfTest
 )
 
@@ -426,7 +429,10 @@ function Assert-Plan([object]$Plan, [string]$WorkerConfigDigest) {
     if ($Operations.Count -eq 0 -or $Operations.Count -gt 128) { throw "Invalid plan operations" }
     foreach ($Operation in $Operations) {
         $HasTargets = $null -ne $Operation.PSObject.Properties["targets"]
-        $ExpectedOperationProperties = if ([string]$Operation.type -eq "package-upgrade") {
+        $IsNodeSwitch = [string]$Operation.type -eq "package-upgrade" -and [string]$Operation.id -ceq "fnm:node"
+        $ExpectedOperationProperties = if ($IsNodeSwitch) {
+            @("argv", "candidate_version", "carry", "hooks", "id", "kind", "required", "type")
+        } elseif ([string]$Operation.type -eq "package-upgrade") {
             @("argv", "candidate_version", "id", "kind", "type")
         } elseif ([string]$Operation.type -eq "chezmoi-apply" -and $HasTargets) {
             @("argv", "id", "kind", "targets", "type")
@@ -452,10 +458,19 @@ function Assert-Plan([object]$Plan, [string]$WorkerConfigDigest) {
             default { $false }
         }
         if (-not $Valid) { throw "Unsupported Windows operation" }
+        if ($IsNodeSwitch) { Assert-NodeSwitchOperationShape $Operation }
         if ($HasTargets -and [string]$Operation.type -ne "chezmoi-apply") {
             throw "Only chezmoi apply may declare targets"
         }
         if ($HasTargets) { [void](Get-ChezmoiTargets $Operation) }
+    }
+    # At most one Node switch, before every npm upgrade in the plan: an npm
+    # upgrade first would change a version the sealed carry names.
+    $Ids = @($Operations | ForEach-Object { [string]$_.id })
+    $SwitchIndex = [Array]::IndexOf([string[]]$Ids, "fnm:node")
+    if (@($Ids | Where-Object { $_ -ceq "fnm:node" }).Count -gt 1 -or
+        ($SwitchIndex -gt 0 -and @($Ids[0..($SwitchIndex - 1)] | Where-Object { $_ -like "npm:*" }).Count -gt 0)) {
+        throw "A plan may contain one Node switch, before every npm upgrade"
     }
 
     $PlanCopy = $Plan | ConvertTo-Json -Compress -Depth 100 | ConvertFrom-Json
@@ -701,6 +716,17 @@ function Get-ExactArgv([object]$Operation, [object]$Config, [object]$Machine) {
     $Id = [string]$Operation.id
     switch ([string]$Operation.type) {
         "package-upgrade" {
+            if ($Id -ceq "fnm:node") {
+                # The Node runtime switch: one fixed marker argv, and exactly
+                # the hooks this worker's configuration declares for the
+                # carried packages, in carry order.
+                Assert-NodeSwitchOperationShape $Operation
+                $Configured = Get-ConfigNodeSwitchHooks $Config @($Operation.carry)
+                if ((ConvertTo-CanonicalJson @($Operation.hooks)) -cne (ConvertTo-CanonicalJson @($Configured))) {
+                    throw "Node switch hooks differ from the configured node_switch_hooks"
+                }
+                return @("fnm", "default", [string]$Operation.candidate_version)
+            }
             if ($Id -cmatch "^npm:(?<name>(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*)$") {
                 # Two shapes only: the exact-version global install, or the
                 # updater the configuration declares for this package.
@@ -772,11 +798,11 @@ function Test-NpmUpdaterOperation([object]$Operation) {
 
 function Get-NpmUpdaterPath([string]$Name, [string]$Bin) {
     # A declared updater runs only as a bin the installed package itself
-    # declares, from the global prefix npm reports, never by PATH lookup.
-    $Npm = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $Npm -or [string]$Npm.Source -match 'fnm_multishells') { throw "Required command is unavailable: npm" }
-    $Root = ((@(& $Npm.Source root --global 2>$null) | ForEach-Object { [string]$_ }) -join "`n").Trim()
-    $Prefix = ((@(& $Npm.Source prefix --global 2>$null) | ForEach-Object { [string]$_ }) -join "`n").Trim()
+    # declares, from the global prefix the durable npm reports, never by PATH
+    # lookup.
+    $Npm = Get-DurableNpmPath
+    $Root = ((@(& $Npm root --global 2>$null) | ForEach-Object { [string]$_ }) -join "`n").Trim()
+    $Prefix = ((@(& $Npm prefix --global 2>$null) | ForEach-Object { [string]$_ }) -join "`n").Trim()
     if ([string]::IsNullOrWhiteSpace($Root) -or [string]::IsNullOrWhiteSpace($Prefix)) {
         throw "npm global prefix is unavailable"
     }
@@ -807,9 +833,8 @@ function Assert-NpmRegistryCandidate([string]$Npm, [string]$Name, [string]$Candi
 }
 
 function Get-SelectedNpm {
-    $Npm = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $Npm -or [string]$Npm.Source -match 'fnm_multishells') { throw "Required command is unavailable: npm" }
-    return [string]$Npm.Source
+    # The durable npm (Get-DurableNpmPath): the fnm default's, else PATH's.
+    return Get-DurableNpmPath
 }
 
 function Invoke-WithNpmOnPath([string]$NpmSource, [scriptblock]$Body) {
@@ -1181,7 +1206,7 @@ function Assert-ResultPath {
     }
 }
 
-function Assert-Postcondition([object]$Operation, [object[]]$Before, [object[]]$After) {
+function Assert-Postcondition([object]$Operation, [object[]]$Before, [object[]]$After, [object[]]$Operations = @()) {
     $BeforeRecord = @(Get-Record $Before ([string]$Operation.kind) ([string]$Operation.id))
     $AfterRecord = @(Get-Record $After ([string]$Operation.kind) ([string]$Operation.id))
     if ($Operation.type -eq "agent-update" -and [string]$Operation.id -match
@@ -1202,6 +1227,9 @@ function Assert-Postcondition([object]$Operation, [object[]]$Before, [object[]]$
         "package-upgrade" {
             if ($AfterRecord[0].data.installed_version -ne [string]$Operation.candidate_version) {
                 throw "Package did not reach the sealed candidate version"
+            }
+            if ([string]$Operation.id -ceq "fnm:node") {
+                Assert-NodeSwitchPostcondition $Operation $AfterRecord[0] $Operations
             }
         }
         "agent-update" {
@@ -1372,6 +1400,1206 @@ function New-ApplySummaryRecord(
                 message = [string]$Failure.message
             }
         })
+    }
+}
+
+# --- The Node runtime on Windows: fnm (lib/node-runtime.sh's Windows arm) ------
+#
+# fnm is the Node runtime source on native Windows, as on POSIX
+# (docs/specs/2026-09-28-npm-global-manager.md §7.7). It keeps one prefix per
+# Node version, `<FNM_DIR>\node-versions\vX\installation`, which is also that
+# version's npm global prefix, and a `default` alias that is a junction to one
+# of them. A switch therefore starts with an EMPTY global set and carries
+# every global explicitly, exactly as on POSIX, and runs in the user's own
+# session: fnm installs per user, so nothing here is ever elevated.
+#
+# The sealed `fnm:node` operation runs three phases with POSIX's guarantees.
+# PREFLIGHT mutates nothing. STAGING installs the target and makes its prefix
+# exactly the carry while the old default stays live. The FLIP records the
+# switch in flight, moves the default, verifies it, runs the hooks, verifies
+# it again, and only then clears the record; any failure after the flip
+# restores the old default (verified) or leaves the record for recovery.
+#
+# The discovery helpers repeat collect-windows.ps1's (the executor and the
+# collector are separate scripts, as with the npm helpers above).
+$script:FnmOnWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+# The pinned official release the bootstrap falls back to when winget cannot
+# install fnm in this session: verified by SHA-256 before anything is unpacked.
+$FnmPinnedRelease = "v1.39.0"
+$FnmPinnedWindowsZipSha256 = "8183bed4348cb78fdfd8abb3d1247fbeab7b2082f941363929c61e747c001e10"
+# One fixed path under the profile in every lane (interop, the Codex control
+# lane, the bootstrap), never under an XDG variable. The self-test points it
+# at its fixture.
+$script:NodeSwitchStateDir = Join-Path (Join-Path (Join-Path $HOME ".local") "state") "roundhouse"
+
+function Get-FnmBinDir([string]$Installation) {
+    if ($script:FnmOnWindows) { return $Installation }
+    return Join-Path $Installation "bin"
+}
+
+function Get-FnmToolPath([string]$BinDir, [string]$Tool) {
+    $Name = if (-not $script:FnmOnWindows) { $Tool } elseif ($Tool -ceq "node") { "node.exe" } else { "$Tool.cmd" }
+    return Join-Path $BinDir $Name
+}
+
+function Get-FnmNpmRoot([string]$Prefix) {
+    # npm's global node_modules under a prefix.
+    if ($script:FnmOnWindows) { return Join-Path $Prefix "node_modules" }
+    return Join-Path (Join-Path $Prefix "lib") "node_modules"
+}
+
+function Get-FnmPrefixBinPath([string]$Prefix, [string]$Bin) {
+    # The shim npm writes for a global bin under a prefix.
+    if ($script:FnmOnWindows) { return Join-Path $Prefix "$Bin.cmd" }
+    return Join-Path (Join-Path $Prefix "bin") $Bin
+}
+
+function Get-FnmInstallation([string]$Root, [string]$Version) {
+    return Join-Path (Join-Path (Join-Path $Root "node-versions") $Version) "installation"
+}
+
+function Get-FnmRootCandidates {
+    $UserFnmDir = if ($script:FnmOnWindows) { [Environment]::GetEnvironmentVariable("FNM_DIR", "User") } else { $null }
+    $AppData = if ($env:APPDATA) { Join-Path $env:APPDATA "fnm" } else { $null }
+    $LocalAppData = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "fnm" } else { $null }
+    $Seen = @{}
+    $Roots = New-Object System.Collections.Generic.List[string]
+    foreach ($Candidate in @($env:FNM_DIR, $UserFnmDir, $AppData, $LocalAppData)) {
+        if ([string]::IsNullOrWhiteSpace($Candidate)) { continue }
+        $Key = ([string]$Candidate).TrimEnd('\', '/').ToLowerInvariant()
+        if ($Seen.ContainsKey($Key)) { continue }
+        $Seen[$Key] = $true
+        $Roots.Add([string]$Candidate)
+    }
+    return @($Roots)
+}
+
+function Test-FnmDurableBin([string]$BinDir) {
+    if ([string]::IsNullOrWhiteSpace($BinDir) -or $BinDir -match 'fnm_multishells') { return $false }
+    return (Test-Path -LiteralPath (Get-FnmToolPath $BinDir "npm") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Get-FnmToolPath $BinDir "node") -PathType Leaf)
+}
+
+function Get-FnmAliasBinDir([string]$Root) {
+    return Get-FnmBinDir (Join-Path (Join-Path $Root "aliases") "default")
+}
+
+function Get-FnmRoot {
+    foreach ($Root in @(Get-FnmRootCandidates)) {
+        if (Test-FnmDurableBin (Get-FnmAliasBinDir $Root)) { return $Root }
+    }
+    return $null
+}
+
+function Test-NodeVersionText([object]$Value) {
+    return $Value -is [string] -and $Value -cmatch '^v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,6}$'
+}
+
+function Get-NodeVersionMajor([string]$Version) {
+    return [int](($Version.TrimStart('v') -split '\.')[0])
+}
+
+function Get-FnmDefaultVersion([string]$Root) {
+    $Alias = Join-Path (Join-Path $Root "aliases") "default"
+    try { $Item = Get-Item -LiteralPath $Alias -Force -ErrorAction Stop } catch { return $null }
+    if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { return $null }
+    $Target = [string]@($Item.Target)[0]
+    if ([string]::IsNullOrWhiteSpace($Target)) { return $null }
+    $Target = ($Target -replace '^\\\\\?\\', '' -replace '^\\\?\?\\', '').TrimEnd('\', '/')
+    if (-not [IO.Path]::IsPathRooted($Target)) { $Target = Join-Path (Split-Path -Parent $Alias) $Target }
+    $VersionDir = Split-Path -Parent $Target
+    $Version = Split-Path -Leaf $VersionDir
+    if ((Split-Path -Leaf $Target) -cne "installation" -or -not (Test-NodeVersionText $Version) -or
+        (Split-Path -Leaf (Split-Path -Parent $VersionDir)) -cne "node-versions") {
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath (Get-FnmToolPath (Get-FnmBinDir (Get-FnmInstallation $Root $Version)) "node") -PathType Leaf)) {
+        return $null
+    }
+    return $Version
+}
+
+function Test-NodeReleaseNewer([string]$A, [string]$B) {
+    $Pattern = '^v?([0-9]{1,6})\.([0-9]{1,6})\.([0-9]{1,6})$'
+    if ($A -cnotmatch $Pattern) { return $false }
+    $Left = [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+    if ($B -cnotmatch $Pattern) { return $false }
+    $Right = [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+    return $Left -gt $Right
+}
+
+function Select-FnmRemoteLatest([string[]]$Lines, [int]$Major) {
+    $Best = $null
+    foreach ($Line in @($Lines)) {
+        $First = @(([string]$Line).Trim() -split '\s+')[0]
+        if (-not (Test-NodeVersionText $First) -or (Get-NodeVersionMajor $First) -ne $Major) { continue }
+        if ($null -eq $Best -or (Test-NodeReleaseNewer $First $Best)) { $Best = $First }
+    }
+    return $Best
+}
+
+function Get-FnmCommandPath {
+    $OnPath = @(Get-Command fnm -CommandType Application -ErrorAction SilentlyContinue |
+        Where-Object { [string]$_.Source -notmatch 'fnm_multishells' }) | Select-Object -First 1
+    if ($null -ne $OnPath) { return [string]$OnPath.Source }
+    if (-not $script:FnmOnWindows) { return $null }
+    $Fixed = New-Object System.Collections.Generic.List[string]
+    if ($env:LOCALAPPDATA) {
+        $Fixed.Add((Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\fnm.exe"))
+        $Fixed.Add((Join-Path $env:LOCALAPPDATA "fnm\fnm.exe"))
+    }
+    foreach ($Root in @(Get-FnmRootCandidates)) { $Fixed.Add((Join-Path $Root "fnm.exe")) }
+    foreach ($Path in $Fixed) {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) { return $Path }
+    }
+    return $null
+}
+
+function Get-DurableNpmPath {
+    # lib/npm.sh's order: fnm's `default` alias first, then PATH (the winget
+    # MSI's npm while fnm has no default). Never an fnm per-shell path.
+    $Root = Get-FnmRoot
+    if ($null -ne $Root) { return Get-FnmToolPath (Get-FnmAliasBinDir $Root) "npm" }
+    $Npm = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $Npm -or [string]$Npm.Source -match 'fnm_multishells') { throw "Required command is unavailable: npm" }
+    return [string]$Npm.Source
+}
+
+function Get-NodeTargetBundled([string]$Target) {
+    # What a Node release ships itself: npm always, corepack on 24 and older.
+    if ((Get-NodeVersionMajor $Target) -lt 25) { return @("npm", "corepack") }
+    return @("npm")
+}
+
+function Test-NpmNameText([object]$Value) {
+    return $Value -is [string] -and $Value.Length -le 214 -and
+        $Value -cmatch '^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$'
+}
+
+function Test-NpmVersionText([object]$Value) {
+    return $Value -is [string] -and $Value.Length -le 128 -and $Value -cmatch '^[0-9A-Za-z][0-9A-Za-z.+-]*$'
+}
+
+function Test-NpmArgv([object]$Value) {
+    # lib/npm.sh's npm_argv_ok: a bin the package installs, then at most seven
+    # literal arguments.
+    if ($Value -isnot [array]) { return $false }
+    $Items = @($Value)
+    if ($Items.Count -lt 1 -or $Items.Count -gt 8 -or @($Items | Where-Object { $_ -isnot [string] }).Count -gt 0) { return $false }
+    if ([string]$Items[0] -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { return $false }
+    foreach ($Item in @($Items | Select-Object -Skip 1)) {
+        if ($Item.Length -gt 128 -or $Item -cnotmatch '^[A-Za-z0-9@=:,._/+-]+$') { return $false }
+    }
+    return $true
+}
+
+function Test-NodeHookList([object]$Value) {
+    if ($Value -isnot [array] -or @($Value).Count -gt 64) { return $false }
+    foreach ($Hook in @($Value)) {
+        if (-not (Test-ExactProperties $Hook @("argv", "package")) -or $Hook.package -isnot [string] -or
+            -not ([string]$Hook.package).StartsWith("npm:", [StringComparison]::Ordinal) -or
+            -not (Test-NpmNameText ([string]$Hook.package).Substring(4)) -or -not (Test-NpmArgv $Hook.argv)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Assert-NodeSwitchOperationShape([object]$Operation) {
+    # node_switch_operations_valid: the fixed marker argv, and `carry`,
+    # `hooks` and `required` in the npm grammar.
+    $Candidate = [string]$Operation.candidate_version
+    if (-not (Test-NodeVersionText $Operation.candidate_version) -or
+        (ConvertTo-CanonicalJson @($Operation.argv)) -cne (ConvertTo-CanonicalJson @("fnm", "default", $Candidate))) {
+        throw "Invalid Node runtime switch"
+    }
+    $Carry = $Operation.carry
+    if ($Carry -isnot [array] -or @($Carry).Count -gt 256) { throw "Invalid Node switch carry list" }
+    $Names = @{}
+    foreach ($Item in @($Carry)) {
+        if (-not (Test-ExactProperties $Item @("name", "version")) -or -not (Test-NpmNameText $Item.name) -or
+            -not (Test-NpmVersionText $Item.version) -or $Names.ContainsKey("n:" + [string]$Item.name)) {
+            throw "Invalid Node switch carry list"
+        }
+        $Names["n:" + [string]$Item.name] = $true
+    }
+    if (-not (Test-NodeHookList $Operation.hooks) -or -not (Test-NodeHookList $Operation.required)) {
+        throw "Invalid Node switch hook list"
+    }
+}
+
+function Get-ConfigNodeSwitchHooks([object]$Config, [object[]]$Carry) {
+    # What this worker configuration declares for the carried packages, in
+    # carry order: the hooks a switch runs.
+    $Hooks = New-Object System.Collections.Generic.List[object]
+    foreach ($Item in @($Carry)) {
+        $Key = "npm:" + [string]$Item.name
+        $Declared = $null
+        if ($null -ne $Config -and $null -ne $Config.node_switch_hooks) {
+            $Declared = $Config.node_switch_hooks.PSObject.Properties |
+                Where-Object { $_.Name -ceq $Key } | Select-Object -First 1
+        }
+        if ($null -eq $Declared) { continue }
+        foreach ($Argv in @($Declared.Value)) {
+            $Hook = [ordered]@{ package = $Key; argv = [string[]]@($Argv) }
+            $Hooks.Add($Hook)
+        }
+    }
+    # ToArray, not @(): PowerShell 7.6 cannot wrap a List of dictionaries.
+    return , $Hooks.ToArray()
+}
+
+function Get-NodeSwitchExpected([object]$Record, [string]$Target, [object]$Config) {
+    # node_switch_plan over the fresh snapshot, without definitions (`required`
+    # is bound by the plan digest): the carry is every global installed under
+    # the current default at its exact version, less what TARGET ships itself;
+    # an unknown or unpinnable global, or a switch in flight, holds.
+    $Bundled = Get-NodeTargetBundled $Target
+    $Data = $Record.data
+    $UnpinnableProperty = $Data.PSObject.Properties["globals_unpinnable"]
+    $DetailKnown = $null -ne $UnpinnableProperty -and $UnpinnableProperty.Value -is [array]
+    $Unpinnable = if ($DetailKnown) { @($UnpinnableProperty.Value | ForEach-Object { [string]$_ }) } else { @() }
+    $Names = @()
+    if ($null -ne $Data.globals) { $Names = @($Data.globals.PSObject.Properties.Name) }
+    [Array]::Sort($Names, [StringComparer]::Ordinal)
+    $Carry = New-Object System.Collections.Generic.List[object]
+    foreach ($Name in $Names) {
+        if ($Bundled -ccontains $Name -or $Unpinnable -ccontains $Name) { continue }
+        $Item = [ordered]@{ name = $Name; version = [string]$Data.globals.$Name }
+        $Carry.Add($Item)
+    }
+    $Stranded = @($Unpinnable | Where-Object { $Bundled -cnotcontains $_ } | Sort-Object -Unique)
+    $Inflight = $Data.PSObject.Properties["switch_inflight"]
+    $Held = if (-not $DetailKnown) {
+        "which npm globals cannot be reinstalled by exact registry version is unknown (the global inventory detail is unavailable)"
+    } elseif ($Stranded.Count -gt 0) {
+        "npm globals $($Stranded -join ' ') cannot be reinstalled by exact registry version (file:, link:, git or no version); a switch would strand them"
+    } elseif ($null -ne $Inflight -and $null -ne $Inflight.Value) {
+        "an interrupted Node switch is pending recovery on this host"
+    } else { $null }
+    $CarryItems = $Carry.ToArray()
+    return @{ Carry = $CarryItems; Hooks = (Get-ConfigNodeSwitchHooks $Config $CarryItems); Held = $Held }
+}
+
+function Assert-NodeSwitchMatchesSnapshot([object]$Operation, [object]$Record, [object]$Config) {
+    # node_switch_verify_snapshot: the carry rule over the fresh snapshot must
+    # hold nothing and give exactly the sealed carry and hooks, and every
+    # sealed `required` hook must be among the hooks.
+    if ($Record.status -ne "present" -or $null -eq $Record.data.globals -or
+        -not (Test-NodeVersionText $Record.data.installed_version)) {
+        throw "the snapshot does not record the npm globals under the current Node default"
+    }
+    $Expected = Get-NodeSwitchExpected $Record ([string]$Operation.candidate_version) $Config
+    if ($null -ne $Expected.Held) { throw "Node switch held: $($Expected.Held)" }
+    if ((ConvertTo-CanonicalJson @($Operation.carry)) -cne (ConvertTo-CanonicalJson @($Expected.Carry)) -or
+        (ConvertTo-CanonicalJson @($Operation.hooks)) -cne (ConvertTo-CanonicalJson @($Expected.Hooks))) {
+        throw "the Node switch carry or hooks no longer match the installed npm globals; create a new plan"
+    }
+    $HookTexts = @(@($Operation.hooks) | ForEach-Object { ConvertTo-CanonicalJson $_ })
+    foreach ($Required in @($Operation.required)) {
+        if ($HookTexts -cnotcontains (ConvertTo-CanonicalJson $Required)) {
+            throw "a required post-switch hook is not among the configured hooks"
+        }
+    }
+}
+
+function Assert-NodeSwitchPostcondition([object]$Operation, [object]$AfterRecord, [object[]]$Operations) {
+    # The NEW default holds exactly the carry (plus what the release bundles,
+    # and nothing left over from an earlier use), each at its carried version
+    # or at the candidate of a later npm upgrade of it in this same plan.
+    $Bundled = Get-NodeTargetBundled ([string]$Operation.candidate_version)
+    $Data = $AfterRecord.data
+    $Unpinnable = $Data.PSObject.Properties["globals_unpinnable"]
+    if ($null -eq $Data.globals -or $null -eq $Unpinnable -or $Unpinnable.Value -isnot [array] -or
+        $null -ne $Data.switch_inflight) {
+        throw "Node switch post-state is not a verified default with a known global set"
+    }
+    $Names = @($Data.globals.PSObject.Properties.Name | Where-Object { $Bundled -cnotcontains $_ })
+    $Carried = @(@($Operation.carry) | ForEach-Object { [string]$_.name })
+    [Array]::Sort($Names, [StringComparer]::Ordinal)
+    [Array]::Sort($Carried, [StringComparer]::Ordinal)
+    if (($Names -join "`0") -cne ($Carried -join "`0") -or
+        @($Unpinnable.Value | Where-Object { $Bundled -cnotcontains $_ }).Count -gt 0) {
+        throw "the npm globals under the new Node default are not exactly the carry"
+    }
+    foreach ($Item in @($Operation.carry)) {
+        $Expected = [string]$Item.version
+        foreach ($Later in @($Operations)) {
+            if ($Later.type -eq "package-upgrade" -and [string]$Later.id -ceq ("npm:" + [string]$Item.name)) {
+                $Expected = [string]$Later.candidate_version
+            }
+        }
+        if ([string]$Data.globals.($Item.name) -cne $Expected) {
+            throw "a carried npm global is not at its carried version under the new Node default"
+        }
+    }
+}
+
+# The commands a switch runs, as replaceable operations: the real ones below,
+# and in-memory fakes in the self-test, so the phases are proven without fnm.
+$script:NodeOps = @{
+    Fnm = {
+        param([string]$Root, [string[]]$Arguments)
+        $Fnm = Get-FnmCommandPath
+        if ($null -eq $Fnm) { throw "fnm is not installed" }
+        $Saved = $env:FNM_DIR
+        try {
+            $env:FNM_DIR = $Root
+            $Code = Invoke-Captured $Fnm $Arguments
+            return $(if ($null -eq $Code) { 0 } else { [int]$Code })
+        } finally { $env:FNM_DIR = $Saved }
+    }
+    FnmLines = {
+        param([string]$Root, [string[]]$Arguments)
+        $Fnm = Get-FnmCommandPath
+        if ($null -eq $Fnm) { throw "fnm is not installed" }
+        $Saved = $env:FNM_DIR
+        try {
+            $env:FNM_DIR = $Root
+            $Lines = @(& $Fnm @Arguments 2>$null)
+            if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { return $null }
+            return , [string[]]@($Lines | ForEach-Object { [string]$_ })
+        } finally { $env:FNM_DIR = $Saved }
+    }
+    Npm = {
+        # The npm at NPMPATH under the node beside it, against PREFIX when
+        # given (so no `prefix=` in an npmrc redirects it), quiet.
+        param([string]$NpmPath, [string]$Prefix, [string[]]$Arguments)
+        $All = New-Object System.Collections.Generic.List[string]
+        if (-not [string]::IsNullOrEmpty($Prefix)) { $All.Add("--prefix"); $All.Add($Prefix) }
+        foreach ($Argument in $Arguments) { $All.Add($Argument) }
+        $Names = @("PATH", "NO_UPDATE_NOTIFIER", "npm_config_update_notifier", "npm_config_fund", "npm_config_audit")
+        $Saved = @{}
+        foreach ($Name in $Names) { $Saved[$Name] = [Environment]::GetEnvironmentVariable($Name) }
+        try {
+            $env:PATH = (Split-Path -Parent $NpmPath) + [IO.Path]::PathSeparator + $Saved["PATH"]
+            $env:NO_UPDATE_NOTIFIER = "1"
+            $env:npm_config_update_notifier = "false"
+            $env:npm_config_fund = "false"
+            $env:npm_config_audit = "false"
+            if ($Arguments[0] -ceq "ls") {
+                $Lines = @(& $NpmPath @All 2>$null)
+                return @{ ExitCode = $LASTEXITCODE; Text = (($Lines | ForEach-Object { [string]$_ }) -join "`n") }
+            }
+            return @{ ExitCode = (Invoke-Captured $NpmPath ([string[]]@($All))); Text = "" }
+        } finally {
+            foreach ($Name in $Names) { [Environment]::SetEnvironmentVariable($Name, $Saved[$Name]) }
+        }
+    }
+    NodeVersion = {
+        param([string]$BinDir)
+        $Node = Get-FnmToolPath $BinDir "node"
+        if (-not (Test-Path -LiteralPath $Node -PathType Leaf)) { return $null }
+        return ((@(& $Node --version 2>$null) | Select-Object -First 1) -as [string])
+    }
+    Hook = {
+        # By absolute path, with the new node first on PATH.
+        param([string]$Path, [string[]]$Arguments, [string]$BinDir)
+        $Saved = $env:PATH
+        try {
+            $env:PATH = $BinDir + [IO.Path]::PathSeparator + $Saved
+            $Code = Invoke-Captured $Path $Arguments
+            return $(if ($null -eq $Code) { 0 } else { [int]$Code })
+        } finally { $env:PATH = $Saved }
+    }
+}
+
+function Get-NpmGlobalDetail([string]$NpmPath, [string]$Prefix) {
+    # One `npm ls`: {Globals (name -> version), Unpinnable}. Throws when the
+    # listing fails: an unknown global set is never an empty one.
+    $Result = & $script:NodeOps.Npm $NpmPath $Prefix @("ls", "--global", "--json", "--depth=0")
+    $List = $null
+    try { $List = [string]$Result.Text | ConvertFrom-Json -ErrorAction Stop } catch { $List = $null }
+    if ($null -eq $List -or $null -ne $List.PSObject.Properties["error"]) {
+        throw "the npm global inventory$(if ($Prefix) { " under $Prefix" }) failed"
+    }
+    $Globals = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $Unpinnable = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $List.dependencies) {
+        foreach ($Property in $List.dependencies.PSObject.Properties) {
+            $Name = [string]$Property.Name
+            $Value = $Property.Value
+            if ($null -eq $Value -or $Value -is [string] -or $Value -is [ValueType]) { continue }
+            $Version = if ($Value.version -is [string]) { [string]$Value.version } else { $null }
+            if ($null -ne $Version) { $Globals[$Name] = $Version }
+            $Resolved = if ($Value.resolved -is [string]) { [string]$Value.resolved } else { "" }
+            if (-not (Test-NpmVersionText $Version) -or -not (Test-NpmNameText $Name) -or
+                $Resolved -cmatch '^(file:|link:|git[+:]|github:|gitlab:|bitbucket:)' -or $Value.link -eq $true) {
+                $Unpinnable.Add($Name)
+            }
+        }
+    }
+    return @{ Globals = $Globals; Unpinnable = @($Unpinnable | Sort-Object -Unique) }
+}
+
+function Get-NodeHookPath([string]$Prefix, [string]$Name, [string]$Bin) {
+    # A hook runs only as a bin the installed package itself declares, found
+    # as npm's shim in that prefix; $null otherwise.
+    $Manifest = Join-Path (Join-Path (Get-FnmNpmRoot $Prefix) $Name) "package.json"
+    if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { return $null }
+    try { $Package = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+    $Bins = if ($Package.bin -is [string]) { @(($Name -split '/')[-1]) }
+        elseif ($null -ne $Package.bin) { @($Package.bin.PSObject.Properties.Name) } else { @() }
+    if ($Bins -cnotcontains $Bin) { return $null }
+    $Path = Get-FnmPrefixBinPath $Prefix $Bin
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    return $Path
+}
+
+function Get-NodeSwitchMarkerPath { return Join-Path $script:NodeSwitchStateDir "node-switch-inflight.json" }
+
+function Read-NodeSwitchMarker {
+    # The record, or $null when no switch is in flight. An unreadable record
+    # still reads as in flight, with nothing to restore to.
+    $Path = Get-NodeSwitchMarkerPath
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $Value = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($Value -is [Management.Automation.PSCustomObject]) { return $Value }
+    } catch { }
+    return [pscustomobject]@{ old = $null; target = $null; unreadable = $true }
+}
+
+function Write-NodeSwitchMarker([string]$Old, [string]$Target, [object[]]$Carry) {
+    [void][IO.Directory]::CreateDirectory($script:NodeSwitchStateDir)
+    $Path = Get-NodeSwitchMarkerPath
+    $Process = Get-Process -Id $PID
+    $Json = [ordered]@{
+        old = $Old
+        target = $Target
+        carry = @($Carry)
+        writer = [ordered]@{ pid = [string]$PID; start = $Process.StartTime.ToUniversalTime().ToString("o") }
+        at = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    } | ConvertTo-Json -Compress -Depth 6
+    [IO.File]::WriteAllText("$Path.$PID", $Json, [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath "$Path.$PID" -Destination $Path -Force
+}
+
+function Clear-NodeSwitchMarker {
+    Remove-Item -LiteralPath (Get-NodeSwitchMarkerPath) -Force -ErrorAction SilentlyContinue
+}
+
+function Enter-NodeSwitchLock {
+    # One lock covers a whole switch, a recovery and the bootstrap: a file held
+    # open exclusively, which the OS releases when the holder exits however it
+    # exits, so a killed switch never leaves a stale lock (the in-flight
+    # record, not the lock, says what needs rolling back).
+    [void][IO.Directory]::CreateDirectory($script:NodeSwitchStateDir)
+    $Path = Join-Path $script:NodeSwitchStateDir "node-switch.lock"
+    try {
+        return [IO.File]::Open($Path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch [IO.IOException] {
+        throw "another Node switch is in progress on this host; not switching"
+    }
+}
+
+function Test-NodeDefaultVerified([string]$Root, [string]$Version) {
+    # node_default_verified: the alias names VERSION, the durable npm resolves
+    # through this alias, and its node is VERSION.
+    if ((Get-FnmDefaultVersion $Root) -cne $Version) { return $false }
+    if ((Get-FnmRoot) -cne $Root) { return $false }
+    return ([string](& $script:NodeOps.NodeVersion (Get-FnmAliasBinDir $Root))).Trim() -ceq $Version
+}
+
+function Invoke-NodeSwitchCore {
+    # STAGING then the FLIP, shared by the sealed switch and the bootstrap.
+    # OLD is the fnm default being replaced, or empty when the bootstrap
+    # creates the first one (nothing to restore: the MSI stays the runtime).
+    param([string]$Root, [string]$Old, [string]$Target, [object[]]$Carry, [object[]]$Hooks, [string]$SourceNpmVersion)
+    $Kept = if ($Old) { "$Old stays the default" } else { "fnm still has no default" }
+    if ((& $script:NodeOps.Fnm $Root @("install", $Target)) -ne 0 -or
+        -not (Test-Path -LiteralPath (Get-FnmToolPath (Get-FnmBinDir (Get-FnmInstallation $Root $Target)) "node") -PathType Leaf)) {
+        throw "fnm install $Target failed; nothing switched ($Kept)"
+    }
+    $Prefix = Get-FnmInstallation $Root $Target
+    $TargetNpm = Get-FnmToolPath (Get-FnmBinDir $Prefix) "npm"
+    $Bundled = Get-NodeTargetBundled $Target
+    # The npm that installs the carry must not be older than the one the host
+    # runs now: npm 12 honours `allow-scripts` in ~/.npmrc, and an older
+    # bundled npm would run every dependency install script.
+    $TargetNpmVersion = $null
+    try {
+        $TargetNpmVersion = [string](Get-Content -LiteralPath (Join-Path (Join-Path (Get-FnmNpmRoot $Prefix) "npm") "package.json") `
+            -Raw -ErrorAction Stop | ConvertFrom-Json).version
+    } catch { $TargetNpmVersion = $null }
+    if (Test-NodeReleaseNewer $SourceNpmVersion $TargetNpmVersion) {
+        if ((& $script:NodeOps.Npm $TargetNpm $Prefix @("install", "--global", "npm@$SourceNpmVersion")).ExitCode -ne 0) {
+            throw "upgrading the npm of $Target to $SourceNpmVersion failed; nothing switched ($Kept)"
+        }
+    }
+    $Specs = [string[]]@(@($Carry) | ForEach-Object { "$($_.name)@$($_.version)" })
+    if ($Specs.Count -gt 0 -and (& $script:NodeOps.Npm $TargetNpm $Prefix (@("install", "--global") + $Specs)).ExitCode -ne 0) {
+        throw "carrying the npm globals to $Target failed; nothing switched ($Kept)"
+    }
+    # Exactly the carry: old versions are kept, so TARGET may be a version
+    # used before, whose prefix still holds globals removed since. Left there,
+    # a rollback would resurrect them.
+    $Carried = @(@($Carry) | ForEach-Object { [string]$_.name })
+    $Present = Get-NpmGlobalDetail $TargetNpm $Prefix
+    foreach ($Extra in @(@($Present.Globals.Keys) + @($Present.Unpinnable) | Sort-Object -Unique)) {
+        if ($Carried -ccontains $Extra -or $Bundled -ccontains $Extra) { continue }
+        if ((& $script:NodeOps.Npm $TargetNpm $Prefix @("uninstall", "--global", $Extra)).ExitCode -ne 0) {
+            throw "could not remove $Extra, left in $Target by an earlier use; nothing switched ($Kept)"
+        }
+    }
+    $After = Get-NpmGlobalDetail $TargetNpm $Prefix
+    $AfterNames = @(@($After.Globals.Keys) + @($After.Unpinnable) | Where-Object { $Bundled -cnotcontains $_ } | Sort-Object -Unique)
+    $Wanted = @($Carried | Sort-Object -Unique)
+    if (($AfterNames -join "`0") -cne ($Wanted -join "`0") -or
+        @(@($Carry) | Where-Object { -not $After.Globals.ContainsKey([string]$_.name) -or
+            $After.Globals[[string]$_.name] -cne [string]$_.version }).Count -gt 0) {
+        throw "the npm globals under $Target are not exactly the carry at its versions; nothing switched ($Kept)"
+    }
+
+    # THE FLIP.
+    $Fail = {
+        param([string]$Message)
+        if ($Old) {
+            [void](& $script:NodeOps.Fnm $Root @("default", $Old))
+            if (Test-NodeDefaultVerified $Root $Old) {
+                Clear-NodeSwitchMarker
+                throw "$Message; fnm default restored to $Old ($Target stays installed)"
+            }
+            throw "$Message; could not restore the fnm default to $Old; the switch stays recorded as in flight ($(Get-NodeSwitchMarkerPath))"
+        }
+        [void](& $script:NodeOps.Fnm $Root @("unalias", "default"))
+        throw "$Message; the fnm default was removed ($Target stays installed)"
+    }
+    if ($Old -cne $Target) {
+        if ($Old) { Write-NodeSwitchMarker $Old $Target @($Carry) }
+        if ((& $script:NodeOps.Fnm $Root @("default", $Target)) -ne 0) { & $Fail "fnm default $Target failed" }
+    }
+    if (-not (Test-NodeDefaultVerified $Root $Target)) {
+        & $Fail "the durable npm does not run under $Target after the switch"
+    }
+    # Each hook is re-proved under the new default and runs through the
+    # alias, so a service it registers names the alias (which survives later
+    # switches), with the new node first on PATH.
+    $AliasBin = Get-FnmAliasBinDir $Root
+    foreach ($Hook in @($Hooks)) {
+        $Name = ([string]$Hook.package).Substring(4)
+        $Argv = [string[]]@($Hook.argv)
+        $Path = Get-NodeHookPath (Join-Path (Join-Path $Root "aliases") "default") $Name $Argv[0]
+        if ($null -eq $Path) { & $Fail "post-switch hook $($Argv[0]) is not a bin of the installed $Name under $Target" }
+        if ((& $script:NodeOps.Hook $Path ([string[]]@($Argv | Select-Object -Skip 1)) $AliasBin) -ne 0) {
+            & $Fail "post-switch hook $(ConvertTo-CanonicalJson $Argv) for $Name failed"
+        }
+    }
+    if (-not (Test-NodeDefaultVerified $Root $Target)) {
+        & $Fail "the fnm default moved off $Target while the switch ran"
+    }
+    Clear-NodeSwitchMarker
+}
+
+function Invoke-NodeRuntimeSwitch([string]$Target, [object[]]$Carry, [object[]]$Hooks) {
+    # The sealed `fnm:node` operation: make TARGET the fnm default with exactly
+    # CARRY in its prefix, then run HOOKS (already matched to this worker's
+    # configuration). Returns 0, or throws with the default never moved,
+    # restored and verified, or recorded in flight.
+    $Lock = Enter-NodeSwitchLock
+    try {
+        # PREFLIGHT mutates nothing.
+        if ($null -ne (Read-NodeSwitchMarker)) {
+            throw "an interrupted Node switch is pending recovery on this host; refusing another (rerun the fnm bootstrap to restore it)"
+        }
+        $Root = Get-FnmRoot
+        if ($null -eq $Root) { throw "no fnm default Node on this host" }
+        $Old = Get-FnmDefaultVersion $Root
+        if ($null -eq $Old) { throw "the fnm default alias does not name an installed version" }
+        $OldPrefix = Get-FnmInstallation $Root $Old
+        $Before = Get-NpmGlobalDetail (Get-FnmToolPath (Get-FnmAliasBinDir $Root) "npm") $null
+        # The carry reproduces what is installed now; it never introduces a package.
+        foreach ($Item in @($Carry)) {
+            if (-not $Before.Globals.ContainsKey([string]$Item.name) -or $Before.Globals[[string]$Item.name] -cne [string]$Item.version) {
+                throw "the carry is not what is installed under $Old; refusing the switch"
+            }
+        }
+        $CarriedNames = @(@($Carry) | ForEach-Object { [string]$_.name })
+        foreach ($Hook in @($Hooks)) {
+            $Name = ([string]$Hook.package).Substring(4)
+            if ($CarriedNames -cnotcontains $Name) { throw "a post-switch hook names $Name, which is not carried" }
+            if ($null -eq (Get-NodeHookPath $OldPrefix $Name ([string]@($Hook.argv)[0]))) {
+                throw "post-switch hook $([string]@($Hook.argv)[0]) is not a bin of the installed $Name; refusing the switch"
+            }
+        }
+        $SourceNpm = if ($Before.Globals.ContainsKey("npm")) { $Before.Globals["npm"] } else { $null }
+        Invoke-NodeSwitchCore -Root $Root -Old $Old -Target $Target -Carry @($Carry) -Hooks @($Hooks) -SourceNpmVersion $SourceNpm
+        return 0
+    } finally {
+        $Lock.Dispose()
+    }
+}
+
+function Assert-NoNodeSwitchInflight {
+    # Never an npm mutation under a default a switch left unverified.
+    if ($null -ne (Read-NodeSwitchMarker)) {
+        throw "a Node switch is recorded in flight on this host; npm upgrades are refused until it is resolved"
+    }
+}
+
+# --- Bootstrap: migrate a Windows host to fnm (run once, by its user) ---------
+#
+# `apply-windows.ps1 -BootstrapNodeFnm -NodeMajor 26`, in the user's own,
+# NON-elevated session. Idempotent; every step converges or is already done:
+#   1. fnm, user scope: winget (Schniz.fnm, --scope user), else the pinned
+#      official release, verified by SHA-256, into %LOCALAPPDATA%\fnm.
+#   2. FNM_DIR, a user variable; a switch recorded in flight is restored first.
+#   3. The newest release in the major as the fnm default, carrying every
+#      global the current npm has (the MSI's %APPDATA%\npm on first run) at its
+#      exact version, through the same staging and flip as a sealed switch.
+#   4. The default alias first on the user PATH.
+# The MSI stays installed (removing it needs elevation). The collector then
+# reports it shadowed and unmanaged, and `fnm:node` carries runtimes.node.
+
+function Test-ProcessElevated {
+    if (-not $script:FnmOnWindows) { return $false }
+    return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Assert-FnmArchive([string]$Path, [string]$ExpectedSha256) {
+    if ((Get-FileSha256 $Path) -cne $ExpectedSha256) {
+        throw "the downloaded fnm release does not match its pinned SHA-256; nothing installed"
+    }
+}
+
+function Install-FnmUserScope {
+    $Existing = Get-FnmCommandPath
+    if ($null -ne $Existing) { return $Existing }
+    $Winget = Get-Command winget -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $Winget) {
+        $Code = Invoke-Captured ([string]$Winget.Source) @("install", "--id", "Schniz.fnm", "--exact", "--source", "winget",
+            "--scope", "user", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
+        $Found = Get-FnmCommandPath
+        if ($null -ne $Found) { return $Found }
+        Write-Output "roundhouse: winget could not install fnm in this session (exit $Code); using the pinned $FnmPinnedRelease release"
+    }
+    $Work = Join-Path ([IO.Path]::GetTempPath()) ("roundhouse-fnm-" + [Guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($Work)
+        $Zip = Join-Path $Work "fnm-windows.zip"
+        Invoke-WebRequest -Uri "https://github.com/Schniz/fnm/releases/download/$FnmPinnedRelease/fnm-windows.zip" `
+            -OutFile $Zip -UseBasicParsing
+        Assert-FnmArchive $Zip $FnmPinnedWindowsZipSha256
+        Expand-Archive -LiteralPath $Zip -DestinationPath (Join-Path $Work "x")
+        $Destination = Join-Path $env:LOCALAPPDATA "fnm"
+        [void][IO.Directory]::CreateDirectory($Destination)
+        Copy-Item -LiteralPath (Join-Path (Join-Path $Work "x") "fnm.exe") -Destination (Join-Path $Destination "fnm.exe") -Force
+    } finally {
+        Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $Installed = Get-FnmCommandPath
+    if ($null -eq $Installed) { throw "fnm could not be installed" }
+    return $Installed
+}
+
+function Select-FnmBootstrapRoot {
+    # An explicit FNM_DIR, else a root that already holds versions, else
+    # %LOCALAPPDATA%\fnm (machine-local: never roamed with the profile).
+    $UserFnmDir = [Environment]::GetEnvironmentVariable("FNM_DIR", "User")
+    foreach ($Candidate in @($env:FNM_DIR, $UserFnmDir)) {
+        if (-not [string]::IsNullOrWhiteSpace($Candidate)) { return [string]$Candidate }
+    }
+    foreach ($Candidate in @(Get-FnmRootCandidates)) {
+        if (Test-Path -LiteralPath (Join-Path $Candidate "node-versions") -PathType Container) { return $Candidate }
+    }
+    return Join-Path $env:LOCALAPPDATA "fnm"
+}
+
+function Get-PathWithFirstEntry([string]$PathValue, [string]$Entry) {
+    # ENTRY first, once; every other entry kept in order.
+    $Want = $Entry.TrimEnd('\', '/')
+    $Rest = @($PathValue -split ';' | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and $_.Trim().TrimEnd('\', '/') -ine $Want
+    })
+    return (@($Entry) + $Rest) -join ';'
+}
+
+function Set-NodeFnmUserEnvironment([string]$Root, [string]$AliasBin) {
+    # The user's own registry environment, raw, so %VAR% entries and the
+    # value kind survive. SetEnvironmentVariable broadcasts the change.
+    $Key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+    try {
+        $Raw = [string]$Key.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $Kind = if (@($Key.GetValueNames()) -contains "Path") { $Key.GetValueKind("Path") } else {
+            [Microsoft.Win32.RegistryValueKind]::ExpandString
+        }
+        $New = Get-PathWithFirstEntry $Raw $AliasBin
+        if ($New -cne $Raw) { $Key.SetValue("Path", $New, $Kind) }
+    } finally {
+        $Key.Dispose()
+    }
+    [Environment]::SetEnvironmentVariable("FNM_DIR", $Root, "User")
+}
+
+function Get-MsiNpmPath([string]$Root) {
+    # The npm that owns the globals before the first fnm default: PATH npm
+    # outside fnm, else the MSI's own.
+    $Found = @(Get-Command npm -CommandType Application -All -ErrorAction SilentlyContinue | Where-Object {
+        [string]$_.Source -notmatch 'fnm_multishells' -and
+        -not ([string]$_.Source).StartsWith($Root.TrimEnd('\', '/'), [StringComparison]::OrdinalIgnoreCase)
+    }) | Select-Object -First 1
+    if ($null -ne $Found) { return [string]$Found.Source }
+    if ($env:ProgramFiles) {
+        $Msi = Join-Path (Join-Path $env:ProgramFiles "nodejs") "npm.cmd"
+        if (Test-Path -LiteralPath $Msi -PathType Leaf) { return $Msi }
+    }
+    return $null
+}
+
+function Resolve-NodeSwitchInflight([string]$Root) {
+    # A switch recorded in flight (killed mid-flip, or a restore that could not
+    # be verified): restore its old default, verified, then clear it. Never
+    # cleared blindly.
+    $Marker = Read-NodeSwitchMarker
+    if ($null -eq $Marker) { return $null }
+    $Old = [string]$Marker.old
+    if (-not (Test-NodeVersionText $Old) -or
+        -not (Test-Path -LiteralPath (Get-FnmToolPath (Get-FnmBinDir (Get-FnmInstallation $Root $Old)) "node") -PathType Leaf)) {
+        throw "a Node switch is recorded in flight ($(Get-NodeSwitchMarkerPath)) and its old default '$Old' is not installed; set a default (fnm default <version>), check it, then delete that record"
+    }
+    [void](& $script:NodeOps.Fnm $Root @("default", $Old))
+    if (-not (Test-NodeDefaultVerified $Root $Old)) {
+        throw "a Node switch is recorded in flight and the fnm default could not be restored to $Old; nothing else changed"
+    }
+    Clear-NodeSwitchMarker
+    return "restored the interrupted Node switch to its old default $Old (verified)"
+}
+
+function Invoke-NodeFnmMigration {
+    # The bootstrap's runtime step (testable without fnm): leave a default
+    # already in MAJOR alone; otherwise install the newest release in MAJOR
+    # and make it the default, carrying every global of the current npm (the
+    # fnm default's, or SOURCENPM's when fnm has none) at its exact version.
+    param([string]$Root, [int]$Major, [string]$SourceNpm)
+    $Default = $null
+    if (Test-FnmDurableBin (Get-FnmAliasBinDir $Root)) { $Default = Get-FnmDefaultVersion $Root }
+    if ($null -ne $Default -and (Get-NodeVersionMajor $Default) -eq $Major) {
+        return @{ Switched = $false; Old = $Default; Default = $Default; Carry = @() }
+    }
+    $Lines = & $script:NodeOps.FnmLines $Root @("list-remote")
+    if ($null -eq $Lines) { throw "cannot list the published Node releases (fnm list-remote failed)" }
+    $Target = Select-FnmRemoteLatest $Lines $Major
+    if ($null -eq $Target) { throw "no published Node $Major release is listed" }
+    $Source = if ($null -ne $Default) { Get-FnmToolPath (Get-FnmAliasBinDir $Root) "npm" } else { $SourceNpm }
+    if ([string]::IsNullOrEmpty($Source)) { throw "no npm to carry the globals from (neither an fnm default nor the MSI's npm)" }
+    $Detail = Get-NpmGlobalDetail $Source $null
+    $Bundled = Get-NodeTargetBundled $Target
+    $Stranded = @($Detail.Unpinnable | Where-Object { $Bundled -cnotcontains $_ })
+    if ($Stranded.Count -gt 0) {
+        throw "npm globals $($Stranded -join ' ') cannot be reinstalled by exact registry version (file:, link:, git or no version); reinstall them from the registry or remove them, then rerun"
+    }
+    $Names = @($Detail.Globals.Keys | Where-Object { $Bundled -cnotcontains $_ })
+    [Array]::Sort($Names, [StringComparer]::Ordinal)
+    $Carry = @($Names | ForEach-Object { [ordered]@{ name = $_; version = $Detail.Globals[$_] } })
+    $SourceNpmVersion = if ($Detail.Globals.ContainsKey("npm")) { $Detail.Globals["npm"] } else { $null }
+    Invoke-NodeSwitchCore -Root $Root -Old $Default -Target $Target -Carry $Carry -Hooks @() -SourceNpmVersion $SourceNpmVersion
+    return @{ Switched = $true; Old = $Default; Default = $Target; Carry = $Carry }
+}
+
+function Get-NodeOnNewSessionPath([string]$AliasBin) {
+    # Which node a NEW session's bare `node` finds: Windows puts the machine
+    # PATH before the user's, so a machine-wide MSI entry wins over any user
+    # entry until the MSI is removed.
+    $Dirs = @(([Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+        [Environment]::GetEnvironmentVariable("Path", "User")) -split ';' | Where-Object { $_ })
+    foreach ($Dir in $Dirs) {
+        $Candidate = Join-Path ([Environment]::ExpandEnvironmentVariables($Dir)) "node.exe"
+        if (Test-Path -LiteralPath $Candidate -PathType Leaf) { return $Candidate }
+    }
+    return $null
+}
+
+function Invoke-NodeFnmBootstrap([int]$Major) {
+    if (-not $script:FnmOnWindows) { throw "the fnm bootstrap runs on native Windows only" }
+    if (Test-ProcessElevated) {
+        throw "refusing to run elevated: fnm installs per user; rerun from your own, non-elevated session"
+    }
+    $Lock = Enter-NodeSwitchLock
+    try {
+        $Fnm = Install-FnmUserScope
+        $Root = Select-FnmBootstrapRoot
+        [void][IO.Directory]::CreateDirectory($Root)
+        $env:FNM_DIR = $Root
+        $Restored = Resolve-NodeSwitchInflight $Root
+        if ($null -ne $Restored) { Write-Output "roundhouse: $Restored" }
+        $Result = Invoke-NodeFnmMigration -Root $Root -Major $Major -SourceNpm (Get-MsiNpmPath $Root)
+        $AliasBin = Get-FnmAliasBinDir $Root
+        Set-NodeFnmUserEnvironment $Root $AliasBin
+        Write-Output "roundhouse: fnm $Fnm, FNM_DIR $Root (user)"
+        if ($Result.Switched) {
+            $From = if ($Result.Old) { "fnm $($Result.Old)" } else { "the MSI's npm" }
+            $Carried = @($Result.Carry | ForEach-Object { "$($_.name)@$($_.version)" })
+            Write-Output ("roundhouse: fnm default $($Result.Default), carried from ${From}: " +
+                $(if ($Carried.Count -gt 0) { $Carried -join " " } else { "no npm globals" }))
+        } else {
+            Write-Output "roundhouse: fnm default $($Result.Default) is already in Node $Major; nothing switched"
+        }
+        Write-Output "roundhouse: $AliasBin is first on the user PATH; global bins resolve to the fnm default"
+        $NodeOnPath = Get-NodeOnNewSessionPath $AliasBin
+        if ($null -ne $NodeOnPath -and -not $NodeOnPath.StartsWith($AliasBin, [StringComparison]::OrdinalIgnoreCase)) {
+            Write-Output ("roundhouse: note: the machine PATH comes before the user PATH, so a bare node/npm/npx in a new " +
+                "session still resolves to $NodeOnPath until that MSI is removed (elevated; not done here). " +
+                "Roundhouse itself always uses the fnm default.")
+        }
+        Write-Output "roundhouse: services a global installed (for example opencodex's) still run on their old Node until their own repair runs (ocx service)"
+    } finally {
+        $Lock.Dispose()
+    }
+}
+
+function Invoke-NodeSwitchSelfTest([string]$Root) {
+    # The switch, the carry rule, the operation checks and the bootstrap's
+    # migration, against an fnm tree in ROOT and in-memory fnm/npm fakes.
+    $Saved = @{ Ops = $script:NodeOps; State = $script:NodeSwitchStateDir; FnmDir = $env:FNM_DIR }
+    $Fnm = Join-Path $Root "fnm"
+    $Fake = @{
+        Log = New-Object System.Collections.Generic.List[string]
+        BundledNpm = "11.0.0"; FailInstall = $false; HookExit = 0; DefaultOnly = $null
+        Remote = @("v24.2.0 (Krypton)", "v26.0.0", "v26.10.0", "v27.0.0")
+        Catalog = @{ "@example/svc" = @("svc"); "plain" = @("plain") }
+    }
+    $script:NodeSelfTestFake = $Fake
+    $script:NodeSwitchStateDir = Join-Path $Root "state"
+    $env:FNM_DIR = $Fnm
+    function Get-FakePrefix([string]$NpmPath, [string]$Prefix) {
+        if ($Prefix) { return $Prefix }
+        $Dir = Split-Path -Parent $NpmPath
+        if ($script:FnmOnWindows) { return $Dir }
+        return Split-Path -Parent $Dir
+    }
+    function Set-FakeLink([string]$Link, [string]$Target) {
+        if (Test-Path -LiteralPath $Link) { [IO.Directory]::Delete($Link, $false) }
+        [void](New-Item -ItemType $(if ($script:FnmOnWindows) { "Junction" } else { "SymbolicLink" }) -Path $Link -Target $Target)
+    }
+    function Read-FakeGlobals([string]$Prefix) {
+        $State = Join-Path $Prefix "globals.json"
+        if (-not (Test-Path -LiteralPath $State)) { return [ordered]@{} }
+        $Value = Get-Content -LiteralPath $State -Raw | ConvertFrom-Json -AsHashtable
+        $Ordered = [ordered]@{}
+        foreach ($Key in @($Value.Keys | Sort-Object)) { $Ordered[$Key] = $Value[$Key] }
+        return $Ordered
+    }
+    function Set-FakeGlobal([string]$Prefix, [string]$Name, [string]$Version) {
+        $Globals = Read-FakeGlobals $Prefix
+        if ([string]::IsNullOrEmpty($Version)) { $Globals.Remove($Name) } else { $Globals[$Name] = $Version }
+        $Globals | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $Prefix "globals.json")
+        $PackageDir = Join-Path (Get-FnmNpmRoot $Prefix) $Name
+        $Bins = if ($script:NodeSelfTestFake.Catalog.ContainsKey($Name)) { @($script:NodeSelfTestFake.Catalog[$Name]) } else { @() }
+        foreach ($Bin in $Bins) { Remove-Item -LiteralPath (Get-FnmPrefixBinPath $Prefix $Bin) -Force -ErrorAction SilentlyContinue }
+        if ([string]::IsNullOrEmpty($Version)) {
+            Remove-Item -LiteralPath $PackageDir -Recurse -Force -ErrorAction SilentlyContinue
+            return
+        }
+        [void][IO.Directory]::CreateDirectory($PackageDir)
+        $BinMap = [ordered]@{}
+        foreach ($Bin in $Bins) {
+            $BinMap[$Bin] = "cli.js"
+            $Shim = Get-FnmPrefixBinPath $Prefix $Bin
+            [void][IO.Directory]::CreateDirectory((Split-Path -Parent $Shim))
+            Set-Content -LiteralPath $Shim -Value "shim"
+        }
+        @{ name = $Name; version = $Version; bin = $BinMap } | ConvertTo-Json -Compress |
+            Set-Content -LiteralPath (Join-Path $PackageDir "package.json")
+    }
+    $Fake.Root = $Fnm
+    function Get-FakeDefaultNow {
+        $Value = Get-FnmDefaultVersion $script:NodeSelfTestFake.Root
+        if ($null -eq $Value) { "none" } else { $Value }
+    }
+    $script:NodeOps = @{
+        Fnm = {
+            param([string]$FnmRoot, [string[]]$Arguments)
+            $Fake = $script:NodeSelfTestFake
+            $Fake.Log.Add("fnm $($Arguments -join ' ')")
+            switch ($Arguments[0]) {
+                "install" {
+                    if ($Fake.FailFnmInstall) { return 1 }
+                    $Installation = Get-FnmInstallation $FnmRoot $Arguments[1]
+                    if (-not (Test-Path -LiteralPath $Installation)) {
+                        $Bin = Get-FnmBinDir $Installation
+                        [void][IO.Directory]::CreateDirectory($Bin)
+                        Set-Content -LiteralPath (Get-FnmToolPath $Bin "node") -Value ""
+                        Set-Content -LiteralPath (Get-FnmToolPath $Bin "npm") -Value ""
+                        Set-Content -LiteralPath (Join-Path $Bin "version.txt") -Value $Arguments[1]
+                        $NpmDir = Join-Path (Get-FnmNpmRoot $Installation) "npm"
+                        [void][IO.Directory]::CreateDirectory($NpmDir)
+                        @{ name = "npm"; version = $Fake.BundledNpm } | ConvertTo-Json -Compress |
+                            Set-Content -LiteralPath (Join-Path $NpmDir "package.json")
+                        @{ npm = $Fake.BundledNpm } | ConvertTo-Json -Compress |
+                            Set-Content -LiteralPath (Join-Path $Installation "globals.json")
+                    }
+                    return 0
+                }
+                "default" {
+                    $Installation = Get-FnmInstallation $FnmRoot $Arguments[1]
+                    if (-not (Test-Path -LiteralPath $Installation)) { return 1 }
+                    if ($null -ne $Fake.DefaultOnly -and $Arguments[1] -cne $Fake.DefaultOnly) { return 1 }
+                    [void][IO.Directory]::CreateDirectory((Join-Path $FnmRoot "aliases"))
+                    Set-FakeLink (Join-Path (Join-Path $FnmRoot "aliases") "default") $Installation
+                    return 0
+                }
+                "unalias" {
+                    $Link = Join-Path (Join-Path $FnmRoot "aliases") "default"
+                    if (Test-Path -LiteralPath $Link) { [IO.Directory]::Delete($Link, $false) }
+                    return 0
+                }
+            }
+            return 64
+        }
+        FnmLines = { param([string]$FnmRoot, [string[]]$Arguments) return , [string[]]@($script:NodeSelfTestFake.Remote) }
+        Npm = {
+            param([string]$NpmPath, [string]$Prefix, [string[]]$Arguments)
+            $Fake = $script:NodeSelfTestFake
+            $Effective = Get-FakePrefix $NpmPath $Prefix
+            $Fake.Log.Add("npm $($Arguments -join ' ') prefix=$(Split-Path -Leaf (Split-Path -Parent $Effective)) default=$(Get-FakeDefaultNow)")
+            switch ($Arguments[0]) {
+                "ls" {
+                    $Dependencies = [ordered]@{}
+                    $Globals = Read-FakeGlobals $Effective
+                    foreach ($Key in $Globals.Keys) { $Dependencies[$Key] = @{ version = $Globals[$Key] } }
+                    if ($Fake.Linked) { $Dependencies["devtool"] = @{ version = "0.0.1"; resolved = "file:../devtool" } }
+                    return @{ ExitCode = 0; Text = (@{ dependencies = $Dependencies } | ConvertTo-Json -Compress -Depth 5) }
+                }
+                "install" {
+                    if ($Fake.FailInstall) { return @{ ExitCode = 1; Text = "" } }
+                    foreach ($Spec in @($Arguments | Select-Object -Skip 2)) {
+                        $At = $Spec.LastIndexOf("@")
+                        Set-FakeGlobal $Effective $Spec.Substring(0, $At) $Spec.Substring($At + 1)
+                    }
+                    return @{ ExitCode = 0; Text = "" }
+                }
+                "uninstall" {
+                    foreach ($Name in @($Arguments | Select-Object -Skip 2)) { Set-FakeGlobal $Effective $Name $null }
+                    return @{ ExitCode = 0; Text = "" }
+                }
+            }
+            return @{ ExitCode = 64; Text = "" }
+        }
+        NodeVersion = {
+            param([string]$BinDir)
+            $File = Join-Path $BinDir "version.txt"
+            if (-not (Test-Path -LiteralPath $File)) { return $null }
+            return (Get-Content -LiteralPath $File -Raw).Trim()
+        }
+        Hook = {
+            param([string]$Path, [string[]]$Arguments, [string]$BinDir)
+            $Fake = $script:NodeSelfTestFake
+            $Fake.Log.Add("hook $(Split-Path -Leaf $Path) $($Arguments -join ' ') node=$((Get-Content -LiteralPath (Join-Path $BinDir 'version.txt') -Raw).Trim())")
+            return $Fake.HookExit
+        }
+    }
+    function Reset-FakeFnm {
+        Remove-Item -LiteralPath $Fnm -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:NodeSwitchStateDir -Recurse -Force -ErrorAction SilentlyContinue
+        $Fake.FailInstall = $false; $Fake.FailFnmInstall = $false; $Fake.HookExit = 0; $Fake.DefaultOnly = $null; $Fake.Linked = $false
+        $Fake.BundledNpm = "11.0.0"
+        [void](& $script:NodeOps.Fnm $Fnm @("install", "v26.0.0"))
+        [void](& $script:NodeOps.Fnm $Fnm @("default", "v26.0.0"))
+        $Old = Get-FnmInstallation $Fnm "v26.0.0"
+        foreach ($Pair in @(@("@example/svc", "1.0.0"), @("plain", "2.0.0"), @("npm", "12.1.0"))) {
+            Set-FakeGlobal $Old $Pair[0] $Pair[1]
+        }
+        $Fake.Log.Clear()
+    }
+    $Carry = @([ordered]@{ name = "@example/svc"; version = "1.0.0" }, [ordered]@{ name = "plain"; version = "2.0.0" })
+    $Hooks = @([ordered]@{ package = "npm:@example/svc"; argv = @("svc", "service") })
+    try {
+        # Success: staged through the target's own npm while the old default
+        # is live, then flipped, hook run under the new node, record cleared.
+        Reset-FakeFnm
+        if ((Invoke-NodeRuntimeSwitch "v26.10.0" $Carry $Hooks) -ne 0 -or (Get-FnmDefaultVersion $Fnm) -cne "v26.10.0") {
+            throw "Node switch self-test: the switch did not complete"
+        }
+        $Target = Read-FakeGlobals (Get-FnmInstallation $Fnm "v26.10.0")
+        if ((ConvertTo-CanonicalJson $Target) -cne '{"@example/svc":"1.0.0","npm":"12.1.0","plain":"2.0.0"}' -or
+            $null -ne (Read-NodeSwitchMarker) -or
+            @($Fake.Log | Where-Object { $_ -like "npm install*" -and $_ -notlike "*default=v26.0.0" }).Count -ne 0 -or
+            @($Fake.Log | Where-Object { $_ -ceq "hook svc service node=v26.10.0" }).Count -ne 1 -or
+            (ConvertTo-CanonicalJson (Read-FakeGlobals (Get-FnmInstallation $Fnm "v26.0.0"))) -cne
+                '{"@example/svc":"1.0.0","npm":"12.1.0","plain":"2.0.0"}') {
+            throw "Node switch self-test: carry before flip, npm bring-up, hook or old prefix wrong: $($Fake.Log -join ' | ')"
+        }
+        # A carry that is not what is installed refuses before anything moves.
+        Reset-FakeFnm
+        $Refused = $false
+        try { [void](Invoke-NodeRuntimeSwitch "v26.10.0" @([ordered]@{ name = "plain"; version = "9.9.9" }) @()) } catch {
+            $Refused = $_.Exception.Message -like "*carry is not what is installed*"
+        }
+        if (-not $Refused -or (Get-FnmDefaultVersion $Fnm) -cne "v26.0.0" -or @($Fake.Log | Where-Object { $_ -like "fnm install*" }).Count -ne 0) {
+            throw "Node switch self-test: an invented carry was not refused before staging"
+        }
+        # A failed carry leaves the default untouched and records nothing.
+        Reset-FakeFnm
+        $Fake.FailInstall = $true
+        $Refused = $false
+        try { [void](Invoke-NodeRuntimeSwitch "v26.10.0" $Carry $Hooks) } catch { $Refused = $_.Exception.Message -like "*nothing switched*" }
+        if (-not $Refused -or (Get-FnmDefaultVersion $Fnm) -cne "v26.0.0" -or $null -ne (Read-NodeSwitchMarker)) {
+            throw "Node switch self-test: a failed carry moved the default or recorded a switch"
+        }
+        # A failed hook restores the old default, verified, and clears the record.
+        Reset-FakeFnm
+        $Fake.HookExit = 1
+        $Refused = $false
+        try { [void](Invoke-NodeRuntimeSwitch "v26.10.0" $Carry $Hooks) } catch { $Refused = $_.Exception.Message -like "*restored to v26.0.0*" }
+        if (-not $Refused -or (Get-FnmDefaultVersion $Fnm) -cne "v26.0.0" -or $null -ne (Read-NodeSwitchMarker)) {
+            throw "Node switch self-test: a failed hook did not restore the old default"
+        }
+        # A restore that cannot be verified leaves the switch recorded in
+        # flight; nothing seals or runs over it until it is restored.
+        Reset-FakeFnm
+        $Fake.HookExit = 1
+        $Fake.DefaultOnly = "v26.10.0"
+        $Refused = $false
+        try { [void](Invoke-NodeRuntimeSwitch "v26.10.0" $Carry $Hooks) } catch { $Refused = $_.Exception.Message -like "*stays recorded as in flight*" }
+        $Marker = Read-NodeSwitchMarker
+        if (-not $Refused -or $null -eq $Marker -or $Marker.old -cne "v26.0.0" -or $Marker.target -cne "v26.10.0") {
+            throw "Node switch self-test: an unverified restore did not stay recorded"
+        }
+        $Refused = $false
+        try { [void](Invoke-NodeRuntimeSwitch "v26.10.0" $Carry $Hooks) } catch { $Refused = $_.Exception.Message -like "*pending recovery*" }
+        $NpmRefused = $false
+        try { Assert-NoNodeSwitchInflight } catch { $NpmRefused = $true }
+        if (-not $Refused -or -not $NpmRefused) { throw "Node switch self-test: a switch in flight did not block the next switch and npm" }
+        $Fake.DefaultOnly = $null
+        if ((Resolve-NodeSwitchInflight $Fnm) -notlike "*v26.0.0*" -or (Get-FnmDefaultVersion $Fnm) -cne "v26.0.0" -or
+            $null -ne (Read-NodeSwitchMarker)) {
+            throw "Node switch self-test: recovery did not restore the old default"
+        }
+        # One switch at a time.
+        Reset-FakeFnm
+        $Held = Enter-NodeSwitchLock
+        try {
+            $Refused = $false
+            try { [void](Invoke-NodeRuntimeSwitch "v26.10.0" $Carry $Hooks) } catch { $Refused = $_.Exception.Message -like "*another Node switch*" }
+            if (-not $Refused) { throw "Node switch self-test: a second switch ran under the lock" }
+        } finally { $Held.Dispose() }
+
+        # The carry rule over a snapshot record, and the sealed operation.
+        $Record = '{"status":"present","data":{"installed_version":"v24.18.0","globals":{"npm":"12.1.0","corepack":"0.34.0","plain":"2.0.0","@example/svc":"1.0.0"},"globals_unpinnable":[],"switch_inflight":null}}' | ConvertFrom-Json
+        $Config = '{"node_switch_hooks":{"npm:@example/svc":[["svc","service"]],"npm:absent":[["x"]]}}' | ConvertFrom-Json
+        $Expected = Get-NodeSwitchExpected $Record "v26.10.0" $Config
+        if ($null -ne $Expected.Held -or (ConvertTo-CanonicalJson @($Expected.Carry)) -cne
+            '[{"name":"@example/svc","version":"1.0.0"},{"name":"corepack","version":"0.34.0"},{"name":"plain","version":"2.0.0"}]' -or
+            (ConvertTo-CanonicalJson @($Expected.Hooks)) -cne '[{"argv":["svc","service"],"package":"npm:@example/svc"}]') {
+            throw "Node switch self-test: carry rule (24 -> 26 carries corepack, hooks in carry order)"
+        }
+        if ((ConvertTo-CanonicalJson @((Get-NodeSwitchExpected $Record "v24.20.0" $Config).Carry)) -cne
+            '[{"name":"@example/svc","version":"1.0.0"},{"name":"plain","version":"2.0.0"}]') {
+            throw "Node switch self-test: a target that bundles corepack carried it"
+        }
+        foreach ($Case in @(
+            @{ Name = "unknown"; Edit = { param($R) $R.data.globals_unpinnable = $null }; Like = "*unknown*" },
+            @{ Name = "unpinnable"; Edit = { param($R) $R.data.globals_unpinnable = @("plain") }; Like = "*plain cannot be reinstalled*" },
+            @{ Name = "inflight"; Edit = { param($R) $R.data.switch_inflight = [pscustomobject]@{ old = "v26.0.0" } }; Like = "*pending recovery*" }
+        )) {
+            $Copy = $Record | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+            & $Case.Edit $Copy
+            if ((Get-NodeSwitchExpected $Copy "v26.10.0" $Config).Held -notlike $Case.Like) {
+                throw "Node switch self-test: carry rule did not hold on $($Case.Name)"
+            }
+        }
+        $Operation = ('{"type":"package-upgrade","kind":"package","id":"fnm:node","candidate_version":"v26.10.0",' +
+            '"argv":["fnm","default","v26.10.0"],"carry":' + (ConvertTo-CanonicalJson @($Expected.Carry)) +
+            ',"hooks":[{"package":"npm:@example/svc","argv":["svc","service"]}],"required":[{"package":"npm:@example/svc","argv":["svc","service"]}]}') |
+            ConvertFrom-Json
+        Assert-NodeSwitchOperationShape $Operation
+        Assert-NodeSwitchMatchesSnapshot $Operation $Record $Config
+        if ((ConvertTo-CanonicalJson @(Get-ExactArgv $Operation $Config $null)) -cne '["fnm","default","v26.10.0"]') {
+            throw "Node switch self-test: the exact argv is not the fixed marker"
+        }
+        foreach ($Bad in @(
+            @{ Name = "argv"; Edit = { param($O) $O.argv = @("fnm", "install", "v26.10.0") } },
+            @{ Name = "version"; Edit = { param($O) $O.candidate_version = "26.10.0" } },
+            @{ Name = "duplicate"; Edit = { param($O) $O.carry = @($O.carry) + @($O.carry[0]) } },
+            @{ Name = "carry-extra"; Edit = { param($O) $O.carry[0] | Add-Member -NotePropertyName source -NotePropertyValue "x" } },
+            @{ Name = "hook-argv"; Edit = { param($O) $O.hooks[0].argv = @("svc", "a b") } },
+            @{ Name = "required"; Edit = { param($O) $O.required = "none" } }
+        )) {
+            $Copy = $Operation | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+            & $Bad.Edit $Copy
+            $Rejected = $false
+            try { Assert-NodeSwitchOperationShape $Copy } catch { $Rejected = $true }
+            if (-not $Rejected) { throw "Node switch self-test: an invalid operation shape passed ($($Bad.Name))" }
+        }
+        foreach ($Bad in @(
+            @{ Name = "padded"; Edit = { param($O) $O.carry = @($O.carry) + @([pscustomobject]@{ name = "extra"; version = "1.0.0" }) } },
+            @{ Name = "partial"; Edit = { param($O) $O.carry = @($O.carry | Select-Object -First 1) } },
+            @{ Name = "no-hooks"; Edit = { param($O) $O.hooks = @() } },
+            @{ Name = "required-undeclared"; Edit = { param($O) $O.required = @([pscustomobject]@{ package = "npm:plain"; argv = @("plain") }) } }
+        )) {
+            $Copy = $Operation | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+            & $Bad.Edit $Copy
+            $Rejected = $false
+            try { Assert-NodeSwitchMatchesSnapshot $Copy $Record $Config } catch { $Rejected = $true }
+            if (-not $Rejected) { throw "Node switch self-test: a switch not matching the snapshot passed ($($Bad.Name))" }
+        }
+        $HookMismatch = $false
+        try { [void](Get-ExactArgv $Operation ('{"node_switch_hooks":{}}' | ConvertFrom-Json) $null) } catch { $HookMismatch = $true }
+        if (-not $HookMismatch) { throw "Node switch self-test: hooks absent from the worker configuration were accepted" }
+        $After = '{"status":"present","data":{"installed_version":"v26.10.0","globals":{"npm":"12.1.0","corepack":"0.34.0","plain":"2.0.0","@example/svc":"1.0.1"},"globals_unpinnable":[],"switch_inflight":null}}' | ConvertFrom-Json
+        $LaterNpm = [pscustomobject]@{ type = "package-upgrade"; id = "npm:@example/svc"; candidate_version = "1.0.1" }
+        Assert-NodeSwitchPostcondition $Operation $After @($Operation, $LaterNpm)
+        $PostRejected = $false
+        try { Assert-NodeSwitchPostcondition $Operation $After @($Operation) } catch { $PostRejected = $true }
+        $After.data.globals | Add-Member -NotePropertyName leftover -NotePropertyValue "1.0.0"
+        $LeftoverRejected = $false
+        try { Assert-NodeSwitchPostcondition $Operation $After @($Operation, $LaterNpm) } catch { $LeftoverRejected = $true }
+        if (-not $PostRejected -or -not $LeftoverRejected) { throw "Node switch self-test: the post-state check accepted a wrong global set" }
+
+        # The bootstrap's migration: from the MSI's npm (no fnm default yet),
+        # carrying every global into the first default; a rerun changes nothing.
+        Remove-Item -LiteralPath $Fnm -Recurse -Force -ErrorAction SilentlyContinue
+        $Fake.Log.Clear(); $Fake.FailInstall = $false; $Fake.HookExit = 0; $Fake.DefaultOnly = $null
+        $MsiPrefix = Join-Path $Root "msi"
+        $MsiNpm = Get-FnmToolPath (Get-FnmBinDir $MsiPrefix) "npm"
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $MsiNpm))
+        Set-Content -LiteralPath $MsiNpm -Value ""
+        foreach ($Pair in @(@("@bitkyc08/opencodex", "2.75.0"), @("npm", "12.1.0"), @("typescript", "7.0.2"))) {
+            Set-FakeGlobal $MsiPrefix $Pair[0] $Pair[1]
+        }
+        $Fake.Linked = $true
+        $Refused = $false
+        try { [void](Invoke-NodeFnmMigration -Root $Fnm -Major 26 -SourceNpm $MsiNpm) } catch { $Refused = $_.Exception.Message -like "*devtool cannot be reinstalled*" }
+        if (-not $Refused -or $null -ne (Get-FnmDefaultVersion $Fnm)) { throw "Node switch self-test: the bootstrap carried a linked global" }
+        $Fake.Linked = $false
+        $Migrated = Invoke-NodeFnmMigration -Root $Fnm -Major 26 -SourceNpm $MsiNpm
+        if (-not $Migrated.Switched -or $Migrated.Default -cne "v26.10.0" -or (Get-FnmDefaultVersion $Fnm) -cne "v26.10.0" -or
+            (ConvertTo-CanonicalJson (Read-FakeGlobals (Get-FnmInstallation $Fnm "v26.10.0"))) -cne
+                '{"@bitkyc08/opencodex":"2.75.0","npm":"12.1.0","typescript":"7.0.2"}' -or
+            (ConvertTo-CanonicalJson (Read-FakeGlobals $MsiPrefix)) -cne
+                '{"@bitkyc08/opencodex":"2.75.0","npm":"12.1.0","typescript":"7.0.2"}' -or
+            $null -ne (Read-NodeSwitchMarker)) {
+            throw "Node switch self-test: the bootstrap did not carry the MSI globals into the first fnm default"
+        }
+        $Fake.Log.Clear()
+        $Again = Invoke-NodeFnmMigration -Root $Fnm -Major 26 -SourceNpm $MsiNpm
+        if ($Again.Switched -or $Fake.Log.Count -ne 0) { throw "Node switch self-test: a bootstrap rerun was not idempotent" }
+        # A first default that cannot be verified is removed again: the MSI
+        # stays the runtime and nothing claims otherwise.
+        Remove-Item -LiteralPath $Fnm -Recurse -Force -ErrorAction SilentlyContinue
+        $Fake.DefaultOnly = "v0.0.0"
+        $Refused = $false
+        try { [void](Invoke-NodeFnmMigration -Root $Fnm -Major 26 -SourceNpm $MsiNpm) } catch { $Refused = $_.Exception.Message -like "*default*failed*" }
+        if (-not $Refused -or $null -ne (Get-FnmDefaultVersion $Fnm) -or $null -ne (Read-NodeSwitchMarker)) {
+            throw "Node switch self-test: a failed first default was left behind"
+        }
+        $Fake.DefaultOnly = $null
+
+        if ((Get-PathWithFirstEntry 'C:\a;C:\fnm\aliases\default\;C:\b;;C:\FNM\aliases\default' 'C:\fnm\aliases\default') -cne
+            'C:\fnm\aliases\default;C:\a;C:\b') {
+            throw "Node switch self-test: the user PATH entry was not moved first exactly once"
+        }
+        $Archive = Join-Path $Root "fnm-windows.zip"
+        Set-Content -LiteralPath $Archive -Value "not the release"
+        $Mismatch = $false
+        try { Assert-FnmArchive $Archive $FnmPinnedWindowsZipSha256 } catch { $Mismatch = $_.Exception.Message -like "*pinned SHA-256*" }
+        if (-not $Mismatch) { throw "Node switch self-test: an archive that is not the pinned release was accepted" }
+        Assert-FnmArchive $Archive (Get-FileSha256 $Archive)
+    } finally {
+        $script:NodeOps = $Saved.Ops
+        $script:NodeSwitchStateDir = $Saved.State
+        $env:FNM_DIR = $Saved.FnmDir
     }
 }
 
@@ -2166,6 +3394,8 @@ if ($SelfTest) {
             }
         }
 
+        Invoke-NodeSwitchSelfTest (Join-Path $SelfTestRoot "node-switch")
+
         foreach ($ChildSelfTest in @(
             @{ Path = (Join-Path $PSScriptRoot "privilege-broker-windows.ps1"); Marker = "PASS: privilege-broker-windows fixture-safe self-check" },
             @{ Path = (Join-Path $PSScriptRoot "profile-worker-windows.ps1"); Marker = "PASS: profile-worker-windows fixture-safe self-check" },
@@ -2223,6 +3453,17 @@ if ($PSCmdlet.ParameterSetName -eq "ApproveHooks") {
     }
     [ordered]@{ pluginId = $ApproveCodexPluginHooks; approved = $true } |
         ConvertTo-Json -Compress
+    exit 0
+}
+
+if ($PSCmdlet.ParameterSetName -eq "BootstrapNodeFnm") {
+    # Run by the host's own user, never through a sealed plan or elevated.
+    try {
+        Invoke-NodeFnmBootstrap $NodeMajor
+    } catch {
+        [Console]::Error.WriteLine("roundhouse: fnm bootstrap failed: " + (Get-SafeFailureMessage $_))
+        exit 1
+    }
     exit 0
 }
 
@@ -2289,6 +3530,16 @@ foreach ($Operation in @($Plan.operations)) {
             (ConvertTo-CanonicalJson @($Record.data.updater)) -ne (ConvertTo-CanonicalJson @($Operation.argv))) {
             throw "npm updater is no longer proven for the installed package"
         }
+        if ([string]$Operation.id -ceq "fnm:node") {
+            # The carry is still exactly the installed set this fresh
+            # inventory shows, with this worker's configured hooks.
+            Assert-NodeSwitchMatchesSnapshot $Operation $Record $Config
+        }
+        if ([string]$Operation.id -like "npm:*" -and @($Before | Where-Object {
+            $_.kind -eq "package" -and $_.id -ceq "fnm:node" -and $null -ne $_.data.switch_inflight
+        }).Count -gt 0) {
+            throw "a Node switch is recorded in flight on the target; npm upgrades are refused until it is resolved"
+        }
     }
     if ($Operation.type -eq "project-clone" -and $PreflightRecord[0].status -ne "absent") {
         throw "Project clone requires an absent configured project"
@@ -2330,9 +3581,13 @@ for ($Index = 0; $Index -lt @($Plan.operations).Count; $Index++) {
         }
         if ($Operation.type -eq "agent-update" -and [string]$Operation.id -like "codex:*") {
             $ExitCode = Invoke-CodexPluginHooks "update" $ExpectedArgv[3]
+        } elseif ($Operation.type -eq "package-upgrade" -and [string]$Operation.id -ceq "fnm:node") {
+            $ExitCode = Invoke-NodeRuntimeSwitch ([string]$Operation.candidate_version) @($Operation.carry) @($Operation.hooks)
         } elseif (Test-NpmUpdaterOperation $Operation) {
+            Assert-NoNodeSwitchInflight
             $ExitCode = Invoke-NpmUpdater $Operation $ExpectedArgv
         } elseif ($Operation.type -eq "package-upgrade" -and [string]$Operation.id -like "npm:*") {
+            Assert-NoNodeSwitchInflight
             $ExitCode = Invoke-WithNpmOnPath (Get-SelectedNpm) { Invoke-Exact $ExpectedArgv }
         } else {
             $ExitCode = Invoke-Exact $ExpectedArgv
@@ -2390,7 +3645,7 @@ try {
 if ($PostInventoryStatus -eq "completed" -and $null -eq $Failure) {
     for ($Index = 0; $Index -lt @($Plan.operations).Count; $Index++) {
         try {
-            Assert-Postcondition @($Plan.operations)[$Index] $Before $After
+            Assert-Postcondition @($Plan.operations)[$Index] $Before $After @($Plan.operations)
         } catch {
             $Result = $OperationResults[$Index]
             # The operation's own output first, then what the check observed.
