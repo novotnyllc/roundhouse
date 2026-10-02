@@ -710,6 +710,7 @@ function Invoke-Enroll {
         if ($Sid -cmatch '-500$') { throw "built_in_administrator_forbidden" }
         $Pending = Get-LaneState
         if ($Pending.State -ceq "canary_pending" -and $null -ne $Pending.Identity -and
+            $Pending.Identity.'host-id' -ceq $HostId -and
             $Pending.Identity.'owner-sid' -ceq $Sid -and $Pending.Identity.'lane-version' -ceq (Get-PluginVersionBeside $Self)) {
             # Everything is installed at this version; only the owner's probe
             # is missing, and that needs no consent at all.
@@ -1087,11 +1088,25 @@ function Submit-Request([string]$ActionId, [string]$PackageId, [string]$WantedVe
     return $Result
 }
 function Compare-WinGetVersion([string]$Left, [string]$Right) {
-    # Highest available version: numeric dotted compare when both parse as
-    # [Version], ordinal otherwise (the SYSTEM side re-checks availability).
+    # Highest available version: [Version] when both parse; otherwise the
+    # strings are split into numeric and non-numeric runs and compared run
+    # by run, numeric runs numerically (so 2.10.0-preview > 2.9.0-preview),
+    # the rest ordinally. The SYSTEM side re-checks availability anyway.
     $L = $null; $R = $null
     if ([Version]::TryParse($Left, [ref]$L) -and [Version]::TryParse($Right, [ref]$R)) { return $L.CompareTo($R) }
-    return [StringComparer]::Ordinal.Compare($Left, $Right)
+    $LeftRuns = @([regex]::Matches($Left, '\d+|\D+') | ForEach-Object { $_.Value })
+    $RightRuns = @([regex]::Matches($Right, '\d+|\D+') | ForEach-Object { $_.Value })
+    $Count = [Math]::Max($LeftRuns.Count, $RightRuns.Count)
+    for ($i = 0; $i -lt $Count; $i++) {
+        if ($i -ge $LeftRuns.Count) { return -1 }
+        if ($i -ge $RightRuns.Count) { return 1 }
+        $A = $LeftRuns[$i]; $B = $RightRuns[$i]
+        if ($A -cmatch '^\d+$' -and $B -cmatch '^\d+$') {
+            $Cmp = ([bigint]::Parse($A)).CompareTo([bigint]::Parse($B))
+        } else { $Cmp = [StringComparer]::Ordinal.Compare($A, $B) }
+        if ($Cmp -ne 0) { return $Cmp }
+    }
+    return 0
 }
 function Get-CandidateRecord([string]$Id, [string]$SourceName) {
     # The owner-side view of a package's installed and highest available
@@ -1268,6 +1283,8 @@ function Invoke-SelfTest {
             Assert-SelfTest $Rejected "closed catalog: $($Bad -join ' ')"
         }
         # WinGet actions through the fixture provider.
+        Assert-SelfTest ((Compare-WinGetVersion "2.10.0-preview" "2.9.0-preview") -gt 0 -and (Compare-WinGetVersion "1.2.3" "1.10.0") -lt 0 -and
+            (Compare-WinGetVersion "26.1.0" "26.1.0") -eq 0 -and (Compare-WinGetVersion "7.1.5 (43453)" "7.1.5 (43452)") -gt 0) "version ordering"
         $CandidateLines = Get-CandidateRecord "Example.Tool" "winget"
         Assert-SelfTest (($CandidateLines -join "`n") -ceq "lane-candidate|1`npackage|Example.Tool`ninstalled|1.0.0`ncandidate|2.0.0`nend-candidate|") "candidate record: $($CandidateLines -join ' ')"
         $CandidateLines = Get-CandidateRecord "Example.Missing" "winget"

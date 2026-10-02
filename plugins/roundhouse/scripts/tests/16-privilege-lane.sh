@@ -17,7 +17,10 @@ chmod +x "$lane_tmp/bin/roundhouse"
 cat >"$lane_tmp/bin/apt-get" <<SH
 #!/bin/sh
 printf 'apt-get %s\n' "\$*" >>"$lane_tmp/apt.log"
-case "\$*" in *"install curl=8.2.0-1"*) printf '8.2.0-1\n' >"$lane_tmp/state-curl" ;; esac
+case "\$*" in
+  "-q update") [ ! -e "$lane_tmp/apt-update-fail" ] || exit 100 ;;
+  *"install curl=8.2.0-1"*) printf '8.2.0-1\n' >"$lane_tmp/state-curl" ;;
+esac
 exit 0
 SH
 cat >"$lane_tmp/bin/apt-cache" <<SH
@@ -265,6 +268,14 @@ EOF
   grep -q 'only-upgrade install curl=8.2.0-1' "$lane_tmp/apt.log" || fail "full-pass apt upgrade did not run through the lane: $(cat "$lane_tmp/apt.log")"
   [ "$(grep -c '|apt.update-metadata.v1|' "$lane_tmp/fixture/var/lib/roundhouse-lane/journal/events.log")" -ge 1 ] || fail 'refresh not journaled'
   lane_fleet_apt_refreshed=; lane_fleet_apt_alerted=
+  # A failed metadata refresh holds the pass's apt upgrades: nothing is
+  # upgraded from a stale cache.
+  : >"$lane_tmp/apt.log"; : >"$lane_tmp/apt-update-fail"; printf '8.1.0-1\n' >"$lane_tmp/state-curl"
+  lane_apt_hold=$(lane_env lane_fleet_run_apt "$tmp/store" test-apt curl curl "" 2>/dev/null) || :
+  rm -f "$lane_tmp/apt-update-fail"
+  printf '%s\n' "$lane_apt_hold" | grep -q 'apt metadata refresh did not complete' || fail "failed refresh did not hold: $lane_apt_hold"
+  grep -q 'only-upgrade' "$lane_tmp/apt.log" && fail 'an upgrade ran after a failed metadata refresh'
+  lane_fleet_apt_refreshed=; lane_fleet_apt_alerted=; lane_fleet_apt_refresh_failed=
   # A host-local plan whose version is not the candidate is refused at
   # sealing, and nothing reaches apt-get.
   : >"$lane_tmp/apt.log"

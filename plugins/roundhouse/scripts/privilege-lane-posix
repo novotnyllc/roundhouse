@@ -432,6 +432,11 @@ lane_state() {
   for d in "$claims_dir" "$journal_dir" "$results_dir"; do
     protected_path "$d" || { st_detail="$d unprotected"; return 0; }
   done
+  # The owner must be able to reach the helper and read its results: a
+  # root-only 0700 on any of these is protected but unusable, so it is drift.
+  for d in "$libexec_dir" "$state_dir" "$results_dir"; do
+    [ "$(file_mode "$d")" = 755 ] || { st_detail="$d is not traversable by the owner (mode $(file_mode "$d"), expected 755)"; return 0; }
+  done
   if ! owner_can_dispatch; then st_detail='sudo does not permit the owner to dispatch'; return 0; fi
   if [ "$id_platform" != "$platform" ]; then st_detail="enrolled for $id_platform on $platform"; return 0; fi
   st_state=ready
@@ -1376,6 +1381,11 @@ self_test() {
   "$installed" request macos.install-signed-pkg.v1 com.example.tool 1.2.3 ABCDE12345 --payload "$payload" >"$root/unsigned.out" 2>&1 && self_fail 'unsigned pkg accepted'
   rm -f "$root/pkg-unsigned"
   grep -Fqx 'reason|package_not_developer_id_signed' "$root/unsigned.out" || self_fail 'unsigned pkg reason'
+  # A results directory the owner cannot read is drift, not ready.
+  chmod 700 "$root/fixture$lane_state/results"
+  rc=0; out=$("$installed" status) || rc=$?
+  [ "$rc" -eq 74 ] && printf '%s\n' "$out" | grep -Fqx 'state|drifted' || self_fail 'owner-inaccessible results dir reported as ready'
+  chmod 755 "$root/fixture$lane_state/results"
   # Revocation removes the grant, the script and the queue, keeps the journal.
   rc=0; out=$("$installed" revoke) || rc=$?
   [ "$rc" -eq 0 ] && [ ! -e "$root/fixture$lane_sudoers" ] && [ ! -e "$installed" ] &&

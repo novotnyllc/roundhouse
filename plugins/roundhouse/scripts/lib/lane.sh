@@ -849,10 +849,22 @@ lane_fleet_run_apt() {
   # Metadata refresh once per pass, then the upgrade: each a sealed plan
   # against this host, verified and applied with the full precondition
   # recheck — never an ad-hoc request.
+  # A refresh that did not complete holds every apt upgrade this pass: a
+  # candidate read from a stale cache is not a candidate. The failure is
+  # reported once, and the flag is set only by a completed refresh.
+  if [ "${lane_fleet_apt_refresh_failed:-false}" = true ]; then
+    printf '  hold  packages.%s — apt metadata refresh did not complete this pass\n' "$lane_fra_package"
+    return 0
+  fi
   if [ "${lane_fleet_apt_refreshed:-false}" != true ]; then
-    lane_host_apply "$lane_fra_host" "[$(lane_operation_json apt.update-metadata.v1)]" </dev/null ||
-      printf 'roundhouse: lane apt metadata refresh did not complete\n' >&2
-    lane_fleet_apt_refreshed=true
+    if lane_host_apply "$lane_fra_host" "[$(lane_operation_json apt.update-metadata.v1)]" </dev/null; then
+      lane_fleet_apt_refreshed=true
+    else
+      lane_fleet_apt_refresh_failed=true
+      printf 'roundhouse: lane apt metadata refresh did not complete; apt upgrades hold this pass\n' >&2
+      printf '  hold  packages.%s — apt metadata refresh did not complete this pass\n' "$lane_fra_package"
+      return 0
+    fi
   fi
   lane_fra_record=$("$script_dir/privilege-lane-posix" candidate "$lane_fra_name" 2>/dev/null) || return 0
   lane_fra_installed=$(printf '%s\n' "$lane_fra_record" | awk -F '|' '$1 == "installed" { print $2; exit }')
