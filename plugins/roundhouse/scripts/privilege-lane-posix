@@ -194,9 +194,9 @@ require_root() {
 write_protected_file() {
   # write_protected_file PATH MODE < content: atomic, privileged-owned.
   local path=$1 mode=$2 tmp
-  tmp=$(mktemp "${path%/*}/.lane.XXXXXX")
-  cat >"$tmp"
-  chmod "$mode" "$tmp"
+  tmp=$(mktemp "${path%/*}/.lane.XXXXXX" 2>/dev/null) || return 1
+  cat >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod "$mode" "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$path"
 }
 ascii_record() {
@@ -749,27 +749,46 @@ compact_claims() {
     rm -rf "$entry"
   done
 }
+process_start() {
+  # process_start PID -> the process's start-time token (Linux: field 22 of
+  # /proc/PID/stat, after the parenthesised comm; elsewhere: ps lstart), or
+  # nothing when no such process runs. A pid plus its start time names one
+  # process: a reused pid carries a different token.
+  if [ -r "/proc/$1/stat" ]; then
+    sed 's/^[^)]*) //' "/proc/$1/stat" | awk '{ print $20 }'
+  else
+    ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'
+  fi
+}
+write_lock_identity() { printf '%s\n' "$$" >"$lock_dir/pid"; process_start "$$" >"$lock_dir/start"; }
 take_lock() {
-  local holder
+  local holder start stale
   if mkdir "$lock_dir" 2>/dev/null; then
-    printf '%s\n' "$$" >"$lock_dir/pid"
+    write_lock_identity
     return 0
   fi
   holder=$(cat "$lock_dir/pid" 2>/dev/null || :)
+  start=$(cat "$lock_dir/start" 2>/dev/null || :)
   if [[ $holder =~ ^[1-9][0-9]*$ ]]; then
-    # A live holder is a competitor; a dead one is a crash. A lock older
-    # than any dispatch ever runs is a crash too, whatever process now
-    # happens to carry its pid.
-    if kill -0 "$holder" 2>/dev/null && [ $(( $(now) - $(file_mtime "$lock_dir") )) -le 3600 ]; then return 1; fi
+    # The holder is a competitor while the very process that took the lock
+    # is alive — pid and start time both match — however long its native
+    # command runs. A dead pid, or a live pid with another start time (a
+    # reuse), is a crashed dispatcher's lock.
+    [ "$(process_start "$holder")" != "${start:-?}" ] || return 1
   else
     # No pid yet: the holder is between mkdir and its pid write — a
     # competitor, unless the directory has sat there far longer than any
     # dispatch runs (a crash in that window).
     [ $(( $(now) - $(file_mtime "$lock_dir") )) -gt 3600 ] || return 1
   fi
-  rm -rf "$lock_dir"
+  # Takeover by rename: of two dispatchers that both judged the lock stale,
+  # only one moves it aside; the other's mv fails and it yields. Nothing is
+  # ever removed that this process did not rename itself.
+  stale=$lock_dir.stale.$$
+  mv "$lock_dir" "$stale" 2>/dev/null || return 1
+  rm -rf "$stale"
   mkdir "$lock_dir" 2>/dev/null || return 1
-  printf '%s\n' "$$" >"$lock_dir/pid"
+  write_lock_identity
 }
 release_lock() {
   # Only the holder releases: a competitor that lost take_lock must never
@@ -905,8 +924,17 @@ publish_result() {
     result=$(render_result "$state" "$reason" "$4" "$5" "$6" "$7" "$8")
   fi
   [ -d "$claims_dir/$id" ] || mkdir -m 700 "$claims_dir/$id"
-  printf '%s\n' "$result" | write_protected_file "$claims_dir/$id/result" 600
-  printf '%s\n' "$result" | write_protected_file "$results_dir/$id.result" 644
+  if ! { printf '%s\n' "$result" | write_protected_file "$claims_dir/$id/result" 600; } ||
+    ! { printf '%s\n' "$result" | write_protected_file "$results_dir/$id.result" 644; }; then
+    # A result the owner cannot read is not a completed request: the
+    # journal records the publication failure and the dispatch counts it
+    # as failed; a lookup finds either the failed record or nothing.
+    state=failed; reason=result_publish_failed
+    journal_event request "$id" "$rq_action" "$rq_package" "$state" "$reason" "$rq_sha" - 2>/dev/null || :
+    result=$(render_result "$state" "$reason" "$4" "$5" "$6" "$7" "$8")
+    { printf '%s\n' "$result" | write_protected_file "$claims_dir/$id/result" 600; } 2>/dev/null || :
+    { printf '%s\n' "$result" | write_protected_file "$results_dir/$id.result" 644; } 2>/dev/null || :
+  fi
 }
 
 # --- actions ------------------------------------------------------------------
@@ -1203,7 +1231,8 @@ self_test() {
   # A failed canary (here: a live dispatch lock the probe cannot take) must
   # roll the whole enrollment back — no grant, no root copy, no identity —
   # and report the failure with its own exit status.
-  mkdir -p "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid" || self_fail 'lock fixture'
+  mkdir -p "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid" &&
+    process_start "$$" >"$root/fixture$lane_state/lock/start" || self_fail 'lock fixture'
   rc=0; out=$(ROUNDHOUSE_LANE_FIXTURE_CANARY_WAIT=2 "$lane" enroll --host-id test-host --owner "$(id -un)" --plugin-root "$plugin_root" 2>/dev/null) || rc=$?
   [ "$rc" -eq 74 ] && grep -Fqx 'state|failed' <<<"$out" && grep -Eqx 'reason\|(positive_dispatch_failed|probe_request_failed)' <<<"$out" ||
     self_fail "failed canary did not report failure (rc $rc): $out"
@@ -1296,13 +1325,27 @@ self_test() {
   rc=0; out=$(sealed apt.autoremove.v1) || rc=$?
   [ "$rc" -eq 71 ] && grep -Fqx 'reason|post_check_failed' <<<"$out" || self_fail "a failed autoremove simulation was not a failed post-check (rc $rc)"
   rm -f "$root/apt-simulate-fail"
-  # A lock whose pid is alive but whose age is beyond any dispatch is a
-  # crashed dispatcher's lock carried by a reused pid: reclaimed.
-  mkdir "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid"
+  # A lock held by a live process — pid and start time both match — is a
+  # competitor however old it is: a long apt run keeps its lock.
+  mkdir "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid" &&
+    process_start "$$" >"$root/fixture$lane_state/lock/start"
   touch -t "$(date -u -v-2H +%Y%m%d%H%M 2>/dev/null || date -u -d '-2 hours' +%Y%m%d%H%M)" "$root/fixture$lane_state/lock"
   rc=0; "$installed" dispatch >/dev/null 2>&1 || rc=$?
-  [ "$rc" -eq 0 ] || self_fail "an hours-old lock with a reused live pid was not reclaimed (rc $rc)"
-  [ "$(cat "$root/fixture$lane_state/lock/pid" 2>/dev/null)" != "$$" ] || self_fail 'the stale lock was left in place'
+  [ "$rc" -eq 75 ] && [ "$(cat "$root/fixture$lane_state/lock/pid")" = "$$" ] || self_fail "a live holder's hours-old lock was broken (rc $rc)"
+  # The same pid with another start time is a reuse: the dispatcher that
+  # took the lock is gone, and the lock is taken over by rename.
+  printf 'reused\n' >"$root/fixture$lane_state/lock/start"
+  rc=0; "$installed" dispatch >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || self_fail "a lock carried by a reused pid was not reclaimed (rc $rc)"
+  [ "$(cat "$root/fixture$lane_state/lock/pid" 2>/dev/null)" != "$$" ] || self_fail 'the reused-pid lock was left in place'
+  ls -d "$root/fixture$lane_state"/lock.stale.* >/dev/null 2>&1 && self_fail 'a renamed stale lock was left behind'
+  rm -rf "$root/fixture$lane_state/lock"
+  # A dead pid is a crash: taken over by rename, and a competitor whose
+  # rename lost yields instead of removing the winner's fresh lock.
+  mkdir "$root/fixture$lane_state/lock" && printf '%s\n' 999999 >"$root/fixture$lane_state/lock/pid" && printf 'gone\n' >"$root/fixture$lane_state/lock/start"
+  rc=0; "$installed" dispatch >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || self_fail "a dead dispatcher's lock was not reclaimed (rc $rc)"
+  ls -d "$root/fixture$lane_state"/lock.stale.* >/dev/null 2>&1 && self_fail 'a renamed stale lock was left behind'
   rm -rf "$root/fixture$lane_state/lock"
   # A lock directory with no pid yet belongs to a dispatcher between mkdir
   # and its pid write: a competitor, never a stale lock to break.
@@ -1426,8 +1469,20 @@ self_test() {
   rc=0; out=$("$installed" status) || rc=$?
   [ "$rc" -eq 74 ] && grep -Fqx 'state|drifted' <<<"$out" || self_fail 'owner-inaccessible results dir reported as ready'
   chmod 755 "$root/fixture$lane_state/results"
+  # A result the owner cannot read is never a completed request: the
+  # dispatch counts it failed and the journal says result_publish_failed.
+  id=request-$(random_hex 32)
+  render_request "$id" test-host "$(id -u)" plan-0123456789abcdef "$(sha256_text plan)" 3 lane.probe.v1 - - - - "$(now)" "$(( $(now) + 60 ))" \
+    >"$root/fixture$lane_state/ingress/$id.request"
+  chmod 500 "$root/fixture$lane_state/results"
+  rc=0; out=$("$installed" dispatch) || rc=$?
+  chmod 755 "$root/fixture$lane_state/results"
+  grep -Fqx 'failed|1' <<<"$out" && grep -Fqx 'completed|0' <<<"$out" || self_fail "unpublishable result counted as (rc $rc): $out"
+  grep -q "|request|$id|lane.probe.v1|-|failed|result_publish_failed|" "$root/fixture$lane_state/journal/events.log" ||
+    self_fail 'the publication failure was not journaled'
   # Revocation under a running dispatch is refused, and removes nothing.
-  mkdir "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid"
+  mkdir "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid" &&
+    process_start "$$" >"$root/fixture$lane_state/lock/start"
   rc=0; out=$("$installed" revoke 2>&1) || rc=$?
   [ "$rc" -eq 75 ] && [ -f "$installed" ] && [ -f "$root/fixture$lane_sudoers" ] && [ -d "$root/fixture$lane_state/ingress" ] ||
     self_fail "revocation during a dispatch was not refused (rc $rc): $out"
