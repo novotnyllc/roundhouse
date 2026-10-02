@@ -697,6 +697,8 @@ if false; then
   . "$script_dir/tests/85-liveness.sh"
   # shellcheck source=tests/86-publish-verbs.sh
   . "$script_dir/tests/86-publish-verbs.sh"
+  # shellcheck source=tests/87-schedule-windows.sh
+  . "$script_dir/tests/87-schedule-windows.sh"
   # shellcheck source=tests/90-jj-bootstrap.sh
   . "$script_dir/tests/90-jj-bootstrap.sh"
   # shellcheck source=tests/91-jj-integrity.sh
