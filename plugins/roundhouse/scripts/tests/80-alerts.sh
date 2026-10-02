@@ -70,7 +70,7 @@ if [ -n "$fleet_fixture_yq" ]; then
 
     # --- every alert kind has a lifecycle, from one table ---
     for rec_kind in removal-cap integrity identity-unavailable uninstall-deferred \
-      stale-host schedule-disabled schedule-missing; do
+      stale-host schedule-disabled schedule-missing schedule-drift; do
       [ "$(fleet_alert_lifecycle "$rec_kind")" = condition ] ||
         fail "$rec_kind is not a condition alert"
     done

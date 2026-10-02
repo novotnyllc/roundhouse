@@ -169,6 +169,14 @@ printf 'loginctl %s\n' "$*" >>"$SCHED_LOG"
 [ "$1" = show-user ] || exit 64
 if [ -e "$SCHED_STATE/linger" ]; then printf 'yes\n'; else printf 'no\n'; fi
 STUB
+    cat >"$sched_bin/pgrep" <<'STUB'
+#!/bin/sh
+# The process table, for a systemd user manager only: manager-process says
+# one runs (out of this session's reach when usermgr is absent). The system
+# counts as booted with systemd (ROUNDHOUSE_TEST_SYSTEMD_BOOTED, below).
+printf 'pgrep %s\n' "$*" >>"$SCHED_LOG"
+[ -e "$SCHED_STATE/manager-process" ]
+STUB
     cat >"$sched_bin/runner" <<'STUB'
 #!/bin/sh
 # Stands in for `roundhouse` in the detached fallback. With SCHED_RUNNER_HOLD
@@ -199,7 +207,8 @@ STUB
     HOME="$sched_root/home"
     XDG_CONFIG_HOME="$HOME/.config"
     SCHED_UNAME=Darwin
-    export PATH ROUNDHOUSE_SELFTEST ROUNDHOUSE_FLEET_TRIGGER_RUNNER \
+    ROUNDHOUSE_TEST_SYSTEMD_BOOTED=1
+    export PATH ROUNDHOUSE_SELFTEST ROUNDHOUSE_FLEET_TRIGGER_RUNNER ROUNDHOUSE_TEST_SYSTEMD_BOOTED \
       ROUNDHOUSE_FLEET_STORE HOME XDG_CONFIG_HOME SCHED_UNAME
     mkdir -p "$ROUNDHOUSE_FLEET_STORE" "$HOME/Library/LaunchAgents" \
       "$HOME/.local/bin"
@@ -247,6 +256,7 @@ ROUNDHOUSE_LIB_ONLY=1
 case $1 in
   fast)
     local_plan_seal_apply() {
+      [ -z "${SCHED_KEEP_DRAFT:-}" ] || cp "$1" "$SCHED_KEEP_DRAFT"
       schedule_operations_valid "$1" "$HOME"
       jq ".operations[0]" "$1" >"$3/operation.json"
       fleet_schedule_execute "$3/operation.json"
@@ -1041,8 +1051,12 @@ fleet_run_command --fast'
     [ -f "$sched_legacy" ] && [ -e "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate" ] &&
       [ ! -e "$sched_fast" ] || fail "a refused install touched the legacy job or wrote new ones"
     : >"$HOME/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist"
-    SCHED_STORE_READY=1 sched_schedule install >/dev/null 2>&1 ||
-      fail "install with legacy entries failed"
+    sched_out=$(SCHED_STORE_READY=1 sched_schedule install 2>&1) ||
+      fail "install with legacy entries failed: $sched_out"
+    case $sched_out in
+      *'absorbed the superseded com.novotnyllc.roundhouse.autoupdate entry (kept as '*', unloaded)'*) ;;
+      *) fail "the absorbed, loaded superseded job was not reported unloaded: $sched_out" ;;
+    esac
     [ -f "$sched_fast" ] && [ -f "$sched_full" ] || fail "the absorbing install wrote no new pair"
     [ ! -e "$sched_legacy" ] && [ -f "$sched_legacy.absorbed" ] &&
       [ -f "$HOME/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist.absorbed" ] ||
@@ -1073,6 +1087,41 @@ fleet_run_command --fast'
         fail "a superseded entry whose rename failed was removed or unloaded"
       rm -f "$sched_legacy" "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate"
     )
+    # A superseded plist that cannot be read fails the observation; it is
+    # never taken for absent and left in place by a "successful" install.
+    : >"$sched_legacy"
+    chmod 000 "$sched_legacy"
+    sched_status=0
+    sched_out=$(SCHED_STORE_READY=1 sched_schedule install 2>&1) || sched_status=$?
+    chmod 600 "$sched_legacy"
+    [ "$sched_status" -ne 0 ] && [ -f "$sched_legacy" ] ||
+      fail "install with an unreadable superseded plist did not fail ($sched_status): $sched_out"
+    rm -f "$sched_legacy"
+    # A superseded job launchd will not let go of is not absorbed: the
+    # install fails and reports no absorption, and the next install unloads
+    # it although its plist was already set aside.
+    : >"$sched_legacy"
+    : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate"
+    sched_status=0
+    sched_out=$(SCHED_BOOTOUT_FAIL=1 SCHED_STORE_READY=1 sched_schedule install 2>&1) || sched_status=$?
+    [ "$sched_status" -ne 0 ] || fail "install reported success while launchd still held the superseded job: $sched_out"
+    case $sched_out in *'absorbed the superseded'*) fail "install reported a superseded job absorbed that launchd still held: $sched_out" ;; esac
+    [ -e "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate" ] ||
+      fail "the fixture's failing bootout unloaded the superseded job"
+    [ ! -e "$sched_legacy" ] || fail "the superseded plist was not set aside before its unload"
+    # Still loaded with its plist set aside, it is still a working job: not
+    # retired without an enrolled store for the new pair to converge.
+    sched_status=0
+    sched_out=$(sched_schedule install 2>&1) || sched_status=$?
+    [ "$sched_status" -eq 69 ] && [ -e "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate" ] ||
+      fail "install retired a loaded superseded job, its plist set aside, with no enrolled store ($sched_status): $sched_out"
+    sched_out=$(SCHED_STORE_READY=1 sched_schedule install 2>&1) ||
+      fail "the install after a failed superseded unload failed: $sched_out"
+    [ ! -e "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate" ] ||
+      fail "a superseded job still loaded, its plist already set aside, was not unloaded"
+    case $sched_out in *'unloaded the superseded com.novotnyllc.roundhouse.autoupdate entry'*) ;;
+      *) fail "the late unload of the superseded job was not reported: $sched_out" ;; esac
+    rm -f "$sched_legacy".absorbed.*
 
     # --- a pass never re-enables an operator-disabled job; it alerts ---
     # The stub, like launchd, keeps the job LOADED through the disable.
@@ -1122,6 +1171,43 @@ fleet_run_command --fast'
     # The condition has ended: the next pass clears the alert.
     fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
     [ ! -e "$sched_alert" ] || fail "a re-enabled job's schedule-disabled alert was not cleared"
+    # A cadence policy change after the install leaves the job on the old
+    # interval: the pass alerts on the drift (the fast job's only), leaves
+    # the job alone, and clears the alert once the policy and the
+    # definition agree again. Each pass's fold is given here; one that fails
+    # decides nothing.
+    sched_drift="$ROUNDHOUSE_FLEET_STORE/alerts/vireo/schedule-drift--fleet-fast.yaml"
+    (
+      # A large fold (here ~300 KB of other desired state, past Linux's
+      # 128 KiB limit on one environment string) is judged too: it is never
+      # exported to the compare's utilities, whose exec it would fail.
+      sched_pad=$(head -c 300000 /dev/zero | tr '\0' x)
+      fleet_fold() { printf '{"policy":{"fast_interval_minutes":45},"pad":"%s"}\n' "$sched_pad"; }
+      : >"$SCHED_LOG"
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
+      [ -f "$sched_drift" ] || fail "a pass did not alert on a job installed before a cadence policy change"
+      [ "$(yq -r '.kind' "$sched_drift")" = schedule-drift ] || fail "the drift alert has the wrong kind"
+      [ -z "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" -name 'schedule-drift--fleet-full.yaml')" ] ||
+        fail "a pass alerted on drift of a job the policy change did not touch"
+      ! grep -Eq 'launchctl (bootstrap|bootout|enable|kickstart)' "$SCHED_LOG" ||
+        fail "a pass acted on a drifted job: $(cat "$SCHED_LOG")"
+      # Unreachable (over SSH): the files still say so.
+      rm -f "$SCHED_STATE/gui"
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
+      : >"$SCHED_STATE/gui"
+      [ -f "$sched_drift" ] || fail "an unreachable scheduler cleared a standing drift alert"
+    )
+    (
+      fleet_fold() { return 1; }
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
+      [ -f "$sched_drift" ] ||
+        fail "a pass whose policy fold failed judged drift against the built-in defaults"
+    )
+    (
+      fleet_fold() { printf '{}\n'; }
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
+      [ ! -e "$sched_drift" ] || fail "the drift alert outlived the policy change being undone"
+    )
     # Missing, with evidence the host is scheduled: alerted.
     rm -f "$sched_full"
     fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
@@ -1180,6 +1266,23 @@ fleet_run_command --fast'
     case $sched_out in *'loads at the next console login'*) ;; *) fail "install over SSH was not explained: $sched_out" ;; esac
     [ -f "$sched_fast" ] || fail "install with no GUI domain wrote no job"
     [ ! -e "$(fleet_schedule_optout_path)" ] || fail "install did not lift the opt-out"
+    # Still no GUI domain, and the plists deleted by hand: launchd may still
+    # hold a job last seen loaded, so uninstall refuses rather than reporting
+    # it gone.
+    printf 'loaded\n' >"$(fleet_schedule_state_path fast)"
+    rm -f "$sched_fast" "$sched_full"
+    # (A trigger or pass in between sees the job missing, but does not forget
+    # it was loaded while launchd cannot be asked whether it let go.)
+    fleet_schedule_job_state fast >/dev/null
+    [ "$(fleet_schedule_last_state fast)" = loaded ] ||
+      fail "an unreachable probe forgot a job last seen loaded when its plist was deleted by hand"
+    sched_status=0
+    sched_out=$(sched_schedule uninstall 2>&1) || sched_status=$?
+    [ "$sched_status" -eq 75 ] ||
+      fail "an unreachable uninstall of a job last seen loaded, its plist deleted by hand, was not refused ($sched_status): $sched_out"
+    case $sched_out in *'fast job is still installed, or was last seen loaded'*'Nothing was changed'*) ;;
+      *) fail "the refused unreachable uninstall did not say why: $sched_out" ;; esac
+    [ ! -e "$(fleet_schedule_optout_path)" ] || fail "a refused unreachable uninstall opted the host out"
 
     # --- one install or uninstall at a time ---
     # A live holder of the schedule lock (another install or uninstall, here
@@ -1316,6 +1419,14 @@ fleet_run_command --fast'
       *'fleet-fast: installed, enabled, loaded, definition differs from what install writes (roundhouse-fleet-fast.service)'*) ;;
       *) fail "status did not report a hand-edited service: $("$cli" fleet-schedule status)" ;;
     esac
+    # …and the pass alerts on it as drift, though the timer still matches.
+    (
+      fleet_fold() { printf '{}\n'; }
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" wren 2>/dev/null
+      [ -f "$ROUNDHOUSE_FLEET_STORE/alerts/wren/schedule-drift--fleet-fast.yaml" ] &&
+        [ ! -e "$ROUNDHOUSE_FLEET_STORE/alerts/wren/schedule-drift--fleet-full.yaml" ] ||
+        fail "a pass did not alert on a hand-edited service alone as drift"
+    )
     rm -f "$sched_units/roundhouse-fleet-fast.service"
     case $("$cli" fleet-schedule status) in
       *'fleet-fast: missing, definition incomplete (roundhouse-fleet-fast.service absent)'*) ;;
@@ -1325,6 +1436,12 @@ fleet_run_command --fast'
       fail "the probe did not treat a missing service as a missing job"
     cp "$sched_root/fast.service.saved" "$sched_units/roundhouse-fleet-fast.service"
     fleet_schedule_job_state fast >/dev/null
+    (
+      fleet_fold() { printf '{}\n'; }
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" wren 2>/dev/null
+      [ ! -e "$ROUNDHOUSE_FLEET_STORE/alerts/wren/schedule-drift--fleet-fast.yaml" ] ||
+        fail "the drift alert outlived the restored service"
+    )
     # Without lingering, the timers die with the session: a PREFLIGHT, so
     # install says so and writes and enables nothing.
     rm -f "$SCHED_STATE/linger"
@@ -1386,6 +1503,67 @@ fleet_run_command --fast'
     [ "$sched_status" -eq 75 ] || fail "install with no user manager did not say so ($sched_status)"
     case $sched_out in *'no systemd user manager is reachable'*'wsl.conf'*) ;; *) fail "install with no user manager named no fix: $sched_out" ;; esac
     case $sched_out in *'enable-linger'*) fail "an unreachable manager on a lingering account was blamed on lingering: $sched_out" ;; esac
+    # Still no user manager, and the fast timer enabled (its wants link on
+    # disk). While a manager process runs out of this session's reach it may
+    # run the timer, so uninstall refuses and changes nothing…
+    mkdir -p "$sched_units/timers.target.wants"
+    ln -s ../roundhouse-fleet-fast.timer "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer"
+    : >"$SCHED_STATE/manager-process"
+    sched_status=0
+    sched_out=$(sched_schedule uninstall 2>&1) || sched_status=$?
+    [ "$sched_status" -eq 75 ] || fail "uninstall beside an unreachable running manager was not refused ($sched_status): $sched_out"
+    [ -L "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" ] &&
+      [ -f "$sched_units/roundhouse-fleet-fast.timer" ] ||
+      fail "an uninstall refused beside an unreachable running manager changed something"
+    # The plan refuses too, link or no link: another session may have started
+    # the disabled timer by hand, and removing its units would not stop it.
+    mv "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" "$sched_root/fast.wants"
+    mkdir -p "$sched_root/plan-work"
+    ! fleet_schedule_plan_steps uninstall "$(fleet_schedule_observe)" "$sched_root/plan-work" >/dev/null 2>&1 ||
+      fail "the uninstall plan removed units an unreachable running manager may still run"
+    mv "$sched_root/fast.wants" "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer"
+    # …and with no manager running at all, the sealed plan removes the link
+    # with the units, instead of refusing — unless a manager has started by
+    # the time the executor reaches the link (the sealed step, run directly).
+    rm -f "$SCHED_STATE/manager-process"
+    jq -n --arg link "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" '
+      {type:"agent-update",kind:"agent_artifact",id:"roundhouse:schedule",
+       argv:["roundhouse","fleet-schedule","uninstall"],
+       steps:[{action:"unlink",mode:"fast",path:$link}]}' >"$sched_root/unlink-op.json"
+    : >"$SCHED_STATE/manager-process"
+    sched_status=0
+    fleet_schedule_execute "$sched_root/unlink-op.json" >/dev/null 2>&1 || sched_status=$?
+    [ "$sched_status" -eq 65 ] && [ -L "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" ] ||
+      fail "the executor unlinked a wants link after a user manager started ($sched_status)"
+    rm -f "$SCHED_STATE/manager-process"
+    sched_out=$(SCHED_KEEP_DRAFT="$sched_root/unlink-draft.json" sched_schedule uninstall 2>&1) ||
+      fail "uninstall with no user manager running failed: $sched_out"
+    jq -e --arg link "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" '
+      any(.operations[0].steps[]; .action == "unlink" and .mode == "fast" and .path == $link)' \
+      "$sched_root/unlink-draft.json" >/dev/null ||
+      fail "the uninstall plan did not carry the wants link as a sealed step: $(cat "$sched_root/unlink-draft.json")"
+    [ ! -e "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" ] &&
+      [ ! -L "$sched_units/timers.target.wants/roundhouse-fleet-fast.timer" ] ||
+      fail "uninstall with no user manager running left the timer's wants link"
+    [ ! -e "$sched_units/roundhouse-fleet-fast.timer" ] && [ ! -e "$sched_units/roundhouse-fleet-full.service" ] &&
+      [ -e "$(fleet_schedule_optout_path)" ] ||
+      fail "uninstall with no user manager running did not remove the units and opt out: $sched_out"
+    case $sched_out in *'fleet-fast: disabled (no user manager is running'*) ;;
+      *) fail "uninstall did not report the removed wants link: $sched_out" ;; esac
+    # A unit deleted by hand while an unreachable manager last ran it: refused.
+    printf 'loaded\n' >"$(fleet_schedule_state_path full)"
+    : >"$SCHED_STATE/manager-process"
+    fleet_schedule_job_state full >/dev/null
+    sched_status=0
+    sched_schedule uninstall >/dev/null 2>&1 || sched_status=$?
+    [ "$sched_status" -eq 75 ] ||
+      fail "an unreachable uninstall of a timer last seen loaded, deleted by hand, was not refused ($sched_status)"
+    # Seen by a reachable manager that no longer holds it, it is forgotten.
+    : >"$SCHED_STATE/usermgr"
+    fleet_schedule_job_state full >/dev/null
+    [ "$(fleet_schedule_last_state full)" = missing ] ||
+      fail "a reachable manager that let go of a deleted timer did not forget it was loaded"
+    rm -f "$SCHED_STATE/manager-process" "$SCHED_STATE/usermgr"
 
     # A HOME and an XDG_CONFIG_HOME with spaces in them: every definition is
     # one path, installed and then removed whole, on both platforms.

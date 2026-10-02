@@ -90,6 +90,42 @@ fleet_schedule_legacy_plists() {
   done
 }
 
+fleet_schedule_legacy_entries() {
+  # The superseded entries as ONE JSON array, an object per label in
+  # fleet_schedule_legacy_labels, plist or not: its plist path, the plist's
+  # sha256 (null when absent), and whether launchd still holds the job
+  # (`loaded`; false with no GUI domain, where no agent can be loaded). One
+  # whose plist an earlier install set aside but whose unload failed is
+  # still a second runner, so it is listed by its label, not its file. A
+  # present plist that cannot be hashed fails the observation (exit 1): read
+  # as absent, it would never be set aside.
+  legacy_entries='[]'
+  legacy_domain=$(fleet_schedule_gui_domain)
+  legacy_reachable=false
+  ! launchctl print "$legacy_domain" >/dev/null 2>&1 || legacy_reachable=true
+  for legacy_label in $fleet_schedule_legacy_labels; do
+    legacy_path="$HOME/Library/LaunchAgents/$legacy_label.plist"
+    legacy_digest=
+    if [ -f "$legacy_path" ]; then
+      legacy_digest=$(sha256_file "$legacy_path" 2>/dev/null) || return 1
+      case $legacy_digest in
+        *[!0-9a-f]* | '') return 1 ;;
+      esac
+      [ "${#legacy_digest}" -eq 64 ] || return 1
+    fi
+    legacy_loaded=false
+    if [ "$legacy_reachable" = true ] &&
+      launchctl print "$legacy_domain/$legacy_label" >/dev/null 2>&1; then
+      legacy_loaded=true
+    fi
+    legacy_entries=$(printf '%s\n' "$legacy_entries" | jq -c --arg label "$legacy_label" \
+      --arg path "$legacy_path" --arg digest "$legacy_digest" --argjson loaded "$legacy_loaded" \
+      '. + [{label:$label,path:$path,digest:(if $digest == "" then null else $digest end),
+        loaded:$loaded}]')
+  done
+  printf '%s\n' "$legacy_entries"
+}
+
 fleet_schedule_paths_in_home() {
   # True when every path on stdin (one per line) is strictly under $HOME. A
   # definition is per-user state: an XDG_CONFIG_HOME pointing elsewhere must
@@ -200,18 +236,47 @@ fleet_schedule_systemd_def_paths() {
   fleet_schedule_systemd_def_path "$1"
 }
 
+fleet_schedule_systemd_wants_path() {
+  # fast|full -> the timers.target.wants link `systemctl --user enable`
+  # makes: the timer's enablement, on disk.
+  printf '%s/timers.target.wants/%s.timer\n' "$(fleet_schedule_unit_dir)" "$(fleet_schedule_unit "$1")"
+}
+
+fleet_schedule_systemd_manager_runs() {
+  # True when a systemd user manager may be running for this user — asked
+  # only once `systemctl --user` could not reach one (no XDG_RUNTIME_DIR over
+  # SSH, say), because such a manager still runs its timers. A system not
+  # booted with systemd (WSL without it) runs none. Otherwise the system
+  # manager is asked about user@UID.service, then the process table, and
+  # whatever cannot rule a manager out counts as one running.
+  if fleet_test_hook "${ROUNDHOUSE_TEST_SYSTEMD_BOOTED:-}"; then
+    [ "$ROUNDHOUSE_TEST_SYSTEMD_BOOTED" = 1 ] || return 1
+  else
+    [ -d /run/systemd/system ] || return 1
+  fi
+  ! systemctl is-active --quiet "user@$(id -u).service" 2>/dev/null || return 0
+  command -v pgrep >/dev/null 2>&1 || return 0
+  manager_runs_rc=0
+  pgrep -u "$(id -u)" -x systemd >/dev/null 2>&1 || manager_runs_rc=$?
+  [ "$manager_runs_rc" -ne 1 ]
+}
+
 fleet_schedule_systemd_facts() {
   # The scheduler half of fleet_schedule_facts. With no manager to ask,
   # `enable` is a symlink on disk (timers.target.wants), so that is read
-  # instead; lingering is logind's, and is read either way.
+  # instead, and whether a manager runs out of this session's reach
+  # (`manager_unreached`);
+  # lingering is logind's, and is read either way.
   systemd_timer="$(fleet_schedule_unit "$1").timer"
   systemd_lingers=1
   fleet_schedule_lingers || systemd_lingers=0
   if ! fleet_schedule_user_manager; then
     systemd_wants=0
-    [ ! -L "$(fleet_schedule_unit_dir)/timers.target.wants/$systemd_timer" ] || systemd_wants=1
-    printf 'reachable=0 enabled=0 disabled=0 active=0 wants=%s lingers=%s\n' \
-      "$systemd_wants" "$systemd_lingers"
+    [ ! -L "$(fleet_schedule_systemd_wants_path "$1")" ] || systemd_wants=1
+    systemd_unreached=0
+    ! fleet_schedule_systemd_manager_runs || systemd_unreached=1
+    printf 'reachable=0 enabled=0 disabled=0 active=0 wants=%s manager_unreached=%s lingers=%s\n' \
+      "$systemd_wants" "$systemd_unreached" "$systemd_lingers"
     return 0
   fi
   systemd_enabled=0
@@ -268,7 +333,8 @@ fleet_schedule_facts() {
   #   present    1 when EVERY definition file exists (fleet_schedule_def_paths)
   #   reachable  the GUI domain / user manager answers
   #   loaded disabled                      (launchd; 0 when unreachable)
-  #   enabled disabled active wants lingers (systemd)
+  #   enabled disabled active wants lingers (systemd); manager_unreached
+  #              (systemd, unreachable: a manager runs that cannot be asked)
   #
   # Values never carry spaces; fleet_schedule_facts_read splits them.
   facts_platform=$(fleet_schedule_platform)
@@ -289,7 +355,7 @@ fleet_schedule_facts_read() {
   # fleet_schedule_facts_read FACTS — split a facts line into sf_<key>
   # globals (absent keys read as 0). Pure: no process, no scheduler query.
   sf_platform= sf_present=0 sf_reachable=0 sf_loaded=0 sf_disabled=0
-  sf_enabled=0 sf_active=0 sf_wants=0 sf_lingers=1
+  sf_enabled=0 sf_active=0 sf_wants=0 sf_manager_unreached=0 sf_lingers=1
   for facts_word in $1; do
     case $facts_word in
       platform=*) sf_platform=${facts_word#*=} ;;
@@ -300,6 +366,7 @@ fleet_schedule_facts_read() {
       enabled=*) sf_enabled=${facts_word#*=} ;;
       active=*) sf_active=${facts_word#*=} ;;
       wants=*) sf_wants=${facts_word#*=} ;;
+      manager_unreached=*) sf_manager_unreached=${facts_word#*=} ;;
       lingers=*) sf_lingers=${facts_word#*=} ;;
     esac
   done
@@ -358,6 +425,36 @@ fleet_schedule_still_scheduled() {
     [ "$sf_wants" = 1 ]
 }
 
+fleet_schedule_out_of_reach() {
+  # fleet_schedule_out_of_reach MODE FACTS — true when MODE's job may still
+  # be held by a scheduler this session cannot reach, so an uninstall cannot
+  # end it and must refuse rather than remove its files: launchd with no GUI
+  # domain, or a systemd user manager that runs but cannot be asked. Held, or
+  # may be: any of its definitions or its wants link on disk, or — the files
+  # deleted by hand — a last state seen that the scheduler holds (loaded, or
+  # disabled, which launchd keeps loaded). A systemd user with NO manager
+  # running holds nothing in memory; its enablement is the wants link on
+  # disk, which the sealed uninstall removes.
+  fleet_schedule_facts_read "$2"
+  [ "$sf_reachable" != 1 ] || return 1
+  if [ "$sf_platform" = systemd ] && [ "$sf_manager_unreached" != 1 ]; then
+    return 1
+  fi
+  [ "$sf_wants" != 1 ] || return 0
+  reach_paths=$(fleet_schedule_def_paths "$1")
+  while IFS= read -r reach_path; do
+    if [ -n "$reach_path" ] && [ -f "$reach_path" ]; then
+      return 0
+    fi
+  done <<EOF_REACH
+$reach_paths
+EOF_REACH
+  case $(fleet_schedule_last_state "$1") in
+    loaded | disabled) return 0 ;;
+  esac
+  return 1
+}
+
 fleet_schedule_probe() {
   # fleet_schedule_probe fast|full -> the state word, read-only.
   fleet_schedule_state_word "$(fleet_schedule_facts "$1")"
@@ -393,15 +490,33 @@ fleet_schedule_last_state() {
 fleet_schedule_job_state() {
   # fleet_schedule_job_state fast|full [FACTS] — the state word, remembered:
   # every state actually observed is written to store.run/schedule-state.MODE,
-  # and `unavailable` never overwrites one. That memory is what lets a trigger
-  # over SSH (no GUI domain to ask) still honour an operator's disable it can
-  # no longer see. FACTS, when the caller already read them, are not re-read.
+  # `unavailable` never overwrites one, and `missing` replaces a held state
+  # only once the scheduler is seen to have let go of the job. That memory is
+  # what lets a trigger over SSH (no GUI domain to ask) still honour an
+  # operator's disable it can no longer see. FACTS, when the caller already
+  # read them, are not re-read.
   #
   # Written whole through a temporary file UNIQUE to this writer and renamed
   # into place, so two triggers racing on one job leave one complete state,
   # never a torn file or another writer's half-written temporary.
-  job_state=$(fleet_schedule_state_word "${2:-$(fleet_schedule_facts "$1")}")
-  if [ "$job_state" != unavailable ] && [ "$(fleet_schedule_last_state "$1")" != "$job_state" ]; then
+  job_state_facts=${2:-$(fleet_schedule_facts "$1")}
+  job_state=$(fleet_schedule_state_word "$job_state_facts")
+  job_state_last=$(fleet_schedule_last_state "$1")
+  job_state_keep=false
+  # A held state (loaded, disabled) is not forgotten for `missing` — the
+  # definitions deleted by hand — until the scheduler is seen to have let go:
+  # an unreachable one may still run the job, and uninstall refuses on the
+  # memory (fleet_schedule_out_of_reach).
+  case $job_state:$job_state_last in
+    missing:loaded | missing:disabled)
+      fleet_schedule_facts_read "$job_state_facts"
+      if [ "$sf_reachable" != 1 ] || fleet_schedule_still_scheduled "$job_state_facts"; then
+        job_state_keep=true
+      fi
+      ;;
+  esac
+  if [ "$job_state" != unavailable ] && [ "$job_state_keep" != true ] &&
+    [ "$job_state_last" != "$job_state" ]; then
     job_state_path=$(fleet_schedule_state_path "$1")
     if mkdir -p "$(dirname "$job_state_path")" &&
       job_state_next=$(mktemp "$job_state_path.next.XXXXXX" 2>/dev/null); then
@@ -420,10 +535,16 @@ fleet_schedule_interval() {
   # jittered from the host NAME, so the scheduler and the policy cannot
   # drift apart and two hosts do not fire on the same minute. The fold is the
   # working copy's, like fleet_run_stale_after's; a store with no policy reads
-  # the built-in defaults (20 ± 5 min, 12 h ± 90 min).
+  # the built-in defaults (20 ± 5 min, 12 h ± 90 min). A caller that already
+  # folded the store sets fleet_schedule_fold to that fold (the pass's drift
+  # check, which must not judge against defaults it fell back to).
   interval_host=$(fleet_host_name 2>/dev/null) || interval_host=
-  interval_fold=$(fleet_fold "$(fleet_store_path)" "$interval_host" 2>/dev/null) ||
-    interval_fold=
+  if [ -n "${fleet_schedule_fold:-}" ]; then
+    interval_fold=$fleet_schedule_fold
+  else
+    interval_fold=$(fleet_fold "$(fleet_store_path)" "$interval_host" 2>/dev/null) ||
+      interval_fold=
+  fi
   [ -n "$interval_fold" ] || interval_fold='{}'
   fleet_run_interval_seconds "$interval_fold" "$interval_host" "$1"
 }
@@ -523,6 +644,25 @@ fleet_schedule_same() {
   esac
 }
 
+fleet_schedule_differs() {
+  # fleet_schedule_differs fast|full — the file NAMES of MODE's definitions
+  # that exist and differ from what `install` writes now
+  # (fleet_schedule_render), one per line; silence when every one that exists
+  # matches. Never their content. What `status` reports as "differs" and the
+  # pass alerts on as drift. Exit 1 when it cannot compare at all.
+  differs_paths=$(fleet_schedule_def_paths "$1") || return 1
+  differs_rendered=$(mktemp "${TMPDIR:-/tmp}/roundhouse-schedule-def.XXXXXX") || return 1
+  while IFS= read -r differs_path; do
+    [ -n "$differs_path" ] && [ -f "$differs_path" ] || continue
+    fleet_schedule_render "$1" "$differs_path" >"$differs_rendered"
+    fleet_schedule_same "$differs_path" "$differs_rendered" ||
+      printf '%s\n' "${differs_path##*/}"
+  done <<EOF_DIFFERS
+$differs_paths
+EOF_DIFFERS
+  rm -f "$differs_rendered"
+}
+
 fleet_schedule_write_definition() {
   # fleet_schedule_write_definition PATH RENDERED-FILE — put one definition in
   # place. An existing one is KEPT as PATH.replaced first, and a backup that
@@ -599,20 +739,13 @@ fleet_schedule_status_facts() {
     fleet_schedule_facts_read "$status_facts"
     status_reachable=false
     [ "$sf_reachable" != 1 ] || status_reachable=true
-    : >"$status_dir/paths"
-    : >"$status_dir/differs"
     : >"$status_dir/absent"
     fleet_schedule_def_paths "$status_mode" >"$status_dir/paths"
     while IFS= read -r status_path; do
-      [ -n "$status_path" ] || continue
-      if [ ! -f "$status_path" ]; then
+      [ -z "$status_path" ] || [ -f "$status_path" ] ||
         printf '%s\n' "${status_path##*/}" >>"$status_dir/absent"
-        continue
-      fi
-      fleet_schedule_render "$status_mode" "$status_path" >"$status_dir/def"
-      fleet_schedule_same "$status_path" "$status_dir/def" ||
-        printf '%s\n' "${status_path##*/}" >>"$status_dir/differs"
     done <"$status_dir/paths"
+    fleet_schedule_differs "$status_mode" >"$status_dir/differs" || : >"$status_dir/differs"
     jq -cn --arg mode "$status_mode" --arg state "$status_state" \
       --arg last "$(fleet_schedule_last_state "$status_mode")" \
       --argjson reachable "$status_reachable" --argjson scheduled "$status_scheduled" \
@@ -662,28 +795,47 @@ fleet_schedule_status() {
 
 # --- the pass's own check ------------------------------------------------------
 
+fleet_schedule_alert() {
+  # fleet_schedule_alert STORE HOST KIND MODE HOLDS NOTE DETAIL — one of the
+  # check's keyed conditions for MODE's job: set (and NOTE said on stderr)
+  # while HOLDS is true, cleared when it is false.
+  [ "$5" != true ] || printf 'roundhouse: %s (%s alert)\n' "$6" "$3" >&2
+  fleet_alert_set "$1" "$2" "$3" "fleet-$4" "$5" "$7" || :
+}
+
 fleet_schedule_check() {
   # fleet_schedule_check STORE HOST — called by every pass. A job the operator
-  # disabled, or one that went missing, is ALERTED and left exactly as it is:
-  # an automatic pass never enables, loads or rewrites a job. Only
-  # `roundhouse fleet-schedule install` does, because a human ran it.
+  # disabled, one that went missing, or one whose definition drifted is
+  # ALERTED and left exactly as it is: an automatic pass never enables, loads
+  # or rewrites a job. Only `roundhouse fleet-schedule install` does, because
+  # a human ran it.
   #
-  # `schedule-disabled` and `schedule-missing` are store-scoped CONDITIONS
-  # (lib/fleet-alerts.sh), one keyed alert per job (`…--fleet-fast.yaml`):
-  # this check sets each while it holds and clears it the pass it ends — the
-  # job re-enabled or reinstalled, or the host opted out with
-  # `fleet-schedule uninstall`.
+  # `schedule-disabled`, `schedule-missing` and `schedule-drift` are
+  # store-scoped CONDITIONS (lib/fleet-alerts.sh), one keyed alert per job
+  # (`…--fleet-fast.yaml`): this check sets each while it holds and clears it
+  # the pass it ends, and an opted-out host (`fleet-schedule uninstall`)
+  # raises none.
   #
   # "Missing" needs evidence the host is meant to be scheduled — the install
   # marker, or the other job still present — so a host whose operator never
   # scheduled it raises nothing. An UNREACHABLE scheduler (no GUI domain over
-  # SSH: the ordinary state of a pass a trigger started) decides nothing, so
-  # both alerts are left as they stand.
+  # SSH: the ordinary state of a pass a trigger started) decides neither
+  # disabled nor missing, so those alerts are left as they stand.
+  #
+  # "Drift" is a definition on disk that is no longer what `install` writes
+  # now (fleet_schedule_differs): the store's cadence policy changed since
+  # the install, so the job still runs on the old interval, or roundhouse's
+  # template changed, or the file was edited by hand. It is read from the
+  # files, so it is judged while the scheduler cannot be reached, against
+  # the store's policy as this pass folds it: a fold that fails decides
+  # nothing (rendering against the built-in defaults would raise a false
+  # alert whose fix, `install`, writes the wrong cadence).
   case $(fleet_schedule_platform) in launchd | systemd) ;; *) return 0 ;; esac
   check_optout=false
   [ ! -e "$(fleet_schedule_optout_path)" ] || check_optout=true
   check_fast=$(fleet_schedule_job_state fast)
   check_full=$(fleet_schedule_job_state full)
+  check_fold=$(fleet_fold "$1" "$2" 2>/dev/null) || check_fold=
   for check_mode in $fleet_schedule_modes; do
     if [ "$check_mode" = fast ]; then
       check_state=$check_fast
@@ -692,6 +844,23 @@ fleet_schedule_check() {
       check_state=$check_full
       check_other=$check_fast
     fi
+    check_drift=false
+    if [ "$check_optout" != true ] && [ "$check_state" != missing ]; then
+      if [ -z "$check_fold" ]; then
+        check_drift=unknown
+      # A plain assignment inside the substitution, never a VAR=… prefix: a
+      # prefix would EXPORT the whole fold to every utility the compare runs,
+      # and a large one fails their exec (E2BIG).
+      elif check_differs=$(fleet_schedule_fold=$check_fold; fleet_schedule_differs "$check_mode"); then
+        [ -z "$check_differs" ] || check_drift=true
+      else
+        check_drift=unknown
+      fi
+    fi
+    [ "$check_drift" = unknown ] ||
+      fleet_schedule_alert "$1" "$2" schedule-drift "$check_mode" "$check_drift" \
+        "the fleet-$check_mode scheduled job differs from the definition install writes now" \
+        "the fleet-$check_mode scheduled job on $2 differs from the definition \`roundhouse fleet-schedule install\` writes now (the cadence policy changed since it was installed, roundhouse's template changed, or it was edited by hand); run \`roundhouse fleet-schedule install\` on $2"
     [ "$check_state" != unavailable ] || [ "$check_optout" = true ] || continue
     check_disabled=false
     check_missing=false
@@ -705,17 +874,11 @@ fleet_schedule_check() {
           ;;
       esac
     fi
-    [ "$check_disabled" != true ] ||
-      printf 'roundhouse: the fleet-%s scheduled job is disabled; a pass never re-enables it (schedule-disabled alert)\n' \
-        "$check_mode" >&2
-    [ "$check_missing" != true ] ||
-      printf 'roundhouse: the fleet-%s scheduled job is missing (schedule-missing alert)\n' \
-        "$check_mode" >&2
-    fleet_alert_set "$1" "$2" schedule-disabled "fleet-$check_mode" "$check_disabled" \
-      "the fleet-$check_mode scheduled job on $2 is disabled; passes will not re-enable it. Run \`roundhouse fleet-schedule install\` on $2 to re-enable it, or \`roundhouse fleet-schedule uninstall\` if it should not be scheduled" ||
-      :
-    fleet_alert_set "$1" "$2" schedule-missing "fleet-$check_mode" "$check_missing" \
-      "the fleet-$check_mode scheduled job on $2 is missing; run \`roundhouse fleet-schedule install\` on $2" ||
-      :
+    fleet_schedule_alert "$1" "$2" schedule-disabled "$check_mode" "$check_disabled" \
+      "the fleet-$check_mode scheduled job is disabled; a pass never re-enables it" \
+      "the fleet-$check_mode scheduled job on $2 is disabled; passes will not re-enable it. Run \`roundhouse fleet-schedule install\` on $2 to re-enable it, or \`roundhouse fleet-schedule uninstall\` if it should not be scheduled"
+    fleet_schedule_alert "$1" "$2" schedule-missing "$check_mode" "$check_missing" \
+      "the fleet-$check_mode scheduled job is missing" \
+      "the fleet-$check_mode scheduled job on $2 is missing; run \`roundhouse fleet-schedule install\` on $2"
   done
 }

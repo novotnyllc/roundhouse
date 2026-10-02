@@ -21,6 +21,24 @@ mkdir -p "$integrity_cover"
 cp -R "$script_dir/../." "$integrity_cover/"
 chmod -R go-w "$integrity_cover"
 "$integrity_cover/scripts/update-integrity"
+# #56: a plugin manager running under umask 002 (the WSL default) leaves the
+# cache group-writable. executor-status, the check every seal and apply runs,
+# seals the tree it is about to trust before verifying, so the host no longer
+# refuses every sealed install until someone runs chmod by hand.
+chmod -R g+w,o+w "$integrity_cover"
+# A seal that cannot finish (here chmod fails) must refuse, not trust a tree
+# that is still writable by others.
+mkdir -p "$tmp/chmod-fails"
+printf '#!/bin/sh\nexit 1\n' >"$tmp/chmod-fails/chmod"
+command chmod 700 "$tmp/chmod-fails/chmod"
+if PATH="$tmp/chmod-fails:$PATH" "$integrity_cover/scripts/roundhouse" executor-status - \
+  >/dev/null 2>&1; then
+  fail "executor status trusted a plugin root it could not seal"
+fi
+"$integrity_cover/scripts/roundhouse" executor-status - >/dev/null ||
+  fail "executor status refused a group-writable plugin root instead of sealing it first"
+[ -z "$(find "$integrity_cover" ! -type l \( -perm -020 -o -perm -002 \) -print)" ] ||
+  fail "executor status left group- or world-writable files in the plugin root"
 "$integrity_cover/scripts/roundhouse" executor-status "$tmp/integrity-cover-executor.json"
 jq -e '.files | any(.path == "references/codex-remote-control.md")' \
   "$integrity_cover/integrity.json" >/dev/null ||
@@ -62,6 +80,9 @@ fi
 dotfiles_home="$tmp/dotfiles-home"
 mkdir -p "$dotfiles_home"
 git -C "$dotfiles_home" init -q
+# No detached auto gc/maintenance racing the rm -rf below (see N18).
+git -C "$dotfiles_home" config gc.auto 0
+git -C "$dotfiles_home" config maintenance.auto false
 printf '.claude/\n.codex/\n' >"$dotfiles_home/.gitignore"
 git -C "$dotfiles_home" add .gitignore
 git -C "$dotfiles_home" -c user.email=test@test.invalid -c user.name=test commit -q -m dotfiles
@@ -109,6 +130,13 @@ rm -rf "$dotfiles_home"
 backup_home="$tmp/backup-home"
 mkdir -p "$backup_home"
 git -C "$backup_home" init -q
+# This repo commits the whole plugin tree and is then rm -rf'd. commit
+# spawns a detached `git maintenance run --auto`; on git 2.55 its geometric
+# repack fires at ~160 loose objects and can still be writing
+# .git/objects/pack when rm runs ("Directory not empty"). Keep every git call
+# in this repo free of auto maintenance and gc.
+git -C "$backup_home" config gc.auto 0
+git -C "$backup_home" config maintenance.auto false
 nested_backup_cache="$backup_home/.claude/plugins/cache/novotnyllc/roundhouse/$plugin_version"
 mkdir -p "$nested_backup_cache"
 cp -R "$script_dir/../." "$nested_backup_cache/"

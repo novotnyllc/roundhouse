@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "594a9ac4eda54ff16852427575cfd7458837e1ae61542150aa86cfb598af59c2"
+      "sha256": "c316d7c9023910a6042a1f3e12724e425882a2b251630c3db8de17d993a3b1f6"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "db4c57f17b42be4a5e1aa3da38fe4c2cc654bea6f47e743e455a95de58439165"
+      "sha256": "eb2ad77611bea9071f88cf9d8e0ba8d6ec4f94b78607a22cb3a31cd46c2d57e2"
     },
     {
       "path": "assets/icon.png",
@@ -50,7 +50,7 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
-      "sha256": "7b55a57d6605a886c161f6f5425f5b951ae7f7d84c4f2ffdcfcb31c2929cbe97"
+      "sha256": "8e6d4d7c8b7b2260c881d11c9d9e455ba1e10acb74f5ba94c87c924bd3b26669"
     },
     {
       "path": "scripts/codex-plugin-hooks.ps1",
@@ -98,11 +98,11 @@
     },
     {
       "path": "scripts/lib/apply-claude.sh",
-      "sha256": "714fd532a41dc95665b4b992d2e7dcf1ef3db919282a963b36ead1cd8b711689"
+      "sha256": "83d9b694f5d9a92a7d8071200eff9b2e74d2edf870fc24f0831fe1fb21ee3baa"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
-      "sha256": "42c409cd68fa74b186123e0d02162255ec2e2ee08f7eb48a72c8ba3ad06759b7"
+      "sha256": "0f22754d1df0794344f517b16db8e9df87309b34c142495cc2c431ef090fcc98"
     },
     {
       "path": "scripts/lib/broker-posix.sh",
@@ -118,7 +118,7 @@
     },
     {
       "path": "scripts/lib/fleet-alerts.sh",
-      "sha256": "97dc25f1135311f73b9fe5c4a83c82040708d676db6a9422919166041f16f191"
+      "sha256": "715bbdf30939fa5271001a46f08024ead19d78baf831fbb70138e8296565a03a"
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
@@ -154,15 +154,15 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "21efa6e5f5492611d7d6d8c3d36cad0cd85c9168d0dc53cd52d54412b9d33a22"
+      "sha256": "ebca7de963dde9d0936da1a91bd7baa2b3bff101edf2d116502816fd612ed41f"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
-      "sha256": "dab83a656630dd38ca56b6d72fd2bc93f5f13e84e6a96022d3ec5684fa8662c8"
+      "sha256": "596fd55aa99e9e091b5681b1497222ea6f1f96671846e51d8ff16fe6950ee1b9"
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
-      "sha256": "a9a0716272d28958434b466d52c4f9d4d470298c637f19654decb557690b0eba"
+      "sha256": "40d1be3753073ec7cd6e67dad36b2896b76f18d6445d2a14302742c0250c2006"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -182,11 +182,11 @@
     },
     {
       "path": "scripts/lib/fleet-vcs.sh",
-      "sha256": "2ef5b6df8aea0cc3f7d388923e07bced396a30d5c3a43e9fb3d2719177e46af7"
+      "sha256": "8c31d3195263a21cf50dd00c6833295262dbe3e9a77563c3e161e0125aef0bc0"
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "8eaf8d75a8620ffe111e9b393dbfb2ac194b80ca2a2ed6ef8a34693df6cfa750"
+      "sha256": "b898da576c4b3f9d2983d247e3a599ca5a20814abbe70d9a721ba80e40ff66fb"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -218,15 +218,15 @@
     },
     {
       "path": "scripts/lib/plan-apply.sh",
-      "sha256": "315d952a90c1295d4d97c663312c1868a97fb3aeb6fdf31c273c7f054844d198"
+      "sha256": "f35f850c3f8ff19e248c201e95ceb0f4ab3d13d032c2c3eda8f7f580c8d894dd"
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
-      "sha256": "48d3d132942167f723b29265dba41deba48d26551cc07b90daf31dff55a0d152"
+      "sha256": "dfe274a560df4471790623ceb37259191b1c71b209a8a4ba522d218e7bd3b9e2"
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "08b1e027155612e94f2371f0f87a2b754a9300252a03b69e791e4430d220131e"
+      "sha256": "6f909db3e6cdf7d2f0c641587f312f090a784299b8045a219479013987f627d5"
     },
     {
       "path": "scripts/lib/plan-verify.sh",
@@ -298,7 +298,7 @@
     },
     {
       "path": "skills/fleet-agents/SKILL.md",
-      "sha256": "e1217c0388ce99b92f237555d80d9c20f8ea9ec5b8edc2c866f8e87be076012a"
+      "sha256": "0abbf7ae8a0c745942dcf5cac830b862aea682709be7294d6415d347ac724ac9"
     },
     {
       "path": "skills/fleet-agents/agents/openai.yaml",
@@ -342,7 +342,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "c3218c3929c85da8c7352877ae2febb2826be4c9bb7c8f25cab9f2802e36e508"
+      "sha256": "80408a28b325f9c9b2b5064bd9776555ea31f1de34f97b7cafa3b1be4617782f"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",
@@ -377,5 +377,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.69"
+  "version": "0.9.64"
 }

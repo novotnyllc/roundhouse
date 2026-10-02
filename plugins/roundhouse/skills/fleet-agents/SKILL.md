@@ -160,8 +160,11 @@ the observed definition hashes and job states as its precondition,
 `fleet-schedule install` is the only path that enables a job. A pass checks its
 own jobs every time and never re-enables, loads or rewrites one: a job the
 operator disabled raises a `schedule-disabled` alert, and a job that went
-missing on a host that is scheduled raises `schedule-missing`, each one keyed
-alert for as long as it lasts, cleared by the check itself once it ends.
+missing on a host that is scheduled raises `schedule-missing`, and a job whose
+definition is no longer what `install` writes now — the cadence policy changed
+since the install, or the file was edited by hand — raises `schedule-drift`,
+each one keyed alert for as long as it lasts, cleared by the check itself once
+it ends.
 
 **Heartbeats.** Every pass records a host-local heartbeat
 (`store.run/alive`). The `outcome: alive` journal record is *published* at most
@@ -273,14 +276,16 @@ from one table (`fleet_alert_lifecycle_rows` in `lib/fleet-alerts.sh`):
 
 | Lifecycle | Scope | Kinds | Ends |
 | --- | --- | --- | --- |
-| condition | store | `removal-cap`, `integrity-store-wide`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render`, `inventory-timeout`, `stale-host` (per silent peer), `schedule-disabled` and `schedule-missing` (per job) | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
+| condition | store | `removal-cap`, `integrity-store-wide`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render`, `inventory-timeout`, `stale-host` (per silent peer), `schedule-disabled`, `schedule-missing` and `schedule-drift` (per job) | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
 | condition | item | `integrity`, `config-key-collision`, `chezmoi-coownership`, `package-hold`, `enabled-but-untrusted`, `record-write`, `identity-unavailable`, `uninstall-deferred`, `package-deferred`, `runtime-hold`, `node-runtime-unverified` | the end-of-pass sweep (`fleet_alert_sweep`) clears it when the pass **checked** the item and did not raise it, or when the item has left the fold; an item the pass skipped (held, waiting on its canary) keeps it; never ages |
 | event | store or item | `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by its latest `at` after the evidence retention window |
 
 `stale-host` clears when the peer publishes a heartbeat again, or leaves the
 roster or the enrolled hosts; `schedule-disabled` and `schedule-missing` clear
-when the job is re-enabled or reinstalled, or the host is taken off the
-schedule with `fleet-schedule uninstall`.
+when the job is re-enabled or reinstalled, and `schedule-drift` when the job is
+reinstalled or the policy changed back; all three clear when the host is taken
+off the schedule with `fleet-schedule uninstall`. A pass that cannot fold the
+store's policy leaves `schedule-drift` as it stands.
 
 `inventory-timeout` is raised by the full pass's seed, one per manager
 (`inventory-timeout--packages-homebrew.yaml`, `--agents-jsm`, …), when the
