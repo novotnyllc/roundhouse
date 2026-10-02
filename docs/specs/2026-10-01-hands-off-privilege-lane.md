@@ -80,7 +80,7 @@ The one approval installs, as root:
 | Path | Owner / mode | Content |
 | --- | --- | --- |
 | `/usr/local/libexec/roundhouse-lane/privilege-lane` | root 0755 | root-owned copy of `scripts/privilege-lane-posix` |
-| `/usr/local/libexec/roundhouse-lane/lane.identity` | root 0644 | `lane-identity|1` record (owner uid/name, host id, platform, plugin root, marketplace, version, digest) |
+| `/usr/local/libexec/roundhouse-lane/lane.identity` | root 0644 | `lane-identity\|1` record (owner uid/name, host id, platform, plugin root, marketplace, version, digest) |
 | `/etc/sudoers.d/roundhouse-lane` | root 0440 | `OWNER ALL=(root) NOPASSWD:NOSETENV: /usr/local/libexec/roundhouse-lane/privilege-lane dispatch` |
 | `/var/lib/roundhouse-lane/ingress` | owner 0700 | request files |
 | `/var/lib/roundhouse-lane/claims` | root 0700 | one directory per claimed request |

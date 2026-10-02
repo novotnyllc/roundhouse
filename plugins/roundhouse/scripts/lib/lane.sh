@@ -101,7 +101,7 @@ lane_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 # program text, so nothing crosses the `$SHELL -lc` argument boundary except
 # quoting the values themselves. Output goes through a file rather than a
 # pipe so pwsh's exit status survives.
-lane_windows_program='root=$1; pwsh=$2; script=$3; shift 3; if [ ! -f "$root/ProgramData/Roundhouse-Lane/privilege-lane-windows.ps1" ]; then printf "%s\n" "lane-status|1" "state|needs_one_time_approval" "platform|windows" "host-id|-" "owner-sid|-" "owner-name|-" "lane-version|-" "lane-sha256|-" "plugin-root|-" "interop-token|-" "detail|installed lane copy absent" "next-command|roundhouse privilege-enroll HOST" "end-status|"; exit 75; fi; [ -x "$pwsh" ] || { printf "privilege-lane: PowerShell 7 is not reachable through WSL interop\n" >&2; exit 69; }; cd "$root" || exit 69; out=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lane.XXXXXX") || exit 69; "$pwsh" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$script" "$@" </dev/null >"$out"; rc=$?; tr -d "\r" <"$out"; rm -f "$out"; exit "$rc"'
+lane_windows_program='root=$1; pwsh=$2; script=$3; shift 3; if [ ! -f "$root/ProgramData/Roundhouse-Lane/privilege-lane-windows.ps1" ]; then if [ -e "$root/ProgramData/Roundhouse-Lane/lane.identity" ]; then printf "%s\n" "lane-status|1" "state|drifted" "platform|windows" "host-id|-" "owner-sid|-" "owner-name|-" "lane-version|-" "lane-sha256|-" "plugin-root|-" "interop-token|-" "detail|installed lane copy missing while the identity survives" "next-command|roundhouse privilege-enroll HOST" "end-status|"; exit 74; fi; printf "%s\n" "lane-status|1" "state|needs_one_time_approval" "platform|windows" "host-id|-" "owner-sid|-" "owner-name|-" "lane-version|-" "lane-sha256|-" "plugin-root|-" "interop-token|-" "detail|installed lane copy absent" "next-command|roundhouse privilege-enroll HOST" "end-status|"; exit 75; fi; [ -x "$pwsh" ] || { printf "privilege-lane: PowerShell 7 is not reachable through WSL interop\n" >&2; exit 69; }; cd "$root" || exit 69; out=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lane.XXXXXX") || exit 69; "$pwsh" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$script" "$@" </dev/null >"$out"; rc=$?; tr -d "\r" <"$out"; rm -f "$out"; exit "$rc"'
 lane_windows_enroll_program='root=$1; pwsh=$2; version=$3; host=$4; [ -x "$pwsh" ] || { printf "privilege-lane: PowerShell 7 is not reachable through WSL interop\n" >&2; exit 69; }; cd "$root" || exit 69; profile=$("$root/Windows/System32/cmd.exe" /c "echo %USERPROFILE%" 2>/dev/null | tr -d "\r"); case $profile in [A-Za-z]:\\*) ;; *) printf "privilege-lane: cannot resolve the Windows user profile through interop\n" >&2; exit 69 ;; esac; helper=; for cache in .claude .codex; do candidate="$profile\\$cache\\plugins\\cache\\novotnyllc\\roundhouse\\$version\\scripts\\privilege-lane-windows.ps1"; posix=$(printf "%s" "$candidate" | sed "s#^[A-Za-z]:#$root#; s#\\\\#/#g"); [ -f "$posix" ] && helper=$candidate && break; done; [ -n "$helper" ] || { printf "privilege-lane: roundhouse %s is not installed in a Windows plugin cache; install or update the Windows plugin first\n" "$version" >&2; exit 69; }; out=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lane.XXXXXX") || exit 69; "$pwsh" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$helper" -Enroll -HostId "$host" </dev/null >"$out"; rc=$?; tr -d "\r" <"$out"; rm -f "$out"; exit "$rc"'
 lane_windows_script_text() {
   # lane_windows_script_text PWSH-ARG...: the one-line remote command that
@@ -188,6 +188,12 @@ lane_status_command() (
       detail=$(lane_field "$raw" detail)
       # The host's own report wins when config has no platform for it.
       [ "$platform" != - ] || platform=$(lane_field "$raw" platform)
+      # An alias that resolves to a host enrolled under another name would
+      # run the operation on that other host: drift, never ready.
+      if [ "$(lane_field "$raw" host-id)" != - ] && [ "$(lane_field "$raw" host-id)" != "$target" ]; then
+        state=drifted
+        detail="the host is enrolled as $(lane_field "$raw" host-id), not $target; the transport resolves to another machine"
+      fi
       if [ "$(lane_field "$raw" interop-token)" = elevated ]; then
         # Requests written under an elevated token are owned by
         # Administrators, not the user, and the SYSTEM side refuses them;
@@ -628,6 +634,12 @@ apply_lane_plan() (
   plan=$1
   confirmation=$2
   output=$3
+  # The plan file is trusted input: it must be the caller's own 0600 file
+  # (its digest is unkeyed, so a writable plan could be re-digested), and
+  # the mutation config gate applies as on every other apply path. The
+  # host-local path seals into its own 0600 temp file.
+  check_mutation_config
+  check_private_owned_file "$plan" "lane apply plan"
   lane_plan_check "$plan" || exit $?
   [ "$confirmation" = "$(jq -r '.plan_id' "$plan")" ] || {
     printf 'roundhouse: apply confirmation must equal the sealed plan ID\n' >&2
@@ -748,10 +760,11 @@ lane_operation_json() {
     '{type:"semantic-action",kind:"privileged_action",id:$id,package:$package,version:$version,source:$source}'
 }
 lane_package_hold_detail() {
-  # lane_package_hold_detail ITEM HOST -> the alert text for a held package:
-  # names the one-time approval when apt is the manager this host lacks root
-  # for, the ordinary "no manager" text otherwise.
-  if command -v apt-get >/dev/null 2>&1 && [ "$(lane_local_state)" != ready ]; then
+  # lane_package_hold_detail ITEM HOST [MANAGER] -> the alert text for a held
+  # package: names the one-time approval only when apt is the manager that
+  # would provide it and the lane is not ready; the ordinary "no manager"
+  # text otherwise (an npm or Homebrew hold is never an apt problem).
+  if [ "${3:-apt}" = apt ] && command -v apt-get >/dev/null 2>&1 && [ "$(lane_local_state)" != ready ]; then
     printf 'apt needs the local privilege lane for %s on %s: run `roundhouse privilege-enroll %s` once (a single sudo prompt); scheduled runs never prompt\n' \
       "$1" "$2" "$2"
   else

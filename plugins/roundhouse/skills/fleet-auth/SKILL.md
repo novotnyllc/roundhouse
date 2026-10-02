@@ -71,7 +71,8 @@ Privilege-lane records are status-only for this skill. Use
 adds `prepare-privilege-identity`, `preview-privilege-upgrade`, and
 `preview-privilege-revocation`), but never put an auth artifact, credential,
 secret reference, encrypted file, token, private key, or secret-backed template
-in a lane request: the lane carries package tokens and versions only. Preserve
+in a lane request: the lane carries package tokens, versions and
+action-specific fields such as the WinGet source, nothing else. Preserve
 `ready`, `needs_one_time_approval`, `user_session_unavailable`, `drifted`,
 `unreachable`, `partial`, and `rejected` without fallback.
 Never ask for or relay a sudo or Administrator password; the host's single OS

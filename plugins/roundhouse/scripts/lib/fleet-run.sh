@@ -3979,7 +3979,7 @@ fleet_run_apply_held() {
   [ "$7" -ne 75 ] || [ "$5" != packages ] ||
     fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-hold \
       "package-hold-$(printf '%s' "$4" | tr './' '--')" \
-      "$(lane_package_hold_detail "$4" "$2")" "$4" ||
+      "$(lane_package_hold_detail "$4" "$2" "$(fleet_resolve_package "$3" "${4#packages.}" apt 2>/dev/null | jq -r '.manager // "none"')")" "$4" ||
     :
   [ "$7" -ne 73 ] || [ "$5" != packages ] ||
     fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-deferred \

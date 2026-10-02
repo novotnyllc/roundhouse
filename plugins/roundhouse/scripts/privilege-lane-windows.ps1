@@ -260,6 +260,10 @@ function New-NativeBoundary {
             $Acl = Get-Acl -LiteralPath $Path
             return [string]$Acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
         }
+        ReadSddl = {
+            param([string]$Path)
+            return [string](Get-Acl -LiteralPath $Path).GetSecurityDescriptorSddlForm("DAO")
+        }
         SetDirectorySddl = {
             param([string]$Path, [string]$Sddl)
             $Security = [Security.AccessControl.DirectorySecurity]::new()
@@ -395,6 +399,32 @@ function Get-ProtectedSddl { return "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;B
 function Get-OwnerReadSddl([string]$OwnerSid) { return "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;$OwnerSid)" }
 function Get-IngressSddl([string]$OwnerSid) { return "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;$OwnerSid)" }
 function Get-ResultFileSddl([string]$OwnerSid) { return "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120089;;;$OwnerSid)" }
+function Test-ProtectedAcl([string]$Sddl, [string]$OwnerSid, [bool]$OwnerMayRead) {
+    # SYSTEM and Administrators must hold allow ACEs; no other principal may
+    # hold any write/delete/change-permission bit, and the owner may hold at
+    # most read bits (only on owner-readable paths). The service rewrites
+    # generic rights, so masks are inspected, never compared for equality.
+    if ($script:Fixture) {
+        $Expected = if ($OwnerMayRead) { Get-OwnerReadSddl $OwnerSid } else { Get-ProtectedSddl }
+        return $Sddl -ceq $Expected
+    }
+    try { $Descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($Sddl) } catch { return $false }
+    $WriteBits = 0x40000000 -bor 0x10000000 -bor 0x00000002 -bor 0x00000004 -bor 0x00000100 -bor 0x00010000 -bor 0x00040000 -bor 0x00080000
+    $Seen = @{}
+    foreach ($Ace in @($Descriptor.DiscretionaryAcl)) {
+        if ($Ace -isnot [Security.AccessControl.CommonAce]) { return $false }
+        $Sid = [string]$Ace.SecurityIdentifier.Value
+        if ($Ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed) { continue }
+        $Seen[$Sid] = $true
+        if ($Sid -cin @($script:SystemSid, "S-1-5-32-544")) { continue }
+        if ($Sid -ceq $OwnerSid -and $OwnerMayRead) {
+            if (([int]$Ace.AccessMask -band $WriteBits) -ne 0) { return $false }
+            continue
+        }
+        return $false
+    }
+    return $Seen.ContainsKey($script:SystemSid) -and $Seen.ContainsKey("S-1-5-32-544")
+}
 function Get-TaskSddl([string]$OwnerSid) { return "O:SYG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;$OwnerSid)" }
 function Get-LaneTaskXml([string]$ScriptPath, [string]$WorkingDirectory) {
     $Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $ScriptPath + '" -Dispatch'
@@ -461,8 +491,8 @@ function Test-LaneTaskSddl([string]$Sddl, [string]$OwnerSid) {
 function Write-ProtectedBytes([string]$Path, [byte[]]$Bytes, [string]$Sddl) {
     $Temporary = Join-Path (Split-Path -Parent $Path) (".lane-" + [Guid]::NewGuid().ToString("n"))
     [IO.File]::WriteAllBytes($Temporary, $Bytes)
-    if ($Sddl.Length -gt 0 -and -not $script:Fixture) { & $script:Native.SetFileSddl $Temporary $Sddl }
     [IO.File]::Move($Temporary, $Path, $true)
+    if ($Sddl.Length -gt 0) { & $script:Native.SetFileSddl $Path $Sddl }
 }
 
 # --- status -------------------------------------------------------------------
@@ -481,6 +511,18 @@ function Get-LaneState {
     }
     foreach ($Directory in @($Paths.Ingress, $Paths.Results, $Paths.Claims, $Paths.Journal)) {
         if (-not [IO.Directory]::Exists($Directory)) { $Result.Detail = "queue directory missing: $Directory"; return [pscustomobject]$Result }
+    }
+    # The task runs this copy as LocalSystem: an ACL that lets anyone but
+    # SYSTEM/Administrators write the script, the identity, the module, the
+    # claims or the journal is arbitrary SYSTEM execution, so it is drift.
+    foreach ($Protected in @(@($Paths.Claims, $false), @($Paths.Journal, $false), @($Paths.Root, $true), @($Paths.Script, $true), @($Paths.Identity, $true), @($Paths.Module, $true))) {
+        $Path = $Protected[0]
+        if (-not ([IO.File]::Exists($Path) -or [IO.Directory]::Exists($Path))) { continue }
+        $Sddl = ""
+        try { $Sddl = & $script:Native.ReadSddl $Path } catch { $Sddl = "" }
+        if (-not (Test-ProtectedAcl $Sddl $Identity.'owner-sid' $Protected[1])) {
+            $Result.Detail = "protected ACL drifted: $Path"; return [pscustomobject]$Result
+        }
     }
     $Task = & $script:Native.ReadTask
     if ($null -eq $Task) { $Result.Detail = "scheduled task missing"; return [pscustomobject]$Result }
@@ -549,17 +591,18 @@ function Install-Lane([string]$TargetHost, [string]$Sid, [string]$Root, [string]
     & $script:Native.SetDirectorySddl $Paths.Claims (Get-ProtectedSddl)
     & $script:Native.SetDirectorySddl $Paths.Journal (Get-ProtectedSddl)
     $ScriptBytes = [IO.File]::ReadAllBytes($SelfPath)
-    Write-ProtectedBytes $Paths.Script $ScriptBytes ""
+    Write-ProtectedBytes $Paths.Script $ScriptBytes (Get-OwnerReadSddl $Sid)
     $Sha = Get-Sha256Bytes $ScriptBytes
     $LockPath = Join-Path (Split-Path -Parent (Split-Path -Parent $SelfPath)) "references\windows-winget-provider.lock"
     if (-not [IO.File]::Exists($LockPath)) { throw "winget_module_lock_missing" }
     Write-ProtectedBytes $Paths.ModuleLock ([IO.File]::ReadAllBytes($LockPath)) ""
     & $script:Native.InstallModule $Paths.ModuleLock $Paths.Module (Join-Path $Paths.Claims ".module-stage")
+    if ([IO.Directory]::Exists($Paths.Module)) { & $script:Native.SetDirectorySddl $Paths.Module (Get-OwnerReadSddl $Sid) }
     $Identity = @{ "host-id" = $TargetHost; "platform" = "windows"; "owner-sid" = $Sid
         "owner-name" = (& $script:Native.CurrentName); "plugin-root" = $Root; "marketplace" = "novotnyllc"
         "plugin" = "roundhouse"; "lane-version" = $Version; "lane-sha256" = $Sha; "enrolled-at" = [string](Get-UnixNow)
         "activation" = "pending" }
-    Write-ProtectedBytes $Paths.Identity (Render-Identity $Identity) ""
+    Write-ProtectedBytes $Paths.Identity (Render-Identity $Identity) (Get-OwnerReadSddl $Sid)
     [void](Read-Identity $Paths.Identity)
     if (-not [IO.File]::Exists($Paths.JournalLog)) { [IO.File]::WriteAllBytes($Paths.JournalLog, [byte[]]@()) }
     & $script:Native.RegisterTask (Get-LaneTaskXml $Paths.Script $Paths.Root) (Get-TaskSddl $Sid)
@@ -968,8 +1011,13 @@ function Submit-Request([string]$ActionId, [string]$PackageId, [string]$WantedVe
     }
     if (-not [IO.File]::Exists($ResultPath)) {
         $Pending = Join-Path $Paths.Ingress "$Id.request"
-        if ([IO.File]::Exists($Pending)) { [IO.File]::Delete($Pending) }
-        return [ordered]@{ state = "rejected"; reason = "lane_dispatch_unavailable"; 'request-id' = $Id }
+        if ([IO.File]::Exists($Pending)) {
+            [IO.File]::Delete($Pending)
+            return [ordered]@{ state = "rejected"; reason = "lane_dispatch_unavailable"; 'request-id' = $Id }
+        }
+        # Claimed by SYSTEM but not yet answered (a long install): the outcome
+        # is unknown, not refused; -Lookup returns it later.
+        return [ordered]@{ state = "partial"; reason = "claimed_result_pending_use_lookup"; 'request-id' = $Id }
     }
     $Result = Read-Result ([IO.File]::ReadAllBytes($ResultPath))
     if ($Result.'request-id' -cne $Id) { throw "published_result_answers_a_different_request" }
@@ -1024,9 +1072,10 @@ function Invoke-Request {
     if ($Result.Contains('bytes')) { [Console]::Out.Write($script:Ascii.GetString($Result['bytes'])) }
     else {
         Write-Record @("lane-result|1", "request-id|$($Result['request-id'])", "host-id|-", "plan-id|$PlanId", "plan-sha256|$PlanSha256",
-            "operation-index|$OperationIndex", "action-id|$Action", "package|$Package", "version|$Version", "state|rejected",
+            "operation-index|$OperationIndex", "action-id|$Action", "package|$Package", "version|$Version", "state|$($Result.state)",
             "reason|$($Result.reason)", "native-exit|-", "pre-state-sha256|-", "post-state-sha256|-", "started-at|$(Get-UnixNow)",
             "finished-at|$(Get-UnixNow)", "lane-version|-", "lane-sha256|-", "request-sha256|-", "end-result|", "result-sha256|-")
+        if ($Result.state -ceq "partial") { return 71 }
         return 75
     }
     switch ($Result.state) { "completed" { return 0 } "rejected" { return 65 } "partial" { return 71 } default { return 70 } }
@@ -1042,7 +1091,8 @@ function New-FixtureNative([hashtable]$World) {
         IsElevated = { return $true }
         FileOwnerSid = { param([string]$Path) if ($World.ForeignOwner.Contains((Split-Path -Leaf $Path))) { return "S-1-5-21-9-9-9-9999" }; return $World.Sid }.GetNewClosure()
         SetDirectorySddl = { param([string]$Path, [string]$Sddl) $World.Sddl[$Path] = $Sddl }.GetNewClosure()
-        SetFileSddl = { param([string]$Path, [string]$Sddl) }
+        SetFileSddl = { param([string]$Path, [string]$Sddl) $World.Sddl[$Path] = $Sddl }.GetNewClosure()
+        ReadSddl = { param([string]$Path) if ($World.Sddl.ContainsKey($Path)) { return $World.Sddl[$Path] }; return "" }.GetNewClosure()
         RegisterTask = { param([string]$Xml, [string]$Sddl) $World.Task = @{ Xml = $Xml; Sddl = $Sddl } }.GetNewClosure()
         ReadTask = { if ($null -eq $World.Task) { return $null }; return [pscustomobject]$World.Task }.GetNewClosure()
         UnregisterTask = { $World.Task = $null }.GetNewClosure()
@@ -1227,6 +1277,17 @@ function Invoke-SelfTest {
         Assert-SelfTest ($R.state -ceq "completed" -and $R.reason -ceq "lane_upgraded") "self-upgrade: $($R.reason)"
         Assert-SelfTest ((Get-Sha256File $Paths.Script) -ceq $NextSha -and (Read-Identity $Paths.Identity).'lane-version' -ceq $Next) "upgraded identity"
         Assert-SelfTest ((Get-LaneState).State -ceq "ready") "state after upgrade"
+        # ACL drift on a protected path is drift, even with the bytes intact.
+        $SavedSddl = $World.Sddl[$Paths.Script]
+        $World.Sddl[$Paths.Script] = "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;$($World.Sid))"
+        Assert-SelfTest ((Get-LaneState).State -ceq "drifted" -and (Get-LaneState).Detail.Contains("protected ACL drifted")) "owner-writable script is drift"
+        $World.Sddl[$Paths.Script] = $SavedSddl
+        Assert-SelfTest ((Get-LaneState).State -ceq "ready") "restored ACL is ready again"
+        # A request SYSTEM already claimed but has not answered is pending, not rejected.
+        $Claimed = "request-" + ("{0:x32}" -f 777)
+        [void][IO.Directory]::CreateDirectory((Join-Path $Paths.Claims $Claimed))
+        $Pending = Submit-Request "lane.probe.v1" "-" "-" "-" "-" "pending" "-" "-" 0 $Claimed
+        Assert-SelfTest ($Pending.state -ceq "partial" -and $Pending.reason -ceq "claimed_result_pending_use_lookup") "claimed timeout is pending: $($Pending.reason)"
         # Drift: a modified installed script is never dispatched.
         Add-Content -LiteralPath $Paths.Script -Value "# drift"
         Assert-SelfTest ((Get-LaneState).State -ceq "drifted") "drift detection"

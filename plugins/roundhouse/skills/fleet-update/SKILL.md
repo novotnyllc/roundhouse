@@ -24,9 +24,9 @@ policy.
   the planned formulae/casks. macOS casks run as the ordinary Homebrew owner through the
   packaged bridge hook so Homebrew retains Caskroom authority. An unprivileged
   app upgrade (including Visual Studio Code when its destination is writable)
-  follows Homebrew normally. A cask package that reaches Homebrew's hardcoded
-  `sudo` succeeds only when it byte-matches an active exact
-  `sealed-cask-payload-v1` enrollment; other privileged artifacts fail closed.
+  follows Homebrew normally. A cask step that reaches Homebrew's hardcoded
+  `sudo` holds in this version (see "Protected package actions"); nothing
+  elevates it.
 - APT: on an update request, `apt-get update` then plan with
   `apt-get --simulate upgrade`. Do not use `full-upgrade`, `dist-upgrade`, or
   `autoremove` unless explicitly selected.

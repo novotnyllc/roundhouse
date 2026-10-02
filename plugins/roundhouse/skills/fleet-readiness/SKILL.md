@@ -66,8 +66,10 @@ prints one `privilege-lane` row per host: `ok` when enrolled, `PENDING` with
 `needs_one_time_approval` and the exact command (`roundhouse privilege-enroll
 HOST`) until the host's single OS approval has happened — ordinary work
 proceeds without it — and a finding only when an enrolled lane has drifted.
-A native-Windows host reports `user_session_unavailable` when its WSL
-sibling is unreachable or the interop token is elevated: user-scope work
+A native-Windows host reports `user_session_unavailable` when it has no
+configured WSL sibling or the interop token is elevated, and `unreachable`
+when the configured sibling does not answer (a logged-off Windows host
+usually stops the WSL VM); either way user-scope work
 (user-scope winget, fnm/Node, profile and agent configuration) runs only in
 the ordinary interop lane under the user's own logged-on session, machine-
 scope work only through the LocalSystem lane task, and no other identity is
@@ -75,8 +77,10 @@ ever substituted. There is no S4U task, no request account and no SFTP
 route. `roundhouse privilege-status HOST OUT` returns the same state as a
 `privilege_broker`/`readiness` record for the sealed-plan verbs.
 
-For macOS the lane's catalog is signed package installs
-(`macos.install-signed-pkg.v1`, Developer ID checked by Team ID). SSH is not
+For macOS the host lane implements signed package installs
+(`macos.install-signed-pkg.v1`, Developer ID checked by Team ID), but sealed
+plans do not bind a payload digest yet, so the controller does not advertise
+that action: only `lane.probe.v1` seals on macOS in this version. SSH is not
 elevation; root Homebrew, arbitrary `sudo`, installer scripts, and arbitrary
 plist paths are unsupported.
 

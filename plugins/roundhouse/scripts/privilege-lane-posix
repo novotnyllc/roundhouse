@@ -657,8 +657,15 @@ take_lock() {
     return 0
   fi
   holder=$(cat "$lock_dir/pid" 2>/dev/null || :)
-  if [[ $holder =~ ^[1-9][0-9]*$ ]] && kill -0 "$holder" 2>/dev/null; then return 1; fi
-  # A lock whose holder is gone is a crash, not a competitor.
+  if [[ $holder =~ ^[1-9][0-9]*$ ]]; then
+    # A live holder is a competitor; a dead one is a crash.
+    ! kill -0 "$holder" 2>/dev/null || return 1
+  else
+    # No pid yet: the holder is between mkdir and its pid write — a
+    # competitor, unless the directory has sat there far longer than any
+    # dispatch runs (a crash in that window).
+    [ $(( $(now) - $(file_mtime "$lock_dir") )) -gt 3600 ] || return 1
+  fi
   rm -rf "$lock_dir"
   mkdir "$lock_dir" 2>/dev/null || return 1
   printf '%s\n' "$$" >"$lock_dir/pid"
@@ -723,13 +730,18 @@ dispatch_one() {
   # Rename before read: once the file is below the root-only claim directory
   # the owner can no longer replace it. A symlink moves as a symlink and is
   # refused below; a hard link elsewhere is refused by the link count.
-  if ! mv -f "$entry" "$claim/request" 2>/dev/null; then
+  if ! mv -f "$entry" "$claim/request.owner" 2>/dev/null; then
     rm -rf "$claim"; printf 'failed\n'; return
   fi
-  if [ -L "$claim/request" ] || [ ! -f "$claim/request" ]; then reason=request_not_regular_file
-  elif [ "$(file_links "$claim/request")" != 1 ]; then reason=request_hard_linked
-  elif [ "$(file_uid "$claim/request")" != "$id_owner_uid" ]; then reason=request_not_owned_by_enrolled_owner
-  elif [ "$(file_size "$claim/request")" -gt "$max_request_bytes" ]; then reason=request_too_large
+  # The rename moves the owner's inode, and an open descriptor the owner kept
+  # on it still writes through. Every check below the metadata ones, every
+  # hash and every read therefore uses a bounded snapshot copied into a file
+  # root created itself; the owner's inode is unlinked right after.
+  if [ -L "$claim/request.owner" ] || [ ! -f "$claim/request.owner" ]; then reason=request_not_regular_file
+  elif [ "$(file_links "$claim/request.owner")" != 1 ]; then reason=request_hard_linked
+  elif [ "$(file_uid "$claim/request.owner")" != "$id_owner_uid" ]; then reason=request_not_owned_by_enrolled_owner
+  elif [ "$(file_size "$claim/request.owner")" -gt "$max_request_bytes" ]; then reason=request_too_large
+  elif ! snapshot_owner_file "$claim/request.owner" "$claim/request" "$max_request_bytes"; then reason=request_snapshot_failed
   elif ! parse_request "$claim/request"; then reason=invalid_request_record
   elif [ "$rq_id" != "$id" ]; then reason=request_id_mismatch
   elif [ "$rq_host" != "$id_host" ]; then reason=host_id_mismatch
@@ -782,8 +794,24 @@ claim_payload() {
   [ "$(file_links "$claim/payload")" = 1 ] || { payload_reason=payload_hard_linked; return 1; }
   [ "$(file_uid "$claim/payload")" = "$id_owner_uid" ] || { payload_reason=payload_not_owned_by_enrolled_owner; return 1; }
   [ "$(file_size "$claim/payload")" -le "$max_payload_bytes" ] || { payload_reason=payload_too_large; return 1; }
+  # Same rule as the request: the owner may still hold a descriptor on the
+  # moved inode, so the digest, the signature checks and the install all
+  # read a root-created copy.
+  mv -f "$claim/payload" "$claim/payload.owner" || { payload_reason=payload_unclaimable; return 1; }
+  snapshot_owner_file "$claim/payload.owner" "$claim/payload" "$max_payload_bytes" || { payload_reason=payload_snapshot_failed; return 1; }
   [ "$(sha256_file "$claim/payload")" = "$rq_payload_sha" ] || { payload_reason=payload_digest_mismatch; return 1; }
   chmod 600 "$claim/payload"
+}
+snapshot_owner_file() {
+  # snapshot_owner_file OWNER-FILE COPY MAX: copy at most MAX+1 bytes of the
+  # owner's (already moved) file into a new root-owned file, refuse if more
+  # arrived than the bound, and unlink the owner's inode.
+  local source=$1 copy=$2 maximum=$3
+  [ ! -e "$copy" ] && [ ! -L "$copy" ] || return 1
+  head -c "$((maximum + 1))" <"$source" >"$copy" || { rm -f "$copy"; return 1; }
+  chmod 600 "$copy"
+  rm -f "$source"
+  [ "$(file_size "$copy")" -le "$maximum" ]
 }
 publish_result() {
   # publish_result ID STATE REASON NATIVE-EXIT PRE POST STARTED FINISHED
@@ -892,13 +920,16 @@ action_apt_install() {
   state=completed; reason=package_installed
 }
 action_apt_autoremove() {
-  local apt_get rc=0
+  local apt_get rc=0 remaining
   apt_get=$(native_binary apt-get) || fail_action apt_get_unavailable || return 1
   pre=$(apt_policy_snapshot) || pre=-
   native_env "$apt_get" -q -y autoremove >/dev/null 2>&1 || rc=$?
   native_exit=$rc
-  post=$(apt_policy_snapshot) || post=-
-  [ "$rc" -eq 0 ] || fail_action native_operation_failed || return 1
+  [ "$rc" -eq 0 ] || { post=$(apt_policy_snapshot) || post=-; fail_action native_operation_failed || return 1; }
+  # Post-state: a simulation must report nothing left to remove.
+  remaining=$(native_env "$apt_get" -q --simulate autoremove 2>/dev/null | awk '$1 == "Remv" { n++ } END { print n + 0 }')
+  post=$(sha256_text "autoremove|remaining|$remaining")
+  [ "$remaining" -eq 0 ] || { state=partial; reason=post_state_mismatch; return 1; }
   state=completed; reason=autoremove_completed
 }
 action_macos_pkg() {
@@ -1012,6 +1043,7 @@ integrity_entries() {
 request_command() {
   local action='' package=- version=- source=- payload_sha=- plan_id=fleet-run plan_sha=- index=- payload='' wait_seconds=600
   local positional=0 id='' created expires request_file result_file deadline rc=0 state platform
+  local request_digest timeout_state timeout_reason timeout_rc
   while [ "$#" -gt 0 ]; do
     case $1 in
       --request-id) id=${2-}; shift 2 ;;
@@ -1092,13 +1124,23 @@ request_command() {
     fi
   done
   if [ ! -f "$result_file" ]; then
-    rm -f "$request_file" "$ingress_dir/$id.payload"
+    if [ -f "$request_file" ]; then
+      # Never claimed: the dispatch did not run. Withdraw it.
+      request_digest=$(head -n 15 "$request_file" | sha256_stream) || request_digest=-
+      rm -f "$request_file" "$ingress_dir/$id.payload"
+      timeout_state=rejected; timeout_reason=lane_dispatch_unavailable; timeout_rc=75
+    else
+      # Claimed by root but not yet answered (a long native command): the
+      # outcome is unknown, not refused — look it up later with `result`.
+      request_digest=-
+      timeout_state=partial; timeout_reason=claimed_result_pending_use_result_lookup; timeout_rc=71
+    fi
     record 'lane-result|1' "request-id|$id" "host-id|$id_host" "plan-id|$plan_id" "plan-sha256|$plan_sha" \
-      "operation-index|$index" "action-id|$action" "package|$package" "version|$version" 'state|rejected' \
-      "reason|lane_dispatch_unavailable" "native-exit|$rc" 'pre-state-sha256|-' 'post-state-sha256|-' \
+      "operation-index|$index" "action-id|$action" "package|$package" "version|$version" "state|$timeout_state" \
+      "reason|$timeout_reason" "native-exit|$rc" 'pre-state-sha256|-' 'post-state-sha256|-' \
       "started-at|$created" "finished-at|$(now)" "lane-version|$id_version" "lane-sha256|$id_sha256" \
-      "request-sha256|$(head -n 15 "$request_file" 2>/dev/null | sha256_stream || printf -- '-')" 'end-result|' 'result-sha256|-'
-    return 75
+      "request-sha256|$request_digest" 'end-result|' 'result-sha256|-'
+    return "$timeout_rc"
   fi
   parse_result "$result_file" || die 74 'request: the published result is malformed'
   [ "$rs_request_id" = "$id" ] || die 74 'request: the published result answers a different request'
@@ -1230,6 +1272,16 @@ self_test() {
   [ "$rc" -eq 65 ] && printf '%s\n' "$out" | grep -Fqx 'reason|package_unknown_to_apt' || self_fail "apt unknown: $out"
   rc=0; out=$("$installed" request apt.install-package-version.v1 jq 1.7.1-3) || rc=$?
   [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -Fqx 'reason|package_installed' || self_fail "apt install: $out"
+  : >"$root/apt-remaining"
+  rc=0; out=$("$installed" request apt.autoremove.v1) || rc=$?
+  [ "$rc" -eq 71 ] && printf '%s\n' "$out" | grep -Fqx 'reason|post_state_mismatch' || self_fail "autoremove with leftovers was not partial (rc $rc)"
+  rm -f "$root/apt-remaining"
+  # A lock directory with no pid yet belongs to a dispatcher between mkdir
+  # and its pid write: a competitor, never a stale lock to break.
+  mkdir "$root/fixture$lane_state/lock"
+  rc=0; "$installed" dispatch >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 75 ] && [ -d "$root/fixture$lane_state/lock" ] || self_fail "a pid-less lock was broken (rc $rc)"
+  rmdir "$root/fixture$lane_state/lock"
   : >"$root/apt-fail"
   "$installed" request apt.autoremove.v1 >"$root/autoremove.out" 2>&1 && self_fail 'failed native exit reported as success'
   rm -f "$root/apt-fail"
@@ -1363,6 +1415,7 @@ write_apt_stubs() {
 printf 'apt-get %s\n' "\$*" >>"$root/apt.log"
 [ ! -e "$root/apt-fail" ] || exit 1
 case "\$*" in
+  *"--simulate autoremove"*) [ ! -e "$root/apt-remaining" ] || printf 'Remv old-kernel [1.0]\n'; exit 0 ;;
   *"install curl=8.2.0-1"*) printf '8.2.0-1\n' >"$root/state-curl" ;;
   *"install jq=1.7.1-3"*) printf '1.7.1-3\n' >"$root/state-jq" ;;
 esac
