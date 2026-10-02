@@ -696,7 +696,8 @@ fleet_vcs_floor_ref=refs/roundhouse/poll-floor/main
 fleet_vcs_floor_fetch() {
   # fleet_vcs_floor_fetch <store> — §6.4's incremental fetch: the remote's
   # main, objects only, into a PRIVATE ref, printing the fetched commit id.
-  # The poll floor and doctor's poll-floor row both go through here.
+  # Only the poll floor fetches through here; doctor reads the remote with
+  # `git ls-remote` and writes nothing.
   #
   # The fetch moves NO jj-visible ref, and that is load-bearing:
   # refs/roundhouse/ is outside what jj imports, so main@origin stays where
