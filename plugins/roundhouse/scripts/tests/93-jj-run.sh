@@ -896,6 +896,40 @@ p0jj_disown() {
   [ ! -e "$vireo/orphan-probe.yaml" ] || fail "the stale-head probe left its file in the working copy"
 }
 
+p0jj_abort() {
+  # --- an abort mid-apply still lands the queued records ---
+  # The loop queues applied/ and journal writes (one batch per pass). A pass
+  # that dies after an item applied — errexit here; a signal the same way —
+  # must still record it as owned and journal it, or the next pass sees an
+  # installed item nobody owns.
+  runjj_abort_a='config_files.~/.abort-a'
+  runjj_abort_outcomes() {
+    for runjj_day in "$vireo/journal/vireo"/*.yaml; do
+      [ -f "$runjj_day" ] || continue
+      FLEET_ITEM=$1 yq -r '.[] | select(.item == strenv(FLEET_ITEM)) | .outcome' \
+        "$runjj_day"
+    done
+  }
+  printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\nconfig_files:\n  ~/.abort-a:\n    keys:\n      a: managed\n  ~/.abort-b:\n    keys:\n      b: managed\n' \
+    >"$vireo/hosts/vireo.yaml"
+  runjj_status=0
+  runjj_out=$(runjj vireo env ROUNDHOUSE_FLEET_TEST_ABORT_AFTER_APPLY="$runjj_abort_a" \
+    "$cli" fleet-run --fast 2>&1) || runjj_status=$?
+  [ "$runjj_status" -ne 0 ] || fail "the pass did not abort after $runjj_abort_a applied: $runjj_out"
+  case $runjj_out in
+    *"self-test abort after applying $runjj_abort_a"*) ;;
+    *) fail "the abort hook did not fire: $runjj_out" ;;
+  esac
+  [ -n "$(fleet_applied_digest "$vireo" vireo "$runjj_abort_a")" ] ||
+    fail "an item applied before the abort was not recorded in applied/ (the queued batch was lost)"
+  runjj_abort_outcomes "$runjj_abort_a" | grep -qx applied ||
+    fail "an item applied before the abort was not journaled (the queued batch was lost)"
+  [ ! -e "$vireo.lock" ] || fail "the aborted run left its lock behind"
+  # The next run converges what is left and publishes.
+  runjj vireo "$cli" fleet-run --fast >/dev/null ||
+    fail "the run after an aborted pass did not converge"
+}
+
 p0jj_aging() {
   # --- §7.11.3: evidence aging, previewed, then published ---
   mkdir -p "$vireo/journal/vireo"
@@ -965,6 +999,7 @@ if [ "$real_jj_ok" = true ] && section_part 2; then
     'alert compaction refused over a layer edit, published, idempotent'
   p0jj_block disown p0jj_disown 'host-only disown: dry run, refusal, publish, no prune after'
   p0jj_block aging p0jj_aging 'evidence aging previewed by --dry-run, then published'
+  p0jj_block abort p0jj_abort 'a pass aborted mid-apply still lands its queued applied/ and journal records'
   p0jj_block verbs p0jj_verb_refusals \
     'publishing verbs refuse a diverged main, a live lock and a foreign edit'
 fi

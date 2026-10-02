@@ -2864,6 +2864,15 @@ fleet_run_pass() (
   run_tmp=$1
   run_mode=$2
   run_ledger="$run_tmp/alert-ledger"
+  # ANY way out of this pass — a refusal, an errexit, a signal — first lands
+  # whatever the apply loop has queued (fleet_run_batch_open): an item it
+  # already installed is recorded as owned, as the per-item writes recorded
+  # it. HERE, in the pass's own subshell, because the batch is: a trap in
+  # fleet_run_command never saw it open. A signal exits 128+N, which runs it.
+  trap '[ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   # Captured BEFORE any fetch: what arrives is what §7.7 has to gate, and after
   # the fetch there is no other way to tell new from known. (The poll floor's
   # own fetch lands in a private ref and does not move main@origin.)
@@ -3469,6 +3478,13 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         run_applied_items="$run_applied_items$run_item "
         run_applied_any=true
         printf '  applied %s\n' "$run_item"
+        # Self-test only: abort the pass right after this item applied, so the
+        # self-check can prove the queued records still land.
+        if fleet_test_hook "${ROUNDHOUSE_FLEET_TEST_ABORT_AFTER_APPLY:-}" &&
+          [ "$run_item" = "$ROUNDHOUSE_FLEET_TEST_ABORT_AFTER_APPLY" ]; then
+          printf 'roundhouse: self-test abort after applying %s\n' "$run_item" >&2
+          false
+        fi
         ;;
       70)
         # No-op BECAUSE CORRECT: the item resolved and reviewed, and this
