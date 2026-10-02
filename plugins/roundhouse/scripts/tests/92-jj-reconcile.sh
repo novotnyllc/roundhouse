@@ -450,6 +450,40 @@ $(fleet_vcs_trailers wren scheduled/agent 'fast convergence' -)" >/dev/null
       [ "$(printf '%s\n' "$reconcile_verdict" | jq -r '.rule')" = 2 ] ||
       fail "a real hand edit against an agent edit did not escalate at rule 2: $reconcile_verdict"
 
-    printf 'real-jj: OK (no bare main, conflicted-bookmark revsets, runbook steps 0-5, hold set, both push guards, op restore, peer remotes, R4 leak, rule 2 over a side range)\n'
+    # 12. A LARGE hand edit still publishes. Step 1 describes the working copy
+    #     with a few sorted paths and a count, never every path on line 1: a
+    #     store cleanup touching hundreds of files put them all on one line,
+    #     one of them read as a secret class to the sweep, and the publish was
+    #     refused. The last-sorted path here carries such a token, past both
+    #     line 1's three names and the bounded items trailer.
+    fleet_vcs_fetch "$vireo" origin
+    reconcile_out=$(fleet_vcs_reconcile "$vireo" vireo scheduled/agent 'catch up again')
+    [ "${reconcile_out%% *}" = clean ] || fail "vireo did not catch up cleanly: $reconcile_out"
+    fleet_vcs_publish "$vireo" "${reconcile_out#* }" >/dev/null ||
+      fail "vireo could not publish its catch-up before the large hand edit"
+    mkdir -p "$vireo/notes"
+    reconcile_n=1
+    while [ "$reconcile_n" -le 60 ]; do
+      printf 'note: %s\n' "$reconcile_n" >"$vireo/notes/note-$(printf '%02d' "$reconcile_n").yaml"
+      reconcile_n=$((reconcile_n + 1))
+    done
+    printf 'cache: rebuilt\n' >"$vireo/notes/zz_WorkspaceIndex_4f9a1C0b7d2E6f8a3B5c9D1e.yaml"
+    reconcile_out=$(fleet_vcs_reconcile "$vireo" vireo scheduled/agent 'a large hand edit') ||
+      fail "the reconcile failed over a large hand edit"
+    [ "${reconcile_out%% *}" = clean ] ||
+      fail "a large hand edit did not reconcile cleanly: $reconcile_out"
+    reconcile_edit_commit=$(jj -R "$vireo" log -r "${reconcile_out#* }-" --no-graph \
+      -T 'if(description.starts_with("hand edit"), commit_id ++ "\n", "")' | grep . | head -1)
+    [ -n "$reconcile_edit_commit" ] || fail "the large hand edit was not described as one"
+    reconcile_line1=$(jj -R "$vireo" log -r "$reconcile_edit_commit" --no-graph \
+      -T 'description.first_line()')
+    [ "$reconcile_line1" = 'hand edit on vireo: notes/note-01.yaml, notes/note-02.yaml, notes/note-03.yaml and 58 more' ] ||
+      fail "a large hand edit's first line is not three sorted paths and a count: $reconcile_line1"
+    [ -z "$(fleet_sweep_range "$vireo" "$(fleet_push_range "${reconcile_out#* }")")" ] ||
+      fail "the sweep refused a large hand edit: $(fleet_sweep_range "$vireo" "$(fleet_push_range "${reconcile_out#* }")")"
+    fleet_vcs_publish "$vireo" "${reconcile_out#* }" >/dev/null ||
+      fail "a large hand edit could not be published through the sweep"
+
+    printf 'real-jj: OK (no bare main, conflicted-bookmark revsets, runbook steps 0-5, hold set, both push guards, op restore, peer remotes, R4 leak, rule 2 over a side range, a large hand edit published)\n'
   ) || fail "real-jj reconcile block failed (see the FAIL: real-jj: line above)"
 fi

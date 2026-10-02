@@ -366,6 +366,21 @@ fleet_vcs_working_copy_files() {
   (cd "$1" && jj diff -r @ --name-only) | tr '\n' ' '
 }
 
+fleet_vcs_path_summary() {
+  # `… | fleet_vcs_path_summary` — stdin: space-separated repo paths; stdout:
+  # the first three in sorted order and `and N more`, cut to §10.4's cap. For
+  # a description's FIRST line, which the redaction sweep reads like any other
+  # line: listing every path of a large hand edit there put hundreds of names
+  # on one line, and one of them reading as a secret class refused the
+  # publish. The bounded `roundhouse-items` trailer carries the longer list.
+  tr ' ' '\n' | grep . | LC_ALL=C sort -u | LC_ALL=C awk '
+    NR <= 3 { out = (NR == 1 ? $0 : out ", " $0) }
+    END {
+      if (NR > 3) out = out " and " (NR - 3) " more"
+      printf "%s", out
+    }' | LC_ALL=C cut -c "1-$fleet_replicated_cap" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null
+}
+
 fleet_vcs_reconcile() {
   # §8.2 steps 1-3: fleet_vcs_reconcile <store> <host> <session> <intent>
   # Prints `clean <M>` or `conflicted <M>`. On the clean path the bookmark
@@ -408,12 +423,16 @@ fleet_vcs_reconcile() {
   # passing it unconditionally makes an empty undescribed commit a permanent
   # ancestor of main and every future push dies with "Won't push commit …
   # since it has no description".
+  #
+  # Line 1 names a FEW paths (fleet_vcs_path_summary), never all of them: a
+  # large hand edit must still publish through the sweep.
   if [ "$(jj -R "$fleet_vcs_repo" log -r @ --no-graph -T 'if(empty,"y","n")')" = n ]; then
-    jj -R "$fleet_vcs_repo" describe -r @ -m "hand edit on $fleet_vcs_host: $(fleet_vcs_working_copy_files "$fleet_vcs_repo")
+    fleet_vcs_edit_files=$(fleet_vcs_working_copy_files "$fleet_vcs_repo")
+    jj -R "$fleet_vcs_repo" describe -r @ -m "hand edit on $fleet_vcs_host: $(printf '%s' "$fleet_vcs_edit_files" | fleet_vcs_path_summary)
 
 $(fleet_vcs_trailers "$fleet_vcs_host" interactive/human \
       'edit found in the working copy at run start' \
-      "$(fleet_vcs_working_copy_files "$fleet_vcs_repo")")" >/dev/null
+      "$fleet_vcs_edit_files")" >/dev/null
     set -- "$@" "$(jj -R "$fleet_vcs_repo" log -r @ --no-graph -T 'commit_id')"
   fi
 
