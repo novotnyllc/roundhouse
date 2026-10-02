@@ -637,6 +637,110 @@ YAML
     ! fleet_canary_gate "$rec_sat_store" plugins.railyard 91ac33 24 \
       2026-08-07T12:00:00Z canary-1 ||
       fail "an item the canary could not apply was released as canary evidence"
+
+    # --- the LATEST clean run of evidence, not the first record ---
+    # mac-mini, live: the canary's journal for one item read applied, applied,
+    # held, applied. The gate timed its wait from the FIRST applied and
+    # rejected any hold after it, so that one transient hold voided the
+    # evidence for as long as the journal kept it and every downstream host
+    # waited forever. A clean apply after the hold is a new run that can pass.
+    rec_run_store="$tmp/records/canary-latest"
+    rec_run_reset() {
+      rm -rf "$rec_run_store"
+      mkdir -p "$rec_run_store"
+      for rec_run_e in 'applied 2026-09-01T04:55:00Z' 'applied 2026-09-01T04:57:00Z' \
+        'held 2026-09-01T05:22:00Z' 'applied 2026-09-01T05:50:00Z'; do
+        fleet_journal_append "$rec_run_store" canary-1 \
+          "$(rec_entry skills.tdd 0c7d "${rec_run_e% *}" "${rec_run_e#* }")"
+      done
+      fleet_journal_append "$rec_run_store" canary-1 \
+        "$(jq -cn '{outcome: "alive", at: "2026-09-02T06:00:00Z"}')"
+    }
+    rec_run_reset
+    fleet_canary_gate "$rec_run_store" skills.tdd 0c7d 24 2026-09-02T06:30:00Z canary-1 ||
+      fail "a clean applied record after an earlier hold did not release the item"
+    # The soak is the clean run's own: 24h after the FIRST applied (04:55) but
+    # not after the one that followed the hold (05:50) is still a wait.
+    ! fleet_canary_gate "$rec_run_store" skills.tdd 0c7d 24 2026-09-02T05:30:00Z canary-1 ||
+      fail "the wait was timed from evidence a later hold withdrew"
+    # A hold or revert AFTER the latest applied still withdraws it, at any
+    # digest — the canary refused the item.
+    for rec_withdrawal in held reverted; do
+      rec_run_reset
+      fleet_journal_append "$rec_run_store" canary-1 \
+        "$(rec_entry skills.tdd other "$rec_withdrawal" 2026-09-01T07:00:00Z)"
+      ! fleet_canary_gate "$rec_run_store" skills.tdd 0c7d 24 2026-09-02T06:30:00Z canary-1 ||
+        fail "a $rec_withdrawal after the latest applied record did not withdraw it"
+    done
+    # A record journaled on every pass (`satisfied`, B-3) does not restart the
+    # soak: the run is timed from its first record, not its newest.
+    rm -rf "$rec_run_store"
+    mkdir -p "$rec_run_store"
+    for rec_run_at in 2026-09-01T00:00:00Z 2026-09-01T08:00:00Z 2026-09-01T16:00:00Z \
+      2026-09-01T23:00:00Z; do
+      fleet_journal_append "$rec_run_store" canary-1 \
+        "$(rec_entry mcp_servers.context7 5a7b satisfied "$rec_run_at")"
+    done
+    fleet_journal_append "$rec_run_store" canary-1 \
+      "$(jq -cn '{outcome: "alive", at: "2026-09-02T00:30:00Z"}')"
+    fleet_canary_gate "$rec_run_store" mcp_servers.context7 5a7b 24 \
+      2026-09-02T01:00:00Z canary-1 ||
+      fail "a satisfied record repeated every pass restarted the canary soak"
+
+    # --- evidence keyed on the resolved upstream identity ---
+    # The digest names the desired VALUE; evidence about last week's upstream
+    # release is not evidence about this one.
+    rm -rf "$rec_run_store"
+    mkdir -p "$rec_run_store"
+    fleet_journal_append "$rec_run_store" canary-1 \
+      "$(jq -cn '{item: "skills.tdd", digest: "d1", identity: "v1", outcome: "applied",
+        at: "2026-09-01T00:00:00Z"}')"
+    fleet_journal_append "$rec_run_store" canary-1 \
+      "$(jq -cn '{outcome: "alive", at: "2026-09-02T01:00:00Z"}')"
+    fleet_canary_gate --identity v1 "$rec_run_store" skills.tdd d1 24 \
+      2026-09-02T02:00:00Z canary-1 ||
+      fail "evidence at the gated upstream identity did not release the item"
+    ! fleet_canary_gate --identity v2 "$rec_run_store" skills.tdd d1 24 \
+      2026-09-02T02:00:00Z canary-1 ||
+      fail "evidence at an older upstream identity released a newer one"
+    ! fleet_canary_gate "$rec_run_store" skills.tdd d1 24 \
+      2026-09-02T02:00:00Z canary-1 ||
+      fail "identity-bound evidence released an identity-less gate"
+    fleet_journal_append "$rec_run_store" canary-1 \
+      "$(rec_entry skills.tdd d1 applied 2026-09-01T00:00:00Z)"
+    ! fleet_canary_gate --identity v2 "$rec_run_store" skills.tdd d1 24 \
+      2026-09-02T02:00:00Z canary-1 ||
+      fail "identity-less evidence released an identity-bound gate"
+
+    # --- plugins are always current: never canary-gated ---
+    for rec_item in plugins.compound-engineering plugins.impeccable@impeccable \
+      definitions.plugins.last30days; do
+      fleet_canary_exempt "$rec_item" || fail "$rec_item waits on canary evidence"
+    done
+    for rec_item in skills.tdd mcp_servers.context7 packages.git \
+      definitions.packages.git config_files.x pluginsx.y ''; do
+      ! fleet_canary_exempt "$rec_item" || fail "${rec_item:-<empty>} skipped the canary gate"
+    done
+
+    # --- aging keeps the record the gate times the clean run from ---
+    rec_jrun="$tmp/records/journal-aging-run"
+    rm -rf "$rec_jrun"
+    mkdir -p "$rec_jrun/journal/vireo"
+    cat >"$rec_jrun/journal/vireo/2001-01-01.yaml" <<'YAML'
+- {item: skills.t, digest: t1, outcome: applied, at: "2001-01-01T00:00:00Z"}
+- {item: skills.t, digest: t1, outcome: held, at: "2001-01-01T01:00:00Z"}
+- {item: skills.t, digest: t1, outcome: applied, at: "2001-01-01T02:00:00Z"}
+- {item: skills.t, digest: t1, outcome: applied, at: "2001-01-01T03:00:00Z"}
+YAML
+    cat >"$rec_jrun/journal/vireo/2001-01-02.yaml" <<'YAML'
+- {item: skills.t, digest: t1, outcome: applied, at: "2001-01-02T00:00:00Z"}
+- {outcome: alive, at: "2001-01-02T01:00:00Z"}
+YAML
+    fleet_records_age "$rec_jrun" vireo 90 >/dev/null || fail "journal aging failed"
+    grep -q '2001-01-01T02:00:00Z' "$rec_jrun/journal/vireo/2001-01-01.yaml" ||
+      fail "aging removed the first record of the clean run the canary gate times from"
+    ! grep -q '2001-01-01T03:00:00Z' "$rec_jrun/journal/vireo/2001-01-01.yaml" ||
+      fail "aging kept a record nothing reads"
   )
 fi
 
@@ -755,6 +859,13 @@ if [ -n "$fleet_fixture_yq" ]; then
 - {item: packages.c, digest: d3, outcome: applied, at: "2026-08-01T00:00:00Z"}
 - {item: packages.c, digest: d3, outcome: held, at: "2026-08-01T05:00:00Z"}
 - {item: packages.d, digest: d4, outcome: applied, at: "2026-08-02T12:00:00Z"}
+- {item: packages.i, digest: d8, outcome: applied, at: "2026-08-01T00:00:00Z"}
+- {item: packages.i, digest: d8, outcome: held, at: "2026-08-01T01:00:00Z"}
+- {item: packages.i, digest: d8, outcome: applied, at: "2026-08-01T02:00:00Z"}
+- {item: packages.i, digest: d8, outcome: satisfied, at: "2026-08-02T23:00:00Z"}
+- {item: packages.j, digest: d9, outcome: applied, at: "2026-08-01T00:00:00Z"}
+- {item: packages.j, digest: zz, outcome: reverted, at: "2026-08-01T03:00:00Z"}
+- {item: packages.k, digest: d10, identity: v1, outcome: applied, at: "2026-08-01T00:00:00Z"}
 YAML
     cat >"$bat_cs/journal/c1/2026-08-03.yaml" <<'YAML'
 - {outcome: alive, at: "2026-08-03T00:00:00Z"}
@@ -780,7 +891,8 @@ YAML
 YAML
     us=$(printf '\037')
     for bat_pair in packages.a:d1 packages.b:d2 packages.c:d3 packages.d:d4 \
-      packages.e:d5 packages.f:d6 packages.g:d7 packages.a:other packages.none:x; do
+      packages.e:d5 packages.f:d6 packages.g:d7 packages.a:other packages.none:x \
+      packages.i:d8 packages.j:d9 packages.k:d10; do
       printf 'converge%s%s%s%s\n' "$us" "${bat_pair%%:*}" "$us" "${bat_pair#*:}"
     done >"$bat/plan"
     printf 'held%spackages.h%s\n' "$us" "$us" >>"$bat/plan"
@@ -797,6 +909,8 @@ YAML
     done
     grep -q 'packages.a d1' "$bat/canary.one" ||
       fail "the canary fixture never released anything, so it proves nothing"
+    grep -q 'packages.i d8' "$bat/canary.one" ||
+      fail "the canary fixture's clean run after a hold was never released, so it proves nothing"
 
     # --- the journal parse cache: the same entries and the same status ---
     for bat_host in c1 c3; do

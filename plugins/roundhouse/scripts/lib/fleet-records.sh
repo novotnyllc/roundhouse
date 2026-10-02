@@ -235,9 +235,12 @@ fleet_journal_load_bearing_filter='
   # readers with a window of their own.
   #
   #   evidence      the OLDEST and the NEWEST `applied` and `satisfied` per
-  #                 (item, digest): the canary gate takes its wait from the
-  #                 oldest and §8.2b rule 5 its time from the newest, and the
-  #                 revert signature (§10.8) needs "this digest was applied"
+  #                 (item, digest, identity), and the oldest one NEWER than the
+  #                 item'"'"'s latest withdrawal: the canary gate takes its wait
+  #                 from the first record of the clean run after the latest
+  #                 `held`/`reverted`, §8.2b rule 5 its time from the newest,
+  #                 and the revert signature (§10.8) needs "this digest was
+  #                 applied"
   #   withdrawals   every `held` or `reverted` NEWER than its item'"'"'s oldest
   #                 evidence: canary condition 2 ("nothing later withdrew it")
   #                 and the revert signature'"'"'s "current" value read them
@@ -249,10 +252,17 @@ fleet_journal_load_bearing_filter='
   def journal_load_bearing($recent):
     map(select(.r | type == "object")) as $recs |
     def at: (.r.at // "") | tostring;
+    ([$recs[] | select((.r.outcome == "held" or .r.outcome == "reverted") and
+        (.r.item | type) == "string")] | group_by(.r.item) |
+      map({key: .[0].r.item, value: (map(at) | max)}) | from_entries) as $latest_withdrawal |
     ([$recs[] | select((.r.outcome == "applied" or .r.outcome == "satisfied") and
         (.r.item | type) == "string")] |
-      group_by([.r.item, ((.r.digest // "") | tostring), .r.outcome]) |
-      map((min_by(at)), (max_by(at)))) as $evidence |
+      group_by([.r.item, ((.r.digest // "") | tostring),
+        ((.r.identity // "") | tostring), .r.outcome]) |
+      map((min_by(at)), (max_by(at)),
+        (($latest_withdrawal[.[0].r.item] // "") as $w |
+          map(select(at > $w)) | if length == 0 then empty else min_by(at) end)
+      )) as $evidence |
     ($evidence | group_by(.r.item) |
       map({key: .[0].r.item, value: (map(at) | min)}) | from_entries) as $since |
     [$recs[] | select((.r.outcome == "held" or .r.outcome == "reverted") and
@@ -723,15 +733,52 @@ fleet_policy_int() {
 
 # --- §10.1 the canary gate, with its liveness term ----------------------------
 
+fleet_canary_exempt() {
+  # `fleet_canary_exempt ITEM` — exit 0 for an item that never waits on canary
+  # evidence. PLUGINS ARE ALWAYS CURRENT (the operator's decision, every
+  # marketplace, both harnesses): a plugin item, and the definition it
+  # resolves through, applies on the first pass that sees it. The gate below
+  # keys on the item DIGEST, and a plugin's digest hashes `name@marketplace`
+  # and its state, never the upstream release it resolves to, so a new
+  # upstream version could never earn evidence of its own and every
+  # non-canary host waited on the canary forever. The removal cap, review,
+  # holds and the identity proof all still apply; only the soak is gone.
+  case ${1:-} in
+    plugins.* | definitions.plugins.*) return 0 ;;
+  esac
+  return 1
+}
+
 fleet_canary_gate() {
-  # `fleet_canary_gate STORE ITEM DIGEST WAIT_HOURS NOW CANARY...`. A
-  # non-canary host applies item X at digest D only when, for SOME canary c:
+  # `fleet_canary_gate [--identity ID] STORE ITEM DIGEST WAIT_HOURS NOW CANARY...`.
+  # A non-canary host applies item X at digest D only when, for SOME canary c:
   #
   #   1. journal/c/ carries `outcome: applied` OR `outcome: satisfied` for
-  #      {X, D}, at least canary_wait_hours ago, and
-  #   2. no LATER record for X from c with `outcome: held` or `reverted`, and
+  #      {X, D} NEWER than c's latest `held` or `reverted` record for X — the
+  #      current clean run of evidence — and that run began at least
+  #      canary_wait_hours ago, and
+  #   2. (so) no `held` or `reverted` record for X from c follows the latest
+  #      evidence, and
   #   3. c has published SOME record — any item, or an `alive` heartbeat —
-  #      dated at or after applied_at + canary_wait_hours.
+  #      dated at or after the run's start + canary_wait_hours.
+  #
+  # THE LATEST CLEAN RUN, NOT THE FIRST EVIDENCE. The gate used to time the
+  # wait from the canary's FIRST applied record at D and reject any hold after
+  # it, so one transient hold (applied, applied, held, applied) voided the
+  # evidence for as long as the journal kept it, and the item waited forever.
+  # Now a later withdrawal still withdraws, but a clean apply after it starts a
+  # new run that can pass. The wait is measured from the run's FIRST record,
+  # not its newest: a `satisfied` item is journaled again on every pass that
+  # reaches it, and timing from the newest would restart the soak each time.
+  #
+  # `--identity ID` keys the evidence on a resolved upstream identity as well
+  # as the digest: an entry counts only when its `identity` field equals ID (an
+  # entry without one is identity-less). The digest names the desired VALUE;
+  # where a value resolves to upstream bytes that move under it, evidence about
+  # last week's release is not evidence about this one. Without the flag the
+  # gate asks about identity-less evidence, which is every record a run writes
+  # today — the one category that resolves an identity, plugins, is exempt
+  # (fleet_canary_exempt).
   #
   # `satisfied` counts in condition 1 and `held` does not, and that asymmetry
   # is the whole point. An item the canary resolved and had nothing to do about
@@ -752,6 +799,11 @@ fleet_canary_gate() {
   # Time comes from journal `at` fields, never commit timestamps. Attribution
   # is real because of §7.3: the commit introducing a record under journal/c/
   # must verify as c.
+  canary_identity=
+  if [ "${1:-}" = --identity ]; then
+    canary_identity=${2:-}
+    shift 2
+  fi
   canary_store=$1
   canary_item=$2
   canary_digest=$3
@@ -771,18 +823,23 @@ fleet_canary_gate() {
       continue
     fi
     jq -es --arg item "$canary_item" --arg digest "$canary_digest" \
+      --arg identity "$canary_identity" \
       --argjson wait "$canary_wait" --arg now "$canary_now" '
         ($now | fromdateiso8601) as $now_epoch |
         ($wait * 3600) as $wait_seconds |
-        [.[] | select(.item == $item and .digest == $digest and
-          (.outcome == "applied" or .outcome == "satisfied"))] as $applied |
-        ($applied | map(.at | fromdateiso8601) | min) as $applied_epoch |
+        [.[] | select(.item == $item)] as $mine |
+        # (2) the latest withdrawal of the item, at any digest
+        ([$mine[] | select(.outcome == "held" or .outcome == "reverted") |
+          .at | fromdateiso8601] | max) as $withdrawn_epoch |
+        # (1) the first record of the clean run after it
+        ([$mine[] | select(.digest == $digest and
+            (.identity // "") == $identity and
+            (.outcome == "applied" or .outcome == "satisfied")) |
+          .at | fromdateiso8601 |
+          select($withdrawn_epoch == null or . > $withdrawn_epoch)] |
+          min) as $applied_epoch |
         $applied_epoch != null and
         ($applied_epoch + $wait_seconds) <= $now_epoch and
-        # (2) nothing later withdrew it
-        ([.[] | select(.item == $item and
-          (.outcome == "held" or .outcome == "reverted")) |
-          (.at | fromdateiso8601) | select(. > $applied_epoch)] | length) == 0 and
         # (3) the canary was still publishing after the wait elapsed
         ([.[] | (.at | fromdateiso8601) |
           select(. >= ($applied_epoch + $wait_seconds))] | length) > 0

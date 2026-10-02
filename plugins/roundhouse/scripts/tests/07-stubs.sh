@@ -255,13 +255,24 @@ if [ "${1:-}" = plugin ] && [ "${2:-}" = list ] && [ "${3:-}" = --json ]; then
     exit 0
   }
   codex_plugin_sha="${CODEX_PLUGIN_SHA:-}"
-  printf '{"installed":[{"pluginId":"example@test-market","name":"example","marketplaceName":"test-market","version":"%s","installed":true,"enabled":true,"source":{"source":"local","path":"fixture-codex-active","sha":"%s"}},{"pluginId":"disabled-example@test-market","name":"disabled-example","marketplaceName":"test-market","version":"3.0.0","installed":true,"enabled":false,"source":{"source":"local","path":"fixture-codex-disabled"}}]}\n' "$version" "$codex_plugin_sha"
+  codex_plugin_json=$(printf '{"installed":[{"pluginId":"example@test-market","name":"example","marketplaceName":"test-market","version":"%s","installed":true,"enabled":true,"source":{"source":"local","path":"fixture-codex-active","sha":"%s"}},{"pluginId":"disabled-example@test-market","name":"disabled-example","marketplaceName":"test-market","version":"3.0.0","installed":true,"enabled":false,"source":{"source":"local","path":"fixture-codex-disabled"}}]}\n' "$version" "$codex_plugin_sha")
+  # CODEX_PLUGIN_SOURCE_URL makes the example record git-sourced, from that
+  # repository, as a record from a Git marketplace plugin carries it.
+  [ -z "${CODEX_PLUGIN_SOURCE_URL:-}" ] || codex_plugin_json=$(printf '%s\n' "$codex_plugin_json" |
+    jq -c --arg u "$CODEX_PLUGIN_SOURCE_URL" \
+      '.installed[0].source = {source: "git", url: $u, sha: .installed[0].source.sha}')
+  printf '%s\n' "$codex_plugin_json"
   exit 0
 fi
 if [ "${1:-}" = plugin ] && [ "${2:-}" = add ] &&
   [ "${3:-}" = example@test-market ] && [ "${4:-}" = --json ]; then
   [ -z "${AGENT_EXEC_MARKER:-}" ] || : >"$AGENT_EXEC_MARKER"
-  printf '%s\n' 1.3.0 >"$CODEX_STATE_FILE"
+  [ -z "${CODEX_HOOK_ORDER_FILE:-}" ] || printf 'codex-add %s\n' "$3" >>"$CODEX_HOOK_ORDER_FILE"
+  # `auto-approve` models a Codex copy already at the identity-verified bytes
+  # (every hook trusted): refreshing it is a no-op, as the real add is for a
+  # copy that is current. Every other scenario moves it to 1.3.0's hooks.
+  [ "${CODEX_HOOK_SCENARIO:-}" = auto-approve ] ||
+    printf '%s\n' 1.3.0 >"$CODEX_STATE_FILE"
   exit 0
 fi
 exit 64
@@ -358,7 +369,9 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = install ]; then
       "\$CLAUDE_PLUGIN_CATALOG_FILE")
     if [ -n "\$resolved" ]; then
       record=\$(printf '%s\n' "\$resolved" |
-        jq -c '{scope:"user", version: .version, gitCommitSha: .source.sha}')
+        jq -c --arg root "\${CLAUDE_INSTALL_PATH_ROOT:-}" --arg id "\$3" '
+          {scope:"user", version: .version, gitCommitSha: .source.sha} +
+          (if \$root == "" then {} else {installPath: (\$root + "/" + \$id + "/" + .version)} end)')
       jq -c --arg id "\$3" --argjson rec "\$record" \
         '.plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user")) + [\$rec])' \
         "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"
@@ -414,7 +427,9 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
       "\$CLAUDE_PLUGIN_CATALOG_FILE")
     if [ -n "\$resolved" ]; then
       record=\$(printf '%s\n' "\$resolved" |
-        jq -c '{scope:"user", version: .version, gitCommitSha: .source.sha}')
+        jq -c --arg root "\${CLAUDE_INSTALL_PATH_ROOT:-}" --arg id "\$3" '
+          {scope:"user", version: .version, gitCommitSha: .source.sha} +
+          (if \$root == "" then {} else {installPath: (\$root + "/" + \$id + "/" + .version)} end)')
       jq -c --arg id "\$3" --argjson rec "\$record" \
         '.plugins[\$id] = ((.plugins[\$id] // []) | map(select(.scope != "user")) + [\$rec])' \
         "\$installed_file" >"\$installed_file.tmp" && mv "\$installed_file.tmp" "\$installed_file"

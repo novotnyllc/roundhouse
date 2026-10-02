@@ -511,15 +511,17 @@ fleet_run_canary_passing() {
         $pairs | split("\n")[] | select(. != "") | split("\t") as [$item, $digest] |
         ($by_item[$item] // []) as $mine |
         select($indexable) |
-        (try ([$mine[] | select(.digest == $digest and
+        # As the gate asks it: the latest withdrawal, then the first
+        # identity-less evidence after it (the current clean run).
+        (try ([$mine[] | select(.outcome == "held" or .outcome == "reverted") |
+            .at | fromdateiso8601] | max) catch "error") as $withdrawn |
+        select($withdrawn != "error") |
+        (try ([$mine[] | select(.digest == $digest and (.identity // "") == "" and
             (.outcome == "applied" or .outcome == "satisfied")) |
-            .at | fromdateiso8601] | min) catch "error") as $applied_epoch |
+            .at | fromdateiso8601 | select($withdrawn == null or . > $withdrawn)] |
+            min) catch "error") as $applied_epoch |
         select($applied_epoch != "error" and $applied_epoch != null) |
         select(($applied_epoch + $ws) <= $now_epoch) |
-        (try ([$mine[] | select(.outcome == "held" or .outcome == "reverted") |
-            (.at | fromdateiso8601) | select(. > $applied_epoch)] | length)
-          catch -1) as $withdrawn |
-        select($withdrawn == 0) |
         select($latest != null and $latest >= ($applied_epoch + $ws)) |
         "\($item)\($us)\($digest)"' <"$fleet_run_cp_entries" 2>/dev/null || :
     fi
@@ -763,6 +765,10 @@ fleet_run_poll_floor() {
   # No stale-host scan owed (§6.3): only a pass that reaches the end runs it
   # (fleet_liveness_owed says what owes one).
   ! fleet_liveness_owed "$1" "$fleet_run_fetched" || return 1
+  # Last, because it is the one network question per marketplace: an
+  # upstream plugin marketplace that moved is work the store cannot show
+  # (fleet_plugins_probe, read-only `git ls-remote`).
+  ! fleet_plugins_probe || return 1
   if [ "$fleet_run_fetched" = "$fleet_run_converged" ]; then
     fleet_run_floor_note='nothing new on the remote'
   else
@@ -1742,10 +1748,279 @@ fleet_run_approve_plugin_hooks() {
   # a false hold. If Codex is present, a malformed/failed list is a real
   # inability to prove ownership and remains held.
   command -v codex >/dev/null 2>&1 || return 0
+  # A failed listing is transient (74): kept, so the next fast pass retries.
+  fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" '') || return $?
+  [ "$fleet_run_codex_plugin_state" != absent ] || return 0
+  # Codex's registration is the operator's, not the item's: a Codex copy
+  # someone DISABLED runs no hooks, so there is nothing to approve, and it is
+  # never reinstalled (`codex plugin add` would re-enable it).
+  fleet_run_codex_rec=$(fleet_run_codex_record "$1") || return $?
+  fleet_run_codex_enabled=$(printf '%s\n' "$fleet_run_codex_rec" | jq -r '.enabled == true') ||
+    return 75
+  [ "$fleet_run_codex_enabled" = true ] || return 0
+  fleet_run_hooks_node=$(fleet_node_path) || {
+    printf 'roundhouse: Node.js is required to approve hooks for %s\n' "$1" >&2
+    return 75
+  }
+  # Third argument `refresh`: called right after an install or update of an
+  # ENABLED plugin. The run never reinstalls Codex's copy (no
+  # `codex-plugin-hooks.mjs update` here: it would re-trust refreshed hooks
+  # before any check below could refuse, and a 75 undoes no trust write).
+  # Codex's own startup sync, which the pass triggers before this loop,
+  # brings the copy current; approval is byte-verified in one session. A
+  # copy from another source sharing the ID, or one Codex has not synced to
+  # the expected SHA yet, holds with its reason, and the next pass retries.
+  if [ "${3:-}" = refresh ]; then
+    fleet_run_codex_source_ok "$1" || {
+      printf "roundhouse: automatic hook approval for %s refused: Codex's copy is not from the source Claude's catalog names\n" "$1" >&2
+      return 75
+    }
+  fi
+  fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" \
+    "$fleet_run_expected_sha") || return 75
+  case $fleet_run_codex_plugin_state in
+    match) ;;
+    local)
+      fleet_run_codex_bytes_verified "$1" "$fleet_run_expected_sha" || {
+        printf 'roundhouse: automatic hook approval for %s refused: %s\n' \
+          "$1" "$fleet_run_bytes_reason" >&2
+        return 75
+      }
+      ;;
+    *)
+      printf 'roundhouse: automatic hook approval for %s refused: Codex has not synced to %s yet; the next pass retries\n' \
+        "$1" "${fleet_run_expected_sha:-the expected bytes}" >&2
+      return 75
+      ;;
+  esac
+  # Codex advances its own copies (its startup sync), so a hook this host
+  # trusted reads `modified` once upstream changed it. Automatic approval
+  # carries that trust only for bytes PROVEN to be the verified upstream ones
+  # (fleet_run_codex_bytes_verified); otherwise the helper refuses a modified
+  # hook, and a never-trusted hook is refused either way.
+  # The verified IDENTITY goes to the helper, not a bare yes: it re-checks
+  # the SHA and the two trees, and that the hooks it writes are the ones it
+  # listed, inside the one app server session that writes trust.
+  fleet_run_hook_sha=
+  fleet_run_hook_tree=
+  fleet_run_hook_codex_tree=
+  fleet_run_hook_source_path=
+  fleet_run_bytes_reason=
+  if [ -n "$fleet_run_expected_sha" ] &&
+    fleet_run_codex_bytes_verified "$1" "$fleet_run_expected_sha"; then
+    fleet_run_hook_sha=$fleet_run_expected_sha
+    fleet_run_hook_tree=$fleet_run_bv_claude_path
+    fleet_run_hook_codex_tree=$fleet_run_bv_codex_path
+    fleet_run_hook_source_path=$fleet_run_bv_local_path
+  fi
+  fleet_run_cli_invalidate
+  ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
+    ROUNDHOUSE_VERIFIED_SHA=$fleet_run_hook_sha \
+    ROUNDHOUSE_VERIFIED_TREE=$fleet_run_hook_tree \
+    ROUNDHOUSE_CODEX_TREE=$fleet_run_hook_codex_tree \
+    ROUNDHOUSE_CODEX_SOURCE_PATH=$fleet_run_hook_source_path \
+    "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
+    >/dev/null || {
+    [ -z "$fleet_run_bytes_reason" ] ||
+      printf 'roundhouse: automatic hook approval for %s carried no trust: %s\n' \
+        "$1" "$fleet_run_bytes_reason" >&2
+    return 75
+  }
+}
+
+fleet_run_codex_bytes_verified() {
+  # fleet_run_codex_bytes_verified ID SHA — exit 0 when Codex's installed
+  # copy of ID is byte-identical to Claude's verified install at SHA: the
+  # Codex record comes from the intended source (fleet_run_codex_source_ok)
+  # at SHA, Claude's user-scoped install is at SHA, and the two installed
+  # trees hash the same under fleet_run_tree_digest (the same digest and
+  # exclusions the relative-source identity uses). Otherwise 1, with the
+  # cause in `fleet_run_bytes_reason`.
+  fleet_run_bytes_reason=
+  fleet_run_codex_source_ok "$1" || {
+    fleet_run_bytes_reason="Codex's copy is not from the source Claude's catalog names"
+    return 1
+  }
+  fleet_run_bv_record=$(fleet_run_codex_record "$1") || {
+    fleet_run_bytes_reason='the Codex plugin list is unreadable'
+    return 1
+  }
+  fleet_run_bv_fields=$(printf '%s\n' "$fleet_run_bv_record" | jq -r '
+    [(.source.sha // ""), (.marketplaceName // ""), (.name // ""), (.version // ""),
+      (.source.source // ""), (.source.path // "")] |
+    map(tostring) | join("\u001f")') || fleet_run_bv_fields=
+  IFS=$fleet_run_sep read -r fleet_run_bv_sha fleet_run_bv_market fleet_run_bv_name \
+    fleet_run_bv_version fleet_run_bv_kind fleet_run_bv_srcpath <<EOF
+$fleet_run_bv_fields
+EOF
+  # A git-sourced record carries the SHA it was installed at. A local
+  # (in-marketplace) one carries none: its path inside the verified
+  # marketplace root was proven above (fleet_run_codex_source_ok), and the
+  # byte comparison below is its identity.
+  fleet_run_bv_local_path=
+  if [ "$fleet_run_bv_kind" = local ] && [ -z "$fleet_run_bv_sha" ]; then
+    fleet_run_bv_local_path=$fleet_run_bv_srcpath
+  elif [ "$fleet_run_bv_sha" != "$2" ]; then
+    fleet_run_bytes_reason="Codex's copy is at ${fleet_run_bv_sha:-no SHA}, not $2"
+    return 1
+  fi
+  fleet_run_bv_claude=$(fleet_run_installed_plugin "$1" 2>/dev/null) || fleet_run_bv_claude='{}'
+  fleet_run_bv_claude_path=$(printf '%s\n' "$fleet_run_bv_claude" | jq -r --arg sha "$2" '
+    if (.gitCommitSha // "") == $sha then (.installPath // "") else "" end') ||
+    fleet_run_bv_claude_path=
+  [ -n "$fleet_run_bv_claude_path" ] && [ -d "$fleet_run_bv_claude_path" ] || {
+    fleet_run_bytes_reason="no Claude install of $1 at $2 to compare against"
+    return 1
+  }
+  for fleet_run_bv_part in "$fleet_run_bv_market" "$fleet_run_bv_name" "$fleet_run_bv_version"; do
+    case $fleet_run_bv_part in '' | . | .. | */*) fleet_run_bytes_reason="Codex's record names no installed copy"; return 1 ;; esac
+  done
+  fleet_run_bv_codex_path="${CODEX_HOME:-$HOME/.codex}/plugins/cache/$fleet_run_bv_market/$fleet_run_bv_name/$fleet_run_bv_version"
+  [ -d "$fleet_run_bv_codex_path" ] || {
+    fleet_run_bytes_reason="Codex's installed copy is missing at $fleet_run_bv_codex_path"
+    return 1
+  }
+  fleet_run_bv_want=$(fleet_run_tree_digest "$fleet_run_bv_claude_path") || {
+    fleet_run_bytes_reason="Claude's install of $1 could not be hashed"
+    return 1
+  }
+  fleet_run_bv_have=$(fleet_run_tree_digest "$fleet_run_bv_codex_path") || {
+    fleet_run_bytes_reason="Codex's installed copy of $1 could not be hashed"
+    return 1
+  }
+  [ "$fleet_run_bv_want" = "$fleet_run_bv_have" ] || {
+    fleet_run_bytes_reason="Codex's installed copy of $1 differs byte-for-byte from Claude's verified install at $2"
+    return 1
+  }
+}
+
+fleet_run_codex_hooks_settled() {
+  # fleet_run_codex_hooks_settled ID SHA — exit 0 when Codex's copy of an
+  # enabled fleet plugin needs nothing: Codex does not have it (or has it
+  # disabled), or its copy is at SHA with every hook trusted. Read-only until
+  # it finds work: a `modified` hook retries the byte-verified approval; a
+  # copy not at SHA, or a hook never trusted (which needs the operator), holds
+  # (75) with its reason, so the next pass asks again.
+  case ${1:-} in *@*) ;; *) return 0 ;; esac
+  command -v codex >/dev/null 2>&1 || return 0
+  fleet_run_hs_record=$(fleet_run_codex_record "$1") || return $?
+  [ "$(printf '%s\n' "$fleet_run_hs_record" | jq -r '.enabled == true')" = true ] || return 0
+  if [ -n "${2:-}" ] && [ "$(printf '%s\n' "$fleet_run_hs_record" | jq -r '.source.sha // ""')" != "$2" ]; then
+    # A local (in-marketplace) record has no SHA: it is synced when it is
+    # from the verified source and byte-identical to Claude's install.
+    if [ "$(fleet_run_codex_record_state "$1" "$2")" = local ]; then
+      fleet_run_codex_bytes_verified "$1" "$2" || {
+        printf 'roundhouse: Codex hooks for %s are not approved: %s; the next pass retries\n' \
+          "$1" "$fleet_run_bytes_reason" >&2
+        return 75
+      }
+    else
+      printf 'roundhouse: Codex hooks for %s are not approved: Codex has not synced to %s yet; the next pass retries\n' \
+        "$1" "$2" >&2
+      return 75
+    fi
+  fi
+  fleet_run_hs_node=$(fleet_node_path) || return 75
+  fleet_run_hs_status=$(bounded_query "$fleet_run_hs_node" "$script_dir/codex-plugin-hooks.mjs" \
+    status "$1" 2>/dev/null </dev/null) || return 74
+  fleet_run_hs_counts=$(printf '%s\n' "$fleet_run_hs_status" |
+    jq -er '"\(.modified | numbers) \(.untrusted | numbers)"' 2>/dev/null) || return 75
+  case $fleet_run_hs_counts in
+    '0 0') return 0 ;;
+    *' 0') fleet_run_approve_plugin_hooks "$1" "${2:-}" refresh ;;
+    *)
+      printf 'roundhouse: Codex hooks for %s are not approved: a hook was never trusted; approve it explicitly (approve-codex-plugin-hooks)\n' \
+        "$1" >&2
+      return 75
+      ;;
+  esac
+}
+
+fleet_run_codex_record() {
+  # fleet_run_codex_record ID -> Codex's installed record for ID as compact
+  # JSON (`{}` when there is none). Exit 75 when the list cannot be read.
   fleet_run_codex_plugins=$(fleet_run_cli_cached codex \
     codex plugin list --json 2>/dev/null) || return 74
-  fleet_run_codex_plugin_state=$(printf '%s\n' "$fleet_run_codex_plugins" | jq -e -r \
-    --arg id "$1" --arg expected_sha "$fleet_run_expected_sha" '
+  printf '%s\n' "$fleet_run_codex_plugins" | jq -e -c --arg id "$1" '
+    if type == "array" then .
+    elif type == "object" and (.installed | type == "array") then .installed
+    else error("invalid plugin list") end |
+    [.[] | objects | select((.pluginId // .id) == $id and (.installed != false))] |
+    (.[0] // {})' 2>/dev/null || return 75
+}
+
+fleet_run_codex_source_ok() {
+  # fleet_run_codex_source_ok ID — exit 0 when Codex's installed copy of ID
+  # comes from the plugin source Claude's catalog names (any revision of it),
+  # 75 otherwise or when that cannot be shown. Two catalog shapes:
+  #   - a source with a repository (`git`/`git-subdir`/`url`/`github`): the
+  #     same repository, GitHub spellings folded together, and the same path
+  #     inside it;
+  #   - a relative, in-marketplace source: the Codex marketplace the record
+  #     belongs to is registered from the same repository Claude's is, and
+  #     the record's local path is that relative path under its root.
+  fleet_run_cso_catalog=$(fleet_run_plugin_catalog_proven "$1") || return 75
+  fleet_run_cso_record=$(fleet_run_codex_record "$1") || return 75
+  fleet_run_cso_srcid='
+    def repo: sub("/+$"; "") |
+      if test("^(https://|ssh://git@|git@)github[.]com[:/]") then
+        "github:" + (sub("^(https://|ssh://git@|git@)github[.]com[:/]"; "") |
+          ascii_downcase | sub("[.]git$"; ""))
+      else sub("[.]git$"; "") end;
+    def rel: (. // "") | tostring | sub("^[.]/"; "") | sub("^[.]$"; "") | sub("/+$"; "");
+    def srcid: (if .source == "github" then "https://github.com/" + (.repo // "")
+      else (.url // "") end) as $u |
+      if ($u | type) == "string" and $u != "" then ($u | repo) + "|" + (.path | rel)
+      else empty end;'
+  fleet_run_cso_kind=$(printf '%s\n' "$fleet_run_cso_catalog" |
+    jq -r '.source.source // ""') || return 75
+  if [ "$fleet_run_cso_kind" != relative ]; then
+    fleet_run_cso_want=$(printf '%s\n' "$fleet_run_cso_catalog" |
+      jq -er "$fleet_run_cso_srcid"' .source | srcid' 2>/dev/null) || return 75
+    fleet_run_cso_have=$(printf '%s\n' "$fleet_run_cso_record" |
+      jq -er "$fleet_run_cso_srcid"' .source | srcid' 2>/dev/null) || return 75
+    [ "$fleet_run_cso_want" = "$fleet_run_cso_have" ]
+    return
+  fi
+  # In-marketplace: compare the two marketplaces' repositories, then the path.
+  fleet_run_cso_market=${1##*@}
+  fleet_run_cso_centry=$(fleet_run_marketplaces | jq -c --arg n "$fleet_run_cso_market" \
+    '[.[] | select(.name == $n)] | .[0] // empty' 2>/dev/null) || return 75
+  [ -n "$fleet_run_cso_centry" ] || return 75
+  fleet_run_cso_claude=$(fleet_run_marketplace_registered_locator "$fleet_run_cso_market" \
+    "$fleet_run_cso_centry") || return 75
+  fleet_run_cso_xmarket=$(printf '%s\n' "$fleet_run_cso_record" |
+    jq -r '.marketplaceName // empty') || return 75
+  fleet_run_cso_xentry=$(bounded_query codex plugin marketplace list --json 2>/dev/null |
+    jq -ec --arg n "$fleet_run_cso_xmarket" '
+      (if type == "array" then . else (.marketplaces // []) end) |
+      [.[] | select(.name == $n)] | .[0] // error("none")' 2>/dev/null) || return 75
+  fleet_run_cso_codex=$(printf '%s\n' "$fleet_run_cso_xentry" | jq -r \
+    "$fleet_run_marketplace_locator_filter"'
+    {source: {source: "git", url: (.marketplaceSource.source // "")}} | locator') ||
+    return 75
+  # A ref is not part of this comparison: an older revision of the same
+  # repository is the same source.
+  [ "${fleet_run_cso_claude%%#*}" = "${fleet_run_cso_codex%%#*}" ] || return 75
+  printf '%s\n' "$fleet_run_cso_xentry" "$fleet_run_cso_record" \
+    "$fleet_run_cso_catalog" | jq -es '
+      def norm: tostring | gsub("/+"; "/") | sub("/$"; "") | sub("/[.]$"; "");
+      def rel: (. // "") | tostring | sub("^[.]/"; "") | sub("^[.]$"; "") | sub("/+$"; "");
+      .[0].root as $root | .[1].source as $s | (.[2].source.path | rel) as $rel |
+      ($root | type) == "string" and ($s.source // "") == "local" and
+      (($s.path // "") | norm) ==
+        (if $rel == "" then $root else $root + "/" + $rel end | norm)' \
+    >/dev/null 2>&1 || return 75
+}
+
+fleet_run_codex_record_state() {
+  # fleet_run_codex_record_state ID EXPECTED-SHA -> `absent` when Codex has no
+  # installed record for ID, else `match` or `mismatch` against EXPECTED-SHA
+  # (an empty one matches any record). Exit 75 when the list cannot be read.
+  fleet_run_codex_plugins=$(fleet_run_cli_cached codex \
+    codex plugin list --json 2>/dev/null) || return 74
+  printf '%s\n' "$fleet_run_codex_plugins" | jq -e -r \
+    --arg id "$1" --arg expected_sha "$2" '
     def records:
       if type == "array" then .
       elif type == "object" and (.installed | type == "array") then .installed
@@ -1755,22 +2030,13 @@ fleet_run_approve_plugin_hooks() {
       if ($matches | length) == 0 then "absent"
       elif $expected_sha == "" or any($matches[]; .source.sha == $expected_sha)
       then "match"
+      # An in-marketplace plugin: Codex records `source: local` with no SHA,
+      # so its identity is its path and bytes (fleet_run_codex_bytes_verified).
+      elif any($matches[]; .source.source == "local" and (.source.sha // "") == "")
+      then "local"
       else "mismatch"
       end
-  ' 2>/dev/null) || return 75
-  case "$fleet_run_codex_plugin_state" in
-    absent) return 0 ;;
-    match) ;;
-    *) return 75 ;;
-  esac
-  fleet_run_hooks_node=$(fleet_node_path) || {
-    printf 'roundhouse: Node.js is required to approve hooks for %s\n' "$1" >&2
-    return 75
-  }
-  fleet_run_cli_invalidate
-  ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
-    "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
-    >/dev/null || return 75
+  ' 2>/dev/null || return 75
 }
 
 fleet_run_skill_source_identity() {
@@ -2378,7 +2644,7 @@ EOF
                 = "$fleet_run_resolved_version" ]; } || return 74
           if [ "$fleet_run_want_enabled" = true ]; then
             fleet_run_approve_plugin_hooks "$fleet_run_id" \
-              "$fleet_run_resolved_sha" || return $?
+              "$fleet_run_resolved_sha" refresh || return $?
           fi
           fleet_run_plugin_mutated=true
         fi
@@ -2434,6 +2700,14 @@ EOF
         [ "$fleet_run_actual_enabled" = true ]; then
         fleet_run_approve_plugin_hooks "$fleet_run_id" \
           "${fleet_run_resolved_sha:-}" || return $?
+      fi
+      # Steady state (nothing installed, updated or enabled this pass): an
+      # approval an earlier pass could not make — Codex had not synced yet —
+      # is retried here, or Claude reads converged and the changed hooks stay
+      # untrusted for good (fleet_run_codex_hooks_settled).
+      if [ "$fleet_run_want_enabled" = true ] && [ "$fleet_run_actual_enabled" = true ] &&
+        [ "$fleet_run_plugin_mutated" != true ] && [ "$fleet_run_enable_attempted" != true ]; then
+        fleet_run_codex_hooks_settled "$fleet_run_id" "${fleet_run_resolved_sha:-}" || return $?
       fi
       ;;
     skills)
@@ -3284,6 +3558,21 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         '{item:$item,digest:"absent",outcome:"reverted",at:$at}')" || :
   done
 
+  # Plugins are always current: marketplaces whose upstream moved (fast), or
+  # all of them (full), are refreshed BEFORE the plan, so this pass's identity
+  # comparison sees the new catalog and updates the plugin items it owns
+  # (lib/fleet-plugins.sh). The stamp keeps the full pass from refreshing
+  # them a second time. On conflicted heads the fold and definitions are the
+  # first head's alone, so a plugin another head owns would read as unowned and
+  # be updated in place past its hold: the refresh waits for the resolution.
+  if [ "$run_state" = conflicted ]; then
+    printf '  hold  plugins — conflicted heads; the marketplace refresh waits for the resolution\n'
+  else
+    fleet_plugins_refresh "$run_store" "$run_host" "$run_fold" "$run_defs" \
+      "$run_mode" "$run_tmp" "$run_desired" || :
+  fi
+  : >"$run_tmp/plugins-refreshed"
+
   # The pass's whole item set, for the sweep's retired-item rule.
   awk 'NF >= 2 { print $2 }' "$run_tmp/verdicts" | fleet_alert_items "$run_ledger"
   # THE PLAN, not one lookup per item: every per-item read below — value,
@@ -3458,9 +3747,11 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fi
 
     # §10.1's gate, with the liveness term. Canary hosts are not gated by
-    # themselves, and a tombstone with nothing installed here is not a change
-    # here: its `satisfied` is true whatever the canaries have seen.
+    # themselves, a tombstone with nothing installed here is not a change
+    # here (its `satisfied` is true whatever the canaries have seen), and a
+    # plugin is never gated: plugins are always current (fleet_canary_exempt).
     if [ "$run_self_canary" != true ] && [ -s "$run_tmp/canaries" ] &&
+      ! fleet_canary_exempt "$run_item" &&
       { [ "$run_tombstone" != true ] || [ "$run_tomb_removal" = true ]; }; then
       # fleet_canary_gate's answer for every plan item was computed before
       # the loop (fleet_run_canary_passing): the canaries' journals do not
@@ -4240,28 +4531,12 @@ fleet_run_full_pass() (
   full_hold_dir=${6:-}
 
   # §10.5: one file per host per upstream. No leases, no CAS, no TTLs, no
-  # takeover — jitter is the coordination primitive.
-  fleet_run_plugin_marketplaces "$full_fold" "$full_defs" \
-    "${6:-}/sigholds" "${6:-}/verdicts" |
-    while IFS= read -r full_upstream; do
-    [ -n "$full_upstream" ] || continue
-    full_result=unavailable
-    if command -v claude >/dev/null 2>&1; then
-      full_result=failed
-      # `update` cannot refresh a marketplace that was never registered, and
-      # never refreshes one registered from another source than the declared
-      # one: that would pull whatever the new source serves under the name.
-      fleet_run_ensure_marketplace "$full_upstream" >/dev/null 2>&1 || :
-      if fleet_run_marketplace_source_ok "$full_upstream"; then
-        ! bounded_verb claude plugin marketplace update "$full_upstream" >/dev/null 2>&1 ||
-          full_result=ok
-      else
-        full_result=held
-        printf '  hold  marketplace %s — %s\n' "$full_upstream" "$fleet_run_repair_reason"
-      fi
-    fi
-    fleet_upstream_write "$full_store" "$full_upstream" "$full_host" "$full_result" || :
-  done
+  # takeover — jitter is the coordination primitive. The run refreshes
+  # plugin marketplaces BEFORE its item loop (fleet_plugins_refresh) and
+  # stamps the pass; this is the refresh for a caller that did not.
+  [ -e "${6:-}/plugins-refreshed" ] ||
+    fleet_plugins_refresh "$full_store" "$full_host" "$full_fold" "$full_defs" \
+      full "${6:-}" || :
 
   # §7.11.3's three aging policies, DELIBERATELY SEPARATE because they answer
   # different questions and have different natural periods. Both of the two that

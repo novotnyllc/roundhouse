@@ -164,6 +164,8 @@ YAML
     export CLAUDE_PLUGIN_ACTION_LOG="$run_plugin_order_log"
     export CODEX_HOOK_ORDER_FILE="$run_plugin_order_log"
     export CODEX_HOOK_SCENARIO=auto-approve
+    # Codex's copy comes from the same repository Claude's catalog names.
+    export CODEX_PLUGIN_SOURCE_URL=https://example.invalid/example.git
 
     # B-1 characterization first: on Claude 2.1.229 the installed plugin is
     # absent from --available, so the existing identity gate has no SHA and
@@ -398,7 +400,7 @@ JSON
 {"name":"test-market","plugins":[{"name":"example","version":"1.2.3","source":{"source":"git","url":"https://example.invalid/roundhouse.git","sha":"$run_sha_old"}}]}
 JSON
 
-    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.2.3\",\"source\":{\"sha\":\"$run_sha_old\"}}]}" >"$run_plugin_catalog"
+    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.2.3\",\"source\":{\"source\":\"git\",\"url\":\"https://example.invalid/example.git\",\"sha\":\"$run_sha_old\"}}]}" >"$run_plugin_catalog"
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_old\"}]}}" >"$run_plugin_installed"
     # Characterization: matching bytes start enabled, so enable refuses its no-op.
     run_plugin_enabled_file="$run_root/plugin-enabled.json"
@@ -407,7 +409,8 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_plugin_identity_matches \
       "$run_plugin_defs" example '{"state":"enabled","marketplace":"test-market"}' ||
       fail "same-version/same-SHA ownership identity did not match"
-    CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+    # Codex's copy is at the same bytes (a steady state checks it).
+    CODEX_PLUGIN_SHA="$run_sha_old" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
@@ -415,7 +418,7 @@ JSON
         '"enabled"' '' >/dev/null || fail "same-SHA plugin apply failed"
     [ ! -s "$run_plugin_install_marker" ] ||
       fail "same-version/same-SHA plugin was reinstalled"
-    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.2.3\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
+    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.2.3\",\"source\":{\"source\":\"git\",\"url\":\"https://example.invalid/example.git\",\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
     run_identity_status=0
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_plugin_identity_matches \
@@ -446,8 +449,10 @@ JSON
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
       'update example@test-market' ] ||
       fail "plugin update did not enter the honest action ledger"
+    # Codex's copy is already at the new bytes (Codex syncs its own), so it
+    # is not refreshed: approval reads it as it is.
     [ "$(sed -n '2p' "$run_plugin_order_log")" = approve ] ||
-      fail "hook approval did not follow the plugin update"
+      fail "hook approval did not follow the plugin update: $(tr '\n' ';' <"$run_plugin_order_log")"
     [ "$(sed -n '3p' "$run_plugin_order_log")" = \
       'enable example@test-market' ] ||
       fail "plugin enable did not enter the honest action ledger"
@@ -479,7 +484,7 @@ JSON
       fail "post-state enable approval did not write Codex hook trust"
 
     : >"$run_plugin_install_marker"
-    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.3.0\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
+    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.3.0\",\"source\":{\"source\":\"git\",\"url\":\"https://example.invalid/example.git\",\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
@@ -492,7 +497,7 @@ JSON
     # the identity re-read must hold before any Codex hook trust mutation.
     : >"$run_plugin_order_log"
     : >"$run_plugin_install_marker"
-    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.4.0\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
+    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.4.0\",\"source\":{\"source\":\"git\",\"url\":\"https://example.invalid/example.git\",\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.3.0\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
     run_status=0
     CLAUDE_INSTALL_SKIP_RECORD=1 \
@@ -517,12 +522,17 @@ JSON
     rm -f "$CODEX_HOOK_WRITES_FILE"
     printf '%s\n' '{"version":2,"plugins":{"example@test-market":[{"scope":"user","version":"1.4.0","gitCommitSha":"'$run_sha_new'"}]}}' >"$run_plugin_installed"
     printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    # It HOLDS — its Codex hooks are not trusted, which only the operator can
+    # fix — and nothing is approved or written.
+    run_status=0
     CODEX_HOOK_SCENARIO=approve \
       CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
-        '"enabled"' '' >/dev/null || fail "steady-state plugin apply failed"
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 75 ] ||
+      fail "a steady-state plugin with untrusted Codex hooks read as converged (got $run_status)"
     [ ! -s "$run_plugin_order_log" ] ||
       fail "steady-state enable invoked automatic hook approval"
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
@@ -626,7 +636,7 @@ JSON
     # identity requiring install, not a malformed-metadata hold.
     : >"$run_plugin_install_marker"
     rm -f "$run_plugin_installed"
-    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.3.0\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
+    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.3.0\",\"source\":{\"source\":\"git\",\"url\":\"https://example.invalid/example.git\",\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
@@ -650,7 +660,7 @@ JSON
     # same converged plugin twice: both passes must be `applied`.
     printf '%s\n' '{}' >"$run_plugin_enabled_file"
     : >"$run_plugin_install_marker"
-    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.3.0\",\"source\":{\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
+    printf '%s\n' "{\"available\":[{\"pluginId\":\"example@test-market\",\"version\":\"1.3.0\",\"source\":{\"source\":\"git\",\"url\":\"https://example.invalid/example.git\",\"sha\":\"$run_sha_new\"}}]}" >"$run_plugin_catalog"
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.3.0\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
     for run_converged_pass in first second; do
       run_status=0

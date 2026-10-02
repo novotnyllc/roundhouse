@@ -40,9 +40,12 @@ assert_contains "$fleet_agents_text" 'freeze a'
 assert_contains "$fleet_agents_text" 'outside-marketplace record to be unchanged'
 assert_contains "$fleet_agents_text" 'Update `roundhouse@novotnyllc` last'
 assert_contains "$fleet_agents_text" 'Report before/after versions per'
+# Codex follows its own startup sync: the routine triggers it and never
+# upgrades then "updates" (the upgrade already reinstalled the plugins).
 assert_ordered "$fleet_agents_skill" \
-  'codex plugin marketplace upgrade MARKETPLACE --json' \
-  'update-codex-plugin EACH_INSTALLED_PLUGIN@MARKETPLACE'
+  'codex plugin marketplace list --json' \
+  'codex-plugin-hooks.mjs" sync ROOT REVISION'
+assert_contains "$fleet_agents_text" 'Do not run `codex plugin marketplace upgrade` followed by'
 assert_contains "$fleet_agents_text" 'never send or interpolate'
 assert_contains "$fleet_agents_text" '"$TARGET_CLI" verify-executor'
 assert_contains "$fleet_agents_text" 'previously resolved and verified `"$TARGET_CLI"`'
@@ -108,9 +111,11 @@ for native_status in tool_surface_missing host_offline saved_project_missing nat
   assert_contains "$remote_control_text" "$native_status"
 done
 assert_contains "$remote_control_text" 'does not require or preflight the Roundhouse executor'
+# Windows remote-control targets follow Codex's own startup sync too.
 assert_ordered "$remote_control_reference" \
-  'codex plugin marketplace upgrade MARKETPLACE --json' \
-  'codex-plugin-hooks.mjs" update EACH_INSTALLED_PLUGIN@MARKETPLACE'
+  'codex plugin marketplace list --json' \
+  'codex-plugin-hooks.mjs" sync --codex-executable "RESOLVED-CODEX-EXE" ROOT REVISION'
+assert_contains "$remote_control_text" 'Do not run `codex plugin marketplace upgrade` followed by'
 assert_contains "$remote_control_text" 'applicable Codex'
 assert_contains "$remote_control_text" 'Claude harnesses'
 assert_contains "$remote_control_text" 'native PowerShell only'

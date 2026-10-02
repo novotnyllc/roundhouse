@@ -9,9 +9,10 @@
 # shellcheck shell=bash
 #
 # Part 1 is the two-host story; parts 2-3 the independent one-host scenarios;
-# parts 4-6 the §7.12.3 reviewed-ref scenarios, each on its own fresh fleet.
-# Split so no unit nears the 10-minute test cap on a macOS runner.
-# roundhouse-test: parts=6
+# parts 4-6 the §7.12.3 reviewed-ref scenarios; part 7 plugin currency; each
+# on its own fresh fleet. Split so no unit nears the 10-minute test cap on a
+# macOS runner.
+# roundhouse-test: parts=7
 
 runjj_root="$tmp/fleet-run-jj"
 mkdir -p "$runjj_root"
@@ -1348,6 +1349,149 @@ p0jj_catchup() {
     fail "the catch-up did not advance reviewed-ref to the new root"
 }
 
+p0jj_plugins() {
+  # --- plugins are always current: no canary, and the fast pass sees upstream ---
+  # mac-mini, live: a full pass logged `wait plugins.compound-engineering — no
+  # canary evidence` for every third-party plugin and Claude Code stayed a
+  # release behind on three hosts. A plugin's digest never moves with its
+  # upstream, so a new release could never earn canary evidence of its own.
+  # Here vireo is NOT a canary and its canary (wren) has never run: an
+  # ordinary item waits, the plugin applies — and when the marketplace's
+  # upstream moves, the poll floor sees it and the same fast pass updates
+  # both the fleet's plugin item and a plugin the fleet does not own.
+  printf 'platform: macos\ngroups: [development]\nhostname: vireo.invalid\nuser: claire\n' \
+    >"$vireo/hosts/vireo.yaml"
+  printf 'platform: macos\ngroups: [development, canary]\nhostname: wren.invalid\nuser: claire\n' \
+    >"$vireo/hosts/wren.yaml"
+  runjj_sha_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  runjj_sha_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  runjj_sha_c=cccccccccccccccccccccccccccccccccccccccc
+  runjj_catalog() {
+    jq -cn --arg v "$1" --arg sha "$2" '{available: [
+      {pluginId: "widget@test-market", version: $v, source: {source: "git", sha: $sha}},
+      {pluginId: "gadget@test-market", version: $v, source: {source: "git", sha: $sha}}]}' \
+      >"$rjj/catalog.json"
+  }
+  runjj_catalog 1.0.0 "$runjj_sha_a"
+  # The marketplace's upstream: a real repository, so the probe's
+  # `git ls-remote` answers offline.
+  "$REAL_GIT" init -q --bare -b main "$rjj/market.git"
+  "$REAL_GIT" init -q -b main "$rjj/market-work"
+  runjj_market_commit() {
+    "$REAL_GIT" -C "$rjj/market-work" -c user.name=x -c user.email=x@example.invalid \
+      -c commit.gpgsign=false commit -q --allow-empty -m "$1"
+    "$REAL_GIT" -C "$rjj/market-work" push -q "$rjj/market.git" main
+  }
+  runjj_market_commit 'release 1.0.0'
+  mkdir -p "$HOME/.claude/plugins"
+  jq -n --arg url "$rjj/market.git" \
+    '{"test-market": {source: {source: "git", url: $url}}}' \
+    >"$HOME/.claude/plugins/known_marketplaces.json"
+  # gadget is installed and is not a fleet item; widget is the fleet's.
+  printf '{"version":2,"plugins":{"gadget@test-market":[{"scope":"user","version":"1.0.0","gitCommitSha":"%s"}]}}\n' \
+    "$runjj_sha_a" >"$HOME/.claude/plugins/installed_plugins.json"
+  printf '{"widget@test-market":false,"gadget@test-market":true}\n' >"$rjj/plugin-enabled.json"
+  : >"$rjj/plugin-actions"
+  : >"$rjj/market-updates"
+  cat >"$vireo/groups/development.yaml" <<'YAML'
+mcp_servers:
+  context7: enabled
+plugins:
+  widget:
+    state: disabled
+    marketplace: test-market
+YAML
+  runjj_plugin_env() {
+    runjj vireo env CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_CATALOG_FILE="$rjj/catalog.json" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$rjj/plugin-enabled.json" \
+      CLAUDE_PLUGIN_ACTION_LOG="$rjj/plugin-actions" \
+      CLAUDE_INSTALL_MARKER="$rjj/plugin-installs" \
+      CLAUDE_MARKETPLACE_UPDATE_MARKER="$rjj/market-updates" "$@"
+  }
+  runjj_installed_sha() {
+    jq -r --arg id "$1" '.plugins[$id][] | select(.scope == "user") | .gitCommitSha' \
+      "$HOME/.claude/plugins/installed_plugins.json"
+  }
+  runjj_out=$(runjj_plugin_env "$cli" fleet-run --fast) ||
+    fail "the plugin run failed: $runjj_out"
+  case $runjj_out in
+    *'wait  mcp_servers.context7 — no canary evidence'*) ;;
+    *) fail "an ordinary item stopped waiting on canary evidence: $runjj_out" ;;
+  esac
+  case $runjj_out in
+    *'wait  plugins.widget'*) fail "a plugin waited on canary evidence: $runjj_out" ;;
+    *'applied plugins.widget'*) ;;
+    *) fail "the plugin did not apply on a non-canary host: $runjj_out" ;;
+  esac
+  [ "$(runjj_installed_sha widget@test-market)" = "$runjj_sha_a" ] ||
+    fail "the plugin was not installed at the catalog identity"
+  grep -Fqx test-market "$rjj/market-updates" ||
+    fail "a marketplace this host had never refreshed was not refreshed by the fast pass"
+
+  # A new upstream release: the marketplace moves, the desired state does not,
+  # and the canary still has no evidence for anything. The pass's own probe
+  # sees the move (the floor stayed open for the waiting item), refreshes the
+  # marketplace before the loop, and both plugins follow it.
+  runjj_market_commit 'release 1.1.0'
+  runjj_catalog 1.1.0 "$runjj_sha_b"
+  : >"$rjj/market-updates"
+  runjj_out=$(runjj_plugin_env "$cli" fleet-run --fast) ||
+    fail "the upstream-moved run failed: $runjj_out"
+  case $runjj_out in
+    *'wait  plugins.widget'*) fail "a new upstream plugin release waited on the canary: $runjj_out" ;;
+    *'applied plugins.widget'*) ;;
+    *) fail "the plugin item did not follow its upstream: $runjj_out" ;;
+  esac
+  case $runjj_out in
+    *'update plugin gadget@test-market (claude)'*) ;;
+    *) fail "an installed plugin the fleet does not own was not updated: $runjj_out" ;;
+  esac
+  grep -Fqx test-market "$rjj/market-updates" ||
+    fail "the moved marketplace was not refreshed before the item loop"
+  [ "$(runjj_installed_sha widget@test-market)" = "$runjj_sha_b" ] ||
+    fail "the fleet's plugin is not at the new upstream identity"
+  [ "$(runjj_installed_sha gadget@test-market)" = "$runjj_sha_b" ] ||
+    fail "the unowned plugin is not at the new upstream identity"
+  grep -Fqx 'update widget@test-market' "$rjj/plugin-actions" ||
+    fail "the installed plugin item was not updated through the manager's update verb"
+
+  # The poll floor asks too. Make vireo a canary again and drop the waiting
+  # item, so nothing but an upstream move can keep the floor open.
+  printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\n' \
+    >"$vireo/hosts/vireo.yaml"
+  cat >"$vireo/groups/development.yaml" <<'YAML'
+plugins:
+  widget:
+    state: disabled
+    marketplace: test-market
+YAML
+  runjj_floor() {
+    runjj_plugin_env bash -c 'ROUNDHOUSE_LIB_ONLY=1 . "$0"; fleet_run_poll_floor "$1"' \
+      "$cli" "$vireo"
+  }
+  runjj_plugin_env "$cli" fleet-run --fast >/dev/null || fail "the settling run failed"
+  runjj_plugin_env "$cli" fleet-run --fast >/dev/null || fail "the settling run failed"
+  runjj_floor ||
+    fail "the poll floor did not exit on a settled store with an unmoved marketplace"
+  runjj_market_commit 'release 1.2.0'
+  runjj_catalog 1.2.0 "$runjj_sha_c"
+  ! runjj_floor ||
+    fail "the poll floor exited past a plugin marketplace whose upstream moved"
+  runjj_out=$(runjj_plugin_env "$cli" fleet-run --fast) ||
+    fail "the floor-detected run failed: $runjj_out"
+  case $runjj_out in
+    *'no convergence pass'*) fail "the fast pass sat out a moved marketplace: $runjj_out" ;;
+  esac
+  [ "$(runjj_installed_sha widget@test-market)" = "$runjj_sha_c" ] &&
+    [ "$(runjj_installed_sha gadget@test-market)" = "$runjj_sha_c" ] ||
+    fail "the floor-detected fast pass did not bring both plugins to the new release"
+  # The upstream head is remembered: the next floor is quiet again.
+  runjj_plugin_env "$cli" fleet-run --fast >/dev/null || fail "the run after the update failed"
+  runjj_floor ||
+    fail "the poll floor kept re-refreshing a marketplace it had already caught up with"
+}
+
 if [ "$real_jj_ok" = true ] && section_part 2; then
   p0jj_block tombstone p0jj_tombstone 'capped tombstone uninstall, then silent'
   p0jj_block takeover p0jj_takeover 'dead-holder lock takeover, alerted and published'
@@ -1378,4 +1522,8 @@ if [ "$real_jj_ok" = true ] && section_part 6; then
     'an origin forked from below the pushed head refused'
   p0jj_block catchup p0jj_catchup \
     'catch-up across a re-root: legacy local mark re-anchored when proved, refused when not'
+fi
+if [ "$real_jj_ok" = true ] && section_part 7; then
+  p0jj_block plugins p0jj_plugins \
+    'plugins skip the canary; the fast pass follows a moved marketplace, owned and not'
 fi

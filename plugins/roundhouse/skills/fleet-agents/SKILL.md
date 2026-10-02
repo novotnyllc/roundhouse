@@ -86,8 +86,8 @@ Two scheduled jobs per host run them, installed by
 
 | | Command | Default | Does |
 | --- | --- | --- | --- |
-| Fast | `roundhouse fleet-run --fast` | 20 min ± 5 jitter | poll floor, fetch, reconcile, promote gate, review → apply → journal, publish, peer nudge |
-| Full | `roundhouse fleet-run --full` | 12 h ± 90 min jitter | everything fast does, plus marketplace refresh, re-seed, promotion proposals, unpinned package updates, and `fleet-doctor` |
+| Fast | `roundhouse fleet-run --fast` | 20 min ± 5 jitter | poll floor (with the plugin upstream probe), fetch, reconcile, promote gate, refresh of moved plugin marketplaces, review → apply → journal, publish, peer nudge |
+| Full | `roundhouse fleet-run --full` | 12 h ± 90 min jitter | everything fast does, plus a refresh of every plugin marketplace, re-seed, promotion proposals, unpinned package updates, and `fleet-doctor` |
 
 The **poll floor** is one incremental fetch into a private ref and a tree
 compare: a fast run exits early when the desired-state paths at the fetched
@@ -95,8 +95,9 @@ remote head (`fleet.yaml`, `definitions.yaml`, `definitions/`, `fleet/`, `os/`,
 `groups/`, `hosts/`, `trust/`) match those of the reference this host last
 converged from, the fetched head descends from what it converged on, and it
 has nothing to push, a clean `@`, no heartbeat owed, no item waiting on canary
-evidence and no retry owed (a failed apply, an unreadable identity, or a
-`fleet-review` verdict not yet acted on). Peers' record commits (journal,
+evidence, no retry owed (a failed apply, an unreadable identity, or a
+`fleet-review` verdict not yet acted on), and no plugin marketplace whose
+upstream moved. Peers' record commits (journal,
 alerts, `applied/`) no longer force a full pass; the floor's fetch does not
 move `main@origin`, so the next full pass still signature-gates everything
 that arrived. Jitter is seeded from the host
@@ -175,6 +176,51 @@ enrolled host that has published no heartbeat within `liveness_alert_hours`
 (default 12, never less than twice `heartbeat_publish_hours`), naming its last
 published heartbeat, and clears it when the peer is heard from again. Both keys are ordinary store policy;
 `0` turns the throttle or the alert off.
+
+**Plugins are always current**, from every marketplace, in both harnesses,
+and never wait on the canary (`plugins.*` and `definitions.plugins.*` skip
+the gate; review, holds, the identity proof and the removal cap still apply).
+The fast pass's poll floor asks each plugin marketplace's upstream for its
+head with a read-only, bounded `git ls-remote` (in parallel; an unreachable
+one reads as unmoved), against the head this host last refreshed it at
+(`store.run/plugin-currency/`). A moved marketplace, or every marketplace on
+the full pass, is handled BEFORE the item loop:
+
+- **Claude:** Roundhouse refreshes the marketplace, so the same pass's
+  identity comparison updates the fleet's plugin items through review →
+  apply → journal, and updates installed user-scoped plugins the fleet does
+  not own in place with `claude plugin update`. It never installs, enables or
+  removes one. Directory and URL sources have no head to ask and refresh on
+  the full pass only.
+- **Codex** plugins follow Codex's own startup sync: every Codex app server
+  start syncs Codex's Git marketplaces and reinstalls what is installed from
+  them, whatever anyone holds. Roundhouse never upgrades or reinstalls a
+  Codex plugin. On a host where Codex may never run, it only TRIGGERS that
+  sync (`codex-plugin-hooks.mjs sync`, an app server held open until each
+  moved marketplace records the probed head and its enabled installed plugins
+  are reinstalled at that revision's catalog identity, at most 30s) and
+  remembers the head only once Codex reached both. A Claude marketplace's
+  head is remembered only once every update from it converged. Per-plugin holds were never enforceable on
+  the Codex side and are not attempted.
+- **Hook trust:** after Claude installs or updates an enabled fleet plugin
+  that Codex also has installed and enabled, the item loop verifies that
+  Codex's copy is from the same plugin source and runs automatic approval
+  against it (a disabled Codex copy is left alone). The run never reinstalls
+  Codex's copy; a copy Codex has not synced to the expected SHA holds
+  ("Codex has not synced to SHA yet; the next pass retries"). Automatic
+  approval only carries existing trust: a never-trusted hook is refused, and
+  a `modified` one is re-trusted at its new hash only when, inside the one
+  app server session that writes the trust, the copy is still at the
+  expected SHA, its tree is byte-identical to Claude's verified install, and
+  every hook hash is unchanged since it was listed. Hooks of third-party
+  Codex plugins that change upstream stay untrusted until the operator
+  approves them (`roundhouse approve-codex-plugin-hooks PLUGIN@MARKETPLACE`),
+  as Codex itself leaves them.
+
+The canary gate (§10.1) times its wait from the first record of the canary's
+**latest clean run** of `applied`/`satisfied` evidence — the records after
+its newest `held` or `reverted` for the item — so one transient hold no longer
+voids the evidence for good, and a later withdrawal still withdraws it.
 
 An unpinned package is kept current by the full pass — that is what anyone
 gets by doing nothing. A `version:` key in `definitions.yaml` opts one
@@ -765,13 +811,18 @@ Codex-side freshness (verified against codex-rs commit 728e25cb, 2026-08-04):
 Codex auto-upgrades `source_type = "git"` marketplaces at startup, but never
 runs `git fetch`/`pull` against `source_type = "local"` marketplaces — for a
 local-checkout marketplace, whoever refreshes it owns pulling that checkout
-current; Codex will not. Once the on-disk marketplace content is current, Codex silently
-advances installed plugin versions itself on the next `plugin/list` (which
-every TUI session issues routinely) — nothing needs to force reinstalls
-or invoke `codex plugin marketplace upgrade`, only to keep the checkout
-current. The 3h remote-catalog TTL and the startup git auto-upgrade are
-catalog-metadata-only and git-type-only respectively; neither gives local
-marketplaces any freshness guarantee.
+current; Codex will not. Observed against codex-cli 0.160.0 (2026-10-02, an
+isolated `CODEX_HOME`): starting an app server — `initialize` alone — fetches
+each Git marketplace in the background and reinstalls the installed plugins
+at the new revision, with no completion notification, and is cut off if the
+server closes first; `codex plugin marketplace upgrade` does the same
+reinstall; the CLI `codex plugin list` does neither. There is no catalog-only
+refresh: whenever Codex starts, installed copies follow the marketplace. That
+is why `codex-plugin-hooks.mjs update` refuses (exit non-zero, nothing
+written) when Codex advances the copy under its own trust snapshot rather
+than report trust it did not carry. The 3h remote-catalog TTL is
+catalog-metadata-only, and nothing gives local marketplaces any freshness
+guarantee.
 
 ## Routine marketplace refresh
 
@@ -802,9 +853,10 @@ an archive download), and an installed copy whose bytes are identical to the
 checkout's keeps its recorded SHA, so a marketplace commit that did not touch
 the plugin does not demand an update.
 
-The scheduled run applies the same comparison. When it cannot prove an
-installed plugin's identity — no catalog entry, or an entry with no SHA — it
-first repairs the marketplace, once per marketplace per pass, and asks again;
+The scheduled run applies the same comparison, after refreshing the
+marketplace first (see **Plugins are always current** above). When it cannot
+prove an installed plugin's identity — no catalog entry, or an entry with no
+SHA — it first repairs the marketplace, once per marketplace per pass, and asks again;
 only then does the plugin hold, as
 `installed marketplace identity unavailable (REASON)`. An unregistered
 marketplace is registered from its `extraKnownMarketplaces` declaration. A
@@ -820,14 +872,61 @@ target's installed Roundhouse version from its active Codex plugin
 record, and set `TARGET_CLI` to that target cache's
 `roundhouse/VERSION/scripts/roundhouse`; never send or interpolate
 the controller's `SKILL_DIR` or `CLI`. Require `"$TARGET_CLI" verify-executor`
-to pass before using it. Run only these target-native command sequences, in
-order, substituting the authorized marketplace and each installed plugin ID:
+to pass before using it.
+
+**Codex follows its own startup sync.** Every Codex app server start fetches
+Codex's Git marketplaces and reinstalls the plugins installed from them, so
+there is no catalog-only refresh and no per-plugin hold on the Codex side.
+Do not run `codex plugin marketplace upgrade` followed by
+`update-codex-plugin`: the upgrade has already reinstalled the plugins, so the
+helper's trust snapshot sees their changed hooks as `modified`, and
+`update-codex-plugin` now refuses (exit non-zero, nothing written) rather
+than report trust it did not carry. To bring a host's Codex plugins current,
+trigger Codex's own sync and wait for it:
 
 ```text
+codex plugin marketplace list --json
+node "$(dirname "$TARGET_CLI")/codex-plugin-hooks.mjs" sync ROOT REVISION [ROOT REVISION ...]
 codex plugin list --json
-codex plugin marketplace upgrade MARKETPLACE --json
-"$TARGET_CLI" update-codex-plugin EACH_INSTALLED_PLUGIN@MARKETPLACE
+```
 
+where each `ROOT` is a Git marketplace's root from the listing and `REVISION`
+its upstream head (`git ls-remote`). The helper holds a Codex app server open
+until each root records its revision and every enabled plugin installed from
+it is at that revision's catalog identity (30s at most; Codex records the
+revision before it reinstalls), and exits 75 for any it did not reach. The
+helper is the verified target's own, beside `"$TARGET_CLI"`; never send the
+controller's `SKILL_DIR` copy over SSH. An enabled install from an unpinned
+remote catalog entry carries no identity to wait on: `sync` holds the server
+open for a short grace and reports the root `unconfirmed`, and the pass does
+not remember its head, so every fast pass syncs it again. `sync` reads the
+catalog from each layout Codex supports (`.agents/plugins/marketplace.json`,
+`.agents/plugins/api_marketplace.json`, `.claude-plugin/marketplace.json`,
+`.cursor-plugin/marketplace.json`).
+
+Hook trust then follows two rules:
+
+- **The fleet's own plugins** are approved by the scheduled run's item loop
+  after Claude updates them: it verifies that Codex's copy comes from the same
+  plugin source at the expected SHA, and that Codex's installed tree is
+  byte-identical to Claude's verified install, before automatic approval may
+  carry a `modified` hook's existing trust to its new hash. A hook that was
+  never trusted, a one-byte difference, or a missing Claude install refuses,
+  and the item holds, naming the cause.
+- **Third-party Codex plugins** whose hooks changed upstream stay untrusted
+  until the user approves them for that exact plugin and host, as Codex
+  itself leaves them: `"$TARGET_CLI" approve-codex-plugin-hooks
+  PLUGIN@MARKETPLACE` (see **Codex hook approval** below).
+
+`update-codex-plugin` remains as a command but has no remaining correct use
+for carrying trust across an upstream change: an app server start inside it
+advances the copy before its snapshot, so at best it is a no-op reinstall of
+an already current copy.
+
+For Claude, run only this target-native sequence, substituting the authorized
+marketplace and each installed plugin ID:
+
+```text
 claude plugin list --json
 claude plugin marketplace update MARKETPLACE
 claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user
@@ -836,23 +935,15 @@ claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user
 Require every frozen ID to end in the exact `@MARKETPLACE` suffix and attempt
 every ID even if another update fails. Do not add IDs that appear only after the
 catalog refresh. Update `roundhouse@novotnyllc` last when present, then
-recapture inventory and re-resolve its installed executor. After every Codex plugin
-install or update, run the hook-approval helper —
-`node "$SKILL_DIR/../../scripts/codex-plugin-hooks.mjs" approve
-PLUGIN@MARKETPLACE` — so ALL of the plugin's current hooks are trusted with
-their fresh hashes: new hooks, changed hooks, hooks never before on this
-machine. An installed plugin is a trusted plugin; a hook left silently
-untrusted after an update is the failure mode this exists to prevent. The
-helper discovers hooks against a fresh Codex app server, writes only
-matching `trusted_hash` leaves, and preserves disabled and unrelated hook
-state. Do not synchronize unrelated marketplaces, runtimes,
-settings, skills, provenance, or configuration. Manager output is progress
-evidence, not post-state. Recapture the bounded `agents` inventory after each
-harness attempt. Require every frozen marketplace plugin record to remain
-installed with its enabled state and Claude scope preserved; require every
+recapture inventory and re-resolve its installed executor. Do not synchronize
+unrelated marketplaces, runtimes, settings, skills, provenance, or
+configuration. Manager output is progress evidence, not post-state. Recapture
+the bounded `agents` inventory after each harness attempt. Require every
+frozen marketplace plugin record to remain installed with its enabled state
+and Claude scope preserved; require every
 outside-marketplace record to be unchanged. Report before/after versions per
-plugin. A failure in one plugin or harness does not erase other evidence or stop
-the remaining marketplace plugins from being attempted.
+plugin, and any Codex hooks left untrusted. A failure in one plugin or harness does not erase other evidence or
+stop the remaining marketplace plugins from being attempted.
 
 Plugin dependencies belong to the workflow that declares them. Execute only
 the user-authorized desired state supplied by that owner, using each target's
@@ -862,11 +953,11 @@ or reinstall a removed plugin merely because a workflow previously used it.
 
 The only pre-helper fallback is a separately approved self-update of
 `roundhouse@novotnyllc` from an integrity-verified release that lacks
-`update-codex-plugin`. After upgrading the `novotnyllc` marketplace, run exactly
-`codex plugin add roundhouse@novotnyllc --json`, recapture inventory,
-reload the new target-native plugin, and require its version `0.5.1` executor
-and integrity verification before any other mutation. Never use that raw-add
-fallback for another plugin or once the helper command is available.
+`codex-plugin-hooks.mjs sync`: run exactly
+`codex plugin add roundhouse@novotnyllc --json`, recapture inventory, reload the new
+target-native plugin, and require its integrity verification before any other
+mutation. Never use that raw-add fallback for another plugin or once the
+helper command is available.
 
 For a native-Windows target with a configured `wsl_interop_via` sibling,
 prefer the WSL interop lane for this whole routine: SSH to the sibling,

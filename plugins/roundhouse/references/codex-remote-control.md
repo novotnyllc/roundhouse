@@ -152,14 +152,15 @@ create a new visible task in the configured saved project, and run native PowerS
 Before and after each
 applicable harness, capture `codex plugin list --json`; for Claude, capture
 `claude plugin list --json`. Freeze a de-duplicated set of every installed
-record owned by the exact marketplace. In the task, run only these mutation
-commands in order for each applicable harness:
+record owned by the exact marketplace. In the task, run only these commands
+in order for each applicable harness:
 
 ```powershell
-# Codex
+# Codex: trigger Codex's own sync, then re-list
+codex plugin marketplace list --json
+git ls-remote MARKETPLACE-SOURCE-URL REF-OR-HEAD
+node "EXACT-ROUNDHOUSE-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" sync --codex-executable "RESOLVED-CODEX-EXE" ROOT REVISION
 codex plugin list --json
-codex plugin marketplace upgrade MARKETPLACE --json
-node "EXACT-ROUNDHOUSE-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" update EACH_INSTALLED_PLUGIN@MARKETPLACE
 
 # Claude
 claude plugin list --json
@@ -167,11 +168,38 @@ claude plugin marketplace update MARKETPLACE
 claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user
 ```
 
+**Codex follows its own startup sync.** Every Codex app server start fetches
+Codex's Git marketplaces and reinstalls the plugins installed from them, so
+there is no catalog-only refresh and no per-plugin hold on the Codex side.
+Do not run `codex plugin marketplace upgrade` followed by
+`codex-plugin-hooks.mjs update`: the upgrade has already reinstalled the
+plugins, so the helper's trust snapshot sees their changed hooks as
+`modified`, and the update now refuses (exit non-zero, nothing written)
+rather than report trust it did not carry. `ROOT` is the marketplace's root
+from `codex plugin marketplace list --json` and `REVISION` its upstream head
+from `git ls-remote`; `sync` holds a Codex app server open until the root
+records that revision AND every enabled plugin installed from it is
+reinstalled at that revision's catalog identity (a pinned entry's SHA, an
+in-repo entry's version; Codex records the revision before it reinstalls),
+30s at most, and exits 75 if either did not happen.
+`RESOLVED-CODEX-EXE` is the native Codex executable the task resolved (the
+same one `apply-windows.ps1` resolves for hook approval). Re-list afterwards;
+manager output is not post-state.
+
+Hook trust after the sync: the fleet's own plugins get byte-verified
+automatic approval from the scheduled run, which carries a `modified` hook's
+existing trust to its new hash only when Codex's copy is from the verified
+source at the expected SHA and its installed tree is byte-identical to
+Claude's verified install there; a never-trusted hook, a byte difference or a
+missing Claude install holds the item. Third-party Codex plugins whose hooks
+changed upstream stay untrusted until the user explicitly approves them for
+that exact plugin and host, through the verified approval path below. Report
+any hooks left untrusted.
+
 Reject any frozen ID without the exact `@MARKETPLACE` suffix. Attempt every
 frozen marketplace plugin even when another one fails; do not install entries
 absent from the pre-refresh set. Update `roundhouse@novotnyllc` last when
-present, then recapture and re-resolve its installed executor. The Codex add is
-idempotent and preserves approved stable hook keys. Require each pre-existing marketplace record to remain
+present, then recapture and re-resolve its installed executor. Require each pre-existing marketplace record to remain
 present with enabled state and Claude scope preserved; require outside-marketplace
 records to be unchanged. Report every before/after version. If native PowerShell cannot find
 `claude`, mark only the Claude harness unavailable. WSL or SSH are prohibited.
@@ -212,16 +240,16 @@ provenance, conversions, ambiguous scope, and sealed-plan mutations.
    `pwsh -NoProfile -File scripts/apply-windows.ps1 -VerifyExecutor
    -ExecutorRequirementPath executor.json`. If the version or any hash differs, return
    `executor_update_required` and run no collector or mutation.
-3. Updating the executor is a separately approved bootstrap action. Use
-   `codex plugin marketplace upgrade novotnyllc --json` followed by the current
-   integrity-verified helper:
-   `node "EXACT-ROUNDHOUSE-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" update roundhouse@novotnyllc`.
-   It snapshots hook trust before running the exact native plugin add. The only
-   fallback is a separately approved Roundhouse self-update from an
-   integrity-verified release that predates this helper: after the marketplace
-   upgrade, run exactly
+3. Updating the executor is a separately approved bootstrap action. Trigger
+   Codex's own sync of the `novotnyllc` marketplace with the current
+   integrity-verified helper,
+   `node "EXACT-ROUNDHOUSE-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" sync --codex-executable "RESOLVED-CODEX-EXE" ROOT REVISION`,
+   then re-list; Codex reinstalls `roundhouse@novotnyllc` itself. If its hooks
+   changed, approve them explicitly through the verified approval path below.
+   The only fallback is a separately approved Roundhouse self-update from an
+   integrity-verified release that predates `sync`: run exactly
    `codex plugin add roundhouse@novotnyllc --json`, end that task, start a
-   fresh task, and verify the `0.5.1` executor and integrity manifest before any
+   fresh task, and verify the new executor and integrity manifest before any
    other mutation. Never use raw add as a fallback for another plugin or once
    the helper is available. For Claude local or
    SSH use `claude plugin marketplace update novotnyllc` followed by

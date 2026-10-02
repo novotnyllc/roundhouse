@@ -281,6 +281,23 @@ JSON
     run_rel_identity
     [ "$run_identity_status" -eq 0 ] ||
       fail "identical relative-source bytes under an older checkout commit failed the gate (got $run_identity_status)"
+    # The managers' install markers are not plugin content, in either harness:
+    # a per-session `.in_use/PID` directory (Claude) and Codex's
+    # `.codex-marketplace-install.json` leave the digest unchanged — but the
+    # same names below the root are plugin content.
+    run_rel_plain=$(fleet_run_tree_digest "$run_rel_copy") ||
+      fail "the tree digest failed on the relative-source copy"
+    rm -f "$run_rel_copy/.in_use"
+    mkdir -p "$run_rel_copy/.in_use"
+    : >"$run_rel_copy/.in_use/12345"
+    printf '{"marketplace":"m"}\n' >"$run_rel_copy/.codex-marketplace-install.json"
+    [ "$(fleet_run_tree_digest "$run_rel_copy")" = "$run_rel_plain" ] ||
+      fail "a .in_use/PID session directory or Codex's install marker changed the tree digest"
+    mkdir -p "$run_rel_copy/sub"
+    printf '{"marketplace":"m"}\n' >"$run_rel_copy/sub/.codex-marketplace-install.json"
+    [ "$(fleet_run_tree_digest "$run_rel_copy")" != "$run_rel_plain" ] ||
+      fail "a nested .codex-marketplace-install.json was dropped from the tree digest"
+    rm -rf "$run_rel_copy/sub" "$run_rel_copy/.in_use" "$run_rel_copy/.codex-marketplace-install.json"
     # A tree too big for one argument list is hashed in BATCHES, and gives the
     # same digest as one batch: xargs is stubbed to two files per call, and
     # the tool is counted.
