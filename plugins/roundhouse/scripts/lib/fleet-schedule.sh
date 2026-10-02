@@ -298,7 +298,10 @@ fleet_schedule_still_scheduled() {
   # holds the job: loaded (launchd), or enabled or active (systemd). What an
   # uninstall must have ended before it may report done.
   fleet_schedule_facts_read "$1"
-  [ "$sf_loaded" = 1 ] || [ "$sf_enabled" = 1 ] || [ "$sf_active" = 1 ]
+  # An unreachable user manager reports a still-enabled timer only through its
+  # timers.target.wants link, so that link counts as scheduled too.
+  [ "$sf_loaded" = 1 ] || [ "$sf_enabled" = 1 ] || [ "$sf_active" = 1 ] ||
+    [ "$sf_wants" = 1 ]
 }
 
 fleet_schedule_probe() {
@@ -535,7 +538,8 @@ fleet_schedule_status_facts() {
   [ ! -e "$(fleet_schedule_optout_path)" ] || status_optout=true
   for status_mode in $fleet_schedule_modes; do
     status_facts=$(fleet_schedule_facts "$status_mode")
-    status_state=$(fleet_schedule_job_state "$status_mode" "$status_facts")
+    # Read-only: the pure state word, never the remembered (persisted) one.
+    status_state=$(fleet_schedule_state_word "$status_facts")
     status_scheduled=false
     ! fleet_schedule_still_scheduled "$status_facts" || status_scheduled=true
     fleet_schedule_facts_read "$status_facts"
