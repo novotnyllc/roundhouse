@@ -128,8 +128,13 @@ converges again in-process before it releases the lock (at most three extra
 passes), so a trigger that lands mid-pass is never lost. One that lands after
 the last comparison but before the lock is released — when a systemd `start`
 of the still-active oneshot queues nothing — is caught by one more comparison
-once the lock is free, which starts a single detached `fleet-run --fast`
-through the normal lock.
+once the lock is free: the run takes the lock back in-process (non-blocking)
+and converges again, at most twice — never a detached pass, which the
+scheduler would kill with the job's process group. If another run holds the
+lock by then, that run sees the stamp. A signal (SIGTERM from the scheduler,
+SIGINT to the group) ends the run after the pass it interrupts, releases the
+lock and starts nothing further; a pass that is cut short still records the
+items it already applied.
 
 ```text
 roundhouse fleet-trigger [--fast|--full]   # stamp, kick the scheduled job, return

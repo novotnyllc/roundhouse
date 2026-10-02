@@ -278,7 +278,7 @@
     },
     {
       "path": "skills/fleet-agents/SKILL.md",
-      "sha256": "e9fab2579c43424ced84f92663a3139fc80828328971d442b86b586eac5de85d"
+      "sha256": "388ae40b9f5c613428f8272b46378b82444194877cc7cf5653d11dcb3673d6d2"
     },
     {
       "path": "skills/fleet-agents/agents/openai.yaml",
@@ -322,7 +322,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "3fce13a07196dafdaee964bd76f7142e574b00e2e6514ae352e4a0ad6b8973ec"
+      "sha256": "b011602d1f4827fdd5c7e4b55c6c4f1307f7a32a8f150fbc1b24cdadae975228"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",

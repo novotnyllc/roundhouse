@@ -319,13 +319,17 @@ checked before anything is planned: without it `install` exits 75 with the
 `loginctl enable-linger` fix and writes nothing.
 
 `install` matches a job that already exists: an identical definition is left
-alone (not rewritten, not reloaded); a differing one is reported with its diff,
-then replaced and reloaded. **Absorb, never duplicate**: if
+alone (not rewritten, not reloaded); a differing one is reported by path
+(never by content — a hand-added environment variable may be a secret), then
+replaced and reloaded. **Absorb, never duplicate**: if
 `com.novotnyllc.roundhouse.autoupdate` or the older one-plist
 `com.novotnyllc.roundhouse.fleet` (or a systemd/Task Scheduler equivalent)
 exists, unload it and set it aside (renamed `.absorbed`, never deleted) in the
 same step that installs the fleet entry; `install` does this for both macOS
-labels. A replaced definition that differed is kept as `.replaced`. A host carrying both
+labels. A replaced definition that differed is kept as `.replaced`, and one
+`uninstall` removes as `.removed`; a backup that cannot be made stops the step.
+`uninstall` unloads a job the scheduler still holds before it removes the file,
+and is not done until the scheduler has let go of it. A host carrying both
 is the exact double-runner this rule exists to prevent. `install` is also the only thing that enables a job: a scheduled pass
 never re-enables one an operator disabled, it raises a `schedule-disabled`
 alert (and `schedule-missing` for a job that disappeared) instead.
