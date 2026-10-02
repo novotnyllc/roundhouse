@@ -20,9 +20,14 @@ select_mikefarah_yq() {
   # put the unrelated Python `yq` first on PATH, so when the first `yq` is not
   # mikefarah's, find one that is and route `yq` to it through an exported
   # function. The choice lives only in this process and its bash children:
-  # nothing is written, and every other tool keeps its PATH position.
+  # nothing is written, and every other tool keeps its PATH position. A command
+  # that EXECS yq rather than calling it (xargs, env, find -exec) bypasses the
+  # function and must name "${ROUNDHOUSE_YQ:-yq}" instead: a bare `xargs yq`
+  # ran Python yq on iris-wsl and sent every fast pass down the per-item path.
   selected_yq=$(command -v yq 2>/dev/null || true)
   if [ -n "$selected_yq" ] && yq_is_mikefarah "$selected_yq"; then
+    # PATH's own yq: an inherited ROUNDHOUSE_YQ without its function is stale.
+    [ "$(type -t yq)" != file ] || unset ROUNDHOUSE_YQ
     return 0
   fi
   for yq_candidate in $(which -a yq 2>/dev/null) \

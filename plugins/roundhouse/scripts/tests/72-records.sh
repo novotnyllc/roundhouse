@@ -914,6 +914,44 @@ EOF
     awk -F"$us" '$2 == "packages.n" && $6 == 1 { found = 1 } END { exit !found }' \
       "$bat/plan.batch" || fail "the fixture never exercised a review hold"
 
+    # Ubuntu's Python yq first on PATH (iris-wsl's systemd unit): the batch
+    # reads must still use the SELECTED yq. xargs execs its command and never
+    # sees the exported `yq` function, so a bare `xargs yq` ran the decoy,
+    # failed, and sent the plan down the per-item path — a yq per journal day
+    # per item, which grows with the items. The decoy answers `--version` as
+    # Python yq does and fails everything else; the selected yq is counted.
+    mkdir -p "$bat/yq-decoy" "$bat/yq-selected"
+    printf '#!/bin/sh\n[ "$1" = --version ] && { echo "yq 3.4.3"; exit 0; }\necho "$*" >>"%s"\nexit 2\n' \
+      "$bat/yq-decoy.log" >"$bat/yq-decoy/yq"
+    printf '#!/bin/sh\necho . >>"%s"\nexec "%s" "$@"\n' \
+      "$bat/yq-selected.log" "${ROUNDHOUSE_YQ:-$(type -P yq)}" >"$bat/yq-selected/yq"
+    chmod +x "$bat/yq-decoy/yq" "$bat/yq-selected/yq"
+    : >"$bat/yq-decoy.log"
+    : >"$bat/yq-selected.log"
+    (
+      unset -f yq
+      unset ROUNDHOUSE_YQ
+      PATH="$bat/yq-decoy:$bat/yq-selected:$PATH"
+      select_mikefarah_yq
+      : >"$bat/yq-selected.log"
+      fleet_run_item_plan "$bat_ps" h1 "$bat_pfold" "$bat/verdicts" "$bat/sigholds" \
+        >"$bat/plan.decoy" 2>/dev/null
+      grep -c . "$bat/yq-selected.log" >"$bat/yq-plan-calls" || :
+      printf 'packages.n\tdn\nplugins.b\tdb\n' | fleet_run_review_holds >"$bat/holds.decoy" ||
+        fail "fleet_run_review_holds failed its batch read behind a Python yq"
+    ) || exit 1
+    [ ! -s "$bat/yq-decoy.log" ] ||
+      fail "a batch read exec'd PATH's Python yq instead of the selected one: $(head -1 "$bat/yq-decoy.log")"
+    cmp -s "$bat/plan.batch" "$bat/plan.decoy" ||
+      fail "the plan behind a Python yq differs from the plan without it"
+    [ "$(cat "$bat/holds.decoy")" = packages.n ] ||
+      fail "fleet_run_review_holds behind a Python yq answered: $(tr '\n' ' ' <"$bat/holds.decoy")"
+    # The call-count guard: the batch plan's yq reads are a fixed handful
+    # (applied/, the verdict files, each journal day), never one per item.
+    bat_yq_calls=$(cat "$bat/yq-plan-calls")
+    [ "$bat_yq_calls" -lt "$(grep -c . "$bat/verdicts")" ] ||
+      fail "the plan ran $bat_yq_calls yq calls for $(grep -c . "$bat/verdicts") verdicts: it went per item"
+
     # --- the held set: fleet_run_items_held vs fleet_run_item_is_held ---
     printf 'held packages.v\nconverge packages.w dw\n' >"$bat/held-verdicts"
     printf '%s\t%s\n' packages.n dn plugins.b db plugins.c db packages.v '' \
