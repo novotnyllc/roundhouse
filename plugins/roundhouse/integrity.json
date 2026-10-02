@@ -122,7 +122,7 @@
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
-      "sha256": "e110290888593c86c92713847521b4bde1abebc9e5c12b2d9d3dd37935ce55ca"
+      "sha256": "b370d5d9397792a4b61e9b76b7265b9c40b0f9ae9633f7333f71d83f5e408b3e"
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
@@ -138,7 +138,7 @@
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
-      "sha256": "2ba27fdb37be1ec942f654f6d0583dac9fc679f3651ebfb4689c7300c9b1975a"
+      "sha256": "4e86e37b3aa941a032456a26447eb98abdd08207031e7d0824f7be42f4f13c5f"
     },
     {
       "path": "scripts/lib/fleet-records.sh",
@@ -150,7 +150,15 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "73bcea632ee995352d090a651bc5e702d999f88182ace5d545faccd19b80147f"
+      "sha256": "528cf808ea9af288db4a93819edacd6fa87655c6de6cb874a669d2c8fb446db9"
+    },
+    {
+      "path": "scripts/lib/fleet-run.sh",
+      "sha256": "528cf808ea9af288db4a93819edacd6fa87655c6de6cb874a669d2c8fb446db9"
+    },
+    {
+      "path": "scripts/lib/fleet-run.sh",
+      "sha256": "528cf808ea9af288db4a93819edacd6fa87655c6de6cb874a669d2c8fb446db9"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -162,7 +170,7 @@
     },
     {
       "path": "scripts/lib/fleet-store.sh",
-      "sha256": "a9a3391290f38cc9e14b23739b4471b1bf2f2304988c5514e1c97ada39d0a62e"
+      "sha256": "b2a3510cd5dd77d51293a48f9b275bf09212841945b6914515d611f8538addcd"
     },
     {
       "path": "scripts/lib/fleet-trigger.sh",
@@ -322,7 +330,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "b011602d1f4827fdd5c7e4b55c6c4f1307f7a32a8f150fbc1b24cdadae975228"
+      "sha256": "7e26665e0637c078ccb694d48d8831be7f1e71aea0ad62fd00f2941433a34edc"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",

@@ -385,7 +385,12 @@ failure. The holder is checked before the age: the lock records the holder's
 pid, process start time, command and a random nonce, and a lock whose holder is
 dead — the pid is gone, or now belongs to a process with a different start time
 or command — is taken over (renamed aside, verified by nonce, recreated) and
-raises a `lock-takeover` alert. Every package- and agent-manager query a
+raises a `lock-takeover` alert. A holder that is provably the recorded run
+(pid, start time and command all match) but has held the lock past the pass
+ceiling (2 h) is a hung pass, not a slow one: the next run stops it and every
+process under it (TERM, then KILL, then confirms it is gone), takes the lock
+over the same way, and raises a `lock-takeover` alert naming the stopped run.
+A `manual` lock is never stopped. Every package- and agent-manager query a
 pass makes is bounded (about a minute for a listing, longer only for an
 install), so a manager that hangs makes only its own inventory unknown for
 that pass and raises an `inventory-timeout` alert. A run releases the lock only while it still

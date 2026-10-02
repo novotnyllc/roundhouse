@@ -92,7 +92,10 @@ fleet_age_evidence_command() (
   fleet_run_verb_begin "$age_verb_store" "$age_verb_host" fleet-age-evidence ||
     exit $?
   age_verb_lock=$(fleet_lock_path)
-  trap 'fleet_lock_release "$age_verb_lock" "$fleet_run_verb_nonce" || :' EXIT HUP INT TERM
+  # A signal ends the verb (fleet_lock_signals_exit): one stopped past the
+  # pass ceiling must not carry on without its lock.
+  trap 'fleet_lock_release "$age_verb_lock" "$fleet_run_verb_nonce" || :' EXIT
+  fleet_lock_signals_exit
   fleet_records_age "$age_verb_store" "$age_verb_host" "$age_verb_days" ||
     exit 65
   if [ "$(jj -R "$age_verb_store" log -r @ --no-graph -T 'if(empty,"y","n")')" = y ]; then
@@ -123,8 +126,8 @@ fleet_compact_alerts_command() (
     exit $?
   compact_lock=$(fleet_lock_path)
   compact_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-compact-alerts.XXXXXX")
-  trap 'fleet_lock_release "$compact_lock" "$fleet_run_verb_nonce" || :; rm -rf "$compact_tmp"' \
-    EXIT HUP INT TERM
+  trap 'fleet_lock_release "$compact_lock" "$fleet_run_verb_nonce" || :; rm -rf "$compact_tmp"' EXIT
+  fleet_lock_signals_exit
   compact_counts=$(fleet_alerts_compact "$compact_store" "$compact_host" \
     "$compact_tmp") || {
     printf 'roundhouse: alert compaction failed; nothing published\n' >&2
@@ -236,7 +239,8 @@ fleet_disown_command() (
   else
     fleet_run_verb_begin "$disown_store" "$disown_host" fleet-disown || exit $?
     disown_lock=$(fleet_lock_path)
-    trap 'fleet_lock_release "$disown_lock" "$fleet_run_verb_nonce" || :' EXIT HUP INT TERM
+    trap 'fleet_lock_release "$disown_lock" "$fleet_run_verb_nonce" || :' EXIT
+    fleet_lock_signals_exit
   fi
   disown_selection=$(
     printf '%s' "$disown_named"

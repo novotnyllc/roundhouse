@@ -2723,11 +2723,34 @@ fleet_run_lock_take() {
   # takeover owes: evidence, not a refusal, so the run proceeds. Exit 0
   # acquired (by takeover or not), 10 held by a live run, 75 refused.
   fleet_run_lock_take_rc=0
-  fleet_lock_take "$3" "$(fleet_run_stale_after "$1" "$2")" || fleet_run_lock_take_rc=$?
-  [ "$fleet_run_lock_take_rc" -eq 11 ] || return "$fleet_run_lock_take_rc"
-  fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
-    "took over the run lock from a dead holder ($fleet_lock_taken_from); the run it belonged to did not finish" ||
-    :
+  fleet_lock_take "$3" "$(fleet_run_stale_after "$1" "$2")" "$(fleet_run_pass_ceiling)" ||
+    fleet_run_lock_take_rc=$?
+  case $fleet_run_lock_take_rc in
+    11)
+      fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
+        "took over the run lock from a dead holder ($fleet_lock_taken_from); the run it belonged to did not finish" ||
+        :
+      ;;
+    12)
+      fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
+        "stopped a run that held the run lock past the $(fleet_run_pass_ceiling)s ceiling ($fleet_lock_taken_from) and took the lock over; that run did not finish" ||
+        :
+      ;;
+    *) return "$fleet_run_lock_take_rc" ;;
+  esac
+}
+
+fleet_run_pass_ceiling() {
+  # The longest a pass may hold the run lock before the next run stops it as
+  # hung (fleet_lock_take's ceiling): two hours. A converged full pass takes a
+  # few minutes; genuine package downloads are what the margin is for, so a
+  # pass that is still running at the ceiling is stuck, not busy. The test
+  # hook only shortens it, and only under the self-check.
+  if fleet_test_hook "${ROUNDHOUSE_TEST_PASS_CEILING:-}"; then
+    printf '%s\n' "$ROUNDHOUSE_TEST_PASS_CEILING"
+    return
+  fi
+  printf '7200\n'
 }
 
 # --- the commands -------------------------------------------------------------
