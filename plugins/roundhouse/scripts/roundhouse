@@ -175,9 +175,11 @@ shift
 # so the lock's recorded pid is also a group that belongs to this run alone
 # (fleet_lock_lead_group; nothing changes under a terminal). Not fleet-lock:
 # its lock is `manual`, names the caller's shell rather than this process, and
-# is never judged by liveness or stopped.
+# is never judged by liveness or stopped. fleet-schedule's install and
+# uninstall take the schedule lock (lib/fleet-schedule-plan.sh), judged the
+# same way.
 case $command in
-  fleet-run | fleet-age-evidence | fleet-compact-alerts | fleet-disown)
+  fleet-run | fleet-age-evidence | fleet-compact-alerts | fleet-disown | fleet-schedule)
     fleet_lock_lead_group "$0" "$command" "$@"
     ;;
 esac
