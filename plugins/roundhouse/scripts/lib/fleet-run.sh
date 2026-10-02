@@ -1746,10 +1746,43 @@ fleet_run_approve_plugin_hooks() {
   # a false hold. If Codex is present, a malformed/failed list is a real
   # inability to prove ownership and remains held.
   command -v codex >/dev/null 2>&1 || return 0
+  fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" '') || return 75
+  [ "$fleet_run_codex_plugin_state" != absent ] || return 0
+  fleet_run_hooks_node=$(fleet_node_path) || {
+    printf 'roundhouse: Node.js is required to approve hooks for %s\n' "$1" >&2
+    return 75
+  }
+  # REFRESH (the third argument, passed after an install or update of an
+  # ENABLED plugin): bring the Codex copy to the new bytes first, through the
+  # hook-preserving helper, which re-trusts at their new hashes exactly the
+  # hooks this host already trusted. The Claude manager updated only Claude's
+  # copy; approving against Codex's stale one refused (a source mismatch, or
+  # the new bytes' hooks read as modified) and held every enabled plugin whose
+  # hooks changed upstream. A state-only enable changed no bytes and does not
+  # reinstall the Codex copy; a disabled state never reaches here.
+  if [ "${3:-}" = refresh ]; then
+    fleet_run_cli_invalidate
+    bounded_verb "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" update "$1" \
+      >/dev/null 2>&1 </dev/null || return 75
+    fleet_run_cli_invalidate
+  fi
+  fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" \
+    "$fleet_run_expected_sha") || return 75
+  [ "$fleet_run_codex_plugin_state" = match ] || return 75
+  fleet_run_cli_invalidate
+  ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
+    "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
+    >/dev/null || return 75
+}
+
+fleet_run_codex_record_state() {
+  # fleet_run_codex_record_state ID EXPECTED-SHA -> `absent` when Codex has no
+  # installed record for ID, else `match` or `mismatch` against EXPECTED-SHA
+  # (an empty one matches any record). Exit 75 when the list cannot be read.
   fleet_run_codex_plugins=$(fleet_run_cli_cached codex \
     codex plugin list --json 2>/dev/null) || return 75
-  fleet_run_codex_plugin_state=$(printf '%s\n' "$fleet_run_codex_plugins" | jq -e -r \
-    --arg id "$1" --arg expected_sha "$fleet_run_expected_sha" '
+  printf '%s\n' "$fleet_run_codex_plugins" | jq -e -r \
+    --arg id "$1" --arg expected_sha "$2" '
     def records:
       if type == "array" then .
       elif type == "object" and (.installed | type == "array") then .installed
@@ -1761,20 +1794,7 @@ fleet_run_approve_plugin_hooks() {
       then "match"
       else "mismatch"
       end
-  ' 2>/dev/null) || return 75
-  case "$fleet_run_codex_plugin_state" in
-    absent) return 0 ;;
-    match) ;;
-    *) return 75 ;;
-  esac
-  fleet_run_hooks_node=$(fleet_node_path) || {
-    printf 'roundhouse: Node.js is required to approve hooks for %s\n' "$1" >&2
-    return 75
-  }
-  fleet_run_cli_invalidate
-  ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
-    "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
-    >/dev/null || return 75
+  ' 2>/dev/null || return 75
 }
 
 fleet_run_skill_source_identity() {
@@ -2360,7 +2380,7 @@ EOF
                 = "$fleet_run_resolved_version" ]; } || return 75
           if [ "$fleet_run_want_enabled" = true ]; then
             fleet_run_approve_plugin_hooks "$fleet_run_id" \
-              "$fleet_run_resolved_sha" || return 75
+              "$fleet_run_resolved_sha" refresh || return 75
           fi
           fleet_run_plugin_mutated=true
         fi

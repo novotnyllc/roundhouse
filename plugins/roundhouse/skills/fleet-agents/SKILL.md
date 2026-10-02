@@ -183,7 +183,9 @@ one reads as unmoved), against the head this host last refreshed it at
 (`store.run/plugin-currency/`). A moved marketplace, or every marketplace on
 the full pass, is refreshed BEFORE the item loop, so the same pass's identity
 comparison updates the fleet's plugin items through review → apply →
-journal. Installed plugins the fleet does not own are updated in place
+journal. When that update is of an enabled plugin Codex also has installed,
+the Codex copy is refreshed through the hook-preserving helper before
+automatic approval reads it. Installed plugins the fleet does not own are updated in place
 afterwards: `claude plugin update` for user-scoped Claude plugins, and for
 each Codex Git marketplace `codex plugin marketplace upgrade` followed by the
 hook-preserving `codex-plugin-hooks.mjs update` for every installed plugin

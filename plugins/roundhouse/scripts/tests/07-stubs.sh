@@ -261,7 +261,12 @@ fi
 if [ "${1:-}" = plugin ] && [ "${2:-}" = add ] &&
   [ "${3:-}" = example@test-market ] && [ "${4:-}" = --json ]; then
   [ -z "${AGENT_EXEC_MARKER:-}" ] || : >"$AGENT_EXEC_MARKER"
-  printf '%s\n' 1.3.0 >"$CODEX_STATE_FILE"
+  [ -z "${CODEX_HOOK_ORDER_FILE:-}" ] || printf 'codex-add %s\n' "$3" >>"$CODEX_HOOK_ORDER_FILE"
+  # `auto-approve` models a Codex copy already at the identity-verified bytes
+  # (every hook trusted): refreshing it is a no-op, as the real add is for a
+  # copy that is current. Every other scenario moves it to 1.3.0's hooks.
+  [ "${CODEX_HOOK_SCENARIO:-}" = auto-approve ] ||
+    printf '%s\n' 1.3.0 >"$CODEX_STATE_FILE"
   exit 0
 fi
 exit 64

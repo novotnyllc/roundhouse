@@ -298,5 +298,102 @@ SH
       *'hold  plugin gadget@m — claude plugin update did not reach the catalog identity'*) ;;
       *) fail "a no-op update read as done: $pc_out" ;;
     esac
+
+    # --- an owned, enabled plugin whose hooks change upstream ends approved ---
+    # The item loop updates Claude's copy; automatic approval reads Codex's. A
+    # Codex copy left at the old bytes refused (source mismatch) and held the
+    # item for good. Codex here models hook trust by hash: a hook is trusted
+    # only while its current hash is the one trust was written for.
+    mkdir -p "$pc/hooks-bin" "$pc/hooks-state"
+    cat >"$pc/hooks-bin/codex" <<'SH'
+#!/usr/bin/env bash
+st=$PC_HOOKS_STATE
+ver=$(cat "$st/version")
+if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
+  while IFS= read -r req; do
+    method=$(printf '%s\n' "$req" | jq -r '.method // empty')
+    id=$(printf '%s\n' "$req" | jq -r '.id // empty')
+    case $method in
+      initialize) jq -cn --argjson id "$id" '{id:$id,result:{}}' ;;
+      hooks/list)
+        cwd=$(printf '%s\n' "$req" | jq -r '.params.cwds[0]')
+        current="sha256:$ver"
+        trusted=$(cat "$st/trusted" 2>/dev/null || :)
+        status=untrusted
+        [ -z "$trusted" ] || status=modified
+        [ "$trusted" != "$current" ] || status=trusted
+        jq -cn --argjson id "$id" --arg cwd "$cwd" --arg h "$current" --arg s "$status" \
+          '{id:$id,result:{data:[{cwd:$cwd,warnings:[],errors:[],hooks:[{
+            key:"widget@m:hooks/hooks.json:stop:0:0",pluginId:"widget@m",
+            currentHash:$h,trustStatus:$s,enabled:true}]}]}}'
+        ;;
+      config/batchWrite)
+        printf '%s\n' "$req" | jq -r '.params.edits[0].value' >"$st/trusted"
+        printf 'trust %s\n' "$(cat "$st/trusted")" >>"$st/log"
+        jq -cn --argjson id "$id" '{id:$id,result:{}}'
+        ;;
+    esac
+  done
+  exit 0
+fi
+case "$*" in
+  'plugin list --json')
+    jq -cn --arg v "$ver" --arg sha "$(cat "$st/sha-$ver")" '{installed:[{
+      pluginId:"widget@m",name:"widget",marketplaceName:"m",version:$v,
+      installed:true,enabled:true,source:{source:"local",path:"x",sha:$sha}}]}'
+    ;;
+  'plugin add widget@m --json')
+    printf '%s\n' new >"$st/version"
+    printf 'codex-add widget@m\n' >>"$st/log"
+    ;;
+  *) exit 64 ;;
+esac
+SH
+    chmod +x "$pc/hooks-bin/codex"
+    pc_hooks_reset() {
+      printf '%s\n' old >"$pc/hooks-state/version"
+      printf '%s\n' "$pc_sha_a" >"$pc/hooks-state/sha-old"
+      printf '%s\n' "$pc_sha_b" >"$pc/hooks-state/sha-new"
+      printf '%s\n' sha256:old >"$pc/hooks-state/trusted"
+      : >"$pc/hooks-state/log"
+      jq -n --arg a "$pc_sha_a" '{version: 2, plugins: {"widget@m":
+        [{scope: "user", version: "1.0.0", gitCommitSha: $a}]}}' \
+        >"$HOME/.claude/plugins/installed_plugins.json"
+      jq -n --arg b "$pc_sha_b" '{available: [{pluginId: "widget@m", version: "1.1.0",
+        source: {source: "git", sha: $b}}]}' >"$pc/hooks-catalog.json"
+      printf '%s\n' '{"widget@m":true}' >"$pc/hooks-enabled.json"
+    }
+    pc_hooks_apply() {
+      PATH="$pc/hooks-bin:$PATH" PC_HOOKS_STATE="$pc/hooks-state" \
+        CLAUDE_PLUGIN_CATALOG_FILE="$pc/hooks-catalog.json" \
+        CLAUDE_PLUGIN_ENABLED_FILE="$pc/hooks-enabled.json" \
+        CLAUDE_INSTALL_MARKER="$pc/hooks-installs" \
+        fleet_run_apply_item "$pc/store" vireo '{}' plugins.widget \
+          '{"state":"enabled","marketplace":"m"}' '' >/dev/null 2>&1
+    }
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 0 ] ||
+      fail "an enabled fleet plugin whose hooks changed upstream was held (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
+    [ "$(head -2 "$pc/hooks-state/log" | tr '\n' ';')" = 'codex-add widget@m;trust sha256:new;' ] ||
+      fail "the Codex copy was not refreshed, carrying its hook trust, before approval: $(tr '\n' ';' <"$pc/hooks-state/log")"
+    [ "$(cat "$pc/hooks-state/trusted")" = sha256:new ] ||
+      fail "the changed hook did not end trusted at its new hash"
+    # Disabled: the Codex copy and its hook trust are never touched.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' '{"widget@m":false}' >"$pc/hooks-enabled.json"
+    PATH="$pc/hooks-bin:$PATH" PC_HOOKS_STATE="$pc/hooks-state" \
+      CLAUDE_PLUGIN_CATALOG_FILE="$pc/hooks-catalog.json" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$pc/hooks-enabled.json" \
+      CLAUDE_INSTALL_MARKER="$pc/hooks-installs" \
+      fleet_run_apply_item "$pc/store" vireo '{}' plugins.widget \
+        '{"state":"disabled","marketplace":"m"}' '' >/dev/null 2>&1 ||
+      fail "a disabled fleet plugin update failed"
+    [ ! -s "$pc/hooks-state/log" ] &&
+      [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+      fail "a disabled desired state refreshed the Codex copy or its hook trust: $(tr '\n' ';' <"$pc/hooks-state/log")"
   )
 fi
