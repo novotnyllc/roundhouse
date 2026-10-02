@@ -28,7 +28,11 @@ Changes under `plugins/` ship to installed fleets. They couple to a release:
    afterward. A disabled desired state must not mutate Codex hook trust; a
    Codex source identity mismatch, untrusted hook, or locally modified Codex
    hook makes automatic approval refuse and hold the item until the Codex copy
-   is refreshed/repaired or the hook is explicitly approved; a
+   is refreshed/repaired or the hook is explicitly approved. Automatic approval
+   only carries existing trust: a hook that reads `modified` because Codex
+   advanced the copy is re-trusted at its new hash only when the copy is from
+   the verified source at the expected SHA and its installed tree is
+   byte-identical to Claude's verified install there; a
    steady-state enabled no-op must not invoke the manager verb or re-approve
    locally modified hooks. Claude-only plugins have no Codex hook state and are
    explicitly skipped after the ownership check. Keep the Node/login-shell
