@@ -8,7 +8,7 @@ main pushes select everything. Unknown inputs within the tested surface fall
 back to full coverage. Unrelated changes need no extra scopes or helpers.
 `select` then splits the chosen sections and scopes into weight-balanced
 shards (`scripts/tests/weights.tsv`, in macOS runner seconds, about 900
-each, at most eight), and each `sections` job runs one shard through the
+each, at most ten), and each `sections` job runs one shard through the
 parallel runner.
 The workflow also runs `actionlint`, native `windows` checks, and the stable
 `ci-ok` gate over all results. Every job has a `timeout-minutes`, and the
@@ -36,7 +36,9 @@ plugin changes.
    `scripts/lib/*.sh` are the CLI's sourced units and `scripts/tests/*.sh` the
    self-check's sourced sections. Neither is executable on its own.
 
-2. **Lint** — `shellcheck --severity=warning -x -P SCRIPTDIR` (Linux job only)
+2. **Lint** — `shellcheck --extended-analysis=false --severity=warning -x -P SCRIPTDIR`
+   (Linux job only; shellcheck 0.10+, pinned to 0.11.0 in CI — with data-flow
+   analysis on, the one-program lint of `test-roundhouse` needs ~17 GB)
    on the five substantial scripts: `roundhouse`, `collect-posix`,
    `launcher-install`, `privilege-lane-posix`, `test-roundhouse`, `update-integrity`. `-x` follows the `# shellcheck
    source=` directives, so `lib/` and `tests/` are analysed as part of the
