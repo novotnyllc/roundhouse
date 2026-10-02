@@ -1697,8 +1697,10 @@ fleet_run_plugin_enabled() {
   # The optional second argument is only for the pre-verb transition probe:
   # an absent row is `unknown` there, while the post-verb proof still holds.
   fleet_run_allow_absent=${2:-false}
+  # A list that fails or times out is transient (74); a list that answers
+  # without one clear row is not (75).
   fleet_run_plugin_list=$(fleet_run_cli_cached installed \
-    claude plugin list --json 2>/dev/null) || return 75
+    claude plugin list --json 2>/dev/null) || return 74
   fleet_run_plugin_state=$(printf '%s\n' "$fleet_run_plugin_list" |
     jq -e -r --arg id "$1" --argjson allow_absent "$fleet_run_allow_absent" '
       def records:
@@ -1741,7 +1743,7 @@ fleet_run_approve_plugin_hooks() {
   # inability to prove ownership and remains held.
   command -v codex >/dev/null 2>&1 || return 0
   fleet_run_codex_plugins=$(fleet_run_cli_cached codex \
-    codex plugin list --json 2>/dev/null) || return 75
+    codex plugin list --json 2>/dev/null) || return 74
   fleet_run_codex_plugin_state=$(printf '%s\n' "$fleet_run_codex_plugins" | jq -e -r \
     --arg id "$1" --arg expected_sha "$fleet_run_expected_sha" '
     def records:
@@ -1909,7 +1911,9 @@ EOF
   # Only the two fixed manager agent identifiers above enter this word split.
   for skill_agent in $skill_agents; do set -- "$@" "$skill_agent"; done
   fleet_run_cli_invalidate
-  bounded_verb npx --yes "$@" >/dev/null 2>&1 || return 75
+  # A failed or timed-out `skills add` is transient (74): the next pass
+  # retries it. Everything above is a standing "this host cannot" (75).
+  bounded_verb npx --yes "$@" >/dev/null 2>&1 || return 74
   [ -f "$skill_canonical/SKILL.md" ] || return 75
   fleet_run_skill_exposed "$skill_name" "$skill_roots" || return 75
   # skills.sh does not write global update records for local-path sources.
@@ -2165,7 +2169,9 @@ fleet_run_brew_current() {
 fleet_run_apply_item() {
   # fleet_run_apply_item STORE HOST DEFS ITEM VALUE MANAGERS
   #
-  # Exit 0 applied, 70 SATISFIED, 75 held. Presence for manager-installed items
+  # Exit 0 applied, 70 SATISFIED, 75 held, 74 held but transient (and, for
+  # runtimes.node, 73 deferred and 76 unverified; fleet_run_node_converge).
+  # Presence for manager-installed items
   # is always the manager's own command; only STATE falls back to a config
   # edit, and where a harness has no state verb this design does not invent
   # one.
@@ -2182,6 +2188,16 @@ fleet_run_apply_item() {
   #   75 HELD       this host tried and could not, or a gate refused. A no-op
   #                 BECAUSE BLOCKED. It journals `held` and blocks downstream,
   #                 which is the property a genuine apply failure must keep.
+  #   74 HELD, TRANSIENT  the same `held`, for an attempt a retry may fix: a
+  #                 bounded manager verb or query (`npx skills add`, `claude
+  #                 plugin install|update|enable|list`, `claude plugin
+  #                 marketplace list`, `codex plugin list`) failed or timed
+  #                 out, or a plugin's post-verb re-read did not verify yet.
+  #                 The run owes it a retry next pass
+  #                 (fleet_run_hold_owes_retry); a 75 waits for the full
+  #                 cadence, since only a change elsewhere resolves it. (The
+  #                 74 node_switch_recover returns is a different, internal
+  #                 status; the runtimes arm folds it into 75.)
   #
   # A miss that is about THIS HOST's capability (no `claude` on the box, no
   # skill root configured, no resolvable source) is 75 and not 70: another host
@@ -2307,11 +2323,15 @@ EOF
         # refreshes the marketplace, then looks ONCE more (§3.5).
         # ...and a catalog is only accepted from the marketplace's declared
         # source: a same-name repoint holds (fleet_run_marketplace_source_ok).
-        fleet_run_marketplace_source_ok "$fleet_run_market" || return 75
-        fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id") ||
-          { fleet_run_marketplace_repair "$fleet_run_market" &&
-            fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id"); } ||
-          return 75
+        fleet_run_marketplace_source_ok "$fleet_run_market" || return $?
+        # A repair that failed in a bounded manager call is transient (74); a
+        # catalog that still cannot prove the bytes after a repair is
+        # standing (75): no entry, or an entry with no SHA.
+        fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id") || {
+          fleet_run_marketplace_repair "$fleet_run_market" || return $?
+          fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id") ||
+            return 75
+        }
         fleet_run_resolved_sha=$(printf '%s\n' "$fleet_run_catalog" |
           jq -r '.source.sha // empty')
         fleet_run_resolved_version=$(printf '%s\n' "$fleet_run_catalog" |
@@ -2337,10 +2357,10 @@ EOF
           # plugin can reject or no-op instead of actually refreshing it.
           if [ -n "$fleet_run_installed_sha" ]; then
             fleet_run_cli_invalidate
-            bounded_verb claude plugin update "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+            bounded_verb claude plugin update "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
           else
             fleet_run_cli_invalidate
-            bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+            bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
           fi
           # The manager wrote the cache under its caller's umask, and 002
           # leaves it group-writable. Seal it before it is re-verified, its
@@ -2350,25 +2370,25 @@ EOF
           # success exit with the catalog identity still unmatched (a no-op
           # install, a race against a catalog refresh) must not journal as
           # applied on stale bytes.
-          fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 75
+          fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 74
           [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // empty')" \
             = "$fleet_run_resolved_sha" ] &&
             { [ -z "$fleet_run_resolved_version" ] ||
               [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
-                = "$fleet_run_resolved_version" ]; } || return 75
+                = "$fleet_run_resolved_version" ]; } || return 74
           if [ "$fleet_run_want_enabled" = true ]; then
             fleet_run_approve_plugin_hooks "$fleet_run_id" \
-              "$fleet_run_resolved_sha" || return 75
+              "$fleet_run_resolved_sha" || return $?
           fi
           fleet_run_plugin_mutated=true
         fi
       else
         fleet_run_cli_invalidate
-        bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 75
+        bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
         # As above: seal what the manager wrote before approving its hooks.
         plugin_cache_seal_permissions "$fleet_run_id" || return 75
         if [ "$fleet_run_want_enabled" = true ]; then
-          fleet_run_approve_plugin_hooks "$fleet_run_id" || return 75
+          fleet_run_approve_plugin_hooks "$fleet_run_id" || return $?
         fi
         fleet_run_plugin_mutated=true
       fi
@@ -2383,7 +2403,7 @@ EOF
       fleet_run_before_enabled=unknown
       [ "$fleet_run_plugin_mutated" = true ] || {
         fleet_run_before_enabled=$(fleet_run_plugin_enabled "$fleet_run_id" true) ||
-          return 75
+          return $?
       }
       if [ "$fleet_run_want_enabled" = true ]; then
         if [ "$fleet_run_plugin_mutated" = true ] ||
@@ -2402,8 +2422,8 @@ EOF
           bounded_verb claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
         fi
       fi
-      fleet_run_actual_enabled=$(fleet_run_plugin_enabled "$fleet_run_id") || return 75
-      [ "$fleet_run_actual_enabled" = "$fleet_run_want_enabled" ] || return 75
+      fleet_run_actual_enabled=$(fleet_run_plugin_enabled "$fleet_run_id") || return $?
+      [ "$fleet_run_actual_enabled" = "$fleet_run_want_enabled" ] || return 74
       # Approval follows the verified post-state, not the manager's exit code.
       # Some native managers write enabled state and then return nonzero; the
       # before/after read is the authoritative transition proof. Install/update
@@ -2413,7 +2433,7 @@ EOF
         [ "$fleet_run_enable_attempted" = true ] &&
         [ "$fleet_run_actual_enabled" = true ]; then
         fleet_run_approve_plugin_hooks "$fleet_run_id" \
-          "${fleet_run_resolved_sha:-}" || return 75
+          "${fleet_run_resolved_sha:-}" || return $?
       fi
       ;;
     skills)
@@ -3568,7 +3588,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         # A FAILED apply, or a TRANSIENT hold, owes a retry next pass: the
         # poll floor stays open for it (fleet_run_hold_owes_retry names which
         # holds are transient and which are standing).
-        ! fleet_run_hold_owes_retry "$run_status" "$run_tombstone" "$run_category" ||
+        ! fleet_run_hold_owes_retry "$run_status" "$run_tombstone" ||
           run_retry_owed=true
         run_holds_grew=true
         fleet_run_apply_held "$run_store" "$run_host" "$run_defs" "$run_item" \
@@ -3961,22 +3981,21 @@ fleet_run_hold_items_into_verdicts() {
 }
 
 fleet_run_hold_owes_retry() {
-  # fleet_run_hold_owes_retry STATUS TOMBSTONE CATEGORY — true when an apply
-  # that ended STATUS (neither applied nor satisfied) owes a retry next pass,
-  # keeping the poll floor open (retry-owed).
+  # fleet_run_hold_owes_retry STATUS TOMBSTONE — true when an apply that ended
+  # STATUS (neither applied nor satisfied) owes a retry next pass, keeping the
+  # poll floor open (retry-owed).
   #
-  # Every failure does. A 75 HOLD does when it is one of the TRANSIENT kinds:
-  # a tombstone's (the live-session uninstall deferral, a `ps` probe that
-  # could not answer) and a plugin's (a bounded Claude install or update
-  # that failed or timed out, a marketplace that would not resolve). Every
-  # other 75 is a standing "this host cannot" — no package manager here
-  # provides the package, a hook this host does not trust, no skill root or
-  # source for a skill — which only a change elsewhere resolves; each has its
-  # alert, and the full cadence re-reads them.
+  # The apply says which kind of hold it is; nothing here guesses from the
+  # category. Any status other than a non-tombstone 75 owes a retry: every
+  # failure, a deferral, and a TRANSIENT hold (74: a bounded manager verb or
+  # query failed or timed out, fleet_run_apply_item). A 75 is a standing
+  # "this host cannot" (no package manager provides the package, a hook this
+  # host does not trust, no skill root or source, no `claude`), which only a
+  # change elsewhere resolves, so the full cadence re-reads it. A tombstone's
+  # 75s are the exception: its live-session deferral and its `ps` probe are
+  # waits, not inabilities.
   [ "$1" = 75 ] || return 0
-  [ "$2" != true ] || return 0
-  # A plugin hold on a host with no `claude` at all is standing, not transient.
-  [ "$3" = plugins ] && command -v claude >/dev/null 2>&1
+  [ "$2" = true ]
 }
 
 fleet_run_apply_held() {
@@ -4014,6 +4033,8 @@ fleet_run_apply_held() {
   fleet_run_journal_queue "$1" "$2" "$4" "$6" held "$9" || :
   if [ "$7" -eq 73 ]; then
     printf '  held    %s (deferred: a Node runtime switch is in flight or backing off on this host)\n' "$4"
+  elif [ "$7" -eq 74 ]; then
+    printf '  held    %s (the manager failed or timed out; retried next pass)\n' "$4"
   else
     printf '  held    %s (this host could not apply it, or a gate refused)\n' "$4"
   fi
@@ -5087,6 +5108,8 @@ fleet_apply_command() (
           '{item:$item,digest:$d,outcome:"held",at:$at}')" || :
       printf 'roundhouse: this host could not apply %s, or a gate refused it\n' \
         "$apply_item" >&2
+      # 74 is the run loop's retry hint; this verb reports any hold as 75.
+      [ "$apply_status" -ne 74 ] || apply_status=75
       exit "$apply_status"
       ;;
   esac
