@@ -10,10 +10,11 @@
 # Sourced by scripts/test-roundhouse in a fixed order; not a
 # standalone test file. See that driver for why.
 #
-# Serial: the trigger must return within three seconds while its detached
-# pass sleeps, and a loaded worker pool would make that a measurement of the
-# machine rather than of the trigger.
-# roundhouse-test: serial
+# Three independent parts, each over the same stubs: the trigger and the
+# run's loop (1), fleet-schedule on macOS (2), and on Linux, a spaced HOME and
+# the refusals (3). No assertion reads a wall clock: the trigger's "returns
+# without waiting" is checked by order, against a runner held on a file.
+# roundhouse-test: parts=3
 # shellcheck shell=bash
 
 if [ -n "$fleet_fixture_yq" ]; then
@@ -128,9 +129,15 @@ if [ -e "$SCHED_STATE/linger" ]; then printf 'yes\n'; else printf 'no\n'; fi
 STUB
     cat >"$sched_bin/runner" <<'STUB'
 #!/bin/sh
-# Stands in for `roundhouse` in the detached fallback: slow on purpose, so a
-# trigger that waited for the pass would be measurably late.
-sleep "${SCHED_RUNNER_SLEEP:-0}"
+# Stands in for `roundhouse` in the detached fallback. With SCHED_RUNNER_HOLD
+# set it does not finish until that file exists (bounded), so a trigger that
+# waited for the pass is caught by ORDER — the pass's record is there before
+# the trigger returns — not by a wall clock.
+hold_n=0
+while [ -n "${SCHED_RUNNER_HOLD:-}" ] && [ ! -e "$SCHED_RUNNER_HOLD" ] && [ "$hold_n" -lt 300 ]; do
+  sleep 0.1
+  hold_n=$((hold_n + 1))
+done
 printf '%s\n' "$*" >>"$SCHED_STATE/runner"
 STUB
     chmod +x "$sched_bin"/*
@@ -229,6 +236,7 @@ fleet_schedule_command "$@"'
       [ ! -e "$SCHED_STATE/runner" ]
     }
 
+    if section_part 1; then
     # --- the trigger: stamp, then start the scheduled job ---
     sched_reset
     : >"$SCHED_STATE/gui"
@@ -258,12 +266,13 @@ fleet_schedule_command "$@"'
     # last SEEN loaded: the detached fallback, and the trigger does not wait.
     rm -f "$SCHED_STATE/gui"
     : >"$SCHED_LOG"
-    SCHED_RUNNER_SLEEP=3
-    export SCHED_RUNNER_SLEEP
-    sched_start=$(date +%s)
+    SCHED_RUNNER_HOLD="$sched_root/runner-release"
+    rm -f "$SCHED_RUNNER_HOLD"
+    export SCHED_RUNNER_HOLD
     sched_out=$("$cli" fleet-trigger --fast) || fail "the fallback trigger failed"
-    [ $(($(date +%s) - sched_start)) -lt 3 ] ||
+    [ ! -e "$SCHED_STATE/runner" ] ||
       fail "the fallback trigger waited for the pass instead of returning"
+    : >"$SCHED_RUNNER_HOLD"
     case $sched_out in
       *'scheduler is unreachable'*'detached fleet-run --fast'*) ;;
       *) fail "the fallback did not say why it detached: $sched_out" ;;
@@ -272,7 +281,7 @@ fleet_schedule_command "$@"'
     sched_wait_runner || fail "the detached fallback never started a pass"
     [ "$(cat "$SCHED_STATE/runner")" = 'fleet-run --fast' ] ||
       fail "the fallback ran something other than fleet-run --fast: $(cat "$SCHED_STATE/runner")"
-    SCHED_RUNNER_SLEEP=0
+    unset SCHED_RUNNER_HOLD
     [ "$(fleet_schedule_last_state fast)" = loaded ] ||
       fail "an unreachable domain overwrote the remembered job state"
     # Never seen: nothing is known about the operator's intent, so nothing runs.
@@ -599,6 +608,9 @@ fleet_run_command --fast'
       done
     )
 
+    fi
+
+    if section_part 2; then
     # --- fleet-schedule on macOS: install, idempotence, status, uninstall ---
     SCHED_UNAME=Darwin
     sched_reset
@@ -950,6 +962,12 @@ fleet_run_command --fast'
     [ -f "$sched_fast" ] || fail "install with no GUI domain wrote no job"
     [ ! -e "$(fleet_schedule_optout_path)" ] || fail "install did not lift the opt-out"
 
+    fi
+
+    if section_part 3; then
+    # The launcher shim the jobs run (part 2 builds its own).
+    printf '#!/bin/sh\n' >"$HOME/.local/bin/roundhouse"
+    chmod +x "$HOME/.local/bin/roundhouse"
     # --- fleet-schedule on Linux: systemd user service + timer pairs ---
     SCHED_UNAME=Linux
     sched_reset
@@ -1107,5 +1125,6 @@ EOF_SPACED
       "$cli" fleet-schedule $sched_bad >/dev/null 2>&1 || sched_status=$?
       [ "$sched_status" -eq 64 ] || fail "fleet-schedule accepted '$sched_bad' ($sched_status)"
     done
+    fi
   )
 fi
