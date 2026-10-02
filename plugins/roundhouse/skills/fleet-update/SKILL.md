@@ -329,7 +329,9 @@ same step that installs the fleet entry; `install` does this for both macOS
 labels. A replaced definition that differed is kept as `.replaced`, and one
 `uninstall` removes as `.removed`; a backup that cannot be made stops the step.
 `uninstall` unloads a job the scheduler still holds before it removes the file,
-and is not done until the scheduler has let go of it. A host carrying both
+and is not done until the scheduler has let go of it. It also opts the host
+out of triggers: after `uninstall`, a trigger or peer nudge only stamps and
+starts no pass until `install` runs again. A host carrying both
 is the exact double-runner this rule exists to prevent. `install` is also the only thing that enables a job: a scheduled pass
 never re-enables one an operator disabled, it raises a `schedule-disabled`
 alert (and `schedule-missing` for a job that disappeared) instead.

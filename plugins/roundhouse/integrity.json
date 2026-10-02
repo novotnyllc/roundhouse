@@ -322,7 +322,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "7e26665e0637c078ccb694d48d8831be7f1e71aea0ad62fd00f2941433a34edc"
+      "sha256": "f5c1dd41899300742783bedfc220feaf2dc63695859641bc680ac64cc51177f8"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",
