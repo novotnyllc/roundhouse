@@ -2836,6 +2836,9 @@ fleet_run_command() {
   # kill with this job's process group the moment it ends. If another run
   # holds the lock by then, it is the one that will see the stamp. Two
   # handoffs at most; a storm past that waits for the next scheduled run.
+  # A move AFTER this last compare is the trigger's to catch: while this job
+  # runs with no lock held, it starts the job only once the job has exited
+  # (fleet_trigger_exit_pending).
   run_status=0
   run_round=0
   while :; do

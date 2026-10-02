@@ -13,7 +13,9 @@
 # Three independent parts, each over the same stubs: the trigger and the
 # run's loop (1), fleet-schedule on macOS (2), and on Linux, a spaced HOME and
 # the refusals (3). No assertion reads a wall clock: the trigger's "returns
-# without waiting" is checked by order, against a runner held on a file.
+# without waiting" is checked by order, against a runner held on a file, and
+# its start of a job still finishing a run by the fake scheduler's own record
+# of whether each start landed while the job ran.
 # roundhouse-test: parts=3
 # shellcheck shell=bash
 
@@ -38,14 +40,24 @@ STUB
 #!/bin/sh
 # launchd, as files: loaded.<label>, disabled.<label>, and gui (the domain).
 # Like the real one, `disable` does NOT unload a running job, and
-# bootstrapping a job that is already loaded is an error.
+# bootstrapping a job that is already loaded is an error. running.<label>
+# holds a count: the job reads as running for that many more prints.
 printf 'launchctl %s\n' "$*" >>"$SCHED_LOG"
 verb=$1
 shift
 case $verb in
   print)
     case $1 in
-      gui/*/*) [ -e "$SCHED_STATE/loaded.${1##*/}" ] || exit 113 ;;
+      gui/*/*)
+        [ -e "$SCHED_STATE/loaded.${1##*/}" ] || exit 113
+        n=$(cat "$SCHED_STATE/running.${1##*/}" 2>/dev/null || printf 0)
+        if [ "$n" -gt 0 ]; then
+          printf '%s\n' "$((n - 1))" >"$SCHED_STATE/running.${1##*/}"
+          printf '\tstate = running\n'
+        else
+          printf '\tstate = not running\n'
+        fi
+        ;;
       gui/*) [ -e "$SCHED_STATE/gui" ] || exit 113 ;;
       *) exit 64 ;;
     esac
@@ -61,6 +73,9 @@ case $verb in
     ;;
   kickstart)
     [ -e "$SCHED_STATE/gui" ] && [ -e "$SCHED_STATE/loaded.${1##*/}" ] || exit 113
+    # Like the real one, a kickstart of a running job starts nothing.
+    [ "$(cat "$SCHED_STATE/running.${1##*/}" 2>/dev/null || printf 0)" -le 0 ] ||
+      printf 'launchctl kickstart-was-a-no-op\n' >>"$SCHED_LOG"
     ;;
   bootstrap)
     [ -e "$SCHED_STATE/gui" ] || exit 125
@@ -89,6 +104,8 @@ STUB
 #!/bin/sh
 # A systemd user manager, as files: usermgr, enabled.<unit>, active.<unit>,
 # and — like the real one — the timers.target.wants link `enable` writes.
+# running.<unit> holds a count: the service reads as activating (a oneshot
+# mid-run) for that many more `show`s.
 printf 'systemctl %s\n' "$*" >>"$SCHED_LOG"
 [ "${1:-}" = --user ] || exit 64
 shift
@@ -104,7 +121,22 @@ case $1 in
     [ "$2" = --quiet ] && shift
     [ -e "$SCHED_STATE/active.$2" ] || exit 3
     ;;
-  start) [ "$2" = --no-block ] || exit 64 ;;
+  start)
+    [ "$2" = --no-block ] || exit 64
+    # Like the real one, a start of an activating oneshot starts nothing.
+    [ "$(cat "$SCHED_STATE/running.$3" 2>/dev/null || printf 0)" -le 0 ] ||
+      printf 'systemctl start-was-a-no-op\n' >>"$SCHED_LOG"
+    ;;
+  show)
+    [ "$2 $3 $4" = '-p ActiveState --value' ] || exit 64
+    n=$(cat "$SCHED_STATE/running.$5" 2>/dev/null || printf 0)
+    if [ "$n" -gt 0 ]; then
+      printf '%s\n' "$((n - 1))" >"$SCHED_STATE/running.$5"
+      printf 'activating\n'
+    else
+      printf 'inactive\n'
+    fi
+    ;;
   enable)
     [ "$2" = --now ] && shift
     : >"$SCHED_STATE/enabled.$2"
@@ -231,6 +263,16 @@ fleet_schedule_command "$@"'
       done
       [ -s "$SCHED_STATE/runner" ]
     }
+    sched_wait_log() {
+      # sched_wait_log LINE — bounded wait for the fake scheduler to log LINE
+      # (the trigger's detached start lands after the trigger returns).
+      sched_waited=0
+      while ! grep -Fqx "$1" "$SCHED_LOG" && [ "$sched_waited" -lt 150 ]; do
+        sleep 0.1
+        sched_waited=$((sched_waited + 1))
+      done
+      grep -Fqx "$1" "$SCHED_LOG"
+    }
     sched_no_runner() {
       sleep 0.3
       [ ! -e "$SCHED_STATE/runner" ]
@@ -277,6 +319,46 @@ fleet_schedule_command "$@"'
       fail "a full trigger for a stopped full job recorded a full request"
     rm -f "$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-full"
     : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-full"
+    # THE LAST-MOMENT RACE: the job is still running and no lock is held, so
+    # its run may be past its last stamp compare, and a kickstart now starts
+    # nothing. The trigger returns at once (over SSH it is on a watchdog) and
+    # a detached waiter starts the job once it has ended. The job reads as
+    # running for its next 30 prints, a few seconds of the waiter's polling,
+    # so the trigger returning first is shown by order: no kickstart yet.
+    sched_running="$SCHED_STATE/running.com.novotnyllc.roundhouse.fleet-fast"
+    sched_kick_fast="launchctl kickstart gui/$sched_uid/com.novotnyllc.roundhouse.fleet-fast"
+    : >"$SCHED_LOG"
+    printf '30\n' >"$sched_running"
+    case $("$cli" fleet-trigger --fast) in
+      *'finishing a run that may not have seen this trigger'*) ;;
+      *) fail "the trigger did not say it would start the job once its run exits" ;;
+    esac
+    ! grep -Fqx "$sched_kick_fast" "$SCHED_LOG" ||
+      fail "the trigger kickstarted a job still finishing a run before returning"
+    sched_wait_log "$sched_kick_fast" ||
+      fail "the detached waiter never started the job once its run ended"
+    ! grep -q 'was-a-no-op' "$SCHED_LOG" ||
+      fail "the job was kickstarted while still finishing a run, which starts nothing"
+    # A run that HOLDS the lock compares the stamp again after releasing it:
+    # the ordinary start, at once, and no waiter.
+    : >"$SCHED_LOG"
+    printf '30\n' >"$sched_running"
+    mkdir -p "$(fleet_lock_path)"
+    printf '{"nonce":"sched-holder"}\n' >"$(fleet_lock_path)/meta.json"
+    case $("$cli" fleet-trigger --fast) in
+      *'stamped and started fleet-fast'*) ;;
+      *) fail "the trigger did not start a job whose run holds the lock at once" ;;
+    esac
+    grep -Fqx "$sched_kick_fast" "$SCHED_LOG" ||
+      fail "the trigger did not start a job whose run holds the lock"
+    rm -rf "$(fleet_lock_path)"
+    # The waiter is bounded: a job that never ends is started anyway.
+    : >"$SCHED_LOG"
+    printf '999\n' >"$sched_running"
+    ROUNDHOUSE_TEST_TRIGGER_AWAIT_SECONDS=1 "$cli" fleet-trigger --fast >/dev/null
+    sched_wait_log "$sched_kick_fast" ||
+      fail "the bounded waiter did not start the job when its bound ran out"
+    rm -f "$sched_running"
 
     # No GUI domain (a Mac over SSH, nobody at the console) and the job was
     # last SEEN loaded: the detached fallback, and the trigger does not wait.
@@ -377,6 +459,15 @@ fleet_schedule_command "$@"'
     grep -Fqx 'systemctl --user start --no-block roundhouse-fleet-fast.service' \
       "$SCHED_LOG" || fail "the Linux trigger did not start the fast service without blocking"
     sched_no_runner || fail "the Linux trigger ran a pass itself"
+    # The oneshot still activating with no lock held: started once it ends.
+    : >"$SCHED_LOG"
+    printf '3\n' >"$SCHED_STATE/running.roundhouse-fleet-fast.service"
+    "$cli" fleet-trigger --fast >/dev/null
+    sched_wait_log 'systemctl --user start --no-block roundhouse-fleet-fast.service' ||
+      fail "the Linux trigger did not start the service once its run ended"
+    ! grep -q 'was-a-no-op' "$SCHED_LOG" ||
+      fail "the Linux trigger started a oneshot still finishing a run, which starts nothing"
+    rm -f "$SCHED_STATE/running.roundhouse-fleet-fast.service"
     # No lingering: a start from this session would die with it.
     rm -f "$SCHED_STATE/linger"
     "$cli" fleet-trigger --fast >/dev/null

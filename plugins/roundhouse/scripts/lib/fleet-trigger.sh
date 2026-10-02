@@ -18,6 +18,9 @@
 # pass re-runs in-process while the stamp has moved since that pass began
 # (fleet_trigger_converge), so a trigger that lands mid-pass is never lost —
 # nor its cadence: the re-run is full while a full request is pending.
+# One that lands after the run's last compare, as it exits, is the trigger's
+# to catch: it starts the job once that exit is done
+# (fleet_trigger_exit_pending).
 #
 # AN OPERATOR STOP IS FINAL TO EVERYTHING BUT `install`. A job the operator
 # disabled or unloaded, a host whose jobs were uninstalled (the opt-out
@@ -95,6 +98,45 @@ fleet_trigger_detach() {
   printf 'roundhouse: %s; started a detached fleet-run --%s\n' "$2" "$1"
 }
 
+fleet_trigger_exit_pending() {
+  # fleet_trigger_exit_pending fast|full — THE LAST-MOMENT RACE. A run
+  # compares the stamp one final time AFTER it releases the lock
+  # (fleet_run_command's handoff), then exits. A trigger that moves the stamp
+  # after that compare, while the job is still running, would get a start
+  # that is a no-op — a running launchd job or an activating systemd oneshot
+  # is not started twice — and wait for the next scheduled run.
+  #
+  # True in the only state in which that can be so: the job running with no
+  # lock held. Held means the lock's meta names a holder, so a lock directory
+  # caught mid-acquire or mid-release reads as free. While a lock IS held, its
+  # holder (a fleet-run) compares again after this stamp, within its storm
+  # bounds.
+  fleet_schedule_backend running "$1" 2>/dev/null &&
+    [ -z "$(fleet_lock_identity "$(fleet_lock_path)")" ]
+}
+
+fleet_trigger_start_after_exit() {
+  # fleet_trigger_start_after_exit fast|full — while fleet_trigger_exit_pending
+  # holds, wait for whichever comes first: a run taking the lock (it sees the
+  # stamp) or the job ending (the start then launches a fresh run); then
+  # start. It lasts a run's exit, or its startup before the lock, never a
+  # pass, and it is bounded. DETACHED, with SIGHUP ignored: a trigger that
+  # came over SSH (the push nudge, under a ten-second watchdog) returns at
+  # once, and the session ending does not take the start with it.
+  await_limit=30
+  if fleet_test_hook "${ROUNDHOUSE_TEST_TRIGGER_AWAIT_SECONDS:-}"; then
+    await_limit=$ROUNDHOUSE_TEST_TRIGGER_AWAIT_SECONDS
+  fi
+  (
+    trap '' HUP
+    await_until=$((SECONDS + await_limit))
+    while fleet_trigger_exit_pending "$1" && [ "$SECONDS" -lt "$await_until" ]; do
+      sleep 0.1
+    done
+    fleet_schedule_backend start "$1" || :
+  ) </dev/null >/dev/null 2>&1 &
+}
+
 fleet_trigger_plan() {
   # fleet_trigger_plan fast|full — what a trigger does with MODE's job, one
   # word. Only `start` and `detach` run MODE's pass; every other word is a
@@ -142,7 +184,10 @@ fleet_trigger_kick() {
       printf 'roundhouse: this host was taken off the schedule (fleet-schedule uninstall); stamped, not started\n'
       ;;
     start)
-      if fleet_schedule_backend start "$1" >/dev/null 2>&1; then
+      if fleet_trigger_exit_pending "$1"; then
+        fleet_trigger_start_after_exit "$1"
+        printf 'roundhouse: stamped; fleet-%s is finishing a run that may not have seen this trigger, and is started once that run exits\n' "$1"
+      elif fleet_schedule_backend start "$1" >/dev/null 2>&1; then
         printf 'roundhouse: stamped and started fleet-%s\n' "$1"
       else
         printf 'roundhouse: the scheduler refused to start fleet-%s; stamped, the next scheduled run picks it up\n' "$1"
