@@ -91,9 +91,12 @@ The reconciler stopped working:
 - **First-time adds.** An item no layer declares yet gets its layer by a fixed rule, so the
   publisher never has to choose:
   - The layer is `fleet/agent-*.yaml` by default.
-  - It is `os/<platform>/agent-*.yaml` only when the item's marketplace entry in
-    `fleet/owner/marketplaces.yaml` (for a skill, its source entry) lists `platforms:` and the
-    origin's platform is among them. The origin's own platform then names the file.
+  - The item's marketplace entry in `fleet/owner/marketplaces.yaml` (for a skill, its source
+    entry) may list `platforms:`. With exactly one platform, the layer is
+    `os/<platform>/agent-*.yaml`. With more than one, the layer stays `fleet/agent-*.yaml`, and the
+    list decides where the item applies: a receiver whose platform isn't listed treats the item as
+    not applicable. It doesn't install it, record a failure or tombstone it. An add made on macOS
+    for `platforms: [macos, linux]` therefore reaches Linux too, through a single declaring layer.
   - The platform list lives in an owner file, so a node can't widen or narrow where an item
     spreads.
   - An origin whose platform isn't on that list doesn't publish the add. The add is reported, the
@@ -320,6 +323,11 @@ once the host reconnects.
   - **What condition 3 then requires.** A `verified` record for the digest, dated at or after
     `applied_at + canary_wait_hours`, whose `run_id` differs from that of the `applied` or
     `satisfied` record. The existing `alive` heartbeat, which carries no run ID, is not used.
+  - **It outlives evidence retention.** `fleet_journal_load_bearing_filter` keeps the newest
+    `verified` record for each digest that is still desired, as it keeps apply evidence. Aging
+    can't prune it while that digest is current. A receiver that returns after more than
+    `evidence_retention_days` still finds it. The record ages normally once the digest is superseded
+    or its tombstone is compacted.
   - A change that kills the origin's loop never produces that record, so it never promotes. At
     wait 0 the delay is one extra pass on the origin, which takes seconds.
 - **Plugin releases: no canary gate (owner decision, 2026-10-02).** Plugins from every marketplace,
@@ -843,6 +851,8 @@ verbs, the token check and the task.
 | PR review (Codex) | Owner pointer in same-user `store.run/` | §4.1 `trustd` custody |
 | PR review (Codex) | Pre-enrollment history tripped the arrival window | §4.2 arrival watermark |
 | PR review (Codex) | A deleted secret file held rendering as a locally typed secret | §5.2 missing is damage |
+| PR review (Codex) | Journal aging could prune the one-shot `verified` record | §3.6 load-bearing while the digest is desired |
+| PR review (Codex) | A multi-platform first-time add reached only the origin's platform | §3.1 multi-platform items in the fleet layer, filtered by `platforms:` |
 | Owner decision 2026-10-02 | No canary soak; plugin releases ungated | §3.6; §10 |
 | Owner rule | No per-use presence for signing; hands-off setup | §4.1; §10 |
 
