@@ -587,6 +587,12 @@ $(docjj_lib fleet_vcs_trailers vireo interactive/human 'leak fixture' -)" >/dev/
     docjj_doctor >/dev/null
     docjj_row_fires run-lock
     rm -rf "$docjj_lock"
+    docjj_lock_age_hours() {
+      # `docjj_lock_age_hours N` — back-date the lock's meta N hours.
+      jq -c --arg at "$(date -u -r $(($(date +%s) - $1 * 3600)) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
+        date -u -d "@$(($(date +%s) - $1 * 3600))" +%Y-%m-%dT%H:%M:%SZ)" '.started_at = $at' \
+        "$docjj_lock/meta.json" >"$doc.meta.tmp" && mv "$doc.meta.tmp" "$docjj_lock/meta.json"
+    }
     # …and a LIVE holder past the pass ceiling, though well under the stale
     # threshold: the next run stops it and takes the lock over, so doctor must
     # say so rather than report it ok (fleet_run_pass_ceiling).
@@ -594,15 +600,34 @@ $(docjj_lib fleet_vcs_trailers vireo interactive/human 'leak fixture' -)" >/dev/
     docjj_live=$!
     docjj_lib fleet_lock_acquire "$docjj_lock" "$docjj_live" ||
       fail "could not take the lock for a live fixture holder"
-    jq -c --arg at "$(date -u -r $(($(date +%s) - 3 * 3600)) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
-      date -u -d "@$(($(date +%s) - 3 * 3600))" +%Y-%m-%dT%H:%M:%SZ)" '.started_at = $at' \
-      "$docjj_lock/meta.json" >"$doc.meta.tmp" && mv "$doc.meta.tmp" "$docjj_lock/meta.json"
+    docjj_lock_age_hours 3
     docjj_doctor >/dev/null
     docjj_row_fires run-lock
     printf '%s\n' "$docjj_rows" | grep -E '^FINDING +run-lock ' | grep -q 'pass ceiling' ||
       fail "doctor did not report a live lock past the pass ceiling: $(printf '%s\n' "$docjj_rows" | grep run-lock)"
     kill "$docjj_live" 2>/dev/null || :
     wait "$docjj_live" 2>/dev/null || :
+    rm -rf "$docjj_lock"
+    # …and a run whose top-level shell was KILLed while its process group
+    # still works, past the ceiling: live (the run does not take it over), but
+    # NOT stoppable, so doctor must not promise the next run will stop it.
+    docjj_group=$(fixture_group_holder docjj-group) ||
+      fail "the process-group fixture did not start"
+    docjj_lib fleet_lock_acquire "$docjj_lock" "$docjj_group" ||
+      fail "could not take the lock for a process-group fixture holder"
+    kill -KILL "$docjj_group" 2>/dev/null || :
+    docjj_tries=0
+    while kill -0 "$docjj_group" 2>/dev/null && [ "$docjj_tries" -lt 50 ]; do
+      sleep 0.1
+      docjj_tries=$((docjj_tries + 1))
+    done
+    docjj_lock_age_hours 3
+    docjj_doctor >/dev/null
+    docjj_row_fires run-lock
+    printf '%s\n' "$docjj_rows" | grep -E '^FINDING +run-lock ' | grep "process group $docjj_group, its top-level pid gone" |
+      grep -q 'cannot prove it is the recorded run' ||
+      fail "doctor did not report a KILLed run's working group past the ceiling: $(printf '%s\n' "$docjj_rows" | grep run-lock)"
+    fixture_group_kill "$docjj_group" docjj-group
     rm -rf "$docjj_lock"
 
     # jj#9571: a raw `git push` from the colocated repo bypasses every guard in

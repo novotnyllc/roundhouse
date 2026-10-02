@@ -225,9 +225,10 @@ fleet_lock_proc_start() {
   # a live holder from an unrelated process that was handed the same pid.
   # Pinned to UTC and the C locale: `lstart` is printed in the READER's zone and
   # language, and a scheduled run and an interactive one need not share either
-  # — a mismatch there would judge a live holder dead.
-  LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null |
-    awk '{ $1 = $1; if ($0 != "") print; exit }'
+  # — a mismatch there would judge a live holder dead. A zombie has exited
+  # and only waits for its parent to collect it, so it answers nothing too.
+  LC_ALL=C TZ=UTC0 ps -o stat= -o lstart= -p "$1" 2>/dev/null |
+    awk '$1 !~ /Z/ { $1 = ""; $0 = $0; $1 = $1; if ($0 != "") print; exit }'
 }
 
 fleet_lock_proc_command() {
@@ -237,6 +238,117 @@ fleet_lock_proc_command() {
   # terminal width otherwise, and two reads at different widths would disagree.
   ps -ww -o command= -p "$1" 2>/dev/null |
     awk '{ sub(/[[:space:]]+$/, ""); if ($0 != "") print; exit }'
+}
+
+fleet_lock_proc_pgid() {
+  # `fleet_lock_proc_pgid PID` — the process group PID is in, or nothing.
+  ps -o pgid= -p "$1" 2>/dev/null | awk 'NF { print $1; exit }'
+}
+
+fleet_lock_boot_id() {
+  # This boot's identity, or nothing: Linux (and WSL) and macOS both name each
+  # boot. Pids and group ids only mean something within one boot, and the
+  # lock directory outlives a reboot.
+  # sysctl lives in /usr/sbin, which a minimal PATH can leave out.
+  cat /proc/sys/kernel/random/boot_id 2>/dev/null ||
+    sysctl -n kern.bootsessionuuid 2>/dev/null ||
+    /usr/sbin/sysctl -n kern.bootsessionuuid 2>/dev/null || :
+}
+
+fleet_lock_group_state() {
+  # `fleet_lock_group_state PGID` — prints `live` while any process is in
+  # group PGID and `empty` when none is; exit 1 (printing nothing) when the
+  # process table cannot be read, which proves nothing either way. Within one
+  # boot a group id is never handed out again while any process is still in
+  # the group, so a live group whose id is a holder's pid is that holder's —
+  # unless the group emptied, the pid was reused by a new group leader, and
+  # that leader died leaving members: the one case this cannot see, and it
+  # errs towards `live`, never towards a takeover.
+  # A zombie has exited and only waits to be collected: it is not the run.
+  lock_group_table=$(ps -A -o pgid= -o stat= 2>/dev/null) || return 1
+  [ -n "$lock_group_table" ] || return 1
+  if printf '%s\n' "$lock_group_table" | awk -v g="$1" '$1 == g && $2 !~ /Z/ { f = 1 } END { exit !f }'; then
+    printf 'live\n'
+  else
+    printf 'empty\n'
+  fi
+}
+
+fleet_lock_lead_group() {
+  # `fleet_lock_lead_group SCRIPT [ARG...]` — run the lock-taking command
+  # about to start as the leader of a process group of its own. This process
+  # becomes (`exec`) a thin perl parent that forks SCRIPT ARG... into a new
+  # group under setpgrp, forwards TERM, INT and HUP to that whole group, and
+  # exits with its status. macOS ships no `setsid` binary; perl is in every
+  # macOS and mainstream Linux base system, and lib/timeout.sh bounds every
+  # manager query the same way. Returns, changing nothing, when this process
+  # already leads its group, has a controlling terminal (below), or has no
+  # perl — and on the far side of the fork, where ROUNDHOUSE_LOCK_GROUP_LEADER
+  # names the child's own pid, so it can never loop.
+  #
+  # WHY: the run lock names the top-level shell, but the pass runs in nested
+  # subshells under it. When that shell dies without its traps (KILL, OOM) the
+  # subshells carry on, and a pid-only liveness check judged the lock dead and
+  # let a second run take it over beside them. Leading a group of its own
+  # makes the group id the recorded pid, owned by this run alone; the lock
+  # records it (fleet_lock_acquire), the holder check reads the run as live
+  # while anything in that group is (fleet_lock_holder_state), and the
+  # pass-ceiling stop signals the whole group (fleet_lock_stop_holder).
+  #
+  # WHY A PARENT: the caller's signals must still reach the run. A supervisor that signals the pid it started (timeout(1)) or the
+  # group it started it in (killpg) reaches the parent, which stays in that
+  # group and passes the signal to the run's group, whose traps end the pass
+  # and release the lock. A run moved out from under its supervisor without
+  # one would keep going, orphaned, and read as live by its group. (run_bounded
+  # in lib/timeout.sh is the same shape, for a single manager query.)
+  #
+  # A CONTROLLING TERMINAL KEEPS ITS FOREGROUND GROUP. A process outside the
+  # terminal's foreground group is stopped by the terminal when it reads it
+  # (a sudo prompt) — the same trade lib/timeout.sh makes for run_bounded —
+  # so with a terminal nothing is forked and Ctrl-C reaches the run directly,
+  # as it always did. That costs little: an interactive job-control shell
+  # already puts each command line in a group led by its first process, so
+  # `roundhouse fleet-run` typed at a prompt leads its group anyway; anything
+  # else with a terminal records a group it does not lead, and the holder
+  # check falls back to the pid alone, exactly as before. Scheduled runs
+  # (launchd, systemd, cron) have no terminal, and either lead their group
+  # already or get one here.
+  if [ "${ROUNDHOUSE_LOCK_GROUP_LEADER:-}" = "$$" ]; then
+    unset ROUNDHOUSE_LOCK_GROUP_LEADER
+    return 0
+  fi
+  unset ROUNDHOUSE_LOCK_GROUP_LEADER
+  [ "$(fleet_lock_proc_pgid "$$")" != "$$" ] || return 0
+  if (: </dev/tty) 2>/dev/null; then
+    return 0
+  fi
+  command -v perl >/dev/null 2>&1 || return 0
+  exec perl -e '
+    use POSIX ();
+    # TERM, INT and HUP are held from before the fork until the parent can
+    # forward them, so one that arrives early is passed on, not lost.
+    my $held = POSIX::SigSet->new(POSIX::SIGTERM(), POSIX::SIGINT(), POSIX::SIGHUP());
+    my $mask = POSIX::SigSet->new();
+    POSIX::sigprocmask(POSIX::SIG_BLOCK(), $held, $mask);
+    my $pid = fork();
+    exit 125 unless defined $pid;
+    if ($pid == 0) {
+      setpgrp(0, 0);
+      $ENV{ROUNDHOUSE_LOCK_GROUP_LEADER} = $$;
+      POSIX::sigprocmask(POSIX::SIG_SETMASK(), $mask);
+      exec { $ARGV[0] } @ARGV;
+      exit 127;
+    }
+    # Both sides set the group, so no signal can arrive before it exists.
+    setpgrp($pid, $pid);
+    for my $sig (qw(TERM INT HUP)) {
+      $SIG{$sig} = sub { kill $sig, -$pid; };
+    }
+    POSIX::sigprocmask(POSIX::SIG_SETMASK(), $mask);
+    1 while waitpid($pid, 0) == -1 && $!{EINTR};
+    my $rc = $?;
+    exit(($rc & 127) ? 128 + ($rc & 127) : ($rc >> 8));
+  ' "${BASH:-bash}" "$@"
 }
 
 fleet_lock_acquire() {
@@ -249,6 +361,13 @@ fleet_lock_acquire() {
   # alone is not an identity: after a crash or reboot the same number belongs
   # to something else, and `kill -0` cannot tell the difference. HOLDER_PID
   # defaults to this process.
+  #
+  # It also records the holder's process GROUP (`pgid`) and this boot
+  # (`boot`). Only a group the holder leads (pgid == pid, fleet_lock_lead_group)
+  # in the boot that is running now is ever read back: then the run is live
+  # while anything in that group is, and the ceiling stop signals the group. A
+  # holder in someone else's group, or a lock from before a reboot, is judged
+  # by its pid alone, as before.
   #
   # `manual` marks a lock taken by hand (`fleet-lock`). Its recorded pid is the
   # caller's shell, which is often gone a second later — so a hand-taken lock
@@ -271,9 +390,13 @@ fleet_lock_acquire() {
     jq -S -n --arg host "$(fleet_host_name)" --argjson pid "$lock_pid" \
       --arg started "$(fleet_now)" --arg start_time "$(fleet_lock_proc_start "$lock_pid")" \
       --arg command "$(fleet_lock_proc_command "$lock_pid")" --arg nonce "$lock_nonce" \
+      --arg pgid "$(fleet_lock_proc_pgid "$lock_pid")" --arg boot "$(fleet_lock_boot_id)" \
       --argjson manual "$lock_manual" \
       '{host:$host,pid:$pid,started_at:$started,start_time:$start_time,
-        command:$command,nonce:$nonce} + (if $manual then {manual:true} else {} end)' \
+        command:$command,nonce:$nonce}
+        + (if ($pgid | test("^[0-9]+$")) then {pgid:($pgid | tonumber)} else {} end)
+        + (if $boot != "" then {boot:$boot} else {} end)
+        + (if $manual then {manual:true} else {} end)' \
       >"$lock_dir/meta.json.tmp" 2>/dev/null &&
     mv -f "$lock_dir/meta.json.tmp" "$lock_dir/meta.json"; then
     fleet_lock_nonce_held=$lock_nonce
@@ -386,19 +509,29 @@ fleet_lock_holder_state() {
   # (fleet_lock_identity) the verdict is about. Globals rather than output, so
   # the takeover that follows can use the identity: call it directly.
   #
-  # dead     the meta names a pid on THIS host that no longer exists, or a live
-  #          pid whose start time or command is not the recorded holder's (pid
-  #          reuse after a crash or a reboot)
-  # live     the recorded holder is running right now, verified by all three
+  # dead     the meta names a pid on THIS host that no longer exists (and,
+  #          when the holder led its own process group, nothing is left in
+  #          that group either), or a live pid whose start time or command is
+  #          not the recorded holder's (pid reuse after a crash or a reboot)
+  # live     the recorded holder is running right now, verified by all three;
+  #          or the holder led its own group (the meta's pgid is its pid) and
+  #          is gone, but something in that group is still running — the
+  #          pass in a subshell of a top-level shell that was KILLed
   # unknown  nothing here can be proved either way: no readable meta, another
   #          host's pid, a hand-taken (`manual`) lock, a pre-nonce lock whose
-  #          pid is alive, or no identity to bind a takeover to
+  #          pid is alive, no identity to bind a takeover to, or a group (or
+  #          the boot it was recorded in) that could not be looked at
+  #
+  # `fleet_lock_live_by` says which proof a `live` rests on: `holder` (the
+  # recorded process itself) or `group` (only its group). The ceiling stop
+  # needs the first: it never signals what it cannot prove is the run.
   #
   # The host name is compared because the lock lives beside a store path that
   # a second instance root could share; a pid from another machine says
   # nothing about this one.
   fleet_lock_judged_id=
   fleet_lock_state=unknown
+  fleet_lock_live_by=
   lock_meta="$1/meta.json"
   [ -f "$lock_meta" ] || return 0
   jq -e 'type == "object"' "$lock_meta" >/dev/null 2>&1 || return 0
@@ -419,6 +552,26 @@ fleet_lock_holder_state() {
   lock_was_command=$(fleet_lock_meta_field "$1" command)
   if [ -z "$lock_now_start" ]; then
     fleet_lock_state=dead
+    # The holder led its own group, in this boot: the run is whatever is
+    # still in it. A lock written before groups were recorded (no pgid or no
+    # boot), or in an earlier boot, keeps the pid rule; a boot that cannot be
+    # read right now proves nothing either way.
+    lock_was_boot=$(fleet_lock_meta_field "$1" boot)
+    if [ "$(fleet_lock_meta_field "$1" pgid)" = "$lock_pid" ] && [ -n "$lock_was_boot" ]; then
+      lock_now_boot=$(fleet_lock_boot_id)
+      if [ -z "$lock_now_boot" ]; then
+        fleet_lock_state=unknown
+      elif [ "$lock_now_boot" = "$lock_was_boot" ]; then
+        case $(fleet_lock_group_state "$lock_pid") in
+          live)
+            fleet_lock_state=live
+            fleet_lock_live_by=group
+            ;;
+          empty) ;;
+          *) fleet_lock_state=unknown ;;
+        esac
+      fi
+    fi
   elif [ -z "$lock_was_start" ] || [ -z "$lock_was_command" ]; then
     # A lock written before holders were recorded: the pid is alive and there
     # is no evidence about whose it is, so this answer keeps the age rule.
@@ -427,14 +580,28 @@ fleet_lock_holder_state() {
     fleet_lock_state=unknown
   elif [ "$lock_now_start" != "$lock_was_start" ] ||
     [ "$(fleet_lock_proc_command "$lock_pid")" != "$lock_was_command" ]; then
+    # A pid cannot be handed out while a group of that id still has a
+    # process in it, so a reused pid also means the holder's group is gone.
     fleet_lock_state=dead
   else
     fleet_lock_state=live
+    fleet_lock_live_by=holder
   fi
   # A dead verdict is only actionable against an identity: the takeover proves
   # it moved the SAME lock it judged, and without one there is nothing to prove.
   [ "$fleet_lock_state" != dead ] || [ -n "$fleet_lock_judged_id" ] ||
     fleet_lock_state=unknown
+}
+
+fleet_lock_holder_desc() {
+  # `fleet_lock_holder_desc LOCK_DIR` — who holds the lock, for a message, as
+  # the last fleet_lock_holder_state on it judged: `pid N`, or, for a run that
+  # is live only through its group, `process group N, its top-level pid gone`.
+  if [ "${fleet_lock_live_by:-}" = group ]; then
+    printf 'process group %s, its top-level pid gone\n' "$(fleet_lock_meta_field "$1" pgid)"
+  else
+    printf 'pid %s\n' "$(fleet_lock_meta_field "$1" pid)"
+  fi
 }
 
 fleet_lock_takeover() {
@@ -535,6 +702,14 @@ fleet_lock_take() {
   if [ "$fleet_run_lock_state" = live ] && [ -n "${3:-}" ]; then
     fleet_run_lock_age=$(fleet_lock_age_seconds "$1" || printf '')
     if [ -n "$fleet_run_lock_age" ] && [ "$fleet_run_lock_age" -gt "$3" ]; then
+      if [ "$fleet_lock_live_by" = group ]; then
+        # Live only through its group: the recorded process is gone, so
+        # nothing left can be proved to be the run by pid, start time and
+        # command, and nothing is signalled on less.
+        printf 'roundhouse: the run holding %s (%s) has run %ss, past the %ss ceiling, but cannot be proved the recorded run; nothing was stopped or taken over — confirm it, stop that group, then fleet-unlock\n' \
+          "$1" "$(fleet_lock_holder_desc "$1")" "$fleet_run_lock_age" "$3" >&2
+        return 75
+      fi
       fleet_run_lock_stopped=$(jq -r '"pid \(.pid // "?") started \(.started_at // "at an unknown time")"' \
         "$1/meta.json" 2>/dev/null) || fleet_run_lock_stopped='an unreadable holder'
       printf 'roundhouse: the run holding %s (%s) has run %ss, past the %ss ceiling; stopping it\n' \
@@ -606,8 +781,8 @@ fleet_lock_take() {
   fi
   if [ "$fleet_run_lock_age" -gt "$fleet_run_lock_stale" ]; then
     if [ "$fleet_run_lock_state" = live ]; then
-      printf 'roundhouse: a live run (pid %s) has held the run lock at %s for %ss, past the %ss threshold; it may be hung — confirm, stop it, then remove the lock\n' \
-        "$(fleet_lock_meta_field "$1" pid)" "$1" "$fleet_run_lock_age" \
+      printf 'roundhouse: a live run (%s) has held the run lock at %s for %ss, past the %ss threshold; it may be hung — confirm, stop it, then remove the lock\n' \
+        "$(fleet_lock_holder_desc "$1")" "$1" "$fleet_run_lock_age" \
         "$fleet_run_lock_stale" >&2
     else
       printf 'roundhouse: a run lock at %s is %ss old; confirm no live runner on this host, then remove it\n' \
@@ -654,9 +829,17 @@ fleet_lock_stop_holder() {
   # rounds, each re-looking first, until a fresh look finds nothing of the
   # run still running; then, and only then, success. Never this process or
   # its parent.
+  #
+  # THE RECORDED GROUP. A holder that leads its own group (the meta's pgid is
+  # its pid, and `ps` agrees right now: fleet_lock_lead_group) also has that
+  # group signalled as one each round, which closes the gap between a look and
+  # a signal, and success needs it EMPTY. Only that group, and never this
+  # process's own or its parent's: a group the run does not lead is never
+  # signalled as one.
   [ -n "${2:-}" ] || return 1
   fleet_lock_holder_state "$1"
-  [ "$fleet_lock_state" = live ] && [ "$fleet_lock_judged_id" = "$2" ] || return 1
+  [ "$fleet_lock_state" = live ] && [ "$fleet_lock_live_by" = holder ] &&
+    [ "$fleet_lock_judged_id" = "$2" ] || return 1
   stop_meta=$(jq -c 'select(type == "object")' "$1/meta.json" 2>/dev/null) || return 1
   [ -n "$stop_meta" ] || return 1
   stop_field() { printf '%s\n' "$stop_meta" | jq -r --arg f "$1" '.[$f] // empty | tostring'; }
@@ -671,6 +854,13 @@ fleet_lock_stop_holder() {
   [ -n "$stop_start" ] && [ -n "$stop_command" ] || return 1
   [ "$(fleet_lock_proc_start "$stop_pid")" = "$stop_start" ] || return 1
   [ "$(fleet_lock_proc_command "$stop_pid")" = "$stop_command" ] || return 1
+  stop_group=
+  if [ "$(stop_field pgid)" = "$stop_pid" ] &&
+    [ "$(fleet_lock_proc_pgid "$stop_pid")" = "$stop_pid" ] &&
+    [ "$stop_pid" != "$(fleet_lock_proc_pgid "$$")" ] &&
+    [ "$stop_pid" != "$(fleet_lock_proc_pgid "${PPID:-0}")" ]; then
+    stop_group=$stop_pid
+  fi
   stop_set="$stop_pid $stop_start"
   for stop_sig in TERM KILL KILL KILL; do
     # A look that fails stops everything: nothing is signalled on a set that
@@ -679,6 +869,12 @@ fleet_lock_stop_holder() {
     stop_set=$stop_next
     stop_live=$(fleet_lock_stop_alive "$stop_set")
     [ -n "$stop_live" ] || break
+    # The look above already holds every member of the run's group (it leads
+    # it); the group signal also reaches one that joined since. Only while
+    # the group still has a process in it: until then its id is the run's.
+    if [ -n "$stop_group" ] && [ "$(fleet_lock_group_state "$stop_group")" = live ]; then
+      kill "-$stop_sig" -- "-$stop_group" 2>/dev/null || :
+    fi
     # shellcheck disable=SC2086 # one pid per word
     kill "-$stop_sig" $stop_live 2>/dev/null || :
     stop_wait=0
@@ -687,10 +883,12 @@ fleet_lock_stop_holder() {
       stop_wait=$((stop_wait + 1))
     done
   done
-  # Success is a FRESH look finding nothing: anything started since the last
-  # signal is in the set before this is judged.
+  # Success is a FRESH look finding nothing — anything started since the last
+  # signal is in the set before this is judged — and the run's own group
+  # confirmed empty.
   stop_next=$(fleet_lock_stop_snapshot "$stop_set") || return 1
-  [ -z "$(fleet_lock_stop_alive "$stop_next")" ]
+  [ -z "$(fleet_lock_stop_alive "$stop_next")" ] || return 1
+  [ -z "$stop_group" ] || [ "$(fleet_lock_group_state "$stop_group")" = empty ]
 }
 
 fleet_lock_stop_snapshot() {

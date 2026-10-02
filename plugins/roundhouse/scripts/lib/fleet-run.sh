@@ -4944,8 +4944,8 @@ fleet_unlock_command() (
   if [ "$unlock_force" != true ]; then
     fleet_lock_holder_state "$unlock"
     [ "$fleet_lock_state" != live ] || {
-      printf 'roundhouse: a live run (pid %s) holds %s; refusing to release it (use --force to override)\n' \
-        "$(fleet_lock_meta_field "$unlock" pid)" "$unlock" >&2
+      printf 'roundhouse: a live run (%s) holds %s; refusing to release it (use --force to override)\n' \
+        "$(fleet_lock_holder_desc "$unlock")" "$unlock" >&2
       exit 75
     }
   fi

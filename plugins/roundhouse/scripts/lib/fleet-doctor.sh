@@ -1603,12 +1603,15 @@ fleet_doctor_command() (
     elif [ -z "$doctor_age" ]; then
       fleet_doctor_row finding run-lock \
         "$doctor_lock has no readable meta.json, so its age is unknown; confirm no live runner, then remove it"
+    elif [ "$doctor_age" -gt "$doctor_ceiling" ] && [ "$fleet_lock_live_by" = group ]; then
+      fleet_doctor_row finding run-lock \
+        "$doctor_lock has been held by a live run ($(fleet_lock_holder_desc "$doctor_lock")) for ${doctor_age}s, past the ${doctor_ceiling}s pass ceiling; the next run cannot prove it is the recorded run and refuses — stop that group, then fleet-unlock"
     elif [ "$doctor_age" -gt "$doctor_ceiling" ] && [ "$fleet_lock_state" = live ]; then
       fleet_doctor_row finding run-lock \
-        "$doctor_lock has been held by a live run (pid $(fleet_lock_meta_field "$doctor_lock" pid)) for ${doctor_age}s, past the ${doctor_ceiling}s pass ceiling; the next run stops it and takes the lock over"
+        "$doctor_lock has been held by a live run ($(fleet_lock_holder_desc "$doctor_lock")) for ${doctor_age}s, past the ${doctor_ceiling}s pass ceiling; the next run stops it and takes the lock over"
     elif [ "$doctor_age" -gt "$doctor_stale" ] && [ "$fleet_lock_state" = live ]; then
       fleet_doctor_row finding run-lock \
-        "$doctor_lock has been held by a live run (pid $(fleet_lock_meta_field "$doctor_lock" pid)) for ${doctor_age}s, past the ${doctor_stale}s threshold; it may be hung"
+        "$doctor_lock has been held by a live run ($(fleet_lock_holder_desc "$doctor_lock")) for ${doctor_age}s, past the ${doctor_stale}s threshold; it may be hung"
     elif [ "$doctor_age" -gt "$doctor_stale" ]; then
       fleet_doctor_row finding run-lock \
         "$doctor_lock is ${doctor_age}s old, past the ${doctor_stale}s threshold; confirm no live runner, then remove it"
@@ -1616,7 +1619,7 @@ fleet_doctor_command() (
       fleet_doctor_row ok run-lock "taken by hand ${doctor_age}s ago, under the ${doctor_stale}s threshold; release it with fleet-unlock"
     else
       if [ "$fleet_lock_state" = live ]; then
-        fleet_doctor_row ok run-lock "held for ${doctor_age}s by a live holder, under the ${doctor_ceiling}s pass ceiling"
+        fleet_doctor_row ok run-lock "held for ${doctor_age}s by a live run ($(fleet_lock_holder_desc "$doctor_lock")), under the ${doctor_ceiling}s pass ceiling"
       else
         fleet_doctor_row ok run-lock "held for ${doctor_age}s by a ${fleet_lock_state} holder, under the ${doctor_stale}s threshold"
       fi
