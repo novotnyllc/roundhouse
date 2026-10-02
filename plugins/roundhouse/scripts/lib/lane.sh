@@ -15,19 +15,30 @@ lane_windows_script='C:\ProgramData\Roundhouse-Lane\privilege-lane-windows.ps1'
 lane_windows_relative=ProgramData/Roundhouse-Lane/privilege-lane-windows.ps1
 
 lane_actions_for_platform() {
+  # The actions a sealed lane plan may carry. The helpers also implement
+  # `macos.install-signed-pkg.v1` and `lane.self-upgrade.v1`, but both need
+  # a payload digest the sealed format does not bind yet, so the controller
+  # does not advertise them (docs/specs/…hands-off-privilege-lane.md,
+  # "Deferred").
   case $1 in
     linux | wsl) printf '%s\n' apt.update-metadata.v1 apt.upgrade-package.v1 \
-      apt.install-package-version.v1 apt.autoremove.v1 lane.probe.v1 lane.self-upgrade.v1 ;;
-    macos) printf '%s\n' macos.install-signed-pkg.v1 lane.probe.v1 lane.self-upgrade.v1 ;;
+      apt.install-package-version.v1 apt.autoremove.v1 lane.probe.v1 ;;
+    macos) printf '%s\n' lane.probe.v1 ;;
     windows) printf '%s\n' winget.inventory-machine.v1 winget.install-machine-package.v1 \
-      winget.upgrade-machine-package.v1 lane.probe.v1 lane.self-upgrade.v1 ;;
+      winget.upgrade-machine-package.v1 lane.probe.v1 ;;
     *) return 1 ;;
   esac
 }
 
+# lane_host_local=true makes every lane function treat TARGET as this host's
+# own helper, without consulting config.json: the scheduled run on a host
+# seals, verifies and applies against itself. Set only by the host-local path.
+lane_host_local=false
+
 # lane_route TARGET -> legacy | local | disabled | unsupported. The legacy
 # CA/SFTP lane is selected only by an explicit `automation_transport`.
 lane_route() {
+  if [ "$lane_host_local" = true ]; then printf 'local\n'; return; fi
   jq -r --arg target "$1" '
     .machines[$target] as $m |
     if $m == null then "unsupported"
@@ -40,6 +51,7 @@ lane_route() {
 # lane_transport TARGET -> "local" | "ssh ALIAS" | "interop ALIAS" |
 # "unavailable REASON". Windows is reachable only through its WSL sibling.
 lane_transport() {
+  if [ "$lane_host_local" = true ]; then printf 'local\n'; return; fi
   lane_platform=$(jq -r --arg target "$1" '.machines[$target].platform // empty' "$(config_path)")
   lane_kind=$(jq -r --arg target "$1" '.machines[$target].transport // empty' "$(config_path)")
   case $lane_platform:$lane_kind in
@@ -155,11 +167,13 @@ lane_status_command() (
   target=$1
   output=$2
   require_jq
-  validate_config_file
+  [ "$lane_host_local" = true ] || validate_config_file
   route=$(lane_route "$target")
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-lane-status.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-  platform=$(jq -r --arg t "$target" '.machines[$t].platform // "-"' "$(config_path)")
+  if [ "$lane_host_local" = true ]; then platform=-
+  else platform=$(jq -r --arg t "$target" '.machines[$t].platform // "-"' "$(config_path)")
+  fi
   state=$route
   detail=-
   raw=$tmp/status
@@ -170,6 +184,7 @@ lane_status_command() (
       lane_status_raw "$target" "$raw" || rc=$?
       state=$(lane_field "$raw" state)
       detail=$(lane_field "$raw" detail)
+      [ "$platform" != - ] || platform=$(lane_field "$raw" platform)
       if [ "$(lane_field "$raw" interop-token)" = elevated ]; then
         # Requests written under an elevated token are owned by
         # Administrators, not the user, and the SYSTEM side refuses them;
@@ -185,7 +200,7 @@ lane_status_command() (
   esac
   next=-
   case $state in
-    needs_one_time_approval | drifted) next="roundhouse privilege-enroll $target" ;;
+    needs_one_time_approval | drifted | canary_pending) next="roundhouse privilege-enroll $target" ;;
   esac
   jq -S -n --arg target "$target" --arg platform "$platform" --arg route "$route" \
     --arg transport "$(lane_transport "$target")" --arg state "$state" --arg detail "$detail" \
@@ -411,6 +426,57 @@ lane_lookup() {
   return "$lookup_rc"
 }
 
+# lane_candidate TARGET MANAGER PACKAGE SOURCE -> "INSTALLED CANDIDATE" as the
+# host's owner-side view reports it (`-` for unknown), through the lane helper.
+lane_candidate() {
+  lane_cand_tr=$(lane_transport "$1")
+  case $lane_cand_tr in
+    unavailable\ *) return 75 ;;
+    interop\ *) lane_cand_script=$(lane_windows_script_text -Candidate -Package "$3" -Source "$4") ;;
+    *) lane_cand_script="$(lane_posix_helper_script "$lane_cand_tr"); exec \"\$lane_helper\" candidate $(lane_quote "$3")" ;;
+  esac
+  lane_cand_out=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lane-candidate.XXXXXX")
+  lane_remote_sh "$lane_cand_tr" "$lane_cand_script" </dev/null >"$lane_cand_out" 2>/dev/null || :
+  if ! lane_record_valid "$lane_cand_out" lane-candidate || [ "$(lane_field "$lane_cand_out" package)" != "$3" ]; then
+    rm -f "$lane_cand_out"
+    return 70
+  fi
+  printf '%s %s\n' "$(lane_field "$lane_cand_out" installed)" "$(lane_field "$lane_cand_out" candidate)"
+  rm -f "$lane_cand_out"
+}
+# lane_fresh_snapshot TARGET PLAN-OR-DRAFT OUTPUT: the target's lane readiness
+# record plus a fresh package record for every upgrade the plan names — the
+# exact inputs the precondition digest is computed over, observed now.
+lane_fresh_snapshot() {
+  lane_fs_target=$1
+  lane_fs_plan=$2
+  lane_fs_out=$3
+  lane_readiness_snapshot "$lane_fs_target" "$lane_fs_out" >/dev/null 2>&1 || return 70
+  lane_fs_id=$(jq -r '.snapshot_id' "$lane_fs_out")
+  lane_fs_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  while IFS=$'\t' read -r lane_fs_action lane_fs_package lane_fs_source; do
+    [ -n "$lane_fs_action" ] || continue
+    case $lane_fs_action in
+      apt.upgrade-package.v1) lane_fs_manager=apt ;;
+      winget.upgrade-machine-package.v1) lane_fs_manager=winget ;;
+      *) continue ;;
+    esac
+    lane_fs_versions=$(lane_candidate "$lane_fs_target" "$lane_fs_manager" "$lane_fs_package" "$lane_fs_source") || continue
+    jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" --arg s "$lane_fs_id" \
+      --arg host "$lane_fs_target" --arg at "$lane_fs_at" --arg manager "$lane_fs_manager" \
+      --arg name "$lane_fs_package" --arg installed "${lane_fs_versions%% *}" --arg candidate "${lane_fs_versions##* }" '
+      {schema:$schema,schema_version:$schema_version,snapshot_id:$s,host_id:$host,kind:"package",
+       id:($manager + ":" + $name),observed_at:$at,status:"present",confidence:"high",
+       data:{manager:$manager,name:$name,installed_version:(if $installed == "-" then null else $installed end),
+         candidate_version:(if $candidate == "-" then null else $candidate end),
+         update_available:($candidate != "-" and $candidate != $installed)},
+       evidence:[{source:"privilege-lane",method:"candidate"}],errors:[]}' >>"$lane_fs_out"
+  done <<EOF
+$(jq -r '.operations[] | [.id, .package, .source] | @tsv' "$lane_fs_plan")
+EOF
+  validate_file "$lane_fs_out"
+}
+
 # --- sealed lane plans (schema 5) ---------------------------------------------
 plan_is_lane() {
   # plan_is_lane FILE: a sealed lane plan (schema 5) or a lane draft. The one
@@ -485,7 +551,8 @@ seal_lane_plan() {
   validate_file "$snapshot"
   target=$(jq -r '.target' "$draft")
   [ "$(lane_route "$target")" = local ] || { printf 'roundhouse: %s is not on the local privilege lane\n' "$target" >&2; exit 69; }
-  platform=$(jq -r --arg t "$target" '.machines[$t].platform' "$(config_path)")
+  # The platform the snapshot's readiness record observed, not a config guess.
+  platform=$(jq -r --arg t "$target" 'select(.host_id == $t and .kind == "privilege_broker" and .id == "readiness") | .data.platform' "$snapshot" | head -n 1)
   while IFS= read -r action; do
     lane_actions_for_platform "$platform" | grep -Fqx "$action" || {
       printf 'roundhouse: %s is not a lane action on %s\n' "$action" "$platform" >&2
@@ -574,9 +641,11 @@ apply_lane_plan() {
   target=$(jq -r '.target' "$plan")
   work=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-lane-apply.XXXXXX")
   trap 'rm -rf "$work"' EXIT HUP INT TERM
-  lane_readiness_snapshot "$target" "$work/fresh.jsonl" >/dev/null 2>&1 || :
-  [ -s "$work/fresh.jsonl" ] && [ "$(lane_readiness_digest "$plan" "$work/fresh.jsonl")" = "$(jq -r '.precondition.readiness_value' "$plan")" ] || {
-    printf 'roundhouse: lane readiness drifted since sealing; run verify-privilege-plan with a fresh snapshot\n' >&2
+  # The whole sealed precondition — readiness AND every package the plan
+  # depends on — observed again now, never a readiness-only shortcut.
+  lane_fresh_snapshot "$target" "$plan" "$work/fresh.jsonl" >/dev/null 2>&1 || :
+  [ -s "$work/fresh.jsonl" ] && [ "$(lane_plan_precondition "$plan" "$work/fresh.jsonl")" = "$(jq -r '.precondition.value' "$plan")" ] || {
+    printf 'roundhouse: lane preconditions drifted since sealing (readiness or package versions); re-inventory and seal again\n' >&2
     exit 65
   }
   snapshot_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
@@ -649,13 +718,29 @@ lane_local_state() {
   lane_local_value=$(printf '%s\n' "$lane_local_raw" | awk -F '|' '$1 == "state" { print $2; exit }')
   printf '%s\n' "${lane_local_value:-unreachable}"
 }
-lane_local_request() {
-  # lane_local_request ACTION PACKAGE VERSION [SOURCE] -> the result reason on
-  # stdout; status 0 only when the host reports completed.
-  lane_local_out=$("$script_dir/privilege-lane-posix" request "$1" "${2:--}" "${3:--}" "${4:--}" - \
-    --plan-id fleet-run 2>/dev/null) || lane_local_status=$?
-  printf '%s\n' "$lane_local_out" | awk -F '|' '$1 == "reason" { print $2; exit }'
-  printf '%s\n' "$lane_local_out" | grep -Fqx 'state|completed'
+lane_host_apply() {
+  # lane_host_apply HOST OPERATIONS-JSON — the scheduled run's only way to
+  # reach its own lane: a sealed plan, verified and applied with the same
+  # precondition rechecks the controller path uses. OPERATIONS-JSON is the
+  # draft's operations array. Status 0 only when every operation completed;
+  # the apply records are discarded (the lane's own journal is the record).
+  (
+    lane_host_local=true
+    lane_ha_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-lane-host.XXXXXX")
+    trap 'rm -rf "$lane_ha_tmp"' EXIT HUP INT TERM
+    jq -cn --arg host "$1" --argjson ops "$2" '{domain:"updates",target:$host,lane:"local",operations:$ops}' \
+      >"$lane_ha_tmp/draft.json"
+    lane_fresh_snapshot "$1" "$lane_ha_tmp/draft.json" "$lane_ha_tmp/snapshot.jsonl" >/dev/null 2>&1 || exit 70
+    ( seal_lane_plan "$lane_ha_tmp/draft.json" "$lane_ha_tmp/snapshot.jsonl" "$lane_ha_tmp/plan.json" ) >/dev/null 2>&1 || exit 65
+    chmod 600 "$lane_ha_tmp/plan.json"
+    ( verify_lane_plan "$lane_ha_tmp/plan.json" "$lane_ha_tmp/snapshot.jsonl" ) >/dev/null 2>&1 || exit 65
+    ( apply_lane_plan "$lane_ha_tmp/plan.json" "$(jq -r '.plan_id' "$lane_ha_tmp/plan.json")" "$lane_ha_tmp/apply.jsonl" ) >/dev/null 2>&1
+  )
+}
+lane_operation_json() {
+  # lane_operation_json ACTION PACKAGE VERSION SOURCE -> one draft operation.
+  jq -cn --arg id "$1" --arg package "${2:--}" --arg version "${3:--}" --arg source "${4:--}" \
+    '{type:"semantic-action",kind:"privileged_action",id:$id,package:$package,version:$version,source:$source}'
 }
 lane_package_hold_detail() {
   # lane_package_hold_detail ITEM HOST -> the alert text for a held package:
@@ -688,9 +773,9 @@ fleet_readiness_lane_row() {
   rm -f "$lane_row_tmp"
   case $lane_row_state in
     ready) fleet_readiness_row "$1" privilege-lane ok "enrolled, lane $lane_row_version" ;;
-    needs_one_time_approval)
+    needs_one_time_approval | canary_pending)
       printf 'PENDING  %-24s %-18s %s\n' "$1" privilege-lane \
-        "needs_one_time_approval: run \`roundhouse privilege-enroll $1\` once" ;;
+        "$lane_row_state: run \`roundhouse privilege-enroll $1\` once" ;;
     user_session_unavailable | unreachable)
       # Neither is a finding: ordinary work proceeds without the lane, and an
       # unreachable probe (no roundhouse on the remote PATH yet, a sleeping
@@ -743,8 +828,11 @@ lane_fleet_run_apt() {
     fi
     return 0
   fi
+  # Metadata refresh once per pass, then the upgrade: each a sealed plan
+  # against this host, verified and applied with the full precondition
+  # recheck — never an ad-hoc request.
   if [ "${lane_fleet_apt_refreshed:-false}" != true ]; then
-    lane_local_request apt.update-metadata.v1 >/dev/null 2>&1 </dev/null ||
+    lane_host_apply "$lane_fra_host" "[$(lane_operation_json apt.update-metadata.v1)]" </dev/null ||
       printf 'roundhouse: lane apt metadata refresh did not complete\n' >&2
     lane_fleet_apt_refreshed=true
   fi
@@ -752,9 +840,8 @@ lane_fleet_run_apt() {
   lane_fra_installed=${lane_fra_policy%% *}
   lane_fra_candidate=${lane_fra_policy##* }
   [ "$lane_fra_installed" != '(none)' ] && [ "$lane_fra_installed" != "$lane_fra_candidate" ] || return 0
-  lane_fra_reason=$(lane_local_request apt.upgrade-package.v1 "$lane_fra_name" "$lane_fra_candidate" </dev/null) ||
-    printf 'roundhouse: lane apt upgrade of %s to %s did not complete: %s\n' \
-      "$lane_fra_name" "$lane_fra_candidate" "${lane_fra_reason:-no result}" >&2
+  lane_host_apply "$lane_fra_host" "[$(lane_operation_json apt.upgrade-package.v1 "$lane_fra_name" "$lane_fra_candidate")]" </dev/null ||
+    printf 'roundhouse: lane apt upgrade of %s to %s did not complete\n' "$lane_fra_name" "$lane_fra_candidate" >&2
 }
 lane_apt_candidate() {
   # lane_apt_candidate PACKAGE -> "INSTALLED CANDIDATE" as apt-cache sees it,

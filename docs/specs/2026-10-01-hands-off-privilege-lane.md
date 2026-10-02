@@ -352,6 +352,22 @@ canary passes rolls the installed pieces back (POSIX: an EXIT trap; Windows:
 
 ## Deferred (not in v1)
 
+- The sealed lane plan does not bind a payload digest yet, so the
+  controller does not advertise `macos.install-signed-pkg.v1` or
+  `lane.self-upgrade.v1`: both are implemented and fixture-tested on the
+  host side (`privilege-lane-posix request … --payload`), but a plan naming
+  them is refused at sealing until the format carries the digest and stages
+  the bytes.
+- Windows enrollment activates in two halves: the elevated child installs
+  with `activation|pending`, status reports `canary_pending`, the dispatcher
+  executes nothing but `lane.probe.v1`, and the owner's own probe (submitted
+  by the unelevated launcher) flips the identity to `passed`. A failed probe
+  therefore leaves nothing enabled; re-running `privilege-enroll` retries.
+- The scheduled run reaches its own lane only through a sealed plan
+  (`lane_host_apply`): the same seal → verify → apply path as the
+  controller, with the full precondition (readiness and package versions)
+  observed again immediately before submission.
+
 - Homebrew cask root steps on macOS through the bridge hook.
 - fleet-run convergence of a native Windows sibling's winget packages: the
   scheduled run converges only the host it runs on; Windows machine-scope

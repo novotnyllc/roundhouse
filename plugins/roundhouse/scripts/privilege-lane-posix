@@ -535,7 +535,8 @@ enroll_command() {
   [ -f "$journal_path" ] || : >"$journal_path"
   chmod 600 "$journal_path"
   install_grant
-  if ! enrollment_canary; then canary_rc=$?; fi
+  # `if cmd; then … else rc=$?` — never `if ! cmd`, whose $? is the negation.
+  if enrollment_canary; then canary_rc=0; else canary_rc=$?; fi
   if [ "$canary_rc" -ne 0 ]; then
     rollback_enrollment
     trap - EXIT
@@ -573,6 +574,15 @@ run_as_owner() {
 canary_reason=
 canary_summary=
 canary_isolation=
+canary_wait() {
+  # The probe's wait, shortened only inside a fixture root so the self-test
+  # can prove a failed canary rolls the enrollment back without idling.
+  if fixture_mode && [[ ${ROUNDHOUSE_LANE_FIXTURE_CANARY_WAIT:-} =~ ^[1-9][0-9]{0,2}$ ]]; then
+    printf '%s\n' "$ROUNDHOUSE_LANE_FIXTURE_CANARY_WAIT"
+  else
+    printf '30\n'
+  fi
+}
 enrollment_canary() {
   local probe out rc=0
   canary_reason=
@@ -599,7 +609,7 @@ enrollment_canary() {
   fi
   # 3. A probe request completes end to end through the owner's path.
   rc=0
-  probe=$(run_as_owner "$installed_script" request lane.probe.v1 --wait 30 2>&1) || rc=$?
+  probe=$(run_as_owner "$installed_script" request lane.probe.v1 --wait "$(canary_wait)" 2>&1) || rc=$?
   [ "$rc" -eq 0 ] && printf '%s\n' "$probe" | grep -Fqx 'state|completed' || {
     canary_reason=probe_request_failed; return 1; }
   canary_summary="dispatch-grant,negative-argument:$canary_isolation,probe-completed"
@@ -1097,6 +1107,21 @@ request_command() {
     *) return 70 ;;
   esac
 }
+candidate_command() {
+  # candidate_command PACKAGE: the owner-side view of what apt would do,
+  # `lane-candidate|1` with installed and candidate versions (`-` when
+  # unknown). This is what the controller seals a precondition against and
+  # rechecks right before it submits; the root side checks the same thing
+  # again against its own apt-cache.
+  local apt_cache output installed candidate
+  valid_apt_package "$1" || die 64 'candidate: PACKAGE must be an apt package name'
+  apt_cache=$(native_binary apt-cache) || die 69 'candidate: apt-cache is unavailable'
+  output=$("$apt_cache" policy "$1" 2>/dev/null </dev/null) || output=
+  installed=$(printf '%s\n' "$output" | awk '$1 == "Installed:" { print $2; exit }')
+  candidate=$(printf '%s\n' "$output" | awk '$1 == "Candidate:" { print $2; exit }')
+  [ "$installed" != '(none)' ] || installed=
+  record 'lane-candidate|1' "package|$1" "installed|${installed:--}" "candidate|${candidate:--}" 'end-candidate|'
+}
 result_command() {
   # result_command REQUEST-ID: the published result for one request, owner
   # readable, never a resubmission.
@@ -1144,6 +1169,18 @@ self_test() {
   # Before enrollment: status says exactly one approval is needed.
   rc=0; out=$("$lane" status) || rc=$?
   [ "$rc" -eq 75 ] && printf '%s\n' "$out" | grep -Fqx 'state|needs_one_time_approval' || self_fail 'pre-enrollment status'
+  # A failed canary (here: a live dispatch lock the probe cannot take) must
+  # roll the whole enrollment back — no grant, no root copy, no identity —
+  # and report the failure with its own exit status.
+  mkdir -p "$root/fixture$lane_state/lock" && printf '%s\n' "$$" >"$root/fixture$lane_state/lock/pid" || self_fail 'lock fixture'
+  rc=0; out=$(ROUNDHOUSE_LANE_FIXTURE_CANARY_WAIT=2 "$lane" enroll --host-id test-host --owner "$(id -un)" --plugin-root "$plugin_root" 2>/dev/null) || rc=$?
+  [ "$rc" -eq 74 ] && printf '%s\n' "$out" | grep -Fqx 'state|failed' && printf '%s\n' "$out" | grep -Eqx 'reason\|(positive_dispatch_failed|probe_request_failed)' ||
+    self_fail "failed canary did not report failure (rc $rc): $out"
+  [ ! -e "$root/fixture$lane_sudoers" ] && [ ! -e "$root/fixture$lane_libexec/$lane_name" ] && [ ! -e "$root/fixture$lane_libexec/lane.identity" ] ||
+    self_fail 'failed canary left the grant, script or identity installed'
+  rc=0; out=$("$lane" status) || rc=$?
+  [ "$rc" -eq 75 ] || self_fail 'status after a failed canary is not needs_one_time_approval'
+  rm -rf "$root/fixture$lane_state/lock"
   # Enrollment (fixture root, current user as the privileged side).
   rc=0; out=$("$lane" enroll --host-id test-host --owner "$(id -un)" --plugin-root "$plugin_root") || rc=$?
   [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -Fqx 'state|enrolled' || self_fail "enrollment: $out"
@@ -1161,6 +1198,10 @@ self_test() {
   [ "$rc" -eq 64 ] || self_fail 'foreign-platform action accepted'
   rc=0; "$installed" request apt.update-metadata.v1 curl >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 64 ] || self_fail 'surplus parameter accepted'
+  rc=0; out=$("$installed" candidate curl) || rc=$?
+  [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -Fqx 'installed|8.1.0-1' && printf '%s\n' "$out" | grep -Fqx 'candidate|8.2.0-1' || self_fail "candidate record: $out"
+  rc=0; out=$("$installed" candidate nonexistent) || rc=$?
+  [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -Fqx 'candidate|-' || self_fail "unknown candidate record: $out"
   # apt actions through the stubs.
   rc=0; out=$("$installed" request apt.update-metadata.v1 --plan-id plan-0123456789abcdef \
     --plan-sha256 "$(sha256_text plan)" --operation-index 3) || rc=$?
@@ -1377,10 +1418,11 @@ case $command in
   dispatch) [ "$#" -eq 0 ] || die 64 'dispatch takes no arguments'; dispatch_command ;;
   request) request_command "$@" ;;
   result) [ "$#" -eq 1 ] || die 64 'result takes exactly one REQUEST-ID'; result_command "$1" ;;
+  candidate) [ "$#" -eq 1 ] || die 64 'candidate takes exactly one PACKAGE'; candidate_command "$1" ;;
   actions) [ "$#" -eq 1 ] || die 64 'actions takes exactly one PLATFORM'; platform_actions "$1" || die 69 'unsupported platform' ;;
   self-test) [ "$#" -eq 0 ] || die 64 'self-test takes no arguments'; self_test ;;
   *)
-    printf 'usage: privilege-lane-posix status|enroll|revoke|dispatch|request|result|actions|self-test\n' >&2
+    printf 'usage: privilege-lane-posix status|enroll|revoke|dispatch|request|result|candidate|actions|self-test\n' >&2
     exit 64
     ;;
 esac

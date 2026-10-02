@@ -168,6 +168,30 @@ jq -r -s '.[1].data.result_record[]' "$lane_tmp/apply.jsonl" | grep -Fqx 'operat
 jq -r -s '.[1].data.result_record[]' "$lane_tmp/apply.jsonl" | grep -Fqx "plan-sha256|$(jq -r '.plan_digest.value' "$lane_tmp/plan.json")" ||
   fail 'the lane result is not bound to the plan digest'
 
+# Apply rechecks the whole sealed precondition right before submitting: a
+# candidate that moved after sealing is a refusal, never a stale submission.
+cat >"$lane_tmp/drift-draft.json" <<'JSON'
+{"domain":"updates","target":"test-apt","lane":"local","operations":[
+  {"type":"semantic-action","kind":"privileged_action","id":"apt.upgrade-package.v1","package":"curl","version":"8.2.0-1","source":"-"}]}
+JSON
+printf '8.1.0-1\n' >"$lane_tmp/state-curl"
+lane_env "$cli" privilege-status test-apt "$lane_tmp/drift-readiness.jsonl" >/dev/null 2>&1 || fail 'privilege-status for the drift plan'
+{
+  cat "$lane_tmp/drift-readiness.jsonl"
+  jq -cn --arg s "$(jq -r '.snapshot_id' "$lane_tmp/drift-readiness.jsonl")" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    {schema:"roundhouse.inventory",schema_version:1,snapshot_id:$s,host_id:"test-apt",kind:"package",id:"apt:curl",
+     observed_at:$at,status:"present",confidence:"high",
+     data:{manager:"apt",name:"curl",installed_version:"8.0.0-1",candidate_version:"8.2.0-1",update_available:true},
+     evidence:[],errors:[]}'
+} >"$lane_tmp/drift-snapshot.jsonl"
+lane_env "$cli" seal-plan "$lane_tmp/drift-draft.json" "$lane_tmp/drift-snapshot.jsonl" "$lane_tmp/drift-plan.json" >/dev/null || fail 'seal-plan for the drift plan'
+chmod 600 "$lane_tmp/drift-plan.json"
+: >"$lane_tmp/apt.log"
+lane_rc=0
+lane_env "$cli" submit-privilege-plan "$lane_tmp/drift-plan.json" "$(jq -r '.plan_id' "$lane_tmp/drift-plan.json")" "$lane_tmp/drift-apply.jsonl" >/dev/null 2>"$lane_tmp/drift.err" || lane_rc=$?
+[ "$lane_rc" -eq 65 ] && grep -q 'preconditions drifted' "$lane_tmp/drift.err" || fail "apply submitted despite a package drift (rc $lane_rc): $(cat "$lane_tmp/drift.err")"
+[ ! -s "$lane_tmp/apt.log" ] || fail 'a drifted plan reached apt-get'
+
 # Lookup reads the published result for an operation without resubmitting.
 : >"$lane_tmp/apt.log"
 lane_env "$cli" lookup-privilege-result "$lane_tmp/plan.json" 1 "$lane_tmp/lookup.result" >/dev/null ||
@@ -189,15 +213,27 @@ lane_env "$cli" lookup-privilege-result "$lane_tmp/unknown.json" 0 "$lane_tmp/un
 [ "$lane_rc" -eq 65 ] || fail "lookup of a tampered plan exited $lane_rc, expected 65"
 # The controller's catalog and the helpers' catalogs agree, per platform.
 for lane_platform in linux wsl macos; do
-  [ "$("$script_dir/privilege-lane-posix" actions "$lane_platform" | sort)" = \
-    "$(ROUNDHOUSE_LIB_ONLY=1 . "$cli"; lane_actions_for_platform "$lane_platform" | sort)" ] ||
-    fail "the $lane_platform action catalog differs between the controller and the POSIX helper"
+  while IFS= read -r lane_action; do
+    "$script_dir/privilege-lane-posix" actions "$lane_platform" | grep -Fqx "$lane_action" ||
+      fail "the controller advertises $lane_action on $lane_platform but the POSIX helper does not implement it"
+  done <<EOF
+$(ROUNDHOUSE_LIB_ONLY=1 . "$cli"; lane_actions_for_platform "$lane_platform")
+EOF
+done
+# Payload-backed actions are implemented by the helpers but not sealable yet.
+for lane_platform in linux macos windows; do
+  if (ROUNDHOUSE_LIB_ONLY=1 . "$cli"; lane_actions_for_platform "$lane_platform") | grep -Eq 'macos.install-signed-pkg|lane.self-upgrade'; then
+    fail "the controller advertises a payload-backed action the sealed format cannot carry"
+  fi
 done
 lane_windows_actions=$(sed -n 's/^\$script:Actions = \[string\[\]\]@(\(.*\)$/\1/p' "$script_dir/privilege-lane-windows.ps1" |
   tr -d '")' | tr ',' '\n' | sed 's/^ *//' | grep . ; sed -n '/^\$script:Actions = /,/)$/p' "$script_dir/privilege-lane-windows.ps1" | sed 1d | tr -d '")' | tr ',' '\n' | sed 's/^ *//' | grep .)
-[ "$(printf '%s\n' "$lane_windows_actions" | sort -u | tr '\n' ' ')" = \
-  "$(ROUNDHOUSE_LIB_ONLY=1 . "$cli"; lane_actions_for_platform windows | sort -u | tr '\n' ' ')" ] ||
-  fail "the windows action catalog differs between the controller and the Windows helper: $(printf '%s' "$lane_windows_actions" | tr '\n' ' ')"
+while IFS= read -r lane_action; do
+  printf '%s\n' "$lane_windows_actions" | grep -Fqx "$lane_action" ||
+    fail "the controller advertises $lane_action on windows but the Windows helper does not implement it"
+done <<EOF
+$(ROUNDHOUSE_LIB_ONLY=1 . "$cli"; lane_actions_for_platform windows)
+EOF
 
 # --- host-local routing used by fleet-run --------------------------------------
 # The fast pass installs apt packages through the lane; before enrollment
@@ -205,9 +241,30 @@ lane_windows_actions=$(sed -n 's/^\$script:Actions = \[string\[\]\]@(\(.*\)$/\1/
 (
   ROUNDHOUSE_LIB_ONLY=1 . "$cli"
   : >"$lane_tmp/apt.log"
+  fleet_host_name() { printf 'test-apt\n'; }
   lane_env fleet_install_package apt curl false 8.2.0-1 || fail "fleet_install_package apt through the lane failed"
   grep -Fqx 'apt-get -q -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-install-recommends install curl=8.2.0-1' "$lane_tmp/apt.log" ||
     fail "fleet_install_package did not route apt through the lane: $(cat "$lane_tmp/apt.log")"
+  # Every host-local mutation is a sealed plan: the lane's journal shows a
+  # sealed plan id, never the ad-hoc fleet-run token.
+  grep -q '|request|request-[0-9a-f]*|apt.install-package-version.v1|' "$lane_tmp/fixture/var/lib/roundhouse-lane/journal/events.log" ||
+    fail 'host-local install was not journaled'
+  lane_last_result=$(ls -t "$lane_tmp/fixture/var/lib/roundhouse-lane/results"/*.result | head -n 1)
+  grep -Eq '^plan-id\|plan-[0-9a-f]{16}$' "$lane_last_result" || fail "host-local install did not ride a sealed plan: $(grep '^plan-id' "$lane_last_result")"
+  grep -Eq '^plan-sha256\|[0-9a-f]{64}$' "$lane_last_result" || fail 'host-local install carried no plan digest'
+  # An unpinned install carries the `-` sentinel, never an empty version.
+  : >"$lane_tmp/apt.log"
+  lane_env fleet_install_package apt curl false || fail "unpinned fleet_install_package apt failed"
+  grep -Fqx 'apt-get -q -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-install-recommends install curl' "$lane_tmp/apt.log" ||
+    fail "unpinned install did not reach apt-get without a version: $(cat "$lane_tmp/apt.log")"
+  # The full-pass apt arm: metadata refresh and upgrade, both sealed.
+  : >"$lane_tmp/apt.log"
+  printf '8.1.0-1\n' >"$lane_tmp/state-curl"
+  lane_env lane_fleet_run_apt "$tmp/store" test-apt curl curl "" >/dev/null 2>&1 || :
+  grep -Fqx 'apt-get -q update' "$lane_tmp/apt.log" || fail "full-pass apt refresh did not run through the lane: $(cat "$lane_tmp/apt.log")"
+  grep -q 'only-upgrade install curl=8.2.0-1' "$lane_tmp/apt.log" || fail "full-pass apt upgrade did not run through the lane: $(cat "$lane_tmp/apt.log")"
+  [ "$(grep -c '|apt.update-metadata.v1|' "$lane_tmp/fixture/var/lib/roundhouse-lane/journal/events.log")" -ge 1 ] || fail 'refresh not journaled'
+  lane_fleet_apt_refreshed=; lane_fleet_apt_alerted=
   lane_env lane_package_hold_detail packages.curl test-apt | grep -q 'no package manager on this host can provide' ||
     fail 'an enrolled lane still blamed the package manager'
   lane_env fleet_doctor_lane_row | grep -Eq '^ok       privilege-lane +enrolled, lane [0-9.]+ [0-9a-f]{12}$' ||
@@ -248,6 +305,7 @@ printf '%s\n' "$*" >>"${LANE_PWSH_LOG:?}"
 case "$*" in
   *-Status*) cat "${LANE_PWSH_STATUS:?}" ;;
   *-Request*) cat "${LANE_PWSH_RESULT:?}" ;;
+  *-Candidate*) printf '%s\n' 'lane-candidate|1' 'package|OpenJS.NodeJS' 'installed|26.0.0' "candidate|${LANE_PWSH_CANDIDATE:-26.1.0}" 'end-candidate|' ;;
   *-Enroll*) cat "${LANE_PWSH_ENROLL:?}" ;;
   *) exit 64 ;;
 esac
@@ -350,6 +408,9 @@ lane_rc=0
 ROUNDHOUSE_CONFIG="$lane_tmp/config-nosibling.json" "$cli" privilege-lane-status test-windows "$lane_tmp/win-status.json" >/dev/null 2>&1 || lane_rc=$?
 [ "$lane_rc" -eq 75 ] && jq -e '.state == "user_session_unavailable"' "$lane_tmp/win-status.json" >/dev/null ||
   fail "a Windows host without a WSL sibling did not report user_session_unavailable: $(cat "$lane_tmp/win-status.json")"
+ROUNDHOUSE_CONFIG="$lane_tmp/config-nosibling.json" "$cli" prepare-privilege-enrollment test-windows "$lane_tmp/win-prep.json" >/dev/null 2>&1 || :
+jq -e '.state == "user_session_unavailable" and .next_command == "-" and (.next_action | contains("user_session"))' "$lane_tmp/win-prep.json" >/dev/null ||
+  fail "prepare-privilege-enrollment rewrote user_session_unavailable: $(cat "$lane_tmp/win-prep.json")"
 
 # --- configuration -------------------------------------------------------------
 # A machine may opt out; a legacy route still wins; anything else is rejected.

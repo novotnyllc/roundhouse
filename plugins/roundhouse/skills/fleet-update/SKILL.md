@@ -423,9 +423,9 @@ environment, a shell, or an elevation control:
 | Platform | Actions |
 | --- | --- |
 | linux, wsl | `apt.update-metadata.v1`, `apt.upgrade-package.v1` (package, candidate version), `apt.install-package-version.v1`, `apt.autoremove.v1` |
-| macos | `macos.install-signed-pkg.v1` (package id, version, Developer ID Team ID, payload digest) |
+| macos | `lane.probe.v1` only in this version: `macos.install-signed-pkg.v1` exists on the host side but the sealed format does not bind its payload digest yet, so plans cannot name it |
 | windows | `winget.inventory-machine.v1`, `winget.install-machine-package.v1`, `winget.upgrade-machine-package.v1` (machine scope, `winget` or `msstore` source; this is also the only lane for a machine-scope Node.js `OpenJS.NodeJS` upgrade) |
-| all | `lane.probe.v1`, `lane.self-upgrade.v1` |
+| all | `lane.probe.v1` (`lane.self-upgrade.v1` is host-side only for the same reason) |
 
 User-scope winget packages, fnm/Node and profile configuration are not lane
 work: they run in the ordinary lane as the user (on Windows, through the WSL

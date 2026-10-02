@@ -1148,7 +1148,10 @@ fleet_install_package() {
     # hold as any other manager this host cannot drive.
     apt)
       [ "$(lane_local_state)" = ready ] || return 75
-      lane_local_request apt.install-package-version.v1 "$2" "${4:-}" >/dev/null 2>&1 </dev/null || return 1
+      # An absent pin is the protocol's `-`, and the install is a sealed plan
+      # against this host like every other lane mutation.
+      lane_host_apply "$(fleet_host_name)" \
+        "[$(lane_operation_json apt.install-package-version.v1 "$2" "${4:--}")]" </dev/null || return 1
       ;;
     npm)
       # Global scope, through the durable npm and its own node (lib/npm.sh).

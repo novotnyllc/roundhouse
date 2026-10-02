@@ -9,13 +9,16 @@ param(
     [Parameter(ParameterSetName = "Enroll")][string]$ReceiptPath = "",
     [Parameter(Mandatory = $true, ParameterSetName = "Revoke")][switch]$Revoke,
     [Parameter(Mandatory = $true, ParameterSetName = "Dispatch")][switch]$Dispatch,
+    [Parameter(Mandatory = $true, ParameterSetName = "Candidate")][switch]$Candidate,
     [Parameter(Mandatory = $true, ParameterSetName = "Lookup")][switch]$Lookup,
     [Parameter(Mandatory = $true, ParameterSetName = "Lookup")]
     [Parameter(ParameterSetName = "Request")][string]$RequestId = "",
     [Parameter(Mandatory = $true, ParameterSetName = "Request")][switch]$Request,
     [Parameter(Mandatory = $true, ParameterSetName = "Request")][string]$Action,
+    [Parameter(Mandatory = $true, ParameterSetName = "Candidate")]
     [Parameter(ParameterSetName = "Request")][string]$Package = "-",
     [Parameter(ParameterSetName = "Request")][string]$Version = "-",
+    [Parameter(ParameterSetName = "Candidate")]
     [Parameter(ParameterSetName = "Request")][string]$Source = "-",
     [Parameter(ParameterSetName = "Request")][string]$PayloadSha256 = "-",
     [Parameter(ParameterSetName = "Request")][string]$PlanId = "fleet-run",
@@ -124,7 +127,7 @@ $script:Actions = [string[]]@("winget.inventory-machine.v1", "winget.install-mac
 
 # --- identity -----------------------------------------------------------------
 $script:IdentityFields = [string[]]@("host-id", "platform", "owner-sid", "owner-name", "plugin-root",
-    "marketplace", "plugin", "lane-version", "lane-sha256", "enrolled-at")
+    "marketplace", "plugin", "lane-version", "lane-sha256", "enrolled-at", "activation")
 function Get-LanePaths {
     $Root = $script:LaneRoot
     return [pscustomobject]@{
@@ -155,6 +158,7 @@ function Read-Identity([string]$Path) {
         $Fields.'owner-name'.Length -lt 1 -or -not (Test-Token $Fields.marketplace) -or
         -not (Test-Token $Fields.plugin) -or -not (Test-PluginVersion $Fields.'lane-version') -or
         -not (Test-Digest $Fields.'lane-sha256') -or -not (Test-UInt $Fields.'enrolled-at') -or
+        $Fields.activation -cnotin @("pending", "passed") -or
         ($Fields.'plugin-root' -cne "-" -and -not $script:Fixture -and -not (Test-WindowsAbsolutePath $Fields.'plugin-root'))) {
         throw "invalid_identity"
     }
@@ -485,6 +489,13 @@ function Get-LaneState {
     if (-not $script:Fixture -and -not [IO.File]::Exists((Join-Path $Paths.Module "Microsoft.WinGet.Client.psd1"))) {
         $Result.Detail = "winget client module missing"; return [pscustomobject]$Result
     }
+    if ($Identity.activation -cne "passed") {
+        # Installed by the elevated child but not yet proven from the owner's
+        # own token: only a lane.probe.v1 is dispatched until it is, and the
+        # SYSTEM side flips this flag when that probe completes.
+        $Result.State = "canary_pending"; $Result.Detail = "the owner's enrollment probe has not completed"
+        return [pscustomobject]$Result
+    }
     $Result.State = "ready"
     return [pscustomobject]$Result
 }
@@ -546,17 +557,20 @@ function Install-Lane([string]$TargetHost, [string]$Sid, [string]$Root, [string]
     & $script:Native.InstallModule $Paths.ModuleLock $Paths.Module (Join-Path $Paths.Claims ".module-stage")
     $Identity = @{ "host-id" = $TargetHost; "platform" = "windows"; "owner-sid" = $Sid
         "owner-name" = (& $script:Native.CurrentName); "plugin-root" = $Root; "marketplace" = "novotnyllc"
-        "plugin" = "roundhouse"; "lane-version" = $Version; "lane-sha256" = $Sha; "enrolled-at" = [string](Get-UnixNow) }
+        "plugin" = "roundhouse"; "lane-version" = $Version; "lane-sha256" = $Sha; "enrolled-at" = [string](Get-UnixNow)
+        "activation" = "pending" }
     Write-ProtectedBytes $Paths.Identity (Render-Identity $Identity) ""
     [void](Read-Identity $Paths.Identity)
     if (-not [IO.File]::Exists($Paths.JournalLog)) { [IO.File]::WriteAllBytes($Paths.JournalLog, [byte[]]@()) }
     & $script:Native.RegisterTask (Get-LaneTaskXml $Paths.Script $Paths.Root) (Get-TaskSddl $Sid)
     $State = Get-LaneState
-    if ($State.State -cne "ready") { throw "enrollment_not_ready:$($State.Detail)" }
+    if ($State.State -cne "canary_pending") { throw "enrollment_not_ready:$($State.Detail)" }
     # The canary request is NOT submitted here: a file created under the
     # elevated token is owned by Administrators, which the dispatcher refuses.
-    # The unelevated launcher submits it after the receipt (Invoke-Enroll).
-    Write-Journal "enrollment" "-" "-" "-" "completed" "version=$Version" "-" "-"
+    # The unelevated launcher submits it after the receipt (Invoke-Enroll);
+    # until that probe completes the identity stays `activation|pending`,
+    # status is `canary_pending`, and nothing but a probe is dispatched.
+    Write-Journal "enrollment" "-" "-" "-" "staged" "version=$Version;activation=pending" "-" "-"
     return [pscustomobject]@{ Version = $Version; Sha256 = $Sha; PluginRoot = $Root }
 }
 function Remove-Lane {
@@ -597,8 +611,11 @@ function Invoke-Enroll {
                     # arriving through drvfs will.
                     $Probe = Submit-Request "lane.probe.v1" "-" "-" "-" "-" "enroll-canary" "-" "-" 120
                     if ($Probe.state -cne "completed") {
+                        # The installed pieces stay `activation|pending`: status
+                        # reports canary_pending, the dispatcher executes nothing
+                        # but a probe, and re-running privilege-enroll retries.
                         Write-Record @("lane-enrollment|1", "state|failed", "reason|enrollment_canary_failed:$($Probe.reason)",
-                            "platform|windows", "next-command|roundhouse privilege-enroll $HostId", "end-enrollment|")
+                            "platform|windows", "lane-state|canary_pending", "next-command|roundhouse privilege-enroll $HostId", "end-enrollment|")
                         return 74
                     }
                     $ReceiptText = $ReceiptText.Replace("canary|task-registered`n", "canary|task-registered,probe-completed`n")
@@ -722,6 +739,7 @@ function Invoke-DispatchOne([IO.FileInfo]$Entry, [object]$Identity, [string]$Lan
         elseif ($Fields.'host-id' -cne $Identity.'host-id') { $Reason = "host_id_mismatch" }
         elseif ($Fields.owner -cne $Identity.'owner-sid') { $Reason = "owner_mismatch" }
         elseif ($Fields.'action-id' -cnotin $script:Actions) { $Reason = "unknown_action_for_platform" }
+        elseif ($Identity.activation -cne "passed" -and $Fields.'action-id' -cne "lane.probe.v1") { $Reason = "lane_not_activated" }
         elseif (-not (Test-ActionParameters $Fields)) { $Reason = "invalid_action_parameters" }
         elseif ($Created -gt ($Now + $script:MaximumFutureSkew) -or ($Now - $Created) -gt $script:MaximumRequestAge -or
             $Expires -le $Now -or $Expires -le $Created -or ($Expires - $Created) -gt $script:MaximumRequestTtl) { $Reason = "stale_request" }
@@ -732,6 +750,16 @@ function Invoke-DispatchOne([IO.FileInfo]$Entry, [object]$Identity, [string]$Lan
         return Publish-Result $Values $Identity
     }
     $Outcome = Invoke-LaneAction $Parsed.Fields $Identity $Claim
+    if ($Outcome.state -ceq "completed" -and $Parsed.Fields.'action-id' -ceq "lane.probe.v1" -and $Identity.activation -cne "passed") {
+        # The owner's own request reached SYSTEM and came back: the lane is
+        # proven end to end from the token every real request will use.
+        $Activated = @{}
+        foreach ($Name in $script:IdentityFields) { $Activated[$Name] = $Identity[$Name] }
+        $Activated.activation = "passed"
+        Write-ProtectedBytes $Paths.Identity (Render-Identity $Activated) ""
+        $Identity.activation = "passed"
+        Write-Journal "activation" $Id "lane.probe.v1" "-" "completed" "owner_probe_passed" "-" "-"
+    }
     foreach ($Name in @("state", "reason", "native-exit", "pre-state-sha256", "post-state-sha256")) { $Values[$Name] = $Outcome[$Name] }
     $Values['finished-at'] = [string](Get-UnixNow)
     return Publish-Result $Values $Identity
@@ -879,7 +907,7 @@ function Submit-Request([string]$ActionId, [string]$PackageId, [string]$WantedVe
     [string]$Payload, [string]$Plan, [string]$PlanDigest, [string]$Index, [int]$WaitSeconds, [string]$FixedId = "") {
     $Paths = Get-LanePaths
     $State = Get-LaneState
-    if ($State.State -cne "ready") {
+    if ($State.State -cne "ready" -and -not ($State.State -ceq "canary_pending" -and $ActionId -ceq "lane.probe.v1")) {
         return [ordered]@{ state = "rejected"; reason = "lane_$($State.State)"; 'request-id' = "-" }
     }
     $Identity = $State.Identity
@@ -916,6 +944,26 @@ function Submit-Request([string]$ActionId, [string]$PackageId, [string]$WantedVe
     if ($Result.'request-id' -cne $Id) { throw "published_result_answers_a_different_request" }
     $Result['bytes'] = [IO.File]::ReadAllBytes($ResultPath)
     return $Result
+}
+function Invoke-Candidate {
+    # The owner-side view of a package's installed and available versions
+    # (`-` when unknown), from winget.exe under the user's own token. The
+    # controller seals its precondition against this and rechecks it right
+    # before submitting; the SYSTEM side checks availability again itself.
+    if (-not (Test-WinGetId $Package) -or $Source -cnotin @("winget", "msstore")) { throw "invalid_candidate_arguments" }
+    $Installed = "-"; $Available = "-"
+    try {
+        $Listed = & winget.exe list --id $Package --exact --source $Source --accept-source-agreements --disable-interactivity 2>$null
+        $Row = @($Listed | Where-Object { $_ -match ('(^|\s)' + [regex]::Escape($Package) + '\s') }) | Select-Object -Last 1
+        if ($null -ne $Row) {
+            $Columns = @([regex]::Split([string]$Row, '\s{2,}') | Where-Object { $_.Length -gt 0 })
+            if ($Columns.Count -ge 3 -and (Test-VersionToken $Columns[2])) { $Installed = $Columns[2] }
+            if ($Columns.Count -ge 4 -and (Test-VersionToken $Columns[3])) { $Available = $Columns[3] }
+        }
+    } catch { }
+    if ($Available -ceq "-") { $Available = $Installed }
+    Write-Record @("lane-candidate|1", "package|$Package", "installed|$Installed", "candidate|$Available", "end-candidate|")
+    return 0
 }
 function Invoke-Lookup {
     if (-not (Test-RequestId $RequestId)) { throw "invalid_request_id" }
@@ -1032,10 +1080,23 @@ function Invoke-SelfTest {
         Assert-SelfTest ((Get-LaneState).State -ceq "needs_one_time_approval") "pre-enrollment state"
         $Installed = Install-Lane "test-host" $World.Sid $PluginRoot $Self
         Assert-SelfTest ($Installed.Version -ceq $Version) "enrolled version"
+        $Paths = Get-LanePaths
+        Assert-SelfTest ((Get-LaneState).State -ceq "canary_pending") "installed but not yet activated"
+        # Nothing but a probe is dispatched while pending.
+        $Early = Submit-Request "winget.inventory-machine.v1" "-" "-" "-" "-" "early" "-" "-" 5
+        Assert-SelfTest ($Early.state -ceq "rejected" -and $Early.reason -ceq "lane_canary_pending") "non-probe refused while pending: $($Early.reason)"
+        # A failed owner canary (the file arrives with a foreign owner) leaves
+        # the lane pending, never ready, and journals nothing as complete.
+        $World.ForeignOwner = @("request")
+        $Failed = Submit-Request "lane.probe.v1" "-" "-" "-" "-" "enroll-canary" "-" "-" 5
+        $World.ForeignOwner = @()
+        Assert-SelfTest ($Failed.state -ceq "rejected" -and (Get-LaneState).State -ceq "canary_pending") "failed canary keeps the lane pending"
+        Assert-SelfTest (-not ([IO.File]::ReadAllText($Paths.JournalLog)).Contains("|activation|")) "failed canary did not activate"
         $Canary = Submit-Request "lane.probe.v1" "-" "-" "-" "-" "enroll-canary" "-" "-" 5
         Assert-SelfTest ($Canary.state -ceq "completed") "owner-side canary"
+        Assert-SelfTest ((Read-Identity $Paths.Identity).activation -ceq "passed" -and (Get-LaneState).State -ceq "ready") "probe activated the lane"
+        Assert-SelfTest (([IO.File]::ReadAllText($Paths.JournalLog)).Contains("|activation|")) "activation journaled"
         Assert-SelfTest ([IO.File]::Exists((Get-LanePaths).ModuleLock)) "module lock copied into the lane root"
-        $Paths = Get-LanePaths
         Assert-SelfTest ((Get-LaneState).State -ceq "ready") "post-enrollment state"
         Assert-SelfTest ($World.Sddl[$Paths.Ingress] -ceq (Get-IngressSddl $World.Sid)) "ingress ACL"
         Assert-SelfTest ($World.Sddl[$Paths.Claims] -ceq (Get-ProtectedSddl)) "claims ACL"
@@ -1149,4 +1210,5 @@ elseif ($Revoke) { $ExitCode = Invoke-Revoke }
 elseif ($Dispatch) { $ExitCode = Invoke-Dispatch }
 elseif ($Request) { $ExitCode = Invoke-Request }
 elseif ($Lookup) { $ExitCode = Invoke-Lookup }
+elseif ($Candidate) { $ExitCode = Invoke-Candidate }
 exit $ExitCode
