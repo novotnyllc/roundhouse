@@ -82,6 +82,24 @@ function Get-RemainingSeconds {
     return [int][Math]::Floor(($Script:Deadline - [DateTime]::UtcNow).TotalSeconds)
 }
 
+function Get-ToolStart([string]$FilePath, [string[]]$Arguments) {
+    # How a child starts. An executable takes each argument as itself. A
+    # batch shim (an npm-installed claude.cmd or codex.cmd) cannot be started
+    # without a shell, so it runs under cmd.exe /d /s /c with one quoted
+    # command line; the arguments here are plugin IDs, flags and paths, and
+    # one carrying a quote or a cmd metacharacter is refused rather than
+    # passed through.
+    if ($FilePath -notmatch '[.](cmd|bat)$') {
+        return [pscustomobject]@{ FileName = $FilePath; ArgumentList = $Arguments; Arguments = $null }
+    }
+    foreach ($Each in @($FilePath) + $Arguments) {
+        if ($Each -match '["%^&|<>!\r\n]') { throw "a batch shim argument carries a character cmd.exe would interpret: $(Get-SafeText $Each 64)" }
+    }
+    $Line = (@($FilePath) + $Arguments | ForEach-Object { if ($_ -match '[\s(),;=]' -or $_ -eq "") { "`"$_`"" } else { $_ } }) -join " "
+    $Shell = if ($env:ComSpec) { $env:ComSpec } else { "cmd.exe" }
+    return [pscustomobject]@{ FileName = $Shell; ArgumentList = $null; Arguments = "/d /s /c `"$Line`"" }
+}
+
 function Invoke-Tool {
     # Invoke-Tool FILE ARGUMENTS TIMEOUT [ENVIRONMENT] — one bounded child:
     # its exit code and stdout, or TimedOut once the smaller of TIMEOUT and
@@ -94,8 +112,12 @@ function Invoke-Tool {
         return [pscustomobject]@{ ExitCode = -1; Stdout = ""; TimedOut = $true }
     }
     $Info = [Diagnostics.ProcessStartInfo]::new()
-    $Info.FileName = $FilePath
-    foreach ($Argument in $Arguments) { [void]$Info.ArgumentList.Add($Argument) }
+    try { $Start = Get-ToolStart $FilePath $Arguments } catch {
+        return [pscustomobject]@{ ExitCode = -1; Stdout = ""; TimedOut = $false }
+    }
+    $Info.FileName = $Start.FileName
+    if ($null -ne $Start.Arguments) { $Info.Arguments = $Start.Arguments }
+    else { foreach ($Argument in $Start.ArgumentList) { [void]$Info.ArgumentList.Add($Argument) } }
     $Info.UseShellExecute = $false
     $Info.CreateNoWindow = $true
     $Info.RedirectStandardInput = $true
@@ -676,6 +698,17 @@ if ($SelfTest) {
         $State = Invoke-PluginCurrency -Claude "claude" -Codex "codex" -Git "git" -PathNode $FakeNode -Helper $Helper
         $Script:Hang = ""
         Assert-True ($State -ceq "timeout" -and (Get-Content -Raw -LiteralPath (Join-Path (Get-StateRoot) "status.json") | ConvertFrom-Json).state -ceq "timeout") "a run past its bound was not reported as a timeout"
+
+        # A batch shim runs under cmd.exe with one quoted line; an executable
+        # takes its arguments as themselves; a metacharacter is refused.
+        $Shim = Get-ToolStart 'C:\Users\A B\AppData\Roaming\npm\codex.cmd' @("plugin", "add", "x@y", "--json", 'C:\a b\root')
+        Assert-True ($Shim.FileName -match 'cmd(\.exe)?$' -and
+            $Shim.Arguments -ceq '/d /s /c ""C:\Users\A B\AppData\Roaming\npm\codex.cmd" plugin add x@y --json "C:\a b\root""') "a batch shim was not started through cmd.exe: $($Shim.Arguments)"
+        $Exe = Get-ToolStart 'C:\Program Files\x\codex.exe' @("plugin", "list")
+        Assert-True ($Exe.FileName -ceq 'C:\Program Files\x\codex.exe' -and $null -eq $Exe.Arguments -and $Exe.ArgumentList.Count -eq 2) "an executable did not take its arguments as themselves"
+        $Refused = $false
+        try { [void](Get-ToolStart 'C:\npm\claude.cmd' @("plugin", "update", "a&calc")) } catch { $Refused = $true }
+        Assert-True $Refused "a batch shim argument with a cmd metacharacter was passed through"
 
         # Node: PATH first, then Codex's bundled runtime, then Claude's.
         $FixtureHome = $env:USERPROFILE

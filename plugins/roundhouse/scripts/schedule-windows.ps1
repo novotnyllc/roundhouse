@@ -74,6 +74,7 @@ $UserPattern = '^[A-Za-z0-9._@-]{1,128}$'
 $CurrencyName = "RoundhousePluginCurrency"
 $CurrencyInterval = "PT20M"
 $CurrencyLimit = "PT15M"
+$CurrencyBoundary = "2026-01-01T00:00:00"
 $CurrencyFiles = @("plugins-windows.ps1", "codex-plugin-hooks.mjs")
 $MaximumBundleBytes = 1048576
 
@@ -292,7 +293,7 @@ function New-CurrencyTaskXml([string]$UserSid, [string]$ScriptPath) {
         "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable>" +
         "<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>" +
         "<ExecutionTimeLimit>$CurrencyLimit</ExecutionTimeLimit><Enabled>true</Enabled></Settings>" +
-        "<Triggers><TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary><Repetition><Interval>$CurrencyInterval</Interval></Repetition><Enabled>true</Enabled></TimeTrigger></Triggers>" +
+        "<Triggers><TimeTrigger><StartBoundary>$CurrencyBoundary</StartBoundary><Repetition><Interval>$CurrencyInterval</Interval></Repetition><Enabled>true</Enabled></TimeTrigger></Triggers>" +
         "<Actions Context=`"Author`"><Exec><Command>$([Security.SecurityElement]::Escape((Get-ConhostPath)))</Command>" +
         "<Arguments>$([Security.SecurityElement]::Escape($Arguments))</Arguments></Exec></Actions></Task>"
 }
@@ -333,9 +334,16 @@ function Get-CurrencyBundle([string]$Xml, [string]$UserSid) {
     $Triggers = @($Document.SelectNodes("/t:Task/t:Triggers/*", $Ns))
     if ($Triggers.Count -ne 1 -or $Triggers[0].LocalName -cne "TimeTrigger") { return "" }
     $Interval = $Triggers[0].SelectSingleNode("t:Repetition/t:Interval", $Ns)
+    $Boundary = $Triggers[0].SelectSingleNode("t:StartBoundary", $Ns)
+    $TriggerOn = $Triggers[0].SelectSingleNode("t:Enabled", $Ns)
+    $TaskOn = $Document.SelectSingleNode("/t:Task/t:Settings/t:Enabled", $Ns)
     $Limit = $Document.SelectSingleNode("/t:Task/t:Settings/t:ExecutionTimeLimit", $Ns)
     if ($null -eq $Interval -or [string]$Interval.InnerText -cne $CurrencyInterval -or
+        $null -eq $Boundary -or [string]$Boundary.InnerText -cne $CurrencyBoundary -or
         $null -eq $Limit -or [string]$Limit.InnerText -cne $CurrencyLimit) { return "" }
+    # A disabled task, or a disabled trigger, runs nothing: not current.
+    if (($null -ne $TriggerOn -and [string]$TriggerOn.InnerText -cne "true") -or
+        ($null -ne $TaskOn -and [string]$TaskOn.InnerText -cne "true")) { return "" }
     $Bundle = Get-DirectoryBundle $Directory
     if ($Bundle -and $Bundle.Substring(0, 16) -ceq [IO.Path]::GetFileName($Directory)) { return $Bundle }
     return ""
@@ -541,6 +549,15 @@ function Invoke-Register([object]$Value) {
         return $Outcome
     }
     $Xml = New-CurrencyTaskXml (Get-CurrentUserSid) ([IO.Path]::Combine($Directory, $CurrencyFiles[0]))
+    # Staging took time: the task is checked again, as it is now, so -Force
+    # never replaces a definition the plan did not observe.
+    $Task = Get-ScheduledTask -TaskName $CurrencyName -TaskPath "\" -ErrorAction SilentlyContinue
+    $Now = if ($null -eq $Task) { "" } else { Get-TextSha256 (Get-TaskXml $CurrencyName "\") }
+    if ($Now -cne [string]$Value.before) {
+        $Outcome.outcome = "changed"
+        $Outcome.message = "the task changed while its bundle was written; it was left as it is"
+        return $Outcome
+    }
     try {
         Register-ScheduledTask -TaskName $CurrencyName -TaskPath "\" -Xml $Xml -Force -ErrorAction Stop | Out-Null
     } catch {
@@ -701,7 +718,7 @@ if ($SelfTest) {
             [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
             $Script:Exports++
             if ($Script:ChangeOnExport -gt 0 -and $Script:Exports -ge $Script:ChangeOnExport) {
-                return $Fixture[$TaskName].Xml.Replace("<Triggers />", "<Triggers></Triggers>")
+                return $Fixture[$TaskName].Xml + "<!-- edited -->"
             }
             return $Fixture[$TaskName].Xml
         }
@@ -845,6 +862,9 @@ if ($SelfTest) {
         # Exactly the written definition, or no bundle at all: install then
         # registers it again. Never unknown, never obsolete.
         foreach ($Edit in @(@("<RunLevel>LeastPrivilege</RunLevel>", "<RunLevel>HighestAvailable</RunLevel>"),
+                @("<Enabled>true</Enabled><Hidden>", "<Enabled>false</Enabled><Hidden>"),
+                @("<Enabled>true</Enabled></TimeTrigger>", "<Enabled>false</Enabled></TimeTrigger>"),
+                @("<StartBoundary>2026-01-01T00:00:00</StartBoundary>", "<StartBoundary>2099-01-01T00:00:00</StartBoundary>"),
                 @("<Interval>PT20M</Interval>", "<Interval>PT1M</Interval>"),
                 @("-ExecutionPolicy Bypass -File", "-ExecutionPolicy Bypass -Command x -File"),
                 @("<Triggers>", "<Triggers><LogonTrigger />"))) {
@@ -856,6 +876,11 @@ if ($SelfTest) {
         }
         [IO.File]::WriteAllText([IO.Path]::Combine($BundleDirectory, "codex-plugin-hooks.mjs"), "// edited")
         if (@(Get-Currency)[0].bundle -cne "") { throw "Self-test reported an edited bundle as current" }
+        # A task edited while the bundle is staged is left as it is.
+        $Script:Exports = 0; $Script:ChangeOnExport = 2
+        $Raced = Invoke-ScheduleRequest (New-Register -Before $Currency[0].digest)
+        $Script:ChangeOnExport = 0
+        if ($Raced.outcome -cne "changed" -or $Script:RegisterCalls -ne 1) { throw "Self-test registered over a task edited while its bundle was staged" }
         # Re-pointing: a new bundle replaces the task bound to its digest, and
         # the old bundle goes.
         $OldDirectory = $BundleDirectory
