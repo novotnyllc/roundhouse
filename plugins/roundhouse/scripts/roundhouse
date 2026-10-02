@@ -105,6 +105,8 @@ EOF
 . "$script_dir/lib/plan-verify.sh"
 # shellcheck source=lib/plan-apply.sh
 . "$script_dir/lib/plan-apply.sh"
+# shellcheck source=lib/local-plan.sh
+. "$script_dir/lib/local-plan.sh"
 # shellcheck source=lib/broker-windows.sh
 . "$script_dir/lib/broker-windows.sh"
 # shellcheck source=lib/broker-posix.sh

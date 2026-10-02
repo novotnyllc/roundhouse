@@ -170,7 +170,7 @@
     },
     {
       "path": "scripts/lib/host.sh",
-      "sha256": "e14dcba73e87cab7000a9ce8343bce9ba26592bf19bed1a46addc21f4d16bd22"
+      "sha256": "183f0606cd84cf9687dc0d2ea89f229cd52fd58906167996bf62453d44de905a"
     },
     {
       "path": "scripts/lib/identity.sh",
@@ -185,6 +185,10 @@
       "sha256": "b196f20e4263646a495a04afd75c1fb0c799fc9ca2bfbea4d0017770047733de"
     },
     {
+      "path": "scripts/lib/local-plan.sh",
+      "sha256": "c08eed37364bc586ed40b6fa5f05970a679a023c0646af85e0c02a94d808e3ac"
+    },
+    {
       "path": "scripts/lib/node-runtime.sh",
       "sha256": "0a69de8b2fccbcfdfbbbf77781caea3d5696a6c4fbefc9519d1a220995ce6da0"
     },
@@ -194,7 +198,7 @@
     },
     {
       "path": "scripts/lib/plan-apply.sh",
-      "sha256": "2083fb1fd5959d064db9e749a114891e55df46b275baa3afdf155760eef43a28"
+      "sha256": "315d952a90c1295d4d97c663312c1868a97fb3aeb6fdf31c273c7f054844d198"
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
@@ -250,7 +254,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "d8f02ef4d13a563ff2ed5d4532ebdd2749f891643e8178982a70d2febc4caaca"
+      "sha256": "be2429b2102877b275bef1ecbced5d0afc5ad7bc9d1078f0395a545c40f54a5b"
     },
     {
       "path": "scripts/roundhouse-trustd",
