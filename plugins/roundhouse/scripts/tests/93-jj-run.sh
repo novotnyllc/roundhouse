@@ -707,11 +707,19 @@ YAML
   [ -f "$vireo/alerts/vireo/removal-cap.yaml" ] ||
     fail "the capped run raised no removal-cap alert"
   runjj_dev_group 5
+  runjj_alive_count() {
+    grep -rh 'outcome: alive' "$vireo/journal/vireo" 2>/dev/null | grep -c . || true
+  }
+  runjj_alive_before=$(runjj_alive_count)
   runjj_out=$(runjj_tomb_run) || fail "the tombstone run failed: $runjj_out"
   case $runjj_out in
     *'applied plugins.retired (uninstalled)'*) ;;
     *) fail "the tombstone did not uninstall the plugin: $runjj_out" ;;
   esac
+  # A pass whose only change is a tombstone APPLIED something, and publishes
+  # the heartbeat that evidence owes (a canary's downstream waits on it).
+  [ "$(runjj_alive_count)" -gt "$runjj_alive_before" ] ||
+    fail "a pass whose only change was a tombstone published no heartbeat"
   grep -Fqx 'uninstall retired@test-market' "$rjj/plugin-actions" ||
     fail "the tombstone did not go through claude plugin uninstall"
   # The cap no longer holds anything, so its CONDITION alert is cleared.

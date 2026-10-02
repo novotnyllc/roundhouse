@@ -3431,12 +3431,19 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         fleet_alert_raise "$run_ledger" "$run_store" "$run_host" \
           uninstall-deferred uninstall-deferred "$run_defer_detail" "$run_item" || :
       fi
+      # Converged either way — uninstalled (0) or already absent (70) — and,
+      # like any applied or satisfied item, that is evidence a canary owes
+      # its heartbeat for (run_applied_any).
       case $run_status in
         0)
           run_applied_items="$run_applied_items$run_item "
+          run_applied_any=true
           continue
           ;;
-        70) continue ;;
+        70)
+          run_applied_any=true
+          continue
+          ;;
       esac
     else
       case $run_category in
