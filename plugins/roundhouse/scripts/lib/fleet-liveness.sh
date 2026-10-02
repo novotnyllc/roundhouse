@@ -215,9 +215,11 @@ fleet_liveness_record() {
   #
   #   due    the first instant a peer heard from now (HEARD, its newest
   #          heartbeat per line) ages past the HOURS window; null when none
-  #          was, so time alone owes nothing. An `at` that does not parse is
-  #          left out: the scan compares it as a string, so time cannot
-  #          change that peer's answer either.
+  #          was, so time alone owes nothing. The scan compares `at` as a
+  #          string against a whole-second cutoff, so its first 19 characters
+  #          decide the crossing: `…:00.123Z` and `…:00+00:00` age out like
+  #          `…:00Z`. An `at` whose first 19 do not parse is left out; it is
+  #          not a time, and no instant of the clock moves its answer.
   #   watch  the peers that were silent or never heard from: their next
   #          journal record is what changes the answer.
   #   base   SCANNED-REV, the commit whose journal the scan read.
@@ -226,7 +228,7 @@ fleet_liveness_record() {
   jq -cn --arg heard "$1" --arg watch "$2" --argjson span "$(($3 * 3600))" \
     --arg base "$4" '
       {due: ([$heard | splits("\n") | select(length > 0)
-              | (try fromdateiso8601 catch empty)]
+              | (try (.[0:19] + "Z" | fromdateiso8601) catch empty)]
              | if length == 0 then null else min + $span end),
        watch: [$watch | splits("\n") | select(length > 0)],
        base: $base}' >"$liveness_state_dir/liveness.json.next" &&

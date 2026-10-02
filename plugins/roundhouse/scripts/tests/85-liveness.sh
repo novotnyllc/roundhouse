@@ -213,6 +213,18 @@ if [ -n "$fleet_fixture_yq" ]; then
     # The scan above recorded nothing to owe, whatever the clock or the remote.
     ! fleet_liveness_owed "$live_store" another-rev "$(jq -rn --arg at "$(live_at 999)" '$at | fromdateiso8601')" ||
       fail "a disabled stale-host check still kept the poll floor open"
+    # A heartbeat stamped with fractional seconds or an offset passes the
+    # scan's string compare, so its deadline is kept, not dropped: the floor
+    # must still come back when it ages out. (Last: this scan's roster clears
+    # every other peer's alert.)
+    printf 'vireo\nlark\n' >"$live_root/hosts-lark"
+    fleet_journal_append "$live_store" lark \
+      "$(jq -cn --arg at "$(live_at 45 | sed 's/Z$/.250Z/')" '{outcome:"alive",at:$at}')"
+    fleet_liveness_alerts "$live_store" vireo "$live_root/hosts-lark" /dev/null \
+      "$live_fold" "$(live_at 46)" scanned-rev >/dev/null
+    [ "$(jq -r '.due' "$(fleet_run_state_dir)/liveness.json")" = \
+      "$(jq -rn --arg at "$(live_at $((45 + 12)))" '$at | fromdateiso8601')" ] ||
+      fail "a heartbeat with fractional seconds left no deadline: $(cat "$(fleet_run_state_dir)/liveness.json")"
     # The policy defaults carry both keys, so a store with no policy block runs
     # the documented 6h/12h.
     [ "$(fleet_policy_int '{}' heartbeat_publish_hours)" = 6 ] ||
