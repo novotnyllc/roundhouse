@@ -152,6 +152,16 @@ select_mikefarah_yq
 command=${1:-}
 [ -n "$command" ] || usage
 shift
+# Every verb that takes the run lock as a RUN leads a process group of its own,
+# so the lock's recorded pid is also a group that belongs to this run alone
+# (fleet_lock_lead_group; nothing changes under a terminal). Not fleet-lock:
+# its lock is `manual`, names the caller's shell rather than this process, and
+# is never judged by liveness or stopped.
+case $command in
+  fleet-run | fleet-age-evidence | fleet-compact-alerts | fleet-disown)
+    fleet_lock_lead_group "$0" "$command" "$@"
+    ;;
+esac
 case $command in
   validate-config) [ $# -eq 0 ] || usage; validate_config_file ;;
   validate-privilege-policy) [ $# -eq 1 ] || usage; validate_privilege_policy_file "$1" ;;

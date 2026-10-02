@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "03be7f3814e962017e3aef20eb57b37c21d37472e6bef432c999c6e6c179576f"
+      "sha256": "f9525a756db76323dc6abdec689b55ab1478229bbeb2fe728153bff69c6a519e"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "fddde7d6b1f9e55687cbc15c8fc423a5ffe9ad37b34de001b626e880a821682b"
+      "sha256": "5f96d323e95de12f45ddf086bde189e384938b9da0c7e3c55175b57565b1399e"
     },
     {
       "path": "assets/icon.png",
@@ -122,7 +122,7 @@
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
-      "sha256": "329ce8c308354c46e07cb8fd735ce398be674d097fd7c0c48d60b70d63b25130"
+      "sha256": "3ce90b04b763dd566facc8687f9321e2b030c113a9093247cb51bba9ad8153b0"
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
@@ -146,11 +146,11 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "d5edcccf997cf3aa6035b1965a454df1aa447f0bb3d435581de796e0dfa04ed7"
+      "sha256": "527f20c3867c9fde13daa459e75bed023ea8d06a0372bfedc129d4e65c49a399"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
-      "sha256": "b2a3510cd5dd77d51293a48f9b275bf09212841945b6914515d611f8538addcd"
+      "sha256": "cee180462ac02b8f72c5ca7e20ecdab10134c8f10e39862a98495f64407cc3f5"
     },
     {
       "path": "scripts/lib/fleet-trust.sh",
@@ -242,7 +242,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "54165434b6315d0ab9102f5ae6164fad5c3349a364ae333897c372a870d19099"
+      "sha256": "18904deb84934a46dba5b9e53699d71571bf24bb2334ec11a4a95792f82f7234"
     },
     {
       "path": "scripts/roundhouse-trustd",
@@ -337,5 +337,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.40"
+  "version": "0.9.43"
 }

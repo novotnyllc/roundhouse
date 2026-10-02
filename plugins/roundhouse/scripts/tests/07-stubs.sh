@@ -1175,3 +1175,39 @@ JSON
     "$tmp/config.json" >"$tmp/ignore-native-auth.json"
   chmod 600 "$tmp/ignore-native-auth.json"
 fi
+
+# A run whose top-level shell leads its own process group, with the pass in a
+# subshell under it that keeps working: the shape fleet_lock_lead_group gives
+# every lock-taking verb, for the run-lock sections (90, 94). Both processes
+# carry NAME in their command line, and the leader is detached (its parent
+# exits at once) so a KILLed leader is reaped rather than left a zombie.
+fixture_group_members() {
+  # `fixture_group_members PGID NAME` — the pids in group PGID that carry NAME.
+  ps -A -o pid= -o pgid= -o command= 2>/dev/null |
+    awk -v g="$1" -v n="$2" '$2 == g && index($0, n) { print $1 }'
+}
+fixture_group_holder() {
+  # `fixture_group_holder NAME` — start the fixture; prints the leader's pid
+  # once the leader leads its group and the subshell is running.
+  fixture_group_leader=$(
+    perl -e 'setpgrp(0, 0); exec @ARGV' bash -c '
+      ( while :; do sleep 1; done ) &
+      while :; do sleep 1; done' "$1" </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!"
+  )
+  fixture_group_tries=0
+  until [ "$(fixture_group_members "$fixture_group_leader" "$1" | grep -c .)" -ge 2 ]; do
+    [ "$fixture_group_tries" -lt 50 ] || return 1
+    sleep 0.1
+    fixture_group_tries=$((fixture_group_tries + 1))
+  done
+  printf '%s\n' "$fixture_group_leader"
+}
+fixture_group_kill() {
+  # `fixture_group_kill PGID NAME` — KILL the fixture's group: only processes
+  # in it that carry NAME, and their `sleep 1`s.
+  for fixture_group_pid in $(ps -A -o pid= -o pgid= -o command= 2>/dev/null |
+    awk -v g="$1" -v n="$2" '$2 == g && (index($0, n) || $3 == "sleep") { print $1 }'); do
+    kill -KILL "$fixture_group_pid" 2>/dev/null || :
+  done
+}
