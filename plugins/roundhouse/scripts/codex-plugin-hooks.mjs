@@ -21,14 +21,17 @@ function treeEntries(root) {
   // Every regular file (bytes and owner-execute bit) and symlink (target, not
   // followed) under ROOT, by relative path — the same tree, with the same
   // exclusions, that apply-claude.sh's fleet_run_tree_digest hashes: any
-  // `.git` is pruned, and Claude's `.in_use` / `.orphaned_at` markers at the
-  // root are not plugin content. Throws when the tree cannot be read.
+  // `.git` is pruned, and the managers' markers at the root are not plugin
+  // content: Claude's `.in_use` (file or per-session directory) and
+  // `.orphaned_at`, and Codex's `.codex-marketplace-install.json`. Throws when
+  // the tree cannot be read.
   const entries = new Map();
   const walk = (dir, rel) => {
     for (const name of readdirSync(dir)) {
       if (name === ".git") continue;
       const relPath = rel ? `${rel}/${name}` : name;
-      if (!rel && (name === ".in_use" || name === ".orphaned_at")) continue;
+      if (!rel && (name === ".in_use" || name === ".orphaned_at" ||
+        name === ".codex-marketplace-install.json")) continue;
       const full = join(dir, name);
       const stat = lstatSync(full);
       if (stat.isSymbolicLink()) entries.set(relPath, `link ${readlinkSync(full)}`);

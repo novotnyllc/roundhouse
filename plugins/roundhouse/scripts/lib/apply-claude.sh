@@ -114,8 +114,10 @@ fleet_run_tree_digest() (
   # fleet_run_tree_digest DIR -> one digest over the tree's content: every
   # regular file's relative path and bytes, which of them are EXECUTABLE, and
   # every symlink's relative path and target (a link is never followed). `.git`
-  # is excluded, and so are the two markers Claude leaves in an installed copy
-  # (`.in_use`, `.orphaned_at`), which are not plugin content. A `chmod +x` or
+  # is excluded, and so are the markers the managers leave in an installed copy,
+  # which are not plugin content: Claude's `.in_use` (a file, or a directory of
+  # per-session `.in_use/PID` files) and `.orphaned_at`, and Codex's
+  # `.codex-marketplace-install.json`. A `chmod +x` or
   # a repointed link is a different plugin, so it is a different digest.
   #
   # Exit non-zero rather than answer a digest it cannot stand behind: an
@@ -127,11 +129,12 @@ fleet_run_tree_digest() (
   cd "$1" 2>/dev/null || exit 1
   tree_work=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-tree.XXXXXX") || exit 1
   trap 'rm -rf "$tree_work"' EXIT
-  find . -name .git -prune -o -type f ! -path ./.in_use ! -path ./.orphaned_at \
-    -print0 | LC_ALL=C sort -z >"$tree_work/files" || exit 1
-  find . -name .git -prune -o -type f -perm -u+x ! -path ./.in_use ! -path ./.orphaned_at \
-    -print0 | LC_ALL=C sort -z >"$tree_work/exec" || exit 1
-  find . -name .git -prune -o -type l -print0 | LC_ALL=C sort -z >"$tree_work/links" || exit 1
+  find . \( -name .git -o -path ./.in_use \) -prune -o -type f ! -path ./.orphaned_at \
+    ! -path ./.codex-marketplace-install.json -print0 | LC_ALL=C sort -z >"$tree_work/files" || exit 1
+  find . \( -name .git -o -path ./.in_use \) -prune -o -type f -perm -u+x ! -path ./.orphaned_at \
+    ! -path ./.codex-marketplace-install.json -print0 | LC_ALL=C sort -z >"$tree_work/exec" || exit 1
+  find . \( -name .git -o -path ./.in_use \) -prune -o -type l -print0 |
+    LC_ALL=C sort -z >"$tree_work/links" || exit 1
   [ -s "$tree_work/files" ] || [ -s "$tree_work/links" ] || exit 1
   {
     printf 'files\n'
