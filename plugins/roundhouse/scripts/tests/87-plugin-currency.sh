@@ -55,6 +55,16 @@ if [ -n "$fleet_fixture_yq" ]; then
       fail "the upstream head of a branch was not read"
     [ "$(fleet_plugins_remote_head "$pc/heads.git" v1)" = "$pc_head" ] ||
       fail "an annotated tag was not peeled to the commit it names"
+    # A ref naming BOTH a branch and an annotated tag is the branch, as
+    # `git clone --branch` resolves it.
+    pc_git -C "$pc/heads-work" tag -a twin -m 'a tag named like the branch'
+    pc_git -C "$pc/heads-work" push -q "$pc/heads.git" twin
+    pc_git -C "$pc/heads-work" checkout -q -b twin-work
+    pc_git -C "$pc/heads-work" commit -q --allow-empty -m 'the branch moves on'
+    pc_git -C "$pc/heads-work" push -q "$pc/heads.git" twin-work:refs/heads/twin
+    pc_twin_branch=$(pc_git -C "$pc/heads-work" rev-parse HEAD)
+    [ "$(fleet_plugins_remote_head "$pc/heads.git" twin)" = "$pc_twin_branch" ] ||
+      fail "a ref naming a branch and a tag resolved to the tag, not the branch"
     ! fleet_plugins_remote_head "$pc/heads.git" nope >/dev/null ||
       fail "a ref the upstream does not have answered a head"
     ! fleet_plugins_remote_head "$pc/missing.git" '' >/dev/null 2>&1 ||
@@ -140,15 +150,28 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
           mkdir -p "$PC_CODEX_ROOT/.agents/plugins"
           jq -n --arg rev "$rev" '{name: "novotnyllc", plugins: [
             {name: "demo", source: {source: "git-subdir", url: "https://example.invalid/demo.git", path: "plugins/demo", sha: $rev}},
-            {name: "loose", source: {source: "url", url: "https://example.invalid/loose.git"}}]}' \
+            {name: "loose", source: {source: "url", url: "https://example.invalid/loose.git"}},
+            {name: "inrepo", source: "./plugins/inrepo"}]}' \
             >"$PC_CODEX_ROOT/.agents/plugins/marketplace.json"
+          # The in-repo plugin changes contents at this revision WITHOUT a
+          # version bump.
+          mkdir -p "$PC_CODEX_ROOT/plugins/inrepo/.codex-plugin"
+          printf '%s\n' '{"name":"inrepo","version":"1"}' \
+            >"$PC_CODEX_ROOT/plugins/inrepo/.codex-plugin/plugin.json"
+          printf '%s\n' "$rev" >"$PC_CODEX_ROOT/plugins/inrepo/README.md"
           jq -n --arg rev "$rev" '{source_type: "git", revision: $rev}' \
             >"$PC_CODEX_ROOT/.codex-marketplace-install.json"
           sleep "${PC_CODEX_REINSTALL_DELAY:-0}"
           kill -0 "$server" 2>/dev/null || exit 0
           jq --arg rev "$rev" '(.installed[] | select(.name == "demo") | .source.sha) = $rev' \
             "$PC_CODEX_INSTALLED" >"$PC_CODEX_INSTALLED.next" &&
-            mv "$PC_CODEX_INSTALLED.next" "$PC_CODEX_INSTALLED") >/dev/null 2>&1 </dev/null &
+            mv "$PC_CODEX_INSTALLED.next" "$PC_CODEX_INSTALLED"
+          sleep "${PC_CODEX_INREPO_DELAY:-0}"
+          kill -0 "$server" 2>/dev/null || exit 0
+          rm -rf "$CODEX_HOME/plugins/cache/novotnyllc/inrepo/1"
+          mkdir -p "$CODEX_HOME/plugins/cache/novotnyllc/inrepo"
+          cp -R "$PC_CODEX_ROOT/plugins/inrepo" "$CODEX_HOME/plugins/cache/novotnyllc/inrepo/1") \
+          >/dev/null 2>&1 </dev/null &
         jq -cn --argjson id "$id" '{id:$id,result:{}}'
         ;;
     esac
@@ -169,12 +192,17 @@ SH
     mkdir -p "$pc/codex-root"
     export PC_CODEX_MARKETS="$pc/codex-markets.json" PC_CODEX_LOG="$pc/codex.log" \
       PC_CODEX_SYNC_TO="$pc/codex-sync-to" PC_CODEX_ROOT="$pc/codex-root" \
-      PC_CODEX_INSTALLED="$pc/codex-installed.json"
+      PC_CODEX_INSTALLED="$pc/codex-installed.json" CODEX_HOME="$pc/codex-sync-home"
+    mkdir -p "$CODEX_HOME/plugins/cache/novotnyllc/inrepo/1/.codex-plugin"
+    printf '%s\n' '{"name":"inrepo","version":"1"}' \
+      >"$CODEX_HOME/plugins/cache/novotnyllc/inrepo/1/.codex-plugin/plugin.json"
+    printf 'old\n' >"$CODEX_HOME/plugins/cache/novotnyllc/inrepo/1/README.md"
     # demo is pinned (waited on until reinstalled); loose is an unpinned
     # remote entry with no identity in the catalog (not waited on).
     printf '%s\n' '{"installed":[
       {"pluginId":"demo@novotnyllc","name":"demo","marketplaceName":"novotnyllc","version":"1","installed":true,"enabled":true,"source":{"source":"git-subdir","sha":"old"}},
-      {"pluginId":"loose@novotnyllc","name":"loose","marketplaceName":"novotnyllc","version":"1","installed":true,"enabled":true,"source":{"source":"url"}}]}' \
+      {"pluginId":"loose@novotnyllc","name":"loose","marketplaceName":"novotnyllc","version":"1","installed":true,"enabled":true,"source":{"source":"url"}},
+      {"pluginId":"inrepo@novotnyllc","name":"inrepo","marketplaceName":"novotnyllc","version":"1","installed":true,"enabled":true,"source":{"source":"local"}}]}' \
       >"$PC_CODEX_INSTALLED"
     jq -n --arg root "$pc/codex-root" --arg url "$pc/codex-up.git" '{marketplaces: [
       {name: "novotnyllc", root: $root, marketplaceSource: {sourceType: "git", source: $url}},
@@ -242,6 +270,24 @@ SH
         fail "a sync whose reinstall finished inside the deadline failed: $pc_out"
       [ "$(jq -r '.installed[] | select(.name == "demo") | .source.sha' "$PC_CODEX_INSTALLED")" = \
         "$pc_codex_head" ] || fail "sync returned before the plugin was reinstalled"
+      # An in-repo plugin whose contents changed WITHOUT a version bump is
+      # done only when its installed tree is byte-identical to the clone's:
+      # the same version is not proof the reinstall finished.
+      pc_codex_head=$(pc_commit codex-up 'same version, new contents')
+      printf '%s\n' "$pc_codex_head" >"$PC_CODEX_SYNC_TO"
+      pc_status=0
+      pc_out=$(PC_CODEX_INREPO_DELAY=6 ROUNDHOUSE_CODEX_SYNC_WAIT_MS=2500 \
+        node "$script_dir/codex-plugin-hooks.mjs" sync "$pc/codex-root" "$pc_codex_head") ||
+        pc_status=$?
+      [ "$pc_status" -eq 75 ] ||
+        fail "a sync reported done while an in-repo plugin was still being reinstalled (got $pc_status): $pc_out"
+      [ "$(cat "$CODEX_HOME/plugins/cache/novotnyllc/inrepo/1/README.md")" != "$pc_codex_head" ] ||
+        fail "the slow in-repo fixture reinstalled inside the deadline"
+      pc_out=$(PC_CODEX_INREPO_DELAY=2 \
+        node "$script_dir/codex-plugin-hooks.mjs" sync "$pc/codex-root" "$pc_codex_head") ||
+        fail "an in-repo reinstall inside the deadline was not waited for: $pc_out"
+      [ "$(cat "$CODEX_HOME/plugins/cache/novotnyllc/inrepo/1/README.md")" = "$pc_codex_head" ] ||
+        fail "sync returned before the in-repo plugin was reinstalled"
       ! grep -q FORBIDDEN "$PC_CODEX_LOG" ||
         fail "Roundhouse drove a Codex upgrade or install: $(tr '\n' ';' <"$PC_CODEX_LOG")"
     )
@@ -440,16 +486,20 @@ SH
         fleet_run_apply_item "$pc/store" vireo '{}' plugins.widget \
           '{"state":"enabled","marketplace":"m"}' '' >/dev/null 2>"$pc/hooks-err"
     }
+    # Codex's copy is NOT at the expected SHA (it has not synced yet, or its
+    # catalog pins the same repository to another revision). The run never
+    # reinstalls it: nothing is installed, NO trust at all is written, and
+    # the item holds saying why, for the next pass to retry.
     pc_hooks_reset
     fleet_run_marketplace_repair_reset
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 0 ] ||
-      fail "an enabled fleet plugin whose hooks changed upstream was held (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
-    [ "$(head -2 "$pc/hooks-state/log" | tr '\n' ';')" = 'codex-add widget@m;trust sha256:new;' ] ||
-      fail "the Codex copy was not refreshed, carrying its hook trust, before approval: $(tr '\n' ';' <"$pc/hooks-state/log")"
-    [ "$(cat "$pc/hooks-state/trusted")" = sha256:new ] ||
-      fail "the changed hook did not end trusted at its new hash"
+    [ "$pc_status" -eq 75 ] && [ ! -s "$pc/hooks-state/log" ] &&
+      [ "$(cat "$pc/hooks-state/version")" = old ] &&
+      [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+      fail "a Codex copy at another revision was reinstalled or had trust written (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
+    grep -q "Codex has not synced to $pc_sha_b yet; the next pass retries" "$pc/hooks-err" ||
+      fail "the hold did not say Codex has not synced yet: $(tr '\n' ';' <"$pc/hooks-err")"
     # Codex already at the expected bytes, hooks unchanged upstream: the copy
     # is left alone (no reinstall) and approval passes as it is.
     pc_hooks_reset

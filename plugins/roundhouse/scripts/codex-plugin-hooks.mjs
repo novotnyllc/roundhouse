@@ -3,6 +3,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -350,9 +351,11 @@ function codexJson(codexExecutable, args) {
 
 function catalogPluginsCurrent(root, marketplaceName, installed) {
   // Every ENABLED installed plugin from this marketplace is at the identity
-  // the catalog at ROOT names for it: a pinned entry's `source.sha`, or an
-  // in-repo entry's own `.codex-plugin/plugin.json` version. An unpinned
-  // remote entry names no identity to wait for, and is not waited on.
+  // the catalog at ROOT names for it: a pinned entry's `source.sha`, or, for
+  // an in-repo entry, an installed tree byte-identical to the clone's plugin
+  // tree (the same comparison approval uses — contents can change without a
+  // version bump). An unpinned remote entry names no identity to wait for,
+  // and is not waited on.
   let catalog;
   try {
     catalog = JSON.parse(readFileSync(join(root, ".agents", "plugins", "marketplace.json"), "utf8"));
@@ -371,12 +374,14 @@ function catalogPluginsCurrent(root, marketplaceName, installed) {
     }
     const relative = typeof source === "string" ? source : source?.source === "local" ? source.path : null;
     if (typeof relative !== "string") continue;
-    try {
-      const manifest = JSON.parse(readFileSync(join(root, relative, ".codex-plugin", "plugin.json"), "utf8"));
-      if (record.version !== manifest?.version) return false;
-    } catch {
+    if (
+      typeof record.version !== "string" ||
+      [marketplaceName, record.name, record.version].some((part) => !part || part === "." || part === ".." || /[\\/]/.test(part))
+    ) {
       return false;
     }
+    const installedTree = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "plugins", "cache", marketplaceName, record.name, record.version);
+    if (!treesIdentical(installedTree, join(root, relative))) return false;
   }
   return true;
 }

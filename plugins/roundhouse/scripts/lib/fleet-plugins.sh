@@ -69,14 +69,15 @@ fleet_plugins_remote_head() {
   shift 2
   fleet_plugins_ls=$(run_bounded 20 env GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never \
     git ls-remote -- "$fleet_plugins_ls_url" "$@" </dev/null 2>/dev/null) || return 1
-  # A peeled tag names the commit; a branch names it directly.
+  # A ref naming both a branch and a tag resolves to the BRANCH, as
+  # `git clone --branch` does; a tag resolves to the commit it peels to.
   printf '%s\n' "$fleet_plugins_ls" | awk -v ref="$fleet_plugins_ls_ref" '
     ref == "" && $2 == "HEAD" { head = $1 }
     ref != "" && $2 == "refs/tags/" ref "^{}" { peeled = $1 }
     ref != "" && $2 == "refs/heads/" ref { branch = $1 }
     ref != "" && $2 == "refs/tags/" ref { tag = $1 }
     END {
-      out = peeled != "" ? peeled : (branch != "" ? branch : (tag != "" ? tag : head))
+      out = branch != "" ? branch : (peeled != "" ? peeled : (tag != "" ? tag : head))
       if (out ~ /^[0-9a-fA-F]+$/ && length(out) == 40) { print out; exit 0 }
       exit 1
     }'

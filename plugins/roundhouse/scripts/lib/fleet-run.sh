@@ -1758,37 +1758,27 @@ fleet_run_approve_plugin_hooks() {
     printf 'roundhouse: Node.js is required to approve hooks for %s\n' "$1" >&2
     return 75
   }
-  # REFRESH (the third argument, passed after an install or update of an
-  # ENABLED plugin): when Codex's copy is not yet at the new bytes, bring it
-  # there through the hook-preserving helper, which re-trusts at their new
-  # hashes exactly the hooks this host already trusted. The Claude manager updated only Claude's
-  # copy; approving against Codex's stale one refused (a source mismatch, or
-  # the new bytes' hooks read as modified) and held every enabled plugin whose
-  # hooks changed upstream. A state-only enable changed no bytes and does not
-  # reinstall the Codex copy; a disabled state never reaches here.
+  # Third argument `refresh`: called right after an install or update of an
+  # ENABLED plugin. The run never reinstalls Codex's copy (no
+  # `codex-plugin-hooks.mjs update` here: it would re-trust refreshed hooks
+  # before any check below could refuse, and a 75 undoes no trust write).
+  # Codex's own startup sync, which the pass triggers before this loop,
+  # brings the copy current; approval is byte-verified in one session. A
+  # copy from another source sharing the ID, or one Codex has not synced to
+  # the expected SHA yet, holds with its reason, and the next pass retries.
   if [ "${3:-}" = refresh ]; then
-    # The helper is never pointed at a DIFFERENT source that merely shares
-    # the ID: it would install those bytes and re-trust their hooks before
-    # the identity check below could refuse, and a 75 undoes neither
-    # (fleet_run_codex_source_ok).
-    fleet_run_codex_source_ok "$1" || return 75
-    # Codex keeps its own copy current (the pass triggered its marketplace
-    # sync before this loop), so a copy already at the expected bytes is left
-    # alone and approval reads it as it is. Only a copy Codex has not caught
-    # up is refreshed, and the helper refuses — rather than report trust it
-    # did not carry — when Codex advances the copy under its snapshot.
-    fleet_run_codex_at=$(fleet_run_codex_record_state "$1" "$fleet_run_expected_sha") ||
+    fleet_run_codex_source_ok "$1" || {
+      printf "roundhouse: automatic hook approval for %s refused: Codex's copy is not from the source Claude's catalog names\n" "$1" >&2
       return 75
-    if [ "$fleet_run_codex_at" != match ]; then
-      fleet_run_cli_invalidate
-      bounded_verb "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" update "$1" \
-        >/dev/null 2>&1 </dev/null || return 75
-      fleet_run_cli_invalidate
-    fi
+    }
   fi
   fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" \
     "$fleet_run_expected_sha") || return 75
-  [ "$fleet_run_codex_plugin_state" = match ] || return 75
+  [ "$fleet_run_codex_plugin_state" = match ] || {
+    printf 'roundhouse: automatic hook approval for %s refused: Codex has not synced to %s yet; the next pass retries\n' \
+      "$1" "${fleet_run_expected_sha:-the expected bytes}" >&2
+    return 75
+  }
   # Codex advances its own copies (its startup sync), so a hook this host
   # trusted reads `modified` once upstream changed it. Automatic approval
   # carries that trust only for bytes PROVEN to be the verified upstream ones

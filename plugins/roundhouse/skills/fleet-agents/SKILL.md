@@ -201,10 +201,15 @@ the full pass, is handled BEFORE the item loop:
   the Codex side and are not attempted.
 - **Hook trust:** after Claude installs or updates an enabled fleet plugin
   that Codex also has installed and enabled, the item loop verifies that
-  Codex's copy is from the same plugin source, then runs automatic approval
-  against it (a disabled Codex copy is left alone). Automatic approval
-  refuses a hook that is untrusted or `modified`, so a fleet plugin whose
-  hooks changed upstream holds until they are approved. Hooks of third-party
+  Codex's copy is from the same plugin source and runs automatic approval
+  against it (a disabled Codex copy is left alone). The run never reinstalls
+  Codex's copy; a copy Codex has not synced to the expected SHA holds
+  ("Codex has not synced to SHA yet; the next pass retries"). Automatic
+  approval only carries existing trust: a never-trusted hook is refused, and
+  a `modified` one is re-trusted at its new hash only when, inside the one
+  app server session that writes the trust, the copy is still at the
+  expected SHA, its tree is byte-identical to Claude's verified install, and
+  every hook hash is unchanged since it was listed. Hooks of third-party
   Codex plugins that change upstream stay untrusted until the operator
   approves them (`roundhouse approve-codex-plugin-hooks PLUGIN@MARKETPLACE`),
   as Codex itself leaves them.
