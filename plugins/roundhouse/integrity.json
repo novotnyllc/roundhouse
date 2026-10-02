@@ -50,7 +50,7 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
-      "sha256": "43bd250ee28f981d95a76a19f50b49d30e02f28f73912418542bb6a806320259"
+      "sha256": "7b55a57d6605a886c161f6f5425f5b951ae7f7d84c4f2ffdcfcb31c2929cbe97"
     },
     {
       "path": "scripts/codex-plugin-hooks.ps1",
@@ -138,7 +138,7 @@
     },
     {
       "path": "scripts/lib/fleet-plugins.sh",
-      "sha256": "bdd46e9f9c0381763954aba94efd807a6e34eead9df33d594bae5998884e1fe6"
+      "sha256": "ba5d6ea969e2feeca5320c3f5db17c977a8a64cf58e87f6ddd5e20f4507808d2"
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
@@ -298,7 +298,7 @@
     },
     {
       "path": "skills/fleet-agents/SKILL.md",
-      "sha256": "aba804143665f356e609e886be9650ecd264b7e0460de9956311efd7846fce04"
+      "sha256": "e1217c0388ce99b92f237555d80d9c20f8ea9ec5b8edc2c866f8e87be076012a"
     },
     {
       "path": "skills/fleet-agents/agents/openai.yaml",

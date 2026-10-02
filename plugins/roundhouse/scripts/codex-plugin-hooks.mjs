@@ -383,19 +383,36 @@ function codexJson(codexExecutable, args) {
   });
 }
 
+// The catalog layouts Codex reads from a marketplace root, in its order.
+const CATALOG_PATHS = [
+  [".agents", "plugins", "marketplace.json"],
+  [".agents", "plugins", "api_marketplace.json"],
+  [".claude-plugin", "marketplace.json"],
+  [".cursor-plugin", "marketplace.json"],
+];
+
+function readCatalog(root) {
+  for (const parts of CATALOG_PATHS) {
+    try {
+      return JSON.parse(readFileSync(join(root, ...parts), "utf8"));
+    } catch {
+      // Absent or unreadable: try the next layout.
+    }
+  }
+  return null;
+}
+
 function catalogPluginsCurrent(root, marketplaceName, installed) {
   // Every ENABLED installed plugin from this marketplace is at the identity
   // the catalog at ROOT names for it: a pinned entry's `source.sha`, or, for
   // an in-repo entry, an installed tree byte-identical to the clone's plugin
   // tree (the same comparison approval uses — contents can change without a
-  // version bump). An unpinned remote entry names no identity to wait for,
-  // and is not waited on.
-  let catalog;
-  try {
-    catalog = JSON.parse(readFileSync(join(root, ".agents", "plugins", "marketplace.json"), "utf8"));
-  } catch {
-    return false;
-  }
+  // version bump). An unpinned remote entry names no identity to wait for:
+  // it makes the root UNCONFIRMED rather than current. Returns "current",
+  // "unconfirmed", or "pending".
+  const catalog = readCatalog(root);
+  if (catalog === null) return "pending";
+  let unconfirmed = false;
   const entries = new Map((Array.isArray(catalog?.plugins) ? catalog.plugins : []).map((entry) => [entry?.name, entry]));
   for (const record of installed) {
     if (record?.marketplaceName !== marketplaceName || record?.installed === false || record?.enabled !== true) continue;
@@ -403,22 +420,29 @@ function catalogPluginsCurrent(root, marketplaceName, installed) {
     if (!entry) continue;
     const source = entry.source;
     if (source && typeof source === "object" && typeof source.sha === "string") {
-      if (record.source?.sha !== source.sha) return false;
+      if (record.source?.sha !== source.sha) return "pending";
       continue;
     }
     const relative = typeof source === "string" ? source : source?.source === "local" ? source.path : null;
-    if (typeof relative !== "string") continue;
+    if (typeof relative !== "string") {
+      unconfirmed = true;
+      continue;
+    }
     if (
       typeof record.version !== "string" ||
       [marketplaceName, record.name, record.version].some((part) => !part || part === "." || part === ".." || /[\\/]/.test(part))
     ) {
-      return false;
+      return "pending";
     }
     const installedTree = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "plugins", "cache", marketplaceName, record.name, record.version);
-    if (!treesIdentical(installedTree, join(root, relative))) return false;
+    if (!treesIdentical(installedTree, join(root, relative))) return "pending";
   }
-  return true;
+  return unconfirmed ? "unconfirmed" : "current";
 }
+
+// How long the server stays open for an unconfirmed root's reinstalls once
+// everything confirmable is current: they cannot be awaited, only given time.
+const UNCONFIRMED_GRACE_MS = Number(process.env.ROUNDHOUSE_CODEX_UNCONFIRMED_GRACE_MS || 10_000);
 
 async function syncMarketplaces(targets, waitMs, codexExecutable) {
   // Codex syncs its Git marketplaces — and reinstalls the plugins installed
@@ -441,6 +465,7 @@ async function syncMarketplaces(targets, waitMs, codexExecutable) {
     for (;;) {
       let installed = null;
       const missing = [];
+      const unconfirmed = [];
       for (const [root, revision] of targets) {
         if (marketplaceRevision(root) !== revision || !names.get(root)) {
           missing.push(root);
@@ -453,9 +478,14 @@ async function syncMarketplaces(targets, waitMs, codexExecutable) {
             installed = undefined;
           }
         }
-        if (!Array.isArray(installed) || !catalogPluginsCurrent(root, names.get(root), installed)) missing.push(root);
+        const state = Array.isArray(installed) ? catalogPluginsCurrent(root, names.get(root), installed) : "pending";
+        if (state === "pending") missing.push(root);
+        else if (state === "unconfirmed") unconfirmed.push(root);
       }
-      if (!missing.length || Date.now() >= deadline) return missing;
+      if (!missing.length && unconfirmed.length) {
+        await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(UNCONFIRMED_GRACE_MS, deadline - Date.now()))));
+      }
+      if (!missing.length || Date.now() >= deadline) return { missing, unconfirmed };
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }, codexExecutable);
@@ -533,8 +563,8 @@ async function main() {
     const targets = [];
     for (let index = 0; index < pairs.length; index += 2) targets.push([pairs[index], pairs[index + 1]]);
     const waitMs = Number(process.env.ROUNDHOUSE_CODEX_SYNC_WAIT_MS || 30_000);
-    const missing = await syncMarketplaces(targets, waitMs, syncExecutable);
-    process.stdout.write(`${JSON.stringify({ synced: targets.length - missing.length, missing })}\n`);
+    const { missing, unconfirmed } = await syncMarketplaces(targets, waitMs, syncExecutable);
+    process.stdout.write(`${JSON.stringify({ synced: targets.length - missing.length, missing, unconfirmed })}\n`);
     if (missing.length) process.exitCode = 75;
     return;
   }

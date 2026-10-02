@@ -147,12 +147,13 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
         [ ! -s "$PC_CODEX_SYNC_TO" ] || (sleep 1
           kill -0 "$server" 2>/dev/null || exit 0
           rev=$(cat "$PC_CODEX_SYNC_TO")
-          mkdir -p "$PC_CODEX_ROOT/.agents/plugins"
+          pc_catalog_dir=$PC_CODEX_ROOT/${PC_CODEX_CATALOG_DIR:-.agents/plugins}
+          mkdir -p "$pc_catalog_dir"
           jq -n --arg rev "$rev" '{name: "novotnyllc", plugins: [
             {name: "demo", source: {source: "git-subdir", url: "https://example.invalid/demo.git", path: "plugins/demo", sha: $rev}},
             {name: "loose", source: {source: "url", url: "https://example.invalid/loose.git"}},
             {name: "inrepo", source: "./plugins/inrepo"}]}' \
-            >"$PC_CODEX_ROOT/.agents/plugins/marketplace.json"
+            >"$pc_catalog_dir/marketplace.json"
           # The in-repo plugin changes contents at this revision WITHOUT a
           # version bump.
           mkdir -p "$PC_CODEX_ROOT/plugins/inrepo/.codex-plugin"
@@ -198,10 +199,11 @@ SH
       >"$CODEX_HOME/plugins/cache/novotnyllc/inrepo/1/.codex-plugin/plugin.json"
     printf 'old\n' >"$CODEX_HOME/plugins/cache/novotnyllc/inrepo/1/README.md"
     # demo is pinned (waited on until reinstalled); loose is an unpinned
-    # remote entry with no identity in the catalog (not waited on).
+    # remote entry with no identity in the catalog — disabled here, so the
+    # marketplace can be confirmed; enabled below, it leaves it unconfirmed.
     printf '%s\n' '{"installed":[
       {"pluginId":"demo@novotnyllc","name":"demo","marketplaceName":"novotnyllc","version":"1","installed":true,"enabled":true,"source":{"source":"git-subdir","sha":"old"}},
-      {"pluginId":"loose@novotnyllc","name":"loose","marketplaceName":"novotnyllc","version":"1","installed":true,"enabled":true,"source":{"source":"url"}},
+      {"pluginId":"loose@novotnyllc","name":"loose","marketplaceName":"novotnyllc","version":"1","installed":true,"enabled":false,"source":{"source":"url"}},
       {"pluginId":"inrepo@novotnyllc","name":"inrepo","marketplaceName":"novotnyllc","version":"1","installed":true,"enabled":true,"source":{"source":"local"}}]}' \
       >"$PC_CODEX_INSTALLED"
     jq -n --arg root "$pc/codex-root" --arg url "$pc/codex-up.git" '{marketplaces: [
@@ -300,8 +302,41 @@ SH
     pc_out=$(node "$script_dir/codex-plugin-hooks.mjs" sync \
       --codex-executable "$pc/bin/codex" "$pc/codex-root" "$pc_codex_head") ||
       fail "sync with an explicit Codex executable failed: $pc_out"
-    [ "$(cat "$PC_CODEX_LOG")" = app-server ] && [ "$pc_out" = '{"synced":1,"missing":[]}' ] ||
+    [ "$(cat "$PC_CODEX_LOG")" = app-server ] && [ "$pc_out" = '{"synced":1,"missing":[],"unconfirmed":[]}' ] ||
       fail "sync did not start the named Codex executable: $pc_out $(tr '\n' ';' <"$PC_CODEX_LOG")"
+    # An ENABLED unpinned remote install has no identity to wait on: the root
+    # syncs but is UNCONFIRMED, the server is held open for its grace, and the
+    # pass does not remember the head, so the next pass syncs it again.
+    jq '(.installed[] | select(.name == "loose") | .enabled) = true' "$PC_CODEX_INSTALLED" \
+      >"$PC_CODEX_INSTALLED.tmp" && mv "$PC_CODEX_INSTALLED.tmp" "$PC_CODEX_INSTALLED"
+    pc_status=0
+    pc_out=$(ROUNDHOUSE_CODEX_UNCONFIRMED_GRACE_MS=200 node "$script_dir/codex-plugin-hooks.mjs" sync \
+      --codex-executable "$pc/bin/codex" "$pc/codex-root" "$pc_codex_head") || pc_status=$?
+    [ "$pc_status" -eq 0 ] &&
+      [ "$(printf '%s' "$pc_out" | jq -c '[.synced, .missing, .unconfirmed]')" = "[1,[],[\"$pc/codex-root\"]]" ] ||
+      fail "an enabled unpinned install did not leave the root unconfirmed (got $pc_status): $pc_out"
+    (
+      PATH="$pc/bin:$PATH"
+      pc_codex_head=$(pc_commit codex-up 'an unpinned release')
+      printf '%s\n' "$pc_codex_head" >"$PC_CODEX_SYNC_TO"
+      fleet_plugins_probe || fail "a moved Codex marketplace did not read as moved"
+      pc_out=$(ROUNDHOUSE_CODEX_UNCONFIRMED_GRACE_MS=200 \
+        fleet_plugins_refresh "$pc/store" vireo '{}' '{}' fast "$pc")
+      [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" != "$pc_codex_head" ] ||
+        fail "an unconfirmed Codex sync was remembered as done: $pc_out"
+    )
+    jq '(.installed[] | select(.name == "loose") | .enabled) = false' "$PC_CODEX_INSTALLED" \
+      >"$PC_CODEX_INSTALLED.tmp" && mv "$PC_CODEX_INSTALLED.tmp" "$PC_CODEX_INSTALLED"
+    # Codex reads other catalog layouts too: a marketplace whose catalog is
+    # `.claude-plugin/marketplace.json` alone is confirmed, not left missing.
+    rm -rf "$pc/codex-root/.agents"
+    pc_status=0
+    pc_out=$(PC_CODEX_CATALOG_DIR=.claude-plugin ROUNDHOUSE_CODEX_SYNC_WAIT_MS=8000 \
+      node "$script_dir/codex-plugin-hooks.mjs" sync --codex-executable "$pc/bin/codex" \
+      "$pc/codex-root" "$(cat "$PC_CODEX_SYNC_TO")") || pc_status=$?
+    [ "$pc_status" -eq 0 ] && [ "$(printf '%s' "$pc_out" | jq -c '.missing')" = '[]' ] ||
+      fail "a marketplace with a .claude-plugin catalog was left missing (got $pc_status): $pc_out"
+    rm -rf "$pc/codex-root/.claude-plugin"
 
     # The run hands the refresh its whole desired universe (fleet_run_desired:
     # the fold plus tombstones), not the bare fold, which drops `absent`.

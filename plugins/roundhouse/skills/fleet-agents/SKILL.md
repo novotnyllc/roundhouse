@@ -891,8 +891,13 @@ until each root records its revision and every enabled plugin installed from
 it is at that revision's catalog identity (30s at most; Codex records the
 revision before it reinstalls), and exits 75 for any it did not reach. The
 helper is the verified target's own, beside `"$TARGET_CLI"`; never send the
-controller's `SKILL_DIR` copy over SSH. Unpinned remote catalog entries carry
-no identity to wait on; Codex's own startup sync completes them.
+controller's `SKILL_DIR` copy over SSH. An enabled install from an unpinned
+remote catalog entry carries no identity to wait on: `sync` holds the server
+open for a short grace and reports the root `unconfirmed`, and the pass does
+not remember its head, so every fast pass syncs it again. `sync` reads the
+catalog from each layout Codex supports (`.agents/plugins/marketplace.json`,
+`.agents/plugins/api_marketplace.json`, `.claude-plugin/marketplace.json`,
+`.cursor-plugin/marketplace.json`).
 
 Hook trust then follows two rules:
 

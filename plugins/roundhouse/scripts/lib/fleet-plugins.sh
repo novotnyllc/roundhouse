@@ -357,10 +357,14 @@ fleet_plugins_codex_sync() {
   # sync left at the head proves nothing about the plugins.
   fleet_plugins_cs_out=$(run_bounded 45 "$fleet_plugins_cs_node" \
     "$script_dir/codex-plugin-hooks.mjs" sync "${fleet_plugins_cs_args[@]}" 2>/dev/null </dev/null) || :
+  # An UNCONFIRMED root synced but has unpinned remote installs whose
+  # reinstall cannot be awaited: its head is not remembered, so the next pass
+  # syncs it again rather than trusting a reinstall that may have been cut off.
   fleet_plugins_cs_missing='*unknown*'
   [ -z "$fleet_plugins_cs_out" ] ||
     fleet_plugins_cs_missing=$(printf '%s\n' "$fleet_plugins_cs_out" |
-      jq -r '.missing | if type == "array" then .[] else error("shape") end' 2>/dev/null) ||
+      jq -r '(.missing | if type == "array" then .[] else error("shape") end),
+        (.unconfirmed // [] | if type == "array" then .[] else error("shape") end)' 2>/dev/null) ||
     fleet_plugins_cs_missing='*unknown*'
   while IFS=$fleet_run_sep read -r fleet_plugins_cs_m fleet_plugins_cs_head \
     fleet_plugins_cs_root; do
