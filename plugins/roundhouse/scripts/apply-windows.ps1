@@ -2020,6 +2020,18 @@ function Resolve-NodeSwitchInflight([string]$Root) {
     return "restored the interrupted Node switch to its old default $Old (verified)"
 }
 
+function Get-SourceNpmVersion([string]$NpmPath, [object]$Detail) {
+    # The newer of what NPMPATH reports running (`npm --version`) and the npm
+    # its global listing holds. Throws when the running version is unknown.
+    $Running = ([string](& $script:NodeOps.NpmText $NpmPath $null @("--version"))).Trim()
+    if ($Running -cnotmatch '^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$') {
+        throw "cannot establish the version of the npm that owns the globals ($NpmPath --version); nothing switched"
+    }
+    $Listed = if ($Detail.Globals.ContainsKey("npm")) { $Detail.Globals["npm"] } else { $null }
+    if (Test-NodeReleaseNewer $Listed $Running) { return $Listed }
+    return $Running
+}
+
 function Invoke-NodeFnmMigration {
     # The bootstrap's runtime step: leave a default already in MAJOR alone;
     # otherwise install the newest release in MAJOR and make it the default,
@@ -2053,7 +2065,13 @@ function Invoke-NodeFnmMigration {
     }
     $Carry = @(@($Detail.Globals.Keys) | Where-Object { $Bundled -cnotcontains $_ } |
         ForEach-Object { [ordered]@{ name = $_; version = $Detail.Globals[$_] } })
-    $SourceNpmVersion = if ($Detail.Globals.ContainsKey("npm")) { $Detail.Globals["npm"] } else { $null }
+    # The npm that owns the globals now, measured by running it: on the first
+    # migration that is the MSI's npm.cmd, whose own npm (under Program
+    # Files, or a newer one it defers to) is not in the %APPDATA%\npm listing.
+    # The carry is never staged with an older npm (npm 12 honours
+    # allow-scripts; an older one runs every install script), so an npm
+    # version that cannot be established refuses.
+    $SourceNpmVersion = Get-SourceNpmVersion $Source $Detail
     Invoke-NodeSwitchCore -Root $Root -Old $Default -Target $Target -Carry $Carry -Hooks @() -SourceNpmVersion $SourceNpmVersion
     return @{ Switched = $true; Old = $Default; Default = $Target; Carry = $Carry }
 }
@@ -2252,6 +2270,12 @@ $script:NodeSelfTestOps = @{
         $Fake = $script:NodeSelfTestFake
         $Effective = Get-NodeSelfTestPrefix $NpmPath $Prefix
         if ($Arguments[0] -ceq "prefix") { return $(if ($Fake.ForeignPrefix) { "C:\elsewhere\npm" } else { $Effective }) }
+        if ($Arguments[0] -ceq "--version") {
+            if ($Fake.NpmVersionFail) { return "" }
+            if ($Fake.RunningNpm) { return $Fake.RunningNpm }
+            $Own = (Read-NodeSelfTestGlobals $Effective)["npm"]
+            return $(if ($Own) { $Own } else { $Fake.BundledNpm })
+        }
         $Dependencies = [ordered]@{}
         $Globals = Read-NodeSelfTestGlobals $Effective
         foreach ($Key in $Globals.Keys) { $Dependencies[$Key] = @{ version = $Globals[$Key] } }
@@ -2285,7 +2309,8 @@ function Reset-NodeSelfTestTree {
     $Fake = $script:NodeSelfTestFake
     Remove-Item -LiteralPath $Fake.Root -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $script:NodeSwitchStateDir -Recurse -Force -ErrorAction SilentlyContinue
-    foreach ($Key in @("FailInstall", "FailFnmInstall", "FailUnalias", "Linked", "ForeignPrefix")) { $Fake[$Key] = $false }
+    foreach ($Key in @("FailInstall", "FailFnmInstall", "FailUnalias", "Linked", "ForeignPrefix", "NpmVersionFail")) { $Fake[$Key] = $false }
+    $Fake.RunningNpm = $null
     $Fake.HookExit = 0
     $Fake.DefaultOnly = $null
     $Fake.BundledNpm = "11.0.0"
@@ -2480,6 +2505,9 @@ function Invoke-NodeSwitchSelfTest([string]$Root) {
             $null -ne (Read-NodeSwitchMarker)) {
             throw "Node switch self-test: the bootstrap did not carry the MSI globals into the first fnm default"
         }
+        if (@($Fake.Log | Where-Object { $_ -like "npm-self 12.1.0 *" }).Count -ne 1) {
+            throw "Node switch self-test: the bootstrap did not bring npm up to the MSI's"
+        }
         $Fake.Log.Clear()
         $Again = Invoke-NodeFnmMigration -Root $Fnm -Major 26 -SourceNpm $MsiNpm
         if ($Again.Switched -or $Fake.Log.Count -ne 0) { throw "Node switch self-test: a bootstrap rerun was not idempotent" }
@@ -2496,6 +2524,30 @@ function Invoke-NodeSwitchSelfTest([string]$Root) {
         Assert-NodeSelfTestThrows { [void](Invoke-NodeFnmMigration -Root $Fnm -Major 27 -SourceNpm $MsiNpm) } `
             "*does not name an installed version*" "a bootstrap over an unreadable default"
         [IO.Directory]::Delete((Get-FnmAliasDir $Fnm), $false)
+        # The MSI's own npm (12, under Program Files, so not in the
+        # %APPDATA%\npm listing) is measured by running it: the target's
+        # bundled npm 11 is brought up to 12 before any global is installed,
+        # and an npm whose version cannot be read refuses.
+        Remove-Item -LiteralPath $Fnm -Recurse -Force -ErrorAction SilentlyContinue
+        Set-NodeSelfTestGlobal $MsiPrefix "npm" ""
+        $Fake.Log.Clear()
+        $Fake.NpmVersionFail = $true
+        Assert-NodeSelfTestThrows { [void](Invoke-NodeFnmMigration -Root $Fnm -Major 26 -SourceNpm $MsiNpm) } `
+            "*cannot establish the version*" "a bootstrap whose npm version is unknown"
+        if ($null -ne (Get-FnmDefaultVersion $Fnm) -or @($Fake.Log | Where-Object { $_ -like "npm*" }).Count -ne 0) {
+            throw "Node switch self-test: a bootstrap with an unknown npm version staged"
+        }
+        $Fake.NpmVersionFail = $false
+        $Fake.RunningNpm = "12.1.0"
+        [void](Invoke-NodeFnmMigration -Root $Fnm -Major 26 -SourceNpm $MsiNpm)
+        $Staging = @($Fake.Log | Where-Object { $_ -like "npm*" })
+        if ($Staging.Count -lt 2 -or $Staging[0] -notlike "npm-self 12.1.0 *" -or
+            @($Staging | Select-Object -Skip 1 | Where-Object { $_ -like "npm-self*" }).Count -ne 0 -or
+            (Read-NodeSelfTestGlobals (Get-FnmInstallation $Fnm "v26.10.0"))["npm"] -cne "12.1.0") {
+            throw "Node switch self-test: the MSI's npm 12 was not brought up before the globals: $($Staging -join ' | ')"
+        }
+        $Fake.RunningNpm = $null
+        Set-NodeSelfTestGlobal $MsiPrefix "npm" "12.1.0"
         # A first default that cannot be verified is removed again: the MSI
         # stays the runtime and nothing claims otherwise.
         Remove-Item -LiteralPath $Fnm -Recurse -Force -ErrorAction SilentlyContinue

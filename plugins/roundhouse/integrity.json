@@ -42,7 +42,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "eb65dbbd0cd6ab776435f4e198cec414626269d1a39a846d937d5be15883be11"
+      "sha256": "6fbeff1981210840f70b483d2e58f1e52c9d8e237d883031fde8fa62415d6e8f"
     },
     {
       "path": "scripts/certify-ssh-node",
