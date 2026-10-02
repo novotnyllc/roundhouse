@@ -157,8 +157,10 @@ executor right before running it:
 2. On POSIX, `<prefix>/bin/<argv[0]>` resolves through its symlinks to a path
    inside `<root>/<name>/`. A same-named bin from another package, or a file
    someone placed there by hand, fails. On Windows, the npm shim
-   `<prefix>\<bin>.cmd` must exist; shims are not links, so the
-   package-declares-it check is the binding.
+   `<prefix>\<bin>.cmd` must exist and name the package's own code
+   (`"%dp0%\node_modules\<name>\…"`, as npm's cmd-shim writes it); shims are
+   not links, so that line is the binding (`node-fnm-windows.ps1`
+   `Get-PackageBinPath`, since 0.9.47; before it, declaration alone was).
 3. It runs by absolute path, with npm's own directory first on PATH, stdin
    closed.
 
@@ -258,8 +260,8 @@ also covers the pin parser.
 - `npm outdated`'s `latest` can be lower than an installed prerelease. The
   full pass would then move to `latest`, and a sealed plan would show it as
   the candidate. No semver comparison is attempted.
-- The Windows updater proof checks declaration plus shim existence, not link
-  targets (2.4).
+- The Windows updater and hook proof reads the `.cmd` shim's text for the
+  package path rather than resolving a link (2.4).
 - A sealed updater can still race a release published between the registry
   check and the updater's own lookup. The post-check turns that into
   `partial` (2.4).
@@ -348,9 +350,9 @@ npm records. `switch_inflight` is the Windows switch's record reduced to
 `shadowed_by: "fnm:node"`, `managed: false` and `update_available: false`:
 the MSI stays installed but is unmanaged, never drift to upgrade. Two cases
 are reported, never read as "no fnm": a default alias that names no installed
-version (`packages:fnm`, `fnm_default_unreadable`), and an fnm default whose
-npm reports a global prefix outside fnm, from an npmrc `prefix=` or
-`NPM_CONFIG_PREFIX` (`packages:fnm-node`, `fnm_npm_prefix_foreign`; no
+version, or one that is dangling or has lost `node.exe`/`npm.cmd` (`packages:fnm`, `fnm_default_unreadable`), and an fnm default whose
+npm reports a global prefix other than that default's installation, from an
+npmrc `prefix=` or `NPM_CONFIG_PREFIX` (`packages:fnm-node`, `fnm_npm_prefix_foreign`; no
 `fnm:node` record, so no switch seals).
 
 Without fnm, the `winget:OpenJS.NodeJS` record carries `shadowed_by: null`
@@ -669,7 +671,10 @@ arm is new. The worker:
   record, `fnm default`, verify, each hook re-proved and run through the
   alias so a service it registers names a path that survives later
   switches, verify again, clear the record). Verifying a default also
-  requires its npm's `prefix --global` to be fnm's. A failure after the flip
+  requires its npm's `prefix --global` to resolve (links followed) to that
+  default's installation in the same root. The preflight re-derives the
+  whole carry from the global set it lists itself, so a global installed
+  after the apply inventory refuses the switch rather than being stranded. A failure after the flip
   restores the old default and verifies it, or leaves the record. Every
   failure carries the failing command's own output tail, as a failed sealed
   argv does;
@@ -701,7 +706,8 @@ pwsh -NoProfile -File <plugin>\scripts\apply-windows.ps1 -BootstrapNodeFnm -Node
    the current npm lists (on the first run the MSI's `%APPDATA%\npm`: npm,
    `@bitkyc08/opencodex` and the rest) at its exact version, through the same
    staging and flip as the sealed switch. A default already in the major is
-   left alone; a linked or `file:` global refuses, naming it.
+   left alone (the sealed lane moves it within the major, with its hooks); a
+   linked or `file:` global refuses, naming it.
 4. `<FNM_DIR>\aliases\default` first on the user `Path` (read raw, so `%VAR%`
    entries and the value kind survive).
 

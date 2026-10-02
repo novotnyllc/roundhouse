@@ -1720,7 +1720,8 @@ function Test-NodeDefaultVerified([string]$Root, [string]$Version) {
     if ((Get-FnmDefaultVersion $Root) -cne $Version -or (Get-FnmRoot) -cne $Root) { return $false }
     $AliasBin = Get-FnmAliasBinDir $Root
     if (([string](& $script:NodeOps.NodeVersion $AliasBin)).Trim() -cne $Version) { return $false }
-    return Test-FnmNpmPrefix ([string](& $script:NodeOps.NpmText (Get-NodeToolPath $AliasBin "npm") $null @("prefix", "--global")))
+    return Test-FnmNpmPrefix ([string](& $script:NodeOps.NpmText (Get-NodeToolPath $AliasBin "npm") $null @("prefix", "--global"))) `
+        $Root $Version
 }
 
 function Invoke-NodeSwitchCore {
@@ -1839,15 +1840,20 @@ function Invoke-NodeRuntimeSwitch([string]$Target, [object[]]$Carry, [object[]]$
         $Old = Get-FnmDefaultVersion $Root
         if ($null -eq $Old) { throw "the fnm default alias does not name an installed version" }
         $AliasNpm = Get-NodeToolPath (Get-FnmAliasBinDir $Root) "npm"
-        if (-not (Test-FnmNpmPrefix ([string](& $script:NodeOps.NpmText $AliasNpm $null @("prefix", "--global"))))) {
+        if (-not (Test-FnmNpmPrefix ([string](& $script:NodeOps.NpmText $AliasNpm $null @("prefix", "--global"))) $Root $Old)) {
             throw "the fnm default's npm keeps its globals outside fnm (an npmrc prefix= or NPM_CONFIG_PREFIX); refusing the switch"
         }
         $Before = Get-NpmGlobalDetail $AliasNpm $null
-        # The carry reproduces what is installed now; it never introduces a package.
-        foreach ($Item in @($Carry)) {
-            if (-not $Before.Globals.ContainsKey([string]$Item.name) -or $Before.Globals[[string]$Item.name] -cne [string]$Item.version) {
-                throw "the carry is not what is installed under $Old; refusing the switch"
-            }
+        # The carry is exactly what is installed now, re-derived here: it
+        # never introduces a package, and a global installed (or relinked)
+        # since the apply inventory is never stranded under the old version.
+        $Bundled = Get-NodeTargetBundled $Target
+        $Installed = @(@($Before.Globals.Keys) + @($Before.Unpinnable) | Where-Object { $Bundled -cnotcontains $_ } | Sort-Object -Unique)
+        $Carried = @(@($Carry) | ForEach-Object { [string]$_.name } | Sort-Object -Unique)
+        if (@($Before.Unpinnable | Where-Object { $Bundled -cnotcontains $_ }).Count -gt 0 -or
+            ($Installed -join "`0") -cne ($Carried -join "`0") -or
+            @(@($Carry) | Where-Object { $Before.Globals[[string]$_.name] -cne [string]$_.version }).Count -gt 0) {
+            throw "the carry is not what is installed under $Old; refusing the switch"
         }
         $CarriedNames = @(@($Carry) | ForEach-Object { [string]$_.name })
         foreach ($Hook in @($Hooks)) {
@@ -1880,8 +1886,10 @@ function Assert-NoNodeSwitchInflight {
 #   1. fnm, user scope: winget (Schniz.fnm, --scope user), else the pinned
 #      official release, verified by SHA-256, into %LOCALAPPDATA%\fnm.
 #   2. FNM_DIR, a user variable; a switch recorded in flight is restored first.
-#   3. The newest release in the major as the fnm default, carrying every
-#      global the current npm has (the MSI's %APPDATA%\npm on first run) at its
+#   3. Unless the fnm default is already in the major (the sealed lane then
+#      moves it within the major, running the host's post-switch hooks), the
+#      newest release in the major as the fnm default, carrying every global
+#      the current npm has (the MSI's %APPDATA%\npm on first run) at its
 #      exact version.
 #   4. The default alias first on the user PATH.
 # The MSI stays installed (removing it needs elevation). The collector then
@@ -2095,6 +2103,19 @@ function Get-NodeSelfTestShim([string]$Prefix, [string]$Bin) {
     return Join-Path (Join-Path $Prefix "bin") $Bin
 }
 
+function Set-NodeSelfTestShim([string]$Prefix, [string]$Name, [string]$Bin) {
+    # npm's shim for a bin of NAME: a `.cmd` naming the package on Windows,
+    # a link into it elsewhere.
+    $Shim = Get-NodeSelfTestShim $Prefix $Bin
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $Shim))
+    Remove-Item -LiteralPath $Shim -Force -ErrorAction SilentlyContinue
+    if ($script:FnmOnWindows) {
+        Set-Content -LiteralPath $Shim -Value ('"%_prog%"  "%dp0%\node_modules\' + ($Name -replace '/', '\') + '\cli.js" %*')
+    } else {
+        [void](New-Item -ItemType SymbolicLink -Path $Shim -Target ("../lib/node_modules/" + $Name + "/cli.js"))
+    }
+}
+
 function Get-NodeSelfTestPrefix([string]$NpmPath, [string]$Prefix) {
     if ($Prefix) { return $Prefix }
     $Dir = Split-Path -Parent $NpmPath
@@ -2125,11 +2146,10 @@ function Set-NodeSelfTestGlobal([string]$Prefix, [string]$Name, [string]$Version
     }
     [void][IO.Directory]::CreateDirectory($PackageDir)
     $BinMap = [ordered]@{}
+    Set-Content -LiteralPath (Join-Path $PackageDir "cli.js") -Value ""
     foreach ($Bin in $Bins) {
         $BinMap[$Bin] = "cli.js"
-        $Shim = Get-NodeSelfTestShim $Prefix $Bin
-        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $Shim))
-        Set-Content -LiteralPath $Shim -Value "shim"
+        Set-NodeSelfTestShim $Prefix $Name $Bin
     }
     @{ name = $Name; version = $Version; bin = $BinMap } | ConvertTo-Json -Compress |
         Set-Content -LiteralPath (Join-Path $PackageDir "package.json")
@@ -2302,6 +2322,10 @@ function Invoke-NodeSwitchSelfTest([string]$Root) {
         Reset-NodeSelfTestTree
         Assert-NodeSelfTestThrows { [void](Invoke-NodeRuntimeSwitch "v26.10.0" @([ordered]@{ name = "plain"; version = "9.9.9" }) @()) } `
             "*carry is not what is installed*" "an invented carry"
+        Set-NodeSelfTestGlobal (Get-FnmInstallation $Fnm "v26.0.0") "late" "1.0.0"
+        Assert-NodeSelfTestThrows { [void](Invoke-NodeRuntimeSwitch "v26.10.0" $Carry $Hooks) } `
+            "*carry is not what is installed*" "a global installed after the inventory"
+        Set-NodeSelfTestGlobal (Get-FnmInstallation $Fnm "v26.0.0") "late" ""
         $Fake.ForeignPrefix = $true
         Assert-NodeSelfTestThrows { [void](Invoke-NodeRuntimeSwitch "v26.10.0" $Carry $Hooks) } "*outside fnm*" "a foreign npm prefix"
         $Fake.ForeignPrefix = $false

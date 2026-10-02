@@ -476,7 +476,8 @@ case "$1 ${2:-}" in
       mkdir -p "$prefix/lib/node_modules/$name" "$prefix/bin"
       if [ "$name" = @example/svc ]; then
         printf '{"name":"%s","bin":{"svc":"cli.js"}}\n' "$name" >"$prefix/lib/node_modules/$name/package.json"
-        cp "$IFN_HOOK" "$prefix/bin/svc"
+        cp "$IFN_HOOK" "$prefix/lib/node_modules/$name/cli.js"
+        ln -sfn "../lib/node_modules/$name/cli.js" "$prefix/bin/svc"
       else
         printf '{"name":"%s"}\n' "$name" >"$prefix/lib/node_modules/$name/package.json"
       fi

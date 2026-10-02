@@ -218,33 +218,79 @@ function Split-NpmGlobalList([object]$List) {
     return @{ Globals = $Globals; Unpinnable = [string[]]@($Unpinnable) }
 }
 
-function Test-FnmNpmPrefix([string]$Prefix) {
-    # npm's own answer to `prefix --global` names an fnm version (the
-    # installation, or the default alias it is read through): no npmrc
-    # `prefix=` or NPM_CONFIG_PREFIX sends the globals elsewhere, such as the
-    # MSI's %APPDATA%\npm.
-    if ([string]::IsNullOrWhiteSpace($Prefix)) { return $false }
-    $Path = $Prefix.Trim().TrimEnd('\', '/')
-    $Leaf = Split-Path -Leaf $Path
-    $Parent = Split-Path -Parent $Path
-    if ($Leaf -ceq "default") { return (Split-Path -Leaf $Parent) -ceq "aliases" }
-    return $Leaf -ceq "installation" -and (Test-NodeVersionText (Split-Path -Leaf $Parent)) -and
-        (Split-Path -Leaf (Split-Path -Parent $Parent)) -ceq "node-versions"
+function Get-RealPath([string]$Path) {
+    # PATH with every link and junction along it resolved (realpath), or
+    # $null when part of it does not exist. Links are followed at most 32
+    # times.
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathRooted($Path)) { return $null }
+    $Full = [IO.Path]::GetFullPath($Path.Trim())
+    $Hops = 0
+    $Done = [IO.Path]::GetPathRoot($Full)
+    $Rest = @($Full.Substring($Done.Length) -split '[\\/]' | Where-Object { $_ })
+    while ($Rest.Count -gt 0) {
+        $Next = Join-Path $Done $Rest[0]
+        $Rest = @($Rest | Select-Object -Skip 1)
+        try { $Item = Get-Item -LiteralPath $Next -Force -ErrorAction Stop } catch { return $null }
+        if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -and $null -ne $Item.Target) {
+            if (++$Hops -gt 32) { return $null }
+            $Target = ([string]@($Item.Target)[0] -replace '^\\\\\?\\', '' -replace '^\\\?\?\\', '')
+            if (-not [IO.Path]::IsPathRooted($Target)) { $Target = Join-Path $Done $Target }
+            $Target = [IO.Path]::GetFullPath($Target)
+            $Done = [IO.Path]::GetPathRoot($Target)
+            $Rest = @(@($Target.Substring($Done.Length) -split '[\\/]' | Where-Object { $_ }) + $Rest)
+            continue
+        }
+        $Done = $Next
+    }
+    return $Done.TrimEnd('\', '/')
+}
+
+function Test-SamePath([string]$A, [string]$B) {
+    if ($null -eq $A -or $null -eq $B) { return $false }
+    $Comparison = if ($script:FnmOnWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    return [string]::Equals($A, $B, $Comparison)
+}
+
+function Test-FnmNpmPrefix([string]$Prefix, [string]$Root, [string]$Version) {
+    # npm's own answer to `prefix --global` is VERSION's installation in this
+    # fnm ROOT (directly or through its `default` alias): no npmrc `prefix=`
+    # or NPM_CONFIG_PREFIX sends the globals elsewhere, to the MSI's
+    # %APPDATA%\npm or another fnm tree.
+    if ([string]::IsNullOrWhiteSpace($Prefix) -or -not (Test-NodeVersionText $Version)) { return $false }
+    return Test-SamePath (Get-RealPath $Prefix) (Get-RealPath (Get-FnmInstallation $Root $Version))
+}
+
+function Test-ShimOfPackage([string]$Shim, [string]$NpmRoot, [string]$Name) {
+    # The shim runs code inside package NAME: an npm `.cmd` shim names
+    # `%dp0%\node_modules\<name>\…`, and a POSIX bin link resolves under
+    # NPMROOT\NAME. A bin of the same name from another package, a stale or
+    # hand-placed file, is not this package's.
+    if ($Shim.EndsWith(".cmd", [StringComparison]::OrdinalIgnoreCase)) {
+        try { $Text = [IO.File]::ReadAllText($Shim) } catch { return $false }
+        $Needle = '"%dp0%\node_modules\' + ($Name -replace '/', '\') + '\'
+        return $Text.IndexOf($Needle, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    }
+    $Target = Get-RealPath $Shim
+    $Package = Get-RealPath (Join-Path $NpmRoot $Name)
+    if ($null -eq $Target -or $null -eq $Package) { return $false }
+    $Comparison = if ($script:FnmOnWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    return $Target.StartsWith($Package + [IO.Path]::DirectorySeparatorChar, $Comparison)
 }
 
 function Get-PackageBinPath([string]$NpmRoot, [string]$Prefix, [string]$Name, [string]$Bin) {
     # BIN as a bin the installed package NAME itself declares, found as npm's
-    # shim in PREFIX: the proof behind an updater and a post-switch hook.
-    # $null otherwise.
+    # shim in PREFIX and proven to run that package's code: the proof behind
+    # an updater and a post-switch hook. $null otherwise.
     $Manifest = Join-Path (Join-Path $NpmRoot $Name) "package.json"
     if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { return $null }
     try { $Package = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
     $Bins = if ($Package.bin -is [string]) { @(($Name -split '/')[-1]) }
         elseif ($null -ne $Package.bin) { @($Package.bin.PSObject.Properties.Name) } else { @() }
     if ($Bins -cnotcontains $Bin) { return $null }
-    foreach ($Candidate in @((Join-Path $Prefix "$Bin.cmd"), (Join-Path $Prefix "$Bin.exe"),
-        (Join-Path (Join-Path $Prefix "bin") $Bin))) {
-        if (Test-Path -LiteralPath $Candidate -PathType Leaf) { return $Candidate }
+    foreach ($Candidate in @((Join-Path $Prefix "$Bin.cmd"), (Join-Path (Join-Path $Prefix "bin") $Bin))) {
+        if ((Test-Path -LiteralPath $Candidate -PathType Leaf) -and (Test-ShimOfPackage $Candidate $NpmRoot $Name)) {
+            return $Candidate
+        }
     }
     return $null
 }
@@ -307,25 +353,46 @@ function Invoke-NodeFnmWindowsSelfTest {
             $null -ne (Split-NpmGlobalList ('{"error":{"code":"ENOTDIR"}}' | ConvertFrom-Json))) {
             throw "self_test_npm_global_split_unknown"
         }
-        foreach ($Good in @('C:\fnm\node-versions\v26.7.0\installation', 'C:\fnm\aliases\default\',
-            (Get-FnmInstallation $Root "v26.7.0"))) {
-            if (-not (Test-FnmNpmPrefix $Good)) { throw "self_test_fnm_prefix_refused: $Good" }
+        # npm's prefix must be this root's default installation (directly or
+        # through the alias), never another tree that merely looks like fnm.
+        $Other = Join-Path $Root "other-fnm"
+        New-Item -ItemType Directory -Path (Get-FnmInstallation $Other "v26.7.0") -Force | Out-Null
+        foreach ($Good in @((Get-FnmInstallation $Root "v26.7.0"), (Get-FnmAliasDir $Root), ((Get-FnmAliasDir $Root) + [IO.Path]::DirectorySeparatorChar))) {
+            if (-not (Test-FnmNpmPrefix $Good $Root "v26.7.0")) { throw "self_test_fnm_prefix_refused: $Good" }
         }
-        foreach ($Bad in @('C:\Users\u\AppData\Roaming\npm', '', 'C:\fnm\node-versions\v26.7.0', 'C:\x\default')) {
-            if (Test-FnmNpmPrefix $Bad) { throw "self_test_fnm_prefix_accepted: $Bad" }
+        foreach ($Bad in @((Get-FnmInstallation $Other "v26.7.0"), (Get-FnmInstallation $Root "v24.18.0"), (Join-Path $Root "npm"), "")) {
+            if (Test-FnmNpmPrefix $Bad $Root "v26.7.0") { throw "self_test_fnm_prefix_accepted: $Bad" }
         }
+        # A hook or updater bin is the declaring package's own shim: npm's
+        # `.cmd` naming that package, or a bin link into it.
         $Prefix = Get-FnmInstallation $Root "v26.7.0"
-        $Package = Join-Path (Get-FnmNpmRoot $Prefix) "@example/svc"
-        New-Item -ItemType Directory -Path $Package -Force | Out-Null
-        Set-Content -LiteralPath (Join-Path $Package "package.json") -Value '{"name":"@example/svc","bin":{"svc":"cli.js"}}'
-        if ($null -ne (Get-PackageBinPath (Get-FnmNpmRoot $Prefix) $Prefix "@example/svc" "svc")) {
-            throw "self_test_package_bin_without_shim"
+        $NpmRoot = Get-FnmNpmRoot $Prefix
+        foreach ($Name in @("@example/svc", "impostor")) {
+            New-Item -ItemType Directory -Path (Join-Path $NpmRoot $Name) -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path (Join-Path $NpmRoot $Name) "cli.js") -Value ""
+            Set-Content -LiteralPath (Join-Path (Join-Path $NpmRoot $Name) "package.json") -Value ('{"name":"' + $Name + '","bin":{"svc":"cli.js"}}')
         }
-        $Shim = if ($script:FnmOnWindows) { Join-Path $Prefix "svc.cmd" } else { Join-Path (Join-Path $Prefix "bin") "svc" }
-        Set-Content -LiteralPath $Shim -Value ""
-        if ((Get-PackageBinPath (Get-FnmNpmRoot $Prefix) $Prefix "@example/svc" "svc") -cne $Shim -or
-            $null -ne (Get-PackageBinPath (Get-FnmNpmRoot $Prefix) $Prefix "@example/svc" "other")) {
+        if ($null -ne (Get-PackageBinPath $NpmRoot $Prefix "@example/svc" "svc")) { throw "self_test_package_bin_without_shim" }
+        function Set-SelfTestShim([string]$Package) {
+            if ($script:FnmOnWindows) {
+                $Shim = Join-Path $Prefix "svc.cmd"
+                Set-Content -LiteralPath $Shim -Value ('@ECHO off' + "`r`n" + '"%_prog%"  "%dp0%\node_modules\' + ($Package -replace '/', '\') + '\cli.js" %*')
+                return $Shim
+            }
+            $Shim = Join-Path (Join-Path $Prefix "bin") "svc"
+            Remove-Item -LiteralPath $Shim -Force -ErrorAction SilentlyContinue
+            [void](New-Item -ItemType SymbolicLink -Path $Shim -Target ("../lib/node_modules/" + $Package + "/cli.js"))
+            return $Shim
+        }
+        $Shim = Set-SelfTestShim "impostor"
+        if ($null -ne (Get-PackageBinPath $NpmRoot $Prefix "@example/svc" "svc")) { throw "self_test_package_bin_of_another_package" }
+        $Shim = Set-SelfTestShim "@example/svc"
+        if ((Get-PackageBinPath $NpmRoot $Prefix "@example/svc" "svc") -cne $Shim -or
+            $null -ne (Get-PackageBinPath $NpmRoot $Prefix "@example/svc" "other")) {
             throw "self_test_package_bin_proof"
+        }
+        if ((Get-PackageBinPath (Get-FnmNpmRoot (Get-FnmAliasDir $Root)) (Get-FnmAliasDir $Root) "@example/svc" "svc") -eq $null) {
+            throw "self_test_package_bin_through_alias"
         }
         $script:NodeSwitchStateDir = Join-Path $Root "state"
         if ($null -ne (Read-NodeSwitchMarker)) { throw "self_test_marker_invented" }

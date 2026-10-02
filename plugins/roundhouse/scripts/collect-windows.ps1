@@ -2509,6 +2509,13 @@ if (Test-Section "packages") {
     # fnm".
     $script:FnmRuntimeRoot = Get-FnmRoot
     $script:FnmRuntimeDefault = $null
+    if ($null -eq $script:FnmRuntimeRoot) {
+        # A root whose alias exists but is broken (dangling, or its target
+        # lost node or npm) is still fnm: reported below, MSI shadowed.
+        $script:FnmRuntimeRoot = @(Get-FnmRootCandidates | Where-Object {
+            $null -ne (Get-Item -LiteralPath (Get-FnmAliasDir $_) -Force -ErrorAction SilentlyContinue)
+        }) | Select-Object -First 1
+    }
     if ($null -ne $script:FnmRuntimeRoot) {
         $script:FnmRuntimeDefault = Get-FnmDefaultVersion $script:FnmRuntimeRoot
         if ($null -eq $script:FnmRuntimeDefault) {
@@ -2696,7 +2703,8 @@ if ((Test-Section "packages") -and (@($Machine.package_managers) -contains "npm"
         # whose installed_version is fnm's default and whose candidate is the
         # newest published release in that major. It binds the global set and
         # the prefix, so a sealed switch stops verifying when either changes.
-        if ($null -ne $script:FnmRuntimeDefault -and -not (Test-FnmNpmPrefix $NpmPrefix)) {
+        if ($null -ne $script:FnmRuntimeDefault -and
+            -not (Test-FnmNpmPrefix $NpmPrefix $script:FnmRuntimeRoot $script:FnmRuntimeDefault)) {
             # npm keeps the globals somewhere else (an npmrc `prefix=` or
             # NPM_CONFIG_PREFIX): a switch could not carry them, so none is
             # offered.
