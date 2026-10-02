@@ -335,6 +335,9 @@ jobs:
           # and PASSES, so moving the suite here without this flag would have
           # silently stopped verifying the store's repository half.
           ROUNDHOUSE_REQUIRE_REAL_JJ: 'true'
+          # Both runner images ship pwsh; without this flag an image that
+          # dropped it would silently skip every Windows collector fixture.
+          ROUNDHOUSE_REQUIRE_PWSH: 'true'
         run: |
           chmod -R go-w plugins/roundhouse
           plugins/roundhouse/scripts/test-roundhouse

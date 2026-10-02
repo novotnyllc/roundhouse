@@ -10,13 +10,16 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 # (set whenever this runs from a git hook) aim every fixture `git -C` at the
 # real repository, JJ_* imports a real jj identity, and the CLI's own
 # ROUNDHOUSE_* inputs (fleet store, identity, trust root, config) would select
-# live material. None of them is a suite input, so drop them before anything
-# runs. ROUNDHOUSE_TEST_* survives: the runner's own selectors and the
-# product's self-test hooks, which 07 and the sections set themselves.
+# live material, and FNM_* (exported by `fnm env` in the operator's shell)
+# makes the npm and Node runtime resolvers, POSIX and Windows alike, take the
+# operator's real fnm default ahead of the fixture's. None of them is a suite
+# input, so drop them before anything runs. ROUNDHOUSE_TEST_* survives: the
+# runner's own selectors and the product's self-test hooks, which 07 and the
+# sections set themselves; so do the CI-only ROUNDHOUSE_REQUIRE_* gates.
 for rh_inherited in $(compgen -e); do
   case $rh_inherited in
-    ROUNDHOUSE_TEST_*|ROUNDHOUSE_REQUIRE_REAL_JJ) ;;
-    XDG_*|JJ_*|GIT_*|ROUNDHOUSE_*) unset "$rh_inherited" ;;
+    ROUNDHOUSE_TEST_*|ROUNDHOUSE_REQUIRE_REAL_JJ|ROUNDHOUSE_REQUIRE_PWSH) ;;
+    XDG_*|JJ_*|GIT_*|FNM_*|ROUNDHOUSE_*) unset "$rh_inherited" ;;
   esac
 done
 unset rh_inherited
@@ -556,6 +559,14 @@ fail() {
   printf 'FAIL: %s\n' "$*" >&2
   exit 1
 }
+
+# Every pwsh-gated fixture (the Windows collector, executor, interop and
+# scheduler blocks) runs only where pwsh exists and is skipped silently
+# otherwise. CI sets this so a runner image without pwsh fails the suite
+# instead of quietly dropping them.
+if [ "${ROUNDHOUSE_REQUIRE_PWSH:-false}" = true ] && [ -z "$pwsh_command" ]; then
+  fail "ROUNDHOUSE_REQUIRE_PWSH is set but pwsh is not on PATH"
+fi
 
 assert_contains() {
   case $1 in
