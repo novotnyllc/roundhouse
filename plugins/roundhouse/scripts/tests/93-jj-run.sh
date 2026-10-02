@@ -9,9 +9,10 @@
 # shellcheck shell=bash
 #
 # Part 1 is the two-host story; parts 2-3 the independent one-host scenarios;
-# parts 4-6 the §7.12.3 reviewed-ref scenarios, each on its own fresh fleet.
-# Split so no unit nears the 10-minute test cap on a macOS runner.
-# roundhouse-test: parts=6
+# parts 4-6 the §7.12.3 reviewed-ref scenarios; part 7 plugin currency; each
+# on its own fresh fleet. Split so no unit nears the 10-minute test cap on a
+# macOS runner.
+# roundhouse-test: parts=7
 
 runjj_root="$tmp/fleet-run-jj"
 mkdir -p "$runjj_root"
@@ -1492,8 +1493,6 @@ YAML
 }
 
 if [ "$real_jj_ok" = true ] && section_part 2; then
-  p0jj_block plugins p0jj_plugins \
-    'plugins skip the canary; the fast pass follows a moved marketplace, owned and not'
   p0jj_block tombstone p0jj_tombstone 'capped tombstone uninstall, then silent'
   p0jj_block takeover p0jj_takeover 'dead-holder lock takeover, alerted and published'
   p0jj_block compaction p0jj_compaction \
@@ -1523,4 +1522,8 @@ if [ "$real_jj_ok" = true ] && section_part 6; then
     'an origin forked from below the pushed head refused'
   p0jj_block catchup p0jj_catchup \
     'catch-up across a re-root: legacy local mark re-anchored when proved, refused when not'
+fi
+if [ "$real_jj_ok" = true ] && section_part 7; then
+  p0jj_block plugins p0jj_plugins \
+    'plugins skip the canary; the fast pass follows a moved marketplace, owned and not'
 fi
