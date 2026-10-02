@@ -112,7 +112,13 @@ shift
 [ -e "$SCHED_STATE/usermgr" ] || exit 1
 wants="$XDG_CONFIG_HOME/systemd/user/timers.target.wants"
 case $1 in
-  show-environment | daemon-reload | restart) ;;
+  show-environment | restart) ;;
+  daemon-reload)
+    # SCHED_RELOAD_FAIL: a manager that does not reload. stale.<unit> says it
+    # still runs an older copy of that unit (NeedDaemonReload).
+    [ -z "${SCHED_RELOAD_FAIL:-}" ] || exit 1
+    rm -f "$SCHED_STATE"/stale.*
+    ;;
   is-enabled)
     if [ -e "$SCHED_STATE/enabled.$2" ]; then printf 'enabled\n'
     else printf 'disabled\n'; exit 1; fi
@@ -128,6 +134,10 @@ case $1 in
       printf 'systemctl start-was-a-no-op\n' >>"$SCHED_LOG"
     ;;
   show)
+    if [ "$2 $3 $4" = '-p NeedDaemonReload --value' ]; then
+      if [ -e "$SCHED_STATE/stale.$5" ]; then printf 'yes\n'; else printf 'no\n'; fi
+      exit 0
+    fi
     [ "$2 $3 $4" = '-p ActiveState --value' ] || exit 64
     n=$(cat "$SCHED_STATE/running.$5" 2>/dev/null || printf 0)
     if [ "$n" -gt 0 ]; then
@@ -1270,6 +1280,30 @@ fleet_run_command --fast'
     sched_schedule install >/dev/null 2>&1 || fail "a repeat Linux install failed"
     ! grep -Eq 'systemctl --user (enable|restart|start|daemon-reload)' "$SCHED_LOG" ||
       fail "a repeat Linux install touched unchanged, active timers: $(cat "$SCHED_LOG")"
+    # A replaced unit runs only once the manager reloads it: the reload is
+    # required, and an install whose reload fails does not report success…
+    cp "$sched_units/roundhouse-fleet-fast.service" "$sched_root/fast.service.expected"
+    printf 'ExecStartPre=/bin/true\n' >>"$sched_units/roundhouse-fleet-fast.service"
+    sched_status=0
+    sched_out=$(SCHED_RELOAD_FAIL=1 sched_schedule install 2>&1) || sched_status=$?
+    [ "$sched_status" -ne 0 ] ||
+      fail "install reported success although the user manager did not reload the replaced unit: $sched_out"
+    case $sched_out in *'daemon-reload failed'*) ;; *) fail "the failed reload was not named: $sched_out" ;; esac
+    cmp -s "$sched_units/roundhouse-fleet-fast.service" "$sched_root/fast.service.expected" ||
+      fail "the install whose reload failed did not write the unit before the reload"
+    # …and the next one, finding the manager still on the older copy, reloads
+    # it and restarts the timer although nothing is rewritten.
+    : >"$SCHED_STATE/stale.roundhouse-fleet-fast.service"
+    : >"$SCHED_LOG"
+    sched_out=$(sched_schedule install 2>&1) || fail "the install after a failed reload failed: $sched_out"
+    case $sched_out in *'fleet-fast: unchanged'*'reloaded the user manager'*) ;;
+      *) fail "the install after a failed reload rewrote the unit or did not report the reload: $sched_out" ;; esac
+    grep -Fqx 'systemctl --user daemon-reload' "$SCHED_LOG" &&
+      grep -Fqx 'systemctl --user restart roundhouse-fleet-fast.timer' "$SCHED_LOG" ||
+      fail "a manager still on a replaced unit's older copy was not reloaded and restarted: $(cat "$SCHED_LOG")"
+    [ ! -e "$SCHED_STATE/stale.roundhouse-fleet-fast.service" ] ||
+      fail "the manager was left on the replaced unit's older copy"
+    rm -f "$sched_units"/*.replaced "$sched_root/fast.service.expected"
     case $("$cli" fleet-schedule status) in
       *'fleet-fast: installed, enabled, loaded, definition matches'*) ;;
       *) fail "the Linux status did not report a healthy timer" ;;
