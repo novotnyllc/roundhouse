@@ -551,27 +551,7 @@ fleet_lock_holder_state() {
   lock_was_start=$(fleet_lock_meta_field "$1" start_time)
   lock_was_command=$(fleet_lock_meta_field "$1" command)
   if [ -z "$lock_now_start" ]; then
-    fleet_lock_state=dead
-    # The holder led its own group, in this boot: the run is whatever is
-    # still in it. A lock written before groups were recorded (no pgid or no
-    # boot), or in an earlier boot, keeps the pid rule; a boot that cannot be
-    # read right now proves nothing either way.
-    lock_was_boot=$(fleet_lock_meta_field "$1" boot)
-    if [ "$(fleet_lock_meta_field "$1" pgid)" = "$lock_pid" ] && [ -n "$lock_was_boot" ]; then
-      lock_now_boot=$(fleet_lock_boot_id)
-      if [ -z "$lock_now_boot" ]; then
-        fleet_lock_state=unknown
-      elif [ "$lock_now_boot" = "$lock_was_boot" ]; then
-        case $(fleet_lock_group_state "$lock_pid") in
-          live)
-            fleet_lock_state=live
-            fleet_lock_live_by=group
-            ;;
-          empty) ;;
-          *) fleet_lock_state=unknown ;;
-        esac
-      fi
-    fi
+    fleet_lock_holder_gone "$1" "$lock_pid"
   elif [ -z "$lock_was_start" ] || [ -z "$lock_was_command" ]; then
     # A lock written before holders were recorded: the pid is alive and there
     # is no evidence about whose it is, so this answer keeps the age rule.
@@ -582,7 +562,14 @@ fleet_lock_holder_state() {
     [ "$(fleet_lock_proc_command "$lock_pid")" != "$lock_was_command" ]; then
     # A pid cannot be handed out while a group of that id still has a
     # process in it, so a reused pid also means the holder's group is gone.
-    fleet_lock_state=dead
+    # But the holder may have exited between the two reads above, and then the
+    # mismatch is only an empty command: a pid that is gone NOW is judged as
+    # gone, by its group.
+    if [ -z "$(fleet_lock_proc_start "$lock_pid")" ]; then
+      fleet_lock_holder_gone "$1" "$lock_pid"
+    else
+      fleet_lock_state=dead
+    fi
   else
     fleet_lock_state=live
     fleet_lock_live_by=holder
@@ -601,6 +588,31 @@ fleet_lock_holder_desc() {
     printf 'process group %s, its top-level pid gone\n' "$(fleet_lock_meta_field "$1" pgid)"
   else
     printf 'pid %s\n' "$(fleet_lock_meta_field "$1" pid)"
+  fi
+}
+
+fleet_lock_holder_gone() {
+  # `fleet_lock_holder_gone LOCK_DIR PID` — fleet_lock_holder_state's verdict
+  # for a recorded holder PID that no longer exists: `dead`, unless it led its
+  # own group in this boot and that group still has a process in it (`live`,
+  # by group). A lock written before groups were recorded (no pgid or no
+  # boot), or in an earlier boot, keeps the pid rule; a boot that cannot be
+  # read right now proves nothing either way (`unknown`).
+  fleet_lock_state=dead
+  lock_was_boot=$(fleet_lock_meta_field "$1" boot)
+  [ "$(fleet_lock_meta_field "$1" pgid)" = "$2" ] && [ -n "$lock_was_boot" ] || return 0
+  lock_now_boot=$(fleet_lock_boot_id)
+  if [ -z "$lock_now_boot" ]; then
+    fleet_lock_state=unknown
+  elif [ "$lock_now_boot" = "$lock_was_boot" ]; then
+    case $(fleet_lock_group_state "$2") in
+      live)
+        fleet_lock_state=live
+        fleet_lock_live_by=group
+        ;;
+      empty) ;;
+      *) fleet_lock_state=unknown ;;
+    esac
   fi
 }
 

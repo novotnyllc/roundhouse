@@ -528,6 +528,16 @@ if [ -n "$fleet_fixture_yq" ]; then
       fail "the lock meta does not record the holder's own process group and this boot"
     verb_group_nonce=$fleet_lock_nonce_held
     verb_group_meta=$(cat "$verb_lock/meta.json")
+    # The holder exiting MID-PROBE, between the start-time read and the
+    # command read, is judged by its group too, never dead on an empty command.
+    (
+      fleet_lock_proc_command() {
+        kill -KILL "$verb_group" 2>/dev/null || :
+        verb_wait_gone "$verb_group"
+      }
+      fleet_lock_holder_state "$verb_lock"
+      [ "$fleet_lock_state" = live ] && [ "$fleet_lock_live_by" = group ]
+    ) || fail "a holder that exited mid-probe was not judged by its group"
     kill -KILL "$verb_group" 2>/dev/null || :
     verb_wait_gone "$verb_group" || fail "the process-group fixture's top-level shell survived KILL"
     verb_alive "$verb_group_pass" || fail "the process-group fixture's subshell died with its top-level shell"
