@@ -103,7 +103,7 @@ jobs:
   # both on Linux and macOS. Other helpers still get one job per host OS.
   helpers:
     name: helpers (${{ matrix.os }}, ${{ matrix.fixture.helper }}, ${{ matrix.fixture.platform || 'self-test' }})
-    timeout-minutes: 15
+    timeout-minutes: 10
     needs: select
     if: needs.select.outputs.helpers != '[]'
     strategy:
@@ -231,7 +231,7 @@ jobs:
   sections:
     name: sections (${{ matrix.os }}, ${{ matrix.shard }})
     needs: select
-    timeout-minutes: 15
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -312,7 +312,7 @@ jobs:
           plugins/roundhouse/scripts/test-roundhouse
 
   windows:
-    timeout-minutes: 15
+    timeout-minutes: 10
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
