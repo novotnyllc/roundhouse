@@ -495,8 +495,196 @@ if [ -n "$fleet_fixture_yq" ]; then
         fail "the ceiling stop ($verb_variant) raised no lock-takeover alert naming the stopped run: $(cat "$verb_alerts"/* 2>/dev/null)"
       grep -q 'past the 60s ceiling; stopping it' "$verb_root/ceiling-err" ||
         fail "the ceiling stop was not reported"
+      # The holder led its own group, the meta says so, and the stop left
+      # that group EMPTY, not just the processes it had looked at.
+      [ "$(fleet_lock_group_state "$verb_hung")" = empty ] ||
+        fail "the ceiling stop ($verb_variant) left the run's process group non-empty"
       fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
     done
+
+    # --- the run's process group: a KILLed top-level shell is not a dead run ---
+    # The lock names the top-level shell, and the pass runs in subshells under
+    # it. KILL (or the OOM killer) ends that shell without its traps and
+    # leaves the subshells working; the pid alone read that as a dead holder,
+    # and a second run took the lock over beside them. A holder that leads its
+    # own group (fleet_lock_lead_group) records it, and is live while anything
+    # in that group is. The fixture is 07's fixture_group_holder.
+    verb_wait_gone() {
+      # `verb_wait_gone PID` — up to ~5 s for PID to be gone (reaped).
+      verb_gone_tries=0
+      while verb_alive "$1" && [ "$verb_gone_tries" -lt 50 ]; do
+        sleep 0.1
+        verb_gone_tries=$((verb_gone_tries + 1))
+      done
+      ! verb_alive "$1"
+    }
+    trap 'verb_cleanup; fixture_group_kill "${verb_group:-x}" verb-group' EXIT
+    verb_group=$(fixture_group_holder verb-group) || fail "the process-group fixture did not start"
+    verb_group_pass=$(fixture_group_members "$verb_group" verb-group | grep -vx "$verb_group" | head -1)
+    fleet_lock_acquire "$verb_lock" "$verb_group" || fail "could not lock for the process-group fixture"
+    [ "$(fleet_lock_meta_field "$verb_lock" pgid)" = "$verb_group" ] &&
+      [ -n "$(fleet_lock_boot_id)" ] &&
+      [ "$(fleet_lock_meta_field "$verb_lock" boot)" = "$(fleet_lock_boot_id)" ] ||
+      fail "the lock meta does not record the holder's own process group and this boot"
+    verb_group_nonce=$fleet_lock_nonce_held
+    verb_group_meta=$(cat "$verb_lock/meta.json")
+    # The holder exiting MID-PROBE, between the start-time read and the
+    # command read, is judged by its group too, never dead on an empty command.
+    (
+      fleet_lock_proc_command() {
+        kill -KILL "$verb_group" 2>/dev/null || :
+        verb_wait_gone "$verb_group"
+      }
+      fleet_lock_holder_state "$verb_lock"
+      [ "$fleet_lock_state" = live ] && [ "$fleet_lock_live_by" = group ]
+    ) || fail "a holder that exited mid-probe was not judged by its group"
+    kill -KILL "$verb_group" 2>/dev/null || :
+    verb_wait_gone "$verb_group" || fail "the process-group fixture's top-level shell survived KILL"
+    verb_alive "$verb_group_pass" || fail "the process-group fixture's subshell died with its top-level shell"
+    # The lock reads LIVE, by its group…
+    fleet_lock_holder_state "$verb_lock"
+    [ "$fleet_lock_state" = live ] && [ "$fleet_lock_live_by" = group ] ||
+      fail "a lock whose KILLed holder's group still works read $fleet_lock_state (by ${fleet_lock_live_by:-nothing})"
+    # …so a second run is the ordinary overlap and takes nothing over…
+    rm -rf "$verb_alerts"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>/dev/null || verb_status=$?
+    [ "$verb_status" -eq 10 ] && [ "$(fleet_lock_meta_field "$verb_lock" nonce)" = "$verb_group_nonce" ] &&
+      verb_alive "$verb_group_pass" ||
+      fail "a second run did not leave a KILLed holder's working group alone (got $verb_status)"
+    # …and past the ceiling it REFUSES with 75: the recorded process is gone,
+    # so nothing left is provably the run, and nothing is signalled on less.
+    verb_backdate '.'
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>"$verb_root/group-err" || verb_status=$?
+    [ "$verb_status" -eq 75 ] && [ "$(fleet_lock_meta_field "$verb_lock" nonce)" = "$verb_group_nonce" ] &&
+      verb_alive "$verb_group_pass" && [ ! -d "$verb_alerts" ] ||
+      fail "a KILLed holder's working group past the ceiling was not refused with 75, untouched (got $verb_status)"
+    grep -q "process group $verb_group, its top-level pid gone" "$verb_root/group-err" ||
+      fail "the refusal does not name the group that is left: $(cat "$verb_root/group-err")"
+    ! fleet_lock_stop_holder "$verb_lock" "$(fleet_lock_identity "$verb_lock")" &&
+      verb_alive "$verb_group_pass" ||
+      fail "the holder stop signalled a group whose recorded process is gone"
+    # A HAND-TAKEN lock is never judged and never stopped, group or not.
+    verb_backdate '.manual = true'
+    fleet_lock_holder_state "$verb_lock"
+    [ "$fleet_lock_state" = unknown ] || fail "a manual lock was judged $fleet_lock_state by its group"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>/dev/null || verb_status=$?
+    [ "$verb_status" -eq 75 ] && verb_alive "$verb_group_pass" &&
+      [ "$(fleet_lock_meta_field "$verb_lock" nonce)" = "$verb_group_nonce" ] ||
+      fail "a manual lock with a working group was stopped or taken (got $verb_status)"
+    ! fleet_lock_stop_holder "$verb_lock" "$(fleet_lock_identity "$verb_lock")" &&
+      verb_alive "$verb_group_pass" || fail "the holder stop signalled a manual lock's group"
+    # AN OLD-FORMAT META (no pgid), a group the holder did not lead, or a lock
+    # from another boot keeps the pid rule exactly as before: the holder's pid
+    # is gone, so it is dead.
+    for verb_old in 'del(.pgid)' '.pgid = 1' 'del(.boot)' '.boot = "an-earlier-boot"'; do
+      printf '%s\n' "$verb_group_meta" | jq -c "$verb_old" >"$verb_lock/meta.json"
+      fleet_lock_holder_state "$verb_lock"
+      [ "$fleet_lock_state" = dead ] ||
+        fail "a lock meta with $verb_old was judged $fleet_lock_state, not by its pid"
+    done
+    # …but a boot that cannot be READ right now proves no reboot: unknown.
+    printf '%s\n' "$verb_group_meta" >"$verb_lock/meta.json"
+    (
+      fleet_lock_boot_id() { :; }
+      fleet_lock_holder_state "$verb_lock"
+      [ "$fleet_lock_state" = unknown ]
+    ) || fail "an unreadable boot id was read as a reboot"
+    printf '%s\n' "$verb_group_meta" | jq -c 'del(.pgid, .boot)' >"$verb_lock/meta.json"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>/dev/null || verb_status=$?
+    [ "$verb_status" -eq 0 ] && [ "$(fleet_lock_meta_field "$verb_lock" pid)" = "$$" ] ||
+      fail "an old-format lock whose holder pid is gone was not taken over (got $verb_status)"
+    fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
+    # ONCE THE GROUP IS EMPTY the holder is dead, and the takeover proceeds.
+    mkdir "$verb_lock"
+    printf '%s\n' "$verb_group_meta" >"$verb_lock/meta.json"
+    fixture_group_kill "$verb_group" verb-group
+    verb_wait_gone "$verb_group_pass" || fail "the process-group fixture's subshell survived KILL"
+    verb_group_tries=0
+    until [ "$(fleet_lock_group_state "$verb_group")" = empty ] || [ "$verb_group_tries" -ge 50 ]; do
+      sleep 0.1
+      verb_group_tries=$((verb_group_tries + 1))
+    done
+    fleet_lock_holder_state "$verb_lock"
+    [ "$fleet_lock_state" = dead ] || fail "a lock whose holder's group is empty read $fleet_lock_state"
+    rm -rf "$verb_alerts"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>/dev/null || verb_status=$?
+    [ "$verb_status" -eq 0 ] && [ "$(fleet_lock_meta_field "$verb_lock" pid)" = "$$" ] &&
+      grep -rqs 'kind: lock-takeover' "$verb_alerts" ||
+      fail "a lock whose holder's group is empty was not taken over and alerted (got $verb_status)"
+    fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
+    trap verb_cleanup EXIT
+
+    # EVERY RUN-LOCK VERB LEADS ITS OWN GROUP (fleet_lock_lead_group): with no
+    # terminal and no group of its own, the verb runs in a child that leads a
+    # new group, under a thin parent that stays where the caller put it,
+    # passes TERM/INT/HUP on to the whole group, and exits with the child's
+    # status. The probe starts in a new session: no controlling terminal, and
+    # not its session's group leader.
+    verb_lead="$verb_root/lead"
+    cat >"$verb_lead-probe" <<'PROBE'
+. "$1/fleet-store.sh"
+# The child runs this script again from the top: only the first pass records.
+[ -e "$2.before" ] || printf '%s\n' "$$" >"$2.before"
+fleet_lock_lead_group "$0" "$@"
+trap 'printf "term\n" >"$2.term"; exit 143' TERM
+printf '%s|%s|%s|%s|%s\n' "$$" "$(fleet_lock_proc_pgid "$$")" "$PPID" \
+  "${ROUNDHOUSE_LOCK_GROUP_LEADER:-unset}" "$3 $4" >"$2.after"
+[ "$3" != wait ] || while :; do sleep 1; done
+exit 7
+PROBE
+    verb_lead_run() {
+      perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!\n"; exec @ARGV' \
+        bash -c 'bash "$@"; exit $?' verb-lead "$verb_lead-probe" "$(dirname -- "$cli")/lib" "$verb_lead" "$@" </dev/null
+    }
+    rm -f "$verb_lead".*
+    verb_status=0
+    verb_lead_run exit "two words" || verb_status=$?
+    verb_lead_parent=$(cat "$verb_lead.before" 2>/dev/null)
+    verb_lead_after=$(cat "$verb_lead.after" 2>/dev/null)
+    verb_lead_child=${verb_lead_after%%|*}
+    [ "$verb_status" -eq 7 ] && [ -n "$verb_lead_parent" ] && [ "$verb_lead_child" != "$verb_lead_parent" ] &&
+      [ "$verb_lead_after" = "$verb_lead_child|$verb_lead_child|$verb_lead_parent|unset|exit two words" ] ||
+      fail "a run-lock verb did not run as its own group leader under its thin parent (exit $verb_status): $verb_lead_parent / $verb_lead_after"
+    # TERM to the parent — what timeout(1) or a killpg of the caller's group
+    # reaches — ends the run through its own trap, and the parent says so.
+    rm -f "$verb_lead".*
+    verb_lead_run wait "" &
+    verb_lead_bg=$!
+    verb_tries=0
+    until [ -s "$verb_lead.after" ] || [ "$verb_tries" -ge 50 ]; do
+      sleep 0.1
+      verb_tries=$((verb_tries + 1))
+    done
+    verb_lead_parent=$(cat "$verb_lead.before" 2>/dev/null)
+    verb_lead_child=$(cut -d'|' -f1 "$verb_lead.after" 2>/dev/null)
+    [ -n "$verb_lead_parent" ] && [ -n "$verb_lead_child" ] || fail "the forwarding probe never started"
+    kill -TERM "$verb_lead_parent" 2>/dev/null || :
+    verb_status=0
+    wait "$verb_lead_bg" || verb_status=$?
+    verb_wait_gone "$verb_lead_child" || kill -KILL -- "-$verb_lead_child" 2>/dev/null || :
+    [ "$verb_status" -eq 143 ] && [ -f "$verb_lead.term" ] && ! verb_alive "$verb_lead_child" ||
+      fail "a TERM to the thin parent did not end the run through its trap (exit $verb_status)"
+    # Which verbs: every *_command that takes the run lock, read from the code
+    # rather than from a second list. Only DIRECT calls in a command's own
+    # body are seen; a verb reaching the lock through another helper is not.
+    verb_lead_verbs=" $(awk '/fleet_lock_lead_group "\$0"/ { print prev } { prev = $0 }' "$cli" | tr -d '|)') "
+    for verb_fn in $(sed -n 's/^\(fleet_[a-z_]*_command\)() .*/\1/p' "$(dirname -- "$cli")"/lib/*.sh); do
+      cli_function_body "$verb_fn" | grep -Eq 'fleet_run_verb_begin|fleet_run_lock_take' || continue
+      verb_name=$(printf '%s\n' "${verb_fn%_command}" | tr _ -)
+      case $verb_lead_verbs in
+        *" $verb_name "*) ;;
+        *) fail "the run-lock verb $verb_name does not lead its own process group" ;;
+      esac
+    done
+    case $verb_lead_verbs in
+      *" fleet-run "*" fleet-disown "*) ;;
+      *) fail "the lead-group verb list could not be read from the dispatcher: $verb_lead_verbs" ;;
+    esac
     # The stop itself refuses anything but a live verdict on the same lock.
     sleep 300 &
     verb_other=$!
