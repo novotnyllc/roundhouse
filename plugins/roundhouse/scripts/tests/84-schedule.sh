@@ -9,6 +9,11 @@
 #
 # Sourced by scripts/test-roundhouse in a fixed order; not a
 # standalone test file. See that driver for why.
+#
+# Serial: the trigger must return within three seconds while its detached
+# pass sleeps, and a loaded worker pool would make that a measurement of the
+# machine rather than of the trigger.
+# roundhouse-test: serial
 # shellcheck shell=bash
 
 if [ -n "$fleet_fixture_yq" ]; then
