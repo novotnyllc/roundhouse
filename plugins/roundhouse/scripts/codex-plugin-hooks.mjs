@@ -621,7 +621,15 @@ function sealPluginCache(pluginId) {
       return;
     }
     if (stat.uid !== uid) refuse(`plugin cache entry is owned by another user: ${path}`);
-    if (stat.mode & 0o022) chmodSync(path, stat.mode & 0o7755);
+    if (stat.mode & 0o022) {
+      // An entry chmod cannot tighten (immutable, read-only mount) will not
+      // tighten on a retry either: a standing refusal, not a transient one.
+      try {
+        chmodSync(path, stat.mode & 0o7755);
+      } catch {
+        refuse(`plugin cache entry is writable by others and cannot be sealed: ${path}`);
+      }
+    }
     if (stat.isDirectory()) {
       let names;
       try {

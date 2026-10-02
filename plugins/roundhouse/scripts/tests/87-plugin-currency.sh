@@ -759,6 +759,21 @@ SH
       fail "an explicit approve failed (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
     [ -z "$(find "$pc/codex-home/plugins/cache" -perm -g+w -print -quit)" ] ||
       fail "an explicit approve trusted a group-writable Codex cache without sealing it"
+    # ...and an entry it cannot tighten (immutable) is a STANDING refusal (75),
+    # not a transient one every fast pass would retry. chflags is macOS/BSD.
+    if command -v chflags >/dev/null 2>&1; then
+      pc_hooks_reset
+      printf '%s\n' new >"$pc/hooks-state/version"
+      pc_locked=$pc/codex-home/plugins/cache/m/widget/new/README.md
+      chmod g+w "$pc_locked" && chflags uchg "$pc_locked"
+      pc_status=0
+      (cd "$pc" && CODEX_HOME="$pc/codex-home" PATH="$pc/hooks-bin:$PATH" \
+        PC_HOOKS_STATE="$pc/hooks-state" node "$script_dir/codex-plugin-hooks.mjs" \
+        approve widget@m >/dev/null 2>"$pc/hooks-err") || pc_status=$?
+      chflags nouchg "$pc_locked"
+      [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+        fail "an unsealable Codex cache entry did not refuse as a standing hold (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    fi
     # ...and refuses (75), writing nothing, when the cache holds a symlink
     # that leaves it: its target is bytes the seal never touched.
     pc_hooks_reset
