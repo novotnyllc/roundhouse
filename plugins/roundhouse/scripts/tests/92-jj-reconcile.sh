@@ -484,6 +484,111 @@ $(fleet_vcs_trailers wren scheduled/agent 'fast convergence' -)" >/dev/null
     fleet_vcs_publish "$vireo" "${reconcile_out#* }" >/dev/null ||
       fail "a large hand edit could not be published through the sweep"
 
-    printf 'real-jj: OK (no bare main, conflicted-bookmark revsets, runbook steps 0-5, hold set, both push guards, op restore, peer remotes, R4 leak, rule 2 over a side range, a large hand edit published)\n'
+    # 13. #56: proposals/ is regenerated on every full pass, and every copy
+    #     carries its writer's `by` and `at`, so two hosts that both wrote
+    #     proposals conflict on all of them. Reconcile takes origin's copy of
+    #     each conflicted proposal and leaves no two-sided conflict there; on
+    #     2026-10-02 mac-studio held 253 of them until a hand `jj restore`.
+    for reconcile_p in pa pb; do
+      jj git clone --colocate --config ui.editor='"true"' \
+        --config ui.paginate=never "$rjj/remote.git" "$rjj/$reconcile_p/store" >/dev/null 2>&1 ||
+        fail "could not clone the fleet store for $reconcile_p"
+      env ROUNDHOUSE_FLEET_STORE="$rjj/$reconcile_p/store" "$cli" fleet-init >/dev/null
+    done
+    pa="$rjj/pa/store"
+    pb="$rjj/pb/store"
+    reconcile_proposals() {
+      # reconcile_proposals <host> <stamp> — a full pass's regenerated
+      # proposals, committed and bookmarked but NOT published.
+      mkdir -p "$rjj/$1/store/proposals"
+      # Item names keep `@` and `+` (fleet_run_proposals only maps `.`
+      # and `/`), so Homebrew's versioned formulae land in file names too.
+      for reconcile_slug in plugins-a plugins-b packages-openssl@3 packages-libsigc++; do
+        printf 'proposes: move\nitem: %s\nby: %s\nat: %s\n' "$reconcile_slug" "$1" "$2" \
+          >"$rjj/$1/store/proposals/promote-$reconcile_slug-to-fleet.yaml"
+      done
+      jj -R "$rjj/$1/store" describe -m "full pass on $1" >/dev/null
+      jj -R "$rjj/$1/store" bookmark set main \
+        -r "$(jj -R "$rjj/$1/store" log -r @ --no-graph -T 'commit_id')" >/dev/null
+      jj -R "$rjj/$1/store" new "$(reconcile_heads "$1")" >/dev/null
+    }
+    reconcile_proposals pa 2026-10-02T01:00:00Z
+    fleet_vcs_publish "$pa" "$(reconcile_heads pa)" >/dev/null ||
+      fail "pa could not publish its proposals"
+    reconcile_proposals pb 2026-10-02T01:05:00Z
+    printf 'proposes: move\nitem: local-only\nby: pb\n' >"$pb/proposals/promote-local-only.yaml"
+    jj -R "$pb" describe -m 'a local-only proposal' >/dev/null
+    jj -R "$pb" bookmark set main -r "$(jj -R "$pb" log -r @ --no-graph -T 'commit_id')" >/dev/null
+    jj -R "$pb" new "$(reconcile_heads pb)" >/dev/null
+    fleet_vcs_fetch "$pb" origin
+    reconcile_out=$(fleet_vcs_reconcile "$pb" pb scheduled/agent 'proposals on both sides') ||
+      fail "the reconcile failed over regenerated proposals"
+    [ "${reconcile_out%% *}" = clean ] ||
+      fail "regenerated proposals left the reconcile conflicted: $reconcile_out"
+    [ -z "$(fleet_vcs_conflicted "$pb" "${reconcile_out#* }")" ] ||
+      fail "the merge still carries a conflict after settling proposals"
+    jj -R "$pb" file show -r "${reconcile_out#* }" \
+      'root:proposals/promote-plugins-b-to-fleet.yaml' | grep -qx 'by: pa' ||
+      fail "a conflicted proposal did not take origin's copy"
+    jj -R "$pb" file show -r "${reconcile_out#* }" \
+      'root-file:"proposals/promote-packages-openssl@3-to-fleet.yaml"' | grep -qx 'by: pa' ||
+      fail "a proposal named after a versioned formula did not take origin's copy"
+    jj -R "$pb" file show -r "${reconcile_out#* }" \
+      'root:proposals/promote-local-only.yaml' | grep -qx 'by: pb' ||
+      fail "settling proposals dropped a non-conflicting local proposal"
+    fleet_vcs_publish "$pb" "${reconcile_out#* }" >/dev/null ||
+      fail "pb could not publish the settled merge"
+
+    # 13a. A workbench left by a reconcile from before this settling (a merge
+    #      conflicted only in proposals/) folds while origin has not moved
+    #      since; if it has, the dominance check refuses and the next run's
+    #      reconcile settles afresh.
+    fleet_vcs_fetch "$pa" origin
+    reconcile_out=$(fleet_vcs_reconcile "$pa" pa scheduled/agent 'catch up with pb')
+    [ "${reconcile_out%% *}" = clean ] || fail "pa did not catch up cleanly: $reconcile_out"
+    fleet_vcs_publish "$pa" "${reconcile_out#* }" >/dev/null || fail "pa could not publish its catch-up"
+    reconcile_proposals pa 2026-10-02T02:00:00Z
+    fleet_vcs_publish "$pa" "$(reconcile_heads pa)" >/dev/null ||
+      fail "pa could not publish its second proposals"
+    reconcile_proposals pb 2026-10-02T02:05:00Z
+    fleet_vcs_fetch "$pb" origin
+    # The pre-fix runbook, by hand: merge both heads, workbench off the merge.
+    # shellcheck disable=SC2046 # one argument per head
+    jj -R "$pb" new -m 'reconcile pb' $(reconcile_heads pb) >/dev/null
+    reconcile_merge=$(jj -R "$pb" log -r @ --no-graph -T 'commit_id')
+    [ -n "$(fleet_vcs_conflicted "$pb" "$reconcile_merge")" ] ||
+      fail "the hand-made merge was not conflicted, so 13a proves nothing"
+    jj -R "$pb" new "$reconcile_merge" >/dev/null
+    [ "$(fleet_vcs_resolution_workbench "$pb")" = "$reconcile_merge" ] ||
+      fail "the hand-made merge was not recognised as a resolution workbench"
+    reconcile_final=$(fleet_vcs_fold_resolution "$pb") ||
+      fail "a workbench conflicted only in proposals/ did not fold"
+    jj -R "$pb" file show -r "$reconcile_final" \
+      'root:proposals/promote-plugins-a-to-fleet.yaml' | grep -qx 'at: 2026-10-02T02:00:00Z' ||
+      fail "the folded merge did not take origin's proposals"
+    fleet_vcs_publish "$pb" "$reconcile_final" >/dev/null ||
+      fail "pb could not publish the folded merge"
+
+    # 13b. Only proposals/ is settled: a real layer conflict in the same merge
+    #      stays conflicted for §8.2b, with no proposal conflict beside it.
+    fleet_vcs_fetch "$pa" origin
+    reconcile_out=$(fleet_vcs_reconcile "$pa" pa scheduled/agent 'catch up with pb again')
+    [ "${reconcile_out%% *}" = clean ] || fail "pa did not catch up cleanly: $reconcile_out"
+    printf 'plugins:\n  ponytail: v4-pa\n' >"$pa/groups.yaml"
+    reconcile_proposals pa 2026-10-02T03:00:00Z
+    fleet_vcs_publish "$pa" "$(reconcile_heads pa)" >/dev/null ||
+      fail "pa could not publish a layer edit with its proposals"
+    printf 'plugins:\n  ponytail: v4-pb\n' >"$pb/groups.yaml"
+    reconcile_proposals pb 2026-10-02T03:05:00Z
+    fleet_vcs_fetch "$pb" origin
+    reconcile_out=$(fleet_vcs_reconcile "$pb" pb scheduled/agent 'layer and proposals')
+    [ "${reconcile_out%% *}" = conflicted ] ||
+      fail "a real layer conflict was settled away with the proposals: $reconcile_out"
+    reconcile_left=$(jj -R "$pb" file list -r "${reconcile_out#* }" \
+      -T 'if(conflict, path ++ "\n")')
+    [ "$reconcile_left" = groups.yaml ] ||
+      fail "the merge should be conflicted in groups.yaml alone: $reconcile_left"
+
+    printf 'real-jj: OK (no bare main, conflicted-bookmark revsets, runbook steps 0-5, hold set, both push guards, op restore, peer remotes, R4 leak, rule 2 over a side range, a large hand edit published, proposals settled from origin, a layer conflict kept)\n'
   ) || fail "real-jj reconcile block failed (see the FAIL: real-jj: line above)"
 fi

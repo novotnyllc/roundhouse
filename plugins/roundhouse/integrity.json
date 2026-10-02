@@ -178,7 +178,7 @@
     },
     {
       "path": "scripts/lib/fleet-vcs.sh",
-      "sha256": "2ef5b6df8aea0cc3f7d388923e07bced396a30d5c3a43e9fb3d2719177e46af7"
+      "sha256": "8c31d3195263a21cf50dd00c6833295262dbe3e9a77563c3e161e0125aef0bc0"
     },
     {
       "path": "scripts/lib/host.sh",
