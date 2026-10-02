@@ -1739,7 +1739,20 @@ fleet_run_command() (
   printf '%s\n' "$run_op" >"$(fleet_run_state_dir)/starting-operation"
 
   # §6.1: the pass, and its in-process re-runs while triggers land mid-pass.
+  # errexit is OFF around the loop, not `|| status=$?`: that would switch it
+  # off inside every pass too, and the loop turns it on per pass itself.
+  run_errexit=false
+  case $- in *e*) run_errexit=true ;; esac
+  set +e
   fleet_trigger_converge fleet_run_pass
+  run_status=$?
+  [ "$run_errexit" != true ] || set -e
+  # Released HERE rather than by the EXIT trap, so the stamp can be compared
+  # once more with the lock free (fleet_trigger_handoff).
+  fleet_lock_release "$run_lock" "$run_lock_nonce" || :
+  trap 'rm -rf "$run_tmp"' EXIT HUP INT TERM
+  fleet_trigger_handoff "$converge_handoff_stamp"
+  exit "$run_status"
 )
 
 fleet_run_pass() (

@@ -274,15 +274,22 @@ fleet_trigger_stamp_state() {
 
 # --- the kick ------------------------------------------------------------------
 
+fleet_trigger_runner() {
+  # The `roundhouse` a detached pass runs: this one (a self-check may stand in
+  # its own).
+  if fleet_test_hook "${ROUNDHOUSE_FLEET_TRIGGER_RUNNER:-}"; then
+    printf '%s\n' "$ROUNDHOUSE_FLEET_TRIGGER_RUNNER"
+  else
+    printf '%s/roundhouse\n' "$script_dir"
+  fi
+}
+
 fleet_trigger_detach() {
   # fleet_trigger_detach fast|full REASON — the unreachable-scheduler
   # fallback. No `setsid`: macOS has none. `nohup` with every stream closed is
   # what lets an SSH session that started it end without waiting on it or
   # taking it down.
-  trigger_runner="$script_dir/roundhouse"
-  if fleet_test_hook "${ROUNDHOUSE_FLEET_TRIGGER_RUNNER:-}"; then
-    trigger_runner=$ROUNDHOUSE_FLEET_TRIGGER_RUNNER
-  fi
+  trigger_runner=$(fleet_trigger_runner)
   nohup "$trigger_runner" fleet-run "--$1" </dev/null >/dev/null 2>&1 &
   printf 'roundhouse: %s; started a detached fleet-run --%s\n' "$2" "$1"
 }
@@ -369,8 +376,12 @@ fleet_trigger_converge() {
   # check no longer raises. Each pass runs with errexit ON — `PASS || …` would
   # switch it off for the whole body — and the return status is the WORST of
   # the passes, so a later clean pass does not launder an earlier hold.
+  #
+  # It leaves the stamp its LAST comparison read in converge_handoff_stamp,
+  # for fleet_trigger_handoff once the lock is released.
   converge_root=$run_tmp
   converge_extra=0
+  converge_handoff_stamp=
   converge_status=0
   converge_errexit=false
   case $- in *e*) converge_errexit=true ;; esac
@@ -389,14 +400,33 @@ fleet_trigger_converge() {
     [ "$converge_errexit" != true ] || set -e
     [ "$converge_pass_status" -le "$converge_status" ] ||
       converge_status=$converge_pass_status
+    converge_now=$(fleet_trigger_stamp_state)
+    converge_handoff_stamp=$converge_now
     [ "$converge_extra" -lt 3 ] || break
-    [ "$(fleet_trigger_stamp_state)" != "$converge_seen" ] || break
+    [ "$converge_now" != "$converge_seen" ] || break
     converge_extra=$((converge_extra + 1))
     run_mode=fast
     printf 'roundhouse: a trigger arrived during the pass; converging again in-process (%s of 3)\n' \
       "$converge_extra"
   done
   return "$converge_status"
+}
+
+fleet_trigger_handoff() {
+  # fleet_trigger_handoff STAMP — the last word of a run, called by
+  # fleet_run_command AFTER it released the run lock, with the stamp the
+  # loop's final comparison read.
+  #
+  # A trigger that lands after that comparison but before the release is
+  # otherwise lost: its own run found the lock and exited, and on systemd a
+  # `start` of a oneshot that is still active queues nothing. So the stamp is
+  # compared once more with the lock free, and a move starts ONE detached
+  # fast pass. That pass takes the lock like any run — two follow-ups, or a
+  # follow-up and a scheduled run, cannot both run a pass; the loser exits.
+  [ "$(fleet_trigger_stamp_state)" != "$1" ] || return 0
+  handoff_runner=$(fleet_trigger_runner)
+  nohup "$handoff_runner" fleet-run --fast </dev/null >/dev/null 2>&1 &
+  printf 'roundhouse: a trigger arrived as this run released its lock; started a detached fleet-run --fast\n'
 }
 
 # --- the job definitions -------------------------------------------------------

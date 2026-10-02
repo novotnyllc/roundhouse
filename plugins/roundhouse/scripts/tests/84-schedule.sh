@@ -352,6 +352,7 @@ STUB
         sched_status_var="SCHED_PASS_STATUS_$sched_n"
         exit "${!sched_status_var:-0}"
       )
+      rm -f "$SCHED_STATE/runner"
       for sched_case in '0 1' '1 2' '2 3' '9 4'; do
         : >"$sched_calls"
         SCHED_TRIGGERS=${sched_case% *}
@@ -364,6 +365,44 @@ STUB
       [ "$(cut -d' ' -f2 "$sched_calls" | LC_ALL=C sort -u | grep -c .)" -eq 4 ] ||
         fail "the in-process passes shared one scratch directory"
       [ ! -e "$(fleet_lock_path)" ] || fail "the looping run left its lock behind"
+      # A trigger that the in-process loop saw (or that the three-pass bound
+      # deferred) starts no follow-up of its own.
+      sched_no_runner || fail "a run whose triggers the loop already saw started a detached follow-up"
+      # THE HANDOFF RACE: a trigger landing after the loop's last comparison
+      # but before the lock is released. Its own run found the lock and
+      # exited, and systemd queues no second start of an active oneshot, so
+      # the run compares the stamp once more after releasing and starts ONE
+      # detached fast pass — through the normal lock, never inside it.
+      cat >"$sched_bin/handoff-runner" <<'STUB'
+#!/bin/sh
+if [ -e "$SCHED_LOCK" ]; then state=held; else state=free; fi
+printf '%s %s\n' "$state" "$*" >>"$SCHED_STATE/runner"
+STUB
+      chmod +x "$sched_bin/handoff-runner"
+      SCHED_LOCK=$(fleet_lock_path)
+      ROUNDHOUSE_FLEET_TRIGGER_RUNNER="$sched_bin/handoff-runner"
+      export SCHED_LOCK ROUNDHOUSE_FLEET_TRIGGER_RUNNER
+      eval "sched_lock_release_real() $(declare -f fleet_lock_release | tail -n +2)"
+      fleet_lock_release() {
+        fleet_trigger_stamp
+        sched_lock_release_real "$@"
+      }
+      : >"$sched_calls"
+      SCHED_TRIGGERS=0
+      sched_out=$(fleet_run_command --fast) || fail "the run with a late trigger failed"
+      [ "$(grep -c . "$sched_calls")" -eq 1 ] ||
+        fail "a trigger after the last comparison was run in-process, inside the lock"
+      case $sched_out in
+        *'released its lock; started a detached fleet-run --fast'*) ;;
+        *) fail "the run did not hand a late trigger off: $sched_out" ;;
+      esac
+      sched_wait_runner || fail "a trigger that landed as the lock was released was lost"
+      [ "$(cat "$SCHED_STATE/runner")" = 'free fleet-run --fast' ] ||
+        fail "the follow-up was not one fleet-run --fast started after the lock was free: $(cat "$SCHED_STATE/runner")"
+      rm -f "$SCHED_STATE/runner"
+      eval "fleet_lock_release() $(declare -f sched_lock_release_real | tail -n +2)"
+      ROUNDHOUSE_FLEET_TRIGGER_RUNNER="$sched_bin/runner"
+      export ROUNDHOUSE_FLEET_TRIGGER_RUNNER
       # PER RUN: one starting operation, the abort point for every pass.
       : >"$sched_root/op-calls"
       : >"$sched_calls"
