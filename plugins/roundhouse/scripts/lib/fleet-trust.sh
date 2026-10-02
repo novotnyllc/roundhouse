@@ -653,6 +653,8 @@ fleet_trust_materialize() {
   # and ALERT — a seamless setup with a named weakness beats a hard stop.
   fleet_trust_ms=$1
   fleet_trust_mrev=$2
+  fleet_trust_refusal=
+  fleet_trust_refusal_key=
   fleet_trust_mtmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-trustd.XXXXXX")
   # ONE INSTANT, recorded beside the file. The drift compare re-renders the same
   # revision later and byte-compares; rendering the two at different clocks
@@ -668,6 +670,7 @@ fleet_trust_materialize() {
   fleet_trust_mgen=$(fleet_trust_generation "$fleet_trust_mtmp/signers.yaml")
   fleet_trust_mgen_was=$(fleet_trust_seen_generation)
   if [ "$fleet_trust_mgen" -lt "$fleet_trust_mgen_was" ]; then
+    fleet_trust_refusal="roster generation went backward ($fleet_trust_mgen < $fleet_trust_mgen_was)"
     printf 'roundhouse: roster generation went backward (%s < %s); refusing to materialize (§7.12.3)\n' \
       "$fleet_trust_mgen" "$fleet_trust_mgen_was" >&2
     rm -rf "$fleet_trust_mtmp"
@@ -681,34 +684,32 @@ fleet_trust_materialize() {
   # helper. A re-root legitimately breaks this ancestry, and §7.11.2's catch-up
   # is what re-points `reviewed-ref` before this runs again.
   #
-  # LOCAL UNPUBLISHED WORK IS NOT A ROLLBACK. A run that reconciles then REFUSES
-  # to publish (the §10.4 sweep, an open conflict) still materialized the head it
-  # reviewed, so reviewed-ref advances to a commit that never reached the fleet.
-  # The §10.4 recovery — `jj abandon` / `op restore` that drops that head and
-  # resets to main@origin — then leaves the next head a SIBLING of reviewed-ref,
-  # not a descendant, and this would brick every future materialize. That is a
-  # LOCAL rewrite, "this host's own doing" (§7.11.2), not the §7.12.3 attack: the
-  # attack is a DIVERGENT origin that does not descend from reviewed-ref. So
-  # refuse ONLY when reviewed-ref does not descend from the current published
-  # head either — when reviewed-ref IS local work built atop main@origin, allow,
-  # and let reviewed-ref re-point below. A rewound/divergent origin still fails
-  # closed, because there reviewed-ref descends from neither the new head nor
-  # main@origin.
-  fleet_trust_mref=$(fleet_trust_reviewed_ref)
-  if [ -n "$fleet_trust_mref" ] &&
-    jj -R "$fleet_trust_ms" log -r "$fleet_trust_mref" --no-graph -T '""' \
-      >/dev/null 2>&1 &&
-    [ -z "$(jj -R "$fleet_trust_ms" log \
-      -r "$fleet_trust_mref & ::$fleet_trust_mrev" --no-graph -T 'commit_id' \
-      2>/dev/null)" ] &&
-    [ -z "$(jj -R "$fleet_trust_ms" log \
-      -r "present(main@origin) & ::$fleet_trust_mref" --no-graph -T 'commit_id' \
-      2>/dev/null)" ]; then
-    printf 'roundhouse: %s is not a descendant of reviewed-ref %s; refusing to materialize (§7.12.3)\n' \
-      "$fleet_trust_mrev" "$fleet_trust_mref" >&2
+  # The gate AND the value recorded next are one shared function,
+  # fleet_trust_reviewed_next, so the run and trustd cannot disagree about
+  # either: reviewed-ref only ever records a commit this host SAW PUBLISHED, and
+  # a reviewed-ref that is not on main@origin is refused unless it is proved to
+  # be this host's own never-published work. Its header argues why that keeps
+  # every §7.12.3 refusal and cannot wedge on local work.
+  #
+  # `fleet_trust_refusal` is left in the CALLER's shell (this function is not a
+  # subshell) so fleet-run can raise the keyed alert with the exact recovery
+  # rather than a generic "refused".
+  fleet_trust_mnext=$(fleet_trust_reviewed_next "$fleet_trust_ms" "$fleet_trust_mrev") || {
+    fleet_trust_refusal=$fleet_trust_mnext
+    case $fleet_trust_mnext in
+      *'not on main@origin'*) fleet_trust_refusal_key=reviewed-ref-unpublished ;;
+    esac
+    printf 'roundhouse: %s; refusing to materialize (§7.12.3)\n' \
+      "$fleet_trust_mnext" >&2
     rm -rf "$fleet_trust_mtmp"
     return 65
-  fi
+  }
+  # THE PARITY GAP, named where it bites. trustd sources its OWN root-owned
+  # copy of this library, refreshed only by the install lane, so a host that
+  # upgrades the plugin keeps the installed helper's older rule — which records
+  # the rendered head as reviewed-ref and so can still wedge on local work —
+  # until `enroll-privilege-posix install-trustd` re-runs. Its refusal says so.
+  fleet_trust_helper_refused='the privileged trustd helper refused; an installed helper older than this plugin keeps the old reviewed-ref rule until the trustd install lane re-runs'
   if fleet_trust_mhelper=$(fleet_trust_privileged); then
     # The privileged lane. trustd re-derives the roster from verified history
     # and writes roster / reviewed-ref / generation / materialized-at / KRL
@@ -737,6 +738,7 @@ fleet_trust_materialize() {
         ROUNDHOUSE_TRUSTD_FIXTURE="${ROUNDHOUSE_TRUSTD_FIXTURE:-}" \
         ROUNDHOUSE_TRUSTD_HOME="${ROUNDHOUSE_TRUSTD_HOME:-}" \
         "$fleet_trust_mhelper" apply "$fleet_trust_ms" "$fleet_trust_mrev" || {
+        fleet_trust_refusal=$fleet_trust_helper_refused
         rm -rf "$fleet_trust_mtmp"
         return 65
       }
@@ -745,6 +747,7 @@ fleet_trust_materialize() {
         PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C LANG=C TZ=UTC SSH_AUTH_SOCK= \
         /usr/bin/sudo -n "$fleet_trust_mhelper" apply \
         "$fleet_trust_ms" "$fleet_trust_mrev" || {
+        fleet_trust_refusal=$fleet_trust_helper_refused
         rm -rf "$fleet_trust_mtmp"
         return 65
       }
@@ -755,14 +758,22 @@ fleet_trust_materialize() {
     # UNCHANGED — regressing it would drop the seamless-setup fallback §7.9
     # mandates. It records materialized-at here, at the instant this run
     # rendered at, since no helper does it for this lane.
+    #
+    # reviewed-ref gets the PUBLISHED high-water mark fleet_trust_reviewed_next
+    # chose, never the head just rendered: that head may be this host's own
+    # reconcile, which a hung or refused publish leaves on no remote, and a
+    # high-water mark naming it wedged every later pass (§7.12.3). The head
+    # rides in materialized-at's second field instead, because the drift
+    # compare must re-render exactly the revision the file was rendered from.
     mkdir -p "$(dirname "$(fleet_trust_materialized_path)")"
     safe_output "$fleet_trust_mtmp/roster" "$(fleet_trust_materialized_path)"
-    printf '%s\n' "$fleet_trust_mrev" >"$fleet_trust_mtmp/reviewed-ref"
+    printf '%s\n' "$fleet_trust_mnext" >"$fleet_trust_mtmp/reviewed-ref"
     printf '%s\n' "$fleet_trust_mgen" >"$fleet_trust_mtmp/generation"
     safe_output "$fleet_trust_mtmp/reviewed-ref" "$(fleet_trust_root)/reviewed-ref"
     safe_output "$fleet_trust_mtmp/generation" "$(fleet_trust_root)/generation"
     mkdir -p "$(fleet_trust_root)"
-    printf '%s\n' "$fleet_trust_mat" >"$fleet_trust_mtmp/materialized-at"
+    printf '%s %s\n' "$fleet_trust_mat" "$fleet_trust_mrev" \
+      >"$fleet_trust_mtmp/materialized-at"
     safe_output "$fleet_trust_mtmp/materialized-at" \
       "$(fleet_trust_root)/materialized-at"
   fi
@@ -792,15 +803,344 @@ fleet_trust_reviewed_ref() {
   awk 'NR == 1 { print $1; exit }' "$fleet_trust_ref_file"
 }
 
+fleet_trust_materialized_rev() {
+  # The revision the materialized roster was RENDERED from: materialized-at's
+  # second field. A file an older writer left carries one field, and that
+  # writer also put the rendered head in reviewed-ref, so the fallback answers
+  # the same question for it.
+  fleet_trust_mr_file=$(fleet_trust_root)/materialized-at
+  fleet_trust_mr=
+  [ ! -f "$fleet_trust_mr_file" ] ||
+    fleet_trust_mr=$(awk 'NR == 1 { print $2; exit }' "$fleet_trust_mr_file")
+  [ -n "$fleet_trust_mr" ] || fleet_trust_mr=$(fleet_trust_reviewed_ref)
+  [ -z "$fleet_trust_mr" ] || printf '%s\n' "$fleet_trust_mr"
+}
+
+# --- §7.12.3 the published high-water mark -----------------------------------
+#
+# THE WEDGE THIS REPLACES. reviewed-ref used to record the head this host had
+# just materialized. A run materializes BEFORE it publishes, so a run that
+# reconciles and then hangs, is killed, or refuses to publish (§10.4's sweep,
+# an open conflict) leaves reviewed-ref naming a commit that reached no remote.
+# Abandon it, reset it, or simply let origin move on, and every later head is a
+# SIBLING of reviewed-ref: the descendant gate refused every pass, forever,
+# while the host published nothing. The old carve-out — allow when reviewed-ref
+# descends from the CURRENT main@origin — stopped applying the moment origin
+# moved past the base the local commit was built on, which is the normal case.
+#
+# THE RULE NOW: reviewed-ref only ever records a commit this host SAW
+# PUBLISHED — the newest ancestor of the materialized head that is in
+# `::main@origin` as fetched (fleet_trust_reviewed_next). Local work therefore
+# never enters the high-water mark and can never wedge it, and the gate is a
+# plain "the new head descends from something origin once held". A rewind,
+# truncation or divergence of origin still fails closed: the mark is on what
+# origin published, so an origin that no longer contains it is exactly the
+# §7.12.3 signal, and nothing here moves the mark backward.
+
+fleet_trust_tilde() {
+  # A host-local path as the operator types it: `$HOME/x` -> `~/x`. Recovery
+  # text is replicated and capped (§10.4), and the home directory is the one
+  # part of the path that says nothing.
+  # shellcheck disable=SC2088 # the tilde is the point: it is printed, not expanded
+  case $1 in
+    "${HOME:-/nonexistent}"/*) printf '~/%s\n' "${1#"$HOME"/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+fleet_trust_seen_published() {
+  # fleet_trust_seen_published <store> -> every commit `main@origin` has EVER
+  # pointed at in this host's operation log, one per line.
+  #
+  # The op log is jj's own record of what each fetch and push observed on the
+  # remote, so it is the one local source for "everything this host has seen
+  # published". One `--op-diff` walk rather than one `--at-op` read per
+  # operation: measured at ~2 s for 1,500 operations, where the per-operation
+  # form costs a jj start per op. `templates.commit_summary` is pinned to the
+  # bare commit id so the remote-bookmark lines carry full ids and nothing
+  # else; a jj whose diff renders differently yields no ids, and the caller's
+  # "the current main@origin must appear" check turns that into a refusal
+  # rather than a vacuous pass.
+  #
+  # HOST-LOCAL AND SAME-USER WRITABLE, and its use is argued where it is read
+  # (fleet_trust_local_only_proof): it is load-bearing only against a hub-only
+  # attacker, who cannot touch it.
+  fleet_trust_sp_out=$(jj -R "$1" --ignore-working-copy op log --no-graph \
+    --op-diff --config 'templates.commit_summary="commit_id"' -T '""' \
+    2>/dev/null) || return 1
+  printf '%s\n' "$fleet_trust_sp_out" | awk '
+    $0 == "main@origin:" { inb = 1; next }
+    inb && /^[+-] / {
+      for (i = 2; i <= NF; i++)
+        if (length($i) == 40 && $i ~ /^[0-9a-f]+$/) print $i
+      next
+    }
+    { inb = 0 }' | LC_ALL=C sort -u
+}
+
+fleet_trust_local_only_proof() {
+  # fleet_trust_local_only_proof <store> <ref> <published-revset>
+  #   -> prints <ref>'s newest ancestor in `::(<published-revset>)` and returns
+  #      0 when everything in <ref> that is NOT there is PROVABLY this host's
+  #      own never-published work; otherwise prints a short reason, returns 1.
+  #
+  # This is the MIGRATION, and the one place a reviewed-ref that is not on the
+  # published line can be re-anchored. An older build recorded the materialized
+  # head itself, so a host upgraded while wedged holds a local commit there
+  # today. "Its newest ancestor in the current main@origin" is NOT acceptable on
+  # its own: under a rewind that ancestor is wherever the attacker rewound TO,
+  # and anchoring there accepts the very truncation §7.12.3 refuses. Two
+  # independent proofs are required, and either one failing holds:
+  #
+  #   1. EVERY COMMIT IN THE GAP IS THIS HOST'S OWN SIGNED WORK. Verified
+  #      against a roster of ONE line — this host's own key, out of the
+  #      materialized roster (root-owned on the privileged lane) — so a
+  #      committer email cannot fake it. A peer's commit can only have arrived
+  #      FROM the remote; one in the gap is published history the remote has
+  #      since dropped, which is a rewind. This is also the proof that holds
+  #      against a same-user attacker: they can rewrite the op log below, but
+  #      not make a peer's revocation commit sign as this host, and rolling back
+  #      this host's OWN commits buys them nothing they could not sign afresh.
+  #   2. NOTHING THIS HOST EVER SAW ON main@origin IS MISSING. Every position the
+  #      op log records must still be in `::(<published-revset>)`. This is the
+  #      proof against a hub-only attacker who drops this host's own published
+  #      commits (its own sponsored revocation, say): they cannot reach the op
+  #      log. The current main@origin must itself appear, so a jj whose op-diff
+  #      this parser cannot read refuses instead of passing on nothing.
+  #
+  # Cheap proof first: the gap is a handful of commits, the op log can be long.
+  fleet_trust_ps=$1
+  fleet_trust_pref=$2
+  fleet_trust_ppub=$3
+  fleet_trust_panchor=$(jj -R "$fleet_trust_ps" log \
+    -r "heads(::$fleet_trust_pref & ::($fleet_trust_ppub) ~ root())" --no-graph \
+    -T 'commit_id ++ "\n"' 2>/dev/null | grep . || true)
+  fleet_trust_ptip=$(jj -R "$fleet_trust_ps" log -r 'present(main@origin)' \
+    --no-graph -T 'commit_id' 2>/dev/null) || fleet_trust_ptip=
+  # NO published ancestor is acceptable in exactly one state: this host has
+  # never seen ANYTHING published — no main@origin now, and (proof 2) none in
+  # the op log either. That is host 1 between fleet-enroll and its first push,
+  # upgraded across this change with the genesis as its mark. There is nothing
+  # origin could have rolled back, so the mark re-anchors to "none yet" and the
+  # first published pass records one. Anywhere else, no ancestor means a
+  # different root, which is §7.11.2's business and holds.
+  case $(printf '%s\n' "$fleet_trust_panchor" | grep -c . || true) in
+    1) ;;
+    0)
+      [ -z "$fleet_trust_ptip" ] || {
+        printf 'no published ancestor\n'
+        return 1
+      }
+      ;;
+    *)
+      printf 'no single newest published ancestor\n'
+      return 1
+      ;;
+  esac
+  # 1. the gap, bounded: a wedge is a few reconcile and evidence commits, and a
+  #    gap of hundreds is not something to prove one signature at a time. jj's
+  #    virtual root carries no signature and is in every ancestry; it is not
+  #    work anyone did.
+  fleet_trust_pgap="::$fleet_trust_pref ~ ::($fleet_trust_ppub) ~ root()"
+  fleet_trust_prest=$(jj -R "$fleet_trust_ps" log -r "$fleet_trust_pgap" \
+    --no-graph --limit 201 -T 'commit_id ++ "\n"' 2>/dev/null) || {
+    printf 'its history is unreadable\n'
+    return 1
+  }
+  fleet_trust_pn=$(printf '%s\n' "$fleet_trust_prest" | grep -c . || true)
+  [ "$fleet_trust_pn" -le 200 ] || {
+    printf 'over 200 unpublished commits\n'
+    return 1
+  }
+  fleet_trust_pprincipal=$(fleet_principal)
+  fleet_trust_pown=$(mktemp "${TMPDIR:-/tmp}/roundhouse-own.XXXXXX")
+  awk -v p="$fleet_trust_pprincipal" '$1 == p' \
+    "$(fleet_trust_materialized_path)" >"$fleet_trust_pown" 2>/dev/null || :
+  [ -s "$fleet_trust_pown" ] || {
+    rm -f "$fleet_trust_pown"
+    printf 'own key absent from the materialized roster\n'
+    return 1
+  }
+  if [ "$fleet_trust_pn" -gt 0 ]; then
+    fleet_trust_psigs=$(fleet_trust_signature_read "$fleet_trust_ps" \
+      "$fleet_trust_pgap" "$fleet_trust_pown") || {
+      rm -f "$fleet_trust_pown"
+      printf 'no usable revocation list\n'
+      return 1
+    }
+    # One line per commit, each `good <me> <me>`. A line count that disagrees
+    # with the gap is a read that went wrong, and it holds like any other.
+    [ "$(printf '%s\n' "$fleet_trust_psigs" | grep -c . || true)" -eq "$fleet_trust_pn" ] &&
+      printf '%s\n' "$fleet_trust_psigs" | awk -v p="$fleet_trust_pprincipal" '
+        NF && !($1 == "good" && $2 == p && $3 == p) { bad = 1 }
+        END { exit(bad ? 1 : 0) }' || {
+      rm -f "$fleet_trust_pown"
+      printf 'a commit not signed by this host is missing from origin\n'
+      return 1
+    }
+  fi
+  rm -f "$fleet_trust_pown"
+  # 2. the op log.
+  fleet_trust_pseen=$(fleet_trust_seen_published "$fleet_trust_ps") || {
+    printf 'the operation log is unreadable\n'
+    return 1
+  }
+  if [ -z "$fleet_trust_pseen" ]; then
+    # Nothing ever seen published is only believable where nothing is
+    # published now; with a main@origin present it is an op-diff this parser
+    # could not read, and that holds rather than passing on nothing.
+    [ -z "$fleet_trust_ptip" ] || {
+      printf 'the operation log records no main@origin\n'
+      return 1
+    }
+    printf '%s\n' "$fleet_trust_panchor"
+    return 0
+  fi
+  [ -z "$fleet_trust_ptip" ] ||
+    printf '%s\n' "$fleet_trust_pseen" | grep -Fqx "$fleet_trust_ptip" || {
+    printf 'the operation log lacks the current main@origin\n'
+    return 1
+  }
+  # Batched into revsets of 400 ids: one jj call per batch rather than per
+  # position, and well under Linux's 128 KiB single-argument ceiling. NO
+  # `present()` around the ids: a recorded position this store cannot resolve
+  # is an error, and an error holds — wrapping it would read it as "fine".
+  fleet_trust_pbatch=
+  fleet_trust_pcount=0
+  fleet_trust_pmiss=
+  for fleet_trust_pid in $fleet_trust_pseen ''; do
+    if [ -n "$fleet_trust_pid" ]; then
+      fleet_trust_pbatch="$fleet_trust_pbatch${fleet_trust_pbatch:+ | }$fleet_trust_pid"
+      fleet_trust_pcount=$((fleet_trust_pcount + 1))
+      [ "$fleet_trust_pcount" -ge 400 ] || continue
+    fi
+    [ -n "$fleet_trust_pbatch" ] || continue
+    fleet_trust_pmiss=$(jj -R "$fleet_trust_ps" log \
+      -r "($fleet_trust_pbatch) ~ ::($fleet_trust_ppub)" --no-graph \
+      -T 'commit_id ++ "\n"' 2>/dev/null) || {
+      printf 'the operation log names a commit this store cannot read\n'
+      return 1
+    }
+    [ -z "$fleet_trust_pmiss" ] || break
+    fleet_trust_pbatch=
+    fleet_trust_pcount=0
+  done
+  [ -z "$fleet_trust_pmiss" ] || {
+    printf 'main@origin once held %s, which origin no longer has\n' \
+      "$(printf '%s\n' "$fleet_trust_pmiss" | head -1)"
+    return 1
+  }
+  printf '%s\n' "$fleet_trust_panchor"
+}
+
+fleet_trust_repoint_hint() {
+  # fleet_trust_repoint_hint <store> <commit> -> the one command that re-points
+  # reviewed-ref at <commit>. Named, never run: re-pointing the rollback mark
+  # is the operator's call, made after confirming origin was not rewound. The
+  # commit travels as a 12-hex prefix jj resolves, because a full id in
+  # replicated prose is shortened to a label nothing can paste.
+  fleet_trust_hint_store=$(fleet_trust_tilde "$1")
+  fleet_trust_hint_file=$(fleet_trust_tilde "$(fleet_trust_root)/reviewed-ref")
+  if fleet_trust_privileged >/dev/null 2>&1; then
+    printf 'jj -R %s log --no-graph -r %s -T commit_id | sudo tee %s\n' \
+      "$fleet_trust_hint_store" "$(printf '%s' "$2" | cut -c1-12)" \
+      "$fleet_trust_hint_file"
+  else
+    printf 'jj -R %s log --no-graph -r %s -T commit_id >%s\n' \
+      "$fleet_trust_hint_store" "$(printf '%s' "$2" | cut -c1-12)" \
+      "$fleet_trust_hint_file"
+  fi
+}
+
+fleet_trust_reviewed_next() {
+  # fleet_trust_reviewed_next <store> <rev> — §7.12.3's descendant gate, and
+  # the reviewed-ref value to record when it passes. Prints that value (empty
+  # before this host has seen anything published) and returns 0, or prints the
+  # refusal and returns 65. fleet_trust_materialize and roundhouse-trustd both
+  # call THIS, so the two lanes cannot drift apart on either half.
+  #
+  # The gate. A reviewed-ref on `::main@origin` is a published commit, and the
+  # head must descend from it. One that is NOT on it is either this host's own
+  # unpublished work (a mark an older build wrote) or an origin that dropped
+  # what it once published; fleet_trust_local_only_proof tells them apart, and
+  # anything it cannot prove holds with the exact recovery named.
+  #
+  # The next value, and why it never moves backward. The newest ancestor of
+  # <rev> on `::main@origin` — normally main@origin itself, since a reconcile
+  # merges it — but ONLY when it descends from the current mark; otherwise the
+  # mark stays. main@origin is this host's own view, so a same-user process can
+  # point it anywhere; monotonicity is what stops that view from rewinding a
+  # root-owned mark. Moving it FORWARD to something unpublished only wedges the
+  # host, which is a denial of service that process already has.
+  fleet_trust_ns=$1
+  fleet_trust_nrev=$2
+  fleet_trust_nold=
+  fleet_trust_nref=$(fleet_trust_reviewed_ref)
+  # A reviewed-ref that no longer RESOLVES is a local rewrite and skips the gate,
+  # exactly as before: `git.abandon-unreachable-commits = false` is pinned so a
+  # force-pushed origin cannot delete local commits, so only this host's own
+  # history surgery reaches this branch.
+  if [ -n "$fleet_trust_nref" ] &&
+    jj -R "$fleet_trust_ns" log -r "$fleet_trust_nref" --no-graph -T '""' \
+      >/dev/null 2>&1; then
+    if [ -n "$(jj -R "$fleet_trust_ns" log \
+      -r "$fleet_trust_nref & ::present(main@origin)" --no-graph -T 'commit_id' \
+      2>/dev/null)" ]; then
+      fleet_trust_nold=$fleet_trust_nref
+    elif fleet_trust_nproof=$(fleet_trust_local_only_proof "$fleet_trust_ns" \
+      "$fleet_trust_nref" 'present(main@origin)'); then
+      fleet_trust_nold=$fleet_trust_nproof
+    else
+      fleet_trust_nanchor=$(jj -R "$fleet_trust_ns" log \
+        -r "heads(::$fleet_trust_nref & ::present(main@origin) ~ root())" --no-graph \
+        -T 'commit_id ++ "\n"' 2>/dev/null | head -1)
+      if [ -n "$fleet_trust_nanchor" ]; then
+        printf 'reviewed-ref %s is not on main@origin and not provably local-only work (%s). Newest published ancestor: %s. If origin was not rewound, re-point: %s\n' \
+          "$fleet_trust_nref" "$fleet_trust_nproof" "$fleet_trust_nanchor" \
+          "$(fleet_trust_repoint_hint "$fleet_trust_ns" "$fleet_trust_nanchor")"
+      else
+        printf 'reviewed-ref %s is not on main@origin and not provably local-only work (%s). It has no published ancestor; if origin is genuine, remove %s to re-anchor\n' \
+          "$fleet_trust_nref" "$fleet_trust_nproof" \
+          "$(fleet_trust_tilde "$(fleet_trust_root)/reviewed-ref")"
+      fi
+      return 65
+    fi
+    [ -z "$fleet_trust_nold" ] ||
+      [ -n "$(jj -R "$fleet_trust_ns" log \
+        -r "$fleet_trust_nold & ::$fleet_trust_nrev" --no-graph -T 'commit_id' \
+        2>/dev/null)" ] || {
+      printf '%s is not a descendant of reviewed-ref %s\n' \
+        "$fleet_trust_nrev" "$fleet_trust_nold"
+      return 65
+    }
+  fi
+  fleet_trust_nnext=$(jj -R "$fleet_trust_ns" log \
+    -r "heads(::$fleet_trust_nrev & ::present(main@origin) ~ root())" --no-graph \
+    -T 'commit_id ++ "\n"' 2>/dev/null | grep . || true)
+  if [ "$(printf '%s\n' "$fleet_trust_nnext" | grep -c .)" -eq 1 ] &&
+    { [ -z "$fleet_trust_nold" ] ||
+      [ -n "$(jj -R "$fleet_trust_ns" log \
+        -r "$fleet_trust_nold & ::$fleet_trust_nnext" --no-graph -T 'commit_id' \
+        2>/dev/null)" ]; }; then
+    printf '%s\n' "$fleet_trust_nnext"
+  else
+    printf '%s\n' "$fleet_trust_nold"
+  fi
+}
+
 fleet_trust_materialization_drift() {
   # fleet_trust_materialization_drift <store> — silent when the materialized
   # roster is byte-identical to the one the ratchet derives AT THE REF IT WAS
   # MATERIALIZED FROM.
   #
-  # The comparison point is `reviewed-ref`, never the head this run is about to
-  # adopt: every legitimate roster change moves the head, so comparing against
-  # the new head would report drift on exactly the commits the ratchet just
-  # accepted. What this row asks is narrower and is the only question worth
+  # The comparison point is the revision the file was RENDERED from
+  # (fleet_trust_materialized_rev), never the head this run is about to adopt:
+  # every legitimate roster change moves the head, so comparing against the new
+  # head would report drift on exactly the commits the ratchet just accepted.
+  # Nor is it `reviewed-ref` any longer, which now names the newest PUBLISHED
+  # ancestor of that revision: a sponsor's own unpublished enrollment commit
+  # changes the roster between the two, and comparing at the anchor would read
+  # that legitimate local edit as tamper and hold the whole store. What this row asks is narrower and is the only question worth
   # asking — has anything edited the materialized file since trustd wrote it.
   #
   # Detection, taken as well as ownership, because it is nearly free and fails
@@ -812,7 +1152,7 @@ fleet_trust_materialization_drift() {
   # doctor row for the case where it never appears.
   fleet_trust_dfile=$(fleet_trust_materialized_path)
   [ -f "$fleet_trust_dfile" ] || return 0
-  fleet_trust_dref=$(fleet_trust_reviewed_ref)
+  fleet_trust_dref=$(fleet_trust_materialized_rev)
   [ -n "$fleet_trust_dref" ] || return 0
   jj -R "$1" log -r "$fleet_trust_dref" --no-graph -T '""' >/dev/null 2>&1 ||
     return 0
@@ -1141,6 +1481,28 @@ fleet_trust_catch_up() {
   fleet_trust_carchive=$(git -C "$fleet_trust_cs" for-each-ref --count=1 \
     --sort=-refname --format='%(objectname)' 'refs/roundhouse/archive/*' \
     2>/dev/null)
+  # THE SAME WEDGE fleet_trust_materialize had, on this path too: a
+  # reviewed-ref an older build wrote may name this host's own reconcile, which
+  # never reached origin and so is in NO archive — and step 3 then refused
+  # every pass across a re-root, forever. reviewed-ref now only records
+  # published commits (fleet_trust_reviewed_next), so this branch is reached
+  # with such a ref only on a host upgraded while wedged. It is re-anchored
+  # here by the SAME two proofs the materialize gate uses, with the archive
+  # counted as published (it is the old line, by the protocol's own
+  # definition), and only then looked up; anything unprovable keeps step 3's
+  # refusal, with the recovery named.
+  if [ -n "$fleet_trust_carchive" ] &&
+    ! git -C "$fleet_trust_cs" merge-base --is-ancestor "$fleet_trust_cref" \
+      "$fleet_trust_carchive" 2>/dev/null; then
+    if fleet_trust_cproof=$(fleet_trust_local_only_proof "$fleet_trust_cs" \
+      "$fleet_trust_cref" "present(main@origin) | $fleet_trust_carchive"); then
+      fleet_trust_cref=$fleet_trust_cproof
+    else
+      printf 'reviewed-ref %s is absent from the archive; this is a rollback until an archive says otherwise (not provably local-only work: %s)\n' \
+        "$fleet_trust_cref" "$fleet_trust_cproof"
+      return 1
+    fi
+  fi
   if [ -z "$fleet_trust_carchive" ] ||
     ! git -C "$fleet_trust_cs" merge-base --is-ancestor "$fleet_trust_cref" \
       "$fleet_trust_carchive" 2>/dev/null; then

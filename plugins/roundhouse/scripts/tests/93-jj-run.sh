@@ -818,6 +818,303 @@ p0jj_verb_refusals() {
   [ ! -d "$runjj_lock" ] || fail "the foreign-edit refusal left its lock behind"
 }
 
+p0jj_ratchet() {
+  # --- §7.12.3: reviewed-ref records only what this host SAW PUBLISHED ---
+  # THE BUG THIS REPRODUCES, as it happened on a live host: a pass reconciled
+  # and materialized, which advanced reviewed-ref to its LOCAL reconcile
+  # commit; the run then hung and was killed before publishing. The commit
+  # reached no remote, origin moved on, and every later pass refused with
+  # "<head> is not a descendant of reviewed-ref" — the old carve-out only
+  # covered a reviewed-ref descending from the CURRENT main@origin. The host
+  # published nothing for days. Each block below is one shape of that, and the
+  # last three are the attacks the gate exists for, which must still hold.
+  rjj_key wren
+  runjj_ref() { runjj_lib vireo fleet_trust_reviewed_ref; }
+  runjj_unpub="$vireo/alerts/vireo/materialization--reviewed-ref-unpublished.yaml"
+  # A second writer on the hub. One enrolled key in this fleet, so the peer
+  # signs as vireo from its own clone — what a second checkout of the same
+  # identity looks like, and all the gate cares about is that origin moved.
+  jj git clone --colocate --config ui.editor='"true"' \
+    --config ui.paginate=never "$rjj/remote.git" "$rjj/peer" >/dev/null 2>&1 ||
+    fail "could not clone the hub for the peer writer"
+  runjj_peer="$rjj/peer"
+  jj -R "$runjj_peer" config set --repo user.email vireo@fleet.example.invalid
+  jj -R "$runjj_peer" config set --repo signing.behavior '"own"'
+  jj -R "$runjj_peer" config set --repo signing.backend '"ssh"'
+  jj -R "$runjj_peer" config set --repo signing.key "$rjj/vireo-key"
+  runjj_peer_push() {
+    # runjj_peer_push N [BASE] — one signed shared-layer commit on the hub, on
+    # main@origin or on BASE (a sideways move: a divergent origin).
+    jj -R "$runjj_peer" git fetch >/dev/null 2>&1
+    jj -R "$runjj_peer" new "${2:-main@origin}" >/dev/null 2>&1
+    printf 'policy:\n  canary_wait_hours: 0\n# peer edit %s\n' "$1" \
+      >"$runjj_peer/groups/canary.yaml"
+    jj -R "$runjj_peer" describe -m "peer edit $1" >/dev/null 2>&1
+    jj -R "$runjj_peer" bookmark set main --allow-backwards -r @ >/dev/null 2>&1
+    jj -R "$runjj_peer" git push --bookmark main >/dev/null 2>&1 ||
+      fail "the peer could not push edit $1"
+    jj -R "$runjj_peer" log -r main@origin --no-graph -T 'commit_id'
+  }
+  runjj_drop_local() {
+    # §10.4's recovery, or a killed run's leftovers simply abandoned: every
+    # local commit above main@origin goes, and main is reset onto it.
+    jj -R "$vireo" abandon -r "main@origin..($1 | @)" >/dev/null 2>&1 ||
+      fail "could not abandon the local work"
+    jj -R "$vireo" bookmark set main --allow-backwards -r main@origin >/dev/null
+    jj -R "$vireo" new main@origin >/dev/null
+  }
+
+  # 1. THE REGRESSION, mac-studio's shape (2026-09-28/29): the hub is
+  #    unreachable for one pass, so the run converges from last known,
+  #    reconciles a hand edit, materializes, and cannot publish — a killed
+  #    run's exact leftovers. The leftovers are then abandoned and origin
+  #    moves on past the published base they were built on.
+  #    First, the steady state: a pass records the head it FETCHED, which is
+  #    published by definition — not the reconcile it is about to push. (Host 1's
+  #    very first pass fetched nothing, so it recorded no mark at all.)
+  printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\n# a published pass\n' \
+    >"$vireo/hosts/vireo.yaml"
+  runjj_fetched=$(fleet_vcs_head_origin "$vireo")
+  runjj vireo "$cli" fleet-run --fast >/dev/null 2>&1 ||
+    fail "the steady-state pass failed"
+  [ "$(runjj_ref)" = "$runjj_fetched" ] ||
+    fail "after a published pass, reviewed-ref is not the head it fetched (got '$(runjj_ref)', want $runjj_fetched)"
+  runjj_published=$(fleet_vcs_head_origin "$vireo")
+  mv "$rjj/remote.git" "$rjj/remote.away"
+  printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\n# a pass that never publishes\n' \
+    >"$vireo/hosts/vireo.yaml"
+  runjj vireo "$cli" fleet-run --fast >/dev/null 2>&1 || :
+  mv "$rjj/remote.away" "$rjj/remote.git"
+  runjj_local=$(fleet_vcs_heads_local "$vireo")
+  runjj_rendered=$(runjj_lib vireo fleet_trust_materialized_rev)
+  #    THE PROPERTY: the materialized head is local work no remote has, and
+  #    reviewed-ref did not follow it there. The rendered revision rides in
+  #    materialized-at for the drift compare.
+  [ -n "$runjj_rendered" ] && [ "$runjj_rendered" != "$runjj_published" ] &&
+    [ -n "$(jj -R "$vireo" log -r "$runjj_rendered & ::$runjj_local" --no-graph -T commit_id)" ] &&
+    [ -z "$(jj -R "$vireo" log -r "$runjj_rendered & ::main@origin" --no-graph -T commit_id)" ] ||
+    fail "the fixture's unreachable-hub pass did not materialize unpublished local work (rendered '$runjj_rendered')"
+  [ "$(runjj_ref)" = "$runjj_published" ] ||
+    fail "reviewed-ref advanced to a commit no remote has (got $(runjj_ref), published $runjj_published)"
+  [ -z "$(runjj_lib vireo fleet_trust_materialization_drift "$vireo")" ] ||
+    fail "rendering at local work read as roster drift"
+  runjj_drop_local "$runjj_local"
+  runjj_moved=$(runjj_peer_push 1)
+  runjj_status=0
+  runjj_out=$(runjj vireo "$cli" fleet-run --fast 2>&1) || runjj_status=$?
+  [ "$runjj_status" -eq 0 ] ||
+    fail "REGRESSION: a host whose materialized local work was abandoned while origin moved on is wedged (got $runjj_status): $runjj_out"
+  case $runjj_out in
+    *published*) ;;
+    *) fail "the pass after the abandoned local work did not publish: $runjj_out" ;;
+  esac
+  [ "$(runjj_ref)" = "$runjj_moved" ] ||
+    fail "reviewed-ref is not the published head this pass adopted (got $(runjj_ref), want $runjj_moved)"
+  [ ! -e "$runjj_unpub" ] || fail "a healthy pass left the reviewed-ref alert"
+
+  # 2. MIGRATION, provable — mac-studio as it stood when upgraded: an older
+  #    build wrote the rendered head itself, so a host upgraded while wedged
+  #    holds a reviewed-ref on its own never-published commit. Its gap is this host's own signed work and the op log shows
+  #    origin never dropping anything, so it is re-anchored and the pass runs.
+  jj -R "$vireo" new main@origin >/dev/null
+  printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\n# legacy local mark\n' \
+    >"$vireo/hosts/vireo.yaml"
+  jj -R "$vireo" describe -m 'a reconcile an older build materialized and never pushed' >/dev/null
+  runjj_legacy=$(jj -R "$vireo" log -r @ --no-graph -T commit_id)
+  printf '%s\n' "$runjj_legacy" >"$rjj/vireo/reviewed-ref"
+  runjj_drop_local "$runjj_legacy"
+  runjj_moved=$(runjj_peer_push 2)
+  runjj_status=0
+  runjj_out=$(runjj vireo "$cli" fleet-run --fast 2>&1) || runjj_status=$?
+  [ "$runjj_status" -eq 0 ] ||
+    fail "MIGRATION: a legacy reviewed-ref on this host's own abandoned work was not re-anchored (got $runjj_status): $runjj_out"
+  [ "$(runjj_ref)" = "$runjj_moved" ] ||
+    fail "the migrated reviewed-ref is not the published head (got $(runjj_ref), want $runjj_moved)"
+
+  # 2b. MIGRATION, iris-wsl's exact shape (2026-09-29): the mark is a local
+  #    reconcile built on the published head, and main was NOT reset — it
+  #    names an unpublished local converge, a SIBLING of the mark on the same
+  #    published base, which every pass since had to keep holding. Nothing is
+  #    abandoned here; the mark is re-anchored on its published base, and the
+  #    held converge finally publishes.
+  runjj_base=$(fleet_vcs_head_origin "$vireo")
+  jj -R "$vireo" new "$runjj_base" >/dev/null
+  printf 'policy:\n  canary_wait_hours: 0\n# the reconcile the mark names\n' \
+    >"$vireo/groups/development.yaml"
+  jj -R "$vireo" describe -m 'reconcile vireo (materialized, never pushed)' >/dev/null
+  runjj_mark=$(jj -R "$vireo" log -r @ --no-graph -T commit_id)
+  jj -R "$vireo" new "$runjj_base" >/dev/null
+  printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\n# the converge main names\n' \
+    >"$vireo/hosts/vireo.yaml"
+  jj -R "$vireo" describe -m 'converge on vireo (never pushed)' >/dev/null
+  runjj_converge=$(jj -R "$vireo" log -r @ --no-graph -T commit_id)
+  jj -R "$vireo" bookmark set main -r "$runjj_converge" >/dev/null
+  jj -R "$vireo" new "$runjj_converge" >/dev/null
+  printf '%s\n' "$runjj_mark" >"$rjj/vireo/reviewed-ref"
+  runjj_moved=$(runjj_peer_push 2b)
+  runjj_status=0
+  runjj_out=$(runjj vireo "$cli" fleet-run --fast 2>&1) || runjj_status=$?
+  [ "$runjj_status" -eq 0 ] ||
+    fail "MIGRATION (iris-wsl): a legacy mark on a local reconcile beside an unpublished converge stayed wedged (got $runjj_status): $runjj_out"
+  [ -n "$(jj -R "$vireo" log -r "$runjj_converge & ::main@origin" --no-graph -T commit_id)" ] ||
+    fail "the held local converge never published after the re-anchor"
+  [ "$(runjj_ref)" = "$runjj_moved" ] ||
+    fail "the iris-wsl mark was not re-anchored on the published head (got $(runjj_ref), want $runjj_moved)"
+
+  # 3. MIGRATION, unprovable, and the recovery it names works. The gap holds a
+  #    commit this host did not sign — something only the remote could have
+  #    supplied, which origin has since dropped. That is a rewind until the
+  #    operator says otherwise: hold, alert with the re-point, and the doctor
+  #    row says the same on the host itself.
+  jj -R "$vireo" new main@origin >/dev/null
+  jj -R "$vireo" config set --repo user.email wren@fleet.example.invalid
+  jj -R "$vireo" config set --repo signing.key "$rjj/wren-key"
+  jj -R "$vireo" describe -m 'a commit only the remote could have supplied' >/dev/null
+  runjj_foreign=$(jj -R "$vireo" log -r @ --no-graph -T commit_id)
+  jj -R "$vireo" config set --repo user.email vireo@fleet.example.invalid
+  jj -R "$vireo" config set --repo signing.key "$rjj/vireo-key"
+  printf '%s\n' "$runjj_foreign" >"$rjj/vireo/reviewed-ref"
+  runjj_drop_local "$runjj_foreign"
+  runjj_anchor=$(fleet_vcs_head_origin "$vireo")
+  runjj_peer_push 3 >/dev/null
+  runjj_status=0
+  runjj_out=$(runjj vireo "$cli" fleet-run --fast 2>&1) || runjj_status=$?
+  [ "$runjj_status" -eq 65 ] ||
+    fail "MIGRATION: a reviewed-ref whose gap holds a peer's commit was re-anchored (got $runjj_status): $runjj_out"
+  case $runjj_out in
+    *'not provably local-only work (a commit not signed by this host is missing from origin)'*) ;;
+    *) fail "the unprovable-migration refusal does not say why: $runjj_out" ;;
+  esac
+  [ -f "$runjj_unpub" ] ||
+    fail "the unprovable reviewed-ref raised no keyed alert (the host-stuck state is silent)"
+  runjj_detail=$(yq -r '.detail' "$runjj_unpub")
+  case $runjj_detail in
+    *"Newest published ancestor: commit[${runjj_anchor:0:12}]"*) ;;
+    *) fail "the alert does not name the newest published ancestor: $runjj_detail" ;;
+  esac
+  case $runjj_detail in
+    *"commit[${runjj_foreign:0:12}]"*) ;;
+    *) fail "the alert does not name the reviewed-ref it refuses: $runjj_detail" ;;
+  esac
+  [ "$(runjj_ref)" = "$runjj_foreign" ] ||
+    fail "a refused pass moved reviewed-ref"
+  runjj_doctor=$(runjj vireo "$cli" fleet-doctor 2>&1) || :
+  printf '%s\n' "$runjj_doctor" | grep -E '^FINDING +reviewed-ref ' | grep -Fq 're-point: jj -R' ||
+    fail "the doctor does not show the stuck reviewed-ref with its re-point command: $(printf '%s\n' "$runjj_doctor" | grep reviewed-ref)"
+  #    The operator's recovery, run exactly as the refusal printed it.
+  runjj_cmd=$(printf '%s\n' "$runjj_out" | sed -n 's/.*If origin was not rewound, re-point: \(.*\); refusing to materialize.*/\1/p' | head -1)
+  [ -n "$runjj_cmd" ] || fail "the refusal printed no re-point command: $runjj_out"
+  (cd "$rjj" && eval "$runjj_cmd") || fail "the printed re-point command failed: $runjj_cmd"
+  [ "$(runjj_ref)" = "$runjj_anchor" ] ||
+    fail "the printed re-point command did not re-point reviewed-ref at the named ancestor"
+  runjj_out=$(runjj vireo "$cli" fleet-run --fast 2>&1) ||
+    fail "the pass after the printed recovery still refused: $runjj_out"
+  [ ! -e "$runjj_unpub" ] || fail "the reviewed-ref alert outlived its condition"
+
+  # 4. A REWOUND ORIGIN STILL REFUSES. The hub is force-rewound to an earlier
+  #    published head, and this host's main follows it (a reset onto
+  #    main@origin, the layer-parse fallback). The gap is all this host's own
+  #    work, so signature alone would pass it; the op log is what remembers
+  #    that origin once held more.
+  runjj_held=$(runjj_ref)
+  runjj_old=$(jj -R "$vireo" log -r "::$runjj_held ~ $runjj_held" --no-graph \
+    --limit 1 -T commit_id)
+  "$REAL_GIT" -C "$rjj/remote.git" update-ref refs/heads/main "$runjj_old"
+  jj -R "$vireo" bookmark set main --allow-backwards -r "$runjj_old" >/dev/null
+  jj -R "$vireo" new "$runjj_old" >/dev/null
+  runjj_status=0
+  runjj_out=$(runjj vireo "$cli" fleet-run --fast 2>&1) || runjj_status=$?
+  [ "$runjj_status" -eq 65 ] ||
+    fail "REWIND: a host following a rewound origin materialized (got $runjj_status): $runjj_out"
+  case $runjj_out in
+    *'main@origin once held'*'which origin no longer has'*) ;;
+    *) fail "the rewind refusal does not name what origin dropped: $runjj_out" ;;
+  esac
+  [ "$(runjj_ref)" = "$runjj_held" ] || fail "a rewound origin moved reviewed-ref backward"
+
+  # 5. A DIVERGENT ORIGIN STILL REFUSES: the hub moved SIDEWAYS, to a line
+  #    built on that earlier head that never contained what this host
+  #    reviewed. Materializing its head directly is the adoption the gate
+  #    exists to stop (the run reaches it through the same fallback).
+  runjj_diverged=$(runjj_peer_push 4 "$runjj_old")
+  jj -R "$vireo" git fetch >/dev/null 2>&1
+  [ "$(fleet_vcs_head_origin "$vireo")" = "$runjj_diverged" ] ||
+    fail "the divergent hub head did not arrive"
+  runjj_status=0
+  runjj_out=$(runjj_lib vireo fleet_trust_materialize "$vireo" "$runjj_diverged" 2>&1) ||
+    runjj_status=$?
+  [ "$runjj_status" -eq 65 ] ||
+    fail "DIVERGENCE: a head on a line that never held reviewed-ref was materialized (got $runjj_status): $runjj_out"
+  case $runjj_out in
+    *'not on main@origin'*'main@origin once held'*) ;;
+    *) fail "the divergence refusal does not name what origin dropped: $runjj_out" ;;
+  esac
+  [ "$(runjj_ref)" = "$runjj_held" ] || fail "a divergent origin moved reviewed-ref"
+}
+
+p0jj_catchup() {
+  # --- §7.11.2: the catch-up had the same wedge, and the same cure ---
+  # A host offline across a re-root looks its reviewed-ref up in the archive.
+  # A mark an older build wrote over its OWN never-published reconcile is in no
+  # archive, so step 3 refused every pass across the re-root, forever. It is
+  # re-anchored by the same two proofs the materialize gate uses — with the
+  # archive counted as published — and an unprovable one keeps the refusal.
+  rjj_key wren
+  runjj_published=$(fleet_vcs_head_origin "$vireo")
+  "$REAL_GIT" -C "$vireo" update-ref refs/roundhouse/archive/20261001 "$runjj_published"
+  runjj_legacy_mark() {
+    # runjj_legacy_mark SIGNER -> a commit atop main@origin, signed by SIGNER,
+    # recorded as reviewed-ref the way an older build did, then dropped.
+    jj -R "$vireo" new main@origin >/dev/null
+    jj -R "$vireo" config set --repo user.email "$1@fleet.example.invalid"
+    jj -R "$vireo" config set --repo signing.key "$rjj/$1-key"
+    jj -R "$vireo" describe -m "a reconcile that never reached the hub ($1)" >/dev/null
+    runjj_mark=$(jj -R "$vireo" log -r @ --no-graph -T commit_id)
+    jj -R "$vireo" config set --repo user.email vireo@fleet.example.invalid
+    jj -R "$vireo" config set --repo signing.key "$rjj/vireo-key"
+    printf '%s\n' "$runjj_mark" >"$rjj/vireo/reviewed-ref"
+    jj -R "$vireo" abandon -r "$runjj_mark" >/dev/null 2>&1
+    jj -R "$vireo" new main@origin >/dev/null
+    printf '%s\n' "$runjj_mark"
+  }
+  # The re-root, as fleet-reroot lays it down: a new parentless root carrying
+  # the checkpoint's roster, signed by a key that roster trusts.
+  jj -R "$vireo" file show -r "$runjj_published" root:trust/signers.yaml \
+    >"$rjj/checkpoint-roster.yaml"
+  jj -R "$vireo" new 'root()' >/dev/null
+  mkdir -p "$vireo/trust"
+  cp "$rjj/checkpoint-roster.yaml" "$vireo/trust/signers.yaml"
+  printf 'policy:\n  canary_wait_hours: 0\n' >"$vireo/fleet.yaml"
+  jj -R "$vireo" describe -m 're-root on the checkpointed state' >/dev/null
+  runjj_newroot=$(jj -R "$vireo" log -r @ --no-graph -T commit_id)
+  jj -R "$vireo" new main@origin >/dev/null
+
+  #    Unprovable first: the dropped mark was signed by a peer, so it is
+  #    published history the archive does not hold — a rollback until an
+  #    archive says otherwise.
+  runjj_foreign=$(runjj_legacy_mark wren)
+  runjj_status=0
+  runjj_out=$(runjj_lib vireo fleet_trust_catch_up "$vireo" "$runjj_newroot") ||
+    runjj_status=$?
+  [ "$runjj_status" -ne 0 ] ||
+    fail "CATCH-UP: a peer-signed mark absent from the archive was adopted across a re-root"
+  case $runjj_out in
+    *'absent from the archive'*'not provably local-only work'*) ;;
+    *) fail "the catch-up refusal does not say why the mark is unprovable: $runjj_out" ;;
+  esac
+  [ "$(runjj_lib vireo fleet_trust_reviewed_ref)" = "$runjj_foreign" ] ||
+    fail "a refused catch-up moved reviewed-ref"
+
+  #    Provable: the dropped mark is this host's own work atop what the archive
+  #    holds, so the catch-up re-anchors and adopts the new root (step 7).
+  runjj_legacy_mark vireo >/dev/null
+  runjj_out=$(runjj_lib vireo fleet_trust_catch_up "$vireo" "$runjj_newroot") ||
+    fail "CATCH-UP: a legacy mark on this host's own unpublished work wedged the re-root: $runjj_out"
+  [ -z "$runjj_out" ] || fail "the re-anchored catch-up printed a hold reason: $runjj_out"
+  [ "$(runjj_lib vireo fleet_trust_reviewed_ref)" = "$runjj_newroot" ] ||
+    fail "the catch-up did not advance reviewed-ref to the new root"
+}
+
 if [ "$real_jj_ok" = true ] && section_part 2; then
   p0jj_block tombstone p0jj_tombstone 'capped tombstone uninstall, then silent'
   p0jj_block takeover p0jj_takeover 'dead-holder lock takeover, alerted and published'
@@ -827,4 +1124,8 @@ if [ "$real_jj_ok" = true ] && section_part 2; then
   p0jj_block aging p0jj_aging 'evidence aging previewed by --dry-run, then published'
   p0jj_block verbs p0jj_verb_refusals \
     'publishing verbs refuse a diverged main, a live lock and a foreign edit'
+  p0jj_block ratchet p0jj_ratchet \
+    'reviewed-ref published-only: abandoned local work, migration proved and refused with recovery, rewind and divergence held'
+  p0jj_block catchup p0jj_catchup \
+    'catch-up across a re-root: legacy local mark re-anchored when proved, refused when not'
 fi

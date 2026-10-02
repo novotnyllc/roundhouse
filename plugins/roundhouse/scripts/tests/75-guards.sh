@@ -738,15 +738,31 @@ JSONC
     printf '%s\n' "$(cli_function_body fleet_sweep_range)" |
       grep -q 'sweep_rc' ||
       fail "the redaction sweep does not capture the enumeration exit (empty range = clean)"
-    # §7.12.3 materialize tolerates LOCAL unpublished work: a sweep-refused or
-    # conflicted run advances reviewed-ref to a head it never pushed, and the
-    # §10.4 recovery (abandon / op restore + reset to main@origin) then leaves
-    # the next head a sibling of reviewed-ref. That is a local rewrite, not the
-    # rollback attack (a DIVERGENT origin), so the check is keyed on whether
-    # reviewed-ref descends from main@origin — refuse only when it does not.
+    # §7.12.3 materialize can never wedge on LOCAL unpublished work: a run
+    # materializes before it publishes, so a hung, killed or refused publish
+    # used to leave reviewed-ref naming a commit no remote has, and every later
+    # head was its sibling. reviewed-ref now records only the newest PUBLISHED
+    # ancestor, through ONE function both lanes call — the run and trustd — so
+    # the rule cannot be fixed in one and left wedging in the other. The
+    # behaviour itself is asserted against real jj in tests/93-jj-run.sh.
     printf '%s\n' "$(cli_function_body fleet_trust_materialize)" |
+      grep -q 'fleet_trust_reviewed_next "\$fleet_trust_ms" "\$fleet_trust_mrev"' ||
+      fail "materialize's §7.12.3 gate does not go through fleet_trust_reviewed_next; local work can wedge reviewed-ref again"
+    printf '%s\n' "$(cli_function_body fleet_trust_materialize)" |
+      grep -q 'printf .%s\\n. "\$fleet_trust_mnext" >"\$fleet_trust_mtmp/reviewed-ref"' ||
+      fail "the same-user lane records something other than the published mark as reviewed-ref"
+    grep -q 'trustd_next=$(fleet_trust_reviewed_next "$trustd_store" "$trustd_rev")' \
+      "$script_dir/roundhouse-trustd" ||
+      fail "trustd does not mirror the published-reviewed-ref gate (§7.9 parity)"
+    grep -q 'printf .%s\\n. "$trustd_next" >"$trustd_tmp/reviewed-ref"' \
+      "$script_dir/roundhouse-trustd" ||
+      fail "trustd records something other than the published mark as reviewed-ref"
+    # The legacy carve-out is GONE, not kept beside the new gate: "allow when
+    # reviewed-ref descends from the current main@origin" also allows a pure
+    # rewind of origin to an ancestor of reviewed-ref.
+    ! printf '%s\n' "$(cli_function_body fleet_trust_materialize)" |
       grep -q 'present(main@origin) & ::' ||
-      fail "materialize's §7.12.3 check has no local-supersede tolerance; the documented recovery would brick every future materialize"
+      fail "materialize still carries the old main@origin carve-out, which a rewound origin satisfies"
 
     # --- §10.6 the private-remote posture, host-local by construction ---
     case $(fleet_posture_path) in

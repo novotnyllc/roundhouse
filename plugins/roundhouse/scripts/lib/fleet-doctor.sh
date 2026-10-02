@@ -1355,6 +1355,41 @@ fleet_doctor_command() (
         "roster generation $doctor_gen is BELOW this host's last-seen $doctor_gen_seen (§7.12.3)"
     fi
 
+    # REVIEWED-REF ON THE PUBLISHED LINE, the descendant gate's half of the same
+    # defence. The mark only ever records a commit this host saw on
+    # main@origin, so one that is not there is either a mark an older build
+    # wrote over local work or an origin that dropped what it published — and
+    # either way fleet-run holds everything until the mark is proved or
+    # re-pointed. This row is where that stuck state is visible on the host
+    # itself, with the command; the run's own keyed alert cannot leave a host
+    # that is holding, because holding is not publishing. Cheap on purpose:
+    # the op-log proof is the run's, and this row only says where things stand.
+    doctor_rref=$(fleet_trust_reviewed_ref)
+    if [ -z "$doctor_rref" ]; then
+      fleet_doctor_row ok reviewed-ref \
+        'no reviewed-ref yet; the first materialize after a publication records one'
+    elif ! jj -R "$doctor_store" log -r "$doctor_rref" --no-graph -T '""' \
+      >/dev/null 2>&1; then
+      fleet_doctor_row ok reviewed-ref \
+        "reviewed-ref $doctor_rref no longer resolves here (a local rewrite); the next materialize re-anchors it"
+    elif [ -n "$(jj -R "$doctor_store" log \
+      -r "$doctor_rref & ::present(main@origin)" --no-graph -T 'commit_id' \
+      2>/dev/null)" ]; then
+      fleet_doctor_row ok reviewed-ref \
+        "reviewed-ref $doctor_rref is on main@origin ($(fleet_trust_root)/reviewed-ref)"
+    else
+      doctor_ranchor=$(jj -R "$doctor_store" log \
+        -r "heads(::$doctor_rref & ::present(main@origin) ~ root())" --no-graph \
+        -T 'commit_id ++ "\n"' 2>/dev/null | head -1)
+      if [ -n "$doctor_ranchor" ]; then
+        fleet_doctor_row finding reviewed-ref \
+          "reviewed-ref $doctor_rref is not on main@origin; fleet-run holds unless it proves it local-only work (§7.12.3). Newest published ancestor: $doctor_ranchor. If origin was not rewound, re-point: $(fleet_trust_repoint_hint "$doctor_store" "$doctor_ranchor")"
+      else
+        fleet_doctor_row finding reviewed-ref \
+          "reviewed-ref $doctor_rref is not on main@origin and has no published ancestor (§7.12.3); if origin is genuine, remove $(fleet_trust_root)/reviewed-ref to re-anchor"
+      fi
+    fi
+
     # CLASS ENFORCEMENT, asserted rather than left in prose: an `ephemeral`
     # principal touching a fleet-shared path, and one touching the roster
     # itself, are both refused. "The class is the security boundary" is

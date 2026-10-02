@@ -472,7 +472,7 @@ YAML
     for docjj_expect in tools genesis-pin config-pins signing-key trust-roots \
       krl privileged-lane trustd-binary head-signature ratchet-replay monotonicity \
       materialization-digest git-cross-check path-identity roster-coherence \
-      roster-lines generation class-enforcement soak revsets working-copy \
+      roster-lines generation reviewed-ref class-enforcement soak revsets working-copy \
       undescribed conflicts conflict-paths store-symlinks \
       host-local-leak description-sweep findings-sweep trailers poll-floor \
       remote-posture run-lock rewrite-messages banned-keys digest raw-git-push \

@@ -2584,6 +2584,29 @@ revocation.
 - Distinguishing a legitimate re-root from this attack is §7.11.2's archive
   protocol, and that is why the archive is mandatory.
 
+**`reviewed-ref` records only what this host saw published.** A run
+materializes *before* it publishes, so recording the materialized head let a
+hung, killed or refused publish leave the mark on a local reconcile no remote
+has; once that commit was abandoned or origin moved past its base, every later
+head was its sibling and the descendant gate refused every pass (observed on
+two hosts, 2026-09-28 onward, with nothing published for days). The mark is
+now the newest ancestor of the materialized head that is in `::main@origin` as
+fetched, and it only ever moves forward (a candidate that does not descend from
+the current mark leaves it in place). The rendered head rides in
+`materialized-at`'s second field for the §7.9 drift compare. A mark that is not
+on `main@origin` — one an older build wrote over local work, or an origin that
+dropped what it published — is re-anchored only when two independent proofs
+hold: every commit between it and its newest published ancestor verifies as
+signed by this host's own key alone (a peer's commit there can only be
+published history the remote dropped), and every position the jj operation log
+records for `main@origin` is still in `::main@origin` (nothing this host ever
+saw published is missing). Otherwise the run holds and raises the keyed
+`materialization`/`reviewed-ref-unpublished` alert naming the mark, its newest
+published ancestor and the re-point command; `fleet-doctor`'s `reviewed-ref`
+row shows the same on the host. `roundhouse-trustd` applies the same function
+from its own root-owned library copy; an installed helper older than the
+plugin keeps the old rule until its install lane re-runs.
+
 #### 7.12.4 The first-host TOFU window
 
 Enrollment reaches a newcomer over SSH. On genuine first contact an attacker
