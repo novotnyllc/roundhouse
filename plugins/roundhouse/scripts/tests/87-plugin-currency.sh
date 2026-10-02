@@ -338,10 +338,12 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
 fi
 case "$*" in
   'plugin list --json')
-    jq -cn --arg v "$ver" --arg sha "$(cat "$st/sha-$ver")" '{installed:[{
+    jq -cn --arg v "$ver" --arg sha "$(cat "$st/sha-$ver")" \
+      --argjson src "$(cat "$st/source")" --argjson on "$(cat "$st/enabled")" '{installed:[{
       pluginId:"widget@m",name:"widget",marketplaceName:"m",version:$v,
-      installed:true,enabled:true,source:{source:"local",path:"x",sha:$sha}}]}'
+      installed:true,enabled:$on,source:($src + {sha:$sha})}]}'
     ;;
+  'plugin marketplace list --json') cat "$st/markets" ;;
   'plugin add widget@m --json')
     printf '%s\n' new >"$st/version"
     printf 'codex-add widget@m\n' >>"$st/log"
@@ -355,12 +357,17 @@ SH
       printf '%s\n' "$pc_sha_a" >"$pc/hooks-state/sha-old"
       printf '%s\n' "$pc_sha_b" >"$pc/hooks-state/sha-new"
       printf '%s\n' sha256:old >"$pc/hooks-state/trusted"
+      printf '%s\n' true >"$pc/hooks-state/enabled"
+      printf '%s\n' '{"source":"git","url":"https://example.invalid/widget.git"}' \
+        >"$pc/hooks-state/source"
+      printf '%s\n' '{"marketplaces":[]}' >"$pc/hooks-state/markets"
       : >"$pc/hooks-state/log"
       jq -n --arg a "$pc_sha_a" '{version: 2, plugins: {"widget@m":
         [{scope: "user", version: "1.0.0", gitCommitSha: $a}]}}' \
         >"$HOME/.claude/plugins/installed_plugins.json"
       jq -n --arg b "$pc_sha_b" '{available: [{pluginId: "widget@m", version: "1.1.0",
-        source: {source: "git", sha: $b}}]}' >"$pc/hooks-catalog.json"
+        source: {source: "git", url: "https://example.invalid/widget.git", sha: $b}}]}' \
+        >"$pc/hooks-catalog.json"
       printf '%s\n' '{"widget@m":true}' >"$pc/hooks-enabled.json"
     }
     pc_hooks_apply() {
@@ -381,6 +388,55 @@ SH
       fail "the Codex copy was not refreshed, carrying its hook trust, before approval: $(tr '\n' ';' <"$pc/hooks-state/log")"
     [ "$(cat "$pc/hooks-state/trusted")" = sha256:new ] ||
       fail "the changed hook did not end trusted at its new hash"
+    # The same ID registered in Codex from ANOTHER source: the helper would
+    # install those bytes and re-trust their hooks before the identity check
+    # refused, and a hold undoes neither. Refused before anything runs.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' '{"source":"git","url":"https://example.invalid/impostor.git"}' \
+      >"$pc/hooks-state/source"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] ||
+      fail "a Codex copy from another source was approved (got $pc_status)"
+    [ ! -s "$pc/hooks-state/log" ] && [ "$(cat "$pc/hooks-state/version")" = old ] &&
+      [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+      fail "a Codex copy from another source was refreshed or re-trusted: $(tr '\n' ';' <"$pc/hooks-state/log")"
+    # A Codex registration someone DISABLED is never reinstalled (that would
+    # re-enable it) and has no hooks to approve; the Claude item still applies.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' false >"$pc/hooks-state/enabled"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 0 ] ||
+      fail "a disabled Codex copy held the Claude plugin item (got $pc_status)"
+    [ ! -s "$pc/hooks-state/log" ] && [ "$(cat "$pc/hooks-state/version")" = old ] ||
+      fail "a disabled Codex copy was reinstalled or re-trusted: $(tr '\n' ';' <"$pc/hooks-state/log")"
+    # An in-marketplace (relative) catalog entry: the two marketplaces must be
+    # the same repository, and the record that path under the Codex root.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    jq -n --arg b "$pc_sha_b" '{available: [{pluginId: "widget@m", version: "1.1.0",
+      source: {source: "relative", path: "./plugins/widget", sha: $b}}]}' \
+      >"$pc/hooks-catalog.json"
+    printf '%s\n' '[{"name":"m","source":"github","repo":"owner/mkt"}]' >"$pc/claude-markets.json"
+    pc_relative() {
+      # pc_relative CODEX-MARKET-URL RECORD-PATH -> fleet_run_codex_source_ok's status
+      jq -n --arg u "$1" '{marketplaces: [{name: "m", root: "/codex/m",
+        marketplaceSource: {sourceType: "git", source: $u}}]}' >"$pc/hooks-state/markets"
+      jq -n --arg p "$2" '{source: "local", path: $p}' >"$pc/hooks-state/source"
+      PATH="$pc/hooks-bin:$PATH" PC_HOOKS_STATE="$pc/hooks-state" \
+        CLAUDE_PLUGIN_CATALOG_FILE="$pc/hooks-catalog.json" \
+        CLAUDE_PLUGIN_MARKETPLACE_FILE="$pc/claude-markets.json" \
+        fleet_run_codex_source_ok widget@m
+    }
+    pc_relative https://github.com/Owner/mkt.git /codex/m/plugins/widget/ ||
+      fail "an in-marketplace Codex copy from the same repository was refused"
+    ! pc_relative https://github.com/attacker/mkt.git /codex/m/plugins/widget ||
+      fail "an in-marketplace Codex copy from another repository was accepted"
+    ! pc_relative https://github.com/owner/mkt.git /codex/m/plugins/other ||
+      fail "an in-marketplace Codex copy at another path was accepted"
     # Disabled: the Codex copy and its hook trust are never touched.
     pc_hooks_reset
     fleet_run_marketplace_repair_reset

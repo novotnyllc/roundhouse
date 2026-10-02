@@ -255,7 +255,13 @@ if [ "${1:-}" = plugin ] && [ "${2:-}" = list ] && [ "${3:-}" = --json ]; then
     exit 0
   }
   codex_plugin_sha="${CODEX_PLUGIN_SHA:-}"
-  printf '{"installed":[{"pluginId":"example@test-market","name":"example","marketplaceName":"test-market","version":"%s","installed":true,"enabled":true,"source":{"source":"local","path":"fixture-codex-active","sha":"%s"}},{"pluginId":"disabled-example@test-market","name":"disabled-example","marketplaceName":"test-market","version":"3.0.0","installed":true,"enabled":false,"source":{"source":"local","path":"fixture-codex-disabled"}}]}\n' "$version" "$codex_plugin_sha"
+  codex_plugin_json=$(printf '{"installed":[{"pluginId":"example@test-market","name":"example","marketplaceName":"test-market","version":"%s","installed":true,"enabled":true,"source":{"source":"local","path":"fixture-codex-active","sha":"%s"}},{"pluginId":"disabled-example@test-market","name":"disabled-example","marketplaceName":"test-market","version":"3.0.0","installed":true,"enabled":false,"source":{"source":"local","path":"fixture-codex-disabled"}}]}\n' "$version" "$codex_plugin_sha")
+  # CODEX_PLUGIN_SOURCE_URL makes the example record git-sourced, from that
+  # repository, as a record from a Git marketplace plugin carries it.
+  [ -z "${CODEX_PLUGIN_SOURCE_URL:-}" ] || codex_plugin_json=$(printf '%s\n' "$codex_plugin_json" |
+    jq -c --arg u "$CODEX_PLUGIN_SOURCE_URL" \
+      '.installed[0].source = {source: "git", url: $u, sha: .installed[0].source.sha}')
+  printf '%s\n' "$codex_plugin_json"
   exit 0
 fi
 if [ "${1:-}" = plugin ] && [ "${2:-}" = add ] &&

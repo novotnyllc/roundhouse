@@ -1748,6 +1748,12 @@ fleet_run_approve_plugin_hooks() {
   command -v codex >/dev/null 2>&1 || return 0
   fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" '') || return 75
   [ "$fleet_run_codex_plugin_state" != absent ] || return 0
+  # Codex's registration is the operator's, not the item's: a Codex copy
+  # someone DISABLED runs no hooks, so there is nothing to approve, and it is
+  # never reinstalled (`codex plugin add` would re-enable it).
+  fleet_run_codex_enabled=$(fleet_run_codex_record "$1" | jq -r '.enabled == true') ||
+    return 75
+  [ "$fleet_run_codex_enabled" = true ] || return 0
   fleet_run_hooks_node=$(fleet_node_path) || {
     printf 'roundhouse: Node.js is required to approve hooks for %s\n' "$1" >&2
     return 75
@@ -1761,6 +1767,11 @@ fleet_run_approve_plugin_hooks() {
   # hooks changed upstream. A state-only enable changed no bytes and does not
   # reinstall the Codex copy; a disabled state never reaches here.
   if [ "${3:-}" = refresh ]; then
+    # The helper is never pointed at a DIFFERENT source that merely shares
+    # the ID: it would install those bytes and re-trust their hooks before
+    # the identity check below could refuse, and a 75 undoes neither
+    # (fleet_run_codex_source_ok).
+    fleet_run_codex_source_ok "$1" || return 75
     fleet_run_cli_invalidate
     bounded_verb "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" update "$1" \
       >/dev/null 2>&1 </dev/null || return 75
@@ -1773,6 +1784,83 @@ fleet_run_approve_plugin_hooks() {
   ROUNDHOUSE_AUTOMATIC_HOOK_APPROVAL=1 \
     "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" approve "$1" \
     >/dev/null || return 75
+}
+
+fleet_run_codex_record() {
+  # fleet_run_codex_record ID -> Codex's installed record for ID as compact
+  # JSON (`{}` when there is none). Exit 75 when the list cannot be read.
+  fleet_run_codex_plugins=$(fleet_run_cli_cached codex \
+    codex plugin list --json 2>/dev/null) || return 75
+  printf '%s\n' "$fleet_run_codex_plugins" | jq -e -c --arg id "$1" '
+    if type == "array" then .
+    elif type == "object" and (.installed | type == "array") then .installed
+    else error("invalid plugin list") end |
+    [.[] | objects | select((.pluginId // .id) == $id and (.installed != false))] |
+    (.[0] // {})' 2>/dev/null || return 75
+}
+
+fleet_run_codex_source_ok() {
+  # fleet_run_codex_source_ok ID — exit 0 when Codex's installed copy of ID
+  # comes from the plugin source Claude's catalog names (any revision of it),
+  # 75 otherwise or when that cannot be shown. Two catalog shapes:
+  #   - a source with a repository (`git`/`git-subdir`/`url`/`github`): the
+  #     same repository, GitHub spellings folded together, and the same path
+  #     inside it;
+  #   - a relative, in-marketplace source: the Codex marketplace the record
+  #     belongs to is registered from the same repository Claude's is, and
+  #     the record's local path is that relative path under its root.
+  fleet_run_cso_catalog=$(fleet_run_plugin_catalog_proven "$1") || return 75
+  fleet_run_cso_record=$(fleet_run_codex_record "$1") || return 75
+  fleet_run_cso_srcid='
+    def repo: sub("/+$"; "") |
+      if test("^(https://|ssh://git@|git@)github[.]com[:/]") then
+        "github:" + (sub("^(https://|ssh://git@|git@)github[.]com[:/]"; "") |
+          ascii_downcase | sub("[.]git$"; ""))
+      else sub("[.]git$"; "") end;
+    def rel: (. // "") | tostring | sub("^[.]/"; "") | sub("^[.]$"; "") | sub("/+$"; "");
+    def srcid: (if .source == "github" then "https://github.com/" + (.repo // "")
+      else (.url // "") end) as $u |
+      if ($u | type) == "string" and $u != "" then ($u | repo) + "|" + (.path | rel)
+      else empty end;'
+  fleet_run_cso_kind=$(printf '%s\n' "$fleet_run_cso_catalog" |
+    jq -r '.source.source // ""') || return 75
+  if [ "$fleet_run_cso_kind" != relative ]; then
+    fleet_run_cso_want=$(printf '%s\n' "$fleet_run_cso_catalog" |
+      jq -er "$fleet_run_cso_srcid"' .source | srcid' 2>/dev/null) || return 75
+    fleet_run_cso_have=$(printf '%s\n' "$fleet_run_cso_record" |
+      jq -er "$fleet_run_cso_srcid"' .source | srcid' 2>/dev/null) || return 75
+    [ "$fleet_run_cso_want" = "$fleet_run_cso_have" ]
+    return
+  fi
+  # In-marketplace: compare the two marketplaces' repositories, then the path.
+  fleet_run_cso_market=${1##*@}
+  fleet_run_cso_centry=$(fleet_run_marketplaces | jq -c --arg n "$fleet_run_cso_market" \
+    '[.[] | select(.name == $n)] | .[0] // empty' 2>/dev/null) || return 75
+  [ -n "$fleet_run_cso_centry" ] || return 75
+  fleet_run_cso_claude=$(fleet_run_marketplace_registered_locator "$fleet_run_cso_market" \
+    "$fleet_run_cso_centry") || return 75
+  fleet_run_cso_xmarket=$(printf '%s\n' "$fleet_run_cso_record" |
+    jq -r '.marketplaceName // empty') || return 75
+  fleet_run_cso_xentry=$(bounded_query codex plugin marketplace list --json 2>/dev/null |
+    jq -ec --arg n "$fleet_run_cso_xmarket" '
+      (if type == "array" then . else (.marketplaces // []) end) |
+      [.[] | select(.name == $n)] | .[0] // error("none")' 2>/dev/null) || return 75
+  fleet_run_cso_codex=$(printf '%s\n' "$fleet_run_cso_xentry" | jq -r \
+    "$fleet_run_marketplace_locator_filter"'
+    {source: {source: "git", url: (.marketplaceSource.source // "")}} | locator') ||
+    return 75
+  # A ref is not part of this comparison: an older revision of the same
+  # repository is the same source.
+  [ "${fleet_run_cso_claude%%#*}" = "${fleet_run_cso_codex%%#*}" ] || return 75
+  printf '%s\n' "$fleet_run_cso_xentry" "$fleet_run_cso_record" \
+    "$fleet_run_cso_catalog" | jq -es '
+      def norm: tostring | gsub("/+"; "/") | sub("/$"; "") | sub("/[.]$"; "");
+      def rel: (. // "") | tostring | sub("^[.]/"; "") | sub("^[.]$"; "") | sub("/+$"; "");
+      .[0].root as $root | .[1].source as $s | (.[2].source.path | rel) as $rel |
+      ($root | type) == "string" and ($s.source // "") == "local" and
+      (($s.path // "") | norm) ==
+        (if $rel == "" then $root else $root + "/" + $rel end | norm)' \
+    >/dev/null 2>&1 || return 75
 }
 
 fleet_run_codex_record_state() {
