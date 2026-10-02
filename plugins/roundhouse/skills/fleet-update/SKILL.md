@@ -393,7 +393,10 @@ minute. Re-run `install` after changing those keys.
   session — `install` checks that first, exits 75 and names the fix, and
   writes nothing — and WSL needs systemd enabled (an unreachable user manager
   is its own diagnostic). A job is its timer AND its service: either one
-  missing is a missing job, and `status` compares both.
+  missing is a missing job, and `status` compares both. A replaced unit runs
+  only once the user manager reloads it, so `install`'s `daemon-reload` is a
+  required step, and an `install` that finds the manager still on an older
+  copy (`NeedDaemonReload`) reloads it and restarts the timers.
 - **Windows** — a **per-user** scheduled task. Where the machine has a
   configured WSL sibling, register it there and drive the native side through
   the interop lane rather than registering a second native entry.

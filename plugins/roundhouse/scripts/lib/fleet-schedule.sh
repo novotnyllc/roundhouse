@@ -173,6 +173,11 @@ fleet_schedule_launchd_facts() {
   printf 'reachable=1 loaded=%s disabled=%s\n' "$launchd_loaded" "$launchd_disabled"
 }
 
+fleet_schedule_launchd_needs_reload() {
+  # launchd reads a plist at bootstrap; there is no separate reload.
+  return 1
+}
+
 fleet_schedule_launchd_start() {
   launchctl kickstart "$(fleet_schedule_gui_domain)/$(fleet_schedule_label "$1")"
 }
@@ -219,6 +224,23 @@ fleet_schedule_systemd_facts() {
   ! systemctl --user is-active --quiet "$systemd_timer" 2>/dev/null || systemd_active=1
   printf 'reachable=1 enabled=%s disabled=%s active=%s wants=0 lingers=%s\n' \
     "$systemd_enabled" "$systemd_disabled" "$systemd_active" "$systemd_lingers"
+}
+
+fleet_schedule_systemd_needs_reload() {
+  # True when the reachable user manager may still run an older copy of a
+  # fleet timer or service than the one on disk (NeedDaemonReload): a unit
+  # was replaced and the manager never reloaded it. Any answer but `no`
+  # counts, since a reload is cheap and safe to repeat. Read for the sealed
+  # plan's observation only, not one of the facts every trigger reads.
+  for reload_mode in $fleet_schedule_modes; do
+    for reload_unit in "$(fleet_schedule_unit "$reload_mode").timer" \
+      "$(fleet_schedule_unit "$reload_mode").service"; do
+      reload_answer=$(systemctl --user show -p NeedDaemonReload --value "$reload_unit" 2>/dev/null) ||
+        reload_answer=unknown
+      [ "$reload_answer" = no ] || return 0
+    done
+  done
+  return 1
 }
 
 fleet_schedule_systemd_start() {

@@ -10,7 +10,9 @@
 #   observe   the collector's `agent_artifact roundhouse:schedule` record
 #             (fleet_schedule_observe): every definition file's sha256 or its
 #             absence, each job's facts and state word (lib/fleet-schedule.sh),
-#             the superseded entries, the scheduler's reachability;
+#             the superseded entries, the scheduler's reachability, and
+#             whether a systemd user manager still runs an older copy of a
+#             replaced unit;
 #   plan      fleet_schedule_plan_steps turns that record into the EXACT
 #             steps — each file to write (with its rendered sha256), keep,
 #             remove or absorb, and each scheduler command with the effect it
@@ -85,6 +87,11 @@ EOF_OBSERVE
       '. + [{mode:$mode,state:$state,loaded:$loaded,disabled:$disabled,
         enabled:$enabled,active:$active}]')
   done
+  # A manager still on an older copy of a replaced unit (systemd only).
+  observe_reload=false
+  if [ "$observe_reachable" = true ] && fleet_schedule_backend needs_reload; then
+    observe_reload=true
+  fi
   observe_legacy='[]'
   if [ "$observe_platform" = launchd ]; then
     observe_legacy_list=$(fleet_schedule_legacy_plists)
@@ -98,11 +105,13 @@ EOF_OBSERVE
   fi
   jq -cn --arg platform "$observe_platform" --arg domain "$(fleet_schedule_gui_domain)" \
     --argjson reachable "$observe_reachable" --argjson lingers "$observe_lingers" \
+    --argjson reload "$observe_reload" \
     --argjson opted_out "$observe_optout" --argjson files "$observe_files" \
     --argjson jobs "$observe_jobs" --argjson legacy "$observe_legacy" \
     '{id:"roundhouse:schedule",artifact_kind:"schedule",platform:$platform,
       domain:(if $platform == "launchd" then $domain else null end),
-      scheduler_reachable:$reachable,lingers:$lingers,opted_out:$opted_out,
+      scheduler_reachable:$reachable,lingers:$lingers,needs_reload:$reload,
+      opted_out:$opted_out,
       files:$files,jobs:$jobs,legacy:$legacy}'
 }
 
@@ -220,11 +229,18 @@ fleet_schedule_systemd_plan_finish() {
   [ "$3" = true ] || return 0
   case $1 in
     install)
-      [ "$2" != true ] || fleet_schedule_command_step all reload
+      # A replaced unit runs only once the manager reloads it, so the reload
+      # is REQUIRED: an install whose reload fails has not happened. A
+      # manager still on an older copy (a previous install whose reload
+      # failed) is reloaded, and its timers restarted, though nothing is
+      # rewritten.
+      finish_reload=$2
+      [ "$(printf '%s\n' "$4" | jq -r '.needs_reload')" != true ] || finish_reload=true
+      [ "$finish_reload" != true ] || fleet_schedule_command_step all reload true
       for finish_mode in $fleet_schedule_modes; do
         if [ "$(printf '%s\n' "$4" | jq -r --arg mode "$finish_mode" \
           'first(.jobs[] | select(.mode == $mode)) | .enabled and .active')" = true ]; then
-          [ "$2" != true ] || fleet_schedule_command_step "$finish_mode" restart
+          [ "$finish_reload" != true ] || fleet_schedule_command_step "$finish_mode" restart
         else
           # The ONE place a disabled timer is re-enabled: the operator asked.
           fleet_schedule_command_step "$finish_mode" enable-start
@@ -446,6 +462,10 @@ fleet_schedule_report() {
         ($s[] | select(.action == "run" and .effect == "enable-start") |
           "fleet-\($mode): enabled and started roundhouse-fleet-\($mode).timer")
       end),
+    (if $action == "install" and any($steps[]; .action == "run" and .effect == "reload") and
+        all($steps[]; .action != "write") then
+       "roundhouse: reloaded the user manager, which was still on an older copy of a unit"
+     else empty end),
     ($absorbed[] | "roundhouse: absorbed the superseded \(.path | split("/") | last | rtrimstr(".plist")) entry (kept as \(.to))")'
 }
 
