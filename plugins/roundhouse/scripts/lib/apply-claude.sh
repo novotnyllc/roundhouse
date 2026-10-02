@@ -312,7 +312,7 @@ fleet_run_marketplace_source_ok() {
   # fleet_run_marketplace_source_ok NAME — READ-ONLY: is NAME registered from
   # the source the user's own declaration (`extraKnownMarketplaces`) names?
   # Exit 0 when it is, or when there is nothing to compare (NAME is not
-  # registered, or not declared); 75 when it cannot be listed, or for a
+  # registered, or not declared); 74 when it cannot be listed, 75 for a
   # same-name REPOINT, with the reason in `fleet_run_repair_reason`. Asked
   # before a catalog entry is accepted and before a marketplace is refreshed:
   # a catalog SHA proves bytes, not that they came from the declared
@@ -328,9 +328,10 @@ fleet_run_marketplace_source_ok() {
       return 75
       ;;
   esac
+  # A list that fails or times out is transient (74), and is not remembered.
   fleet_run_source_list=$(fleet_run_marketplaces) || {
     fleet_run_repair_reason="the registered marketplaces cannot be listed"
-    return 75
+    return 74
   }
   fleet_run_source_entry=$(printf '%s\n' "$fleet_run_source_list" | jq -c --arg n "$1" '
     [.[] | select(.name == $n)] | .[0] // empty' 2>/dev/null) || fleet_run_source_entry=

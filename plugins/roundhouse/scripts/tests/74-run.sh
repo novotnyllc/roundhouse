@@ -28,25 +28,18 @@ if [ -n "$fleet_fixture_yq" ]; then
     mkdir -p "$HOME"
 
     # --- which held applies keep the poll floor open (retry-owed) ---
-    # Transient holds (a tombstone's live-session deferral or failed probe, a
-    # plugin's bounded install or unresolved marketplace) and every failure
-    # are retried every pass; standing capability holds are left to the full
-    # cadence.
-    for run_retry_case in '75 true plugins' '75 false plugins' '75 true skills' \
-      '1 false plugins' '65 false packages' '73 false packages' '64 false skills'; do
-      # shellcheck disable=SC2086 # deliberate: status, tombstone, category
+    # The apply names the kind: a transient hold (74, a bounded manager verb
+    # that failed or timed out), a tombstone's holds (a live-session deferral
+    # or failed probe) and every failure are retried every pass; a standing
+    # 75 is left to the full cadence, whatever its category.
+    for run_retry_case in '74 false' '75 true' '1 false' '65 false' \
+      '73 false' '64 false'; do
+      # shellcheck disable=SC2086 # deliberate: status, tombstone
       fleet_run_hold_owes_retry $run_retry_case ||
         fail "a transient hold ($run_retry_case) left the poll floor free to skip its retry"
     done
-    for run_retry_case in '75 false packages' '75 false hooks' '75 false skills'; do
-      # shellcheck disable=SC2086 # deliberate: status, tombstone, category
-      ! fleet_run_hold_owes_retry $run_retry_case ||
-        fail "a standing capability hold ($run_retry_case) held the poll floor open"
-    done
-    # A plugin hold on a host with no claude at all is standing: the fixture
-    # stubs claude into its PATH, so this case runs on a PATH without it.
-    ! PATH=/usr/bin:/bin fleet_run_hold_owes_retry 75 false plugins ||
-      fail "a plugin hold on a host with no claude held the poll floor open"
+    ! fleet_run_hold_owes_retry 75 false ||
+      fail "a standing capability hold held the poll floor open"
 
     # --- §6.1 the two cadences and the jitter that spreads them ---
     # Seeded from the host NAME. A fleet whose hosts re-roll their offset every
@@ -509,8 +502,8 @@ JSON
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null 2>&1 || run_status=$?
-    [ "$run_status" -eq 75 ] ||
-      fail "a stale post-update identity did not hold (got $run_status)"
+    [ "$run_status" -eq 74 ] ||
+      fail "a stale post-update identity did not hold as transient (got $run_status)"
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
       'update example@test-market' ] ||
       fail "the stale post-update case did not enter the update ledger"
@@ -753,8 +746,9 @@ JSON
     run_plugin_list_status=75
     run_status=0
     fleet_run_plugin_enabled claude-example@test-market >/dev/null || run_status=$?
-    [ "$run_status" -eq 75 ] ||
-      fail "plugin state re-read accepted output from a failed list command"
+    # A failed list is a transient hold (74), owed a retry next pass.
+    [ "$run_status" -eq 74 ] ||
+      fail "plugin state re-read accepted output from a failed list command (got $run_status, not 74)"
     unset -f claude
 
     # A declared marketplace the harness never registered (headless hosts never
@@ -961,6 +955,7 @@ JSON
           fail "skill install omitted explicit skill/agent selection: $*"
         printf '%s\n' "$5" >>"$run_root/skill-manager-calls"
         [ "$5" != noop ] || return 0
+        [ "$5" != slow ] || return 124
         mkdir -p "$HOME/.agents/skills/$5"
         if [ -f "$3/SKILL.md" ]; then
           cp "$3/SKILL.md" "$HOME/.agents/skills/$5/SKILL.md"
@@ -997,7 +992,7 @@ JSON
       ln -s "$HOME/.agents/skills/managed" "$HOME/.claude/skills/managed"
       run_skill_defs=$(jq -cn --arg collection "$run_root/skill-repository" \
         --arg standalone "$run_root/standalone-repository" \
-        '{skills:{selected:{source:$collection},standalone:{source:$standalone},unexposed:{source:$standalone},noop:{source:$collection}}}')
+        '{skills:{selected:{source:$collection},standalone:{source:$standalone},unexposed:{source:$standalone},noop:{source:$collection},slow:{source:$collection}}}')
       fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.selected '"enabled"' '' ||
         fail "missing collection skill failed to install"
       [ "$(cat "$HOME/.agents/skills/selected/SKILL.md")" = 'selected contents' ] ||
@@ -1013,6 +1008,14 @@ JSON
       run_status=0
       fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.noop '"enabled"' '' || run_status=$?
       [ "$run_status" -eq 75 ] || fail "manager success without installed skill was accepted"
+      # #56: a bounded `npx skills add` that fails or times out (124) is a
+      # TRANSIENT hold, owed a retry next pass, not a standing 75 that waits
+      # for the full cadence.
+      run_status=0
+      fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.slow '"enabled"' '' || run_status=$?
+      [ "$run_status" -eq 74 ] || fail "a timed-out skills add was not a transient hold (got $run_status)"
+      fleet_run_hold_owes_retry "$run_status" false ||
+        fail "a timed-out skills add left the poll floor free to skip its retry"
       run_status=0
       fleet_run_apply_item "$run_store" vireo "$run_skill_defs" skills.unexposed '"enabled"' '' || run_status=$?
       [ "$run_status" -eq 75 ] || fail "manager install without requested harness exposure was accepted"
