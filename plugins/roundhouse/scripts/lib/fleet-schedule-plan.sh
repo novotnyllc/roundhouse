@@ -504,10 +504,12 @@ fleet_schedule_lock_take() {
 fleet_schedule_signals_defer() {
   # From the sealed step to the last bookkeeping write, a HUP, INT or TERM is
   # held here, not acted on. The sealed step's own processes may still die of
-  # it (Ctrl-C signals the whole group), which is why the bookkeeping is
-  # decided from what the scheduler shows afterwards, not from the step's
-  # status alone (fleet_schedule_record). fleet_schedule_signals_replay exits
-  # with the held signal once the writes are done.
+  # it (Ctrl-C signals the whole group), which is why, after a held signal,
+  # the bookkeeping is decided from what the scheduler shows, not from the
+  # step's status alone (fleet_schedule_record) — and the bookkeeping itself
+  # runs with the signals ignored, so no `mkdir` or `rm` of it dies of one.
+  # fleet_schedule_signals_replay exits with the held signal once the writes
+  # are done.
   fleet_schedule_signal=
   trap 'fleet_schedule_signal=129' HUP
   trap 'fleet_schedule_signal=130' INT
@@ -559,17 +561,22 @@ fleet_schedule_preflight() {
 }
 
 fleet_schedule_record() {
-  # fleet_schedule_record install|uninstall SEALED-STATUS — the host-local
-  # bookkeeping after the sealed step; its exit is the command's. It is this
-  # host's own run state (store.run), like schedule-state, not a target the
-  # sealed plan mutates. A write that fails is reported, never swallowed
-  # (73). Called directly, so a held signal waits for it.
+  # fleet_schedule_record install|uninstall SEALED-STATUS [SIGNALLED] — the
+  # host-local bookkeeping after the sealed step; its exit is the command's.
+  # It is this host's own run state (store.run), like schedule-state, not a
+  # target the sealed plan mutates. A write or removal that fails is
+  # reported, never swallowed (73). Its caller runs it with HUP, INT and TERM
+  # ignored, so a held signal waits for it.
   case $1 in
     uninstall)
-      # Done when the scheduler shows both jobs gone and let go — whatever
-      # the sealed step's status: a signal can end that step after its
-      # removals and before it reports. A job still there is not opted out.
-      [ "$2" -eq 0 ] || fleet_schedule_verify uninstall false 2>/dev/null || return "$2"
+      # Done when the sealed step succeeded — or, when a held signal
+      # (SIGNALLED) ended that step, which it can after its removals and
+      # before it reports, when the scheduler shows both jobs gone and let
+      # go. Any other failure changes nothing here, and a job still there is
+      # never opted out.
+      if [ "$2" -ne 0 ]; then
+        [ -n "${3:-}" ] && fleet_schedule_verify uninstall false 2>/dev/null || return "$2"
+      fi
       # The opt-out: from here on a trigger stamps and starts nothing, and a
       # pass raises no schedule alert, until `install` is run again. If it
       # cannot be written the jobs are still gone, and re-running uninstall —
@@ -580,13 +587,19 @@ fleet_schedule_record() {
           "$(fleet_schedule_optout_path)" >&2
         return 73
       }
-      rm -f "$(fleet_schedule_marker)"
+      # The install marker and remembered states go with the jobs, and a
+      # full request no pass took yet with the jobs it was made of: a later
+      # install must not inherit it as a full pass nobody asked for.
+      record_failed=false
+      rm -f "$(fleet_schedule_marker)" "$(fleet_trigger_full_path)" || record_failed=true
       for record_mode in $fleet_schedule_modes; do
-        rm -f "$(fleet_schedule_state_path "$record_mode")"
+        rm -f "$(fleet_schedule_state_path "$record_mode")" || record_failed=true
       done
-      # A full request no pass took yet goes with the jobs it was made of: a
-      # later install must not inherit it as a full pass nobody asked for.
-      rm -f "$(fleet_trigger_full_path)"
+      [ "$record_failed" != true ] || {
+        printf 'roundhouse: the scheduled jobs are removed and the host opted out, but the install marker, remembered job states or pending full request under %s could not be removed; remove them, or re-run `roundhouse fleet-schedule uninstall`\n' \
+          "$(fleet_run_state_dir)" >&2
+        return 73
+      }
       ;;
     install)
       case $2 in 0 | 75) ;; *) return "$2" ;; esac
@@ -716,7 +729,10 @@ fleet_schedule_command() (
   fleet_schedule_signals_defer
   errexit_capture command_sealed_status fleet_schedule_sealed "$1"
   command_status=0
-  fleet_schedule_record "$1" "$command_sealed_status" || command_status=$?
+  (
+    trap '' HUP INT TERM
+    fleet_schedule_record "$1" "$command_sealed_status" "$fleet_schedule_signal"
+  ) || command_status=$?
   fleet_schedule_signals_replay
   exit "$command_status"
 )

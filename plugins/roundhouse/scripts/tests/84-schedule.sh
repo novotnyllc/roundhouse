@@ -1220,6 +1220,21 @@ fleet_run_command --fast'
       [ ! -e "$(fleet_trigger_full_path)" ] ||
       fail "a signal during the sealed uninstall left the jobs removed without the opt-out bookkeeping: $sched_out"
     [ ! -e "$(fleet_schedule_lock_path)" ] || fail "the signalled uninstall left the schedule lock behind"
+    # With no signal held, a sealed step that fails before it applies (here,
+    # no mutation configuration) records nothing, even with the jobs absent.
+    rm -f "$(fleet_schedule_optout_path)"
+    sched_status=0
+    ROUNDHOUSE_CONFIG="$sched_root/no-such-config.json" sched_schedule uninstall >/dev/null 2>&1 ||
+      sched_status=$?
+    [ "$sched_status" -ne 0 ] && [ ! -e "$(fleet_schedule_optout_path)" ] ||
+      fail "an uninstall that failed before its sealed apply still opted the host out ($sched_status)"
+    # A bookkeeping removal that fails is reported, not swallowed.
+    mkdir -p "$(fleet_schedule_marker)/held"
+    sched_status=0
+    sched_out=$(sched_schedule uninstall 2>&1) || sched_status=$?
+    [ "$sched_status" -eq 73 ] || fail "an uninstall whose marker could not be removed exited $sched_status, not 73: $sched_out"
+    case $sched_out in *'could not be removed'*) ;; *) fail "the failed marker removal was not reported: $sched_out" ;; esac
+    rm -rf "$(fleet_schedule_marker)"
 
     fi
 
