@@ -7,12 +7,14 @@ its `--scopes`/`--helpers` modes to choose PR coverage from changed paths;
 main pushes select everything. Unknown inputs within the tested surface fall
 back to full coverage. Unrelated changes need no extra scopes or helpers.
 `select` then splits the chosen sections and scopes into weight-balanced
-shards (`scripts/tests/weights.tsv`, about 450 weighted seconds each, at most
-eight), and each `sections` job runs one shard through the parallel runner.
+shards (`scripts/tests/weights.tsv`, in macOS runner seconds, about 900
+each, at most eight), and each `sections` job runs one shard through the
+parallel runner.
 The workflow also runs `actionlint`, native `windows` checks, and the stable
 `ci-ok` gate over all results. Every job has a `timeout-minutes`, and the
 runner fails a hung unit with its log after `ROUNDHOUSE_TEST_UNIT_TIMEOUT`
-seconds, well inside it. Reproduce the relevant gates locally before pushing
+seconds, or at `ROUNDHOUSE_TEST_DEADLINE`, which CI sets 30 seconds before
+the job timeout. Reproduce the relevant gates locally before pushing
 plugin changes.
 
 ## POSIX gates
@@ -63,9 +65,13 @@ plugin changes.
    time; a failing section's whole log is printed and the run exits nonzero.
    `ROUNDHOUSE_TEST_JOBS` sets the pool size (default: performance cores plus
    half the efficiency cores on Apple silicon, otherwise the CPU count);
-   `ROUNDHOUSE_TEST_JOBS=1` is the original single-process serial run, and so
-   is any run that selects a single section without a `partition`/`parts`
-   marker. A sharded run ends `PASS: roundhouse self-check (shard I/K only)`,
+   `ROUNDHOUSE_TEST_JOBS=1` runs the units one at a time, and keeps the
+   original single-process run when `ROUNDHOUSE_TEST_ONLY` names one section,
+   as does any run that selects a single section without a `partition`/`parts`
+   marker. Every runner run honors `ROUNDHOUSE_TEST_DEADLINE` (default: 10
+   minutes after it starts): past it, running units are killed with their
+   logs and nothing new starts, so a suite over the cap fails rather than
+   finishing late. A sharded run ends `PASS: roundhouse self-check (shard I/K only)`,
    and an empty shard fails. `ROUNDHOUSE_TEST_ONLY` selects
    section numbers; sections at or after 90 load 90's real-jj definitions as
    a prerequisite, while 90's own assertions run only when 90 is selected.

@@ -8,9 +8,10 @@
 # gate this section reuses; not a standalone test file.
 # shellcheck shell=bash
 #
-# Part 1 is the two-host story; part 2 the independent one-host scenarios;
-# part 3 the §7.12.3 reviewed-ref scenarios, each on its own fresh fleet.
-# roundhouse-test: parts=3
+# Part 1 is the two-host story; parts 2-3 the independent one-host scenarios;
+# parts 4-6 the §7.12.3 reviewed-ref scenarios, each on its own fresh fleet.
+# Split so no unit nears the 10-minute test cap on a macOS runner.
+# roundhouse-test: parts=6
 
 runjj_root="$tmp/fleet-run-jj"
 mkdir -p "$runjj_root"
@@ -1334,20 +1335,26 @@ if [ "$real_jj_ok" = true ] && section_part 2; then
   p0jj_block compaction p0jj_compaction \
     'alert compaction refused over a layer edit, published, idempotent'
   p0jj_block disown p0jj_disown 'host-only disown: dry run, refusal, publish, no prune after'
+fi
+if [ "$real_jj_ok" = true ] && section_part 3; then
   p0jj_block aging p0jj_aging 'evidence aging previewed by --dry-run, then published'
   p0jj_block abort p0jj_abort 'a pass aborted mid-apply still lands its queued applied/ and journal records'
   p0jj_block verbs p0jj_verb_refusals \
     'publishing verbs refuse a diverged main, a live lock and a foreign edit'
 fi
-if [ "$real_jj_ok" = true ] && section_part 3; then
+if [ "$real_jj_ok" = true ] && section_part 4; then
   p0jj_block ratchet-wedge p0jj_ratchet_wedge \
     'mac-studio: abandoned materialized local work never wedges reviewed-ref'
   p0jj_block ratchet-legacy p0jj_ratchet_legacy \
     'legacy marks re-anchored when proved: mac-studio and iris-wsl shapes'
+fi
+if [ "$real_jj_ok" = true ] && section_part 5; then
   p0jj_block ratchet-unprovable p0jj_ratchet_unprovable \
     'unprovable legacy mark held, alerted, doctored, and the printed re-point recovers it'
   p0jj_block ratchet-rewind p0jj_ratchet_rewind \
     'a rewound origin refused, in the current and the legacy format'
+fi
+if [ "$real_jj_ok" = true ] && section_part 6; then
   p0jj_block ratchet-diverge p0jj_ratchet_diverge \
     'an origin forked from below the pushed head refused'
   p0jj_block catchup p0jj_catchup \

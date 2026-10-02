@@ -15,6 +15,9 @@ privileged installs. Plugin source lives under
 - Do not hard-code maintainer-local secrets, host names, vault names, or
   machine inventory.
 - Never treat an installed plugin cache as the source repository.
+- Tests never take more than 10 minutes: the full local `test-roundhouse` run
+  and every CI job. Shorter is better. A slower suite is a defect to fix, not
+  a limit to raise; CI job timeouts enforce it.
 
 ## Verify
 

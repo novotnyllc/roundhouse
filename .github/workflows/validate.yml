@@ -103,7 +103,7 @@ jobs:
   # both on Linux and macOS. Other helpers still get one job per host OS.
   helpers:
     name: helpers (${{ matrix.os }}, ${{ matrix.fixture.helper }}, ${{ matrix.fixture.platform || 'self-test' }})
-    timeout-minutes: 15
+    timeout-minutes: 10
     needs: select
     if: needs.select.outputs.helpers != '[]'
     strategy:
@@ -198,14 +198,15 @@ jobs:
           echo "only=$only" >> "$GITHUB_OUTPUT"
           echo "scopes=$scopes" >> "$GITHUB_OUTPUT"
 
-          # Enough shards that each holds ~450 weighted seconds: with the
-          # pool on the runner's cores that is ~3 minutes, plus setup.
+          # Enough shards that each holds ~900 weighted seconds (weights are
+          # macOS runner seconds): over its three workers that is ~5 minutes
+          # of tests, well inside the 10-minute cap, plus setup.
           total=$(ROUNDHOUSE_TEST_ONLY="$only" ROUNDHOUSE_TEST_SCOPES="$scopes" \
             ROUNDHOUSE_TEST_LIST=true plugins/roundhouse/scripts/test-roundhouse |
             awk '{ s += $2 } END { print s + 0 }')
           units=$(ROUNDHOUSE_TEST_ONLY="$only" ROUNDHOUSE_TEST_SCOPES="$scopes" \
             ROUNDHOUSE_TEST_LIST=true plugins/roundhouse/scripts/test-roundhouse | grep -c .)
-          count=$(( (total + 449) / 450 ))
+          count=$(( (total + 899) / 900 ))
           [ "$count" -ge 1 ] || count=1
           [ "$count" -le 8 ] || count=8
           # An empty shard fails, so never ask for more shards than units.
@@ -231,7 +232,7 @@ jobs:
   sections:
     name: sections (${{ matrix.os }}, ${{ matrix.shard }})
     needs: select
-    timeout-minutes: 15
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -239,6 +240,14 @@ jobs:
         shard: ${{ fromJSON(needs.select.outputs.shards) }}
     runs-on: ${{ matrix.os }}
     steps:
+      # The suite deadline counts from the job's start, so a hung unit is
+      # killed with its log 30 seconds before the 10-minute job timeout,
+      # however long the setup below takes. Setup is bounded too, so it
+      # cannot eat a passing shard's budget: macOS has only the 1-minute
+      # jj/yq step (setup normally takes ~5s; the heaviest unit is 440s),
+      # and Linux shards are under 4 minutes beside their OpenSSH step.
+      - name: Start the suite deadline
+        run: echo "ROUNDHOUSE_TEST_DEADLINE=$(( $(date +%s) + 570 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install OpenSSH server for scope validation
         if: runner.os == 'Linux'
@@ -266,7 +275,7 @@ jobs:
           printf 'could not install openssh-server\n' >&2
           exit 1
       - name: Install jj and yq for the real-jj sections
-        timeout-minutes: 3
+        timeout-minutes: 1
         shell: bash
         run: |
           set -eu
@@ -300,9 +309,10 @@ jobs:
           ROUNDHOUSE_TEST_ONLY: ${{ needs.select.outputs.only }}
           ROUNDHOUSE_TEST_SCOPES: ${{ needs.select.outputs.scopes }}
           ROUNDHOUSE_TEST_SHARD: ${{ matrix.shard }}
-          # Fail a hung unit with its log well inside the job timeout, rather
-          # than losing every buffered log to a cancelled job.
-          ROUNDHOUSE_TEST_UNIT_TIMEOUT: '600'
+          # Fail a hung unit with its log inside the job timeout, rather
+          # than losing every buffered log to a cancelled job; the deadline
+          # set above bounds a unit that starts late.
+          ROUNDHOUSE_TEST_UNIT_TIMEOUT: '480'
           # Travels with the suite. Without it a real-jj section prints a NOTICE
           # and PASSES, so moving the suite here without this flag would have
           # silently stopped verifying the store's repository half.
@@ -312,7 +322,7 @@ jobs:
           plugins/roundhouse/scripts/test-roundhouse
 
   windows:
-    timeout-minutes: 15
+    timeout-minutes: 10
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
