@@ -52,8 +52,13 @@ What the lane still guarantees:
   owner-SID Modify / SYSTEM-BA Full on Windows). The privileged side
   authenticates a request by the file's owner (uid / SID), not by its
   content, and binds the enrolled owner identity at enrollment time.
-- **Digest-bound.** Each request carries the sealed plan id, plan digest and
-  operation index it came from, and ends with a digest over its own lines.
+- **Digest-bound, and sealed or nothing.** Each request carries the sealed
+  plan id, plan digest and operation index it came from, and ends with a
+  digest over its own lines. Every mutating action requires those three
+  fields to be real (a `plan-<16 hex>` id, a 64-hex digest, an index); a
+  request written by hand without them is refused by the root side as
+  `unsealed_mutation_request`, and the owner-side `request` verb refuses to
+  write it. Only `lane.probe.v1` is ad hoc.
   Results and journal entries repeat those values, so a result can be
   matched to a sealed plan after the fact and a truncated or edited request
   is refused.
@@ -202,7 +207,7 @@ lane-request|1
 request-id|request-<32 hex>
 host-id|<machine name from config>
 owner|<uid on POSIX | SID on Windows>
-plan-id|<plan-… or fleet-run token>
+plan-id|<plan-<16 hex> of the sealed plan; - only for lane.probe.v1>
 plan-sha256|<64 hex or ->
 operation-index|<uint or ->
 action-id|<catalog action>

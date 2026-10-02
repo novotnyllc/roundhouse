@@ -286,6 +286,12 @@ lane_rc=0
 # the same call holds (75) with the one-approval alert text.
 (
   ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+  # Architecture-qualified apt names are valid draft packages; a malformed
+  # suffix is not.
+  jq -c '.operations[0].package = "curl:i386"' "$lane_tmp/drift-draft.json" >"$lane_tmp/arch-draft.json"
+  lane_draft_valid "$lane_tmp/arch-draft.json" || fail 'an architecture-qualified package was refused in a lane draft'
+  jq -c '.operations[0].package = "curl:I386!"' "$lane_tmp/drift-draft.json" >"$lane_tmp/arch-bad-draft.json"
+  lane_draft_valid "$lane_tmp/arch-bad-draft.json" && fail 'a malformed architecture suffix was accepted in a lane draft'
   : >"$lane_tmp/apt.log"
   fleet_host_name() { printf 'test-apt\n'; }
   lane_env fleet_install_package apt curl false 8.2.0-1 || fail "fleet_install_package apt through the lane failed"

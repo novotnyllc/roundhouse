@@ -482,7 +482,7 @@ lane_draft_valid() {
       type == "object" and (keys | sort) == (["id","kind","package","source","type","version"] | sort) and
       .type == "semantic-action" and .kind == "privileged_action" and
       (.id | type == "string" and test("^[a-z]+\\.[a-z0-9-]+\\.v[0-9]+$")) and
-      (.package | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}$"))) and
+      (.package | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}(:[a-z0-9-]{1,16})?$"))) and
       (.version | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,127}$"))) and
       (.source == "-")
     ] | all)' "$1" >/dev/null 2>&1

@@ -225,9 +225,12 @@ valid_uint_or_dash() { [ "$1" = - ] || valid_uint "$1"; }
 valid_version() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,127}$ ]]; }
 valid_version_or_dash() { [ "$1" = - ] || valid_version "$1"; }
 valid_plugin_version() { [[ $1 =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]]; }
-# A trailing `-` is apt-get's remove syntax (`install PKG-`), never a name.
-valid_apt_package() { [[ $1 =~ ^[a-z0-9][a-z0-9+.-]{0,127}$ ]] && [[ $1 != *- ]]; }
-valid_plan_id() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
+# A Debian package name, optionally architecture-qualified (`pkg:i386`), as
+# the apt inventory already records them. A trailing `-` is apt-get's
+# remove syntax (`install PKG-`), never a name.
+valid_apt_package() { [[ $1 =~ ^[a-z0-9][a-z0-9+.-]{0,127}(:[a-z0-9-]{1,16})?$ ]] && [[ $1 != *- ]]; }
+valid_sealed_plan_id() { [[ $1 =~ ^plan-[0-9a-f]{16}$ ]]; }
+valid_plan_id() { [ "$1" = - ] || [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
 valid_account() { [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]]; }
 valid_abs_dir() { [[ $1 =~ ^/[A-Za-z0-9._/@-]+$ ]] && [[ $1 != *'/../'* ]] && [[ $1 != *'/..' ]]; }
 
@@ -334,11 +337,19 @@ parse_request() {
     valid_token "$rq_action" && valid_version_or_dash "$rq_version" &&
     valid_digest_or_dash "$rq_payload_sha" && valid_uint "$rq_created" && valid_uint "$rq_expires" &&
     valid_digest "$rq_sha" || return 1
-  [ "$rq_package" = - ] || [[ $rq_package =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}$ ]] || return 1
+  [ "$rq_package" = - ] || [[ $rq_package =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}(:[a-z0-9-]{1,16})?$ ]] || return 1
   [ "$rq_source" = - ] || valid_token "$rq_source" || return 1
   expected=$(head -n 15 "$file" | sha256_stream) || return 1
   digest=$rq_sha
   [ "$digest" = "$expected" ]
+}
+sealed_mutation() {
+  # Every mutating action must carry the sealed plan it came from — a real
+  # plan id, the plan digest and the operation index — so nothing running
+  # as the owner can skip sealing, verification and the precondition
+  # snapshot by writing a request by hand. Only the probe is ad hoc.
+  [ "$rq_action" = lane.probe.v1 ] ||
+    { valid_sealed_plan_id "$rq_plan" && valid_digest "$rq_plan_sha" && valid_uint "$rq_index"; }
 }
 validate_action_parameters() {
   # The per-action parameter shape. Anything the action does not use must be
@@ -665,9 +676,15 @@ enrollment_canary() {
 # live files (same directory, same mode, root-owned; the sudoers copy carries
 # a `.` so sudo ignores it) until the new enrollment is on record.
 enroll_previous=
+enroll_previous_ingress_uid=
 backup_enrollment() {
   local path
   enroll_previous=
+  enroll_previous_ingress_uid=
+  # The ingress directory is not copied (its content is the owner's), but
+  # its owner is: a re-enrollment for another account chowns it, and a
+  # failed one must hand it back to the owner the restored identity names.
+  if [ -d "$ingress_dir" ] && [ ! -L "$ingress_dir" ]; then enroll_previous_ingress_uid=$(file_uid "$ingress_dir"); fi
   for path in "$installed_script" "$identity_path" "$sudoers_path"; do
     rm -f "$path.previous"
     [ -f "$path" ] && [ ! -L "$path" ] || continue
@@ -687,6 +704,9 @@ rollback_enrollment() {
       rm -f "$path" "$path.previous"
     fi
   done
+  if [ "$enroll_previous" = true ] && [ -n "$enroll_previous_ingress_uid" ] && [ -d "$ingress_dir" ]; then
+    chown "$enroll_previous_ingress_uid" "$ingress_dir" 2>/dev/null || :
+  fi
 }
 discard_enrollment_backup() {
   rm -f "$installed_script.previous" "$identity_path.previous" "$sudoers_path.previous"
@@ -827,6 +847,7 @@ dispatch_one() {
   elif [ "$rq_owner" != "$id_owner_uid" ]; then reason=owner_mismatch
   elif ! action_known "$id_platform" "$rq_action"; then reason=unknown_action_for_platform
   elif ! validate_action_parameters; then reason=invalid_action_parameters
+  elif ! sealed_mutation; then reason=unsealed_mutation_request
   elif ! request_fresh; then reason=stale_request
   elif [ "$(requests_in_last_hour)" -ge "$max_requests_per_hour" ]; then reason=rate_limited
   else reason=
@@ -863,14 +884,21 @@ snapshot_owner_file() {
   [ "$(file_size "$copy")" -le "$maximum" ]
 }
 publish_result() {
-  # publish_result ID STATE REASON NATIVE-EXIT PRE POST STARTED FINISHED
+  # publish_result ID STATE REASON NATIVE-EXIT PRE POST STARTED FINISHED —
+  # journals first, then publishes. Work the journal cannot record is not
+  # completed work: the published state becomes `failed` /
+  # `journal_write_failed`, and `state`/`reason` are rewritten in the
+  # caller's scope so dispatch counts it that way too.
   local id=$1 result
   result=$(render_result "$2" "$3" "$4" "$5" "$6" "$7" "$8")
+  if ! journal_event request "$id" "$rq_action" "$rq_package" "$2" "$3" "$rq_sha" \
+    "$(head -n 20 <<<"$result" | sha256_stream)"; then
+    state=failed; reason=journal_write_failed
+    result=$(render_result "$state" "$reason" "$4" "$5" "$6" "$7" "$8")
+  fi
   [ -d "$claims_dir/$id" ] || mkdir -m 700 "$claims_dir/$id"
   printf '%s\n' "$result" | write_protected_file "$claims_dir/$id/result" 600
   printf '%s\n' "$result" | write_protected_file "$results_dir/$id.result" 644
-  journal_event request "$id" "$rq_action" "$rq_package" "$2" "$3" "$rq_sha" \
-    "$(head -n 20 <<<"$result" | sha256_stream)"
 }
 
 # --- actions ------------------------------------------------------------------
@@ -990,7 +1018,7 @@ action_apt_autoremove() {
 }
 # --- request (owner side) -----------------------------------------------------
 request_command() {
-  local action='' package=- version=- source=- payload_sha=- plan_id=fleet-run plan_sha=- index=- wait_seconds=600
+  local action='' package=- version=- source=- payload_sha=- plan_id=- plan_sha=- index=- wait_seconds=600
   local positional=0 id='' created expires request_file result_file deadline rc=0 state platform
   local request_digest timeout_state timeout_reason timeout_rc
   while [ "$#" -gt 0 ]; do
@@ -1041,6 +1069,7 @@ request_command() {
   parse_request "$ingress_dir/.$id.tmp" || { rm -f "$ingress_dir/.$id.tmp"; die 64 'request: arguments do not form a valid request'; }
   action_known "$platform" "$action" || { rm -f "$ingress_dir/.$id.tmp"; die 64 "request: $action is not an action on $platform"; }
   validate_action_parameters || { rm -f "$ingress_dir/.$id.tmp"; die 64 "request: invalid parameters for $action"; }
+  sealed_mutation || { rm -f "$ingress_dir/.$id.tmp"; die 64 "request: $action needs the sealed plan it came from (--plan-id plan-<16 hex> --plan-sha256 DIGEST --operation-index N); only lane.probe.v1 is ad hoc"; }
   request_file=$ingress_dir/$id.request
   mv -f "$ingress_dir/.$id.tmp" "$request_file"
   # Trigger, in the background. The grant permits exactly this; a refusal
@@ -1185,29 +1214,37 @@ self_test() {
   [ "$(file_mode "$root/fixture$lane_state/ingress")" = 700 ] || self_fail 'ingress mode'
   grep -Fq "$(id -un) ALL=(root) NOPASSWD:NOSETENV: $lane_libexec/$lane_name dispatch" "$root/fixture$lane_sudoers" ||
     self_fail 'sudoers grant text'
+  # Every mutating request below carries the sealed plan it (notionally)
+  # came from; only the probe is ad hoc.
+  sealed() { "$installed" request "$@" --plan-id plan-0123456789abcdef --plan-sha256 "$(sha256_text plan)" --operation-index 3; }
+  # A mutating request without its sealed plan never reaches the queue; the
+  # root side refuses one that was written by hand just the same.
+  rc=0; "$installed" request apt.update-metadata.v1 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 64 ] || self_fail 'an unsealed mutation request was accepted by the owner side'
+  rc=0; "$installed" request apt.update-metadata.v1 --plan-id fleet-run --plan-sha256 "$(sha256_text plan)" --operation-index 0 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 64 ] || self_fail 'a fleet-run placeholder plan id was accepted'
   # Closed catalog: argv, shell and unknown actions never reach the queue.
-  rc=0; "$installed" request 'apt.upgrade-package.v1' 'curl; rm -rf /' 1.0 >/dev/null 2>&1 || rc=$?
+  rc=0; sealed 'apt.upgrade-package.v1' 'curl; rm -rf /' 1.0 >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 64 ] || self_fail 'shell-shaped package accepted'
-  rc=0; "$installed" request winget.install-machine-package.v1 Foo.Bar >/dev/null 2>&1 || rc=$?
+  rc=0; sealed winget.install-machine-package.v1 Foo.Bar >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 64 ] || self_fail 'foreign-platform action accepted'
-  rc=0; "$installed" request apt.update-metadata.v1 curl >/dev/null 2>&1 || rc=$?
+  rc=0; sealed apt.update-metadata.v1 curl >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 64 ] || self_fail 'surplus parameter accepted'
-  rc=0; "$installed" request apt.install-package-version.v1 curl- >/dev/null 2>&1 || rc=$?
+  rc=0; sealed apt.install-package-version.v1 curl- >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 64 ] || self_fail 'apt remove syntax (PKG-) accepted as a package name'
   rc=0; out=$("$installed" candidate curl) || rc=$?
   [ "$rc" -eq 0 ] && grep -Fqx 'installed|8.1.0-1' <<<"$out" && grep -Fqx 'candidate|8.2.0-1' <<<"$out" || self_fail "candidate record: $out"
   rc=0; out=$("$installed" candidate nonexistent) || rc=$?
   [ "$rc" -eq 0 ] && grep -Fqx 'candidate|-' <<<"$out" || self_fail "unknown candidate record: $out"
   # apt actions through the stubs.
-  rc=0; out=$("$installed" request apt.update-metadata.v1 --plan-id plan-0123456789abcdef \
-    --plan-sha256 "$(sha256_text plan)" --operation-index 3) || rc=$?
+  rc=0; out=$(sealed apt.update-metadata.v1) || rc=$?
   [ "$rc" -eq 0 ] && grep -Fqx 'reason|metadata_refreshed' <<<"$out" &&
     grep -Fqx 'plan-id|plan-0123456789abcdef' <<<"$out" &&
     grep -Fqx 'operation-index|3' <<<"$out" || self_fail "apt update: $out"
   grep -Fqx 'apt-get -q update' "$root/apt.log" || self_fail 'apt-get update argv'
   # A refresh whose post-state cannot be read is partial, never completed.
   : >"$root/apt-policy-fail"
-  rc=0; out=$("$installed" request apt.update-metadata.v1) || rc=$?
+  rc=0; out=$(sealed apt.update-metadata.v1) || rc=$?
   rm -f "$root/apt-policy-fail"
   [ "$rc" -eq 71 ] && grep -Fqx 'reason|post_state_unavailable' <<<"$out" || self_fail "unreadable post-state reported as (rc $rc): $out"
   # A native command that hangs does not hang the owner: the wait bounds the
@@ -1216,7 +1253,7 @@ self_test() {
   : >"$root/apt-hang"
   local hang_started hang_id
   hang_started=$(now)
-  rc=0; out=$("$installed" request apt.update-metadata.v1 --wait 1) || rc=$?
+  rc=0; out=$(sealed apt.update-metadata.v1 --wait 1) || rc=$?
   rm -f "$root/apt-hang"
   [ "$rc" -eq 71 ] && grep -Fqx 'reason|claimed_result_pending_use_result_lookup' <<<"$out" || self_fail "hung dispatch (rc $rc): $out"
   [ $(( $(now) - hang_started )) -le 3 ] || self_fail 'the owner waited for the hung native command'
@@ -1230,21 +1267,25 @@ self_test() {
   [ "$rc" -eq 0 ] && cmp -s "$root/lookup.out" "$root/fixture$lane_state/results/$id.result" || self_fail 'result lookup'
   rc=0; "$installed" result request-00000000000000000000000000000000 >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 66 ] || self_fail 'missing result lookup'
-  rc=0; out=$("$installed" request apt.upgrade-package.v1 curl 8.2.0-1) || rc=$?
+  # Unjournaled work is never reported completed.
+  rc=0; out=$(ROUNDHOUSE_LANE_FIXTURE_FAIL_JOURNAL=request sealed apt.update-metadata.v1) || rc=$?
+  [ "$rc" -eq 70 ] && grep -Fqx 'state|failed' <<<"$out" && grep -Fqx 'reason|journal_write_failed' <<<"$out" ||
+    self_fail "unjournaled mutation reported as (rc $rc): $out"
+  rc=0; out=$(sealed apt.upgrade-package.v1 curl 8.2.0-1) || rc=$?
   [ "$rc" -eq 0 ] && grep -Fqx 'reason|package_upgraded' <<<"$out" || self_fail "apt upgrade: $out"
   grep -Fqx 'apt-get -q -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-remove --only-upgrade install curl=8.2.0-1' "$root/apt.log" || self_fail 'apt-get upgrade argv'
-  rc=0; out=$("$installed" request apt.upgrade-package.v1 curl 9.9.9) || rc=$?
+  rc=0; out=$(sealed apt.upgrade-package.v1 curl 9.9.9) || rc=$?
   [ "$rc" -eq 65 ] && grep -Fqx 'reason|candidate_version_mismatch' <<<"$out" || self_fail "apt wrong candidate: $out"
-  rc=0; out=$("$installed" request apt.upgrade-package.v1 nonexistent 1.0) || rc=$?
+  rc=0; out=$(sealed apt.upgrade-package.v1 nonexistent 1.0) || rc=$?
   [ "$rc" -eq 65 ] && grep -Fqx 'reason|package_unknown_to_apt' <<<"$out" || self_fail "apt unknown: $out"
-  rc=0; out=$("$installed" request apt.install-package-version.v1 jq 1.7.1-3) || rc=$?
+  rc=0; out=$(sealed apt.install-package-version.v1 jq 1.7.1-3) || rc=$?
   [ "$rc" -eq 0 ] && grep -Fqx 'reason|package_installed' <<<"$out" || self_fail "apt install: $out"
   : >"$root/apt-remaining"
-  rc=0; out=$("$installed" request apt.autoremove.v1) || rc=$?
+  rc=0; out=$(sealed apt.autoremove.v1) || rc=$?
   [ "$rc" -eq 71 ] && grep -Fqx 'reason|post_state_mismatch' <<<"$out" || self_fail "autoremove with leftovers was not partial (rc $rc)"
   rm -f "$root/apt-remaining"
   : >"$root/apt-simulate-fail"
-  rc=0; out=$("$installed" request apt.autoremove.v1) || rc=$?
+  rc=0; out=$(sealed apt.autoremove.v1) || rc=$?
   [ "$rc" -eq 71 ] && grep -Fqx 'reason|post_check_failed' <<<"$out" || self_fail "a failed autoremove simulation was not a failed post-check (rc $rc)"
   rm -f "$root/apt-simulate-fail"
   # A lock directory with no pid yet belongs to a dispatcher between mkdir
@@ -1254,7 +1295,7 @@ self_test() {
   [ "$rc" -eq 75 ] && [ -d "$root/fixture$lane_state/lock" ] || self_fail "a pid-less lock was broken (rc $rc)"
   rmdir "$root/fixture$lane_state/lock"
   : >"$root/apt-fail"
-  "$installed" request apt.autoremove.v1 >"$root/autoremove.out" 2>&1 && self_fail 'failed native exit reported as success'
+  sealed apt.autoremove.v1 >"$root/autoremove.out" 2>&1 && self_fail 'failed native exit reported as success'
   rm -f "$root/apt-fail"
   grep -Fqx 'state|failed' "$root/autoremove.out" && grep -Fqx 'reason|native_operation_failed' "$root/autoremove.out" ||
     self_fail 'failed native result record'
@@ -1270,7 +1311,13 @@ self_test() {
   grep -Fqx 'reason|native_operation_failed' "$root/fixture$lane_state/results/$id.result" || self_fail 'replay overwrote the published result'
   grep -q "|request|$id|-|-|rejected|replayed_request|" "$root/fixture$lane_state/journal/events.log" || self_fail 'replay not journaled'
   [ ! -s "$root/apt.log" ] || self_fail 'replayed request executed'
-  rc=0; "$installed" request apt.upgrade-package.v1 libstdc++6 1.0 >/dev/null 2>&1 || rc=$?
+  # An architecture-qualified name is a name; it reaches apt-get as written.
+  rc=0; out=$(sealed apt.install-package-version.v1 jq:amd64 1.7.1-3) || rc=$?
+  [ "$rc" -eq 0 ] && grep -Fqx 'reason|package_installed' <<<"$out" || self_fail "architecture-qualified install (rc $rc): $out"
+  grep -Fq 'install jq:amd64=1.7.1-3' "$root/apt.log" || self_fail 'architecture-qualified name did not reach apt-get as written'
+  rc=0; sealed apt.install-package-version.v1 'jq:AMD64!' >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 64 ] || self_fail 'a malformed architecture suffix was accepted'
+  rc=0; sealed apt.upgrade-package.v1 libstdc++6 1.0 >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 65 ] || self_fail "apt package with + was not accepted by the grammar (rc $rc)"
   # Owner binding: a request owned by the enrolled owner but claiming another
   # uid, a stale request, and a bad digest are all rejected by name.
@@ -1280,7 +1327,12 @@ self_test() {
   check_rejection "$installed" "$root" 'stale_request' test-host "$(id -u)" apt.update-metadata.v1 - - "$(now)" "$(( $(now) + 7200 ))"
   check_rejection "$installed" "$root" 'unknown_action_for_platform' test-host "$(id -u)" macos.install-signed-pkg.v1 - - "$(now)" "$(( $(now) + 60 ))"
   id=request-$(random_hex 32)
-  render_request "$id" test-host "$(id -u)" fleet-run - - apt.update-metadata.v1 - - - - "$(now)" "$(( $(now) + 60 ))" |
+  render_request "$id" test-host "$(id -u)" - - - apt.update-metadata.v1 - - - - "$(now)" "$(( $(now) + 60 ))" \
+    >"$root/fixture$lane_state/ingress/$id.request"
+  "$installed" dispatch >/dev/null
+  grep -Fqx 'reason|unsealed_mutation_request' "$root/fixture$lane_state/results/$id.result" || self_fail 'hand-written unsealed mutation not rejected by root'
+  id=request-$(random_hex 32)
+  render_request "$id" test-host "$(id -u)" plan-0123456789abcdef "$(sha256_text plan)" 3 apt.update-metadata.v1 - - - - "$(now)" "$(( $(now) + 60 ))" |
     sed '$s/request-sha256|.*/request-sha256|0000000000000000000000000000000000000000000000000000000000000000/' \
     >"$root/fixture$lane_state/ingress/$id.request"
   "$installed" dispatch >/dev/null
@@ -1321,6 +1373,8 @@ self_test() {
   : >"$root/fixture$lane_state/journal/events.log"
   rc=0; out=$("$installed" request lane.probe.v1) || rc=$?
   [ "$rc" -eq 0 ] && grep -Fqx 'reason|probe_completed' <<<"$out" || self_fail "previous lane does not dispatch after a failed re-enrollment: $out"
+  [ "$(file_uid "$root/fixture$lane_state/ingress")" = "$(id -u)" ] && [ "$(file_mode "$root/fixture$lane_state/ingress")" = 700 ] ||
+    self_fail 'ingress ownership changed across a failed re-enrollment'
   : >"$root/fixture$lane_state/journal/events.log"
   # The owner cannot read root's 0440 grant file: status from the owner's
   # seat still reports ready, because the grant is proved by `sudo -n -l`,
@@ -1373,7 +1427,7 @@ check_rejection() {
   # check_rejection INSTALLED ROOT REASON HOST OWNER ACTION PACKAGE VERSION CREATED EXPIRES
   local installed=$1 root=$2 want=$3 id
   id=request-$(random_hex 32)
-  render_request "$id" "$4" "$5" fleet-run - - "$6" "$7" "$8" - - "$9" "${10}" \
+  render_request "$id" "$4" "$5" plan-0123456789abcdef "$(sha256_text plan)" 3 "$6" "$7" "$8" - - "$9" "${10}" \
     >"$root/fixture$lane_state/ingress/$id.request"
   "$installed" dispatch >/dev/null
   grep -Fqx "reason|$want" "$root/fixture$lane_state/results/$id.result" ||
@@ -1390,7 +1444,7 @@ printf 'umask %s\n' "\$(umask)" >>"$root/umask.log"
 case "\$*" in
   *"--simulate autoremove"*) [ ! -e "$root/apt-simulate-fail" ] || exit 100; [ ! -e "$root/apt-remaining" ] || printf 'Remv old-kernel [1.0]\n'; exit 0 ;;
   *"install curl=8.2.0-1"*) printf '8.2.0-1\n' >"$root/state-curl" ;;
-  *"install jq=1.7.1-3"*) printf '1.7.1-3\n' >"$root/state-jq" ;;
+  *"install jq=1.7.1-3"*|*"install jq:amd64=1.7.1-3"*) printf '1.7.1-3\n' >"$root/state-jq" ;;
 esac
 exit 0
 EOF
@@ -1398,7 +1452,7 @@ EOF
 #!/bin/sh
 case "\$1 \$2" in
   "policy curl") printf 'curl:\n  Installed: %s\n  Candidate: 8.2.0-1\n' "\$(cat "$root/state-curl" 2>/dev/null || printf '8.1.0-1')" ;;
-  "policy jq") printf 'jq:\n  Installed: (none)\n  Candidate: 1.7.1-3\n' ;;
+  "policy jq"|"policy jq:amd64") printf 'jq:\n  Installed: (none)\n  Candidate: 1.7.1-3\n' ;;
   "policy ") [ ! -e "$root/apt-policy-fail" ] || exit 100; printf 'curl:\n  Installed: 8.1.0-1\n' ;;
   *) exit 100 ;;
 esac
@@ -1407,7 +1461,7 @@ EOF
 #!/bin/sh
 case "\$4" in
   curl) cat "$root/state-curl" 2>/dev/null || printf '8.1.0-1' ;;
-  jq) cat "$root/state-jq" 2>/dev/null || exit 1 ;;
+  jq|jq:amd64) cat "$root/state-jq" 2>/dev/null || exit 1 ;;
   *) exit 1 ;;
 esac
 EOF
