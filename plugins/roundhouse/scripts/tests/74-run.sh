@@ -27,6 +27,23 @@ if [ -n "$fleet_fixture_yq" ]; then
     export ROUNDHOUSE_FLEET_STORE HOME
     mkdir -p "$HOME"
 
+    # --- which held applies keep the poll floor open (retry-owed) ---
+    # Transient holds (a tombstone's live-session deferral or failed probe, a
+    # plugin's bounded install or unresolved marketplace) and every failure
+    # are retried every pass; standing capability holds are left to the full
+    # cadence.
+    for run_retry_case in '75 true plugins' '75 false plugins' '75 true skills' \
+      '1 false plugins' '65 false packages' '73 false packages' '64 false skills'; do
+      # shellcheck disable=SC2086 # deliberate: status, tombstone, category
+      fleet_run_hold_owes_retry $run_retry_case ||
+        fail "a transient hold ($run_retry_case) left the poll floor free to skip its retry"
+    done
+    for run_retry_case in '75 false packages' '75 false hooks' '75 false skills'; do
+      # shellcheck disable=SC2086 # deliberate: status, tombstone, category
+      ! fleet_run_hold_owes_retry $run_retry_case ||
+        fail "a standing capability hold ($run_retry_case) held the poll floor open"
+    done
+
     # --- §6.1 the two cadences and the jitter that spreads them ---
     # Seeded from the host NAME. A fleet whose hosts re-roll their offset every
     # run converges on the same minute as often as it spreads out, and jitter

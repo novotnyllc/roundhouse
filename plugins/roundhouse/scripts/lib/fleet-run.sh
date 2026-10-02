@@ -3426,7 +3426,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         if [ "$((run_defer_first + 86400))" -gt "$(date +%s)" ]; then
           run_defer_detail="$run_item is enabled and a claude session is running; its uninstall waits up to 24h from the first deferral"
         else
-          run_defer_detail="$run_item: the 24h live-session window has passed and the uninstall still fails; it is retried every pass"
+          run_defer_detail="$run_item: the 24h live-session window has passed and the uninstall still fails; every fast pass retries it (it keeps the poll floor open)"
         fi
         fleet_alert_raise "$run_ledger" "$run_store" "$run_host" \
           uninstall-deferred uninstall-deferred "$run_defer_detail" "$run_item" || :
@@ -3502,11 +3502,11 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
           "$run_item"
         ;;
       *)
-        # A FAILED apply owes a retry next pass. 75 is not a failure: it is a
-        # standing "this host cannot" (no manager provides the package, a hook
-        # it does not trust), which only a change elsewhere resolves — the
-        # full cadence re-reads it, and the floor need not stay open for it.
-        [ "$run_status" -eq 75 ] || run_retry_owed=true
+        # A FAILED apply, or a TRANSIENT hold, owes a retry next pass: the
+        # poll floor stays open for it (fleet_run_hold_owes_retry names which
+        # holds are transient and which are standing).
+        ! fleet_run_hold_owes_retry "$run_status" "$run_tombstone" "$run_category" ||
+          run_retry_owed=true
         run_holds_grew=true
         fleet_run_apply_held "$run_store" "$run_host" "$run_defs" "$run_item" \
           "$run_category" "$run_digest" "$run_status" "$run_tmp" "$run_now" || {
@@ -3893,6 +3893,24 @@ fleet_run_hold_items_into_verdicts() {
   ' "$fleet_run_hold_item_list" "$2" |
     LC_ALL=C sort >"$fleet_run_held_verdicts"
   mv -f "$fleet_run_held_verdicts" "$2"
+}
+
+fleet_run_hold_owes_retry() {
+  # fleet_run_hold_owes_retry STATUS TOMBSTONE CATEGORY — true when an apply
+  # that ended STATUS (neither applied nor satisfied) owes a retry next pass,
+  # keeping the poll floor open (retry-owed).
+  #
+  # Every failure does. A 75 HOLD does when it is one of the TRANSIENT kinds:
+  # a tombstone's (the live-session uninstall deferral, a `ps` probe that
+  # could not answer) and a plugin's (a bounded Claude install or update
+  # that failed or timed out, a marketplace that would not resolve). Every
+  # other 75 is a standing "this host cannot" — no package manager here
+  # provides the package, a hook this host does not trust, no skill root or
+  # source for a skill — which only a change elsewhere resolves; each has its
+  # alert, and the full cadence re-reads them.
+  [ "$1" = 75 ] || return 0
+  [ "$2" != true ] || return 0
+  [ "$3" = plugins ]
 }
 
 fleet_run_apply_held() {
