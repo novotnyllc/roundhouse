@@ -115,136 +115,90 @@ if [ -n "$fleet_fixture_yq" ]; then
     mv "$pc/known.next" "$HOME/.claude/plugins/known_marketplaces.json"
     ! fleet_plugins_probe || fail "an unreachable upstream read as moved"
 
-    # --- Codex: the routine refresh, unattended ---
+    # --- Codex: Roundhouse only TRIGGERS Codex's own marketplace sync ---
+    # Codex syncs its Git marketplaces, and reinstalls what is installed from
+    # them, in the background whenever an app server starts. Roundhouse never
+    # upgrades or reinstalls a Codex plugin: it holds an app server open until
+    # Codex records the probed head, and remembers the head only then.
     cat >"$pc/bin/codex" <<'SH'
 #!/usr/bin/env bash
-case "$*" in
-  'plugin marketplace list --json') cat "$PC_CODEX_MARKETS"; exit 0 ;;
-  'plugin list --json') cat "$PC_CODEX_PLUGINS"; exit 0 ;;
-esac
-if [ "$1 $2 $3" = 'plugin marketplace upgrade' ] && [ "${5:-}" = --json ]; then
-  printf 'upgrade %s\n' "$4" >>"$PC_CODEX_LOG"
-  [ "${PC_CODEX_UPGRADE_FAIL:-0}" != 1 ] || exit 1
-  jq -n --arg rev "$(cat "$PC_CODEX_NEXT_REV")" '{source_type: "git", ref_name: null, revision: $rev}' \
-    >"$PC_CODEX_ROOT/.codex-marketplace-install.json"
+if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
+  printf 'app-server\n' >>"$PC_CODEX_LOG"
+  while IFS= read -r req; do
+    id=$(printf '%s\n' "$req" | jq -r '.id // empty')
+    case $(printf '%s\n' "$req" | jq -r '.method // empty') in
+      initialize)
+        # The sync runs in the background, announces nothing, and is cut off
+        # when the app server is closed before it finishes, as Codex's is.
+        server=$$
+        [ ! -s "$PC_CODEX_SYNC_TO" ] || (sleep 1
+          kill -0 "$server" 2>/dev/null || exit 0
+          jq -n --arg rev "$(cat "$PC_CODEX_SYNC_TO")" '{source_type: "git", revision: $rev}' \
+            >"$PC_CODEX_ROOT/.codex-marketplace-install.json") >/dev/null 2>&1 </dev/null &
+        jq -cn --argjson id "$id" '{id:$id,result:{}}'
+        ;;
+    esac
+  done
   exit 0
 fi
+case "$*" in
+  'plugin marketplace list --json') cat "$PC_CODEX_MARKETS"; exit 0 ;;
+esac
+# Roundhouse must never drive Codex's own updates.
+printf 'FORBIDDEN %s\n' "$*" >>"$PC_CODEX_LOG"
 exit 64
 SH
-    cat >"$pc/bin/fake-node" <<'SH'
-#!/usr/bin/env bash
-printf 'helper %s %s\n' "$2" "$3" >>"$PC_CODEX_LOG"
-[ "$3" != "${PC_NODE_FAIL_ID:-}" ] || exit 1
-SH
-    chmod +x "$pc/bin/codex" "$pc/bin/fake-node"
+    chmod +x "$pc/bin/codex"
+    pc_upstream codex-up >/dev/null
+    pc_codex_head=$(pc_git -C "$pc/codex-up-work" rev-parse HEAD)
     mkdir -p "$pc/codex-root"
-    export PC_CODEX_MARKETS="$pc/codex-markets.json" PC_CODEX_PLUGINS="$pc/codex-plugins.json" \
-      PC_CODEX_LOG="$pc/codex.log" PC_CODEX_NEXT_REV="$pc/codex-next-rev" \
-      PC_CODEX_ROOT="$pc/codex-root"
-    jq -n --arg root "$pc/codex-root" '{marketplaces: [
-      {name: "novotnyllc", root: $root,
-       marketplaceSource: {sourceType: "git", source: "https://example.invalid/m.git"}},
+    export PC_CODEX_MARKETS="$pc/codex-markets.json" PC_CODEX_LOG="$pc/codex.log" \
+      PC_CODEX_SYNC_TO="$pc/codex-sync-to" PC_CODEX_ROOT="$pc/codex-root"
+    jq -n --arg root "$pc/codex-root" --arg url "$pc/codex-up.git" '{marketplaces: [
+      {name: "novotnyllc", root: $root, marketplaceSource: {sourceType: "git", source: $url}},
       {name: "openai-bundled", root: "/bundled", marketplaceSource: {sourceType: "local", source: "/bundled"}}]}' \
       >"$PC_CODEX_MARKETS"
-    printf '%s\n' '{"installed":[
-      {"pluginId":"roundhouse@novotnyllc","marketplaceName":"novotnyllc","installed":true,"enabled":true},
-      {"pluginId":"railyard@novotnyllc","marketplaceName":"novotnyllc","installed":true,"enabled":true},
-      {"pluginId":"agent-utilities@novotnyllc","marketplaceName":"novotnyllc","installed":true,"enabled":true},
-      {"pluginId":"tart-xcode-runner@novotnyllc","marketplaceName":"novotnyllc","installed":true,"enabled":true},
-      {"pluginId":"dormant@novotnyllc","marketplaceName":"novotnyllc","installed":true,"enabled":false},
-      {"pluginId":"gone@novotnyllc","marketplaceName":"novotnyllc","installed":false},
-      {"pluginId":"browser@openai-bundled","marketplaceName":"openai-bundled","installed":true}]}' \
-      >"$PC_CODEX_PLUGINS"
-    pc_rev1=1111111111111111111111111111111111111111
-    pc_rev2=2222222222222222222222222222222222222222
-    printf '%s\n' "$pc_rev1" >"$PC_CODEX_NEXT_REV"
     (
       PATH="$pc/bin:$PATH"
-      fleet_node_path() { printf '%s\n' "$pc/bin/fake-node"; }
       # Local and remote-catalog marketplaces advance with Codex itself.
       [ "$(fleet_plugins_codex_markets | tr "$us" '|')" = \
-        "novotnyllc|https://example.invalid/m.git||$pc/codex-root" ] ||
+        "novotnyllc|$pc/codex-up.git||$pc/codex-root" ] ||
         fail "the Codex Git marketplaces were wrong: $(fleet_plugins_codex_markets)"
-      # A full refresh: upgrade the Git marketplace, then every installed,
-      # enabled plugin from it through the hook-preserving helper, roundhouse
-      # last. A fleet item is the item loop's — held or not, a tombstone
-      # (`railyard: absent`, outside the fold) or a definition — and a
-      # disabled install is never handed to a helper that rewrites hook trust.
-      : >"$PC_CODEX_LOG"
-      pc_out=$(fleet_plugins_refresh "$pc/store" vireo '{}' \
-        '{"plugins":{"agent-utilities":{"marketplace":"novotnyllc"}}}' full "$pc" \
-        '{"plugins":{"railyard":"absent"}}')
-      printf '%s\n' 'upgrade novotnyllc' 'helper update tart-xcode-runner@novotnyllc' \
-        'helper update roundhouse@novotnyllc' >"$pc/codex.want"
-      cmp -s "$PC_CODEX_LOG" "$pc/codex.want" ||
-        fail "the Codex refresh touched a fleet item or a disabled install: $(tr '\n' ';' <"$PC_CODEX_LOG")"
-      rm -f "$(fleet_plugins_memo_path codex novotnyllc complete)"
+      # Full pass: Codex syncs to the upstream head; the head is remembered.
+      printf '%s\n' "$pc_codex_head" >"$PC_CODEX_SYNC_TO"
       : >"$PC_CODEX_LOG"
       pc_out=$(fleet_plugins_refresh "$pc/store" vireo '{}' '{}' full "$pc")
-      printf '%s\n' 'upgrade novotnyllc' 'helper update agent-utilities@novotnyllc' \
-        'helper update railyard@novotnyllc' 'helper update tart-xcode-runner@novotnyllc' \
-        'helper update roundhouse@novotnyllc' \
-        >"$pc/codex.want"
-      cmp -s "$PC_CODEX_LOG" "$pc/codex.want" ||
-        fail "the Codex refresh did not run the routine sequence: $(tr '\n' ';' <"$PC_CODEX_LOG")"
-      case $pc_out in
-        *'update plugin roundhouse@novotnyllc (codex)'*) ;;
-        *) fail "the Codex refresh did not report its updates: $pc_out" ;;
-      esac
-      [ "$(fleet_plugins_memo_read codex novotnyllc complete)" = "$pc_rev1" ] ||
-        fail "a completed Codex refresh did not remember its revision"
-      # The same revision again costs one upgrade and nothing more.
+      [ "$(cat "$PC_CODEX_LOG")" = app-server ] ||
+        fail "the pass did more than start Codex's own sync: $(tr '\n' ';' <"$PC_CODEX_LOG")"
+      [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" = "$pc_codex_head" ] ||
+        fail "a Codex sync that reached the upstream head was not remembered: $pc_out"
+      # The probe now reads Codex as current.
+      ! fleet_plugins_probe ||
+        fail "a marketplace Codex had synced still read as moved: $fleet_plugins_moved"
+      # Upstream moves; Codex's sync does not get there this pass: nothing is
+      # remembered, so the next pass asks again, and the pass says so.
+      pc_codex_head=$(pc_commit codex-up 'a release')
+      : >"$PC_CODEX_SYNC_TO"
       : >"$PC_CODEX_LOG"
-      fleet_plugins_codex_refresh novotnyllc "$pc/codex-root" >/dev/null
-      [ "$(cat "$PC_CODEX_LOG")" = 'upgrade novotnyllc' ] ||
-        fail "an unchanged Codex marketplace re-ran its plugin updates: $(tr '\n' ';' <"$PC_CODEX_LOG")"
-      # A new revision with one failing update: every plugin is still tried,
-      # and the revision is not recorded complete, so the next pass retries.
-      printf '%s\n' "$pc_rev2" >"$PC_CODEX_NEXT_REV"
-      : >"$PC_CODEX_LOG"
-      pc_out=$(PC_NODE_FAIL_ID=railyard@novotnyllc \
-        fleet_plugins_codex_refresh novotnyllc "$pc/codex-root" "$pc_rev2")
-      [ "$(grep -c '^helper update' "$PC_CODEX_LOG")" -eq 4 ] ||
-        fail "one failed Codex update stopped the rest: $(tr '\n' ';' <"$PC_CODEX_LOG")"
+      fleet_plugins_probe || fail "a moved Codex marketplace did not read as moved"
+      pc_out=$(ROUNDHOUSE_CODEX_SYNC_WAIT_MS=1500 \
+        fleet_plugins_refresh "$pc/store" vireo '{}' '{}' fast "$pc")
+      [ "$(cat "$PC_CODEX_LOG")" = app-server ] ||
+        fail "the fast pass did more than start Codex's own sync: $(tr '\n' ';' <"$PC_CODEX_LOG")"
+      [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" != "$pc_codex_head" ] ||
+        fail "a Codex sync that never happened was remembered as done"
       case $pc_out in
-        *'hold  plugin railyard@novotnyllc (codex)'*) ;;
-        *) fail "a failed Codex update was not reported as a hold: $pc_out" ;;
+        *'hold  marketplace novotnyllc (codex) — Codex did not sync it'*) ;;
+        *) fail "a Codex sync that did not reach the head was not reported: $pc_out" ;;
       esac
-      [ "$(fleet_plugins_memo_read codex novotnyllc complete)" = "$pc_rev1" ] ||
-        fail "a Codex refresh with a failed update was recorded complete"
-      [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" = "$pc_rev2" ] ||
-        fail "the attempted upstream head was not remembered"
-      # A listing that exits 0 but is not the documented shape fails CLOSED:
-      # no upgrade, and neither memo moves, so the revision is never recorded
-      # complete with nothing updated.
-      pc_rev3=3333333333333333333333333333333333333333
-      printf '%s\n' "$pc_rev3" >"$PC_CODEX_NEXT_REV"
-      cp "$PC_CODEX_PLUGINS" "$pc/codex-plugins.good"
-      for pc_bad_list in '{"installed":"nope"}' '{invalid' '[]' '{"installed":["x"]}'; do
-        printf '%s\n' "$pc_bad_list" >"$PC_CODEX_PLUGINS"
-        : >"$PC_CODEX_LOG"
-        pc_out=$(fleet_plugins_codex_refresh novotnyllc "$pc/codex-root" "$pc_rev3")
-        [ ! -s "$PC_CODEX_LOG" ] ||
-          fail "a malformed codex plugin list ($pc_bad_list) still upgraded or updated: $(tr '\n' ';' <"$PC_CODEX_LOG")"
-        case $pc_out in
-          *'hold  marketplace novotnyllc (codex) — codex plugin list is unreadable'*) ;;
-          *) fail "a malformed codex plugin list ($pc_bad_list) was not held: $pc_out" ;;
-        esac
-        [ "$(fleet_plugins_memo_read codex novotnyllc complete)" = "$pc_rev1" ] &&
-          [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" = "$pc_rev2" ] ||
-          fail "a malformed codex plugin list ($pc_bad_list) advanced a memo"
-      done
-      cp "$pc/codex-plugins.good" "$PC_CODEX_PLUGINS"
-      # A failed upgrade updates nothing.
-      : >"$PC_CODEX_LOG"
-      pc_out=$(PC_CODEX_UPGRADE_FAIL=1 \
-        fleet_plugins_codex_refresh novotnyllc "$pc/codex-root")
-      ! grep -q '^helper' "$PC_CODEX_LOG" ||
-        fail "plugins were updated from a marketplace whose upgrade failed"
-      case $pc_out in
-        *'hold  marketplace novotnyllc (codex)'*) ;;
-        *) fail "a failed Codex marketplace upgrade was not reported: $pc_out" ;;
-      esac
+      # The next fast pass, with Codex reaching it, remembers it.
+      printf '%s\n' "$pc_codex_head" >"$PC_CODEX_SYNC_TO"
+      fleet_plugins_probe || fail "an unsynced Codex marketplace stopped reading as moved"
+      fleet_plugins_refresh "$pc/store" vireo '{}' '{}' fast "$pc" >/dev/null
+      [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" = "$pc_codex_head" ] ||
+        fail "a fast-pass Codex sync was not remembered"
+      ! grep -q FORBIDDEN "$PC_CODEX_LOG" ||
+        fail "Roundhouse drove a Codex upgrade or install: $(tr '\n' ';' <"$PC_CODEX_LOG")"
     )
 
     # The run hands the refresh its whole desired universe (fleet_run_desired:
@@ -299,17 +253,23 @@ SH
       *) fail "a no-op update read as done: $pc_out" ;;
     esac
 
-    # --- an owned, enabled plugin whose hooks change upstream ends approved ---
-    # The item loop updates Claude's copy; automatic approval reads Codex's. A
-    # Codex copy left at the old bytes refused (source mismatch) and held the
-    # item for good. Codex here models hook trust by hash: a hook is trusted
-    # only while its current hash is the one trust was written for.
+    # --- the fleet's own plugins: source-verified approval of Codex's copy ---
+    # The item loop updates Claude's copy; automatic approval reads Codex's.
+    # Codex here models hook trust by hash (a hook is trusted only while its
+    # current hash is the one trust was written for) and its startup sync: a
+    # `pending` version is installed the moment an app server starts.
     mkdir -p "$pc/hooks-bin" "$pc/hooks-state"
     cat >"$pc/hooks-bin/codex" <<'SH'
 #!/usr/bin/env bash
 st=$PC_HOOKS_STATE
 ver=$(cat "$st/version")
 if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
+  if [ -s "$st/pending" ]; then
+    cat "$st/pending" >"$st/version"
+    rm -f "$st/pending"
+    printf 'codex-sync\n' >>"$st/log"
+  fi
+  ver=$(cat "$st/version")
   while IFS= read -r req; do
     method=$(printf '%s\n' "$req" | jq -r '.method // empty')
     id=$(printf '%s\n' "$req" | jq -r '.id // empty')
@@ -361,6 +321,7 @@ SH
       printf '%s\n' '{"source":"git","url":"https://example.invalid/widget.git"}' \
         >"$pc/hooks-state/source"
       printf '%s\n' '{"marketplaces":[]}' >"$pc/hooks-state/markets"
+      rm -f "$pc/hooks-state/pending"
       : >"$pc/hooks-state/log"
       jq -n --arg a "$pc_sha_a" '{version: 2, plugins: {"widget@m":
         [{scope: "user", version: "1.0.0", gitCommitSha: $a}]}}' \
@@ -388,6 +349,48 @@ SH
       fail "the Codex copy was not refreshed, carrying its hook trust, before approval: $(tr '\n' ';' <"$pc/hooks-state/log")"
     [ "$(cat "$pc/hooks-state/trusted")" = sha256:new ] ||
       fail "the changed hook did not end trusted at its new hash"
+    # Codex already at the expected bytes, hooks unchanged upstream: the copy
+    # is left alone (no reinstall) and approval passes as it is.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    printf '%s\n' sha256:new >"$pc/hooks-state/trusted"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 0 ] ||
+      fail "a Codex copy already at the expected bytes was held (got $pc_status)"
+    ! grep -q codex-add "$pc/hooks-state/log" ||
+      fail "a Codex copy already at the expected bytes was reinstalled: $(tr '\n' ';' <"$pc/hooks-state/log")"
+    # Codex already advanced the copy AND its hooks changed upstream (they
+    # read `modified` against the old trusted hash), source verified. The
+    # item loop's AUTOMATIC approval refuses a modified hook, so the item
+    # holds and nothing is stamped. (Accepting this case is an open decision:
+    # see the plugin-currency report; flip this block when it is made.)
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    pc_status=0
+    pc_hooks_apply || pc_status=$?
+    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+      ! grep -q codex-add "$pc/hooks-state/log" ||
+      fail "an advanced copy's modified hook was handled differently than automatic approval allows (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
+    # The helper's update NEVER reports trust it did not carry: when Codex's
+    # startup sync advances the copy under its snapshot (trusted hooks then
+    # read modified), it says so and fails, and writes nothing.
+    pc_hooks_reset
+    printf '%s\n' new >"$pc/hooks-state/pending"
+    pc_status=0
+    pc_err=$(cd "$pc" && PATH="$pc/hooks-bin:$PATH" PC_HOOKS_STATE="$pc/hooks-state" \
+      node "$script_dir/codex-plugin-hooks.mjs" update widget@m 2>&1 >/dev/null) || pc_status=$?
+    [ "$pc_status" -ne 0 ] ||
+      fail "the hook helper reported an update after Codex advanced the copy under its snapshot"
+    case $pc_err in
+      *'Codex advanced widget@m before the trust snapshot'*) ;;
+      *) fail "the hook helper did not say Codex advanced the copy: $pc_err" ;;
+    esac
+    [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+      ! grep -q '^trust\|codex-add' "$pc/hooks-state/log" ||
+      fail "the hook helper carried or wrote trust after Codex advanced the copy: $(tr '\n' ';' <"$pc/hooks-state/log")"
     # The same ID registered in Codex from ANOTHER source: the helper would
     # install those bytes and re-trust their hooks before the identity check
     # refused, and a hold undoes neither. Refused before anything runs.

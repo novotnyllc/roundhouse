@@ -181,17 +181,31 @@ The fast pass's poll floor asks each plugin marketplace's upstream for its
 head with a read-only, bounded `git ls-remote` (in parallel; an unreachable
 one reads as unmoved), against the head this host last refreshed it at
 (`store.run/plugin-currency/`). A moved marketplace, or every marketplace on
-the full pass, is refreshed BEFORE the item loop, so the same pass's identity
-comparison updates the fleet's plugin items through review → apply →
-journal. When that update is of an enabled plugin Codex also has installed,
-the Codex copy is refreshed through the hook-preserving helper before
-automatic approval reads it. Installed plugins the fleet does not own are updated in place
-afterwards: `claude plugin update` for user-scoped Claude plugins, and for
-each Codex Git marketplace `codex plugin marketplace upgrade` followed by the
-hook-preserving `codex-plugin-hooks.mjs update` for every installed plugin
-from it, `roundhouse@novotnyllc` last. Neither path installs, enables or
-removes anything. Directory and URL Claude sources have no head to ask and
-refresh on the full pass only.
+the full pass, is handled BEFORE the item loop:
+
+- **Claude:** Roundhouse refreshes the marketplace, so the same pass's
+  identity comparison updates the fleet's plugin items through review →
+  apply → journal, and updates installed user-scoped plugins the fleet does
+  not own in place with `claude plugin update`. It never installs, enables or
+  removes one. Directory and URL sources have no head to ask and refresh on
+  the full pass only.
+- **Codex** plugins follow Codex's own startup sync: every Codex app server
+  start syncs Codex's Git marketplaces and reinstalls what is installed from
+  them, whatever anyone holds. Roundhouse never upgrades or reinstalls a
+  Codex plugin. On a host where Codex may never run, it only TRIGGERS that
+  sync (`codex-plugin-hooks.mjs sync`, an app server held open until each
+  moved marketplace records the probed head, at most 30s) and remembers the
+  head only once Codex reached it. Per-plugin holds were never enforceable on
+  the Codex side and are not attempted.
+- **Hook trust:** after Claude installs or updates an enabled fleet plugin
+  that Codex also has installed and enabled, the item loop verifies that
+  Codex's copy is from the same plugin source, then runs automatic approval
+  against it (a disabled Codex copy is left alone). Automatic approval
+  refuses a hook that is untrusted or `modified`, so a fleet plugin whose
+  hooks changed upstream holds until they are approved. Hooks of third-party
+  Codex plugins that change upstream stay untrusted until the operator
+  approves them (`roundhouse approve-codex-plugin-hooks PLUGIN@MARKETPLACE`),
+  as Codex itself leaves them.
 
 The canary gate (§10.1) times its wait from the first record of the canary's
 **latest clean run** of `applied`/`satisfied` evidence — the records after
@@ -785,16 +799,18 @@ Codex-side freshness (verified against codex-rs commit 728e25cb, 2026-08-04):
 Codex auto-upgrades `source_type = "git"` marketplaces at startup, but never
 runs `git fetch`/`pull` against `source_type = "local"` marketplaces — for a
 local-checkout marketplace, whoever refreshes it owns pulling that checkout
-current; Codex will not. Once the on-disk marketplace content is current, Codex silently
-advances installed plugin versions itself on the next `plugin/list` (which
-every TUI session issues routinely) — nothing needs to force reinstalls
-or invoke `codex plugin marketplace upgrade`, only to keep the checkout
-current. The scheduled run upgrades and updates through the hook-preserving
-helper anyway: a host where no Codex session starts never auto-upgrades a Git
-marketplace, and the helper re-trusts, at their new hashes, exactly the hooks
-this host already trusted. The 3h remote-catalog TTL and the startup git
-auto-upgrade are catalog-metadata-only and git-type-only respectively; neither gives local
-marketplaces any freshness guarantee.
+current; Codex will not. Observed against codex-cli 0.160.0 (2026-10-02, an
+isolated `CODEX_HOME`): starting an app server — `initialize` alone — fetches
+each Git marketplace in the background and reinstalls the installed plugins
+at the new revision, with no completion notification, and is cut off if the
+server closes first; `codex plugin marketplace upgrade` does the same
+reinstall; the CLI `codex plugin list` does neither. There is no catalog-only
+refresh: whenever Codex starts, installed copies follow the marketplace. That
+is why `codex-plugin-hooks.mjs update` refuses (exit non-zero, nothing
+written) when Codex advances the copy under its own trust snapshot rather
+than report trust it did not carry. The 3h remote-catalog TTL is
+catalog-metadata-only, and nothing gives local marketplaces any freshness
+guarantee.
 
 ## Routine marketplace refresh
 

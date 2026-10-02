@@ -3346,6 +3346,15 @@ its own, and the operator wants every plugin current on every host as soon as
 a pass sees the new upstream. Review, holds, the identity proof and the removal
 cap still apply.
 
+On the Codex side "current" is Codex's own: every Codex app server start
+syncs its Git marketplaces and reinstalls the plugins installed from them, so
+Roundhouse never upgrades or reinstalls a Codex plugin and holds are not
+enforceable there. It only triggers that sync on hosts where Codex may never
+run, and approves the hooks of the fleet's own plugins after verifying that
+Codex's copy comes from the same source. Hooks of third-party Codex plugins
+that change upstream stay untrusted until the operator approves them, as
+Codex itself leaves them.
+
 Condition 3 is new and it closes a lie by omission the reviewer found: a canary
 that applies an item, is wrecked by it, and stops journaling satisfies (1) and
 (2), as does a canary that went **publication-silent because of an unrelated

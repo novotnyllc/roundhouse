@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 const TIMEOUT_MS = 15_000;
@@ -232,6 +234,68 @@ async function verifyTrust(pluginId, cwd, wanted, rejectNewTrusted, requireAllPr
   return hooks;
 }
 
+function installedRecord(pluginId, codexExecutable) {
+  // The CLI listing does not run Codex's marketplace startup sync (an app
+  // server start does), so it reads the installed copy as it stands.
+  return new Promise((resolve, reject) => {
+    const child = spawnCodex(codexExecutable, ["plugin", "list", "--json"], {
+      stdio: ["ignore", "pipe", "inherit"],
+      windowsHide: true,
+    });
+    let out = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+      if (out.length > 4 * 1024 * 1024) {
+        terminateCodexChild(child);
+        reject(new Error("codex plugin list output exceeded 4 MiB"));
+      }
+    });
+    const timer = setTimeout(() => {
+      terminateCodexChild(child);
+      reject(new Error("codex plugin list timed out"));
+    }, TIMEOUT_MS);
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(`codex plugin list failed (${code ?? "signal"})`));
+      try {
+        const installed = JSON.parse(out)?.installed;
+        if (!Array.isArray(installed)) throw new Error("shape");
+        const record = installed.find((p) => p?.pluginId === pluginId && p?.installed !== false);
+        resolve(record ? JSON.stringify({ version: record.version ?? null, sha: record.source?.sha ?? null }) : null);
+      } catch {
+        reject(new Error("codex plugin list returned invalid JSON"));
+      }
+    });
+  });
+}
+
+function marketplaceRevision(root) {
+  try {
+    const revision = JSON.parse(readFileSync(join(root, ".codex-marketplace-install.json"), "utf8"))?.revision;
+    return typeof revision === "string" ? revision : null;
+  } catch {
+    return null;
+  }
+}
+
+async function syncMarketplaces(targets, waitMs, codexExecutable) {
+  // Codex syncs its Git marketplaces — and reinstalls the plugins installed
+  // from them — in the background when an app server starts, and announces
+  // nothing when it is done. Hold one open until every target root records
+  // its expected revision, or the deadline passes. Read-only on our side:
+  // no request here changes anything.
+  return withAppServer(async () => {
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      const missing = targets.filter(([root, revision]) => marketplaceRevision(root) !== revision);
+      if (!missing.length || Date.now() >= deadline) return missing.map(([root]) => root);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }, codexExecutable);
+}
+
 function pluginInstalled(pluginId, codexExecutable) {
   return new Promise((resolve, reject) => {
     const child = spawnCodex(codexExecutable, ["plugin", "list", "--json"], {
@@ -286,6 +350,22 @@ function runCodexPluginAdd(pluginId, codexExecutable) {
 }
 
 async function main() {
+  if (process.argv[2] === "sync") {
+    // sync ROOT REVISION [ROOT REVISION ...]: trigger Codex's own marketplace
+    // sync and report which roots reached their revision. Exit non-zero
+    // when any did not, so nobody records a revision Codex never reached.
+    const pairs = process.argv.slice(3);
+    if (!pairs.length || pairs.length % 2 || pairs.some((value) => !value)) {
+      fail("usage: codex-plugin-hooks.mjs sync ROOT REVISION [ROOT REVISION ...]");
+    }
+    const targets = [];
+    for (let index = 0; index < pairs.length; index += 2) targets.push([pairs[index], pairs[index + 1]]);
+    const waitMs = Number(process.env.ROUNDHOUSE_CODEX_SYNC_WAIT_MS || 30_000);
+    const missing = await syncMarketplaces(targets, waitMs, "codex");
+    process.stdout.write(`${JSON.stringify({ synced: targets.length - missing.length, missing })}\n`);
+    if (missing.length) process.exitCode = 75;
+    return;
+  }
   const [command, pluginId, ...rest] = process.argv.slice(2);
   let codexExecutable = "codex";
   if (rest.length === 2 && rest[0] === CODEX_EXECUTABLE_FLAG && rest[1]) {
@@ -324,7 +404,20 @@ async function main() {
     return;
   }
   if (command === "update") {
+    // The trust snapshot is taken through an app server, and starting one
+    // runs Codex's marketplace sync, which may reinstall this plugin at new
+    // bytes before the snapshot is read: its trusted hooks then read as
+    // modified, and there is nothing honest left to carry over. Detect it
+    // and say so rather than report a refresh that preserved nothing.
+    const recordBefore = await installedRecord(pluginId, codexExecutable);
     const before = await listHooks(pluginId, cwd, codexExecutable);
+    const recordAfter = await installedRecord(pluginId, codexExecutable);
+    if (recordBefore !== recordAfter) {
+      fail(
+        `Codex advanced ${pluginId} before the trust snapshot (${recordBefore} -> ${recordAfter}); ` +
+          "no hook trust was carried over — approve its hooks explicitly",
+      );
+    }
     // Only hooks this host had already trusted get re-trusted at their new
     // hashes. "modified" is the tampered-drift state — the content no longer
     // matches the trusted hash — and writeTrust stamps whatever hash is on disk
@@ -343,7 +436,7 @@ async function main() {
     );
     return;
   }
-  fail("usage: codex-plugin-hooks.mjs approve|update PLUGIN@MARKETPLACE");
+  fail("usage: codex-plugin-hooks.mjs approve|update PLUGIN@MARKETPLACE | sync ROOT REVISION...");
 }
 
 main().catch((error) => {

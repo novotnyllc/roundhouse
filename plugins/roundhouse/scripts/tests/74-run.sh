@@ -447,17 +447,14 @@ JSON
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
       'update example@test-market' ] ||
       fail "plugin update did not enter the honest action ledger"
-    # The Codex copy is refreshed through the hook-preserving helper (its
-    # `codex plugin add`, then its carry-over trust write) before automatic
-    # approval reads it: approving a stale copy held every plugin whose hooks
-    # changed upstream.
-    [ "$(sed -n '2,4p' "$run_plugin_order_log" | tr '\n' ';')" = \
-      'codex-add example@test-market;approve;approve;' ] ||
-      fail "the Codex copy was not refreshed and approved after the plugin update: $(tr '\n' ';' <"$run_plugin_order_log")"
-    [ "$(sed -n '5p' "$run_plugin_order_log")" = \
+    # Codex's copy is already at the new bytes (Codex syncs its own), so it
+    # is not refreshed: approval reads it as it is.
+    [ "$(sed -n '2p' "$run_plugin_order_log")" = approve ] ||
+      fail "hook approval did not follow the plugin update: $(tr '\n' ';' <"$run_plugin_order_log")"
+    [ "$(sed -n '3p' "$run_plugin_order_log")" = \
       'enable example@test-market' ] ||
       fail "plugin enable did not enter the honest action ledger"
-    [ "$(sed -n '6p' "$run_plugin_order_log")" = approve ] ||
+    [ "$(sed -n '4p' "$run_plugin_order_log")" = approve ] ||
       fail "hook approval did not follow the plugin enable"
 
     # A native manager may persist the enabled state and then report a
@@ -577,11 +574,7 @@ JSON
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
       'update example@test-market' ] ||
       fail "modified-hook refusal did not enter the update ledger"
-    # The Codex copy is refreshed (it carries no trust for a modified hook)
-    # and automatic approval still refuses: nothing after it.
-    [ "$(sed -n '2p' "$run_plugin_order_log")" = 'codex-add example@test-market' ] ||
-      fail "modified-hook refusal did not refresh the Codex copy before refusing"
-    [ -z "$(sed -n '3p' "$run_plugin_order_log")" ] ||
+    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
       fail "modified-hook refusal attempted a later state verb"
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
       fail "modified-hook refusal wrote Codex hook trust"
@@ -607,16 +600,10 @@ JSON
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
       'update example@test-market' ] ||
       fail "untrusted-hook refusal did not enter the update ledger"
-    # The Codex copy is refreshed first; the helper carries over trust only
-    # for the hooks this host had already trusted, so the untrusted one is
-    # never stamped and automatic approval still refuses: nothing after it.
-    [ "$(sed -n '2,3p' "$run_plugin_order_log" | tr '\n' ';')" = \
-      'codex-add example@test-market;approve;' ] ||
-      fail "untrusted-hook refusal did not refresh the Codex copy before refusing: $(tr '\n' ';' <"$run_plugin_order_log")"
-    [ -z "$(sed -n '4p' "$run_plugin_order_log")" ] ||
+    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
       fail "untrusted-hook refusal attempted a later state verb"
-    ! grep -q 'pre_tool_use' "$CODEX_HOOK_WRITES_FILE" 2>/dev/null ||
-      fail "untrusted-hook refusal wrote trust for the untrusted Codex hook"
+    [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
+      fail "untrusted-hook refusal wrote Codex hook trust"
 
     # A Claude-only qualified plugin must not turn the absent Codex identity
     # into a held DSC item. The manager update still runs, but there is no

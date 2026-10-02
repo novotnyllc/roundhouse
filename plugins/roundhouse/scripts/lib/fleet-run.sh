@@ -1759,9 +1759,9 @@ fleet_run_approve_plugin_hooks() {
     return 75
   }
   # REFRESH (the third argument, passed after an install or update of an
-  # ENABLED plugin): bring the Codex copy to the new bytes first, through the
-  # hook-preserving helper, which re-trusts at their new hashes exactly the
-  # hooks this host already trusted. The Claude manager updated only Claude's
+  # ENABLED plugin): when Codex's copy is not yet at the new bytes, bring it
+  # there through the hook-preserving helper, which re-trusts at their new
+  # hashes exactly the hooks this host already trusted. The Claude manager updated only Claude's
   # copy; approving against Codex's stale one refused (a source mismatch, or
   # the new bytes' hooks read as modified) and held every enabled plugin whose
   # hooks changed upstream. A state-only enable changed no bytes and does not
@@ -1772,10 +1772,19 @@ fleet_run_approve_plugin_hooks() {
     # the identity check below could refuse, and a 75 undoes neither
     # (fleet_run_codex_source_ok).
     fleet_run_codex_source_ok "$1" || return 75
-    fleet_run_cli_invalidate
-    bounded_verb "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" update "$1" \
-      >/dev/null 2>&1 </dev/null || return 75
-    fleet_run_cli_invalidate
+    # Codex keeps its own copy current (the pass triggered its marketplace
+    # sync before this loop), so a copy already at the expected bytes is left
+    # alone and approval reads it as it is. Only a copy Codex has not caught
+    # up is refreshed, and the helper refuses — rather than report trust it
+    # did not carry — when Codex advances the copy under its snapshot.
+    fleet_run_codex_at=$(fleet_run_codex_record_state "$1" "$fleet_run_expected_sha") ||
+      return 75
+    if [ "$fleet_run_codex_at" != match ]; then
+      fleet_run_cli_invalidate
+      bounded_verb "$fleet_run_hooks_node" "$script_dir/codex-plugin-hooks.mjs" update "$1" \
+        >/dev/null 2>&1 </dev/null || return 75
+      fleet_run_cli_invalidate
+    fi
   fi
   fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" \
     "$fleet_run_expected_sha") || return 75

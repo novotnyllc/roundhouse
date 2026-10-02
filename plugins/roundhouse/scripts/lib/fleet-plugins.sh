@@ -2,28 +2,32 @@
 # marketplace, in both harnesses, follows its upstream on the first pass that
 # sees the upstream move.
 #
-# Two halves, one per question:
-#
 #   fleet_plugins_probe    READ-ONLY and cheap: one `git ls-remote` per
 #                          marketplace, in parallel, against the head this
 #                          host last refreshed it at. The fast pass asks it at
 #                          the poll floor, so a new upstream release is work
 #                          even when the store did not move.
-#   fleet_plugins_refresh  refreshes the marketplaces that moved (fast) or all
-#                          of them (full), BEFORE the item loop, so the same
-#                          pass's identity comparison sees the new catalog and
-#                          updates the fleet's own plugin items through the
-#                          ordinary review → apply → journal path. Plugins that
-#                          are not fleet items are updated here, in place:
-#                          `claude plugin update` and the hook-preserving
-#                          `codex-plugin-hooks.mjs update`, never an install,
-#                          enable or removal.
+#   fleet_plugins_refresh  runs BEFORE the item loop, on the marketplaces that
+#                          moved (fast) or all of them (full).
 #
-# Memos are host-local, under store.run/plugin-currency/HARNESS/: `M.attempted`
-# is the upstream head this host last refreshed M at (the probe compares the
-# remote against it, so a refresh that cannot complete is retried by the full
-# pass, not by every fast pass), and for Codex `M.complete` is the marketplace
-# revision every installed plugin from M was last updated to.
+# CLAUDE: Roundhouse refreshes each marketplace (`claude plugin marketplace
+# update`), so the same pass's identity comparison updates the fleet's own
+# plugin items through review → apply → journal; installed plugins that are
+# not fleet items are updated in place with `claude plugin update`, never an
+# install, enable or removal.
+#
+# CODEX keeps the plugins of its Git marketplaces current ITSELF: every app
+# server start syncs those marketplaces and reinstalls what is installed from
+# them, whatever anyone holds. Roundhouse does not upgrade or reinstall a
+# Codex plugin; it only TRIGGERS that sync on a host where Codex itself may
+# never run (codex-plugin-hooks.mjs sync), and the item loop's
+# source-verified automatic approval then covers the fleet's own plugins.
+# Hooks of third-party Codex plugins that change upstream stay untrusted until
+# the operator approves them, as Codex itself leaves them.
+#
+# Memos are host-local: store.run/plugin-currency/HARNESS/M.attempted is the
+# upstream head this host last refreshed (Claude) or saw Codex sync (Codex)
+# M at. The probe compares the remote against it.
 #
 # Sourced by scripts/roundhouse; carries definitions only.
 # shellcheck shell=bash
@@ -143,6 +147,38 @@ fleet_plugins_codex_revision() {
     "$1/.codex-marketplace-install.json" 2>/dev/null
 }
 
+fleet_plugins_ask_heads() {
+  # fleet_plugins_ask_heads SOURCES OUT — SOURCES holds `HARNESS NAME URL REF
+  # LOCATION` lines (\037-separated); OUT gets `HARNESS NAME HEAD LOCATION`
+  # for every one whose upstream answered a head, asked in parallel.
+  fleet_plugins_heads_dir=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-plugins.XXXXXX") ||
+    return 1
+  fleet_plugins_heads_n=0
+  fleet_plugins_heads_pids=
+  : >"$fleet_plugins_heads_dir/index"
+  while IFS=$fleet_run_sep read -r fleet_plugins_h fleet_plugins_m fleet_plugins_url \
+    fleet_plugins_ref fleet_plugins_loc; do
+    [ -n "$fleet_plugins_m" ] || continue
+    fleet_plugins_heads_n=$((fleet_plugins_heads_n + 1))
+    printf '%s\n' "$fleet_plugins_heads_n$fleet_run_sep$fleet_plugins_h$fleet_run_sep$fleet_plugins_m$fleet_run_sep$fleet_plugins_loc" \
+      >>"$fleet_plugins_heads_dir/index"
+    fleet_plugins_remote_head "$fleet_plugins_url" "$fleet_plugins_ref" \
+      >"$fleet_plugins_heads_dir/$fleet_plugins_heads_n" 2>/dev/null </dev/null &
+    fleet_plugins_heads_pids="$fleet_plugins_heads_pids $!"
+  done <"$1"
+  for fleet_plugins_pid in $fleet_plugins_heads_pids; do
+    wait "$fleet_plugins_pid" 2>/dev/null || :
+  done
+  while IFS=$fleet_run_sep read -r fleet_plugins_n fleet_plugins_h fleet_plugins_m \
+    fleet_plugins_loc; do
+    fleet_plugins_head=$(cat "$fleet_plugins_heads_dir/$fleet_plugins_n" 2>/dev/null) ||
+      continue
+    [ -n "$fleet_plugins_head" ] || continue
+    printf '%s\n' "$fleet_plugins_h$fleet_run_sep$fleet_plugins_m$fleet_run_sep$fleet_plugins_head$fleet_run_sep$fleet_plugins_loc"
+  done <"$fleet_plugins_heads_dir/index" >"$2"
+  rm -rf "$fleet_plugins_heads_dir"
+}
+
 fleet_plugins_probe() {
   # Sets `fleet_plugins_moved` to `HARNESS NAME HEAD LOCATION` lines
   # (\037-separated), one per
@@ -157,33 +193,17 @@ fleet_plugins_probe() {
     ! command -v claude >/dev/null 2>&1 || fleet_plugins_claude_sources
     fleet_plugins_codex_markets | awk -v us="$fleet_run_sep" '{ print "codex" us $0 }'
   } >"$fleet_plugins_probe_dir/sources" 2>/dev/null || :
-  fleet_plugins_probe_n=0
-  fleet_plugins_probe_pids=
-  : >"$fleet_plugins_probe_dir/index"
-  while IFS=$fleet_run_sep read -r fleet_plugins_h fleet_plugins_m fleet_plugins_url \
-    fleet_plugins_ref fleet_plugins_loc; do
-    [ -n "$fleet_plugins_m" ] || continue
-    fleet_plugins_probe_n=$((fleet_plugins_probe_n + 1))
-    printf '%s\n' "$fleet_plugins_probe_n$fleet_run_sep$fleet_plugins_h$fleet_run_sep$fleet_plugins_m$fleet_run_sep$fleet_plugins_loc" \
-      >>"$fleet_plugins_probe_dir/index"
-    fleet_plugins_remote_head "$fleet_plugins_url" "$fleet_plugins_ref" \
-      >"$fleet_plugins_probe_dir/$fleet_plugins_probe_n" 2>/dev/null </dev/null &
-    fleet_plugins_probe_pids="$fleet_plugins_probe_pids $!"
-  done <"$fleet_plugins_probe_dir/sources"
-  for fleet_plugins_pid in $fleet_plugins_probe_pids; do
-    wait "$fleet_plugins_pid" 2>/dev/null || :
-  done
-  while IFS=$fleet_run_sep read -r fleet_plugins_n fleet_plugins_h fleet_plugins_m \
+  : >"$fleet_plugins_probe_dir/heads"
+  fleet_plugins_ask_heads "$fleet_plugins_probe_dir/sources" \
+    "$fleet_plugins_probe_dir/heads" || :
+  while IFS=$fleet_run_sep read -r fleet_plugins_h fleet_plugins_m fleet_plugins_head \
     fleet_plugins_loc; do
-    fleet_plugins_head=$(cat "$fleet_plugins_probe_dir/$fleet_plugins_n" 2>/dev/null) ||
-      continue
-    [ -n "$fleet_plugins_head" ] || continue
     [ "$fleet_plugins_head" != \
       "$(fleet_plugins_memo_read "$fleet_plugins_h" "$fleet_plugins_m" attempted)" ] ||
       continue
     fleet_plugins_moved="$fleet_plugins_moved$fleet_plugins_h$fleet_run_sep$fleet_plugins_m$fleet_run_sep$fleet_plugins_head$fleet_run_sep$fleet_plugins_loc
 "
-  done <"$fleet_plugins_probe_dir/index"
+  done <"$fleet_plugins_probe_dir/heads"
   rm -rf "$fleet_plugins_probe_dir"
   [ -n "$fleet_plugins_moved" ]
 }
@@ -303,74 +323,39 @@ fleet_plugins_order() {
     { print } END { if (last != "") print last }'
 }
 
-fleet_plugins_codex_refresh() {
-  # fleet_plugins_codex_refresh NAME ROOT [HEAD [OWNED]] — the documented
-  # routine refresh, unattended: freeze the installed set (`codex plugin
-  # list`), upgrade the marketplace, then update every ENABLED plugin from it
-  # that is not a fleet item (OWNED, fleet_plugins_owned, matched by name)
-  # with the hook-preserving helper, `roundhouse@novotnyllc` last. The helper
-  # rewrites hook trust, so a disabled install is never handed to it, and a
-  # fleet item (held or not) is the item loop's to converge. Runs the updates
-  # only when the marketplace revision differs from the one they last
-  # completed at, so an unchanged upstream costs one `upgrade` and nothing
-  # more.
+fleet_plugins_codex_sync() {
+  # fleet_plugins_codex_sync TARGETS — TARGETS holds `NAME HEAD ROOT` lines
+  # (\037-separated): Codex Git marketplaces whose upstream is at HEAD.
+  # Trigger Codex's OWN sync once (an app server held open until every ROOT
+  # records its HEAD, or the deadline), and remember a HEAD only for a
+  # marketplace Codex actually reached: a sync that did not happen is retried.
+  # Nothing here upgrades, installs or re-trusts anything.
+  [ -s "$1" ] || return 0
   command -v codex >/dev/null 2>&1 || return 0
-  fleet_plugins_xr_list=$(bounded_query codex plugin list --json 2>/dev/null) || {
-    printf '  hold  marketplace %s (codex) — codex plugin list failed\n' "$1"
+  fleet_plugins_cs_node=$(fleet_node_path) || {
+    printf '  hold  Codex marketplace sync — Node.js is required to start the Codex app server\n'
     return 0
   }
-  # FAIL CLOSED on a listing that is not the documented shape: an unreadable
-  # list is not an empty one, and reading it as empty would record this
-  # revision complete with nothing updated. No upgrade, no memo.
-  fleet_plugins_xr_ids=$(printf '%s\n' "$fleet_plugins_xr_list" | jq -r --arg m "$1" '
-    if type == "object" and (.installed | type) == "array" and
-      all(.installed[]; type == "object")
-    then . else error("codex plugin list shape") end |
-    .installed[] |
-    select(.marketplaceName == $m and .installed == true and .enabled == true) |
-    .pluginId | strings | select(test("^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$"))' \
-    2>/dev/null) || {
-    printf '  hold  marketplace %s (codex) — codex plugin list is unreadable\n' "$1"
-    return 0
-  }
-  fleet_plugins_xr_ids=$(printf '%s\n' "$fleet_plugins_xr_ids" |
-    awk -v owned="${4:-}" '
-      BEGIN { while (owned != "" && (getline line < owned) > 0) {
-        split(line, f, " "); n = f[2]; sub(/@.*/, "", n); mine[n] = 1 } }
-      { n = $0; sub(/@.*/, "", n); if (!(n in mine)) print }' |
-    fleet_plugins_order)
-  if ! bounded_verb codex plugin marketplace upgrade "$1" --json >/dev/null 2>&1 </dev/null; then
-    printf '  hold  marketplace %s (codex) — codex plugin marketplace upgrade failed\n' "$1"
-    fleet_plugins_memo_write codex "$1" attempted "${3:-}" || :
-    return 0
-  fi
-  fleet_plugins_xr_rev=$(fleet_plugins_codex_revision "$2") || fleet_plugins_xr_rev=
-  fleet_plugins_memo_write codex "$1" attempted "${3:-$fleet_plugins_xr_rev}" || :
-  [ -n "$fleet_plugins_xr_rev" ] || return 0
-  [ "$fleet_plugins_xr_rev" != "$(fleet_plugins_memo_read codex "$1" complete)" ] ||
-    return 0
-  fleet_plugins_xr_ok=true
-  if [ -n "$fleet_plugins_xr_ids" ]; then
-    fleet_plugins_xr_node=$(fleet_node_path) || {
-      printf '  hold  marketplace %s (codex) — Node.js is required for the hook-preserving update\n' "$1"
-      return 0
-    }
-    while IFS= read -r fleet_plugins_xr_id; do
-      [ -n "$fleet_plugins_xr_id" ] || continue
-      if bounded_verb "$fleet_plugins_xr_node" "$script_dir/codex-plugin-hooks.mjs" \
-        update "$fleet_plugins_xr_id" >/dev/null 2>&1 </dev/null; then
-        printf '  update plugin %s (codex)\n' "$fleet_plugins_xr_id"
-      else
-        fleet_plugins_xr_ok=false
-        printf '  hold  plugin %s (codex) — the hook-preserving update failed\n' \
-          "$fleet_plugins_xr_id"
-      fi
-    done <<EOF
-$fleet_plugins_xr_ids
-EOF
-  fi
-  [ "$fleet_plugins_xr_ok" != true ] ||
-    fleet_plugins_memo_write codex "$1" complete "$fleet_plugins_xr_rev" || :
+  fleet_plugins_cs_args=()
+  while IFS=$fleet_run_sep read -r fleet_plugins_cs_m fleet_plugins_cs_head \
+    fleet_plugins_cs_root; do
+    [ -n "$fleet_plugins_cs_root" ] && [ -n "$fleet_plugins_cs_head" ] || continue
+    fleet_plugins_cs_args+=("$fleet_plugins_cs_root" "$fleet_plugins_cs_head")
+  done <"$1"
+  [ "${#fleet_plugins_cs_args[@]}" -gt 0 ] || return 0
+  run_bounded 45 "$fleet_plugins_cs_node" "$script_dir/codex-plugin-hooks.mjs" sync \
+    "${fleet_plugins_cs_args[@]}" >/dev/null 2>&1 </dev/null || :
+  while IFS=$fleet_run_sep read -r fleet_plugins_cs_m fleet_plugins_cs_head \
+    fleet_plugins_cs_root; do
+    fleet_upstream_id_valid "$fleet_plugins_cs_m" && [ -n "$fleet_plugins_cs_head" ] || continue
+    if [ "$(fleet_plugins_codex_revision "$fleet_plugins_cs_root" 2>/dev/null)" = \
+      "$fleet_plugins_cs_head" ]; then
+      fleet_plugins_memo_write codex "$fleet_plugins_cs_m" attempted "$fleet_plugins_cs_head" || :
+    else
+      printf '  hold  marketplace %s (codex) — Codex did not sync it to %s this pass\n' \
+        "$fleet_plugins_cs_m" "$fleet_plugins_cs_head"
+    fi
+  done <"$1"
 }
 
 fleet_plugins_refresh() (
@@ -378,9 +363,9 @@ fleet_plugins_refresh() (
   # before the
   # item loop. MODE `full` refreshes every Claude marketplace a fleet plugin
   # resolves to (held ones excepted, as fleet_run_plugin_marketplaces decides)
-  # or an installed plugin comes from, and every Codex Git marketplace;
-  # `fast` only those fleet_plugins_probe found moved (asking it now if the
-  # poll floor did not). DESIRED (fleet_run_desired: the fold plus its
+  # or an installed plugin comes from, and triggers Codex's own sync for every
+  # Codex Git marketplace whose upstream answers; `fast` only those
+  # fleet_plugins_probe found moved (asking it now if the poll floor did not). DESIRED (fleet_run_desired: the fold plus its
   # tombstones; FOLD when omitted) names the plugins the fleet owns, which the
   # in-place updates leave to the item loop. A refresh failure holds that
   # marketplace and nothing else; it never fails the pass.
@@ -401,8 +386,12 @@ fleet_plugins_refresh() (
       fleet_plugins_claude_installed_markets
     } | LC_ALL=C sort -u | awk -v us="$fleet_run_sep" 'NF { print $1 us us }' \
       >"$fleet_plugins_r_tmp/claude"
-    fleet_plugins_codex_markets | awk -F"$fleet_run_sep" -v us="$fleet_run_sep" \
-      '{ print $1 us us $4 }' >"$fleet_plugins_r_tmp/codex"
+    fleet_plugins_codex_markets | awk -v us="$fleet_run_sep" '{ print "codex" us $0 }' \
+      >"$fleet_plugins_r_tmp/codex-sources"
+    fleet_plugins_ask_heads "$fleet_plugins_r_tmp/codex-sources" \
+      "$fleet_plugins_r_tmp/codex-heads" || : >"$fleet_plugins_r_tmp/codex-heads"
+    awk -F"$fleet_run_sep" -v us="$fleet_run_sep" '{ print $2 us $3 us $4 }' \
+      "$fleet_plugins_r_tmp/codex-heads" >"$fleet_plugins_r_tmp/codex"
   else
     [ "${fleet_plugins_probed:-}" = true ] || fleet_plugins_probe || :
     printf '%s' "${fleet_plugins_moved:-}" |
@@ -412,11 +401,12 @@ fleet_plugins_refresh() (
         $1 == "codex" { print $2 us $3 us $4 > x }'
   fi
 
-  if [ -s "$fleet_plugins_r_tmp/claude" ] || [ -s "$fleet_plugins_r_tmp/codex" ]; then
+  # Codex first: the item loop's automatic approval reads Codex's copy.
+  fleet_plugins_codex_sync "$fleet_plugins_r_tmp/codex" || :
+
+  if [ -s "$fleet_plugins_r_tmp/claude" ]; then
     fleet_plugins_owned "$fleet_plugins_r_desired" "$fleet_plugins_r_defs" \
       >"$fleet_plugins_r_tmp/owned"
-  fi
-  if [ -s "$fleet_plugins_r_tmp/claude" ]; then
     fleet_plugins_r_known="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/known_marketplaces.json"
     # Read on fd 9: the body runs `claude`, and a greedy child must not eat
     # the rest of the list.
@@ -439,10 +429,4 @@ fleet_plugins_refresh() (
     done 9<"$fleet_plugins_r_tmp/claude"
   fi
 
-  while IFS=$fleet_run_sep read -r fleet_plugins_r_m fleet_plugins_r_head \
-    fleet_plugins_r_root <&9; do
-    fleet_upstream_id_valid "$fleet_plugins_r_m" && [ -n "$fleet_plugins_r_root" ] || continue
-    fleet_plugins_codex_refresh "$fleet_plugins_r_m" "$fleet_plugins_r_root" \
-      "$fleet_plugins_r_head" "$fleet_plugins_r_tmp/owned" || :
-  done 9<"$fleet_plugins_r_tmp/codex"
 )
