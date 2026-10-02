@@ -545,11 +545,25 @@ SH
         argv:["roundhouse","fleet-schedule","install"],steps:$steps}]}' >"$win_root/direct/draft.json"
       # Each native step's postcondition on its own: a plan of the local
       # jobs and only the removal, then only the registration.
+      # Each from a fresh seed and its own planning snapshot, so neither
+      # rides on the other's changes.
       for win_only in unregister register; do
-        jq --arg only "$win_only" '.operations[0].steps |= map(select(.mode != "native" or .action == $only))' \
-          "$win_root/direct/draft.json" >"$win_root/direct/only.json"
-        "$cli" seal-plan "$win_root/direct/only.json" "$win_root/planning.jsonl" "$win_root/direct/plan.json" ||
-          fail "the native $win_only plan did not seal"
+        win_seed
+        win_reset_units
+        rm -rf "$win_root/direct/$win_only" "$win_root/direct/result.jsonl"
+        mkdir -p "$win_root/direct/$win_only"
+        ROUNDHOUSE_SCHEDULE_OBSERVE=1 "$cli" collect --target test-host --section agents \
+          --output "$win_root/direct/$win_only/planning.jsonl"
+        win_steps=$(fleet_schedule_plan_steps install "$(jq -c 'select(.kind == "agent_artifact" and
+          .id == "roundhouse:schedule") | .data' "$win_root/direct/$win_only/planning.jsonl")" "$win_root/direct/$win_only")
+        jq -n --arg only "$win_only" --argjson steps "$win_steps" '{domain:"agents",target:"test-host",operations:[{
+          type:"agent-update",kind:"agent_artifact",id:"roundhouse:schedule",
+          argv:["roundhouse","fleet-schedule","install"],
+          steps:($steps | map(select(.mode != "native" or .action == $only)))}]}' >"$win_root/direct/only.json"
+        [ "$(jq '[.operations[0].steps[] | select(.mode == "native")] | length' "$win_root/direct/only.json")" -eq 1 ] ||
+          fail "the direct $win_only fixture is not one native step"
+        "$cli" seal-plan "$win_root/direct/only.json" "$win_root/direct/$win_only/planning.jsonl" \
+          "$win_root/direct/plan.json" || fail "the native $win_only plan did not seal"
         win_status=0
         WIN_DENY=1 ROUNDHOUSE_SCHEDULE_OBSERVE=1 "$cli" apply-plan "$win_root/direct/plan.json" \
           "$(jq -r '.plan_id' "$win_root/direct/plan.json")" "$win_root/direct/result.jsonl" \
