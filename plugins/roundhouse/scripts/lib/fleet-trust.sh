@@ -85,6 +85,30 @@ fleet_trust_entries() {
   # detached context and the field comes back EMPTY, which silently shifts
   # every column after it. Two reads, no assignment, no shift.
   [ -f "$1" ] || return 0
+  # A one-slot memo keyed by the file's BYTES, for a caller that walks many
+  # commits whose rosters are almost always identical (the ratchet walk sets
+  # `fleet_trust_memo`): the answer is a pure function of the file,
+  # so a byte-identical file gets the stored answer and anything else is read.
+  if [ -n "${fleet_trust_memo:-}" ] &&
+    [ -f "$fleet_trust_memo/entries.yaml" ] &&
+    [ -f "$fleet_trust_memo/entries" ] &&
+    cmp -s "$1" "$fleet_trust_memo/entries.yaml"; then
+    cat "$fleet_trust_memo/entries"
+    return 0
+  fi
+  if [ -n "${fleet_trust_memo:-}" ] &&
+    mkdir -p "$fleet_trust_memo" 2>/dev/null; then
+    rm -f "$fleet_trust_memo/entries"
+    fleet_trust_entries_read "$1" >"$fleet_trust_memo/entries.tmp" &&
+      cp "$1" "$fleet_trust_memo/entries.yaml" &&
+      mv -f "$fleet_trust_memo/entries.tmp" "$fleet_trust_memo/entries" &&
+      cat "$fleet_trust_memo/entries" && return 0
+    rm -f "$fleet_trust_memo/entries" "$fleet_trust_memo/entries.tmp"
+  fi
+  fleet_trust_entries_read "$1"
+}
+
+fleet_trust_entries_read() {
   for fleet_trust_class in durable ephemeral; do
     # `map(tostring) | join(" ")`, never `+` between the fields: an unquoted
     # `2026-08-07T09:00:00Z` is a TIMESTAMP to yq, and `+` on a timestamp is
@@ -185,15 +209,47 @@ fleet_trust_generation() {
 # --- derivation from history: the ratchet loop --------------------------------
 
 fleet_trust_commit_time() {
-  jj -R "$1" log -r "$2" --no-graph \
+  # `--ignore-working-copy` on this and the three readers below: each reads a
+  # named COMMIT, which a snapshot of @ cannot change, and on a store with tens
+  # of thousands of evidence files every snapshot cost ~150 ms — per call, and
+  # the ratchet walk makes several calls per commit.
+  #
+  # Under a walk's `fleet_trust_memo`, a full commit id's time is read from
+  # the memo when the walk prefetched it (fleet_trust_memo_times): a commit's
+  # committer timestamp is part of the commit, so it cannot differ.
+  case ${fleet_trust_memo:-}:$2 in
+    ?*:????????????????????????????????????????)
+      if [ -f "$fleet_trust_memo/time.$2" ]; then
+        IFS= read -r fleet_trust_memo_time <"$fleet_trust_memo/time.$2" &&
+          [ -n "$fleet_trust_memo_time" ] && {
+          printf '%s\n' "$fleet_trust_memo_time"
+          return 0
+        }
+      fi
+      ;;
+  esac
+  jj --ignore-working-copy -R "$1" log -r "$2" --no-graph \
     -T 'committer.timestamp().utc().format("%Y-%m-%dT%H:%M:%SZ")' 2>/dev/null
+}
+
+fleet_trust_memo_times() {
+  # fleet_trust_memo_times STORE REVSET — prefetch, in ONE jj call, the
+  # timestamp fleet_trust_commit_time would read for every commit in REVSET
+  # and every parent of one, into `fleet_trust_memo`. Best effort: a commit it
+  # misses is simply read the ordinary way.
+  [ -n "${fleet_trust_memo:-}" ] || return 0
+  mkdir -p "$fleet_trust_memo" 2>/dev/null || return 0
+  jj --ignore-working-copy -R "$1" log -r "($2) | parents($2)" --no-graph \
+    -T 'commit_id ++ " " ++ committer.timestamp().utc().format("%Y-%m-%dT%H:%M:%SZ") ++ "\n"' \
+    2>/dev/null | LC_ALL=C awk -v dir="$fleet_trust_memo" '
+      length($1) == 40 && NF == 2 { f = dir "/time." $1; print $2 > f; close(f) }' || :
 }
 
 fleet_trust_parents() {
   # Real parents only. jj's virtual root commit is a parent of the genesis
   # commit and carries no tree, so it is excluded here rather than in five
   # callers.
-  jj -R "$1" log -r "parents($2) ~ root()" --no-graph \
+  jj --ignore-working-copy -R "$1" log -r "parents($2) ~ root()" --no-graph \
     -T 'commit_id ++ "\n"' 2>/dev/null | grep . || true
 }
 
@@ -202,7 +258,8 @@ fleet_trust_roster_show() {
   # at one revision. Confirmed readable at an arbitrary ancestor, including
   # while a merge is conflicted. An absent file yields an empty roster, which
   # renders as "nobody is trusted" and holds — the safe direction.
-  jj -R "$1" file show -r "$2" "root:$fleet_trust_roster_file" >"$3" 2>/dev/null ||
+  jj --ignore-working-copy -R "$1" file show -r "$2" "root:$fleet_trust_roster_file" \
+    >"$3" 2>/dev/null ||
     : >"$3"
 }
 
@@ -357,7 +414,7 @@ fleet_trust_signature_read() {
   # config points it at 1Password's op-ssh-sign, a shim that rejects the
   # revocation argument and takes the whole gate down.
   fleet_trust_krl_file=$(fleet_trust_krl) || return
-  jj -R "$1" \
+  jj --ignore-working-copy -R "$1" \
     --config signing.backends.ssh.program="$(fleet_vcs_toml_string "$(system_ssh_keygen_path)")" \
     --config signing.backends.ssh.allowed-signers="$(fleet_vcs_toml_string "$3")" \
     --config signing.backends.ssh.revocation-list="$(fleet_vcs_toml_string "$fleet_trust_krl_file")" \
@@ -425,6 +482,9 @@ fleet_trust_commit_hold() {
     printf 'no usable revocation list, so nothing can be verified\n'
     return "$fleet_trust_read_rc"
   }
+  # Kept beside the derived roster: the run's path checks need the principal
+  # this same read derived, and asking ssh-keygen again answers identically.
+  printf '%s\n' "$fleet_trust_line" >"$3/signature" 2>/dev/null || :
   # Parameter expansion, not `read a b c`: an empty roster yields an EMPTY
   # display field, and `read` collapses the run of spaces and shifts the
   # committer email into the display variable.
@@ -551,6 +611,11 @@ fleet_trust_class_allows() {
   # Which host-keyed path a principal may write is §7.3's equality check and is
   # enforced separately; this predicate answers only the class question, so the
   # two never drift into one combined condition nobody can read.
+  #
+  # IT DEPENDS ON THE PATH ONLY THROUGH fleet_vcs_path_owner, and
+  # fleet_run_signature_commit relies on that: it asks once per owner per
+  # commit. A rule that looks at more of the path must change that memo's key
+  # too; tests/72-records.sh fails when two paths with one owner disagree.
   #
   # DEFAULT-DENY, and the default is LEAF rather than durable. `[ "$1" =
   # ephemeral ] || return 0` granted full durable authority to the EMPTY class —

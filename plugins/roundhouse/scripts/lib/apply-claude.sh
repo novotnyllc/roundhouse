@@ -20,7 +20,10 @@ fleet_run_marketplaces() {
   # The one reader of `claude plugin marketplace list --json`: the registered
   # marketplaces as a JSON ARRAY, whichever shape the manager prints (a bare
   # array, or `{marketplaces: [...]}`). Exit 75 when the manager cannot list.
-  fleet_run_mlist=$(claude plugin marketplace list --json 2>/dev/null) || return 75
+  # Inside the run loop the answer is kept until the next manager verb
+  # (fleet_run_cli_cached): the list does not change between two items.
+  fleet_run_mlist=$(fleet_run_cli_cached marketplaces \
+    claude plugin marketplace list --json 2>/dev/null) || return 75
   printf '%s\n' "$fleet_run_mlist" |
     jq -c 'if type == "array" then . else (.marketplaces // []) end' 2>/dev/null ||
     return 75
@@ -36,7 +39,8 @@ fleet_run_plugin_catalog() {
   fleet_run_catalog_id=$1
   fleet_run_catalog_name=${fleet_run_catalog_id%@*}
   fleet_run_catalog_market=${fleet_run_catalog_id##*@}
-  fleet_run_catalog_json=$(claude plugin list --available --json 2>/dev/null) ||
+  fleet_run_catalog_json=$(fleet_run_cli_cached available \
+    claude plugin list --available --json 2>/dev/null) ||
     fleet_run_catalog_json=
   fleet_run_catalog_entry=$(printf '%s\n' "$fleet_run_catalog_json" |
     jq -e -c --arg id "$fleet_run_catalog_id" '
@@ -372,7 +376,8 @@ fleet_run_marketplace_repair_once() {
   else
     fleet_run_marketplace_source_ok "$1" || return 75
   fi
-  claude plugin marketplace update "$1" >/dev/null 2>&1 || return 75
+  fleet_run_cli_invalidate
+  bounded_verb claude plugin marketplace update "$1" >/dev/null 2>&1 || return 75
 }
 
 fleet_run_ensure_marketplace() {
@@ -392,7 +397,8 @@ fleet_run_ensure_marketplace() {
   fi
   fleet_run_ensure_source=$(fleet_run_marketplace_source "$fleet_run_ensure_name") ||
     return 75
-  claude plugin marketplace add "$fleet_run_ensure_source" >/dev/null 2>&1 || return 75
+  fleet_run_cli_invalidate
+  bounded_verb claude plugin marketplace add "$fleet_run_ensure_source" >/dev/null 2>&1 || return 75
   fleet_run_ensure_list=$(fleet_run_marketplaces) || return 75
   printf '%s\n' "$fleet_run_ensure_list" | jq -e --arg n "$fleet_run_ensure_name" \
     'any(.[]; .name == $n)' >/dev/null 2>&1 || return 75
@@ -668,7 +674,8 @@ fleet_run_uninstall_plugin() {
     fi
     printf '  defer %s — the 24h live-session window has elapsed; uninstalling\n' "$2"
   fi
-  claude plugin uninstall --scope user --keep-data "$fleet_run_uninstall_target" \
+  fleet_run_cli_invalidate
+  bounded_verb claude plugin uninstall --scope user --keep-data "$fleet_run_uninstall_target" \
     >/dev/null 2>&1 || return 75
   # The manager's exit status proves it ran, not that the record is gone.
   [ "$(fleet_run_installed_plugin "$fleet_run_uninstall_target")" = '{}' ] || return 75

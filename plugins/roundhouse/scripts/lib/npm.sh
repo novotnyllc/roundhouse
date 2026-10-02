@@ -108,11 +108,25 @@ npm_exec() (
   # first on PATH, no stdin (these run inside `while read` loops), and none
   # of npm's interactive or advisory chatter. The one npm environment, for
   # the durable npm and for a prefix being staged alike.
+  #
+  # BOUNDED (lib/timeout.sh) wherever the bound is loaded: a query gets the
+  # listing ceiling and an install, update or removal the install ceiling, and
+  # a call that reaches it is stopped and answers 124 — the same failed query
+  # every caller already holds on.
   npm_exec_bin=$1
   shift
-  PATH="$npm_exec_bin:$PATH" NO_UPDATE_NOTIFIER=1 npm_config_update_notifier=false \
-    npm_config_fund=false npm_config_audit=false \
+  PATH="$npm_exec_bin:$PATH"
+  export PATH NO_UPDATE_NOTIFIER=1 npm_config_update_notifier=false \
+    npm_config_fund=false npm_config_audit=false
+  command -v run_bounded >/dev/null 2>&1 ||
     exec "$npm_exec_bin/npm" "$@" </dev/null
+  npm_exec_kind=list
+  for npm_exec_arg in "$@"; do
+    case $npm_exec_arg in
+      install | i | uninstall | remove | rm | update | upgrade | ci) npm_exec_kind=install ;;
+    esac
+  done
+  run_bounded "$(run_bounded_seconds "$npm_exec_kind")" "$npm_exec_bin/npm" "$@" </dev/null
 )
 
 npm_global_run() (

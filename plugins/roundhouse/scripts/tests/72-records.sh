@@ -639,3 +639,450 @@ YAML
       fail "an item the canary could not apply was released as canary evidence"
   )
 fi
+
+# --- the run's batched bookkeeping answers exactly what the per-item calls did ---
+#
+# fleet-run reviews every item every run, and its bookkeeping used to cost
+# seconds per item. The batch forms (lib/fleet-fold.sh, lib/fleet-run.sh,
+# lib/fleet-trust.sh) are each DEFINED as "what the one-item call prints", so
+# each is asserted here against that call over fixtures built to hit the
+# edges: dotted names, false/null values, number forms, malformed journal
+# entries, multi-document records, symlinked destinations.
+if [ -n "$fleet_fixture_yq" ]; then
+  printf 'records: batched run bookkeeping equals the per-item calls\n'
+  (
+    set -eu
+    PATH=$fleet_fixture_path
+    export PATH
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+    bat="$tmp/batch-equivalence"
+    mkdir -p "$bat/store"
+    ROUNDHOUSE_FLEET_STORE="$bat/store"
+    export ROUNDHOUSE_FLEET_STORE
+
+    # --- digests: fleet_fold_item_values | fleet_value_digests ---
+    bat_fold='{"plugins":{"a":"enabled","b":{"state":"enabled","marketplace":"m"},
+      "c.d":{"x":12.0},"e":false,"f":null,"g":"absent"},"skills":{"ü-name":"enabled",
+      "s/t":{"source":"https://x/y"}},"packages":{"n":12,"m":{"version":"1.0",
+      "nested":{"z":[1,2.5,{"k":"v\n---\nw"}]}}},"platform":"macos","groups":["g"],
+      "policy":{"cadence_hours":12.0,"canary_group":"canary"},"weird.cat":{"x":1}}'
+    bat_fold=$(printf '%s\n' "$bat_fold" | jq -c .)
+    fleet_items "$bat_fold" | while IFS= read -r bat_item; do
+      bat_digest=$(fleet_item_digest "$bat_fold" "$bat_item") || continue
+      printf '%s %s\n' "$bat_item" "$bat_digest"
+    done >"$bat/digests.one"
+    fleet_fold_item_values "$bat_fold" | fleet_value_digests >"$bat/digests.batch"
+    [ -s "$bat/digests.one" ] || fail "the digest fixture produced no items"
+    cmp -s "$bat/digests.one" "$bat/digests.batch" ||
+      fail "batched fold digests differ from fleet_item_digest: $(diff "$bat/digests.one" "$bat/digests.batch" | head -3)"
+
+    bat_defs='{"packages":{"jj":{"homebrew":"jj","winget":"jj-vcs.jj"},"x.y":{"apt":"x"},
+      "off":false},"plugins":{"p":{"marketplace":"mk"}},"skills":"not-a-map"}'
+    bat_defs=$(printf '%s\n' "$bat_defs" | jq -c .)
+    fleet_definition_items "$bat_defs" | while IFS= read -r bat_item; do
+      bat_cat=${bat_item#definitions.}
+      bat_cat=${bat_cat%%.*}
+      bat_value=$(fleet_definition_entry "$bat_defs" "$bat_cat" "${bat_item#"definitions.$bat_cat."}")
+      [ -n "$bat_value" ] || continue
+      bat_digest=$(printf '%s\n' "$bat_value" | fleet_value_digest "$bat_item") || continue
+      printf '%s %s\n' "$bat_item" "$bat_digest"
+    done >"$bat/defdigests.one"
+    fleet_definition_item_values "$bat_defs" | fleet_value_digests >"$bat/defdigests.batch"
+    cmp -s "$bat/defdigests.one" "$bat/defdigests.batch" ||
+      fail "batched definition digests differ from the per-item loop"
+
+    # --- package resolution: fleet_resolve_packages vs fleet_resolve_package ---
+    bat_pdefs='{"packages":{
+      "plain":{},
+      "str":{"homebrew":"brew-name","winget":"Win.Name"},
+      "obj":{"homebrew":{"name":"o2","cask":true,"version":null}},
+      "gone":{"homebrew":"unavailable","winget":"unavailable"},
+      "fleetver":{"version":"1.2","winget":"W.V"},
+      "brewver":{"homebrew":{"version":"3"}},
+      "aptver":{"apt":{"name":"a","version":"9"}},
+      "scoopver":{"version":"5"},
+      "npmdecl":{"npm":"pkg"},
+      "npmoff":{"npm":"unavailable","homebrew":"h"},
+      "falsever":{"version":false},
+      "numname":{"homebrew":{"name":42}},
+      "notmap":"x"}}'
+    bat_pdefs=$(printf '%s\n' "$bat_pdefs" | jq -c .)
+    printf '%s\n' plain str obj gone fleetver brewver aptver scoopver npmdecl \
+      npmoff falsever numname notmap absent >"$bat/pkgs"
+    for bat_managers in "homebrew npm" "npm homebrew" "winget" "apt homebrew" \
+      "scoop winget" ""; do
+      fleet_resolve_packages "$bat_pdefs" "$bat_managers" <"$bat/pkgs" >"$bat/resolved"
+      while IFS='	' read -r bat_name bat_json; do
+        # shellcheck disable=SC2086 # the manager list, as the run passes it
+        bat_one=$(fleet_resolve_package "$bat_pdefs" "$bat_name" $bat_managers) || :
+        [ "$(printf '%s\n' "$bat_one" | jq -cS .)" = "$(printf '%s\n' "$bat_json" | jq -cS .)" ] ||
+          fail "batched resolution of $bat_name [$bat_managers] differs: $bat_json vs $bat_one"
+      done <"$bat/resolved"
+      # What it leaves to the per-package resolver is exactly what needs it.
+      for bat_slow in npmdecl notmap; do
+        ! grep -q "^$bat_slow	" "$bat/resolved" ||
+          fail "the batch resolved $bat_slow, which only the per-package resolver may"
+      done
+      case " $bat_managers " in
+        *' homebrew '*)
+          case $bat_managers in
+            homebrew*) ! grep -q '^brewver	' "$bat/resolved" ||
+              fail "the batch decided a Homebrew version pin without asking brew" ;;
+          esac
+          ;;
+      esac
+    done
+
+    # fleet_packages_pinned is fleet_package_pinned over a list.
+    bat_pin_defs='{"packages":{"a":{"version":"1"},"b":{"homebrew":{"version":"2"}},
+      "c":{"homebrew":"c"},"d":{"version":false},"e":{"winget":{"version":null}},
+      "f":"x","g":{"version":0}}}'
+    bat_pin_defs=$(printf '%s\n' "$bat_pin_defs" | jq -c .)
+    printf '%s\n' a b c d e f g absent | fleet_packages_pinned "$bat_pin_defs" >"$bat/pinned.batch"
+    for bat_name in a b c d e f g absent; do
+      ! fleet_package_pinned "$bat_pin_defs" "$bat_name" || printf '%s\n' "$bat_name"
+    done >"$bat/pinned.one"
+    cmp -s "$bat/pinned.one" "$bat/pinned.batch" ||
+      fail "fleet_packages_pinned differs from fleet_package_pinned: $(tr '\n' ' ' <"$bat/pinned.batch")"
+
+    # --- the canary gate: fleet_run_canary_passing vs fleet_canary_gate ---
+    bat_cs="$bat/canary-store"
+    mkdir -p "$bat_cs/journal/c1" "$bat_cs/journal/c2" "$bat_cs/journal/c3" "$bat_cs/journal/c4"
+    cat >"$bat_cs/journal/c1/2026-08-01.yaml" <<'YAML'
+- {item: packages.a, digest: d1, outcome: applied, at: "2026-08-01T00:00:00Z"}
+- {item: packages.b, digest: d2, outcome: satisfied, at: "2026-08-01T00:00:00Z"}
+- {item: packages.c, digest: d3, outcome: applied, at: "2026-08-01T00:00:00Z"}
+- {item: packages.c, digest: d3, outcome: held, at: "2026-08-01T05:00:00Z"}
+- {item: packages.d, digest: d4, outcome: applied, at: "2026-08-02T12:00:00Z"}
+YAML
+    cat >"$bat_cs/journal/c1/2026-08-03.yaml" <<'YAML'
+- {outcome: alive, at: "2026-08-03T00:00:00Z"}
+YAML
+    # c2: one entry carries an unparsable `at`, which errs condition 3 for
+    # every item this canary is asked about.
+    cat >"$bat_cs/journal/c2/2026-08-01.yaml" <<'YAML'
+- {item: packages.e, digest: d5, outcome: applied, at: "2026-08-01T00:00:00Z"}
+- {item: packages.z, digest: zz, outcome: applied, at: "yesterday"}
+- {outcome: alive, at: "2026-08-03T00:00:00Z"}
+YAML
+    # c3: an unparsable day file makes the whole canary partial.
+    cat >"$bat_cs/journal/c3/2026-08-01.yaml" <<'YAML'
+- {item: packages.f, digest: d6, outcome: applied, at: "2026-08-01T00:00:00Z"}
+- {outcome: alive, at: "2026-08-03T00:00:00Z"}
+YAML
+    printf '%s\n' '- [unclosed' >"$bat_cs/journal/c3/2026-08-02.yaml"
+    # c4: a non-object entry errs every item's read of this canary.
+    cat >"$bat_cs/journal/c4/2026-08-01.yaml" <<'YAML'
+- {item: packages.g, digest: d7, outcome: applied, at: "2026-08-01T00:00:00Z"}
+- "a bare string"
+- {outcome: alive, at: "2026-08-03T00:00:00Z"}
+YAML
+    us=$(printf '\037')
+    for bat_pair in packages.a:d1 packages.b:d2 packages.c:d3 packages.d:d4 \
+      packages.e:d5 packages.f:d6 packages.g:d7 packages.a:other packages.none:x; do
+      printf 'converge%s%s%s%s\n' "$us" "${bat_pair%%:*}" "$us" "${bat_pair#*:}"
+    done >"$bat/plan"
+    printf 'held%spackages.h%s\n' "$us" "$us" >>"$bat/plan"
+    for bat_wait in 24 1 0; do
+      fleet_run_canary_passing "$bat_cs" "$bat_wait" 2026-08-03T01:00:00Z "$bat/plan" \
+        c1 c2 c3 c4 | tr "$us" ' ' | LC_ALL=C sort >"$bat/canary.batch"
+      awk -F"$us" '$1 == "converge" { print $2, $3 }' "$bat/plan" |
+        while read -r bat_item bat_digest; do
+          ! fleet_canary_gate "$bat_cs" "$bat_item" "$bat_digest" "$bat_wait" \
+            2026-08-03T01:00:00Z c1 c2 c3 c4 || printf '%s %s\n' "$bat_item" "$bat_digest"
+        done | LC_ALL=C sort >"$bat/canary.one"
+      cmp -s "$bat/canary.one" "$bat/canary.batch" ||
+        fail "batched canary verdicts (wait $bat_wait) differ: $(diff "$bat/canary.one" "$bat/canary.batch" | tr '\n' ' ')"
+    done
+    grep -q 'packages.a d1' "$bat/canary.one" ||
+      fail "the canary fixture never released anything, so it proves nothing"
+
+    # --- the journal parse cache: the same entries and the same status ---
+    for bat_host in c1 c3; do
+      bat_rc_one=0
+      fleet_journal_entries "$bat_cs" "$bat_host" >"$bat/entries.one" 2>/dev/null || bat_rc_one=$?
+      for bat_pass in cold warm; do
+        bat_rc_batch=0
+        fleet_run_journal_entries "$bat_cs" "$bat_host" >"$bat/entries.batch" 2>/dev/null ||
+          bat_rc_batch=$?
+        cmp -s "$bat/entries.one" "$bat/entries.batch" ||
+          fail "cached journal read of $bat_host ($bat_pass) differs from fleet_journal_entries"
+        { [ "$bat_rc_one" -eq 0 ] && [ "$bat_rc_batch" -eq 0 ]; } ||
+          { [ "$bat_rc_one" -ne 0 ] && [ "$bat_rc_batch" -ne 0 ]; } ||
+          fail "cached journal read of $bat_host ($bat_pass) changed the partial-read status"
+      done
+    done
+    # Warm, the read is served from the cache: no parser runs at all.
+    mkdir -p "$bat/noyq"
+    printf '#!/bin/sh\nexit 97\n' >"$bat/noyq/yq"
+    chmod +x "$bat/noyq/yq"
+    fleet_journal_entries "$bat_cs" c1 >"$bat/entries.one"
+    (PATH="$bat/noyq:$PATH" fleet_run_journal_entries "$bat_cs" c1) >"$bat/entries.batch" ||
+      fail "a warm journal read still needed the parser"
+    cmp -s "$bat/entries.one" "$bat/entries.batch" ||
+      fail "a warm journal read was not served from the cache"
+    bat_jcache="$bat/store.run/journal-cache/c1"
+    [ -n "$(ls "$bat_jcache"/*.jsonl 2>/dev/null)" ] ||
+      fail "the journal parse was not cached"
+    [ -z "$(ls "$bat/store.run/journal-cache/c3" 2>/dev/null | grep 2026-08-02)" ] ||
+      fail "an unparsable day file's partial parse was cached"
+    # A changed day file is a different key; a corrupted cache entry is a
+    # miss, never an answer.
+    printf '%s\n' '- {item: packages.a, digest: d1, outcome: reverted, at: "2026-08-03T00:30:00Z"}' \
+      >>"$bat_cs/journal/c1/2026-08-03.yaml"
+    for bat_f in "$bat_jcache"/*.jsonl; do
+      printf '%s\n' '{"item":"forged","outcome":"applied"}' >"$bat_f"
+    done
+    fleet_journal_entries "$bat_cs" c1 >"$bat/entries.one"
+    fleet_run_journal_entries "$bat_cs" c1 >"$bat/entries.batch"
+    cmp -s "$bat/entries.one" "$bat/entries.batch" ||
+      fail "a changed day file or a corrupted cache entry was served from the cache"
+    ! grep -q forged "$bat/entries.batch" ||
+      fail "a corrupted journal cache entry was served"
+
+    # --- the item plan: one line per verdict, the per-item answers ---
+    bat_ps="$bat/store"
+    mkdir -p "$bat_ps/applied" "$bat_ps/journal/h1" "$bat/store.run/verdicts"
+    cat >"$bat_ps/applied/h1.yaml" <<'YAML'
+items:
+  plugins.a: {digest: da, at: "2026-08-01T00:00:00Z"}
+  packages.n: {digest: old, at: "2026-08-01T00:00:00Z"}
+  skills.bad: notamap
+YAML
+    cat >"$bat_ps/journal/h1/2026-08-01.yaml" <<'YAML'
+- {item: packages.n, digest: dn, outcome: applied, at: "2026-08-01T00:00:00Z"}
+- {item: packages.n, digest: old, outcome: applied, at: "2026-08-01T01:00:00Z"}
+- {item: plugins.a, digest: da, outcome: applied, at: "2026-08-01T00:00:00Z"}
+- {item: plugins.a, digest: da, outcome: reverted, at: "2026-08-01T02:00:00Z"}
+- {item: plugins.a, digest: da, outcome: applied, at: "2026-08-01T03:00:00Z"}
+- {outcome: alive, at: "2026-08-01T04:00:00Z"}
+YAML
+    printf 'item: packages.n\nverdict: hold\ndigest: dn\n' >"$bat/store.run/verdicts/packages.n.yaml"
+    printf 'item: plugins.b\nverdict: hold\ndigest: other\n' >"$bat/store.run/verdicts/plugins.b.yaml"
+    printf 'verdict: hold\ndigest: db\n---\nverdict: hold\ndigest: db\n' \
+      >"$bat/store.run/verdicts/plugins.c.yaml"
+    printf 'item: plugins.a\nverdict: pass\ndigest: da\n' >"$bat/store.run/verdicts/plugins.a.yaml"
+    bat_pfold='{"plugins":{"a":"enabled","b":{"state":"disabled"},"c":{"marketplace":"m"},
+      "t":"en\tabled"},"packages":{"n":"enabled"},"skills":{"s":12,"bad":"enabled"}}'
+    bat_pfold=$(printf '%s\n' "$bat_pfold" | jq -c .)
+    cat >"$bat/verdicts" <<'EOF'
+converge packages.n dn
+converge plugins.a da
+converge plugins.b db
+converge plugins.c db
+converge plugins.t dt
+converge skills.bad dbad
+converge skills.s ds
+held skills.gone
+EOF
+    printf 'plugins.b  first hold reason\nplugins.b second\nskills.s\n' >"$bat/sigholds"
+    fleet_run_item_plan "$bat_ps" h1 "$bat_pfold" "$bat/verdicts" "$bat/sigholds" \
+      >"$bat/plan.batch" 2>/dev/null
+    [ "$(grep -c . "$bat/plan.batch")" -eq 8 ] || fail "the plan lost or gained a line"
+    while IFS="$us" read -r bat_v bat_i bat_d bat_val bat_app bat_rh bat_rv bat_state bat_hold; do
+      [ "$bat_val" = "$(fleet_item_value "$bat_pfold" "$bat_i" 2>/dev/null || :)" ] ||
+        fail "plan value of $bat_i differs from fleet_item_value"
+      [ "$bat_app" = "$(fleet_applied_digest "$bat_ps" h1 "$bat_i" 2>/dev/null || :)" ] ||
+        fail "plan applied digest of $bat_i differs from fleet_applied_digest"
+      bat_want=0
+      [ -z "$bat_d" ] || ! fleet_run_verdict_held "$bat_i" "$bat_d" || bat_want=1
+      [ "$bat_rh" = "$bat_want" ] || fail "plan review hold of $bat_i differs from fleet_run_verdict_held"
+      bat_want=0
+      [ -z "$bat_d" ] || ! fleet_run_is_revert "$bat_ps" h1 "$bat_i" "$bat_d" || bat_want=1
+      [ "$bat_rv" = "$bat_want" ] || fail "plan revert flag of $bat_i differs from fleet_run_is_revert"
+      [ "$bat_hold" = "$(awk -v item="$bat_i" '$1 == item { $1 = ""; print; exit }' "$bat/sigholds")" ] ||
+        fail "plan hold of $bat_i differs from the sighold lookup"
+      bat_state_one=$(fleet_run_state_of "$bat_val")
+      case $bat_state_one in
+        enabled | disabled) [ "$bat_state" = "$bat_state_one" ] ||
+          fail "plan state of $bat_i differs from fleet_run_state_of" ;;
+        *) case $bat_state in enabled | disabled)
+          fail "plan state of $bat_i reads as a known state where fleet_run_state_of does not" ;; esac ;;
+      esac
+    done <"$bat/plan.batch"
+    # An unreadable verdict file sends the whole plan down the per-item path,
+    # which must give the same plan.
+    printf 'not: [valid\n' >"$bat/store.run/verdicts/skills.s.yaml"
+    fleet_run_item_plan "$bat_ps" h1 "$bat_pfold" "$bat/verdicts" "$bat/sigholds" \
+      >"$bat/plan.slow" 2>/dev/null
+    rm -f "$bat/store.run/verdicts/skills.s.yaml"
+    cmp -s "$bat/plan.batch" "$bat/plan.slow" ||
+      fail "the per-item fallback plan differs from the batched plan: $(diff "$bat/plan.batch" "$bat/plan.slow" | tr "$us" '|' | head -4 | tr '\n' ' ')"
+    awk -F"$us" '$2 == "packages.n" && $7 == 1 { found = 1 } END { exit !found }' \
+      "$bat/plan.batch" || fail "the fixture never exercised a revert"
+    awk -F"$us" '$2 == "packages.n" && $6 == 1 { found = 1 } END { exit !found }' \
+      "$bat/plan.batch" || fail "the fixture never exercised a review hold"
+
+    # --- the held set: fleet_run_items_held vs fleet_run_item_is_held ---
+    printf 'held packages.v\nconverge packages.w dw\n' >"$bat/held-verdicts"
+    printf '%s\t%s\n' packages.n dn plugins.b db plugins.c db packages.v '' \
+      packages.w dw plugins.b '' definitions.packages.x '' >"$bat/held-items"
+    printf 'definitions.packages.x  refused\n' >"$bat/held-holds"
+    for bat_h in "$bat/held-holds" "$bat/no-such-holds" ''; do
+      for bat_vd in "$bat/held-verdicts" "$bat/no-such-verdicts" ''; do
+        fleet_run_items_held "$bat_h" "$bat_vd" <"$bat/held-items" >"$bat/held.batch"
+        while IFS='	' read -r bat_i bat_d; do
+          ! fleet_run_item_is_held "$bat_i" "$bat_d" "$bat_h" "$bat_vd" ||
+            printf '%s\n' "$bat_i"
+        done <"$bat/held-items" >"$bat/held.one"
+        cmp -s "$bat/held.one" "$bat/held.batch" ||
+          fail "fleet_run_items_held differs from fleet_run_item_is_held (holds=$bat_h verdicts=$bat_vd)"
+      done
+    done
+
+    # --- batched records: the files fleet_record_write writes, byte for byte ---
+    mkdir -p "$bat/rec-one" "$bat/rec-batch"
+    bat_records() {
+      printf '%s%s%s\n' "$1/a.yaml" "$us" '{"item":"a","reason":"x\n---\ny","n":12.0}'
+      printf '%s%s%s\n' "$1/nested/dir/b.yaml" "$us" '{"item":"b: c","digest":"0755"}'
+      printf '%s%s%s\n' "$1/a.yaml" "$us" '{"item":"a","second":true}'
+      printf '%s%s%s\n' "$1/.dot.yaml" "$us" '{"yes":"no"}'
+    }
+    bat_records "$bat/rec-one" | while IFS="$us" read -r bat_path bat_json; do
+      fleet_record_write "$bat_path" "$bat_json"
+    done
+    bat_records "$bat/rec-batch" | fleet_run_records_batch
+    diff -r "$bat/rec-one" "$bat/rec-batch" >/dev/null ||
+      fail "batched records differ from fleet_record_write's"
+    [ "$(t_mode "$bat/rec-batch/a.yaml")" = 600 ] || fail "a batched record is not owner-only"
+    [ -z "$(find "$bat/rec-batch" -name '.roundhouse.*')" ] ||
+      fail "the batched writer left a staging directory behind"
+    # A symlinked destination is refused exactly where the one-by-one writes
+    # would have reached it: what precedes it lands, nothing after it does.
+    mkdir -p "$bat/rec-link"
+    ln -s "$bat/elsewhere" "$bat/rec-link/b.yaml"
+    bat_link_rc=0
+    {
+      printf '%s%s%s\n' "$bat/rec-link/a.yaml" "$us" '{"a":1}'
+      printf '%s%s%s\n' "$bat/rec-link/b.yaml" "$us" '{"b":1}'
+      printf '%s%s%s\n' "$bat/rec-link/c.yaml" "$us" '{"c":1}'
+    } | (fleet_run_records_batch) 2>/dev/null || bat_link_rc=$?
+    [ "$bat_link_rc" -eq 64 ] || fail "a symlinked record destination was not refused (rc $bat_link_rc)"
+    [ -f "$bat/rec-link/a.yaml" ] && [ ! -e "$bat/rec-link/c.yaml" ] && [ ! -e "$bat/elsewhere" ] ||
+      fail "the symlink refusal did not land at the symlink's position"
+
+    # --- the Homebrew snapshot only ever skips a provable no-op install ---
+    mkdir -p "$bat/brewbin"
+    cat >"$bat/brewbin/brew" <<'SH'
+#!/bin/sh
+case "$*" in
+  'list --formula -1') printf 'jq\nwget\nnode@24\n' ;;
+  'list --cask -1') printf 'firefox\n' ;;
+  'outdated --json=v2')
+    [ -z "${BAT_BREW_FAIL:-}" ] || exit 1
+    printf '{"formulae":[{"name":"user/tap/wget"}],"casks":[]}\n' ;;
+  *) exit 2 ;;
+esac
+SH
+    chmod +x "$bat/brewbin/brew"
+    (
+      PATH="$bat/brewbin:$PATH"
+      ! fleet_run_brew_current homebrew jq false || fail "a brew skip happened outside the run loop"
+      fleet_run_apply_context_open "$bat/ctx" '{}' homebrew
+      fleet_run_brew_current homebrew jq false || fail "an installed, current formula was not skipped"
+      fleet_run_brew_current homebrew node@24 false || fail "an installed pinned formula was not skipped"
+      ! fleet_run_brew_current homebrew wget false ||
+        fail "a formula brew reports outdated (by its tap name) was skipped"
+      fleet_run_brew_current homebrew firefox true || fail "an installed, current cask was not skipped"
+      ! fleet_run_brew_current homebrew firefox false || fail "a cask was skipped as a formula"
+      ! fleet_run_brew_current homebrew absent false || fail "an absent formula was skipped"
+      ! fleet_run_brew_current homebrew user/tap/jq false || fail "a tap-qualified name was skipped"
+      ! fleet_run_brew_current npm jq false || fail "a non-Homebrew install was skipped"
+      fleet_run_apply_context_close
+      BAT_BREW_FAIL=1
+      export BAT_BREW_FAIL
+      fleet_run_apply_context_open "$bat/ctx2" '{}' homebrew
+      ! fleet_run_brew_current homebrew jq false ||
+        fail "a failed outdated query still let an install be skipped"
+      fleet_run_apply_context_close
+    ) || exit 1
+
+    # --- the sweep's one-awk predicate IS fleet_quote_is_secret, line by line ---
+    # fleet_sweep_predicate_awk (lib/fleet-doctor.sh) is a twin of the shell
+    # predicate. Over every class, both sides of every length and boundary
+    # rule, and the 40-hex exemption shape: `S` (or `C`, which without a store
+    # proves nothing) exactly when fleet_quote_is_secret says secret.
+    bat_secret_rep() { printf "%${2}s" '' | tr ' ' "$1"; }
+    {
+      for bat_pfx in ghp_ gho_ ghu_ ghs_ ghr_ github_pat_ glpat- xoxb- xoxp-; do
+        printf '%s%s\n' "$bat_pfx" "$(bat_secret_rep a 7)" "$bat_pfx" "$(bat_secret_rep a 8)"
+        printf 'x%s%s\n' "$bat_pfx" "$(bat_secret_rep a 8)"
+        printf -- '-%s%s\n' "$bat_pfx" "$(bat_secret_rep a 8)"
+        printf ' %s%s-_9\n' "$bat_pfx" "$(bat_secret_rep Z 8)"
+      done
+      printf 'sk-%s\n' "$(bat_secret_rep a 15)" "$(bat_secret_rep a 16)" "$(bat_secret_rep 9 16)"
+      printf 'xsk-%s\n_sk-%s\n' "$(bat_secret_rep a 16)" "$(bat_secret_rep a 16)"
+      printf 'AKIA%s\n' "$(bat_secret_rep A 15)" "$(bat_secret_rep A 16)" "$(bat_secret_rep 7 16)"
+      printf 'xAKIA%s\n AKIA%s\n' "$(bat_secret_rep A 16)" "$(bat_secret_rep a 16)"
+      printf '%s\n' '-----BEGIN OPENSSH PRIVATE KEY-----' 'eyJ.x' 'eyJa.b.c' 'x eyJ.a.' 'eyJ..'
+      for bat_len in 31 32 33 39 40 41 64; do
+        bat_secret_rep a "$bat_len"; printf '\n'
+        printf '%s1\n' "$(bat_secret_rep a $((bat_len - 1)))"
+        printf '%sB\n' "$(bat_secret_rep a $((bat_len - 1)))"
+        printf '%s9\n' "$(bat_secret_rep F $((bat_len - 1)))"
+        printf '%s_\n' "$(bat_secret_rep 0 $((bat_len - 1)))"
+        printf 'path/%s1/x\n' "$(bat_secret_rep c $((bat_len - 1)))"
+        printf 'a-%s1-b\n' "$(bat_secret_rep d $((bat_len - 1)))"
+      done
+      printf '%s\n' 0123456789abcdef0123456789abcdef01234567 \
+        '0123456789abcdef0123456789abcdef01234567 0123456789ABCDEF0123456789abcdef01234567' \
+        'commit 0123456789abcdef0123456789abcdef01234567 and aB1aB1aB1aB1aB1aB1aB1aB1aB1aB1aB1aB1' \
+        'roundhouse-intent: fast convergence' 'store.run/roster.7f3a2c9e1b04d55a' \
+        kxrntvmqzuwstrpqwxrwprquoloswvxymn 'token ghr_ABCdef1234567890abcdef' \
+        'the plugin update landed cleanly on mac-mini' '' ' ' 'é ghp_ü12345678'
+    } >"$bat/secret-corpus"
+    awk '{ printf "%d\t%s\n", NR, $0 }' "$bat/secret-corpus" |
+      LC_ALL=C awk "$fleet_sweep_predicate_awk" | cut -f1 >"$bat/secret-awk"
+    bat_n=0
+    : >"$bat/secret-shell"
+    while IFS= read -r bat_line; do
+      bat_n=$((bat_n + 1))
+      ! fleet_quote_is_secret "$bat_line" || printf '%s\n' "$bat_n" >>"$bat/secret-shell"
+    done <"$bat/secret-corpus"
+    [ "$(wc -l <"$bat/secret-shell")" -gt 40 ] || fail "the secret corpus exercised too few secrets"
+    diff "$bat/secret-shell" "$bat/secret-awk" >"$bat/secret-diff" ||
+      fail "the sweep's awk predicate disagrees with fleet_quote_is_secret on corpus lines: $(sed -n 's/^[<>] //p' "$bat/secret-diff" | while read -r n; do sed -n "${n}p" "$bat/secret-corpus"; done | head -5)"
+
+    # --- the signature walk asks identity and class once per OWNER ---
+    # fleet_run_signature_commit memoizes both answers on fleet_vcs_path_owner;
+    # that is sound only while neither predicate looks at more of the path.
+    printf '%s\n' vireo heron >"$bat/owner-hosts"
+    for bat_owner_path in hosts/vireo.yaml applied/vireo.yaml findings/vireo/a.yaml \
+      findings/vireo/b/c.yaml alerts/vireo/x.yaml journal/vireo/2026-01-01.yaml \
+      hosts/heron.yaml applied/heron.yaml alerts/heron/y.yaml fleet.yaml \
+      groups/canary.yaml os/macos.yaml definitions/jq.yaml definitions/node.yaml \
+      proposals/a.yaml proposals/b/c.yaml joins/a.yaml joins/b.yaml trust/signers.yaml \
+      checkpoints/x.yaml lineage/y.yaml README.md .gitignore; do
+      bat_owner='?'
+      ! fleet_vcs_path_owner "$bat_owner_path" >/dev/null 2>&1 || bat_owner=$fleet_vcs_owner_of
+      for bat_principal in vireo@fleet.example.invalid heron@fleet.example.invalid unknown; do
+        bat_identity=1
+        fleet_vcs_path_identity_ok "$bat_owner_path" "$bat_principal" "$bat/owner-hosts" \
+          2>/dev/null || bat_identity=0
+        printf '%s %s identity %s\n' "$bat_owner" "$bat_principal" "$bat_identity"
+      done
+      for bat_class in durable ephemeral ''; do
+        bat_allowed=1
+        fleet_trust_class_allows "$bat_class" "$bat_owner_path" 2>/dev/null || bat_allowed=0
+        printf '%s class:%s allows %s\n' "$bat_owner" "$bat_class" "$bat_allowed"
+      done
+    done >"$bat/owner-answers"
+    # One answer per (owner, question): two paths with one owner never differ.
+    [ "$(awk '{ k = $1 " " $2 " " $3 } !(k in a) { a[k] = $4; next } a[k] != $4 { print; bad = 1 }
+      END { exit bad }' "$bat/owner-answers")" = "" ] ||
+      fail "the identity or class rule answers differently for two paths with one owner; the per-owner memo in fleet_run_signature_commit is unsound"
+    # …and an owner the PATH spells with the memo's own separators is never a
+    # memo key: `alerts/*=1|y=1|w/…` must not plant an answer for `*`.
+    for bat_forged in '*=1|y=1|w' '*=1|y' 'a|b' 'x=1' 'a*' '' 'a b'; do
+      fleet_run_owner_memo_key "$bat_forged"
+      [ -z "$fleet_run_memo_owner" ] ||
+        fail "a forged owner '$bat_forged' became a memo key"
+    done
+    for bat_safe in '*' '+' '?' vireo mac-mini a.b_c@d; do
+      fleet_run_owner_memo_key "$bat_safe"
+      [ "$fleet_run_memo_owner" = "$bat_safe" ] ||
+        fail "a plain owner '$bat_safe' was not memoized"
+    done
+  ) || exit 1
+fi

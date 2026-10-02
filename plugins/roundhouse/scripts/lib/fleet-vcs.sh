@@ -44,36 +44,42 @@ fleet_vcs_path_owner() {
   # `trust/signers.yaml` and `checkpoints/` are row 1: sponsoring and
   # checkpointing are fleet-shared writes, which is exactly why a leaf is
   # already refused both with no separate enforcement.
+  #
+  # The answer also lands in `fleet_vcs_owner_of`, so a caller walking
+  # thousands of paths can ask `fleet_vcs_path_owner P >/dev/null` without a
+  # command substitution (a fork) per path.
+  fleet_vcs_owner_of=
   case $1 in
     fleet.yaml | definitions.yaml | fleet/?* | os/?* | groups/?* | hosts/?* | \
       lineage/?* | proposals/?* | trust/?* | checkpoints/?*)
-      printf '*\n'
+      fleet_vcs_owner_of='*'
       ;;
     definitions/?*)
       fleet_definitions_file_path "$1" || return 1
-      printf '*\n'
+      fleet_vcs_owner_of='*'
       ;;
     joins/?*.yaml)
-      printf '+\n'
+      fleet_vcs_owner_of='+'
       ;;
     journal/?*/?* | alerts/?*/?* | findings/?*/?*)
       fleet_vcs_owner=${1#*/}
-      printf '%s\n' "${fleet_vcs_owner%%/*}"
+      fleet_vcs_owner_of=${fleet_vcs_owner%%/*}
       ;;
     applied/?*.yaml)
       fleet_vcs_owner=${1#applied/}
       case $fleet_vcs_owner in */*) return 1 ;; esac
-      printf '%s\n' "${fleet_vcs_owner%.yaml}"
+      fleet_vcs_owner_of=${fleet_vcs_owner%.yaml}
       ;;
     upstreams/?*/?*.yaml)
       # upstreams/<id>/<h>.yaml — exactly three components, so a deeper path
       # cannot smuggle a host name into the leaf position.
       fleet_vcs_owner=${1#upstreams/*/}
       case $fleet_vcs_owner in */*) return 1 ;; esac
-      printf '%s\n' "${fleet_vcs_owner%.yaml}"
+      fleet_vcs_owner_of=${fleet_vcs_owner%.yaml}
       ;;
     *) return 1 ;;
   esac
+  printf '%s\n' "$fleet_vcs_owner_of"
 }
 
 fleet_vcs_host_record_filter() {
@@ -109,6 +115,11 @@ fleet_vcs_path_identity_ok() {
   # <hosts-file> is one enrolled host name per line (fleet_vcs_enrolled_hosts),
   # passed in rather than read here so the predicate is pure and testable with
   # no store.
+  #
+  # IT DEPENDS ON THE PATH ONLY THROUGH fleet_vcs_path_owner, and
+  # fleet_run_signature_commit relies on that: it asks once per owner per
+  # commit. A rule that looks at more of the path must change that memo's key
+  # too; tests/72-records.sh fails when two paths with one owner disagree.
   fleet_vcs_required=$(fleet_vcs_path_owner "$1") || return 1
   # `joins/` takes any signer, including `unknown`: it is never applied, so
   # there is nothing for a forged one to authorize.
