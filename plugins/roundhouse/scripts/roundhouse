@@ -58,6 +58,8 @@ Usage:
   roundhouse fleet-reroot [--authority-receipt RECEIPT]
   roundhouse fleet-explain [HOST] ITEM
   roundhouse fleet-run [--fast|--full]
+  roundhouse fleet-trigger [--fast|--full]
+  roundhouse fleet-schedule install|status|uninstall
   roundhouse fleet-seed
   roundhouse fleet-review ITEM pass|hold REASON
   roundhouse fleet-apply ITEM
@@ -103,6 +105,8 @@ EOF
 . "$script_dir/lib/plan-verify.sh"
 # shellcheck source=lib/plan-apply.sh
 . "$script_dir/lib/plan-apply.sh"
+# shellcheck source=lib/local-plan.sh
+. "$script_dir/lib/local-plan.sh"
 # shellcheck source=lib/broker-windows.sh
 . "$script_dir/lib/broker-windows.sh"
 # shellcheck source=lib/broker-posix.sh
@@ -137,6 +141,14 @@ EOF
 . "$script_dir/lib/apply-claude.sh"
 # shellcheck source=lib/fleet-publish-verbs.sh
 . "$script_dir/lib/fleet-publish-verbs.sh"
+# shellcheck source=lib/fleet-liveness.sh
+. "$script_dir/lib/fleet-liveness.sh"
+# shellcheck source=lib/fleet-schedule.sh
+. "$script_dir/lib/fleet-schedule.sh"
+# shellcheck source=lib/fleet-schedule-plan.sh
+. "$script_dir/lib/fleet-schedule-plan.sh"
+# shellcheck source=lib/fleet-trigger.sh
+. "$script_dir/lib/fleet-trigger.sh"
 # shellcheck source=lib/fleet-run.sh
 . "$script_dir/lib/fleet-run.sh"
 # shellcheck source=lib/fleet-doctor.sh
@@ -232,6 +244,8 @@ case $command in
   fleet-reroot) [ $# -le 2 ] || usage; fleet_reroot_command "$@" ;;
   fleet-explain) [ $# -ge 1 ] && [ $# -le 2 ] || usage; fleet_explain_command "$@" ;;
   fleet-run) [ $# -le 1 ] || usage; fleet_run_command "$@" ;;
+  fleet-trigger) [ $# -le 1 ] || usage; fleet_trigger_command "$@" ;;
+  fleet-schedule) [ $# -eq 1 ] || usage; fleet_schedule_command "$1" ;;
   fleet-seed) [ $# -eq 0 ] || usage; fleet_seed_command ;;
   fleet-review) [ $# -eq 3 ] || usage; fleet_review_command "$1" "$2" "$3" ;;
   fleet-apply) [ $# -eq 1 ] || usage; fleet_apply_command "$1" ;;

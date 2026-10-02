@@ -482,6 +482,19 @@ YAML
     done
     [ "$(printf '%s\n' "$docjj_rows" | grep -c '^ok ')" -ge 30 ] ||
       fail "doctor printed fewer than the ~30 rows §10.7 tables"
+    # The poll-floor row is READ-ONLY like every other: it reads the remote
+    # with `git ls-remote` and never fetches — no ref and no object written,
+    # not even the floor's private ref.
+    git -C "$doc" update-ref -d refs/roundhouse/poll-floor/main 2>/dev/null || :
+    docjj_refs_before=$(git -C "$doc" for-each-ref --format='%(refname) %(objectname)')
+    docjj_objects_before=$(git -C "$doc" count-objects -v | grep -E '^(count|in-pack):')
+    docjj_doctor >/dev/null
+    [ "$(git -C "$doc" for-each-ref --format='%(refname) %(objectname)')" = "$docjj_refs_before" ] ||
+      fail "doctor moved or wrote a git ref"
+    [ "$(git -C "$doc" count-objects -v | grep -E '^(count|in-pack):')" = "$docjj_objects_before" ] ||
+      fail "doctor wrote git objects (its poll-floor row fetched)"
+    printf '%s\n' "$docjj_rows" | grep -qE '^ok +poll-floor .*converged reference' ||
+      fail "the poll-floor row did not compare the remote main with the converged reference: $(printf '%s\n' "$docjj_rows" | grep poll-floor)"
 
     # B-3: a checkpoint record without a jj tag is a normal finding, not an
     # arithmetic error from a two-line `grep -c || printf 0` substitution.

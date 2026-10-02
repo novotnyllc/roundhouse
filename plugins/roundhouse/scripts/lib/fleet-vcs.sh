@@ -19,11 +19,25 @@ fleet_vcs_toml_string() {
   printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
 }
 
+# The row-1 roots, once: fleet_vcs_path_owner runs per path per commit in the
+# §7.7 gate, so it reads this string instead of forking for the list.
+fleet_vcs_fleet_roots_list='fleet.yaml definitions.yaml definitions fleet os groups hosts lineage proposals trust checkpoints'
+
+fleet_vcs_fleet_roots() {
+  # §7.3 row 1, as data: the top-level store entries any enrolled host may
+  # author. A `.yaml` name is a single file; anything else is a directory
+  # whose children are row 1. fleet_vcs_path_owner reads membership here, and
+  # fleet_vcs_desired_roots derives from it — one list, so a new fleet-wide
+  # layer cannot be authorised and then missed by the poll floor.
+  printf '%s\n' $fleet_vcs_fleet_roots_list
+}
+
 fleet_vcs_path_owner() {
   # §7.3's path->identity table, as one function over a store-relative path.
   #
   #   `*`      row 1 — any `<h>@<domain>` where `<h>` has a hosts/ entry:
-  #            the shared layers, definitions.yaml, lineage/, proposals/.
+  #            the roots fleet_vcs_fleet_roots lists — the shared layers,
+  #            definitions.yaml, lineage/, proposals/, trust/, checkpoints/.
   #            definitions.yaml belongs HERE and not in row 2: it is a
   #            fleet-shared layer like any other, and the reserved
   #            `definitions.` item prefix is about item identity (§5.1), not
@@ -49,15 +63,28 @@ fleet_vcs_path_owner() {
   # thousands of paths can ask `fleet_vcs_path_owner P >/dev/null` without a
   # command substitution (a fork) per path.
   fleet_vcs_owner_of=
+  fleet_vcs_root=${1%%/*}
+  case " $fleet_vcs_fleet_roots_list " in
+    *" $fleet_vcs_root "*)
+      case $fleet_vcs_root in
+        # A file root is exactly that file: `fleet.yaml/x` is not row 1.
+        *.yaml) [ "$1" = "$fleet_vcs_root" ] || return 1 ;;
+        # A directory root needs a child: bare `hosts` is not row 1.
+        *)
+          case $1 in
+            "$fleet_vcs_root"/?*) ;;
+            *) return 1 ;;
+          esac
+          ;;
+      esac
+      [ "$fleet_vcs_root" != definitions ] || fleet_definitions_file_path "$1" ||
+        return 1
+      fleet_vcs_owner_of='*'
+      printf '%s\n' "$fleet_vcs_owner_of"
+      return 0
+      ;;
+  esac
   case $1 in
-    fleet.yaml | definitions.yaml | fleet/?* | os/?* | groups/?* | hosts/?* | \
-      lineage/?* | proposals/?* | trust/?* | checkpoints/?*)
-      fleet_vcs_owner_of='*'
-      ;;
-    definitions/?*)
-      fleet_definitions_file_path "$1" || return 1
-      fleet_vcs_owner_of='*'
-      ;;
     joins/?*.yaml)
       fleet_vcs_owner_of='+'
       ;;
@@ -102,6 +129,35 @@ fleet_vcs_host_record_filter() {
     p[1] == "applied" && n == 2 && p[2] == h ".yaml" { next }
     p[1] == "upstreams" && n == 3 && p[2] != "" && p[3] == h ".yaml" { next }
     { print }'
+}
+
+fleet_vcs_desired_roots() {
+  # §6.4's desired-state paths: fleet_vcs_fleet_roots MINUS lineage/,
+  # proposals/ and checkpoints/ — fleet-shared writes, but history and
+  # suggestions rather than state anything converges on. trust/ stays in: a
+  # roster change is desired state (it decides whose layers apply).
+  fleet_vcs_fleet_roots | grep -vxE 'lineage|proposals|checkpoints'
+}
+
+fleet_vcs_desired_digest() {
+  # fleet_vcs_desired_digest <store> <commit> -> the tree entries of the
+  # desired-state roots at <commit>, one `git ls-tree` line each (an absent
+  # root has no line). Git object ids are content addresses, so equal output
+  # IS byte-identical desired state, whatever records (journal/, alerts/,
+  # applied/, …) the two commits otherwise differ by. Fails when <commit> is
+  # not on disk. Reads objects only: no ref moves and nothing is fetched.
+  # shellcheck disable=SC2046 # the root list, one pathspec per word
+  git -C "$1" ls-tree "$2" -- $(fleet_vcs_desired_roots)
+}
+
+fleet_vcs_desired_changed() {
+  # fleet_vcs_desired_changed <store> <from> <to> — true when desired state
+  # differs between the two commits, or <from> is empty or unreadable (a
+  # never-fetched store has no "before", so everything is new).
+  [ -n "$2" ] || return 0
+  fleet_vcs_desired_from=$(fleet_vcs_desired_digest "$1" "$2" 2>/dev/null) || return 0
+  fleet_vcs_desired_to=$(fleet_vcs_desired_digest "$1" "$3" 2>/dev/null) || return 0
+  [ "$fleet_vcs_desired_from" != "$fleet_vcs_desired_to" ]
 }
 
 fleet_vcs_path_identity_ok() {
@@ -322,6 +378,21 @@ fleet_vcs_working_copy_files() {
   (cd "$1" && jj diff -r @ --name-only) | tr '\n' ' '
 }
 
+fleet_vcs_path_summary() {
+  # `… | fleet_vcs_path_summary` — stdin: space-separated repo paths; stdout:
+  # the first three in sorted order and `and N more`, cut to §10.4's cap. For
+  # a description's FIRST line, which the redaction sweep reads like any other
+  # line: listing every path of a large hand edit there put hundreds of names
+  # on one line, and one of them reading as a secret class refused the
+  # publish. The bounded `roundhouse-items` trailer carries the longer list.
+  tr ' ' '\n' | grep . | LC_ALL=C sort -u | LC_ALL=C awk '
+    NR <= 3 { out = (NR == 1 ? $0 : out ", " $0) }
+    END {
+      if (NR > 3) out = out " and " (NR - 3) " more"
+      printf "%s", out
+    }' | LC_ALL=C cut -c "1-$fleet_replicated_cap" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null
+}
+
 fleet_vcs_reconcile() {
   # §8.2 steps 1-3: fleet_vcs_reconcile <store> <host> <session> <intent>
   # Prints `clean <M>` or `conflicted <M>`. On the clean path the bookmark
@@ -364,12 +435,16 @@ fleet_vcs_reconcile() {
   # passing it unconditionally makes an empty undescribed commit a permanent
   # ancestor of main and every future push dies with "Won't push commit …
   # since it has no description".
+  #
+  # Line 1 names a FEW paths (fleet_vcs_path_summary), never all of them: a
+  # large hand edit must still publish through the sweep.
   if [ "$(jj -R "$fleet_vcs_repo" log -r @ --no-graph -T 'if(empty,"y","n")')" = n ]; then
-    jj -R "$fleet_vcs_repo" describe -r @ -m "hand edit on $fleet_vcs_host: $(fleet_vcs_working_copy_files "$fleet_vcs_repo")
+    fleet_vcs_edit_files=$(fleet_vcs_working_copy_files "$fleet_vcs_repo")
+    jj -R "$fleet_vcs_repo" describe -r @ -m "hand edit on $fleet_vcs_host: $(printf '%s' "$fleet_vcs_edit_files" | fleet_vcs_path_summary)
 
 $(fleet_vcs_trailers "$fleet_vcs_host" interactive/human \
       'edit found in the working copy at run start' \
-      "$(fleet_vcs_working_copy_files "$fleet_vcs_repo")")" >/dev/null
+      "$fleet_vcs_edit_files")" >/dev/null
     set -- "$@" "$(jj -R "$fleet_vcs_repo" log -r @ --no-graph -T 'commit_id')"
   fi
 
@@ -645,6 +720,27 @@ fleet_vcs_archive_fetch() {
   [ "$2" = origin ] || return 0
   git -C "$1" fetch "$2" \
     '+refs/roundhouse/archive/*:refs/roundhouse/archive/*' >/dev/null 2>&1
+}
+
+fleet_vcs_floor_ref=refs/roundhouse/poll-floor/main
+
+fleet_vcs_floor_fetch() {
+  # fleet_vcs_floor_fetch <store> — §6.4's incremental fetch: the remote's
+  # main, objects only, into a PRIVATE ref, printing the fetched commit id.
+  # Only the poll floor fetches through here; doctor reads the remote with
+  # `git ls-remote` and writes nothing.
+  #
+  # The fetch moves NO jj-visible ref, and that is load-bearing:
+  # refs/roundhouse/ is outside what jj imports, so main@origin stays where
+  # the last full pass left it, and that pass's successor still signature-
+  # gates every commit that arrived since (§7.7). `--refmap=` is NOT optional:
+  # without it git also "opportunistically" updates refs/remotes/origin/main
+  # through the colocated repo's configured refspec, jj imports that as a
+  # moved main@origin, fast-forwards the tracked local bookmark — and the
+  # commits the floor skipped would never be gated.
+  git -C "$1" fetch --quiet --no-tags --refmap= origin \
+    "+refs/heads/main:$fleet_vcs_floor_ref" >/dev/null 2>&1 || return 1
+  git -C "$1" rev-parse --verify --quiet "$fleet_vcs_floor_ref^{commit}" 2>/dev/null
 }
 
 fleet_vcs_fetch() {

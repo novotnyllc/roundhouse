@@ -33,6 +33,10 @@ if [ -n "$fleet_fixture_yq" ]; then
           for (i = 1; i <= n; i++) { gsub(/[[:space:]]/, "", alt[i]); print alt[i] }
         }
         { line = "" }')
+    # Row 1's roots live in fleet_vcs_fleet_roots, not in a case arm; walk
+    # them too, as the table matches them (`<root>/?*`, or the file itself).
+    pub_patterns="$pub_patterns
+$(fleet_vcs_fleet_roots | awk '/\.yaml$/ { print; next } { print $0 "/?*" }')"
     [ "$(printf '%s\n' "$pub_patterns" | grep -c .)" -ge 17 ] ||
       fail "the owner table's patterns could not be read: $pub_patterns"
     pub_samples="$tmp/publish-verbs-samples"

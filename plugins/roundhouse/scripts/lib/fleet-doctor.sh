@@ -404,9 +404,12 @@ fleet_posture_get() {
 }
 
 fleet_remote_url() {
-  # jj-native, because §8.4 admits exactly two read-only git calls
-  # (`ls-remote`, `verify-commit`) and `git remote get-url` is neither. The
-  # rule was applied to the symlink row and not to this one; it applies here.
+  # jj-native, because §8.4 bans git writes to the store (`git push`,
+  # `git commit`) and keeps every other git call to a short, named list —
+  # `verify-commit`, the archive and poll-floor fetches into private
+  # refs/roundhouse/ refs, and object reads — and `git remote get-url` is not
+  # on it. The rule was applied to the symlink row and not to this one; it
+  # applies here.
   jj -R "$1" git remote list 2>/dev/null |
     awk -v want="${2:-origin}" '$1 == want { print $2; exit }'
 }
@@ -1551,19 +1554,43 @@ fleet_doctor_command() (
       'every commit in the push range carries the §5 trailer block' \
       'a run that stops writing trailers degrades every future conflict to an escalation'
 
-  # --- §6.1(a) the poll floor is the propagation mechanism ---
+  # --- §6.1(a)/§6.4 the poll floor is the propagation mechanism ---
+  # READ-ONLY, like every row: `git ls-remote` reads the remote's main without
+  # writing a ref or an object, and is compared with the reference this host
+  # last CONVERGED from (store.run/converged), the floor's own base. The
+  # floor's verdict also needs the desired-state trees of the remote head,
+  # and those are compared only when its objects are already on disk; a head
+  # this host has never fetched is SAID to need a fetch rather than fetched —
+  # a doctor that fetches is a doctor that changes the store it reports on.
   if [ -z "$(fleet_remote_url "$doctor_store")" ]; then
     fleet_doctor_row ok poll-floor 'no origin remote configured; nothing to poll'
   else
-    doctor_ls=$(git -C "$doctor_store" ls-remote origin refs/heads/main 2>/dev/null |
-      awk 'NR == 1 { print $1; exit }') || doctor_ls=
-    if [ -z "$doctor_ls" ] && [ -n "$doctor_origin" ]; then
+    doctor_remote_main=$(git -C "$doctor_store" ls-remote origin refs/heads/main 2>/dev/null |
+      awk '$2 == "refs/heads/main" { print $1; exit }') || doctor_remote_main=
+    doctor_converged=$(cat "$(fleet_run_state_dir)/converged" 2>/dev/null || true)
+    doctor_converged_desired=$(cat "$(fleet_run_state_dir)/converged-desired" 2>/dev/null || true)
+    if [ -z "$doctor_remote_main" ] && [ -n "$doctor_origin" ]; then
       fleet_doctor_row finding poll-floor \
-        'ls-remote answered nothing while main@origin exists; the fleet degrades to the 12h cadence silently'
-    elif [ -n "$doctor_ls" ] && [ -n "$doctor_origin" ] && [ "$doctor_ls" != "$doctor_origin" ]; then
-      fleet_doctor_row ok poll-floor "remote is ahead of main@origin ($doctor_ls)"
+        "the remote's main cannot be read (git ls-remote fails) while main@origin exists; the floor's fetch cannot reach it either, so every fast pass will run in full"
+    elif [ -z "$doctor_remote_main" ]; then
+      fleet_doctor_row ok poll-floor 'the remote has no main yet; nothing to poll'
+    elif [ -z "$doctor_converged" ]; then
+      fleet_doctor_row ok poll-floor \
+        "the remote's main is $doctor_remote_main; this host has not converged yet, so the next fast pass runs in full"
+    elif [ "$doctor_remote_main" = "$doctor_converged" ]; then
+      fleet_doctor_row ok poll-floor \
+        "the remote's main is the converged reference ($doctor_remote_main); the floor exits"
+    elif ! git -C "$doctor_store" cat-file -e "$doctor_remote_main^{commit}" 2>/dev/null; then
+      fleet_doctor_row ok poll-floor \
+        "the remote's main ($doctor_remote_main) differs from the converged reference ($doctor_converged); comparing their desired-state trees needs its objects, and this read-only probe does not fetch them — the next fast pass's floor will"
+    elif [ -n "$doctor_converged_desired" ] &&
+      [ "$(fleet_vcs_desired_digest "$doctor_store" "$doctor_remote_main" 2>/dev/null)" = \
+        "$doctor_converged_desired" ]; then
+      fleet_doctor_row ok poll-floor \
+        "the remote's main ($doctor_remote_main) moved past the converged reference with the desired state unchanged; the floor exits"
     else
-      fleet_doctor_row ok poll-floor "ls-remote is comparable to main@origin"
+      fleet_doctor_row ok poll-floor \
+        "the remote's main ($doctor_remote_main) changes desired state since the converged reference; the next fast pass converges it"
     fi
   fi
 

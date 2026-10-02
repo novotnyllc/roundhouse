@@ -636,6 +636,10 @@ if false; then
   . "$script_dir/tests/80-alerts.sh"
   # shellcheck source=tests/83-apply-claude.sh
   . "$script_dir/tests/83-apply-claude.sh"
+  # shellcheck source=tests/84-schedule.sh
+  . "$script_dir/tests/84-schedule.sh"
+  # shellcheck source=tests/85-liveness.sh
+  . "$script_dir/tests/85-liveness.sh"
   # shellcheck source=tests/86-publish-verbs.sh
   . "$script_dir/tests/86-publish-verbs.sh"
   # shellcheck source=tests/90-jj-bootstrap.sh

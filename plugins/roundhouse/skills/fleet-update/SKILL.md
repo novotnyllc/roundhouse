@@ -151,7 +151,8 @@ Cleanup and autoremove are separate explicit actions.
 
 Auto-updating on a schedule uses the OS scheduler calling the CLI — no new
 daemon, database, or engine. **There is exactly one owned scheduler
-entry per host**, and it runs `roundhouse fleet-run`. Two local runners racing one
+entry per host**: the fast and full job pair that `roundhouse fleet-schedule`
+installs, and it runs `roundhouse fleet-run`. Two local runners racing one
 plugin cache is the failure this prevents, so a second entry is never
 added: the desired-state run **absorbs** the older autoupdate entry rather
 than being given one of its own. Marketplace refresh and package updates are
@@ -289,25 +290,81 @@ Both intervals are jittered from the host **name**, so the fleet does not
 re-synchronise on the same minute; the interval keys live in the store's
 policy block, not on the machine being governed.
 
-The calling workflow installs the entry on request. **Absorb, never duplicate**:
-if `com.novotnyllc.roundhouse.autoupdate` (or its systemd/Task Scheduler
-equivalent) exists, unload and remove it in the same step that installs the
-fleet entry. A host carrying both is the exact double-runner this rule exists
-to prevent.
+The calling workflow installs the entry on request, on the host itself, after
+`roundhouse launcher-install` (the jobs run that `~/.local/bin/roundhouse`
+shim):
+
+```bash
+roundhouse fleet-schedule install     # write and load both jobs; idempotent
+roundhouse fleet-schedule status      # installed / enabled / loaded, definition matches or differs
+roundhouse fleet-schedule uninstall   # unload and remove both
+```
+
+`install` and `uninstall` are mutations, so they ride the **sealed-plan
+pipeline** like `launcher-install` (they need the mutation configuration and
+one local machine whose `expected_hostname`/`expected_user` are this host's).
+The collector observes the jobs (an `agent_artifact roundhouse:schedule`
+record: every definition file's sha256 or its absence, each job's
+loaded/disabled or enabled/active state, the superseded entries); the plan
+lists the exact files to write, keep, remove or absorb (each written file with
+its rendered sha256) and the exact `launchctl`/`systemctl --user` commands, in
+order, and is sealed with that record as its precondition. `apply-plan`
+re-collects and refuses if anything changed since the seal — a job disabled or
+a definition edited in between gets a refusal, not a surprise — then runs only
+those steps (a definition only while it still renders to the sealed digest, a
+command only when it names this host's own jobs), checks every written file is
+at its sealed digest and every removed one is gone, and `status` must then
+report the result. `status` is read-only and unsealed. On Linux, lingering is
+checked before anything is planned: without it `install` exits 75 with the
+`loginctl enable-linger` fix and writes nothing.
+
+`install` matches a job that already exists: an identical definition is left
+alone (not rewritten, not reloaded); a differing one is reported by path
+(never by content — a hand-added environment variable may be a secret), then
+replaced and reloaded. **Absorb, never duplicate**: if
+`com.novotnyllc.roundhouse.autoupdate` or the older one-plist
+`com.novotnyllc.roundhouse.fleet` (or a systemd/Task Scheduler equivalent)
+exists, unload it and set it aside (renamed `.absorbed`, never deleted) in the
+same step that installs the fleet entry; `install` does this for both macOS
+labels. A replaced definition that differed is kept as `.replaced`, and one
+`uninstall` removes as `.removed`; a backup that cannot be made stops the step.
+`uninstall` unloads a job the scheduler still holds before it removes the file,
+and is not done until the scheduler has let go of it. It also opts the host
+out of triggers: after `uninstall`, a trigger or peer nudge only stamps and
+starts no pass until `install` runs again. A host carrying both
+is the exact double-runner this rule exists to prevent. `install` is also the only thing that enables a job: a scheduled pass
+never re-enables one an operator disabled, it raises a `schedule-disabled`
+alert (and `schedule-missing` for a job that disappeared) instead.
 
 The shape per platform, all three running the same two commands:
 
-- **macOS** — one per-user launchd agent,
-  `~/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist`, with two
-  `StartCalendarInterval`/`StartInterval` slots (or two agents only if the
-  scheduler cannot express both in one).
-- **Linux** — a systemd **user** timer pair,
-  `roundhouse-fleet-fast.timer` and `roundhouse-fleet-full.timer`, with
-  `Persistent=true` so a laptop that was asleep catches up once rather than
-  storming.
+Both intervals come from the same policy the run reads
+(`fast_interval_minutes` ± `fast_jitter_minutes`, `cadence_hours` ±
+`jitter_minutes`; 20 ± 5 min and 12 h ± 90 min by default), with the offset
+seeded from the host name, so each host's jobs fire on their own stable
+minute. Re-run `install` after changing those keys.
+
+- **macOS** — two per-user launchd agents (launchd cannot run two commands
+  from one), `~/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet-fast.plist`
+  and `com.novotnyllc.roundhouse.fleet-full.plist`, each a `StartInterval`
+  job running
+  `/bin/zsh -lc 'exec "$HOME/.local/bin/roundhouse" fleet-run --fast|--full'`
+  and logging to `~/Library/Logs/roundhouse-fleet-fast.log` /
+  `roundhouse-fleet-full.log`. Over SSH with nobody logged in at the console
+  there is no GUI domain to load into; the agents load at the next login.
+- **Linux** — a systemd **user** timer pair, each timer with its oneshot
+  service, `roundhouse-fleet-fast.timer` and `roundhouse-fleet-full.timer`, on
+  `OnBootSec`/`OnUnitActiveSec` monotonic intervals, so a laptop that was
+  asleep resumes its cadence at wake rather than storming. The user manager
+  must linger (`loginctl enable-linger`) for the timers to outlive a login
+  session — `install` checks that first, exits 75 and names the fix, and
+  writes nothing — and WSL needs systemd enabled (an unreachable user manager
+  is its own diagnostic). A job is its timer AND its service: either one
+  missing is a missing job, and `status` compares both.
 - **Windows** — a **per-user** scheduled task. Where the machine has a
   configured WSL sibling, register it there and drive the native side through
   the interop lane rather than registering a second native entry.
+  `fleet-schedule` does not manage native Windows.
 
 ```bash
 roundhouse fleet-run --fast    # the fast slot

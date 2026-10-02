@@ -109,7 +109,7 @@ certify-ssh-node'
 # Sections are SOURCED cumulatively, and a few used to build on an earlier
 # one's fixtures: 67 read $oversized_setting and snapshot.jsonl from 65, 68 read
 # snapshot-2.jsonl from 65, and 71/72/74/75 read $fleet_fixture_yq from 70 (as
-# 83 and 86 would; 84 and 85 are reserved for a sibling branch). That
+# 83, 84, 85 and 86 would). That
 # made a per-section matrix unschedulable without pairing entries together.
 # Those fixtures now live in the always-run 07 harness, so every section stands
 # alone and the matrix can schedule them in any combination. Verified by running

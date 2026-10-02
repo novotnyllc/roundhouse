@@ -32,7 +32,10 @@ elif section_part 1; then
       printf 'FAIL: real-jj: %s\n' "$*" >&2
       exit 1
     }
-    PATH="$(dirname "$real_jj"):$(dirname "$real_yq"):$PATH"
+    # The ssh stub must still win when a real yq lives beside a real ssh
+    # (/usr/bin on Linux runners): a directory holding only the stub, first.
+    mkdir -p "$tmp/ssh-stub-only" && ln -sf "$tmp/bin/ssh" "$tmp/ssh-stub-only/ssh"
+    PATH="$tmp/ssh-stub-only:$(dirname "$real_jj"):$(dirname "$real_yq"):$PATH"
     export PATH
     # shellcheck source=/dev/null
     ROUNDHOUSE_LIB_ONLY=1 . "$cli"
@@ -177,14 +180,48 @@ YAML
     [ "$runjj_shape" = "empty undescribed $(fleet_vcs_heads_local "$vireo")" ] ||
       fail "the run did not end with @ an empty child of the published main: $runjj_shape"
 
-    # --- §6.1(a): the poll floor's three states ---
+    # --- §6.1(a)/§6.4: the poll floor's states ---
     # 1. fully published + empty @ -> the true no-op, and it says what it cost.
     runjj_out=$(runjj vireo "$cli" fleet-run --fast) ||
       fail "the no-op run failed"
     case $runjj_out in
-      *'no fetch'*) ;;
+      *'nothing new on the remote'*'no convergence pass'*) ;;
       *) fail "a settled store did not short-circuit at the poll floor: $runjj_out" ;;
     esac
+    # The floor's fetch moves no jj-visible ref: main@origin is what the last
+    # full pass gated, and the next one gates everything after it (§7.7).
+    "$REAL_GIT" -C "$vireo" rev-parse --verify --quiet \
+      refs/roundhouse/poll-floor/main >/dev/null ||
+      fail "the poll floor did not fetch into its private ref"
+    # A heartbeat that is owed is work: only a pass that reaches the end
+    # publishes one (§6.3), so the floor must not exit past it.
+    runjj_hb="$rjj/vireo/store.run/heartbeat.json"
+    cp "$runjj_hb" "$runjj_hb.saved"
+    rm -f "$runjj_hb"
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor exited while a published heartbeat was owed"
+    mv "$runjj_hb.saved" "$runjj_hb"
+    # …and so is an item waiting on canary evidence, which arrives as records.
+    : >"$rjj/vireo/store.run/canary-waiting"
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor exited while an item waited on canary evidence"
+    rm -f "$rjj/vireo/store.run/canary-waiting"
+    # …and so is a retry owed: a failed apply or transiently unreadable gate
+    # input, or a host-local verdict nothing on the remote carries.
+    : >"$rjj/vireo/store.run/retry-owed"
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor exited while a retry was owed"
+    rm -f "$rjj/vireo/store.run/retry-owed"
+    runjj vireo "$cli" fleet-review hooks.commit-guard hold 'probe' >/dev/null ||
+      fail "fleet-review could not record a verdict"
+    [ -e "$rjj/vireo/store.run/retry-owed" ] ||
+      fail "a host-local fleet-review verdict did not make the next pass owed"
+    rm -f "$rjj/vireo/store.run/retry-owed" "$rjj/vireo/store.run/verdicts/hooks.commit-guard.yaml"
+    # The comparison base is the converged REFERENCE's desired state.
+    [ -s "$rjj/vireo/store.run/converged-desired" ] ||
+      fail "the publishing pass recorded no converged desired-state digest"
+    runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor did not exit on a settled store after the probes"
     # 2. a dirty @ is work to publish, even with an unchanged remote.
     printf '# a pending hand edit\n' >>"$vireo/fleet.yaml"
     ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
@@ -459,7 +496,84 @@ YAML
       *) fail "a downstream host stopped waiting on an item the canary could not apply: $runjj_out" ;;
     esac
 
-    printf 'real-jj: OK (poll floor three states, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding)\n'
+    # --- §6.4: peers' record commits no longer defeat the floor ---
+    # Settle vireo, then let wren publish a pass whose commit carries only
+    # records (it is waiting on canary evidence, so it journals `held`).
+    runjj vireo "$cli" fleet-run --fast >/dev/null ||
+      fail "vireo could not settle before the floor probes"
+    runjj vireo "$cli" fleet-run --fast >/dev/null ||
+      fail "vireo could not settle before the floor probes"
+    runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "vireo was not settled at the poll floor before the record-only probe"
+    runjj_converged=$(cat "$rjj/vireo/store.run/converged")
+    runjj_nudges="$rjj/nudges.log"
+    : >"$runjj_nudges"
+    SSH_COMMAND_LOG=$runjj_nudges runjj wren "$cli" fleet-run --fast >/dev/null ||
+      fail "wren could not publish its record-only pass"
+    # §6.1: a records-only publish nudges nobody — two hosts waiting on one
+    # canary would otherwise nudge each other every pass for the whole wait.
+    ! grep -q 'fleet-trigger' "$runjj_nudges" ||
+      fail "a records-only publish nudged a peer"
+    runjj_remote=$("$REAL_GIT" -C "$vireo" ls-remote origin refs/heads/main |
+      awk '{ print $1; exit }')
+    [ "$runjj_remote" != "$runjj_converged" ] ||
+      fail "wren's pass published nothing, so the record-only probe proves nothing"
+    # shellcheck disable=SC2046 # the desired-state roots, one pathspec each
+    [ -z "$("$REAL_GIT" -C "$vireo" fetch --quiet --refmap= origin \
+      "+refs/heads/main:refs/selfcheck/probe" 2>&1 && "$REAL_GIT" -C "$vireo" \
+      diff --name-only "$runjj_converged" refs/selfcheck/probe -- \
+      $(fleet_vcs_desired_roots))" ] ||
+      fail "wren's probe commit touched desired state, so it is not record-only"
+    runjj_origin_before=$(fleet_vcs_head_origin "$vireo")
+    runjj_out=$(runjj vireo "$cli" fleet-run --fast) ||
+      fail "vireo's run after a peer's record-only commit failed"
+    case $runjj_out in
+      *'record-only commit(s) on the remote'*'no convergence pass'*) ;;
+      *) fail "a peer's record-only commit defeated the poll floor (§6.4): $runjj_out" ;;
+    esac
+    [ "$(fleet_vcs_head_origin "$vireo")" = "$runjj_origin_before" ] ||
+      fail "the poll floor moved main@origin, dropping the skipped commits out of the next pass's §7.7 range"
+    # A desired-state change from a peer DOES defeat it, and the next pass
+    # converges on it.
+    printf '# a peer edit to a shared layer\n' >>"$wren/groups/development.yaml"
+    # The fixture ssh cannot reach a real peer, so an earlier nudge may have
+    # parked vireo in the one-interval unreachable memo; clear it.
+    rm -f "$rjj/wren/store.run/nudge-unreachable"
+    runjj_wren_out=$(SSH_COMMAND_LOG=$runjj_nudges runjj wren "$cli" fleet-run --fast 2>&1) ||
+      fail "wren could not publish its layer edit: $runjj_wren_out"
+    grep -q 'rh-vireo.*fleet-trigger --fast' "$runjj_nudges" ||
+      fail "a publish that changed desired state nudged nobody (nudges: $(cat "$runjj_nudges"); memo: $(cat "$rjj/wren/store.run/nudge-unreachable" 2>&1); pass: $(printf '%s\n' "$runjj_wren_out" | grep -v '^Working copy\|^Parent commit\|^Moved' | tail -15))"
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor exited past a peer's layer edit"
+    runjj vireo "$cli" fleet-run --fast >/dev/null ||
+      fail "vireo could not converge on the peer's layer edit"
+    grep -Fq '# a peer edit to a shared layer' "$vireo/groups/development.yaml" ||
+      fail "vireo's pass did not converge on the peer's layer edit"
+    runjj vireo "$cli" fleet-run --fast >/dev/null || :
+    runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "vireo did not settle at the poll floor after converging"
+
+    # A fetched head that does not descend from what this host converged on
+    # is a re-root or a rollback: the full pass's archive check, never the
+    # floor's to sit out. (Last, because it rewrites the shared remote.)
+    runjj_orphan="$rjj/orphan"
+    "$REAL_GIT" init -q -b main "$runjj_orphan"
+    for runjj_root in $(fleet_vcs_desired_roots); do
+      [ ! -e "$vireo/$runjj_root" ] || cp -R "$vireo/$runjj_root" "$runjj_orphan/"
+    done
+    "$REAL_GIT" -C "$runjj_orphan" add -A
+    "$REAL_GIT" -C "$runjj_orphan" -c user.name=x -c user.email=x@example.invalid \
+      -c commit.gpgsign=false commit -qm 'unrelated history'
+    # Same desired state, so only the ancestry check can refuse it.
+    [ "$(fleet_vcs_desired_digest "$runjj_orphan" HEAD)" = \
+      "$(cat "$rjj/vireo/store.run/converged-desired")" ] ||
+      fail "the unrelated head differs in desired state, so it does not isolate the ancestry check"
+    "$REAL_GIT" -C "$runjj_orphan" push -q --force "$rjj/remote.git" main:main ||
+      fail "could not stage an unrelated remote head"
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor exited on a remote head that does not descend from the converged one"
+
+    printf 'real-jj: OK (poll floor states incl. record-only peers, propagate and apply, hooks held, rule-4 resolution, canary gate, satisfied-is-evidence, revert and --now binding)\n'
   ) || fail "real-jj run block failed (see the FAIL: real-jj: line above)"
 fi
 
@@ -472,7 +586,8 @@ p0jj_setup() {
   # $runjj_root/p0-NAME with a private remote, a verified posture, the fleet
   # and host layers the scenarios read, and its first run published. Defines
   # the helpers the scenarios use: runjj, runjj_lib; sets rjj and vireo.
-  PATH="$(dirname "$real_jj"):$(dirname "$real_yq"):$PATH"
+  mkdir -p "$tmp/ssh-stub-only" && ln -sf "$tmp/bin/ssh" "$tmp/ssh-stub-only/ssh"
+  PATH="$tmp/ssh-stub-only:$(dirname "$real_jj"):$(dirname "$real_yq"):$PATH"
   export PATH
   # shellcheck source=/dev/null
   ROUNDHOUSE_LIB_ONLY=1 . "$cli"
@@ -592,11 +707,19 @@ YAML
   [ -f "$vireo/alerts/vireo/removal-cap.yaml" ] ||
     fail "the capped run raised no removal-cap alert"
   runjj_dev_group 5
+  runjj_alive_count() {
+    grep -rh 'outcome: alive' "$vireo/journal/vireo" 2>/dev/null | grep -c . || true
+  }
+  runjj_alive_before=$(runjj_alive_count)
   runjj_out=$(runjj_tomb_run) || fail "the tombstone run failed: $runjj_out"
   case $runjj_out in
     *'applied plugins.retired (uninstalled)'*) ;;
     *) fail "the tombstone did not uninstall the plugin: $runjj_out" ;;
   esac
+  # A pass whose only change is a tombstone APPLIED something, and publishes
+  # the heartbeat that evidence owes (a canary's downstream waits on it).
+  [ "$(runjj_alive_count)" -gt "$runjj_alive_before" ] ||
+    fail "a pass whose only change was a tombstone published no heartbeat"
   grep -Fqx 'uninstall retired@test-market' "$rjj/plugin-actions" ||
     fail "the tombstone did not go through claude plugin uninstall"
   # The cap no longer holds anything, so its CONDITION alert is cleared.
@@ -754,6 +877,65 @@ p0jj_disown() {
   esac
   ! runjj_outcomes "$runjj_hostonly" | grep -qx reverted ||
     fail "a disowned item was journaled reverted"
+  # A bookmark move jj refuses is a FAILED publish. An @ that descends from a
+  # stale head — here main's parent — is sideways from main; jj will not move
+  # main there, and the publish must say so and fail rather than push the
+  # unmoved main and report success while the work sits in an orphan.
+  runjj_main=$(fleet_vcs_heads_local "$vireo")
+  jj -R "$vireo" new "$runjj_main-" >/dev/null
+  printf 'orphan: probe\n' >"$vireo/orphan-probe.yaml"
+  runjj_status=0
+  runjj_out=$(runjj_lib vireo fleet_run_publish "$vireo" vireo interactive/human \
+    'a publish from a stale head' 'orphan-probe' 'stale-head probe' 2>&1) ||
+    runjj_status=$?
+  [ "$runjj_status" -eq 65 ] ||
+    fail "a publish whose bookmark move jj refused did not fail with 65 (got $runjj_status): $runjj_out"
+  case $runjj_out in
+    *'could not move main to the new commit'*'nothing published'*) ;;
+    *) fail "a refused bookmark move was not reported: $runjj_out" ;;
+  esac
+  [ "$(fleet_vcs_heads_local "$vireo")" = "$runjj_main" ] ||
+    fail "main moved although the publish failed"
+  [ "$(fleet_vcs_head_origin "$vireo")" = "$runjj_main" ] ||
+    fail "the remote moved although the publish failed"
+  runjj_orphan=$(jj -R "$vireo" log -r @ --no-graph -T 'commit_id')
+  jj -R "$vireo" new "$runjj_main" >/dev/null
+  jj -R "$vireo" abandon "$runjj_orphan" >/dev/null
+  [ ! -e "$vireo/orphan-probe.yaml" ] || fail "the stale-head probe left its file in the working copy"
+}
+
+p0jj_abort() {
+  # --- an abort mid-apply still lands the queued records ---
+  # The loop queues applied/ and journal writes (one batch per pass). A pass
+  # that dies after an item applied — errexit here; a signal the same way —
+  # must still record it as owned and journal it, or the next pass sees an
+  # installed item nobody owns.
+  runjj_abort_a='config_files.~/.abort-a'
+  runjj_abort_outcomes() {
+    for runjj_day in "$vireo/journal/vireo"/*.yaml; do
+      [ -f "$runjj_day" ] || continue
+      FLEET_ITEM=$1 yq -r '.[] | select(.item == strenv(FLEET_ITEM)) | .outcome' \
+        "$runjj_day"
+    done
+  }
+  printf 'platform: macos\ngroups: [development, canary]\nhostname: vireo.invalid\nuser: claire\nconfig_files:\n  ~/.abort-a:\n    keys:\n      a: managed\n  ~/.abort-b:\n    keys:\n      b: managed\n' \
+    >"$vireo/hosts/vireo.yaml"
+  runjj_status=0
+  runjj_out=$(runjj vireo env ROUNDHOUSE_FLEET_TEST_ABORT_AFTER_APPLY="$runjj_abort_a" \
+    "$cli" fleet-run --fast 2>&1) || runjj_status=$?
+  [ "$runjj_status" -ne 0 ] || fail "the pass did not abort after $runjj_abort_a applied: $runjj_out"
+  case $runjj_out in
+    *"self-test abort after applying $runjj_abort_a"*) ;;
+    *) fail "the abort hook did not fire: $runjj_out" ;;
+  esac
+  [ -n "$(fleet_applied_digest "$vireo" vireo "$runjj_abort_a")" ] ||
+    fail "an item applied before the abort was not recorded in applied/ (the queued batch was lost)"
+  runjj_abort_outcomes "$runjj_abort_a" | grep -qx applied ||
+    fail "an item applied before the abort was not journaled (the queued batch was lost)"
+  [ ! -e "$vireo.lock" ] || fail "the aborted run left its lock behind"
+  # The next run converges what is left and publishes.
+  runjj vireo "$cli" fleet-run --fast >/dev/null ||
+    fail "the run after an aborted pass did not converge"
 }
 
 p0jj_aging() {
@@ -825,6 +1007,7 @@ if [ "$real_jj_ok" = true ] && section_part 2; then
     'alert compaction refused over a layer edit, published, idempotent'
   p0jj_block disown p0jj_disown 'host-only disown: dry run, refusal, publish, no prune after'
   p0jj_block aging p0jj_aging 'evidence aging previewed by --dry-run, then published'
+  p0jj_block abort p0jj_abort 'a pass aborted mid-apply still lands its queued applied/ and journal records'
   p0jj_block verbs p0jj_verb_refusals \
     'publishing verbs refuse a diverged main, a live lock and a foreign edit'
 fi
