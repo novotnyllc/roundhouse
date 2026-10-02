@@ -154,6 +154,8 @@ EOF
 . "$script_dir/lib/fleet-liveness.sh"
 # shellcheck source=lib/fleet-schedule.sh
 . "$script_dir/lib/fleet-schedule.sh"
+# shellcheck source=lib/fleet-schedule-windows.sh
+. "$script_dir/lib/fleet-schedule-windows.sh"
 # shellcheck source=lib/fleet-schedule-plan.sh
 . "$script_dir/lib/fleet-schedule-plan.sh"
 # shellcheck source=lib/fleet-trigger.sh

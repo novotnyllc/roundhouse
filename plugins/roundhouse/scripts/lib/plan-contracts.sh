@@ -29,7 +29,8 @@ schedule_operations_valid() {
   # shared by seal-plan and verify-preconditions: at most one, its exact argv,
   # and steps that only write, keep, remove or absorb an absolute definition
   # path UNDER HOME, unlink a fleet timer's timers.target.wants link under
-  # HOME, or run a launchctl/systemctl argv for a named effect.
+  # HOME, run a launchctl/systemctl argv for a named effect, or unregister one
+  # obsolete native Windows task by name and digest.
   # Which paths and commands THIS host's jobs own is fleet_schedule_execute's
   # to check where they run.
   jq -e --arg home "$2" '
@@ -69,6 +70,12 @@ schedule_operations_valid() {
           $action == "install" and exact(["action","before","path","to"]) and
           (.path | in_home) and (.path | endswith(".plist")) and (.before | hex) and
           (.to | in_home) and (.to | startswith($s.path + ".absorbed"))
+        elif .action == "unregister" then
+          # The native Windows half of a WSL machine: one obsolete one-shot
+          # task in the Task Scheduler root, by its definition digest.
+          $action == "install" and exact(["action","digest","mode","name","path"]) and
+          .mode == "native" and .path == "\\" and (.digest | hex) and
+          (.name | type == "string" and test("^Roundhouse-[A-Za-z0-9]{1,32}-[0-9a-f]{32}$"))
         elif .action == "run" then
           exact(["action","argv","effect","mode","required"]) and
           (.mode | IN("fast","full","legacy","all")) and (.required | type == "boolean") and
