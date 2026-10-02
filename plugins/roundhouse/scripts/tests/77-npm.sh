@@ -380,6 +380,12 @@ jq -se 'any(.[]; .id == "packages:npm" and .status == "unavailable" and
   all(.[]; (.kind == "package" and .data.manager == "npm") | not)' \
   "$tmp/npm-prefix-hang.jsonl" >/dev/null ||
   fail "a timed-out npm prefix query was not reported as an unknown npm inventory"
+# A KILLed child can take a moment to be reaped under load: poll, bounded.
+nfx_reap=0
+while pgrep -f 'sleep 589' >/dev/null 2>&1 && [ "$nfx_reap" -lt 50 ]; do
+  sleep 0.1
+  nfx_reap=$((nfx_reap + 1))
+done
 ! pgrep -f 'sleep 589' >/dev/null 2>&1 || fail "a hung npm prefix query outlived its timeout"
 [ "$(jq -r 'select(.kind == "package" and .id == "npm:current-only") |
   [.data.update_available,.data.updater,.data.updater_status] | map(tostring) | join(" ")' \
