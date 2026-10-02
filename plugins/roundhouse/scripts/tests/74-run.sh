@@ -32,21 +32,21 @@ if [ -n "$fleet_fixture_yq" ]; then
     # plugin's bounded install or unresolved marketplace) and every failure
     # are retried every pass; standing capability holds are left to the full
     # cadence.
-    mkdir -p "$tmp/retry-claude"
-    printf '#!/bin/sh\nexit 0\n' >"$tmp/retry-claude/claude"
-    chmod +x "$tmp/retry-claude/claude"
     for run_retry_case in '75 true plugins' '75 false plugins' '75 true skills' \
       '1 false plugins' '65 false packages' '73 false packages' '64 false skills'; do
       # shellcheck disable=SC2086 # deliberate: status, tombstone, category
-      PATH="$tmp/retry-claude:$PATH" fleet_run_hold_owes_retry $run_retry_case ||
+      fleet_run_hold_owes_retry $run_retry_case ||
         fail "a transient hold ($run_retry_case) left the poll floor free to skip its retry"
     done
-    # The fixture PATH has no claude, so a plugin 75 here is standing (no harness).
-    for run_retry_case in '75 false packages' '75 false hooks' '75 false skills' '75 false plugins'; do
+    for run_retry_case in '75 false packages' '75 false hooks' '75 false skills'; do
       # shellcheck disable=SC2086 # deliberate: status, tombstone, category
       ! fleet_run_hold_owes_retry $run_retry_case ||
         fail "a standing capability hold ($run_retry_case) held the poll floor open"
     done
+    # A plugin hold on a host with no claude at all is standing: the fixture
+    # stubs claude into its PATH, so this case runs on a PATH without it.
+    ! PATH=/usr/bin:/bin fleet_run_hold_owes_retry 75 false plugins ||
+      fail "a plugin hold on a host with no claude held the poll floor open"
 
     # --- §6.1 the two cadences and the jitter that spreads them ---
     # Seeded from the host NAME. A fleet whose hosts re-roll their offset every
