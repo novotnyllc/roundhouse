@@ -65,6 +65,26 @@ fi
 "$integrity_cover/scripts/update-integrity"
 "$integrity_cover/scripts/roundhouse" executor-status - >/dev/null ||
   fail "integrity enumeration did not pick up a new scripts/ file"
+# #84: an INSTALLED copy is only as sealed as the directories above it: a
+# group-writable cache/<market>/ lets a peer swap the verified tree whole.
+# executor-status seals them up to the harness home, and refuses when it
+# cannot.
+anc_home="$tmp/ancestor-home"
+anc_cache="$anc_home/.claude/plugins/cache/novotnyllc/roundhouse/$plugin_version"
+mkdir -p "$anc_cache"
+cp -R "$integrity_cover/." "$anc_cache/"
+chmod -R go-w "$anc_home"
+chmod g+w "$anc_home/.claude/plugins/cache/novotnyllc"
+if HOME="$anc_home" CLAUDE_CONFIG_DIR="$anc_home/.claude" PATH="$tmp/chmod-fails:$PATH" \
+  "$anc_cache/scripts/roundhouse" executor-status - >/dev/null 2>&1; then
+  fail "executor status trusted an installed copy under a group-writable cache directory"
+fi
+HOME="$anc_home" CLAUDE_CONFIG_DIR="$anc_home/.claude" \
+  "$anc_cache/scripts/roundhouse" executor-status - >/dev/null 2>&1 ||
+  fail "executor status refused an installed copy instead of sealing the cache above it"
+[ -z "$(find "$anc_home" -type d \( -perm -020 -o -perm -002 \) -print)" ] ||
+  fail "executor status left a cache directory above the installed copy group-writable"
+rm -rf "$anc_home"
 # N17: an INSTALLED plugin cache nested inside a git repo whose .gitignore
 # excludes .claude/ (a dotfiles repo - common, and likely across a fleet
 # given roundhouse's own chezmoi tooling) must NOT have its manifest-

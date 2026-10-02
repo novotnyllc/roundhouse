@@ -244,13 +244,19 @@ fleet_plugins_claude_refresh() {
   # Claude marketplace, recorded under upstreams/. `update` cannot refresh a
   # marketplace that was never registered, and never refreshes one
   # registered from another source than the declared one: that would pull
-  # whatever the new source serves under the name. Exit 0 when refreshed.
+  # whatever the new source serves under the name. Exit 0 when refreshed,
+  # 75 for a standing hold (a same-name repoint, which only a change to the
+  # registration resolves), 74 when a bounded list or the update itself
+  # failed or timed out, 1 when there is no `claude`.
   fleet_plugins_cr_result=unavailable
   fleet_plugins_cr_rc=1
   if command -v claude >/dev/null 2>&1; then
     fleet_plugins_cr_result=failed
+    fleet_plugins_cr_rc=74
     fleet_run_ensure_marketplace "$3" >/dev/null 2>&1 || :
-    if fleet_run_marketplace_source_ok "$3"; then
+    fleet_plugins_cr_source=0
+    fleet_run_marketplace_source_ok "$3" || fleet_plugins_cr_source=$?
+    if [ "$fleet_plugins_cr_source" -eq 0 ]; then
       fleet_run_cli_invalidate
       if bounded_verb claude plugin marketplace update "$3" >/dev/null 2>&1; then
         fleet_plugins_cr_result=ok
@@ -258,6 +264,7 @@ fleet_plugins_claude_refresh() {
       fi
     else
       fleet_plugins_cr_result=held
+      [ "$fleet_plugins_cr_source" -eq 74 ] || fleet_plugins_cr_rc=75
       printf '  hold  marketplace %s — %s\n' "$3" "$fleet_run_repair_reason"
     fi
   fi
@@ -271,9 +278,13 @@ fleet_plugins_claude_update_unowned() {
   # fleet_plugins_owned) and whose installed bytes are not the
   # catalog's: `claude plugin update`, then the same identity proof the item
   # path requires before it reads the update as done. Exit 0 only when every
-  # one CONVERGED (current, or updated and proven); any hold, or an installed
-  # list that cannot be read, is 1, so the caller does not remember the
-  # marketplace as caught up and the next pass retries.
+  # one CONVERGED (current, or updated and proven). A hold says which kind it
+  # is: 75 when every hold is STANDING (no catalog entry or SHA upstream, a
+  # same-name repoint, a cache that cannot be sealed), which only a change
+  # elsewhere resolves; 74 when any is TRANSIENT (a manager list or verb that
+  # failed or timed out, an update that did not verify yet), and 1 when the
+  # installed list cannot be read. Only 0 and 75 let the caller remember the
+  # marketplace as caught up; anything else and the next pass retries.
   fleet_plugins_cu_map=$(fleet_run_installed_plugins 2>/dev/null) || return 1
   fleet_plugins_cu_ids=$(printf '%s\n' "$fleet_plugins_cu_map" | jq -r --arg m "$2" '
     to_entries[] | select(any((.value // [])[]?; .scope == "user")) |
@@ -298,33 +309,50 @@ fleet_plugins_claude_update_unowned() {
       *)
         printf '  hold  plugin %s — installed marketplace identity unavailable (%s)\n' \
           "$fleet_plugins_cu_id" "${fleet_run_identity_reason:-unproven}"
-        fleet_plugins_cu_converged=1
+        fleet_plugins_cu_hold "$fleet_plugins_cu_status"
         continue
         ;;
     esac
     fleet_run_cli_invalidate
-    fleet_plugins_cu_ok=false
     # The manager writes under the caller's umask (002 leaves the cache
     # group-writable): seal it before its identity is accepted, as the item
     # loop does, so a group member cannot edit the hooks it will run.
-    if bounded_verb claude plugin update "$fleet_plugins_cu_id" --scope user \
-      >/dev/null 2>&1 </dev/null &&
-      plugin_cache_seal_permissions "$fleet_plugins_cu_id" &&
+    fleet_plugins_cu_status=0
+    if ! bounded_verb claude plugin update "$fleet_plugins_cu_id" --scope user \
+      >/dev/null 2>&1 </dev/null; then
+      fleet_plugins_cu_status=74
+    elif ! plugin_cache_seal_permissions "$fleet_plugins_cu_id"; then
+      printf '  hold  plugin %s — its updated cache cannot be sealed\n' "$fleet_plugins_cu_id"
+      fleet_plugins_cu_hold 75
+      continue
+    else
       fleet_run_plugin_identity_matches "$1" "$fleet_plugins_cu_name" \
-        "$fleet_plugins_cu_value"; then
-      fleet_plugins_cu_ok=true
+        "$fleet_plugins_cu_value" || fleet_plugins_cu_status=$?
+      # Updated and still not the catalog's bytes: not verified YET (74),
+      # unless the catalog itself can no longer prove them (75).
+      [ "$fleet_plugins_cu_status" -ne 1 ] || fleet_plugins_cu_status=74
     fi
-    if [ "$fleet_plugins_cu_ok" = true ]; then
+    if [ "$fleet_plugins_cu_status" -eq 0 ]; then
       printf '  update plugin %s (claude)\n' "$fleet_plugins_cu_id"
     else
       printf '  hold  plugin %s — claude plugin update did not reach the catalog identity\n' \
         "$fleet_plugins_cu_id"
-      fleet_plugins_cu_converged=1
+      fleet_plugins_cu_hold "$fleet_plugins_cu_status"
     fi
   done 9<<EOF
 $fleet_plugins_cu_ids
 EOF
   return "$fleet_plugins_cu_converged"
+}
+
+fleet_plugins_cu_hold() {
+  # fleet_plugins_cu_hold STATUS — fold one hold into the unowned update's
+  # answer: a transient one (anything but 75) wins over a standing one.
+  if [ "$1" -eq 75 ]; then
+    [ "$fleet_plugins_cu_converged" -ne 0 ] || fleet_plugins_cu_converged=75
+  else
+    fleet_plugins_cu_converged=74
+  fi
 }
 
 fleet_plugins_order() {
@@ -440,8 +468,14 @@ fleet_plugins_refresh() (
     while IFS=$fleet_run_sep read -r fleet_plugins_r_m fleet_plugins_r_head \
       fleet_plugins_r_loc <&9; do
       fleet_upstream_id_valid "$fleet_plugins_r_m" || continue
+      # A STANDING hold (75) still remembers the head, or the poll floor
+      # stays open and every fast pass refreshes a marketplace that only a
+      # change elsewhere (a fixed registration, a new upstream commit)
+      # can unblock; a TRANSIENT one leaves it unremembered, to be retried.
+      fleet_plugins_r_rc=0
       fleet_plugins_claude_refresh "$fleet_plugins_r_store" "$fleet_plugins_r_host" \
-        "$fleet_plugins_r_m" || continue
+        "$fleet_plugins_r_m" || fleet_plugins_r_rc=$?
+      case $fleet_plugins_r_rc in 0 | 75) ;; *) continue ;; esac
       if [ -z "$fleet_plugins_r_head" ]; then
         [ -n "$fleet_plugins_r_loc" ] || fleet_plugins_r_loc=$(jq -r --arg n "$fleet_plugins_r_m" \
           '.[$n].installLocation // empty | strings' "$fleet_plugins_r_known" 2>/dev/null) ||
@@ -450,11 +484,13 @@ fleet_plugins_refresh() (
           fleet_plugins_r_head=$(fleet_run_marketplace_commit "$fleet_plugins_r_loc") ||
           fleet_plugins_r_head=
       fi
-      # Remember the head only once every plugin from it converged: a failed
-      # or unproven update leaves the marketplace unremembered, and the next
-      # fast pass retries it.
-      fleet_plugins_claude_update_unowned "$fleet_plugins_r_defs" "$fleet_plugins_r_m" \
-        "$fleet_plugins_r_tmp/owned" || continue
+      # Remember the head only once every plugin from it converged or holds
+      # for good: a failed or not-yet-verified update leaves the marketplace
+      # unremembered, and the next fast pass retries it.
+      [ "$fleet_plugins_r_rc" -ne 0 ] ||
+        fleet_plugins_claude_update_unowned "$fleet_plugins_r_defs" "$fleet_plugins_r_m" \
+          "$fleet_plugins_r_tmp/owned" || fleet_plugins_r_rc=$?
+      case $fleet_plugins_r_rc in 0 | 75) ;; *) continue ;; esac
       fleet_plugins_memo_write claude "$fleet_plugins_r_m" attempted "$fleet_plugins_r_head" || :
     done 9<"$fleet_plugins_r_tmp/claude"
   fi

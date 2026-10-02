@@ -36,7 +36,9 @@ fleet_run_plugin_catalog() {
   # Claude 2.1.229's `--available` view omits plugins already installed on the
   # host, so use it when it has a SHA and fall back to the installed
   # marketplace manifest when it does not. Older managers that fail the
-  # `--available` command still reach the manifest path.
+  # `--available` command still reach the manifest path. Exit 74 when that
+  # fallback's marketplace list failed or timed out (transient: it proves
+  # nothing about the entry), 75 when there is no entry.
   fleet_run_catalog_id=$1
   fleet_run_catalog_name=${fleet_run_catalog_id%@*}
   fleet_run_catalog_market=${fleet_run_catalog_id##*@}
@@ -54,7 +56,7 @@ fleet_run_plugin_catalog() {
     return 0
   }
 
-  fleet_run_catalog_markets=$(fleet_run_marketplaces) || return 75
+  fleet_run_catalog_markets=$(fleet_run_marketplaces) || return $?
   fleet_run_catalog_locations=$(printf '%s\n' "$fleet_run_catalog_markets" |
     jq -r --arg market "$fleet_run_catalog_market" '
       .[] | select(.name == $market) | .installLocation // empty' 2>/dev/null) ||
@@ -191,12 +193,20 @@ fleet_run_relative_source_sha() {
 
 fleet_run_plugin_catalog_proven() {
   # fleet_run_plugin_catalog_proven ID -> a catalog entry that carries a
-  # resolved 40-hex source SHA. Exit 75 when there is no entry, 74 when the
-  # entry cannot prove its bytes — distinct, so a caller can say which.
-  fleet_run_proven=$(fleet_run_plugin_catalog "$1") || return 75
+  # resolved 40-hex source SHA. Exit 75 when there is no entry, 76 when the
+  # entry cannot prove its bytes, and 74 when the catalog could not be read
+  # (its marketplace list failed or timed out) — distinct, so a caller can
+  # say which, and keep the last one transient.
+  fleet_run_proven_status=0
+  fleet_run_proven=$(fleet_run_plugin_catalog "$1") || fleet_run_proven_status=$?
+  case $fleet_run_proven_status in
+    0) ;;
+    74) return 74 ;;
+    *) return 75 ;;
+  esac
   printf '%s\n' "$fleet_run_proven" | jq -r '
     .source | if type == "object" then (.sha // "") else "" end' |
-    grep -Eq '^[0-9a-fA-F]{40}$' || return 74
+    grep -Eq '^[0-9a-fA-F]{40}$' || return 76
   printf '%s\n' "$fleet_run_proven"
 }
 
@@ -471,7 +481,10 @@ fleet_run_plugin_identity_matches() {
   # can turn an already-applied item into `nothing`. Return 0 for matching
   # bytes/version, 1 for a reinstall, and 75 when the manager cannot prove the
   # identity — with `fleet_run_identity_reason` naming which proof was missing,
-  # because "identity unavailable" on twenty plugins is not a diagnosis.
+  # because "identity unavailable" on twenty plugins is not a diagnosis. A
+  # proof that failed only because a bounded manager list or verb failed or
+  # timed out is 74 instead (transient), so a caller can retry it rather than
+  # read it as standing.
   #
   # SELF-REPAIR FIRST (§3.5). A catalog that has no entry, or an entry with no
   # SHA, is most often a marketplace that was never registered on a headless
@@ -494,29 +507,42 @@ fleet_run_plugin_identity_matches() {
   # A catalog SHA proves the bytes, not where they came from: a same-name
   # marketplace registered from another repository holds before its catalog
   # is read at all.
-  fleet_run_marketplace_source_ok "$fleet_run_identity_market" || {
+  fleet_run_identity_rc=0
+  fleet_run_marketplace_source_ok "$fleet_run_identity_market" || fleet_run_identity_rc=$?
+  [ "$fleet_run_identity_rc" -eq 0 ] || {
     fleet_run_identity_reason=$fleet_run_repair_reason
-    return 75
+    [ "$fleet_run_identity_rc" -eq 74 ] || return 75
+    return 74
   }
   fleet_run_identity_id="$2@$fleet_run_identity_market"
   fleet_run_identity_rc=0
   fleet_run_repair_reason=
   fleet_run_identity_catalog=$(fleet_run_plugin_catalog_proven \
     "$fleet_run_identity_id") || fleet_run_identity_rc=$?
-  if [ "$fleet_run_identity_rc" -ne 0 ] &&
-    fleet_run_marketplace_repair "$fleet_run_identity_market"; then
-    fleet_run_identity_rc=0
-    fleet_run_identity_catalog=$(fleet_run_plugin_catalog_proven \
-      "$fleet_run_identity_id") || fleet_run_identity_rc=$?
+  fleet_run_identity_repair_rc=0
+  if [ "$fleet_run_identity_rc" -ne 0 ]; then
+    if fleet_run_marketplace_repair "$fleet_run_identity_market"; then
+      fleet_run_identity_rc=0
+      fleet_run_identity_catalog=$(fleet_run_plugin_catalog_proven \
+        "$fleet_run_identity_id") || fleet_run_identity_rc=$?
+    else
+      fleet_run_identity_repair_rc=$?
+    fi
   fi
   case $fleet_run_identity_rc in
     0) ;;
     74)
+      fleet_run_identity_reason=${fleet_run_repair_reason:-"the registered marketplaces cannot be listed to read the $fleet_run_identity_market catalog"}
+      return 74
+      ;;
+    76)
       fleet_run_identity_reason=${fleet_run_repair_reason:-"the $fleet_run_identity_market catalog entry carries no source SHA, even after a refresh"}
+      [ "$fleet_run_identity_repair_rc" -ne 74 ] || return 74
       return 75
       ;;
     *)
       fleet_run_identity_reason=${fleet_run_repair_reason:-"no $fleet_run_identity_market catalog entry for $fleet_run_identity_id, even after re-registering and refreshing the marketplace"}
+      [ "$fleet_run_identity_repair_rc" -ne 74 ] || return 74
       return 75
       ;;
   esac

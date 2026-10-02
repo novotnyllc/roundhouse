@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import { chmodSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
@@ -417,7 +417,12 @@ function catalogPluginsCurrent(root, marketplaceName, installed) {
   for (const record of installed) {
     if (record?.marketplaceName !== marketplaceName || record?.installed === false || record?.enabled !== true) continue;
     const entry = entries.get(record.name);
-    if (!entry) continue;
+    // Removed or renamed upstream: no identity to wait for, and nothing to
+    // say the install is current either.
+    if (!entry) {
+      unconfirmed = true;
+      continue;
+    }
     const source = entry.source;
     if (source && typeof source === "object" && typeof source.sha === "string") {
       if (record.source?.sha !== source.sha) return "pending";
@@ -545,29 +550,89 @@ function runCodexPluginAdd(pluginId, codexExecutable) {
 }
 
 // `codex plugin add` writes the cache under its caller's umask, and 002 (the
-// WSL default) leaves it group-writable. Seal it BEFORE the hook trust write,
-// or a group member could swap a hook in between and have its hash trusted:
-// clear group/other write on every entry (a directory before its listing, so
-// nothing new lands in it), and refuse an entry another user owns.
+// WSL default) leaves it group-writable. Seal it BEFORE any hook is listed
+// for trust or trust is written, or a group member could swap a hook in
+// between and have its hash trusted: clear group/other write on every entry
+// (a directory before its listing, so nothing new lands in it), and refuse
+// (75) an entry another user owns, a cache root that is a symlink or not a
+// directory, and a symlink whose whole chain does not end inside the sealed
+// tree — a link is never followed by the seal, so its target could be bytes
+// that stay mutable. The directories above it, up to CODEX_HOME, are sealed
+// too: through a writable parent a peer could rename the sealed plugin
+// directory and put another in its place. An absent cache is nothing to seal.
 function sealPluginCache(pluginId) {
   if (process.platform === "win32") return;
   const [name, marketplace] = pluginId.split("@");
   const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
   const uid = process.getuid();
+  const refuse = (message) => fail(message, 75);
+  const root = join(codexHome, "plugins", "cache", marketplace, name);
+  let rootStat;
+  try {
+    rootStat = lstatSync(root);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    refuse(`plugin cache cannot be read: ${root}`);
+  }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory() || rootStat.uid !== uid) {
+    refuse(`plugin cache is a symlink, not a directory, or owned by another user: ${root}`);
+  }
+  // Ancestors, top-down: CODEX_HOME itself may be reached through a symlink;
+  // nothing below it may be one.
+  const ancestors = [codexHome, join(codexHome, "plugins"), join(codexHome, "plugins", "cache"),
+    join(codexHome, "plugins", "cache", marketplace)];
+  for (const [index, dir] of ancestors.entries()) {
+    let stat;
+    try {
+      stat = index === 0 ? statSync(dir) : lstatSync(dir);
+    } catch {
+      refuse(`a directory above the plugin cache cannot be read: ${dir}`);
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) refuse(`not a plain directory above the plugin cache: ${dir}`);
+    if (stat.uid !== uid && stat.uid !== 0) refuse(`a directory above the plugin cache is owned by another user: ${dir}`);
+    if (stat.mode & 0o022) {
+      if (stat.uid === uid) {
+        try {
+          chmodSync(dir, stat.mode & 0o7755);
+        } catch {
+          // Checked below.
+        }
+      }
+      if (statSync(dir).mode & 0o022) refuse(`a directory above the plugin cache is writable by others: ${dir}`);
+    }
+  }
+  const base = realpathSync(root);
   const walk = (path) => {
     let stat;
     try {
       stat = lstatSync(path);
     } catch (error) {
       if (error.code === "ENOENT") return;
-      throw error;
+      refuse(`plugin cache entry cannot be read: ${path}`);
     }
-    if (stat.isSymbolicLink()) return;
-    if (stat.uid !== uid) fail(`plugin cache entry is owned by another user: ${path}`);
+    if (stat.isSymbolicLink()) {
+      let to;
+      try {
+        to = realpathSync(path);
+      } catch {
+        refuse(`plugin cache symlink does not resolve: ${path}`);
+      }
+      if (!to.startsWith(base + sep)) refuse(`plugin cache symlink leaves the plugin tree: ${path}`);
+      return;
+    }
+    if (stat.uid !== uid) refuse(`plugin cache entry is owned by another user: ${path}`);
     if (stat.mode & 0o022) chmodSync(path, stat.mode & 0o7755);
-    if (stat.isDirectory()) for (const entry of readdirSync(path)) walk(join(path, entry));
+    if (stat.isDirectory()) {
+      let names;
+      try {
+        names = readdirSync(path);
+      } catch {
+        refuse(`plugin cache directory cannot be listed: ${path}`);
+      }
+      for (const entry of names) walk(join(path, entry));
+    }
   };
-  walk(join(codexHome, "plugins", "cache", marketplace, name));
+  walk(root);
 }
 
 async function main() {
@@ -627,6 +692,9 @@ async function main() {
     // Codex may advance the copy at any moment, and the write records the
     // snapshot's hashes, never whatever is current. Any mismatch is 75 with
     // nothing written.
+    // Sealed before the first listing: a hook a peer could still swap
+    // between this listing and the trust write is not the hook listed.
+    sealPluginCache(pluginId);
     const outcome = await withAppServer(async (server) => {
       const listNow = async () =>
         matchingPluginHooks(validateHooks(await server.request("hooks/list", { cwds: [cwd] }), cwd, pluginId), pluginId);
@@ -696,6 +764,7 @@ async function main() {
     return;
   }
   if (command === "approve") {
+    sealPluginCache(pluginId);
     const hooks = await listHooks(pluginId, cwd, codexExecutable);
     if (!hooks.length) {
       // A hookless plugin is the normal case, not an error: approve means
