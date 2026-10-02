@@ -4,11 +4,9 @@
 > describes the CA-certificate lane, selected only by an explicit
 > `privilege_broker.automation_transport` route in a machine entry. The
 > default privilege lane needs no ceremony: one OS approval per host through
-> `roundhouse privilege-enroll HOST`, then unattended operation (Linux and
-> WSL apt work in this version; the macOS and Windows lanes follow). See
+> `roundhouse privilege-enroll HOST`, then unattended operation. See
 > `docs/specs/2026-10-01-hands-off-privilege-lane.md` in the repository.
-> Nothing below is required to add a Linux or WSL host or to run its
-> privileged package work.
+> Nothing below is required to add a host or to run privileged package work.
 
 
 This reference covers the owner-operated path from node identity preparation

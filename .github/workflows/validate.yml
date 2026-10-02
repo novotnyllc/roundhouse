@@ -342,6 +342,7 @@ jobs:
             "plugins/roundhouse/scripts/privilege-broker-windows.ps1",
             "plugins/roundhouse/scripts/profile-worker-windows.ps1",
             "plugins/roundhouse/scripts/register-profile-task-windows.ps1",
+            "plugins/roundhouse/scripts/privilege-lane-windows.ps1",
             "plugins/roundhouse/scripts/windows-native-canary-runner.ps1"
           )
           foreach ($script in $scripts) {
