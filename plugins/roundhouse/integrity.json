@@ -58,7 +58,7 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "fdae1b63153056e2b6d42a326d99b692c33289e9f4c4a99301a473ab58dcb684"
+      "sha256": "035c9315c1614653173ea23999c1c6655ecb1ee91dcda78073815d78781d05be"
     },
     {
       "path": "scripts/collect-windows.ps1",
@@ -146,7 +146,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "e2c6bc449032250c7339017d6126a552a25814418bfa85734d0a1dc8fc71113c"
+      "sha256": "7c0eee6aaae7ad5ac9a5dea9ffd93e10f382ae64df0746e95d9ef020139d745a"
     },
     {
       "path": "scripts/lib/fleet-store.sh",

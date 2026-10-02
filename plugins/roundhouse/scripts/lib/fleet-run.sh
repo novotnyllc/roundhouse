@@ -588,10 +588,19 @@ fleet_run_batch_flush() {
       while IFS="$fleet_run_sep" read -r fleet_run_flush_item fleet_run_flush_rest; do
         printf 'roundhouse: could not record %s in applied/%s.yaml; the item is applied but unowned\n' \
           "$fleet_run_flush_item" "$2" >&2
-        fleet_alert_write "$1" "$2" record-write \
-          "record-write-$(printf '%s' "$fleet_run_flush_item" | tr './' '--')" \
-          "applied/$2.yaml could not be updated for $fleet_run_flush_item" \
-          "$fleet_run_flush_item" || :
+        # Through the pass's ledger when there is one: the item was already
+        # noted `checked`, so a bare write would be swept at the end of the pass.
+        if [ -n "${run_ledger:-}" ]; then
+          fleet_alert_raise "$run_ledger" "$1" "$2" record-write \
+            "record-write-$(printf '%s' "$fleet_run_flush_item" | tr './' '--')" \
+            "applied/$2.yaml could not be updated for $fleet_run_flush_item" \
+            "$fleet_run_flush_item" || :
+        else
+          fleet_alert_write "$1" "$2" record-write \
+            "record-write-$(printf '%s' "$fleet_run_flush_item" | tr './' '--')" \
+            "applied/$2.yaml could not be updated for $fleet_run_flush_item" \
+            "$fleet_run_flush_item" || :
+        fi
       done <"$fleet_run_batch/applied"
     fi
     : >"$fleet_run_batch/applied"

@@ -2095,9 +2095,15 @@ if has_section packages; then
         # version: under fnm a Node upgrade moves every global to a new
         # prefix, so a plan sealed against the old one must not verify.
         if npm_bin=$(npm_global_bin_dir); then
+          query_reset
           npm_node_version=$(PATH="$npm_bin:$PATH" bounded_query "$npm_bin/node" --version 2>/dev/null </dev/null |
             head -1 | clip) || npm_node_version=
           npm_prefix=$(npm_global_prefix | clip) || npm_prefix=
+          # A timed-out Node or prefix query leaves the globals' owner unknown:
+          # the whole npm inventory is then unknown, never a record with a null
+          # prefix that a sealed plan could bind to.
+          npm_runtime_timeout=false
+          [ ! -s "$run_bounded_log" ] || npm_runtime_timeout=true
           npm_candidates=null
           npm_candidate_confidence=high
           query_reset
@@ -2109,7 +2115,7 @@ if has_section packages; then
               "$(query_errors candidate_query_failed 'npm outdated inventory failed')"
           fi
           query_reset
-          if npm_installed=$(npm_global_list); then
+          if [ "$npm_runtime_timeout" = false ] && npm_installed=$(npm_global_list); then
             # A configured updater is reported only once it is proven to be
             # a bin of the installed package itself; the executor re-proves
             # it before running anything. An unproven one is marked on the
@@ -2158,6 +2164,7 @@ NPM_UPDATERS
                   evidence:[{source:"package-manager",method:"npm-ls-global+outdated"}],errors:[]}'
           else
             npm_installed=
+            [ "$npm_runtime_timeout" = false ] || printf 'npm runtime\n' >>"$run_bounded_log"
             emit error packages:npm unavailable high '{}' '[]' \
               "$(query_errors manager_query_failed 'npm global inventory failed')"
           fi
