@@ -3534,9 +3534,15 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   # all of them (full), are refreshed BEFORE the plan, so this pass's identity
   # comparison sees the new catalog and updates the plugin items it owns
   # (lib/fleet-plugins.sh). The stamp keeps the full pass from refreshing
-  # them a second time.
-  fleet_plugins_refresh "$run_store" "$run_host" "$run_fold" "$run_defs" \
-    "$run_mode" "$run_tmp" "$run_desired" || :
+  # them a second time. On conflicted heads the fold and definitions are the
+  # first head's alone, so a plugin another head owns would read as unowned and
+  # be updated in place past its hold: the refresh waits for the resolution.
+  if [ "$run_state" = conflicted ]; then
+    printf '  hold  plugins — conflicted heads; the marketplace refresh waits for the resolution\n'
+  else
+    fleet_plugins_refresh "$run_store" "$run_host" "$run_fold" "$run_defs" \
+      "$run_mode" "$run_tmp" "$run_desired" || :
+  fi
   : >"$run_tmp/plugins-refreshed"
 
   # The pass's whole item set, for the sweep's retired-item rule.

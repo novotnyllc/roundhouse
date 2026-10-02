@@ -308,6 +308,12 @@ SH
     cli_function_body fleet_run_pass | tr -d '\\\n' |
       grep -Fq '"$run_mode" "$run_tmp" "$run_desired"' ||
       fail "the pass does not name its tombstones to the plugin refresh"
+    # On conflicted heads the fold is the first head's alone, so the refresh
+    # (and its in-place updates of plugins it reads as unowned) waits for the
+    # resolution rather than run past another head's hold.
+    cli_function_body fleet_run_pass | tr -d '\\\n' |
+      grep -Eq 'if \[ "\$run_state" = conflicted \]; then +printf .  hold  plugins — conflicted heads.*else +fleet_plugins_refresh' ||
+      fail "the pass refreshes plugins on conflicted heads, past another head's hold"
 
     # --- Claude: plugins the fleet does not own are updated in place ---
     pc_sha_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
