@@ -3559,7 +3559,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
           run_retry_owed=true
         run_holds_grew=true
         fleet_run_apply_held "$run_store" "$run_host" "$run_defs" "$run_item" \
-          "$run_category" "$run_digest" "$run_status" "$run_tmp" "$run_now" || {
+          "$run_category" "$run_digest" "$run_status" "$run_tmp" "$run_now" "$run_managers" || {
           fleet_run_batch_close "$run_store" "$run_host"
           exit 65
         }
@@ -3965,7 +3965,7 @@ fleet_run_hold_owes_retry() {
 }
 
 fleet_run_apply_held() {
-  # fleet_run_apply_held STORE HOST DEFS ITEM CATEGORY DIGEST STATUS TMP NOW —
+  # fleet_run_apply_held STORE HOST DEFS ITEM CATEGORY DIGEST STATUS TMP NOW MANAGERS —
   # the run loop's answer to an apply that neither applied (0) nor was
   # satisfied (70): the run-local hold the full cadence consumes, the alert
   # that names why, the `held` journal entry, and the line. STATUS 73 is a
@@ -3979,7 +3979,7 @@ fleet_run_apply_held() {
   [ "$7" -ne 75 ] || [ "$5" != packages ] ||
     fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-hold \
       "package-hold-$(printf '%s' "$4" | tr './' '--')" \
-      "no package manager on this host can provide $4" "$4" ||
+      "$(lane_package_hold_detail "$4" "$2" "$(fleet_run_resolve_package "$3" "${4#packages.}" "${10}" 2>/dev/null | jq -r '.manager // "none"')")" "$4" ||
     :
   [ "$7" -ne 73 ] || [ "$5" != packages ] ||
     fleet_alert_raise "$8/alert-ledger" "$1" "$2" package-deferred \
@@ -4267,6 +4267,10 @@ fleet_run_full_pass() (
   # current by this pass — that is what anyone gets by doing nothing — and a
   # `version:` key opts one package out. Skipping the pinned ones is not an
   # optimisation; running them would quietly undo the pin.
+  # The privilege-lane alert is a keyed condition: say the pass looked, so an
+  # alert raised earlier clears on the first pass after the approval even
+  # when no apt package remains to route.
+  [ -z "$full_hold_dir" ] || fleet_alert_checked "$full_hold_dir/alert-ledger" privilege-lane '*'
   full_npm_queried=false
   full_npm_outdated='{}'
   # The per-package questions — held?, pinned?, how does it resolve? — asked
@@ -4370,9 +4374,14 @@ EOF
             printf 'roundhouse: npm global %s did not reach %s\n' \
               "$full_npm_name" "$full_npm_latest" >&2
           ;;
-        # A manager with no user-space update path (apt needs root, and
-        # roundhouse never uses sudo) is reported, never silently skipped —
-        # the same answer fleet_install_package gives at install time.
+        # Root work rides the local privilege lane once this host has had
+        # its one approval; before it the package holds and the pass raises
+        # the one-time-approval alert once. A scheduled run never prompts.
+        apt) lane_fleet_run_apt "$full_store" "$full_host" "$full_package" \
+          "$(printf '%s\n' "$full_resolved" | jq -r '.name')" "$full_hold_dir" || : ;;
+        # A manager with no user-space update path is reported, never
+        # silently skipped — the same answer fleet_install_package gives at
+        # install time.
         *) printf '  hold  packages.%s — %s has no user-space update path\n' \
           "$full_package" "$full_manager" ;;
       esac

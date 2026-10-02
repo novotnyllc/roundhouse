@@ -314,7 +314,8 @@ assert_contains "$fleet_update_text" 'a second run finds the lock
 held and exits 0 without acting'
 assert_contains "$fleet_update_text" 'Exit 75 is the STALE-lock refusal'
 assert_contains "$fleet_update_text" 'whose `meta.json` is missing so its age cannot be read'
-assert_contains "$fleet_update_text" 'Unattended runs skip protected/privileged actions'
+assert_contains "$fleet_update_text" 'Unattended runs route privileged package work through the
+host'
 assert_contains "$fleet_update_text" 'After every plugin `install`, `update`, or `enable` operation'
 assert_contains "$fleet_update_text" 'scripts/codex-plugin-hooks.ps1 approve PLUGIN@MARKETPLACE'
 assert_contains "$fleet_update_text" '$SHELL -lc'

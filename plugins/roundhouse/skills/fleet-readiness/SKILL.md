@@ -65,10 +65,26 @@ harness can stage them over SSH/SFTP (broker pickup within one minute), and
 only the in-session cache install and hook-trust convergence still needs the
 Codex task surface.
 
+Privileged apt work on Linux and WSL rides the **privilege lane**: a
+root-owned helper behind an owner-only queue on each host, reached over the
+same ordinary transport (local shell or SSH as the user) after the host's
+single OS approval. `fleet-readiness` prints one `privilege-lane` row per
+host from the raw state `roundhouse privilege-lane-status HOST OUT` reports:
+`ready` → `ok`; `needs_one_time_approval` → `PENDING` with the exact command
+(`roundhouse privilege-enroll HOST`), and ordinary work proceeds without it;
+`unreachable` → `PENDING`; `disabled` and `legacy` → `ok`; `unsupported`
+(macOS and native Windows in this version) → `ok  not yet supported`; and
+`drifted` → a finding, the only one, because an enrolled lane is broken.
+`partial` and `rejected` are operation-result states on a lane result, never
+readiness states. `roundhouse privilege-status HOST OUT` returns the same
+state as a `privilege_broker`/`readiness` record for the sealed-plan verbs.
+
 For macOS, report a separate root-broker state only when readiness advertises
 the owner-enrolled, default-disabled `macos.install-signed-pkg.v1` or
-`macos.apply-system-setting.v1` action. SSH is not elevation; root Homebrew,
-arbitrary `sudo`, installer scripts, and arbitrary plist paths are unsupported.
+`macos.apply-system-setting.v1` action of the optional CA lane; the privilege
+lane's own macOS action is not in this version. SSH is not elevation; root
+Homebrew, arbitrary `sudo`, installer scripts, and arbitrary plist paths are
+unsupported.
 
 Report the exact configured nodes checked, requirements, evidence, changes,
 unknowns, and any restart or saved-project action still required. When the

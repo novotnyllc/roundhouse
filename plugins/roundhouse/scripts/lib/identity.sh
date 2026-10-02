@@ -201,6 +201,11 @@ privilege_status_command() {
   transport=$(jq -r --arg target "$target" '.machines[$target].transport // empty' "$config")
   route=$(jq -r --arg target "$target" \
     '.machines[$target].privilege_broker.automation_transport.mode // empty' "$config")
+  # The hands-off default: no explicit route means the local privilege lane.
+  if [ -z "$route" ] && [ "$(lane_route "$target")" != unsupported ]; then
+    lane_readiness_snapshot "$target" "$output"
+    return
+  fi
   if { [ "$platform" = linux ] || [ "$platform" = macos ]; } &&
     [ "$transport:$route" = ssh:posix-ssh ]; then
     posix_dispatch_readiness_snapshot "$target" "$output"
@@ -220,6 +225,10 @@ verify_privilege_plan_command() {
   plan=$1
   snapshot=$2
   require_jq
+  if plan_is_lane "$plan"; then
+    verify_lane_plan "$plan" "$snapshot"
+    return
+  fi
   jq -e '.schema_version == 3 or .schema_version == 4' "$plan" >/dev/null 2>&1 || {
     printf 'roundhouse: verify-privilege-plan requires a sealed privilege plan\n' >&2
     return 64
@@ -232,6 +241,10 @@ submit_privilege_plan_command() {
   confirmation=$2
   output=$3
   require_jq
+  if plan_is_lane "$plan"; then
+    apply_lane_plan "$plan" "$confirmation" "$output"
+    return
+  fi
   jq -e '.schema_version == 3 or .schema_version == 4' "$plan" >/dev/null 2>&1 || {
     printf 'roundhouse: submit-privilege-plan requires a sealed privilege plan\n' >&2
     return 64
@@ -269,6 +282,37 @@ prepare_privilege_enrollment_command() (
     '.machines[$target].privilege_broker.automation_transport.mode // "not-configured"' "$config")
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-enrollment-prepare.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  # Only an unconfigured route consults the lane: an explicit route keeps the
+  # legacy preparation below without the lane unit being loaded at all.
+  lane=not-applicable
+  [ "$route" != not-configured ] || lane=$(lane_route "$target")
+  if [ "$route" = not-configured ] && { [ "$lane" = local ] || [ "$lane" = disabled ]; }; then
+    # The hands-off lane: one OS approval, triggered by `privilege-enroll`,
+    # and nothing else. The preparation names that command and the state.
+    lane_status_command "$target" "$tmp/lane-status.json" >/dev/null 2>&1 || :
+    jq -S --arg target "$target" --arg platform "$platform" '{
+      schema:"roundhouse.privilege-enrollment-preparation",schema_version:1,
+      target:$target,platform:$platform,route:"local-lane",
+      state:(if .state | IN("ready","disabled","drifted","unreachable")
+             then .state else "needs_one_time_approval" end),
+      reason:(if .state == "ready" then "lane_enrolled" elif .state == "disabled" then "privilege_lane_disabled"
+              elif .state == "drifted" then "lane_drifted_re_enroll" elif .state == "unreachable" then "host_unreachable"
+              else "one_os_approval_required" end),
+      lane_state:.state,detail:.detail,activation_performed:false,
+      credential_handling:"agent_never_requests_or_relays_a_password_or_administrator_credential",
+      fixed_entrypoints:[{path:"scripts/privilege-lane-posix",mode:"enroll",elevation:"single_sudo"}],
+      required_public_artifacts:["release-integrity"],
+      next_action:(if .state | IN("ready","disabled") then "none"
+                   elif .state == "unreachable" then "restore_reachability_and_retry"
+                   else "run_roundhouse_privilege_enroll" end),
+      next_command:(if .state | IN("ready","disabled","unreachable") then "-"
+                    else ("roundhouse privilege-enroll " + $target) end)
+    }' "$tmp/lane-status.json" >"$tmp/preparation"
+    safe_output "$tmp/preparation" "$output"
+    trap - EXIT HUP INT TERM
+    rm -rf "$tmp"
+    return 0
+  fi
   case $platform:$route in
     wsl:*)
       jq -S -n --arg target "$target" --arg route "$route" '{

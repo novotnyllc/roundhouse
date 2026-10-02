@@ -1,5 +1,16 @@
 # Automation SSH identity
 
+> **Optional high-assurance mode — not the default.** This reference
+> describes the CA-certificate lane, selected only by an explicit
+> `privilege_broker.automation_transport` route in a machine entry. The
+> default privilege lane needs no ceremony: one OS approval per host through
+> `roundhouse privilege-enroll HOST`, then unattended operation (Linux and
+> WSL apt work in this version; the macOS and Windows lanes follow). See
+> `docs/specs/2026-10-01-hands-off-privilege-lane.md` in the repository.
+> Nothing below is required to add a Linux or WSL host or to run its
+> privileged package work.
+
+
 Privileged fleet planning uses a node-local identity file separate from the
 portable fleet configuration. Set `ROUNDHOUSE_IDENTITY`, or create
 `identity.json` beside the default `config.json`. Keep it outside repositories,

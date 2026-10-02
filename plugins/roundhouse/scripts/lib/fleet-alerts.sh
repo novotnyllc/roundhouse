@@ -81,6 +81,7 @@ integrity              condition  item
 config-key-collision   condition  item
 chezmoi-coownership    condition  item
 package-hold           condition  item
+privilege-lane         condition  item
 enabled-but-untrusted  condition  item
 record-write           condition  item
 identity-unavailable   condition  item

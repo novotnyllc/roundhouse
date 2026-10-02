@@ -30,6 +30,9 @@ Usage:
   roundhouse approve-codex-plugin-hooks PLUGIN@MARKETPLACE
   roundhouse update-codex-plugin PLUGIN@MARKETPLACE
   roundhouse privilege-status TARGET OUTPUT.jsonl|-
+  roundhouse privilege-enroll TARGET
+  roundhouse privilege-lane-status TARGET OUTPUT.json|-
+  roundhouse privilege-lane-path
   roundhouse prepare-privilege-identity FLEET-DOMAIN NODE-ID ENDPOINT-PRINCIPALS SOURCE-CIDRS OUTPUT|-
   roundhouse prepare-privilege-enrollment TARGET OUTPUT.json|-
   roundhouse record-codex-readiness SNAPSHOT.jsonl METADATA.json OUTPUT.jsonl
@@ -113,6 +116,8 @@ EOF
 . "$script_dir/lib/broker-posix.sh"
 # shellcheck source=lib/interop.sh
 . "$script_dir/lib/interop.sh"
+# shellcheck source=lib/lane.sh
+. "$script_dir/lib/lane.sh"
 # shellcheck source=lib/apply-commands.sh
 . "$script_dir/lib/apply-commands.sh"
 # shellcheck source=lib/fleet-store.sh
@@ -203,6 +208,9 @@ case $command in
     codex_plugin_hooks_command update "$1"
     ;;
   privilege-status) [ $# -eq 2 ] || usage; privilege_status_command "$1" "$2" ;;
+  privilege-enroll) [ $# -eq 1 ] || usage; privilege_enroll_command "$1" ;;
+  privilege-lane-status) [ $# -eq 2 ] || usage; lane_status_command "$1" "$2" ;;
+  privilege-lane-path) [ $# -eq 0 ] || usage; printf '%s\n' "$script_dir/privilege-lane-posix" ;;
   prepare-privilege-identity)
     [ $# -eq 5 ] || usage
     prepare_privilege_identity_command "$1" "$2" "$3" "$4" "$5"

@@ -42,6 +42,7 @@ jobs:
           bash -n plugins/roundhouse/scripts/git-merge-plugin-version
           bash -n plugins/roundhouse/scripts/preflight
           bash -n plugins/roundhouse/scripts/privilege-broker-posix
+          bash -n plugins/roundhouse/scripts/privilege-lane-posix
           bash -n plugins/roundhouse/scripts/test-roundhouse
           bash -n plugins/roundhouse/scripts/update-integrity
           for unit in plugins/roundhouse/scripts/lib/*.sh \
@@ -65,6 +66,7 @@ jobs:
             shellcheck --severity=warning -x -P SCRIPTDIR \
               plugins/roundhouse/scripts/roundhouse \
               plugins/roundhouse/scripts/collect-posix \
+              plugins/roundhouse/scripts/privilege-lane-posix \
               plugins/roundhouse/scripts/launcher-install \
               plugins/roundhouse/scripts/test-roundhouse \
               plugins/roundhouse/scripts/update-integrity

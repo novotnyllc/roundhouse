@@ -325,6 +325,8 @@ validate_config_file() {
       ([.package_managers[]? | IN("homebrew","linuxbrew","apt","winget","npm")] | all) and
       (if any(.package_managers[]?; . == "winget") then .platform == "windows" else true end) and
       (if any(.package_managers[]?; . == "apt") then (.platform == "linux" or .platform == "wsl") else true end) and
+      # The hands-off lane is on by default; a machine opts out explicitly.
+      ((.privilege_lane // null) == null or (.privilege_lane | IN("enabled","disabled"))) and
       ((.privilege_broker // null) == null or
         ((.privilege_broker | type == "object") and
          ([.privilege_broker | keys[] | select(IN("automation_transport","policy_proposal") | not)] | length == 0) and

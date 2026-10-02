@@ -26,7 +26,8 @@ policy.
   app upgrade (including Visual Studio Code when its destination is writable)
   follows Homebrew normally. A cask package that reaches Homebrew's hardcoded
   `sudo` succeeds only when it byte-matches an active exact
-  `sealed-cask-payload-v1` enrollment; other privileged artifacts fail closed.
+  `sealed-cask-payload-v1` enrollment on the optional CA lane; otherwise it
+  holds (see "Protected package actions").
 - APT: on an update request, `apt-get update` then plan with
   `apt-get --simulate upgrade`. Do not use `full-upgrade`, `dist-upgrade`, or
   `autoremove` unless explicitly selected.
@@ -402,51 +403,55 @@ whose `meta.json` is missing so its age cannot be read — and it names the
 recovery rather than forcing. `roundhouse fleet-unlock` releases a lock by hand, and refuses while a
 verified-live run holds it unless given `--force`; `roundhouse fleet-lock` marks
 its lock `manual`, which is never judged dead (the age rule governs it), and also
-exits 75 when the lock is already held. Unattended runs skip protected/privileged actions — those
-stay interactive by design. Failures land in the store's own alert and journal
-records and surface in `roundhouse fleet-pending` and `roundhouse fleet-doctor`.
+exits 75 when the lock is already held. Unattended runs route privileged package work through the
+host's enrolled privilege lane (the fast pass installs a missing apt package,
+the full pass refreshes apt metadata and upgrades each unpinned package to
+its candidate); on a host that has not had its one-time approval the run
+keeps the hold and raises a `privilege-lane` alert naming
+`roundhouse privilege-enroll HOST` — a scheduled run never prompts. Failures
+land in the store's own alert and journal records and surface in
+`roundhouse fleet-pending` and `roundhouse fleet-doctor`.
 
 ## Protected package actions
 
-When readiness advertises an active protected action-context pair, select only
-the repository-defined semantic action already present there:
-`apt.update-metadata.v1`, `apt.install-package-version.v1`,
-`apt.upgrade-package.v1`, `apt.autoremove.v1`,
-`macos.install-signed-pkg.v1`, `macos.apply-system-setting.v1`,
-`winget.inventory-machine.v1`, `winget.install-machine-package.v1`, or
-`winget.upgrade-machine-package.v1`. WinGet is required for V1 Windows
-machine-package work; it is also the only lane for a machine-scope Node.js
-(`OpenJS.NodeJS`) upgrade, within the channel its policy token enrolls. macOS actions are owner-enrolled and default-disabled;
-use them only when readiness advertises the exact active action. Never use root
-Homebrew, arbitrary `sudo`, arbitrary installer scripts, or arbitrary plist
-paths. `sealed-cask-payload-v1` is the sole scripted-package exception: it
-authorizes one exact owner-enrolled Apple-signed package and still invokes only
-the fixed broker installer action. During a normal `homebrew-cask:*` apply,
-Homebrew remains the ordinary-user transaction owner and writes its own
-Caskroom metadata. A human-enrolled `macos-cask-app` record may bind the cask
-token to one existing `/Applications/<Name>.app`; the typed broker prepares
-only that non-symlink tree for the enrolled UID, then Homebrew replaces it as
-the ordinary user. For package casks, the root bridge ignores Homebrew's
-submitted package path after matching its bytes and executes the protected
-artifact instead. It does not authorize unenrolled app targets, package
-receipt-pattern deletion, installer choices, or any other Homebrew sudo shape; those return
-`unsupported_homebrew_cask_privilege_boundary`. Never add argv, executable,
-source, installer, dependency, environment, shell, or elevation controls to a
-protected request; WinGet source dependency selection remains delegated to the
-attested provider.
+Privileged package work goes through the host's **privilege lane** — a
+root-owned helper behind an owner-only queue, enrolled by one OS
+approval (`roundhouse privilege-enroll HOST`) and never by a ceremony. The
+catalog is closed and semantic; a request carries a package token and a
+version, never argv, an executable, an installer selector, an environment, a
+shell, or an elevation control:
 
-Run `"$CLI" privilege-status HOST SNAPSHOT`, seal the semantic action, use
-`verify-privilege-plan` immediately before `submit-privilege-plan`, and use
-`lookup-privilege-result PLAN INDEX OUTPUT` for recovery without resubmission.
-The shared Codex/Claude lifecycle vocabulary is
-`prepare-privilege-identity`, `prepare-privilege-enrollment`,
-`preview-privilege-upgrade`, and `preview-privilege-revocation`. Preserve
-`needs_enrollment`, `drifted`, `transport_unavailable`,
-`unsupported_context`, `unsupported_security_boundary`, `partial`, and
-`stale`; perform no fallback. Never ask for or relay a sudo or Administrator password.
-Human enrollment, upgrade, activation, and revocation stop at the local
-password/UAC boundary; on macOS that is owner-local interactive elevation, not
-an SSH fallback.
+| Platform | Actions |
+| --- | --- |
+| linux, wsl | `apt.update-metadata.v1`, `apt.upgrade-package.v1` (package, candidate version), `apt.install-package-version.v1`, `apt.autoremove.v1`, `lane.probe.v1` |
+| macos, windows | none in this version: readiness reports the lane as `not yet supported`, and machine-scope winget or signed macOS package work holds unless the host has the optional CA lane configured (`privilege_broker.automation_transport`), whose own `winget.*` / `macos.*` actions and vocabulary then apply |
+
+User-scope winget packages, fnm/Node and profile configuration are not lane
+work: they run in the ordinary lane as the user. Never use root Homebrew,
+arbitrary `sudo`, arbitrary installer scripts, or arbitrary plist paths;
+Homebrew cask steps that reach Homebrew's own `sudo` are not routed through
+the lane in this version and hold.
+
+To drive it from a plan: `"$CLI" privilege-status HOST SNAPSHOT` (a
+`privilege_broker`/`readiness` record whose `lifecycle_status` must be
+`ready`), append the package records the plan depends on, seal a lane draft
+(`{"domain":"updates","target":HOST,"lane":"local","operations":[{"type":
+"semantic-action","kind":"privileged_action","id":ACTION,"package":…,
+"version":…,"source":…}]}`) with `seal-plan`, run `verify-privilege-plan`
+immediately before `submit-privilege-plan`, and use
+`lookup-privilege-result PLAN INDEX OUTPUT` for recovery without
+resubmission: every operation carries a sealed request id that the host
+accepts exactly once. `prepare-privilege-enrollment HOST OUT` reports
+`ready`, `needs_one_time_approval` with the exact command, `disabled`,
+`drifted`, or `unreachable`; `prepare-privilege-identity`,
+`preview-privilege-upgrade`, and `preview-privilege-revocation` belong to
+the optional CA lane and are not needed here. Preserve the readiness states
+`ready`, `needs_one_time_approval`, `disabled`, `legacy`, `unsupported`,
+`drifted`, and `unreachable`, and the operation-result states `partial` and
+`rejected`, exactly; perform no fallback.
+Never ask for or relay a sudo or Administrator password: the one approval is
+typed by the owner at the host's own prompt, and the agent's job
+when it is missing is to report `needs_one_time_approval` and the command.
 After a Roundhouse plugin install or update on POSIX, run
 `roundhouse launcher-install ~/.local/bin/roundhouse` so the maintained
 launcher is refreshed from the installed plugin and selects the highest

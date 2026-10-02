@@ -565,6 +565,10 @@ verify_preconditions_command() {
   require_jq
   check_mutation_config
   check_private_owned_file "$plan" "apply plan"
+  if plan_is_lane "$plan"; then
+    verify_lane_plan "$plan" "$snapshot"
+    return
+  fi
   if jq -e '.schema_version == 4' "$plan" >/dev/null 2>&1; then
     verify_mixed_privileged_preconditions_command "$plan" "$snapshot"
     return

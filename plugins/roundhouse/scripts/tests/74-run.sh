@@ -128,8 +128,9 @@ JSON
     for run_readiness_host in readiness-a readiness-b readiness-c; do
       grep -Fqx "$run_readiness_host" "$run_readiness_calls" ||
         fail "readiness never called ssh_run for $run_readiness_host"
-      [ "$(grep -Fc "$run_readiness_host" "$run_readiness_calls")" -eq 2 ] ||
-        fail "readiness did not complete both SSH probes for $run_readiness_host"
+      # tools/identity, remote posture, and the privilege-lane status probe.
+      [ "$(grep -Fc "$run_readiness_host" "$run_readiness_calls")" -eq 3 ] ||
+        fail "readiness did not complete all three SSH probes for $run_readiness_host"
     done
     )
 
@@ -298,15 +299,17 @@ SH
         "$run_root/layers" "$run_root/package-open-tmp" >/dev/null
       grep -Fqx 'upgrade example' "$run_package_upgrade_marker" ||
         fail "full cadence skipped a linuxbrew package instead of upgrading it"
-      # apt has no user-space update path: the pass says so rather than
-      # skipping silently, and runs nothing.
+      # apt needs root: without the privilege lane's one-time approval the
+      # pass says so (naming the command) rather than skipping silently, and
+      # runs nothing. This host has no enrolled lane.
       : >"$run_package_upgrade_marker"
-      run_apt_out=$(fleet_run_full_pass "$run_store" vireo \
+      run_apt_out=$(ROUNDHOUSE_LANE_FIXTURE_ROOT="$run_root/no-lane" ROUNDHOUSE_LANE_FIXTURE_PLATFORM=linux \
+        fleet_run_full_pass "$run_store" vireo \
         '{"packages":{"example":"enabled"},"package_managers":["apt"]}' \
         '{"packages":{"example":{"apt":"example"}}}' \
         "$run_root/layers" "$run_root/package-open-tmp")
       printf '%s\n' "$run_apt_out" |
-        grep -Fq 'hold  packages.example — apt has no user-space update path' ||
+        grep -Fq 'hold  packages.example — apt needs the local privilege lane; run: roundhouse privilege-enroll vireo' ||
         fail "full cadence silently skipped an apt package instead of reporting the hold"
       [ ! -s "$run_package_upgrade_marker" ] ||
         fail "full cadence ran brew for an apt-resolved package"
