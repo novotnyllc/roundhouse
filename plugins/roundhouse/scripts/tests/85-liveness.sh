@@ -120,7 +120,7 @@ if [ -n "$fleet_fixture_yq" ]; then
     fleet_journal_append "$live_store" robin \
       "$(jq -cn --arg at "$(live_at 27.5)" '{item:"plugins.x",digest:"d",outcome:"held",at:$at}')"
     live_out=$(fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" \
-      /dev/null "$live_fold" "$live_now")
+      /dev/null "$live_fold" "$live_now" scanned-rev)
     [ "$live_out" = 'stale robin' ] ||
       fail "the stale-host scan did not name exactly the silent host: $live_out"
     live_alert=$(find "$live_store/alerts/vireo" -name 'stale-host--robin.yaml' | head -1)
@@ -136,6 +136,25 @@ if [ -n "$fleet_fixture_yq" ]; then
     case $(yq -r '.detail' "$live_alert") in
       *"$(live_at 28)"*) fail "the stale-host detail carries the moving cutoff" ;;
     esac
+    # The scan tells the poll floor when it is next owed: when wren, heard
+    # from at 39h, ages past the 12h window, and whenever robin (silent) or
+    # newbie (never heard) journals again. Fetching the very commit the scan
+    # read isolates the time half; tests/93-jj-run.sh drives the records half.
+    live_state="$(fleet_run_state_dir)/liveness.json"
+    [ "$(jq -c '.watch | sort' "$live_state")" = '["newbie","robin"]' ] ||
+      fail "the scan did not watch exactly the silent and never-heard peers: $(cat "$live_state")"
+    live_due=$(jq -rn --arg at "$(live_at $((39 + 12)))" '$at | fromdateiso8601')
+    [ "$(jq -r '.due' "$live_state")" = "$live_due" ] ||
+      fail "the scan's next-owed instant is not wren's heartbeat plus the window: $(cat "$live_state")"
+    ! fleet_liveness_owed "$live_store" scanned-rev "$((live_due - 1))" ||
+      fail "the floor was told the scan is owed before any heard peer can age out"
+    fleet_liveness_owed "$live_store" scanned-rev "$live_due" ||
+      fail "the floor was not told the scan is owed once a heard peer ages out (a quiet floor hides a stale peer)"
+    cp "$live_state" "$live_state.saved"
+    rm -f "$live_state"
+    fleet_liveness_owed "$live_store" scanned-rev "$((live_due - 1))" ||
+      fail "missing liveness state did not read as owed"
+    mv "$live_state.saved" "$live_state"
     # One keyed alert per silence: the next pass leaves it exactly as it is.
     live_before=$(cat "$live_alert")
     fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" /dev/null \
@@ -191,6 +210,21 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ -z "$(fleet_liveness_alerts "$live_store" vireo "$live_root/hosts" /dev/null \
       '{"policy":{"liveness_alert_hours":0}}' "$(live_at 70)")" ] ||
       fail "liveness_alert_hours: 0 did not disable the stale-host alert"
+    # The scan above recorded nothing to owe, whatever the clock or the remote.
+    ! fleet_liveness_owed "$live_store" another-rev "$(jq -rn --arg at "$(live_at 999)" '$at | fromdateiso8601')" ||
+      fail "a disabled stale-host check still kept the poll floor open"
+    # A heartbeat stamped with fractional seconds or an offset passes the
+    # scan's string compare, so its deadline is kept, not dropped: the floor
+    # must still come back when it ages out. (Last: this scan's roster clears
+    # every other peer's alert.)
+    printf 'vireo\nlark\n' >"$live_root/hosts-lark"
+    fleet_journal_append "$live_store" lark \
+      "$(jq -cn --arg at "$(live_at 45 | sed 's/Z$/.250Z/')" '{outcome:"alive",at:$at}')"
+    fleet_liveness_alerts "$live_store" vireo "$live_root/hosts-lark" /dev/null \
+      "$live_fold" "$(live_at 46)" scanned-rev >/dev/null
+    [ "$(jq -r '.due' "$(fleet_run_state_dir)/liveness.json")" = \
+      "$(jq -rn --arg at "$(live_at $((45 + 12)))" '$at | fromdateiso8601')" ] ||
+      fail "a heartbeat with fractional seconds left no deadline: $(cat "$(fleet_run_state_dir)/liveness.json")"
     # The policy defaults carry both keys, so a store with no policy block runs
     # the documented 6h/12h.
     [ "$(fleet_policy_int '{}' heartbeat_publish_hours)" = 6 ] ||

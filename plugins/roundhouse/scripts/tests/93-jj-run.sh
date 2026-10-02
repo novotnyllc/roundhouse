@@ -535,6 +535,25 @@ YAML
     esac
     [ "$(fleet_vcs_head_origin "$vireo")" = "$runjj_origin_before" ] ||
       fail "the poll floor moved main@origin, dropping the skipped commits out of the next pass's §7.7 range"
+    # §6.3: the same record-only commit IS work when it can end a silence.
+    # Had vireo's last scan found wren silent, wren's journal in it is the
+    # recovery that would otherwise leave the stale-host alert standing.
+    runjj_live="$rjj/vireo/store.run/liveness.json"
+    [ -s "$runjj_live" ] || fail "the converging pass recorded no stale-host scan state"
+    cp "$runjj_live" "$runjj_live.saved"
+    runjj_live_set() { jq -c "$1" "$runjj_live.saved" >"$runjj_live"; }
+    runjj_live_set '.watch = ["wren"]'
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor sat out a silent peer's record-only commit (its stale-host alert would outlive the recovery)"
+    # A watched peer the new commits do not touch is not work…
+    runjj_live_set '.watch = ["no-such-peer"]'
+    runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "a watched peer with no new journal kept the poll floor open"
+    # …and neither is time, until a heard peer ages out of the window.
+    runjj_live_set '.due = 0'
+    ! runjj_lib vireo fleet_run_poll_floor "$vireo" ||
+      fail "the poll floor exited past a due stale-host scan (a peer could go stale unalerted)"
+    mv "$runjj_live.saved" "$runjj_live"
     # A desired-state change from a peer DOES defeat it, and the next pass
     # converges on it.
     printf '# a peer edit to a shared layer\n' >>"$wren/groups/development.yaml"

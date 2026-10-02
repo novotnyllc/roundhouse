@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "9c8e88e735cca7eaf4aed0454ba1971b2bf328a697bd4ae5d8c044ab268f000d"
+      "sha256": "b131e55a53236c097e696b230facaad226135b7207336b20bf3406f6c8502b2e"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "aaeb97537962efa6e71fc36d8be0cc3d77a30ebd1e122144fc910564a8debe9d"
+      "sha256": "7c01a94c702c9c69ee2dd8f0bb450f8f1ea0cf0b0ec062d382c941baa13c6108"
     },
     {
       "path": "assets/icon.png",
@@ -134,7 +134,7 @@
     },
     {
       "path": "scripts/lib/fleet-liveness.sh",
-      "sha256": "d3f49a9a31f1d7050e709b094f7f720ea095e2750b34aa1de59333ad4df60f09"
+      "sha256": "cd1fe4ac78a26fd01c376a1e9f4e710d651c473f2e6dfa1b154ce2ca76412f0b"
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
@@ -150,7 +150,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "c004d8da4105d9548b40d6847332751edb592708136b9c3402ca83fdeed949b7"
+      "sha256": "4e6abe759c7d9fe7ec3361807ccbf408ce8ffdaa03fbb40b62ad43cb2e350502"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -373,5 +373,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.58"
+  "version": "0.9.59"
 }
