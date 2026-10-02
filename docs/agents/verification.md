@@ -152,6 +152,13 @@ ROUNDHOUSE_TEST_TIER=jj ROUNDHOUSE_REQUIRE_REAL_JJ=true \
   plugins/roundhouse/scripts/test-roundhouse
 ```
 
+The Windows collector, executor and scheduler fixtures run under `pwsh`
+wherever it is on PATH, as it is on both runner images, and skip silently
+otherwise. The `sections` jobs set `ROUNDHOUSE_REQUIRE_PWSH=true`, so a
+runner without `pwsh` fails the suite instead of dropping them. The driver
+also drops inherited `FNM_*` (from `fnm env`), which would otherwise point
+the npm and Node runtime fixtures at the operator's own fnm default.
+
 ## Windows gates
 
 PowerShell parse of every shipped `.ps1`, then `-SelfTest` on each of them
