@@ -1624,7 +1624,10 @@ $script:NodeOps = @{
     NpmText = {
         # A query's stdout (`ls`, `prefix`), against PREFIX when given.
         param([string]$NpmPath, [string]$Prefix, [string[]]$Arguments)
-        $All = if ([string]::IsNullOrEmpty($Prefix)) { $Arguments } else { [string[]](@("--prefix", $Prefix) + $Arguments) }
+        # Typed and wrapped: an `if` used as an expression unrolls a one-element
+        # array into a bare string, and splatting a string passes its characters
+        # (`npm --version` ran as `npm - - v e r …`).
+        [string[]]$All = @(if ([string]::IsNullOrEmpty($Prefix)) { $Arguments } else { @("--prefix", $Prefix) + $Arguments })
         return Invoke-WithNpmOnPath $NpmPath { ((@(& $NpmPath @All 2>$null) | ForEach-Object { [string]$_ }) -join "`n") }
     }
     NpmSelf = {
@@ -2326,6 +2329,18 @@ function Invoke-NodeSwitchSelfTest([string]$Root) {
     # The switch, the carry rule, the operation checks and the bootstrap's
     # migration, against an fnm tree in ROOT and the in-memory fakes above.
     $Saved = @{ Ops = $script:NodeOps; State = $script:NodeSwitchStateDir; FnmDir = $env:FNM_DIR; Fake = $script:NodeSelfTestFake }
+    if ($IsWindows) {
+        # The REAL NpmText (the fakes below replace it): a single argument with
+        # no prefix must reach npm whole, not as its characters.
+        $EchoDir = Join-Path $Root "npm-echo"
+        [void](New-Item -ItemType Directory -Force -Path $EchoDir)
+        $Echo = Join-Path $EchoDir "npm.cmd"
+        Set-Content -LiteralPath $Echo -Value "@echo args=%*" -Encoding ascii
+        $Got = [string](& $script:NodeOps.NpmText $Echo $null @("--version"))
+        if ($Got.Trim() -cne "args=--version") { throw "NpmText passed a single argument as '$($Got.Trim())', not '--version'" }
+        $Got = [string](& $script:NodeOps.NpmText $Echo "C:\p" @("ls"))
+        if ($Got.Trim() -cne "args=--prefix C:\p ls") { throw "NpmText with a prefix passed '$($Got.Trim())'" }
+    }
     $Fnm = Join-Path $Root "fnm"
     $script:NodeSelfTestFake = @{
         Root = $Fnm
