@@ -2324,10 +2324,14 @@ EOF
         # ...and a catalog is only accepted from the marketplace's declared
         # source: a same-name repoint holds (fleet_run_marketplace_source_ok).
         fleet_run_marketplace_source_ok "$fleet_run_market" || return $?
-        fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id") ||
-          { fleet_run_marketplace_repair "$fleet_run_market" &&
-            fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id"); } ||
-          return 74
+        # A repair that failed in a bounded manager call is transient (74); a
+        # catalog that still cannot prove the bytes after a repair is
+        # standing (75): no entry, or an entry with no SHA.
+        fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id") || {
+          fleet_run_marketplace_repair "$fleet_run_market" || return $?
+          fleet_run_catalog=$(fleet_run_plugin_catalog_proven "$fleet_run_id") ||
+            return 75
+        }
         fleet_run_resolved_sha=$(printf '%s\n' "$fleet_run_catalog" |
           jq -r '.source.sha // empty')
         fleet_run_resolved_version=$(printf '%s\n' "$fleet_run_catalog" |

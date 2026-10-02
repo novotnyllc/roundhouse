@@ -19,11 +19,12 @@ fleet_run_settings_path() {
 fleet_run_marketplaces() {
   # The one reader of `claude plugin marketplace list --json`: the registered
   # marketplaces as a JSON ARRAY, whichever shape the manager prints (a bare
-  # array, or `{marketplaces: [...]}`). Exit 75 when the manager cannot list.
+  # array, or `{marketplaces: [...]}`). Exit 74 when the list command fails or
+  # times out (transient), 75 when its output cannot be read.
   # Inside the run loop the answer is kept until the next manager verb
   # (fleet_run_cli_cached): the list does not change between two items.
   fleet_run_mlist=$(fleet_run_cli_cached marketplaces \
-    claude plugin marketplace list --json 2>/dev/null) || return 75
+    claude plugin marketplace list --json 2>/dev/null) || return 74
   printf '%s\n' "$fleet_run_mlist" |
     jq -c 'if type == "array" then . else (.marketplaces // []) end' 2>/dev/null ||
     return 75
@@ -281,6 +282,7 @@ fleet_run_marketplace_repair() {
     *" $1 "*)
       fleet_run_repair_reason=$(printf '%s\n' "${fleet_run_repaired_reasons:-}" |
         awk -v n="$1" '$1 == n { sub(/^[^ ]* /, ""); print; exit }')
+      case " ${fleet_run_repaired_transient:-} " in *" $1 "*) return 74 ;; esac
       return 75
       ;;
   esac
@@ -290,6 +292,8 @@ fleet_run_marketplace_repair() {
     fleet_run_repaired_ok="${fleet_run_repaired_ok:-} $1"
   else
     fleet_run_repaired_failed="${fleet_run_repaired_failed:-} $1"
+    [ "$fleet_run_repair_rc" -ne 74 ] ||
+      fleet_run_repaired_transient="${fleet_run_repaired_transient:-} $1"
     [ -z "$fleet_run_repair_reason" ] ||
       fleet_run_repaired_reasons="${fleet_run_repaired_reasons:-}$1 $fleet_run_repair_reason
 "
@@ -302,6 +306,7 @@ fleet_run_marketplace_repair_reset() {
   # pass in the same process retries a repair an earlier one could not make.
   fleet_run_repaired_ok=
   fleet_run_repaired_failed=
+  fleet_run_repaired_transient=
   fleet_run_repaired_reasons=
   fleet_run_source_ok=
   fleet_run_source_bad=
@@ -330,8 +335,9 @@ fleet_run_marketplace_source_ok() {
   esac
   # A list that fails or times out is transient (74), and is not remembered.
   fleet_run_source_list=$(fleet_run_marketplaces) || {
+    fleet_run_source_status=$?
     fleet_run_repair_reason="the registered marketplaces cannot be listed"
-    return 74
+    return "$fleet_run_source_status"
   }
   fleet_run_source_entry=$(printf '%s\n' "$fleet_run_source_list" | jq -c --arg n "$1" '
     [.[] | select(.name == $n)] | .[0] // empty' 2>/dev/null) || fleet_run_source_entry=
@@ -373,16 +379,18 @@ fleet_run_marketplace_repair_once() {
   fleet_run_repair_reason=
   fleet_upstream_id_valid "$1" || return 75
   command -v claude >/dev/null 2>&1 || return 75
-  fleet_run_repair_list=$(fleet_run_marketplaces) || return 75
+  # A bounded manager list or verb that fails or times out is transient (74);
+  # an undeclared, unusable or repointed source is standing (75).
+  fleet_run_repair_list=$(fleet_run_marketplaces) || return $?
   fleet_run_repair_entry=$(printf '%s\n' "$fleet_run_repair_list" | jq -c --arg n "$1" '
     [.[] | select(.name == $n)] | .[0] // empty' 2>/dev/null) || return 75
   if [ -z "$fleet_run_repair_entry" ]; then
-    fleet_run_ensure_marketplace "$1" || return 75
+    fleet_run_ensure_marketplace "$1" || return $?
   else
-    fleet_run_marketplace_source_ok "$1" || return 75
+    fleet_run_marketplace_source_ok "$1" || return $?
   fi
   fleet_run_cli_invalidate
-  bounded_verb claude plugin marketplace update "$1" >/dev/null 2>&1 || return 75
+  bounded_verb claude plugin marketplace update "$1" >/dev/null 2>&1 || return 74
 }
 
 fleet_run_ensure_marketplace() {
@@ -395,7 +403,7 @@ fleet_run_ensure_marketplace() {
   fleet_run_ensure_name=$1
   fleet_upstream_id_valid "$fleet_run_ensure_name" || return 75
   command -v claude >/dev/null 2>&1 || return 75
-  fleet_run_ensure_list=$(fleet_run_marketplaces) || return 75
+  fleet_run_ensure_list=$(fleet_run_marketplaces) || return $?
   if printf '%s\n' "$fleet_run_ensure_list" | jq -e --arg n "$fleet_run_ensure_name" \
     'any(.[]; .name == $n)' >/dev/null 2>&1; then
     return 0
@@ -403,8 +411,8 @@ fleet_run_ensure_marketplace() {
   fleet_run_ensure_source=$(fleet_run_marketplace_source "$fleet_run_ensure_name") ||
     return 75
   fleet_run_cli_invalidate
-  bounded_verb claude plugin marketplace add "$fleet_run_ensure_source" >/dev/null 2>&1 || return 75
-  fleet_run_ensure_list=$(fleet_run_marketplaces) || return 75
+  bounded_verb claude plugin marketplace add "$fleet_run_ensure_source" >/dev/null 2>&1 || return 74
+  fleet_run_ensure_list=$(fleet_run_marketplaces) || return $?
   printf '%s\n' "$fleet_run_ensure_list" | jq -e --arg n "$fleet_run_ensure_name" \
     'any(.[]; .name == $n)' >/dev/null 2>&1 || return 75
 }

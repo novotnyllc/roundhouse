@@ -784,6 +784,16 @@ JSON
     done
     [ "$(wc -l <"$run_market_log" | tr -d ' ')" -eq 2 ] ||
       fail "an undeclared, option-shaped, or bad-ref marketplace source reached the manager"
+    # #56: a marketplace list that fails or times out is a transient hold
+    # (74, retried next pass); the refusals above are standing (75).
+    run_status=0
+    (
+      claude() { return 124; }
+      fleet_run_cli_invalidate
+      CLAUDE_CONFIG_DIR="$HOME/.claude" fleet_run_ensure_marketplace test-market
+    ) || run_status=$?
+    [ "$run_status" -eq 74 ] ||
+      fail "a timed-out marketplace list exited $run_status, not the transient 74"
     printf '%s\n' "$run_saved_settings" >"$HOME/.claude/settings.json"
 
     # A different `yq` first on PATH (the Python one on Ubuntu) is stepped over.
