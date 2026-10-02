@@ -1,6 +1,7 @@
 # Automatic fleet sync for agent tooling
 
-Status: **design proposal, rev 3.3** · 2026-09-30 · nothing implemented here.
+Status: **design proposal, rev 3.4** · 2026-10-02 · Phases 0a and 0b and the ratchet fix have shipped
+(#40, #42, #55); the rest is not implemented.
 
 ## History
 
@@ -18,6 +19,13 @@ Status: **design proposal, rev 3.3** · 2026-09-30 · nothing implemented here.
     owner-verified pointer;
   - staged changes are derived, never stored;
   - held batches can be released or discarded.
+- **Rev 3.4** records two owner decisions and answers the remaining PR review threads (§9):
+  - **No canary soak** (2026-10-02). The store carries `policy.canary_wait_hours: 0`. The canary
+    still applies first and every other host follows on its next pass. Plugin releases from every
+    marketplace, in both harnesses, stay current with **no canary gate** (§3.6).
+  - **Unattended signing** (standing rule). No per-use Touch ID or other interactive presence for
+    any signature. Signing is unattended after a one-time setup, and the fleet stays hands-off: at
+    most one OS approval per host, ever, and no CA ceremonies or runbooks (§4.1, §10).
 
 Everything in `2026-08-06-dsc-storage-design-v2.md` (V2) holds unless a section here says otherwise.
 
@@ -32,7 +40,8 @@ The owner works on one machine at a time. What they do there becomes how every m
 - **Model defaults and other allowlisted preferences** propagate the same way (§5.1). "Make model X
   the default everywhere" means changing it on the machine in use; no agent task and no dotfiles
   PR.
-- **Upstream releases** arrive everywhere through the existing canary gate (§3.6).
+- **Upstream plugin releases** reach every host on its own passes, from every marketplace and in
+  both harnesses, with no canary gate (§3.6).
 - **Native Windows** takes part, with its harness commands running natively.
 - **What needs the owner.** Only *owner-controlled* settings (§4.1):
   - a marketplace the fleet has never seen;
@@ -79,6 +88,18 @@ The reconciler stopped working:
   one a local change edits. The **receiving host's fold** enforces this: an agent item found in two
   layers, or in a host layer, is an item-scoped detection in `fleet_run_alerts`, held through the
   existing single hold surface.
+- **First-time adds.** An item no layer declares yet gets its layer by a fixed rule, so the
+  publisher never has to choose:
+  - The layer is `fleet/agent-*.yaml` by default.
+  - It is `os/<platform>/agent-*.yaml` only when the item's marketplace entry in
+    `fleet/owner/marketplaces.yaml` (for a skill, its source entry) lists `platforms:` and the
+    origin's platform is among them. The origin's own platform then names the file.
+  - The platform list lives in an owner file, so a node can't widen or narrow where an item
+    spreads.
+  - An origin whose platform isn't on that list doesn't publish the add. The add is reported, the
+    same way as a never-staged item (§4.3).
+  - A receiver that can't install a fleet-layer item on its platform records an item-scoped
+    failure, as a failed apply does today. It does not tombstone the item.
 - **A change is a commit** to the declaring file, signed by the host that made it. There is no
   event store.
 - **The loop is the only writer.**
@@ -124,10 +145,13 @@ All host-local state lives under `fleet_instance_path store.run/` (the existing
 - the **baseline** (`agent-baseline.json`);
 - **pending-apply markers**;
 - the **dirty stamp**;
-- the **owner pointer** (§4.1);
 - **pending-confirm decisions**;
+- the receiver's **arrival window and watermark** (§4.2);
 - the per-item **refused-publish counter** (§3.3 step 6);
 - **conflict records**: the local value a conflict displaced (§3.3 step 3).
+
+The **owner pointer** (§4.1) is the exception. It is a trust high-water mark, so it lives with
+`reviewed-ref` in `roundhouse-trustd`'s custody, not in `store.run/`.
 
 For each item, the baseline is the value this host last saw **agreed**: observed equal to the
 fleet value, at a commit that was fetched and is on the remote.
@@ -194,6 +218,10 @@ fleet value, at a commit that was fetched and is on the remote.
    - Agent files never diverge across heads, so V2 §8.2b (the conflict resolver) and §8.3 (the
      hold set) apply only to non-agent files.
    - Git history is the only order.
+   - **Origin evidence.** After a successful publish, the pass journals `satisfied` for each
+     published item's digest. The origin's observed state already equals the published value, so
+     there is often no harness mutation to journal as `applied`. This record starts origin-as-canary
+     verification (§3.6).
 6. **Converge** through each harness's own commands (§3.5), with sealed plans, the precondition
    recheck and backups as today.
    - Converge skips only **publishable** local changes (those §4.3 allows) and pending-confirm
@@ -214,7 +242,8 @@ fleet value, at a commit that was fetched and is on the remote.
 2. observes;
 3. writes the baseline where ours = theirs, and writes an **ignored** entry for every local extra
    not in the fleet;
-4. publishes nothing.
+4. records the arrival watermark (§4.2);
+5. publishes nothing.
 
 Local extras are therefore left alone on every later pass too, and are listed in one alert, with
 `fleet-take-local` to publish them.
@@ -268,31 +297,40 @@ once the host reconnects.
 
 ### 3.6 Versions and the canary
 
-- **State changes: the origin is the canary.** For a state change, the origin host's journaled
-  `applied` for that digest is the canary evidence. `agent_canary_wait_minutes` defaults to 0.
+- **Policy (owner decision, 2026-10-02): no soak.** The store carries `policy.canary_wait_hours:
+  0`. The canary still applies first, and every other host follows on its next pass. The wait is
+  the existing V2 knob. This design adds no agent-specific wait.
+- **State changes: the origin is the canary.** For a state change, the canary evidence is the
+  origin host's journaled `applied` or `satisfied` record for that digest. A change made by hand on
+  the origin usually leaves only `satisfied`, written at publish (§3.3 step 5).
   `fleet_canary_gate` is otherwise unchanged, including V2 condition 3: a canary that goes silent
   after applying blocks promotion. There is no failover.
   - **Why condition 3 still has teeth at wait 0.** Condition 3 accepts any record at or after
-    `applied_at + wait`, so with a wait of 0 the apply record would satisfy it by itself.
+    `applied_at + canary_wait_hours`, so at wait 0 the evidence record would satisfy it by itself.
     Origin-as-canary therefore requires a **later, distinct** record: a new journal outcome,
     `verified {item, digest, run_id}`.
-  - **Who writes it.** The origin's next pass, which it runs immediately after the apply through
-    the dirty stamp (§6.1), writes `verified` for every item the previous pass applied that still
-    matches.
-  - **It can't be skipped.** Writing it is exempt from the §6.4 poll floor and from the heartbeat
-    throttle, so a verification pass never exits early without it.
-  - **What condition 3 then requires.** A `verified` record for the digest whose `run_id` differs
-    from that of the `applied` record. The existing `alive` heartbeat, which carries no run ID, is
-    not used.
-  - A change that kills the origin's loop never produces that record, so it never promotes. The
-    delay is one extra pass on the origin, which is seconds.
-- **Upstream releases use the same gate.**
-  - A canary that updates a marketplace catalog journals `applied` for a synthetic item
-    `upstream.<marketplace-id>`, whose digest is the catalog revision.
-  - Non-canary hosts update to a revision only after `fleet_canary_gate` passes for that digest.
-  - One gate, and no new record shape.
-- **Harness auto-update outside Roundhouse** bypasses the gate wherever it's on. That's an owner
-  decision (§10).
+  - **Who writes it, and when.** The origin owes a verification at `applied_at +
+    canary_wait_hours`, recorded with the existing liveness deadline (`fleet-liveness.sh`). Its
+    first pass at or after that instant writes `verified` for every owed item that still matches.
+    At wait 0 that is the pass the dirty stamp starts immediately after the apply or publish
+    (§6.1). With a positive wait, it is the first pass after the soak, not the pass right after the
+    apply, so a nonzero wait can't leave the record forever early.
+  - **It can't be skipped.** A pass with an owed verification is exempt from the §6.4 poll floor
+    and from the heartbeat throttle, so it never exits early without writing it.
+  - **What condition 3 then requires.** A `verified` record for the digest, dated at or after
+    `applied_at + canary_wait_hours`, whose `run_id` differs from that of the `applied` or
+    `satisfied` record. The existing `alive` heartbeat, which carries no run ID, is not used.
+  - A change that kills the origin's loop never produces that record, so it never promotes. At
+    wait 0 the delay is one extra pass on the origin, which takes seconds.
+- **Plugin releases: no canary gate (owner decision, 2026-10-02).** Plugins from every marketplace,
+  in both harnesses, stay current on every host:
+  - each host updates them on its own passes;
+  - harness auto-update is allowed;
+  - there is no synthetic `upstream.<marketplace-id>` item and no gate on catalog revisions.
+
+  Item values still carry state only (§3.2), so a release never shows up as a desired-state
+  change. A bad upstream release reaches every host on its next pass; the owner accepted that
+  cost. The plugin-currency mechanism is implemented separately from this design.
 
 ## 4. Safety
 
@@ -312,8 +350,11 @@ once the host reconnects.
 
 **Owner class.** `owner` is a third class in the existing roster and ratchet, alongside `durable`
 and `ephemeral`.
-- **Keys.** At least two owner keys: one in the 1Password SSH agent, set to approve every use, and
-  an offline recovery key.
+- **Keys.** At least two owner keys, so either one can rotate the other.
+- **Signing is unattended** (standing owner rule). After a one-time setup, an owner signature
+  needs no per-use Touch ID, no 1Password approval prompt and no other interactive presence.
+  Where the keys live is open (§10 item 4). Whatever custody is chosen must keep within the
+  fleet's hands-off limit: at most one OS approval per host, ever, and no CA ceremony or runbook.
 - **The one new ratchet rule.** Owner rows change only in a commit signed by an owner at the
   parents.
 - **What an owner key may sign.** `fleet/owner/**`, `trust/` owner rows, and row-1 layer paths,
@@ -324,6 +365,19 @@ and `ephemeral`.
 checks only newly fetched commits, and a refused non-fold file has no item to hold.
 - **What it is.** Each host keeps a host-local pointer to the last commit whose owner tree was
   owner-verified. The owner tree is `fleet/owner/**` plus the owner rows in `trust/`.
+- **Where it is kept.** The pointer is a trust high-water mark, so it gets the same custody as
+  `reviewed-ref` and `generation` (V2 §7.9). That is a root-owned file, `<TRUST>/owner-ref`, written
+  only by `roundhouse-trustd`. The pinned owner fingerprints sit beside it.
+  - `trustd` advances the pointer by **re-deriving** the advance rule below from its own
+    root-owned pointer and the signed history. It never takes the run's answer.
+  - A process running as the user, such as a malicious plugin or a prompt-injected session, can't
+    rewrite the pointer to a commit of its choosing. It also can't roll it back to older owner
+    policy.
+  - Every run and `fleet-doctor` compare the pointer the run would use with the root-owned one. A
+    mismatch is a loud alert and a full hold, as for the roster.
+  - **Degraded rung.** A host without the lane keeps the pointer in same-user custody. The run and
+    `fleet-doctor` report that weakness on every pass, as they do for the roster. On that rung the
+    pointer defends against a remote node key, not against a local same-user process.
 - **Where owner files are read from.** Always at the pointer, never at head. That includes the
   owner key set itself: owner keys come **only from the owner rows at the pointer**, never from a
   commit's parents, whose roster bytes may be unverified.
@@ -362,33 +416,37 @@ checks only newly fetched commits, and a refused non-fold file has no item to ho
   alerted, and `fleet_policy_get` reads only the owner file at the pointer.
 
 **Pinning and recovery.**
-- The genesis owner keys are pinned on each host with `roundhouse fleet-owner pin --fingerprint
-  SHA256:… --fingerprint SHA256:…`.
-  - **Where the fingerprints come from.** The owner supplies them from an independent record: the
-    1Password item and the offline recovery key's card. They are **never derived from the store** or
-    any other file a node key can write.
-  - **Proving possession.** The command requires a signature over a fresh challenge from a key
-    that matches one of those fingerprints, entered interactively in a TTY.
-  - **Sealed plan.** It runs as a sealed per-target plan: exact argv including the fingerprints,
-    host identity verified first, and a precondition recheck immediately before the host-local
-    pin is written.
-  - Possession alone never establishes ownership. A node key holder who inserts its own key into
-    the store can't pass, because its fingerprint isn't one the owner typed.
-- Enrolling a new host (V2 enrollment) includes the same pin step.
-- Losing one owner key: the other one rotates it.
-- Losing both: re-run `fleet-owner pin` on every host with the new keys' fingerprints, supplied
-  the same independent way. This is documented as the recovery procedure.
+- **The pin.** Each host pins the genesis owner key fingerprints in `trustd`'s custody, beside the
+  owner pointer. `roundhouse fleet-owner pin` writes them as a sealed per-target plan: exact argv
+  including the fingerprints, host identity verified first, and a precondition recheck
+  immediately before the pin is written.
+- **No per-host ceremony.** The pin is written by the host's one-time setup (V2 enrollment, through
+  the hands-off privilege lane), with no further approval. Hosts that are already enrolled get it
+  unattended through their existing lane. Nobody types fingerprints on each host, and no step needs
+  an interactive challenge or Touch ID.
+- **Where the fingerprints come from.** Never from the store, or from any other file a node key
+  can write. A node key holder who inserts its own key into the store therefore can't become an
+  owner. The independent source that enrollment copies them from is part of the custody decision
+  (§10 item 4).
+- **Losing one owner key:** the other one rotates it, unattended, as an owner-signed commit.
+- **Losing every owner key** must not mean a per-host runbook. Recovery belongs to the custody
+  decision (§10 item 4).
 
 **Receiving hosts** hold:
 - any fleet plugin whose marketplace isn't in `marketplaces.yaml`, or whose source doesn't match it;
 - any plugin from a `review: per-plugin` marketplace that isn't confirmed.
 
 **What this defends against.** A prompt-injected session or a malicious plugin holds the node key
-and can write the store directly. It still can't do any of these:
+and can write the store directly. Unless it can also get an owner signature, it can't do any of
+these:
 - add or repoint a marketplace;
 - change posture, pins, policy, protection or hook trust;
 - release a batch;
 - touch the roster.
+
+Because signing is unattended, per-use presence can't keep a session from getting an owner
+signature; only the chosen custody can (§10 item 4). That custody decides on which hosts this
+guarantee holds against a local session. On every host it holds against a remote node key.
 
 **Accepted residual risk.** Such a session *can* enable, disable or remove plugins from confirmed
 marketplaces. Those changes propagate, bounded by the change cap. Protected items are exempt,
@@ -412,6 +470,15 @@ The existing `fleet_removal_cap` becomes one pure `fleet_change_cap`:
     window, so a release doesn't keep re-tripping it.
   - Arrival times come from the receiver's own clock, recorded in its `store.run/`. They only size
     a safety window and never order changes.
+  - **History from before the receiver doesn't count.** Only commits fetched after the
+    receiver's **arrival watermark** count as arrivals.
+    - A new host or a rebuilt store sets the watermark in its silent first pass (§3.3), at the
+      verified head that pass converges to. That pass is exempt from the receiver cap, because
+      pre-existing history is the fleet's agreed state, not a burst from one source.
+    - A host that loses only its window sets the watermark at its current verified head. Changes
+      it hasn't converged yet still count toward the per-source pending cap.
+    - A mature store with months of changes from one source therefore doesn't trip
+      `max_changes_per_source_day` on enrollment.
   - Splitting 100 removals into 100 one-item commits doesn't evade the cap.
   - Six small changes that pile up while a host sleeps count together, but they don't stay stuck:
     - Over the cap, that source's pending changes become a receiver-side pending-confirm.
@@ -501,14 +568,23 @@ keys:
   the owner pointer. No node can repoint a variable at a different 1Password item.
 - **Rendering.** Each host renders the file at mode 0600 through a sealed per-target plan with its
   own `op`, or alerts if `op` is unavailable.
+  - `op` must resolve unattended after a one-time setup, as signing does (§4.1). A resolution that
+    would prompt counts as `op` unavailable.
+  - **When references are resolved.** A rotation in 1Password changes neither the store nor the
+    file, so the §6.4 poll floor can't see it. Every full pass therefore resolves each reference
+    and compares the result with the recorded keyed hash. That check is not covered by the
+    no-op exit. A rotation reaches each host within one full-pass interval; fast passes may skip
+    it.
 - **Values are never logged or printed.** A new secret typed on one host produces an alert asking
   the owner to store it in 1Password.
 - **A locally entered secret is never overwritten before it is captured.** Each host keeps a
   host-local 0600 keyed hash of the last value the loop rendered for each secret key, never the
   value itself.
-  - When the on-disk value differs from that hash, it was typed locally, and rendering of that
-    file is **held** on that host. This is the one exception to §3.3 step 6's rule that
-    never-staged values converge.
+  - When a secret key is **present** on disk with a non-empty value that differs from that hash,
+    it was typed locally, and rendering of that file is **held** on that host. This is the one
+    exception to §3.3 step 6's rule that never-staged values converge.
+  - **A missing file, a missing key or an empty value is damage, not capture.** It is rendered
+    again, with no hold and no `fleet-discard`.
   - A rotation in 1Password changes only what the reference renders, not the file, so it renders
     normally everywhere.
   - The host alerts, without the value, and asks the owner to store the new secret in 1Password.
@@ -578,6 +654,9 @@ keys:
   The desired-state paths are derived from `fleet_vcs_path_owner`'s row-1 paths minus `lineage/`,
   `proposals/` and `checkpoints/`, so `trust/` and `definitions` are included. If everything
   matches, the pass exits without starting `claude` or `codex`.
+- **What the floor never skips:**
+  - an owed canary verification (§3.6);
+  - a full pass's secret-reference resolution (§5.2).
 
 ## 7. Native Windows: the operated instance
 
@@ -638,7 +717,7 @@ goes into `lib/fleet-store.sh` (`tests/90-jj-bootstrap.sh`).
 Each phase ships alone, and none leaves the fleet worse off.
 
 **P0: stop the bleeding.**
-- **Already landed:** #35 and #37.
+- **Already landed:** #35, #37, Phase 0a (#40), Phase 0b (#42) and the ratchet fix (#55).
 - **Code:**
   - lock nonce;
   - alert keying and compaction;
@@ -650,7 +729,7 @@ Each phase ships alone, and none leaves the fleet worse off.
   - Claude uninstall for `absent`;
   - re-seed and unanimity promotion skip the agent keys (`plugins` and `skills` inside
     `seed_desired`). Seed still writes packages, `platform` and `groups`;
-  - a canary member list with two live hosts.
+  - a canary member list with two live hosts, at `canary_wait_hours: 0` (§3.6).
 - **Data:** one reviewed store commit.
   - Delete `hosts/*/99-canonical-agents.yaml` and the agent `proposals/promote-*`.
   - Keep `fleet/99-canonical-agents.yaml` as the fleet's agent set, minus tombstones for `codex`,
@@ -664,7 +743,8 @@ Each phase ships alone, and none leaves the fleet worse off.
 
 **P1: identity and owner.**
 - **P1a** ships readers for `agent_*`, the owner class and pointer, `fleet-owner pin` and the Codex
-  apply path; nothing writes the new categories yet. The owner pins each host.
+  apply path; nothing writes the new categories yet. Each host's owner pin and pointer are written
+  unattended through its existing lane (§4.1); nobody visits a host.
 - **P1b** follows once every host reports P1a and is owner-pinned. One owner-signed commit:
   - moves agent entries into the dedicated `agent_*` files;
   - moves marketplaces and the whole policy category into `fleet/owner/`;
@@ -730,7 +810,7 @@ verbs, the token check and the task.
 | Rev 3.1 | Receiver cap re-trips; no release | §4.2 |
 | Rev 3.1 | Canary membership writable by any host; layer rules only at the publisher | §4.1 policy; §3.1 receiver detection |
 | Rev 3.1 | Split policy source | §4.1 whole policy category |
-| Rev 3.1 | Parallel upstream gate | §3.6 synthetic `upstream.<id>` items |
+| Rev 3.1 | Parallel upstream gate | §3.6; superseded 2026-10-02, plugin releases are ungated |
 | Rev 3.1 | Per-file jj conflicts | §3.1 dedicated agent files |
 | Rev 3.1 | P0 prunes trip the cap | §8.2 P0 disown |
 | Rev 3.1 | Tombstone compaction stalls; floor path list; owner-class duplication; naming; hook writers; `--with-windows` | §3.4; §6.4; §4.1; §8.1; §6.1; §7 |
@@ -756,15 +836,35 @@ verbs, the token check and the task.
 | PR review (Codex) | Rendering overwrote a locally entered secret | §5.2 hold rendering until captured |
 | PR review (Codex) | A paced publisher evaded the receiver cap | §4.2 cumulative 24 h arrival window |
 | PR review (Codex) | Model defaults vs `railyard:model-routing` | §5.1 replication, not choice |
+| PR review (Codex) | Origin of a hand-made change has no `applied` to verify | §3.3 step 5 `satisfied` at publish; §3.6 |
+| PR review (Codex) | A positive soak left `verified` forever early | §3.6 verification at the soak boundary |
+| PR review (Codex) | A secret rotation behind an unchanged `op://` reference hit the no-op exit | §5.2 resolution on full passes; §6.4 |
+| PR review (Codex) | No declaring layer for a first-time add | §3.1 first-time adds |
+| PR review (Codex) | Owner pointer in same-user `store.run/` | §4.1 `trustd` custody |
+| PR review (Codex) | Pre-enrollment history tripped the arrival window | §4.2 arrival watermark |
+| PR review (Codex) | A deleted secret file held rendering as a locally typed secret | §5.2 missing is damage |
+| Owner decision 2026-10-02 | No canary soak; plugin releases ungated | §3.6; §10 |
+| Owner rule | No per-use presence for signing; hands-off setup | §4.1; §10 |
 
-## 10. Open decisions for the owner
+## 10. Owner decisions
 
-1. **Harness auto-update.**
-   - Leave it on: fast, but plugin updates bypass the canary.
-   - Or turn it off on non-canary hosts: updates are then canary-gated, a `canary_wait_hours`
-     behind.
-2. **Canary members:** which two or more hosts.
-3. **Change cap:** 5 changes or 25% per pass or commit (the existing numbers), or higher; and
+**Decided:**
+1. **Canary soak (2026-10-02):** none. `policy.canary_wait_hours: 0`. The canary applies first, and
+   every other host follows on its next pass (§3.6).
+2. **Harness auto-update and plugin releases (2026-10-02):** plugins from every marketplace, in both
+   harnesses, stay current with no canary gate. Harness auto-update may stay on (§3.6).
+3. **Signing (standing rule):** no per-use Touch ID or other interactive presence. Signing is
+   unattended after a one-time setup. Fleet operations stay hands-off: at most one OS approval per
+   host, ever, and no CA ceremonies or runbooks (§4.1).
+
+**Still open.** Items 4 and 5 move to the signing and canary thread, per the PR handoff.
+
+4. **Owner-key custody** within the rule in item 3:
+   - where the two owner keys live;
+   - which hosts can produce an owner signature, and so where §4.1's guarantee holds against a
+     local session;
+   - the independent source enrollment copies the pinned fingerprints from;
+   - recovery from losing every owner key without a per-host runbook.
+5. **Canary members and order:** which two or more hosts, and in what order.
+6. **Change cap:** 5 changes or 25% per pass or commit (the existing numbers), or higher; and
    `max_changes_per_source_day` (proposed 20).
-4. **Owner keys:** a 1Password SSH agent key with per-use approval, plus an offline recovery key
-   (proposed).
