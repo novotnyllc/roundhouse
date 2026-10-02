@@ -595,6 +595,9 @@ fleet_schedule_command() (
       for uninstall_mode in $fleet_schedule_modes; do
         rm -f "$(fleet_schedule_state_path "$uninstall_mode")"
       done
+      # A full request no pass took yet goes with the jobs it was made of: a
+      # later install must not inherit it as a full pass nobody asked for.
+      rm -f "$(fleet_trigger_full_path)"
       ;;
     install)
       [ -x "$HOME/.local/bin/roundhouse" ] || {

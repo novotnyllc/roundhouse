@@ -261,6 +261,22 @@ fleet_schedule_command "$@"'
     "$cli" fleet-trigger --full >/dev/null
     grep -Fqx "launchctl kickstart gui/$sched_uid/com.novotnyllc.roundhouse.fleet-full" \
       "$SCHED_LOG" || fail "fleet-trigger --full did not kick the full job"
+    # …and records the cadence it asked for, which outlives the next fast
+    # trigger's stamp: a pass holding the lock re-runs as full (below).
+    [ -e "$(fleet_trigger_full_path)" ] ||
+      fail "fleet-trigger --full recorded no full request"
+    "$cli" fleet-trigger --fast >/dev/null
+    [ -e "$(fleet_trigger_full_path)" ] ||
+      fail "a fast trigger after a full one dropped the full request"
+    # A full trigger that starts nothing records no request: an operator stop
+    # is final, so no later fast run turns into the stopped job's full pass.
+    rm -f "$(fleet_trigger_full_path)" "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-full"
+    : >"$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-full"
+    "$cli" fleet-trigger --full >/dev/null
+    [ ! -e "$(fleet_trigger_full_path)" ] ||
+      fail "a full trigger for a stopped full job recorded a full request"
+    rm -f "$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-full"
+    : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-full"
 
     # No GUI domain (a Mac over SSH, nobody at the console) and the job was
     # last SEEN loaded: the detached fallback, and the trigger does not wait.
@@ -417,7 +433,11 @@ fleet_schedule_command "$@"'
         printf 'raised\tx\ty\n' >>"$run_tmp/alert-ledger"
         sched_n=$(grep -c . "$sched_calls")
         # Triggers "arrive" during the first SCHED_TRIGGERS passes.
-        [ "$sched_n" -gt "${SCHED_TRIGGERS:-0}" ] || fleet_trigger_stamp
+        # A full one records its request before the stamp, as the trigger does.
+        [ "$sched_n" -gt "${SCHED_TRIGGERS:-0}" ] || {
+          [ -z "${SCHED_TRIGGER_FULL:-}" ] || fleet_trigger_request_full
+          fleet_trigger_stamp
+        }
         sched_status_var="SCHED_PASS_STATUS_$sched_n"
         exit "${!sched_status_var:-0}"
       )
@@ -522,6 +542,44 @@ fleet_schedule_command "$@"'
       [ "$sched_status" -eq 0 ] || fail "the looping full run failed"
       [ "$(cut -d' ' -f1 "$sched_calls" | tr '\n' ' ')" = 'full fast ' ] ||
         fail "an in-process re-run repeated the full pass: $(cut -d' ' -f1 "$sched_calls" | tr '\n' ' ')"
+      # …but a FULL trigger wins: `fleet-trigger --full` landing mid-pass
+      # kicks a full job that finds the lock and exits, so the run holding
+      # the lock re-runs full, and that consumes the request.
+      : >"$SCHED_STATE/gui"
+      : >"$sched_full"
+      rm -f "$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-full"
+      : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-full"
+      : >"$sched_calls"
+      SCHED_TRIGGERS=1
+      SCHED_TRIGGER_FULL=1
+      sched_run --fast
+      unset SCHED_TRIGGER_FULL
+      [ "$sched_status" -eq 0 ] || fail "the run with a mid-pass full trigger failed"
+      [ "$(cut -d' ' -f1 "$sched_calls" | tr '\n' ' ')" = 'fast full ' ] ||
+        fail "a mid-pass full trigger was consumed as fast: $(cut -d' ' -f1 "$sched_calls" | tr '\n' ' ')"
+      [ ! -e "$(fleet_trigger_full_path)" ] ||
+        fail "the full pass did not consume the full request"
+      # A request still pending when a run begins (the fast job won the lock
+      # race against the full job it kicked) makes that run's pass full.
+      fleet_trigger_request_full
+      : >"$sched_calls"
+      SCHED_TRIGGERS=0
+      sched_run --fast
+      [ "$(cut -d' ' -f1 "$sched_calls" | tr '\n' ' ')" = 'full ' ] ||
+        fail "a pending full request did not make the next pass full: $(cut -d' ' -f1 "$sched_calls" | tr '\n' ' ')"
+      [ ! -e "$(fleet_trigger_full_path)" ] ||
+        fail "a full pass left the request it satisfied behind"
+      # …unless the operator stopped the full job since: the request is
+      # dropped, and the fast job does not run the stopped job's full pass.
+      fleet_trigger_request_full
+      rm -f "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-full"
+      : >"$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-full"
+      : >"$sched_calls"
+      sched_run --fast
+      [ "$(cut -d' ' -f1 "$sched_calls" | tr '\n' ' ')" = 'fast ' ] ||
+        fail "a pending request ran the full pass of a job the operator stopped: $(cut -d' ' -f1 "$sched_calls" | tr '\n' ' ')"
+      [ ! -e "$(fleet_trigger_full_path)" ] ||
+        fail "a request for a stopped full job was not dropped"
       # The run's status is the WORST pass's: a clean re-run does not launder
       # an earlier hold.
       : >"$sched_calls"
@@ -926,6 +984,7 @@ fleet_run_command --fast'
     # trigger only stamps and a pass raises nothing. A removed definition is
     # kept, as .removed.
     : >"$SCHED_LOG"
+    fleet_trigger_request_full
     "$cli" fleet-schedule uninstall >/dev/null || fail "fleet-schedule uninstall failed"
     [ ! -e "$sched_fast" ] && [ ! -e "$sched_full" ] || fail "uninstall left a job behind"
     [ -f "$sched_fast.removed" ] || fail "uninstall kept no .removed copy of the definition"
@@ -934,6 +993,8 @@ fleet_run_command --fast'
       fail "uninstall did not unload the fast job"
     [ ! -e "$(fleet_schedule_marker)" ] || fail "uninstall left the install marker"
     [ -e "$(fleet_schedule_optout_path)" ] || fail "uninstall left no opt-out marker"
+    [ ! -e "$(fleet_trigger_full_path)" ] ||
+      fail "uninstall left a pending full request for a later install to inherit"
     : >"$sched_fast"
     : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-fast"
     : >"$SCHED_LOG"
