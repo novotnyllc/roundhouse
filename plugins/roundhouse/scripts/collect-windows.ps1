@@ -17,6 +17,8 @@ $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $script:Records = New-Object System.Collections.Generic.List[object]
 $script:HasProblems = $false
 $ObservedAt = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+# fnm discovery, shared with apply-windows.ps1.
+. (Join-Path $PSScriptRoot "node-fnm-windows.ps1")
 
 function Test-Section([string]$Name) {
     return $Sections -contains "all" -or $Sections -contains $Name
@@ -2086,10 +2088,101 @@ function Get-WingetUpgradeCandidates([string[]]$Lines, [object]$Export) {
     return $Candidates
 }
 
-# npm, global scope. Windows Node comes from winget (OpenJS.NodeJS) and its
-# global prefix (%APPDATA%\npm) survives Node upgrades, so PATH resolution is
-# durable here; an fnm per-shell path is still refused, as on POSIX.
+# The Node runtime source on Windows is fnm, exactly as on POSIX
+# (docs/specs/2026-09-28-npm-global-manager.md §7.7); its discovery is
+# node-fnm-windows.ps1's. The winget MSI may stay installed (removing it needs
+# elevation); once fnm has a default it is shadowed and unmanaged.
+function Get-NodeGlobalsSplit([object]$List) {
+    # The `fnm:node` record's global set from the SAME `npm ls` the npm
+    # records come from, so the two never disagree (Split-NpmGlobalList, the
+    # one rule): `globals` ({name: version}) and `globals_unpinnable`. A
+    # failed listing is unknown (both $null), never "none unpinnable".
+    $Split = Split-NpmGlobalList $List
+    if ($null -eq $Split) { return @{ globals = $null; globals_unpinnable = $null } }
+    $Globals = [ordered]@{}
+    foreach ($Name in $Split.Globals.Keys) { $Globals[(Limit-Text $Name)] = Limit-Text $Split.Globals[$Name] }
+    return @{ globals = $Globals; globals_unpinnable = [string[]]@($Split.Unpinnable | ForEach-Object { Limit-Text $_ }) }
+}
+
+function Read-NodeSwitchInflight {
+    # The Windows switch's in-flight record (apply-windows.ps1), reported as
+    # {old, target, at}; an unreadable record is still in flight, with nothing
+    # to restore.
+    $Value = Read-NodeSwitchMarker
+    if ($null -eq $Value) { return $null }
+    if ($Value.unreadable -eq $true) { return [ordered]@{ old = $null; target = $null; unreadable = $true } }
+    return [ordered]@{
+        old = $(if (Test-NodeVersionText $Value.old) { [string]$Value.old } else { $null })
+        target = $(if (Test-NodeVersionText $Value.target) { [string]$Value.target } else { $null })
+        at = Limit-Text $Value.at
+    }
+}
+
+function Get-NodeHooksUnproven([object]$Config, [string]$NpmPath, [object]$List) {
+    # Configured post-switch hooks of installed globals whose argv[0] is not
+    # a proven bin of the package (as updaters are proven): sealing refuses a
+    # switch carrying one.
+    $Listed = @()
+    if ($null -ne $List -and $null -ne $List.dependencies) { $Listed = @($List.dependencies.PSObject.Properties.Name) }
+    $Unproven = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Config.node_switch_hooks) { return @() }
+    foreach ($Property in $Config.node_switch_hooks.PSObject.Properties) {
+        $Name = ([string]$Property.Name).Substring(4)
+        if ($Listed -cnotcontains $Name) { continue }
+        foreach ($Argv in @($Property.Value)) {
+            if ($null -eq (Get-NpmUpdaterPath $NpmPath $Name ([string]@($Argv)[0]))) { $Unproven.Add([string]$Property.Name) }
+        }
+    }
+    return @($Unproven)
+}
+
+function New-FnmNodeRecordData {
+    # The `fnm:node` record, the same shape as collect-posix's. Pure: the
+    # caller gathers the facts, so the self-test builds it from fixtures.
+    param(
+        [string]$Root, [string]$Default, [string[]]$Installed, [string[]]$RemoteLines,
+        [object]$Split, [object]$Inflight, [string[]]$HooksUnproven
+    )
+    $Line = ($Default.Substring(1) -split '\.')[0]
+    $Known = $null -ne $RemoteLines
+    $Candidate = $null
+    if ($Known) {
+        $Latest = Select-FnmRemoteLatest $RemoteLines ([int]$Line)
+        if ($null -eq $Latest) { $Known = $false }
+        elseif (Test-NodeReleaseNewer $Latest $Default) { $Candidate = $Latest }
+    }
+    $Prefix = Join-Path (Join-Path (Join-Path $Root "node-versions") $Default) "installation"
+    return [ordered]@{
+        Known = $Known
+        Data = @{
+            manager = "fnm"
+            name = "node"
+            installed_version = $Default
+            candidate_version = $Candidate
+            update_available = $(if ($Known) { $null -ne $Candidate } else { $null })
+            line = $Line
+            installed_versions = [string[]]@($Installed)
+            stale_versions = [string[]]@($Installed | Where-Object { $_ -cne $Default })
+            fnm_dir = Limit-Text $Root
+            prefix = Limit-Text $Prefix
+            globals = $Split.globals
+            globals_unpinnable = $Split.globals_unpinnable
+            switch_inflight = $Inflight
+            switch_hooks_unproven = [string[]]@($HooksUnproven | Sort-Object -Unique)
+        }
+    }
+}
+
 function Get-NpmCommand {
+    # The durable npm, in lib/npm.sh's order: fnm's `default` alias first,
+    # then PATH (the winget MSI's npm when fnm has no default). An fnm
+    # per-shell path is refused, as on POSIX.
+    $Root = Get-FnmRoot
+    if ($null -ne $Root) {
+        $Alias = Get-Command -Name (Get-NodeToolPath (Get-FnmAliasBinDir $Root) "npm") -CommandType Application `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $Alias) { return $Alias }
+    }
     $Npm = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $Npm -or [string]$Npm.Source -match 'fnm_multishells') { return $null }
     return $Npm
@@ -2100,7 +2193,7 @@ function Resolve-NpmNode([string]$NpmPath) {
     # beside itself and only then falls back to PATH. Querying PATH on its own
     # could record a different installation, and node_version is a sealed
     # precondition.
-    $Sibling = Join-Path (Split-Path -Parent $NpmPath) "node.exe"
+    $Sibling = Get-NodeToolPath (Split-Path -Parent $NpmPath) "node"
     if (Test-Path -LiteralPath $Sibling -PathType Leaf) { return $Sibling }
     $OnPath = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -ne $OnPath) { return [string]$OnPath.Source }
@@ -2112,9 +2205,9 @@ function Invoke-NpmNodeSelfTest {
     try {
         $NpmDir = Join-Path $Root "npm-home"
         New-Item -ItemType Directory -Path $NpmDir -Force | Out-Null
-        $NpmCmd = Join-Path $NpmDir "npm.cmd"
+        $NpmCmd = Get-NodeToolPath $NpmDir "npm"
         Set-Content -LiteralPath $NpmCmd -Value "@echo off"
-        $Sibling = Join-Path $NpmDir "node.exe"
+        $Sibling = Get-NodeToolPath $NpmDir "node"
         Set-Content -LiteralPath $Sibling -Value ""
         if ((Resolve-NpmNode $NpmCmd) -ne $Sibling) { throw "self_test_npm_node_not_sibling" }
         Remove-Item -LiteralPath $Sibling -Force
@@ -2129,28 +2222,13 @@ function Invoke-NpmText([string]$Npm, [string[]]$Arguments) {
     return (($Lines | ForEach-Object { [string]$_ }) -join "`n").Trim()
 }
 
-function Get-NpmPackageBins([string]$Npm, [string]$Name) {
-    $Root = Invoke-NpmText $Npm @("root", "--global")
-    if ([string]::IsNullOrWhiteSpace($Root)) { return @() }
-    $Manifest = Join-Path (Join-Path $Root $Name) "package.json"
-    if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { return @() }
-    try { $Package = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json } catch { return @() }
-    if ($Package.bin -is [string]) { return @(($Name -split '/')[-1]) }
-    if ($null -ne $Package.bin) { return @($Package.bin.PSObject.Properties.Name) }
-    return @()
-}
-
 function Get-NpmUpdaterPath([string]$Npm, [string]$Name, [string]$Bin) {
     # The updater is honoured only as a bin the installed package declares,
     # found in the global prefix npm itself reports.
-    if (@(Get-NpmPackageBins $Npm $Name) -cnotcontains $Bin) { return $null }
+    $Root = Invoke-NpmText $Npm @("root", "--global")
     $Prefix = Invoke-NpmText $Npm @("prefix", "--global")
-    if ([string]::IsNullOrWhiteSpace($Prefix)) { return $null }
-    foreach ($Candidate in @((Join-Path $Prefix "$Bin.cmd"), (Join-Path $Prefix "$Bin.exe"),
-        (Join-Path (Join-Path $Prefix "bin") $Bin))) {
-        if (Test-Path -LiteralPath $Candidate -PathType Leaf) { return $Candidate }
-    }
-    return $null
+    if ([string]::IsNullOrWhiteSpace($Root) -or [string]::IsNullOrWhiteSpace($Prefix)) { return $null }
+    return Get-PackageBinPath $Root $Prefix $Name $Bin
 }
 
 # The Node runtime on Windows is winget's OpenJS.NodeJS (the Current line),
@@ -2252,6 +2330,88 @@ function Get-NodeInstallScope {
     } @($env:ProgramFiles, ${env:ProgramFiles(x86)}) @($env:LOCALAPPDATA, $env:APPDATA, $env:USERPROFILE)
 }
 
+function Set-NodeMsiShadowing([hashtable]$PackageData, [bool]$FnmIsRuntime) {
+    # Once fnm has a default it is the runtime source: the MSI stays installed
+    # (removing it needs elevation) but is shadowed and unmanaged, never drift
+    # to upgrade. `runtimes.node` converges through `fnm:node` instead.
+    $PackageData.shadowed_by = $(if ($FnmIsRuntime) { "fnm:node" } else { $null })
+    $PackageData.managed = -not $FnmIsRuntime
+    if ($FnmIsRuntime) { $PackageData.update_available = $false }
+}
+
+function Invoke-FnmNodeSelfTest {
+    # The collector's own part: the durable npm under fnm, the `fnm:node`
+    # record shape, and the MSI's shadowing. Discovery is node-fnm-windows.ps1's
+    # (its own -SelfTest).
+    $Root = Join-Path ([IO.Path]::GetTempPath()) ("rh-fnm-" + [guid]::NewGuid())
+    $SavedFnmDir = $env:FNM_DIR
+    try {
+        $Installation = Get-FnmInstallation $Root "v26.7.0"
+        $Bin = Get-FnmBinDir $Installation
+        New-Item -ItemType Directory -Path $Bin -Force | Out-Null
+        Set-Content -LiteralPath (Get-NodeToolPath $Bin "node") -Value ""
+        Set-Content -LiteralPath (Get-NodeToolPath $Bin "npm") -Value ""
+        New-Item -ItemType Directory -Path (Join-Path $Root "aliases") -Force | Out-Null
+        [void](New-Item -ItemType $(if ($script:FnmOnWindows) { "Junction" } else { "SymbolicLink" }) `
+            -Path (Get-FnmAliasDir $Root) -Target $Installation)
+        $env:FNM_DIR = $Root
+        $Npm = Get-NpmCommand
+        if ($null -eq $Npm -or [string]$Npm.Source -cne (Get-NodeToolPath (Get-FnmAliasBinDir $Root) "npm")) {
+            throw "self_test_durable_npm_not_the_fnm_default"
+        }
+        $Remote = @("v24.2.0   (Krypton)", "v26.0.0", "v26.10.0", "v26.9.0", "v27.0.0")
+        $List = '{"dependencies":{"npm":{"version":"12.1.0"},"@bitkyc08/opencodex":{"version":"2.75.0"},' +
+            '"dev":{"version":"0.0.1","resolved":"file:../dev"}}}' | ConvertFrom-Json
+        $Split = Get-NodeGlobalsSplit $List
+        if ((ConvertTo-Json -Compress -InputObject $Split.globals) -cne
+            '{"@bitkyc08/opencodex":"2.75.0","dev":"0.0.1","npm":"12.1.0"}' -or ($Split.globals_unpinnable -join ",") -cne "dev") {
+            throw "self_test_fnm_globals_split"
+        }
+        $Unknown = Get-NodeGlobalsSplit $null
+        if ($null -ne $Unknown.globals -or $null -ne $Unknown.globals_unpinnable) { throw "self_test_fnm_globals_unknown" }
+        $Built = New-FnmNodeRecordData -Root $Root -Default "v26.7.0" -Installed @("v26.7.0") `
+            -RemoteLines $Remote -Split $Split -Inflight $null -HooksUnproven @()
+        $Json = @{ data = $Built.Data } | ConvertTo-Json -Compress -Depth 10 | ConvertFrom-Json
+        $Keys = @($Json.data.PSObject.Properties.Name)
+        [Array]::Sort($Keys, [StringComparer]::Ordinal)
+        if (($Keys -join ",") -cne ("candidate_version,fnm_dir,globals,globals_unpinnable,installed_version," +
+            "installed_versions,line,manager,name,prefix,stale_versions,switch_hooks_unproven,switch_inflight,update_available") -or
+            -not $Built.Known -or $Json.data.candidate_version -cne "v26.10.0" -or $Json.data.update_available -ne $true -or
+            $Json.data.line -cne "26" -or $Json.data.installed_versions -isnot [array] -or
+            $Json.data.installed_versions.Count -ne 1 -or $Json.data.stale_versions.Count -ne 0 -or
+            $Json.data.prefix -cne $Installation -or $Json.data.globals.npm -cne "12.1.0" -or
+            $Json.data.switch_hooks_unproven -isnot [array]) {
+            throw "self_test_fnm_record_shape"
+        }
+        $Current = New-FnmNodeRecordData -Root $Root -Default "v26.10.0" -Installed @("v26.7.0", "v26.10.0") `
+            -RemoteLines $Remote -Split $Split -Inflight $null -HooksUnproven @("npm:b", "npm:a", "npm:a")
+        if ($null -ne $Current.Data.candidate_version -or $Current.Data.update_available -ne $false -or
+            ($Current.Data.stale_versions -join ",") -cne "v26.7.0" -or
+            ($Current.Data.switch_hooks_unproven -join ",") -cne "npm:a,npm:b") {
+            throw "self_test_fnm_record_current"
+        }
+        $Failed = New-FnmNodeRecordData -Root $Root -Default "v26.7.0" -Installed @("v26.7.0") `
+            -RemoteLines $null -Split $Unknown -Inflight ([ordered]@{ old = "v26.0.0"; target = "v26.7.0" }) -HooksUnproven @()
+        if ($Failed.Known -or $null -ne $Failed.Data.candidate_version -or $null -ne $Failed.Data.update_available -or
+            $null -ne $Failed.Data.globals -or $null -eq $Failed.Data.switch_inflight) {
+            throw "self_test_fnm_record_unknown"
+        }
+        $Msi = @{ update_available = $true }
+        Set-NodeMsiShadowing $Msi $true
+        if ($Msi.shadowed_by -cne "fnm:node" -or $Msi.managed -ne $false -or $Msi.update_available -ne $false) {
+            throw "self_test_node_msi_not_shadowed"
+        }
+        $Msi = @{ update_available = $true }
+        Set-NodeMsiShadowing $Msi $false
+        if ($null -ne $Msi.shadowed_by -or $Msi.managed -ne $true -or $Msi.update_available -ne $true) {
+            throw "self_test_node_msi_shadowed_without_fnm"
+        }
+    } finally {
+        $env:FNM_DIR = $SavedFnmDir
+        Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-NodeRuntimeSelfTest {
     $Pin = Get-WingetPinFromLines @(
         "Name    Id            Version Source Pin type Pinned version",
@@ -2298,6 +2458,7 @@ if ($SelfTest) {
     Invoke-WindowsSftpReceiptSelfTest
     Invoke-NpmNodeSelfTest
     Invoke-NodeRuntimeSelfTest
+    Invoke-FnmNodeSelfTest
     exit 0
 }
 
@@ -2341,6 +2502,28 @@ if (Test-Section "host") {
 }
 
 if (Test-Section "packages") {
+    # fnm with a default alias holding a durable npm is this host's Node
+    # runtime source: the npm records come from it, the MSI is shadowed
+    # (Set-NodeMsiShadowing), and the npm section reports `fnm:node`. An
+    # alias that names no installed version is reported, never read as "no
+    # fnm".
+    $script:FnmRuntimeRoot = Get-FnmRoot
+    $script:FnmRuntimeDefault = $null
+    if ($null -eq $script:FnmRuntimeRoot) {
+        # A root whose alias exists but is broken (dangling, or its target
+        # lost node or npm) is still fnm: reported below, MSI shadowed.
+        $script:FnmRuntimeRoot = @(Get-FnmRootCandidates | Where-Object {
+            $null -ne (Get-Item -LiteralPath (Get-FnmAliasDir $_) -Force -ErrorAction SilentlyContinue)
+        }) | Select-Object -First 1
+    }
+    if ($null -ne $script:FnmRuntimeRoot) {
+        $script:FnmRuntimeDefault = Get-FnmDefaultVersion $script:FnmRuntimeRoot
+        if ($null -eq $script:FnmRuntimeDefault) {
+            Add-Record -Kind "error" -Id "packages:fnm" -Status "error" -Confidence "high" -Errors @(
+                @{ code = "fnm_default_unreadable"; severity = "error"; retryable = $false; message = "the fnm default alias does not name an installed version" }
+            )
+        }
+    }
     $Managers = @($Machine.package_managers)
     if ($Managers -contains "winget") {
         $Winget = Get-Command winget -ErrorAction SilentlyContinue
@@ -2410,6 +2593,7 @@ if (Test-Section "packages") {
                                 $PackageData.pin_query = $(if ($PinSucceeded) { "ok" } else { "failed" })
                                 $PackageData.install_scope = Get-NodeInstallScope
                                 $PackageData.line = Limit-Text (([string]$Package.Version) -split '\.')[0]
+                                Set-NodeMsiShadowing $PackageData ($null -ne $script:FnmRuntimeRoot)
                             }
                             Add-Record -Kind "package" -Id ("winget:" + $Name) -Status "present" `
                                 -Confidence $(if ($CandidateQueryAuthoritative) { "high" } else { "medium" }) -Data $PackageData `
@@ -2510,9 +2694,38 @@ if ((Test-Section "packages") -and (@($Machine.package_managers) -contains "npm"
                 } -Evidence @(@{ source = "package-manager"; method = "npm-ls-global+outdated" })
             }
         } catch {
+            $List = $null
             Add-Record -Kind "error" -Id "packages:npm" -Status "error" -Confidence "high" -Errors @(
                 @{ code = "manager_query_failed"; severity = "error"; retryable = $true; message = "npm global inventory failed" }
             )
+        }
+        # The runtime under those globals, when fnm provides it: `fnm:node`,
+        # whose installed_version is fnm's default and whose candidate is the
+        # newest published release in that major. It binds the global set and
+        # the prefix, so a sealed switch stops verifying when either changes.
+        if ($null -ne $script:FnmRuntimeDefault -and
+            -not (Test-FnmNpmPrefix $NpmPrefix $script:FnmRuntimeRoot $script:FnmRuntimeDefault)) {
+            # npm keeps the globals somewhere else (an npmrc `prefix=` or
+            # NPM_CONFIG_PREFIX): a switch could not carry them, so none is
+            # offered.
+            Add-Record -Kind "error" -Id "packages:fnm-node" -Status "error" -Confidence "high" -Errors @(
+                @{ code = "fnm_npm_prefix_foreign"; severity = "error"; retryable = $false; message = "the fnm default's npm reports a global prefix outside fnm" }
+            )
+        } elseif ($null -ne $script:FnmRuntimeDefault) {
+            $NodeRoot = $script:FnmRuntimeRoot
+            $NodeFnm = Get-FnmCommandPath
+            $NodeRemote = if ($null -ne $NodeFnm) { Invoke-FnmLines $NodeFnm $NodeRoot @("list-remote") } else { $null }
+            $NodeBuilt = New-FnmNodeRecordData -Root $NodeRoot -Default $script:FnmRuntimeDefault `
+                -Installed @(Get-FnmInstalledVersions $NodeRoot) -RemoteLines $NodeRemote `
+                -Split (Get-NodeGlobalsSplit $List) -Inflight (Read-NodeSwitchInflight) -HooksUnproven @(Get-NodeHooksUnproven $Config $NpmPath $List)
+            if (-not $NodeBuilt.Known) {
+                Add-Record -Kind "error" -Id "packages:fnm-updates" -Status "unavailable" -Confidence "high" -Errors @(
+                    @{ code = "candidate_query_failed"; severity = "warning"; retryable = $true; message = "fnm list-remote inventory failed" }
+                )
+            }
+            Add-Record -Kind "package" -Id "fnm:node" -Status "present" `
+                -Confidence $(if ($NodeBuilt.Known) { "high" } else { "medium" }) -Data $NodeBuilt.Data `
+                -Evidence @(@{ source = "package-manager"; method = "fnm-default-alias+list-remote" })
         }
     }
 }

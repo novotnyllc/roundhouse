@@ -42,7 +42,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "cd06e3f70770b046ef984b8dd9f9c8c5b1be64a96de875010d8bda936e0880de"
+      "sha256": "6fbeff1981210840f70b483d2e58f1e52c9d8e237d883031fde8fa62415d6e8f"
     },
     {
       "path": "scripts/certify-ssh-node",
@@ -62,7 +62,7 @@
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "ee6db45d40f0247b8b46d316727a9fcb81750ec3f6901d94581538209787d560"
+      "sha256": "c9aa28c417962580ad50f6fb17ae2f46fb10ec9f56792cd542285e877c42c4bf"
     },
     {
       "path": "scripts/enroll-privilege-posix",
@@ -114,7 +114,7 @@
     },
     {
       "path": "scripts/lib/config.sh",
-      "sha256": "a09d57916785c5fa24234221420ade4593b6875e4e3261c9404c4c43c60ad2c0"
+      "sha256": "ffa2509fa56c35379077c58d747625e71119839758695120f9cf4fb34e17e498"
     },
     {
       "path": "scripts/lib/fleet-alerts.sh",
@@ -222,7 +222,7 @@
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "6ae7b001a7b48ae2555124862ae3a23c070d23152b29be80c9df6499d7ad1e36"
+      "sha256": "08b1e027155612e94f2371f0f87a2b754a9300252a03b69e791e4430d220131e"
     },
     {
       "path": "scripts/lib/plan-verify.sh",
@@ -243,6 +243,10 @@
     {
       "path": "scripts/mcp-siding.selftest.mjs",
       "sha256": "d7afbaf00bddb3d2a9c1bee097240fe8fa7deb2f234f6b51b1e82d4c0de056e7"
+    },
+    {
+      "path": "scripts/node-fnm-windows.ps1",
+      "sha256": "ffa923fe47e86116184fb210dddd84244bc1e6db1a6e823c6259ec18c6e4825b"
     },
     {
       "path": "scripts/preflight",
@@ -334,7 +338,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "321c6138c96cd210af857874bd0d7278448e82a9c3b588d73660d2fa48075e61"
+      "sha256": "e6043b75e8b4c3a8210e5b5b6cb43c64ac9e8d8247f219b3f738a9dc54f2da43"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",

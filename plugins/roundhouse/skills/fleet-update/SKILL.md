@@ -55,9 +55,10 @@ policy.
   outdated), never "all current". npm always runs through the durable npm: fnm's `default` alias first,
   then PATH, then the fixed Homebrew/Linuxbrew/system prefixes, never an
   `fnm_multishells` path, and always with npm's own directory first on PATH so
-  the matching `node` owns the install. On native Windows (winget
-  `OpenJS.NodeJS`) the executor resolves `npm` from PATH and an updater from
-  the prefix npm reports. npm 12 blocks dependency install scripts unless
+  the matching `node` owns the install. On native Windows the
+  executor resolves the durable npm the same way (fnm's `default` alias
+  `npm.cmd` first, then PATH, which is the MSI's npm on a host without fnm)
+  and an updater from the prefix that npm reports. npm 12 blocks dependency install scripts unless
   `~/.npmrc` allows them (`allow-scripts[]=<package>`, written in the ini
   array form because `npm config set` rejects it). chezmoi owns that file;
   Roundhouse neither writes nor rewrites it.
@@ -103,17 +104,37 @@ policy.
   `partial`. Old
   versions are never removed (a service may still run from one); they are
   reported. The sealed lane moves within the current major; a major change is
-  a store edit (`runtimes.node`, below). On Windows Node is winget
-  `OpenJS.NodeJS`: its record carries the gating `pin` (`winget pin add --id
-  OpenJS.NodeJS --version 26.*`), `line` and `install_scope` (read from the
-  package's HKLM/HKCU uninstall registration, never from PATH; ambiguous
-  evidence is null and treated as machine scope). The MSI
-  installs machine-wide, so the ordinary lane refuses its upgrade (`hold:
-  Node.js … needs elevation`); seal the protected
-  `winget.upgrade-machine-package.v1` action when readiness advertises it for
-  that channel, and otherwise report the hold. Never trigger a UAC prompt.
-  `%APPDATA%\npm` survives the upgrade, so Windows carries nothing and runs no
-  hooks.
+  a store edit (`runtimes.node`, below). Native Windows has two cases.
+- Node on a Windows host migrated to fnm: the collector reports the same
+  `fnm:node` record (root from `%FNM_DIR%`, `%APPDATA%\fnm` or
+  `%LOCALAPPDATA%\fnm`; default from the `aliases\default` junction; npm
+  records from that default's `npm.cmd`), and the same sealed switch runs
+  through `apply-interop-plan` in `apply-windows.ps1`, in the user's own
+  session, never elevated, with the same carry rule, hooks (projected to
+  Windows workers too), in-flight record and post-state. List `npm` in the
+  host's `package_managers` so the record is collected. The winget MSI
+  (`OpenJS.NodeJS`) may stay installed; its record then shows `shadowed_by:
+  "fnm:node"`, `managed: false`, `update_available: false`, and `seal-plan`
+  refuses its upgrade (`hold: Node.js (winget OpenJS.NodeJS) is shadowed by
+  fnm …`): never plan one. Migrate a host once, as its own user, from a
+  non-elevated PowerShell 7: `pwsh -NoProfile -File
+  <plugin>\scripts\apply-windows.ps1 -BootstrapNodeFnm -NodeMajor 26`. It is
+  idempotent: fnm user-scope via winget, else the pinned SHA-256-verified
+  release; `FNM_DIR`; the newest release in the major carrying every global
+  of the MSI's `%APPDATA%\npm` (an fnm default already in the major is left
+  as it is; the sealed lane moves it and runs the hooks); the alias first on
+  the user PATH. Rerunning
+  it also restores a Windows switch left in flight. The machine PATH still
+  puts the MSI's `node` first for a bare `node`/`npm` in new sessions;
+  global bins and Roundhouse itself use fnm.
+- Node on a Windows host without fnm: the MSI rules stand. Its record
+  carries the gating `pin` (`winget pin add --id OpenJS.NodeJS --version
+  26.*`), `line` and `install_scope` (from the package's HKLM/HKCU uninstall
+  registration, never from PATH; ambiguous is null, treated as machine
+  scope). A machine-scope upgrade holds (`hold: Node.js … needs elevation`)
+  unless readiness advertises the protected
+  `winget.upgrade-machine-package.v1` action for that channel. Never trigger
+  a UAC prompt.
 
 Present exact host, manager, package, current version, candidate version, and
 command. Every `package-upgrade` operation must carry the exact observed
@@ -127,7 +148,8 @@ config, plan integrity, and preconditions without executing plan text. Then
 execute only the exact argv sealed in the plan. For a local target use `"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; for SSH
 use `"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`; for native Windows with a
 `wsl_interop_via` sibling use `"$CLI" apply-interop-plan PLAN PLAN-ID OUTPUT`
-(winget and npm upgrades run through the installed, verified `apply-windows.ps1`).
+(winget and npm upgrades and the `fnm:node` switch run through the installed,
+verified `apply-windows.ps1`).
 Each recaptures trusted preflight and enforces the same executor, identity, manager-command,
 fresh-precondition, and semantic post-state checks. If an operation or
 postcondition fails, preserve the authoritative partial result emitted when
@@ -283,7 +305,9 @@ The host may declare further host-only hooks (a WSL-only shim reinstall,
 say); those run too. What the new Node provides, and older Node versions
 (never removed), are reported as `note` lines. `runtimes.node: disabled` stops managing the
 runtime. Only fnm is a runtime source; DSC never runs on native Windows, whose
-Node converges only through the sealed lane above. Add `runtimes:` to the
+fnm Node converges only through the sealed lane above (seal the `fnm:node`
+switch for the Windows target; a Windows switch left in flight is restored by
+rerunning the bootstrap). Add `runtimes:` to the
 store only once every host runs a Roundhouse that knows the category (0.9.30
 or later): an older host holds everything on an unknown category.
 
