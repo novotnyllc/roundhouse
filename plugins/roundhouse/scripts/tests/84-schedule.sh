@@ -1051,8 +1051,12 @@ fleet_run_command --fast'
     [ -f "$sched_legacy" ] && [ -e "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate" ] &&
       [ ! -e "$sched_fast" ] || fail "a refused install touched the legacy job or wrote new ones"
     : >"$HOME/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist"
-    SCHED_STORE_READY=1 sched_schedule install >/dev/null 2>&1 ||
-      fail "install with legacy entries failed"
+    sched_out=$(SCHED_STORE_READY=1 sched_schedule install 2>&1) ||
+      fail "install with legacy entries failed: $sched_out"
+    case $sched_out in
+      *'absorbed the superseded com.novotnyllc.roundhouse.autoupdate entry (kept as '*', unloaded)'*) ;;
+      *) fail "the absorbed, loaded superseded job was not reported unloaded: $sched_out" ;;
+    esac
     [ -f "$sched_fast" ] && [ -f "$sched_full" ] || fail "the absorbing install wrote no new pair"
     [ ! -e "$sched_legacy" ] && [ -f "$sched_legacy.absorbed" ] &&
       [ -f "$HOME/Library/LaunchAgents/com.novotnyllc.roundhouse.fleet.plist.absorbed" ] ||
@@ -1083,6 +1087,41 @@ fleet_run_command --fast'
         fail "a superseded entry whose rename failed was removed or unloaded"
       rm -f "$sched_legacy" "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate"
     )
+    # A superseded plist that cannot be read fails the observation; it is
+    # never taken for absent and left in place by a "successful" install.
+    : >"$sched_legacy"
+    chmod 000 "$sched_legacy"
+    sched_status=0
+    sched_out=$(SCHED_STORE_READY=1 sched_schedule install 2>&1) || sched_status=$?
+    chmod 600 "$sched_legacy"
+    [ "$sched_status" -ne 0 ] && [ -f "$sched_legacy" ] ||
+      fail "install with an unreadable superseded plist did not fail ($sched_status): $sched_out"
+    rm -f "$sched_legacy"
+    # A superseded job launchd will not let go of is not absorbed: the
+    # install fails and reports no absorption, and the next install unloads
+    # it although its plist was already set aside.
+    : >"$sched_legacy"
+    : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate"
+    sched_status=0
+    sched_out=$(SCHED_BOOTOUT_FAIL=1 SCHED_STORE_READY=1 sched_schedule install 2>&1) || sched_status=$?
+    [ "$sched_status" -ne 0 ] || fail "install reported success while launchd still held the superseded job: $sched_out"
+    case $sched_out in *'absorbed the superseded'*) fail "install reported a superseded job absorbed that launchd still held: $sched_out" ;; esac
+    [ -e "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate" ] ||
+      fail "the fixture's failing bootout unloaded the superseded job"
+    [ ! -e "$sched_legacy" ] || fail "the superseded plist was not set aside before its unload"
+    # Still loaded with its plist set aside, it is still a working job: not
+    # retired without an enrolled store for the new pair to converge.
+    sched_status=0
+    sched_out=$(sched_schedule install 2>&1) || sched_status=$?
+    [ "$sched_status" -eq 69 ] && [ -e "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate" ] ||
+      fail "install retired a loaded superseded job, its plist set aside, with no enrolled store ($sched_status): $sched_out"
+    sched_out=$(SCHED_STORE_READY=1 sched_schedule install 2>&1) ||
+      fail "the install after a failed superseded unload failed: $sched_out"
+    [ ! -e "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.autoupdate" ] ||
+      fail "a superseded job still loaded, its plist already set aside, was not unloaded"
+    case $sched_out in *'unloaded the superseded com.novotnyllc.roundhouse.autoupdate entry'*) ;;
+      *) fail "the late unload of the superseded job was not reported: $sched_out" ;; esac
+    rm -f "$sched_legacy".absorbed.*
 
     # --- a pass never re-enables an operator-disabled job; it alerts ---
     # The stub, like launchd, keeps the job LOADED through the disable.
