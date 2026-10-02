@@ -66,6 +66,7 @@ jobs:
             shellcheck --severity=warning -x -P SCRIPTDIR \
               plugins/roundhouse/scripts/roundhouse \
               plugins/roundhouse/scripts/collect-posix \
+              plugins/roundhouse/scripts/privilege-lane-posix \
               plugins/roundhouse/scripts/launcher-install \
               plugins/roundhouse/scripts/test-roundhouse \
               plugins/roundhouse/scripts/update-integrity

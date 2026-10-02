@@ -18,6 +18,8 @@
 #                            [--plan-id ID] [--plan-sha256 DIGEST] [--operation-index N]
 #                            [--wait SECONDS] [--request-id REQUEST-ID]
 #   privilege-lane-posix result REQUEST-ID
+#   privilege-lane-posix candidate PACKAGE
+#   privilege-lane-posix actions PLATFORM
 #   privilege-lane-posix self-test
 #
 # This version covers the apt catalog on Linux and WSL. macOS reports
@@ -27,6 +29,9 @@
 # Trust model: the lane trusts the enrolled owner. The design, the catalog and
 # the residual risks are in docs/specs/2026-10-01-hands-off-privilege-lane.md.
 set -euo pipefail
+# Under pipefail, `printf … | grep -q` can fail when grep exits on its match
+# before the writer's last write (seen under load with bash 3.2), so every
+# grep over a variable below reads a here-string instead of a pipe.
 
 umask 077
 export LC_ALL=C LANG=C TZ=UTC
@@ -220,16 +225,19 @@ valid_uint_or_dash() { [ "$1" = - ] || valid_uint "$1"; }
 valid_version() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,127}$ ]]; }
 valid_version_or_dash() { [ "$1" = - ] || valid_version "$1"; }
 valid_plugin_version() { [[ $1 =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]]; }
-valid_apt_package() { [[ $1 =~ ^[a-z0-9][a-z0-9+.-]{0,127}$ ]]; }
+# A trailing `-` is apt-get's remove syntax (`install PKG-`), never a name.
+valid_apt_package() { [[ $1 =~ ^[a-z0-9][a-z0-9+.-]{0,127}$ ]] && [[ $1 != *- ]]; }
 valid_plan_id() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
 valid_account() { [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]]; }
 valid_abs_dir() { [[ $1 =~ ^/[A-Za-z0-9._/@-]+$ ]] && [[ $1 != *'/../'* ]] && [[ $1 != *'/..' ]]; }
 
 platform_actions() {
   # The closed catalog. Every action takes at most a package and a version;
-  # `source` and `payload-sha256` stay `-` on every one of them in this
-  # version (the fields exist so the record format does not change when the
-  # payload-backed actions arrive).
+  # `source` and `payload-sha256` stay `-` on every one of them. The fields
+  # exist now because the owner-side copy that writes requests is updated
+  # with the plugin while root's copy, which parses them, stays at the
+  # enrolled version until re-enrollment: the record shape must not move
+  # between the two.
   case $1 in
     linux|wsl) record apt.update-metadata.v1 apt.upgrade-package.v1 \
       apt.install-package-version.v1 apt.autoremove.v1 lane.probe.v1 ;;
@@ -396,10 +404,11 @@ render_sudoers() {
 }
 owner_can_dispatch() {
   # The grant as the owner sees it: `sudo -n -l COMMAND` succeeds only when
-  # the exact command is permitted without a password. Fixture mode has no
-  # sudo and checks the rendered grant instead.
+  # the exact command is permitted without a password. Root reads the grant
+  # file itself (grant_present); fixture mode has no sudo and checks the
+  # rendered grant instead.
   if fixture_mode; then grant_present; return; fi
-  [ "$(id -u)" = "$id_owner_uid" ] || return 0
+  [ "$(id -u)" -ne 0 ] || return 0
   /usr/bin/sudo -n -l "$lane_libexec/$lane_name" dispatch >/dev/null 2>&1
 }
 st_state=
@@ -444,6 +453,11 @@ lane_state() {
   for d in "$libexec_dir" "$state_dir" "$results_dir"; do
     [ "$(file_mode "$d")" = 755 ] || { st_detail="$d is not traversable by the owner (mode $(file_mode "$d"), expected 755)"; return 0; }
   done
+  # Only the enrolled owner (or root) can vouch for the grant: another user
+  # on the host has no lane here, and is told so rather than shown `ready`.
+  if [ "$(id -u)" -ne 0 ] && [ "$(id -u)" != "$id_owner_uid" ]; then
+    st_detail="the lane is enrolled for $id_owner_name (uid $id_owner_uid), not the current user"; return 0
+  fi
   if ! owner_can_dispatch; then st_detail='sudo does not permit the owner to dispatch'; return 0; fi
   if [ "$id_platform" != "$platform" ]; then st_detail="enrolled for $id_platform on $platform"; return 0; fi
   st_state=ready
@@ -686,7 +700,11 @@ take_lock() {
   mkdir "$lock_dir" 2>/dev/null || return 1
   printf '%s\n' "$$" >"$lock_dir/pid"
 }
-release_lock() { rm -rf "$lock_dir"; }
+release_lock() {
+  # Only the holder releases: a competitor that lost take_lock must never
+  # remove the winner's lock on its way out.
+  if [ "$(cat "$lock_dir/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$lock_dir"; fi
+}
 
 # --- dispatch -----------------------------------------------------------------
 dispatch_command() {
@@ -699,7 +717,9 @@ dispatch_command() {
   parse_identity "$identity_path" || die 74 'dispatch: lane identity is missing or drifted'
   [ "$(sha256_file "$installed_script")" = "$id_sha256" ] || die 74 'dispatch: installed script digest drifted'
   take_lock || die 75 'dispatch: another dispatch holds the lane lock'
-  trap 'release_lock' EXIT HUP INT TERM
+  # A signal ends the drain (a trap alone would resume the loop lock-less).
+  trap 'release_lock; trap - EXIT; exit 1' HUP INT TERM
+  trap 'release_lock' EXIT
   compact_claims
   for entry in "$ingress_dir"/request-*.request; do
     [ -e "$entry" ] || [ -L "$entry" ] || continue
@@ -807,7 +827,7 @@ publish_result() {
   printf '%s\n' "$result" | write_protected_file "$claims_dir/$id/result" 600
   printf '%s\n' "$result" | write_protected_file "$results_dir/$id.result" 644
   journal_event request "$id" "$rq_action" "$rq_package" "$2" "$3" "$rq_sha" \
-    "$(printf '%s\n' "$result" | head -n 20 | sha256_stream)"
+    "$(head -n 20 <<<"$result" | sha256_stream)"
 }
 
 # --- actions ------------------------------------------------------------------
@@ -815,9 +835,11 @@ publish_result() {
 # The native command is fixed per action; the request contributes only the
 # validated package and version.
 native_env() {
-  # native_env COMMAND...: the one native command, under a clean environment.
-  env -i LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-    HOME="$(native_home)" DEBIAN_FRONTEND=noninteractive "$@" </dev/null
+  # native_env COMMAND...: the one native command, under a clean environment
+  # and the system umask — this script's own 077 must not reach dpkg
+  # maintainer scripts, whose files would come out root-only.
+  (umask 022; exec env -i LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME="$(native_home)" DEBIAN_FRONTEND=noninteractive "$@" </dev/null)
 }
 apt_dpkg_options() {
   # Never a conffile prompt: keep the local conffile, fall back to the
@@ -849,8 +871,8 @@ apt_candidate() {
   local apt_cache installed candidate output
   apt_cache=$(native_binary apt-cache) || return 1
   output=$(native_env "$apt_cache" policy "$1" 2>/dev/null) || return 1
-  installed=$(printf '%s\n' "$output" | awk '$1 == "Installed:" { print $2; exit }')
-  candidate=$(printf '%s\n' "$output" | awk '$1 == "Candidate:" { print $2; exit }')
+  installed=$(awk '$1 == "Installed:" { print $2; exit }' <<<"$output")
+  candidate=$(awk '$1 == "Candidate:" { print $2; exit }' <<<"$output")
   [ -n "$installed" ] && [ -n "$candidate" ] || return 1
   printf '%s %s\n' "$installed" "$candidate"
 }
@@ -894,7 +916,7 @@ action_apt_install() {
   [ "$rq_version" = - ] || spec="$rq_package=$rq_version"
   pre=$(sha256_text "install|$rq_package|$(dpkg_version "$rq_package" || printf -- '-')")
   # shellcheck disable=SC2046 # fixed option tokens, no whitespace
-  native_env "$apt_get" -q -y $(apt_dpkg_options) --no-install-recommends install "$spec" >/dev/null 2>&1 || rc=$?
+  native_env "$apt_get" -q -y $(apt_dpkg_options) --no-remove --no-install-recommends install "$spec" >/dev/null 2>&1 || rc=$?
   native_exit=$rc
   after=$(dpkg_version "$rq_package") || after=-
   post=$(sha256_text "installed|$rq_package|$after")
@@ -917,7 +939,7 @@ action_apt_autoremove() {
     post=$(sha256_text 'autoremove|simulation|failed')
     state=partial; reason=post_check_failed; return 1
   fi
-  remaining=$(printf '%s\n' "$simulation" | awk '$1 == "Remv" { n++ } END { print n + 0 }')
+  remaining=$(awk '$1 == "Remv" { n++ } END { print n + 0 }' <<<"$simulation")
   post=$(sha256_text "autoremove|remaining|$remaining")
   [ "$remaining" -eq 0 ] || { state=partial; reason=post_state_mismatch; return 1; }
   state=completed; reason=autoremove_completed
@@ -997,10 +1019,13 @@ request_command() {
     fi
   done
   if [ ! -f "$result_file" ]; then
-    if [ -f "$request_file" ]; then
-      # Never claimed: the dispatch did not run. Withdraw it.
-      request_digest=$(head -n 15 "$request_file" | sha256_stream) || request_digest=-
-      rm -f "$request_file"
+    if mv -f "$request_file" "$ingress_dir/.$id.withdrawn" 2>/dev/null; then
+      # Never claimed: the dispatch did not run. The withdrawal is a rename,
+      # so a root claim that lands in the same instant takes the file first
+      # and this branch is not reached (root's own rename would then fail,
+      # and it publishes nothing for a request it never read).
+      request_digest=$(head -n 15 "$ingress_dir/.$id.withdrawn" | sha256_stream) || request_digest=-
+      rm -f "$ingress_dir/.$id.withdrawn"
       timeout_state=rejected; timeout_reason=lane_dispatch_unavailable; timeout_rc=75
     else
       # Claimed by root but not yet answered (a long native command): the
@@ -1115,6 +1140,8 @@ self_test() {
   [ "$rc" -eq 64 ] || self_fail 'foreign-platform action accepted'
   rc=0; "$installed" request apt.update-metadata.v1 curl >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 64 ] || self_fail 'surplus parameter accepted'
+  rc=0; "$installed" request apt.install-package-version.v1 curl- >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 64 ] || self_fail 'apt remove syntax (PKG-) accepted as a package name'
   rc=0; out=$("$installed" candidate curl) || rc=$?
   [ "$rc" -eq 0 ] && grep -Fqx 'installed|8.1.0-1' <<<"$out" && grep -Fqx 'candidate|8.2.0-1' <<<"$out" || self_fail "candidate record: $out"
   rc=0; out=$("$installed" candidate nonexistent) || rc=$?
@@ -1126,6 +1153,7 @@ self_test() {
     grep -Fqx 'plan-id|plan-0123456789abcdef' <<<"$out" &&
     grep -Fqx 'operation-index|3' <<<"$out" || self_fail "apt update: $out"
   grep -Fqx 'apt-get -q update' "$root/apt.log" || self_fail 'apt-get update argv'
+  grep -Fqx 'umask 0022' "$root/umask.log" || self_fail "native command did not run under the system umask: $(cat "$root/umask.log")"
   id=$(printf '%s\n' "$out" | sed -n 's/^request-id|//p')
   rc=0; "$installed" result "$id" >"$root/lookup.out" || rc=$?
   [ "$rc" -eq 0 ] && cmp -s "$root/lookup.out" "$root/fixture$lane_state/results/$id.result" || self_fail 'result lookup'
@@ -1250,6 +1278,7 @@ write_apt_stubs() {
   cat >"$bin/apt-get" <<EOF
 #!/bin/sh
 printf 'apt-get %s\n' "\$*" >>"$root/apt.log"
+printf 'umask %s\n' "\$(umask)" >>"$root/umask.log"
 [ ! -e "$root/apt-fail" ] || exit 1
 case "\$*" in
   *"--simulate autoremove"*) [ ! -e "$root/apt-simulate-fail" ] || exit 100; [ ! -e "$root/apt-remaining" ] || printf 'Remv old-kernel [1.0]\n'; exit 0 ;;

@@ -85,7 +85,7 @@ scopes_for() {
     plugins/roundhouse/scripts/enroll-privilege-posix*|\
     plugins/roundhouse/scripts/privilege-broker-posix*) printf 'macos-privilege-contracts\n'; u2_scopes ;;
     plugins/roundhouse/scripts/launcher-install*) printf 'u4-contracts\nu5-contracts\n' ;;
-    plugins/roundhouse/scripts/privilege-lane-*) printf 'u5-contracts\n' ;;
+    plugins/roundhouse/scripts/privilege-lane-posix*) printf 'u5-contracts\n' ;;
     *) return 1 ;;
   esac
 }

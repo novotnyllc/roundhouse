@@ -73,8 +73,8 @@ adds `prepare-privilege-identity`, `preview-privilege-upgrade`, and
 secret reference, encrypted file, token, private key, or secret-backed template
 in a lane request: the lane carries package tokens and versions, nothing
 else. Preserve the readiness states `ready`, `needs_one_time_approval`,
-`unsupported`, `drifted`, and `unreachable`, and the operation-result states
-`partial` and `rejected`, without fallback.
+`disabled`, `legacy`, `unsupported`, `drifted`, and `unreachable`, and the
+operation-result states `partial` and `rejected`, without fallback.
 Never ask for or relay a sudo or Administrator password; the host's single OS
 approval (`roundhouse privilege-enroll HOST`) is the only privileged
 credential interaction and it belongs to the owner at the host's own prompt.

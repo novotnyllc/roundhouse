@@ -257,7 +257,7 @@ lane_rc=0
   : >"$lane_tmp/apt.log"
   fleet_host_name() { printf 'test-apt\n'; }
   lane_env fleet_install_package apt curl false 8.2.0-1 || fail "fleet_install_package apt through the lane failed"
-  grep -Fqx 'apt-get -q -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-install-recommends install curl=8.2.0-1' "$lane_tmp/apt.log" ||
+  grep -Fqx 'apt-get -q -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-remove --no-install-recommends install curl=8.2.0-1' "$lane_tmp/apt.log" ||
     fail "fleet_install_package did not route apt through the lane: $(cat "$lane_tmp/apt.log")"
   # Every host-local mutation is a sealed plan: the lane's journal shows a
   # sealed plan id, never the ad-hoc fleet-run token.
@@ -269,7 +269,7 @@ lane_rc=0
   # An unpinned install carries the `-` sentinel, never an empty version.
   : >"$lane_tmp/apt.log"
   lane_env fleet_install_package apt curl false || fail "unpinned fleet_install_package apt failed"
-  grep -Fqx 'apt-get -q -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-install-recommends install curl' "$lane_tmp/apt.log" ||
+  grep -Fqx 'apt-get -q -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --no-remove --no-install-recommends install curl' "$lane_tmp/apt.log" ||
     fail "unpinned install did not reach apt-get without a version: $(cat "$lane_tmp/apt.log")"
   # The full-pass apt arm: metadata refresh and upgrade, both sealed.
   : >"$lane_tmp/apt.log"
@@ -285,6 +285,8 @@ lane_rc=0
   lane_apt_hold=$(lane_env lane_fleet_run_apt "$tmp/store" test-apt curl curl "" 2>/dev/null) || :
   rm -f "$lane_tmp/apt-update-fail"
   grep -q 'apt metadata refresh did not complete' <<<"$lane_apt_hold" || fail "failed refresh did not hold: $lane_apt_hold"
+  grep -rlq 'apt metadata refresh through the privilege lane did not complete' "$tmp/store/alerts" 2>/dev/null ||
+    fail "a failed refresh on an enrolled lane raised no alert: $(ls -R "$tmp/store/alerts" 2>/dev/null | head -n 5)"
   grep -q 'only-upgrade' "$lane_tmp/apt.log" && fail 'an upgrade ran after a failed metadata refresh'
   lane_fleet_apt_refreshed=; lane_fleet_apt_alerted=; lane_fleet_apt_refresh_failed=
   # A host-local plan whose version is not the candidate is refused at
@@ -294,7 +296,7 @@ lane_rc=0
   lane_env lane_host_apply test-apt "[$(lane_operation_json apt.upgrade-package.v1 curl 9.9.9)]" >/dev/null 2>"$lane_tmp/host-apply.err" || lane_rc=$?
   [ "$lane_rc" -eq 65 ] || fail "host-local apply with a stale version exited $lane_rc, expected 65"
   [ ! -s "$lane_tmp/apt.log" ] || fail 'a refused host-local plan reached apt-get'
-  lane_env lane_package_hold_detail packages.curl test-apt | grep -q 'no package manager on this host can provide' ||
+  lane_env lane_package_hold_detail packages.curl test-apt apt | grep -q 'no package manager on this host can provide' ||
     fail 'an enrolled lane still blamed the package manager'
   lane_env fleet_doctor_lane_row | grep -Eq '^ok       privilege-lane +enrolled, lane [0-9.]+ [0-9a-f]{12}$' ||
     fail 'fleet-doctor did not report the enrolled lane'
@@ -303,8 +305,10 @@ lane_rc=0
   lane_rc=0
   lane_env fleet_install_package apt curl false >/dev/null 2>&1 || lane_rc=$?
   [ "$lane_rc" -eq 75 ] || fail "fleet_install_package apt without a lane returned $lane_rc, expected 75"
-  lane_env lane_package_hold_detail packages.curl test-apt | grep -q 'run `roundhouse privilege-enroll test-apt` once' ||
+  lane_env lane_package_hold_detail packages.curl test-apt apt | grep -q 'run `roundhouse privilege-enroll test-apt` once' ||
     fail 'the hold text did not name the one-time approval'
+  lane_env lane_package_hold_detail packages.curl test-apt | grep -q 'no package manager on this host can provide' ||
+    fail 'a package no manager resolves was blamed on the apt lane'
   lane_env fleet_doctor_lane_row | grep -Eq '^ok       privilege-lane +not enrolled' ||
     fail 'fleet-doctor did not report the unenrolled lane as pending'
   rm -rf "$lane_tmp/fixture"
@@ -320,7 +324,9 @@ jq '.machines["test-ssh-linux"] = {platform:"linux",transport:"ssh",ssh_alias:"f
 chmod 600 "$lane_tmp/config-ssh.json"
 : >"$lane_tmp/ssh.log"
 ROUNDHOUSE_CONFIG="$lane_tmp/config-ssh.json" SSH_COMMAND_LOG="$lane_tmp/ssh.log" lane_env "$cli" privilege-lane-status test-ssh-linux "$lane_tmp/ssh-status.json" >/dev/null 2>&1 || :
-jq -e '.transport == "ssh fake-host" and (.state | IN("ready","drifted"))' "$lane_tmp/ssh-status.json" >/dev/null ||
+# The fixture lane is enrolled as test-apt, so an alias that lands on it
+# under another machine name is drift: the operation would run elsewhere.
+jq -e '.transport == "ssh fake-host" and .state == "drifted" and (.detail | contains("enrolled as test-apt"))' "$lane_tmp/ssh-status.json" >/dev/null ||
   fail "lane status over ssh: $(cat "$lane_tmp/ssh-status.json")"
 grep -q 'fake-host' "$lane_tmp/ssh.log" && grep -q 'privilege-lane-path' "$lane_tmp/ssh.log" ||
   fail 'the ssh transport did not resolve the remote helper through roundhouse'

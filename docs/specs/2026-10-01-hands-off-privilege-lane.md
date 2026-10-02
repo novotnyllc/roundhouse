@@ -25,7 +25,7 @@ This design replaces it with a **local privilege lane**: after exactly one
 OS approval per host — a single `sudo` password on POSIX, a single UAC
 consent on Windows, both triggered by Roundhouse during onboarding or the
 first time privilege is needed — every privileged action the fleet needs
-runs unattended, including upgrades of the lane itself. No ceremony, no
+runs unattended (upgrades of the lane itself are deferred; see below). No ceremony, no
 PKI, no recurring human step.
 
 The previous CA/SFTP lane stays in the tree as an optional high-assurance
@@ -219,6 +219,7 @@ request-sha256|<sha256 of every line above>
 ```text
 lane-result|1
 request-id|…
+host-id|…
 plan-id|…
 plan-sha256|…
 operation-index|…
@@ -321,7 +322,7 @@ relays or stores a password or administrator credential.
 
 | Platform / transport | What happens | The one human action |
 | --- | --- | --- |
-| Linux / WSL, `transport: local` | `sudo -p … scripts/privilege-lane-posix enroll --host-id HOST --owner $(id -un) --plugin-root …` | type the sudo password in the terminal running the command |
+| Linux / WSL, `transport: local` | `sudo -p … scripts/privilege-lane-posix enroll --host-id HOST --owner $(id -un)` | type the sudo password in the terminal running the command |
 | Linux / WSL, `transport: ssh` | `ssh -t ALIAS "sudo -p … \"\$(roundhouse privilege-lane-path)\" enroll …"` | same, over the forwarded TTY |
 | macOS (deferred) | the same POSIX path once `macos.install-signed-pkg.v1` ships; until then `privilege-enroll` refuses with "not yet supported" and installs nothing | — |
 | Windows with `wsl_interop_via` (deferred) | through the WSL sibling: `pwsh.exe -File <installed plugin>\scripts\privilege-lane-windows.ps1 -Enroll -HostId HOST`, which re-launches itself elevated with `Start-Process -Verb RunAs` | click **Yes** on the UAC consent dialog that appears on the console |
@@ -386,7 +387,8 @@ probe — no second consent.
   and the full pass refreshes metadata then upgrades each unpinned apt
   package that `apt-cache policy` reports behind through
   `apt.upgrade-package.v1`. When the lane is not enrolled the run keeps the
-  existing hold (`no privileged lane enrolled`) and raises one
+  existing hold (`apt needs the local privilege lane; run: roundhouse
+  privilege-enroll HOST`) and raises one
   `privilege-lane` alert with the exact enrollment command; a scheduled run
   never prompts.
   Every such mutation is a sealed plan against the host itself

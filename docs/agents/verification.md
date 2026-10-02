@@ -36,7 +36,7 @@ plugin changes.
 
 2. **Lint** — `shellcheck --severity=warning -x -P SCRIPTDIR` (Linux job only)
    on the five substantial scripts: `roundhouse`, `collect-posix`,
-   `launcher-install`, `test-roundhouse`, `update-integrity`. `-x` follows the `# shellcheck
+   `launcher-install`, `privilege-lane-posix`, `test-roundhouse`, `update-integrity`. `-x` follows the `# shellcheck
    source=` directives, so `lib/` and `tests/` are analysed as part of the
    program that sources them rather than as standalone fragments.
 3. **Integrity** — `plugins/roundhouse/scripts/update-integrity` followed by

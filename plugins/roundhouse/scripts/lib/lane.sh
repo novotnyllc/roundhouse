@@ -11,8 +11,6 @@
 # Sourced by scripts/roundhouse; carries definitions only.
 # shellcheck shell=bash
 
-lane_posix_libexec=/usr/local/libexec/roundhouse-lane/privilege-lane
-
 lane_actions_for_platform() {
   # The actions a sealed lane plan may carry: the apt catalog on linux and
   # wsl, nothing anywhere else in this version (the helper's own catalog is
@@ -266,11 +264,17 @@ privilege_enroll_command() (
       if fleet_test_hook "${ROUNDHOUSE_LANE_ENROLL_COMMAND:-}"; then
         sh -c "$ROUNDHOUSE_LANE_ENROLL_COMMAND" "lane-enroll" "$target" >"$tmp/out" 2>"$tmp/err" || rc=$?
       elif [ -t 0 ] && [ -t 1 ]; then
-        # -t: the sudo prompt needs the forwarded terminal. Everything else
-        # about the remote command is fixed text.
-        /usr/bin/ssh -t -o BatchMode=no -o ConnectTimeout=10 "$alias" \
-          "lane_helper=\$(roundhouse privilege-lane-path) || exit 69; sudo -p 'Roundhouse one-time approval for $target (your sudo password): ' \"\$lane_helper\" enroll --host-id $(lane_quote "$target") --owner \"\$(id -un)\"" \
-          >"$tmp/out" 2>"$tmp/err" || rc=$?
+        # The remote half is constant text run by the login shell, exactly
+        # as ssh_run does it, so the launcher's ~/.local/bin is on PATH and
+        # `roundhouse privilege-lane-path` resolves. -t forwards the
+        # terminal for sudo's prompt, which sudo prints on the pty — that
+        # is ssh's stdout — so the output is copied to stderr for the owner
+        # and kept for the record; lane_report_enrollment cuts the record
+        # out from its header line. $target matches ^[A-Za-z0-9._-]+$.
+        lane_enroll_program="lane_helper=\$(roundhouse privilege-lane-path) || exit 69; sudo -p \"Roundhouse one-time approval for $target (your sudo password): \" \"\$lane_helper\" enroll --host-id $target --owner \"\$(id -un)\""
+        ssh -t -o BatchMode=no -o RequestTTY=yes -o RemoteCommand=none -o ConnectTimeout=10 "$alias" \
+          "if [ -z \"\${SHELL:-}\" ] || [ ! -x \"\$SHELL\" ]; then printf 'roundhouse: configured login shell is unavailable\\n' >&2; exit 69; fi; exec \"\$SHELL\" -lc '$lane_enroll_program'" \
+          2>"$tmp/err" | tee "$tmp/out" >&2 && rc=${PIPESTATUS[0]} || rc=${PIPESTATUS[0]}
       else
         lane_report_pending "$target" needs_one_time_approval \
           "run from a terminal: roundhouse privilege-enroll $target (one sudo password prompt over ssh $alias)"
@@ -444,7 +448,7 @@ lane_draft_valid() {
       (.id | type == "string" and test("^[a-z]+\\.[a-z0-9-]+\\.v[0-9]+$")) and
       (.package | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}$"))) and
       (.version | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,127}$"))) and
-      (.source | type == "string" and (. == "-" or test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")))
+      (.source == "-")
     ] | all)' "$1" >/dev/null 2>&1
 }
 lane_plan_precondition() {
@@ -653,9 +657,8 @@ lookup_lane_result() {
 lane_local_state() {
   # lane_local_state -> ready | needs_one_time_approval | drifted |
   # unsupported | unreachable (the helper printed no state at all).
-  lane_local_rc=0
-  lane_local_raw=$("$script_dir/privilege-lane-posix" status 2>/dev/null) || lane_local_rc=$?
-  lane_local_value=$(printf '%s\n' "$lane_local_raw" | awk -F '|' '$1 == "state" { print $2; exit }')
+  lane_local_raw=$("$script_dir/privilege-lane-posix" status 2>/dev/null) || :
+  lane_local_value=$(awk -F '|' '$1 == "state" { print $2; exit }' <<<"$lane_local_raw")
   printf '%s\n' "${lane_local_value:-unreachable}"
 }
 lane_host_apply() {
@@ -693,11 +696,12 @@ lane_operation_json() {
     '{type:"semantic-action",kind:"privileged_action",id:$id,package:$package,version:$version,source:$source}'
 }
 lane_package_hold_detail() {
-  # lane_package_hold_detail ITEM HOST [MANAGER] -> the alert text for a held
+  # lane_package_hold_detail ITEM HOST MANAGER -> the alert text for a held
   # package: names the one-time approval only when apt is the manager that
   # would provide it and the lane is not ready; the ordinary "no manager"
-  # text otherwise (an npm or Homebrew hold is never an apt problem).
-  if [ "${3:-apt}" = apt ] && command -v apt-get >/dev/null 2>&1 && [ "$(lane_local_state)" != ready ]; then
+  # text otherwise (an npm or Homebrew hold, or a package no manager on the
+  # host resolves, is never an apt problem).
+  if [ "${3:-none}" = apt ] && command -v apt-get >/dev/null 2>&1 && [ "$(lane_local_state)" != ready ]; then
     printf 'apt needs the local privilege lane for %s on %s: run `roundhouse privilege-enroll %s` once (a single sudo prompt); scheduled runs never prompt\n' \
       "$1" "$2" "$2"
   else
@@ -746,11 +750,11 @@ fleet_readiness_lane_row() {
 fleet_doctor_lane_row() {
   # fleet_doctor_lane_row — this host's lane, from its own status helper.
   lane_doctor_raw=$("$script_dir/privilege-lane-posix" status 2>/dev/null) || :
-  lane_doctor_state=$(printf '%s\n' "$lane_doctor_raw" | awk -F '|' '$1 == "state" { print $2; exit }')
-  lane_doctor_version=$(printf '%s\n' "$lane_doctor_raw" | awk -F '|' '$1 == "lane-version" { print $2; exit }')
-  lane_doctor_sha=$(printf '%s\n' "$lane_doctor_raw" | awk -F '|' '$1 == "lane-sha256" { print $2; exit }')
-  lane_doctor_detail=$(printf '%s\n' "$lane_doctor_raw" | awk -F '|' '$1 == "detail" { print $2; exit }')
-  case ${lane_doctor_state:-unsupported} in
+  lane_doctor_state=$(awk -F '|' '$1 == "state" { print $2; exit }' <<<"$lane_doctor_raw")
+  lane_doctor_version=$(awk -F '|' '$1 == "lane-version" { print $2; exit }' <<<"$lane_doctor_raw")
+  lane_doctor_sha=$(awk -F '|' '$1 == "lane-sha256" { print $2; exit }' <<<"$lane_doctor_raw")
+  lane_doctor_detail=$(awk -F '|' '$1 == "detail" { print $2; exit }' <<<"$lane_doctor_raw")
+  case ${lane_doctor_state:-unreachable} in
     ready) fleet_doctor_row ok privilege-lane "enrolled, lane $lane_doctor_version $(printf '%s' "$lane_doctor_sha" | cut -c1-12)" ;;
     needs_one_time_approval) fleet_doctor_row ok privilege-lane 'not enrolled; privileged package work holds until `roundhouse privilege-enroll` runs once' ;;
     unsupported) fleet_doctor_row ok privilege-lane 'not yet supported on this platform (the lane covers linux and wsl in this version)' ;;
@@ -768,22 +772,15 @@ lane_fleet_run_apt() {
   lane_fra_package=$3
   lane_fra_name=$4
   lane_fra_hold_dir=$5
+  lane_fra_err=$(mktemp "${TMPDIR:-/tmp}/roundhouse-lane-apt.XXXXXX")
   if [ "$(lane_local_state)" != ready ]; then
     printf '  hold  packages.%s — apt needs the local privilege lane; run: roundhouse privilege-enroll %s\n' \
       "$lane_fra_package" "$lane_fra_host"
     [ "${lane_fleet_apt_alerted:-false}" = true ] && return 0
     lane_fleet_apt_alerted=true
-    if [ -n "$lane_fra_hold_dir" ]; then
-      fleet_alert_raise "$lane_fra_hold_dir/alert-ledger" "$lane_fra_store" "$lane_fra_host" privilege-lane \
-        privilege-lane-needs-one-time-approval \
-        "$(lane_package_hold_detail "packages.$lane_fra_package" "$lane_fra_host")" \
-        "packages.$lane_fra_package" || :
-    else
-      fleet_alert_write "$lane_fra_store" "$lane_fra_host" privilege-lane \
-        privilege-lane-needs-one-time-approval \
-        "$(lane_package_hold_detail "packages.$lane_fra_package" "$lane_fra_host")" \
-        "packages.$lane_fra_package" || :
-    fi
+    lane_fleet_apt_alert privilege-lane-needs-one-time-approval \
+      "$(lane_package_hold_detail "packages.$lane_fra_package" "$lane_fra_host" apt)"
+    rm -f "$lane_fra_err"
     return 0
   fi
   # Metadata refresh once per pass, then the upgrade: each a sealed plan
@@ -794,22 +791,46 @@ lane_fleet_run_apt() {
   # reported once, and the flag is set only by a completed refresh.
   if [ "${lane_fleet_apt_refresh_failed:-false}" = true ]; then
     printf '  hold  packages.%s — apt metadata refresh did not complete this pass\n' "$lane_fra_package"
+    rm -f "$lane_fra_err"
     return 0
   fi
   if [ "${lane_fleet_apt_refreshed:-false}" != true ]; then
-    if lane_host_apply "$lane_fra_host" "[$(lane_operation_json apt.update-metadata.v1)]" </dev/null; then
+    if lane_host_apply "$lane_fra_host" "[$(lane_operation_json apt.update-metadata.v1)]" </dev/null 2>"$lane_fra_err"; then
       lane_fleet_apt_refreshed=true
     else
       lane_fleet_apt_refresh_failed=true
-      printf 'roundhouse: lane apt metadata refresh did not complete; apt upgrades hold this pass\n' >&2
+      lane_fra_why=$(tr '\n' ' ' <"$lane_fra_err" | cut -c1-200)
+      printf 'roundhouse: lane apt metadata refresh did not complete; apt upgrades hold this pass: %s\n' "$lane_fra_why" >&2
       printf '  hold  packages.%s — apt metadata refresh did not complete this pass\n' "$lane_fra_package"
+      # An enrolled lane that cannot complete its work is a standing
+      # condition the owner must see, not a line in a scheduled run's log.
+      lane_fleet_apt_alert privilege-lane-apt-refresh-failed \
+        "apt metadata refresh through the privilege lane did not complete on $lane_fra_host: ${lane_fra_why:-no reason reported}"
+      rm -f "$lane_fra_err"
       return 0
     fi
   fi
-  lane_fra_record=$("$script_dir/privilege-lane-posix" candidate "$lane_fra_name" 2>/dev/null) || return 0
-  lane_fra_installed=$(printf '%s\n' "$lane_fra_record" | awk -F '|' '$1 == "installed" { print $2; exit }')
-  lane_fra_candidate=$(printf '%s\n' "$lane_fra_record" | awk -F '|' '$1 == "candidate" { print $2; exit }')
-  [ "$lane_fra_installed" != - ] && [ "$lane_fra_candidate" != - ] && [ "$lane_fra_installed" != "$lane_fra_candidate" ] || return 0
-  lane_host_apply "$lane_fra_host" "[$(lane_operation_json apt.upgrade-package.v1 "$lane_fra_name" "$lane_fra_candidate")]" </dev/null ||
-    printf 'roundhouse: lane apt upgrade of %s to %s did not complete\n' "$lane_fra_name" "$lane_fra_candidate" >&2
+  lane_fra_record=$("$script_dir/privilege-lane-posix" candidate "$lane_fra_name" 2>/dev/null) || { rm -f "$lane_fra_err"; return 0; }
+  lane_fra_installed=$(awk -F '|' '$1 == "installed" { print $2; exit }' <<<"$lane_fra_record")
+  lane_fra_candidate=$(awk -F '|' '$1 == "candidate" { print $2; exit }' <<<"$lane_fra_record")
+  [ "$lane_fra_installed" != - ] && [ "$lane_fra_candidate" != - ] && [ "$lane_fra_installed" != "$lane_fra_candidate" ] || { rm -f "$lane_fra_err"; return 0; }
+  if ! lane_host_apply "$lane_fra_host" "[$(lane_operation_json apt.upgrade-package.v1 "$lane_fra_name" "$lane_fra_candidate")]" </dev/null 2>"$lane_fra_err"; then
+    lane_fra_why=$(tr '\n' ' ' <"$lane_fra_err" | cut -c1-200)
+    printf 'roundhouse: lane apt upgrade of %s to %s did not complete: %s\n' "$lane_fra_name" "$lane_fra_candidate" "$lane_fra_why" >&2
+    lane_fleet_apt_alert "privilege-lane-apt-upgrade-failed-$(printf '%s' "$lane_fra_package" | tr './' '--')" \
+      "apt upgrade of $lane_fra_name to $lane_fra_candidate through the privilege lane did not complete on $lane_fra_host: ${lane_fra_why:-no reason reported}"
+  fi
+  rm -f "$lane_fra_err"
+}
+lane_fleet_apt_alert() {
+  # lane_fleet_apt_alert SLUG DETAIL — a keyed `privilege-lane` alert for the
+  # package lane_fleet_run_apt is working on, through the pass ledger when
+  # there is one (so it clears on the first pass where the condition is
+  # gone) and straight to the store otherwise.
+  if [ -n "$lane_fra_hold_dir" ]; then
+    fleet_alert_raise "$lane_fra_hold_dir/alert-ledger" "$lane_fra_store" "$lane_fra_host" privilege-lane \
+      "$1" "$2" "packages.$lane_fra_package" || :
+  else
+    fleet_alert_write "$lane_fra_store" "$lane_fra_host" privilege-lane "$1" "$2" "packages.$lane_fra_package" || :
+  fi
 }

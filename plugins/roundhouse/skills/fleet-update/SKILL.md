@@ -24,9 +24,10 @@ policy.
   the planned formulae/casks. macOS casks run as the ordinary Homebrew owner through the
   packaged bridge hook so Homebrew retains Caskroom authority. An unprivileged
   app upgrade (including Visual Studio Code when its destination is writable)
-  follows Homebrew normally. A cask step that reaches Homebrew's hardcoded
-  `sudo` holds in this version (see "Protected package actions"); nothing
-  elevates it.
+  follows Homebrew normally. A cask package that reaches Homebrew's hardcoded
+  `sudo` succeeds only when it byte-matches an active exact
+  `sealed-cask-payload-v1` enrollment on the optional CA lane; otherwise it
+  holds (see "Protected package actions").
 - APT: on an update request, `apt-get update` then plan with
   `apt-get --simulate upgrade`. Do not use `full-upgrade`, `dist-upgrade`, or
   `autoremove` unless explicitly selected.
@@ -414,11 +415,11 @@ land in the store's own alert and journal records and surface in
 ## Protected package actions
 
 Privileged package work goes through the host's **privilege lane** — a
-root/SYSTEM-owned helper behind an owner-only queue, enrolled by one OS
+root-owned helper behind an owner-only queue, enrolled by one OS
 approval (`roundhouse privilege-enroll HOST`) and never by a ceremony. The
-catalog is closed and semantic; a request carries a package token, a version
-and (winget) a source, never argv, an executable, an installer selector, an
-environment, a shell, or an elevation control:
+catalog is closed and semantic; a request carries a package token and a
+version, never argv, an executable, an installer selector, an environment, a
+shell, or an elevation control:
 
 | Platform | Actions |
 | --- | --- |
@@ -445,11 +446,11 @@ accepts exactly once. `prepare-privilege-enrollment HOST OUT` reports
 `drifted`, or `unreachable`; `prepare-privilege-identity`,
 `preview-privilege-upgrade`, and `preview-privilege-revocation` belong to
 the optional CA lane and are not needed here. Preserve the readiness states
-`ready`, `needs_one_time_approval`, `unsupported`, `drifted`, and
-`unreachable`, and the operation-result states `partial` and `rejected`,
-exactly; perform no fallback.
+`ready`, `needs_one_time_approval`, `disabled`, `legacy`, `unsupported`,
+`drifted`, and `unreachable`, and the operation-result states `partial` and
+`rejected`, exactly; perform no fallback.
 Never ask for or relay a sudo or Administrator password: the one approval is
-typed or clicked by the owner at the host's own prompt, and the agent's job
+typed by the owner at the host's own prompt, and the agent's job
 when it is missing is to report `needs_one_time_approval` and the command.
 After a Roundhouse plugin install or update on POSIX, run
 `roundhouse launcher-install ~/.local/bin/roundhouse` so the maintained

@@ -47,7 +47,7 @@ doesn't move a train the shop hasn't cleared:
 | Inventory & parity | `fleet-inventory`, `fleet-agents`, `fleet-projects`, `fleet-auth` |
 | Baselines | `fleet-update` (packages/tools) |
 | Integrations | Optional chezmoi cooperation through [`agent-utilities`](https://github.com/novotnyllc/agent-utilities) |
-| Transport | `remote-mac`, `ssh-doctor`, the privilege lane, the WSL interop lane, the Codex remote-control contract |
+| Transport | `remote-mac`, `ssh-doctor`, the privilege lane, the WSL interop lane, the Codex remote-control contract; SSH certificate enrollment and the signed `windows-sftp` lane as the optional CA mode |
 
 ## Standalone skill installation
 
