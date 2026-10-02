@@ -123,6 +123,10 @@ fleet_trigger_start_after_exit() {
   # pass, and it is bounded. DETACHED, with SIGHUP ignored: a trigger that
   # came over SSH (the push nudge, under a ten-second watchdog) returns at
   # once, and the session ending does not take the start with it.
+  #
+  # The job is judged AGAIN right before the start, by the trigger's own
+  # plan: an operator who disabled, unloaded or uninstalled it during the
+  # wait has stopped it, and an operator stop is final.
   await_limit=30
   if fleet_test_hook "${ROUNDHOUSE_TEST_TRIGGER_AWAIT_SECONDS:-}"; then
     await_limit=$ROUNDHOUSE_TEST_TRIGGER_AWAIT_SECONDS
@@ -133,6 +137,7 @@ fleet_trigger_start_after_exit() {
     while fleet_trigger_exit_pending "$1" && [ "$SECONDS" -lt "$await_until" ]; do
       sleep 0.1
     done
+    [ "$(fleet_trigger_plan "$1")" = start ] || exit 0
     fleet_schedule_backend start "$1" || :
   ) </dev/null >/dev/null 2>&1 &
 }

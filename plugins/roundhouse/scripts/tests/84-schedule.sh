@@ -352,6 +352,21 @@ fleet_schedule_command "$@"'
     grep -Fqx "$sched_kick_fast" "$SCHED_LOG" ||
       fail "the trigger did not start a job whose run holds the lock"
     rm -rf "$(fleet_lock_path)"
+    # An operator stop that lands during the wait is final: the waiter judges
+    # the job again before the start, finds it stopped, and starts nothing.
+    # (Its re-judgement reads the disabled list, which is how the order shows.)
+    printf '30\n' >"$sched_running"
+    "$cli" fleet-trigger --fast >/dev/null
+    : >"$SCHED_LOG"
+    rm -f "$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-fast"
+    : >"$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-fast"
+    sched_wait_log "launchctl print-disabled gui/$sched_uid" ||
+      fail "the waiter never judged the job again before its start"
+    sleep 0.5
+    ! grep -Fqx "$sched_kick_fast" "$SCHED_LOG" ||
+      fail "the waiter started a job the operator stopped during its wait"
+    rm -f "$SCHED_STATE/disabled.com.novotnyllc.roundhouse.fleet-fast"
+    : >"$SCHED_STATE/loaded.com.novotnyllc.roundhouse.fleet-fast"
     # The waiter is bounded: a job that never ends is started anyway.
     : >"$SCHED_LOG"
     printf '999\n' >"$sched_running"
