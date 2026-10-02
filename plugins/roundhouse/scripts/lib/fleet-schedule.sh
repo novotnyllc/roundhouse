@@ -200,18 +200,47 @@ fleet_schedule_systemd_def_paths() {
   fleet_schedule_systemd_def_path "$1"
 }
 
+fleet_schedule_systemd_wants_path() {
+  # fast|full -> the timers.target.wants link `systemctl --user enable`
+  # makes: the timer's enablement, on disk.
+  printf '%s/timers.target.wants/%s.timer\n' "$(fleet_schedule_unit_dir)" "$(fleet_schedule_unit "$1")"
+}
+
+fleet_schedule_systemd_manager_runs() {
+  # True when a systemd user manager may be running for this user — asked
+  # only once `systemctl --user` could not reach one (no XDG_RUNTIME_DIR over
+  # SSH, say), because such a manager still runs its timers. A system not
+  # booted with systemd (WSL without it) runs none. Otherwise the system
+  # manager is asked about user@UID.service, then the process table, and
+  # whatever cannot rule a manager out counts as one running.
+  if fleet_test_hook "${ROUNDHOUSE_TEST_SYSTEMD_BOOTED:-}"; then
+    [ "$ROUNDHOUSE_TEST_SYSTEMD_BOOTED" = 1 ] || return 1
+  else
+    [ -d /run/systemd/system ] || return 1
+  fi
+  ! systemctl is-active --quiet "user@$(id -u).service" 2>/dev/null || return 0
+  command -v pgrep >/dev/null 2>&1 || return 0
+  manager_runs_rc=0
+  pgrep -u "$(id -u)" -x systemd >/dev/null 2>&1 || manager_runs_rc=$?
+  [ "$manager_runs_rc" -ne 1 ]
+}
+
 fleet_schedule_systemd_facts() {
   # The scheduler half of fleet_schedule_facts. With no manager to ask,
   # `enable` is a symlink on disk (timers.target.wants), so that is read
-  # instead; lingering is logind's, and is read either way.
+  # instead, and whether a manager runs out of this session's reach
+  # (`manager_unreached`);
+  # lingering is logind's, and is read either way.
   systemd_timer="$(fleet_schedule_unit "$1").timer"
   systemd_lingers=1
   fleet_schedule_lingers || systemd_lingers=0
   if ! fleet_schedule_user_manager; then
     systemd_wants=0
-    [ ! -L "$(fleet_schedule_unit_dir)/timers.target.wants/$systemd_timer" ] || systemd_wants=1
-    printf 'reachable=0 enabled=0 disabled=0 active=0 wants=%s lingers=%s\n' \
-      "$systemd_wants" "$systemd_lingers"
+    [ ! -L "$(fleet_schedule_systemd_wants_path "$1")" ] || systemd_wants=1
+    systemd_unreached=0
+    ! fleet_schedule_systemd_manager_runs || systemd_unreached=1
+    printf 'reachable=0 enabled=0 disabled=0 active=0 wants=%s manager_unreached=%s lingers=%s\n' \
+      "$systemd_wants" "$systemd_unreached" "$systemd_lingers"
     return 0
   fi
   systemd_enabled=0
@@ -268,7 +297,8 @@ fleet_schedule_facts() {
   #   present    1 when EVERY definition file exists (fleet_schedule_def_paths)
   #   reachable  the GUI domain / user manager answers
   #   loaded disabled                      (launchd; 0 when unreachable)
-  #   enabled disabled active wants lingers (systemd)
+  #   enabled disabled active wants lingers (systemd); manager_unreached
+  #              (systemd, unreachable: a manager runs that cannot be asked)
   #
   # Values never carry spaces; fleet_schedule_facts_read splits them.
   facts_platform=$(fleet_schedule_platform)
@@ -289,7 +319,7 @@ fleet_schedule_facts_read() {
   # fleet_schedule_facts_read FACTS — split a facts line into sf_<key>
   # globals (absent keys read as 0). Pure: no process, no scheduler query.
   sf_platform= sf_present=0 sf_reachable=0 sf_loaded=0 sf_disabled=0
-  sf_enabled=0 sf_active=0 sf_wants=0 sf_lingers=1
+  sf_enabled=0 sf_active=0 sf_wants=0 sf_manager_unreached=0 sf_lingers=1
   for facts_word in $1; do
     case $facts_word in
       platform=*) sf_platform=${facts_word#*=} ;;
@@ -300,6 +330,7 @@ fleet_schedule_facts_read() {
       enabled=*) sf_enabled=${facts_word#*=} ;;
       active=*) sf_active=${facts_word#*=} ;;
       wants=*) sf_wants=${facts_word#*=} ;;
+      manager_unreached=*) sf_manager_unreached=${facts_word#*=} ;;
       lingers=*) sf_lingers=${facts_word#*=} ;;
     esac
   done
@@ -358,6 +389,36 @@ fleet_schedule_still_scheduled() {
     [ "$sf_wants" = 1 ]
 }
 
+fleet_schedule_out_of_reach() {
+  # fleet_schedule_out_of_reach MODE FACTS — true when MODE's job may still
+  # be held by a scheduler this session cannot reach, so an uninstall cannot
+  # end it and must refuse rather than remove its files: launchd with no GUI
+  # domain, or a systemd user manager that runs but cannot be asked. Held, or
+  # may be: any of its definitions or its wants link on disk, or — the files
+  # deleted by hand — a last state seen that the scheduler holds (loaded, or
+  # disabled, which launchd keeps loaded). A systemd user with NO manager
+  # running holds nothing in memory; its enablement is the wants link on
+  # disk, which the sealed uninstall removes.
+  fleet_schedule_facts_read "$2"
+  [ "$sf_reachable" != 1 ] || return 1
+  if [ "$sf_platform" = systemd ] && [ "$sf_manager_unreached" != 1 ]; then
+    return 1
+  fi
+  [ "$sf_wants" != 1 ] || return 0
+  reach_paths=$(fleet_schedule_def_paths "$1")
+  while IFS= read -r reach_path; do
+    if [ -n "$reach_path" ] && [ -f "$reach_path" ]; then
+      return 0
+    fi
+  done <<EOF_REACH
+$reach_paths
+EOF_REACH
+  case $(fleet_schedule_last_state "$1") in
+    loaded | disabled) return 0 ;;
+  esac
+  return 1
+}
+
 fleet_schedule_probe() {
   # fleet_schedule_probe fast|full -> the state word, read-only.
   fleet_schedule_state_word "$(fleet_schedule_facts "$1")"
@@ -393,15 +454,33 @@ fleet_schedule_last_state() {
 fleet_schedule_job_state() {
   # fleet_schedule_job_state fast|full [FACTS] — the state word, remembered:
   # every state actually observed is written to store.run/schedule-state.MODE,
-  # and `unavailable` never overwrites one. That memory is what lets a trigger
-  # over SSH (no GUI domain to ask) still honour an operator's disable it can
-  # no longer see. FACTS, when the caller already read them, are not re-read.
+  # `unavailable` never overwrites one, and `missing` replaces a held state
+  # only once the scheduler is seen to have let go of the job. That memory is
+  # what lets a trigger over SSH (no GUI domain to ask) still honour an
+  # operator's disable it can no longer see. FACTS, when the caller already
+  # read them, are not re-read.
   #
   # Written whole through a temporary file UNIQUE to this writer and renamed
   # into place, so two triggers racing on one job leave one complete state,
   # never a torn file or another writer's half-written temporary.
-  job_state=$(fleet_schedule_state_word "${2:-$(fleet_schedule_facts "$1")}")
-  if [ "$job_state" != unavailable ] && [ "$(fleet_schedule_last_state "$1")" != "$job_state" ]; then
+  job_state_facts=${2:-$(fleet_schedule_facts "$1")}
+  job_state=$(fleet_schedule_state_word "$job_state_facts")
+  job_state_last=$(fleet_schedule_last_state "$1")
+  job_state_keep=false
+  # A held state (loaded, disabled) is not forgotten for `missing` — the
+  # definitions deleted by hand — until the scheduler is seen to have let go:
+  # an unreachable one may still run the job, and uninstall refuses on the
+  # memory (fleet_schedule_out_of_reach).
+  case $job_state:$job_state_last in
+    missing:loaded | missing:disabled)
+      fleet_schedule_facts_read "$job_state_facts"
+      if [ "$sf_reachable" != 1 ] || fleet_schedule_still_scheduled "$job_state_facts"; then
+        job_state_keep=true
+      fi
+      ;;
+  esac
+  if [ "$job_state" != unavailable ] && [ "$job_state_keep" != true ] &&
+    [ "$job_state_last" != "$job_state" ]; then
     job_state_path=$(fleet_schedule_state_path "$1")
     if mkdir -p "$(dirname "$job_state_path")" &&
       job_state_next=$(mktemp "$job_state_path.next.XXXXXX" 2>/dev/null); then

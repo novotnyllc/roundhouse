@@ -284,7 +284,9 @@ seal_plan_command() {
     }
     # Bound to what was OBSERVED: every file a step writes over, keeps,
     # removes or absorbs is the observed file at its observed digest (or
-    # observed absent), so the plan is the snapshot's and nothing else's.
+    # observed absent), and a wants link is unlinked only where it was
+    # observed with no user manager running, so the plan is the snapshot's
+    # and nothing else's.
     jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
       first($records[] | select(.kind == "agent_artifact" and
         .id == "roundhouse:schedule" and (.status | IN("present","absent")))) as $r |
@@ -298,6 +300,10 @@ seal_plan_command() {
           any($r.data.files[]; .path == $s.path and .mode == $s.mode and .digest == $s.before)
         elif .action == "absorb" then
           any($r.data.legacy[]; .path == $s.path and .digest == $s.before)
+        elif .action == "unlink" then
+          ($r.data.scheduler_reachable | not) and
+            any($r.data.jobs[]; .mode == $s.mode and .wants == true and
+              (.manager_unreached | not))
         else true end)
     ' >/dev/null || {
       printf 'roundhouse: fleet-schedule plan is not bound to the observed definitions\n' >&2

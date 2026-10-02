@@ -84,8 +84,10 @@ EOF_OBSERVE
       --argjson disabled "$([ "$sf_disabled" = 1 ] && echo true || echo false)" \
       --argjson enabled "$([ "$sf_enabled" = 1 ] && echo true || echo false)" \
       --argjson active "$([ "$sf_active" = 1 ] && echo true || echo false)" \
+      --argjson wants "$([ "$sf_wants" = 1 ] && echo true || echo false)" \
+      --argjson unreached "$([ "$sf_manager_unreached" = 1 ] && echo true || echo false)" \
       '. + [{mode:$mode,state:$state,loaded:$loaded,disabled:$disabled,
-        enabled:$enabled,active:$active}]')
+        enabled:$enabled,active:$active,wants:$wants,manager_unreached:$unreached}]')
   done
   # A manager still on an older copy of a replaced unit (systemd only).
   observe_reload=false
@@ -197,11 +199,26 @@ fleet_schedule_launchd_plan() {
 }
 
 fleet_schedule_systemd_plan() {
-  # fleet_schedule_systemd_plan ACTION MODE WRITTEN JOB — the per-job steps
-  # an uninstall needs; install's come after every unit is written
+  # fleet_schedule_systemd_plan ACTION MODE WRITTEN JOB RECORD — the per-job
+  # steps an uninstall needs; install's come after every unit is written
   # (fleet_schedule_systemd_plan_finish).
   [ "$1" = uninstall ] || return 0
-  if [ "$(printf '%s\n' "$4" | jq -r '.enabled or .active')" = true ]; then
+  # A manager that runs out of this session's reach may have the timer
+  # loaded, link or no link (another session can start a disabled timer),
+  # and removing anything of the job then would not stop it: refused while
+  # any unit or the wants link is on disk.
+  if [ "$(printf '%s\n' "$4" | jq -r '.manager_unreached')" = true ] &&
+    [ "$(printf '%s\n' "$5" | jq -r --arg mode "$2" --argjson job "$4" \
+      '$job.wants or any(.files[]; .mode == $mode and .digest != null)')" = true ]; then
+    printf 'roundhouse: a systemd user manager runs that this session cannot reach, and it may still run the fleet-%s timer; nothing was changed\n' "$2" >&2
+    return 75
+  fi
+  if [ "$(printf '%s\n' "$4" | jq -r '.wants')" = true ]; then
+    # Observed only with no user manager to ask: the timer's enablement is
+    # its timers.target.wants link on disk, removed like the units.
+    jq -cn --arg mode "$2" --arg path "$(fleet_schedule_systemd_wants_path "$2")" \
+      '{action:"unlink",mode:$mode,path:$path}'
+  elif [ "$(printf '%s\n' "$4" | jq -r '.enabled or .active')" = true ]; then
     fleet_schedule_command_step "$2" disable-stop true
   fi
 }
@@ -271,11 +288,13 @@ fleet_schedule_plan_steps() {
       'first(.jobs[] | select(.mode == $mode))')
     # An uninstall unloads BEFORE it removes: a scheduler that refuses to let
     # go of the job leaves its definition on disk, not a running job with no
-    # file behind it.
-    if [ "$plan_action" = uninstall ] && [ "$plan_reachable" = true ]; then
-      fleet_schedule_backend plan uninstall "$plan_mode" false "$plan_job" \
+    # file behind it. An unreachable scheduler reports nothing loaded or
+    # enabled; with no systemd user manager the backend removes the timer's
+    # wants link instead.
+    if [ "$plan_action" = uninstall ]; then
+      fleet_schedule_backend plan uninstall "$plan_mode" false "$plan_job" "$plan_record" \
         >>"$plan_work/steps.jsonl" || return 70
-      ! grep -q '"action":"run"' "$plan_work/steps.jsonl" || plan_changed=true
+      ! grep -Eq '"action":"(run|unlink)"' "$plan_work/steps.jsonl" || plan_changed=true
     fi
     plan_files=$(printf '%s\n' "$plan_record" | jq -c --arg mode "$plan_mode" \
       '.files[] | select(.mode == $mode)')
@@ -351,7 +370,7 @@ fleet_schedule_execute() (
     execute_index=$((execute_index + 1))
     execute_action=$(jq -r '.action' "$execute_tmp/step.json")
     case $execute_action in
-      write | keep | remove | absorb)
+      write | keep | remove | absorb | unlink)
         execute_path=$(jq -r '.path' "$execute_tmp/step.json")
         printf '%s\n' "$execute_path" | fleet_schedule_paths_in_home || {
           printf 'roundhouse: a sealed fleet-schedule step names %s, which is not under %s\n' \
@@ -390,6 +409,31 @@ fleet_schedule_execute() (
             rm -f -- "$execute_path" || exit 73
             ;;
         esac
+        ;;
+      unlink)
+        # Only this host's own timer's wants link, and only a link.
+        execute_mode=$(jq -r '.mode' "$execute_tmp/step.json")
+        case $execute_mode in fast | full) ;; *) exit 64 ;; esac
+        [ "$(fleet_schedule_platform)" = systemd ] &&
+          [ "$execute_path" = "$(fleet_schedule_systemd_wants_path "$execute_mode")" ] || {
+          printf 'roundhouse: a sealed fleet-schedule step unlinks %s, which is not the fleet-%s timer'"'"'s wants link on this host\n' \
+            "$execute_path" "$execute_mode" >&2
+          exit 64
+        }
+        # Sealed on "no user manager running"; asked again at the last
+        # moment: a manager that started since may already have loaded the
+        # timer from this link, and removing it would not unload it.
+        if fleet_schedule_user_manager || fleet_schedule_systemd_manager_runs; then
+          printf 'roundhouse: a systemd user manager started after the plan was sealed; %s was left in place — create a new plan\n' \
+            "$execute_path" >&2
+          exit 65
+        fi
+        [ ! -e "$execute_path" ] || [ -L "$execute_path" ] || {
+          printf 'roundhouse: %s is not a link; a sealed unlink removes only the timer'"'"'s wants link\n' \
+            "$execute_path" >&2
+          exit 64
+        }
+        rm -f -- "$execute_path" || exit 73
         ;;
       absorb)
         execute_to=$(jq -r '.to' "$execute_tmp/step.json")
@@ -446,9 +490,12 @@ fleet_schedule_report() {
     (["fast","full"][] as $mode |
       ($steps | map(select(.mode == $mode))) as $s |
       if $action == "uninstall" then
-        ($s | map(select(.action == "remove"))) as $removed |
+        ($s | map(select(.action == "remove" or .action == "unlink"))) as $removed |
         if ($removed | length) == 0 then "fleet-\($mode): not installed"
-        else $removed[] | "fleet-\($mode): removed \(.path)" end
+        else $removed[] |
+          if .action == "unlink" then "fleet-\($mode): disabled (no user manager is running; removed \(.path))"
+          else "fleet-\($mode): removed \(.path)" end
+        end
       else
         (if any($s[]; .action == "run" and .effect == "enable") then
            "fleet-\($mode): re-enabled (it was disabled)" else empty end),
@@ -548,14 +595,14 @@ fleet_schedule_preflight() {
   case $1 in
     uninstall)
       # A scheduler this session cannot reach may still hold the job: launchd
-      # with no GUI domain (over SSH) cannot say whether a present agent is
-      # loaded, and a systemd user manager out of reach still enables a timer
-      # through its timers.target.wants link. Removing the definitions then
-      # would leave a job running with no file. Refuse first.
+      # with no GUI domain (over SSH) cannot say whether an agent is loaded,
+      # even one whose plist was deleted by hand, and a systemd user manager
+      # running out of reach still runs its timers. Removing the definitions
+      # then would leave a job running with no file. Refuse first
+      # (fleet_schedule_out_of_reach).
       for preflight_mode in $fleet_schedule_modes; do
-        fleet_schedule_facts_read "$(fleet_schedule_facts "$preflight_mode")"
-        [ "$sf_reachable" = 1 ] || { [ "$sf_wants" != 1 ] && [ "$sf_present" != 1 ]; } || {
-          printf 'roundhouse: the %s job is still installed but its scheduler is not reachable from this session (no GUI domain over SSH, or no systemd user manager); run uninstall from a login session. Nothing was changed.\n' \
+        ! fleet_schedule_out_of_reach "$preflight_mode" "$(fleet_schedule_facts "$preflight_mode")" || {
+          printf 'roundhouse: the %s job is still installed, or was last seen loaded or disabled, but its scheduler is not reachable from this session (no GUI domain over SSH, or a systemd user manager this session cannot ask, e.g. XDG_RUNTIME_DIR unset); run uninstall from a login session. Nothing was changed.\n' \
             "$preflight_mode" >&2
           return 75
         }
