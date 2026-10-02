@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "46295b356fa3d912b01db7ad7edb679ff44b183727706b6a49fdf275b62d3ab3"
+      "sha256": "03be7f3814e962017e3aef20eb57b37c21d37472e6bef432c999c6e6c179576f"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "6374ebfbaf2dc9ae5b8ccbfea61d6b4e09721e4e4e6041cd61d41c12326fe81a"
+      "sha256": "fddde7d6b1f9e55687cbc15c8fc423a5ffe9ad37b34de001b626e880a821682b"
     },
     {
       "path": "assets/icon.png",
@@ -122,7 +122,7 @@
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
-      "sha256": "ed6788cbda0eaba2e93088d0d007943f2edf7f0900388f0f63e36af2428bc698"
+      "sha256": "329ce8c308354c46e07cb8fd735ce398be674d097fd7c0c48d60b70d63b25130"
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
@@ -134,7 +134,7 @@
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
-      "sha256": "2ba27fdb37be1ec942f654f6d0583dac9fc679f3651ebfb4689c7300c9b1975a"
+      "sha256": "4e86e37b3aa941a032456a26447eb98abdd08207031e7d0824f7be42f4f13c5f"
     },
     {
       "path": "scripts/lib/fleet-records.sh",
@@ -146,11 +146,11 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "1bdc512f9960de566b8be1244127809ab2729308479dc772c79cb2ffe583df17"
+      "sha256": "d5edcccf997cf3aa6035b1965a454df1aa447f0bb3d435581de796e0dfa04ed7"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
-      "sha256": "a9a3391290f38cc9e14b23739b4471b1bf2f2304988c5514e1c97ada39d0a62e"
+      "sha256": "bae89a338c3d4ebe802deace9eaa991ce365856d94a4a69c85daf79d205b5d86"
     },
     {
       "path": "scripts/lib/fleet-trust.sh",
@@ -302,7 +302,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "e18d50a0938cd356242ff527012f853ac2f90bf13b469233ad1f9891e04c99c7"
+      "sha256": "df46ff154bed6fb220ee97202aa9363ef2aa5170b1a95da7958bc9da28167e45"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",
@@ -337,5 +337,5 @@
   "plugin": "roundhouse",
   "schema": "roundhouse.integrity",
   "schema_version": 1,
-  "version": "0.9.39"
+  "version": "0.9.40"
 }

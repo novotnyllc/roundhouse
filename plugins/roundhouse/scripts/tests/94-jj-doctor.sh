@@ -587,6 +587,23 @@ $(docjj_lib fleet_vcs_trailers vireo interactive/human 'leak fixture' -)" >/dev/
     docjj_doctor >/dev/null
     docjj_row_fires run-lock
     rm -rf "$docjj_lock"
+    # …and a LIVE holder past the pass ceiling, though well under the stale
+    # threshold: the next run stops it and takes the lock over, so doctor must
+    # say so rather than report it ok (fleet_run_pass_ceiling).
+    sleep 300 &
+    docjj_live=$!
+    docjj_lib fleet_lock_acquire "$docjj_lock" "$docjj_live" ||
+      fail "could not take the lock for a live fixture holder"
+    jq -c --arg at "$(date -u -r $(($(date +%s) - 3 * 3600)) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
+      date -u -d "@$(($(date +%s) - 3 * 3600))" +%Y-%m-%dT%H:%M:%SZ)" '.started_at = $at' \
+      "$docjj_lock/meta.json" >"$doc.meta.tmp" && mv "$doc.meta.tmp" "$docjj_lock/meta.json"
+    docjj_doctor >/dev/null
+    docjj_row_fires run-lock
+    printf '%s\n' "$docjj_rows" | grep -E '^FINDING +run-lock ' | grep -q 'pass ceiling' ||
+      fail "doctor did not report a live lock past the pass ceiling: $(printf '%s\n' "$docjj_rows" | grep run-lock)"
+    kill "$docjj_live" 2>/dev/null || :
+    wait "$docjj_live" 2>/dev/null || :
+    rm -rf "$docjj_lock"
 
     # jj#9571: a raw `git push` from the colocated repo bypasses every guard in
     # fleet_vcs_publish, and jj's own refusal is not self-enforcing. Comparing

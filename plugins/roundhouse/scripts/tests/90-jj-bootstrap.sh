@@ -321,6 +321,259 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$verb_status" -eq 75 ] && grep -q 'unknown age' "$verb_root/stale-err" ||
       fail "a lock with no meta was not refused as of unknown age (got $verb_status)"
     rmdir "$verb_lock"
+
+    # --- the pass ceiling: a provably hung run is stopped, then taken over ---
+    # A run hung inside an inventory query once held the lock for ~37 hours.
+    # Past the ceiling, a holder that is PROVABLY the recorded run (pid, start
+    # time and command) is stopped with everything under it and its lock is
+    # taken over the ordinary way; anything less than that proof is never
+    # signalled. The ceiling is shortened through the self-check hook.
+    ROUNDHOUSE_TEST_PASS_CEILING=60
+    export ROUNDHOUSE_TEST_PASS_CEILING
+    verb_tree() {
+      # PID and every descendant, from one `ps` of the table.
+      ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="$1" '
+        { kids[$2] = kids[$2] " " $1 }
+        END {
+          n = 1; q[1] = root
+          for (i = 1; i <= n; i++) {
+            m = split(kids[q[i]], k, " ")
+            for (j = 1; j <= m; j++) if (k[j] != "") q[++n] = k[j]
+          }
+          for (i = 1; i <= n; i++) printf "%s ", q[i]
+        }'
+    }
+    verb_hung_holder() {
+      # The shape of a real hung run, not a toy: a top-level shell leading
+      # its own process group (the recorded pid), whose TERM trap releases the
+      # lock and CARRIES ON — the old run trap — with a subshell under it that
+      # ignores TERM (the pass), and a grandchild in a process group of its
+      # own (a manager query run under a bound). Not this shell's child,
+      # so a stopped one is reaped at once rather than lingering as a zombie.
+      verb_hung=$(
+        perl -e 'setpgrp(0, 0); exec @ARGV' bash -c '
+          case $2 in
+            release) trap "rm -rf \"\$1\"" TERM ;;
+            keep) trap : TERM ;;
+            # default (and spawner): the leader dies on TERM at once, as the
+            # real top-level script does, and only its children are left.
+          esac
+          # spawner: a descendant leading its own group answers TERM by
+          # starting a helper and exiting, so no live member is the
+          # ancestor of the helper any more; only its group still finds it.
+          [ "$2" != spawner ] ||
+            perl -e "setpgrp(0, 0); exec @ARGV" bash -c "trap \"sleep 594 & exit 0\" TERM; while :; do sleep 1; done" &
+          ( trap "" TERM; perl -e "setpgrp(0, 0); exec q(sleep), 593" & while :; do sleep 1; done ) &
+          while :; do sleep 1; done' verb-hung "$verb_lock" "${1:-keep}" </dev/null >/dev/null 2>&1 &
+        printf '%s\n' "$!"
+      )
+      # The fixture's OWN `sleep 593`, found in its own tree: other units of
+      # the parallel runner run this same fixture.
+      verb_hung_tries=0
+      verb_hung_child=
+      verb_hung_spawner=
+      [ "${1:-keep}" = spawner ] || verb_hung_spawner=none
+      while { [ -z "$verb_hung_child" ] || [ -z "$verb_hung_spawner" ]; } &&
+        [ "$verb_hung_tries" -lt 50 ]; do
+        sleep 0.1
+        verb_hung_tries=$((verb_hung_tries + 1))
+        verb_hung_tree=$(verb_tree "$verb_hung")
+        for verb_pid in $verb_hung_tree; do
+          case $(ps -o command= -p "$verb_pid" 2>/dev/null) in
+            'sleep 593'*) verb_hung_child=$verb_pid ;;
+            *'sleep 594 &'*) verb_hung_spawner=$verb_pid ;;
+          esac
+        done
+      done
+      [ -n "$verb_hung_child" ] && [ -n "$verb_hung_spawner" ] &&
+        [ "$(printf '%s\n' $verb_hung_tree | wc -l | tr -d ' ')" -ge 4 ] ||
+        fail "the hung-run fixture did not start its tree ($verb_hung_tree)"
+    }
+    # A failing assertion must not leave a looping fixture behind — and only
+    # the fixture's own processes are killed, never a recycled pid.
+    verb_cleanup() {
+      for verb_pid in ${verb_hung_tree:-} ${verb_hung_child:-}; do
+        case $(ps -o command= -p "$verb_pid" 2>/dev/null) in
+          *verb-hung* | *'sleep 594'* | 'sleep 593'* | 'sleep 1'*) kill -KILL "$verb_pid" 2>/dev/null || : ;;
+        esac
+      done
+    }
+    trap verb_cleanup EXIT
+    verb_backdate() {
+      # `verb_backdate JQ` — rewrite the lock meta: age it past the ceiling
+      # and apply JQ.
+      jq -c '.started_at = "2000-01-01T00:00:00Z" | '"$1" "$verb_lock/meta.json" \
+        >"$verb_root/meta.tmp" && mv "$verb_root/meta.tmp" "$verb_lock/meta.json"
+    }
+    verb_alive() { kill -0 "$1" 2>/dev/null; }
+    verb_reap() {
+      kill -KILL "$@" 2>/dev/null || :
+      for verb_reap_pid in "$@"; do wait "$verb_reap_pid" 2>/dev/null || :; done
+    }
+    # Under the ceiling a live run is the ordinary overlap, untouched.
+    verb_hung_holder
+    fleet_lock_acquire "$verb_lock" "$verb_hung" || fail "could not lock for the hung fixture"
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>/dev/null || verb_status=$?
+    [ "$verb_status" -eq 10 ] && verb_alive "$verb_hung" ||
+      fail "a live run under the ceiling was not left alone (got $verb_status)"
+    # A HAND-TAKEN lock past the ceiling is never stopped: it keeps the 75.
+    verb_backdate '.manual = true'
+    verb_status=0
+    fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>/dev/null || verb_status=$?
+    [ "$verb_status" -eq 75 ] && verb_alive "$verb_hung" && verb_alive "$verb_hung_child" ||
+      fail "a manual lock past the ceiling was stopped or taken (got $verb_status)"
+    # A mismatched start time, command or pid is NOT the recorded run: it is
+    # judged dead and taken over like any crash, and nothing is signalled.
+    for verb_mismatch in '.start_time = "Thu Jan  1 00:00:00 1970"' \
+      '.command = "not-the-holder"' "pid"; do
+      rm -rf "$verb_alerts"
+      jq -c '.manual = false' "$verb_lock/meta.json" >"$verb_root/meta.tmp" &&
+        mv "$verb_root/meta.tmp" "$verb_lock/meta.json"
+      if [ "$verb_mismatch" = pid ]; then
+        # The recorded pid now belongs to a different live process, carrying
+        # the hung run's start time and command.
+        sleep 300 &
+        verb_other=$!
+        verb_backdate ".pid = $verb_other"
+      else
+        verb_backdate "$verb_mismatch"
+      fi
+      verb_status=0
+      fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>/dev/null || verb_status=$?
+      [ "$verb_status" -eq 0 ] && verb_alive "$verb_hung" && verb_alive "$verb_hung_child" ||
+        fail "a holder with a mismatched $verb_mismatch was signalled or not taken over (got $verb_status)"
+      if [ "$verb_mismatch" = pid ]; then
+        verb_alive "$verb_other" || fail "the process now at the recorded pid was signalled"
+        verb_reap "$verb_other"
+      fi
+      ! grep -rq 'stopped a run' "$verb_alerts" 2>/dev/null ||
+        fail "a mismatched $verb_mismatch was reported as a stopped run"
+      fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
+      fleet_lock_acquire "$verb_lock" "$verb_hung" || fail "could not re-lock for the hung fixture"
+    done
+    # The recorded run itself, past the ceiling: stopped (its group, its
+    # tree, the subshell that ignores TERM, the grandchild in a group of its
+    # own), confirmed gone, its lock taken (renamed aside under the transition
+    # mutex when it is still there; simply free when the dying run released
+    # it), alerted by name — and this process, outside its group, untouched.
+    fleet_lock_release "$verb_lock" "$(fleet_lock_identity "$verb_lock")" || :
+    for verb_variant in keep release default spawner; do
+      # shellcheck disable=SC2086 # one pid per word
+      kill -KILL $verb_hung_tree $verb_hung_child 2>/dev/null || :
+      verb_hung_holder "$verb_variant"
+      fleet_lock_acquire "$verb_lock" "$verb_hung" || fail "could not lock for the $verb_variant fixture"
+      rm -rf "$verb_alerts"
+      verb_backdate '.'
+      verb_status=0
+      fleet_run_lock_take "$verb_store" vireo "$verb_lock" 2>"$verb_root/ceiling-err" ||
+        verb_status=$?
+      [ "$verb_status" -eq 0 ] ||
+        fail "a hung run ($verb_variant) past the ceiling was not taken over (got $verb_status): $(cat "$verb_root/ceiling-err")"
+      for verb_pid in $verb_hung_tree "$verb_hung_child"; do
+        ! verb_alive "$verb_pid" ||
+          fail "process $verb_pid of the hung run ($verb_variant) survived the ceiling stop"
+      done
+      # Nothing of the run is left in any group a member led either: the
+      # spawner's helper was started after the first look, by a process that
+      # then exited.
+      ! ps -A -o pgid= -o command= 2>/dev/null | awk -v tree=" $verb_hung_tree " '
+        index(tree, " " $1 " ") && $2 == "sleep" && $3 == "594" { found = 1 } END { exit !found }' ||
+        fail "a helper the hung run ($verb_variant) started on TERM survived the ceiling stop"
+      [ "$(fleet_lock_meta_field "$verb_lock" pid)" = "$$" ] &&
+        [ "$(fleet_lock_meta_field "$verb_lock" nonce)" = "$fleet_lock_nonce_held" ] ||
+        fail "the stopped run's lock ($verb_variant) was not taken with a fresh nonce"
+      [ ! -e "$verb_lock.t" ] || fail "the ceiling takeover left its transition mutex"
+      grep -q "stopped a run that held the run lock past the 60s ceiling (pid $verb_hung " \
+        "$verb_alerts/lock-takeover.yaml" ||
+        fail "the ceiling stop ($verb_variant) raised no lock-takeover alert naming the stopped run: $(cat "$verb_alerts"/* 2>/dev/null)"
+      grep -q 'past the 60s ceiling; stopping it' "$verb_root/ceiling-err" ||
+        fail "the ceiling stop was not reported"
+      fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
+    done
+    # The stop itself refuses anything but a live verdict on the same lock.
+    sleep 300 &
+    verb_other=$!
+    fleet_lock_acquire "$verb_lock" "$verb_other" manual
+    fleet_lock_holder_state "$verb_lock"
+    ! fleet_lock_stop_holder "$verb_lock" "$(fleet_lock_identity "$verb_lock")" &&
+      verb_alive "$verb_other" || fail "the holder stop signalled a manual lock's holder"
+    fleet_lock_release "$verb_lock" "$fleet_lock_nonce_held"
+    verb_reap "$verb_other"
+    # A LOOK THAT FAILS STOPS NOTHING: when the process table cannot be read
+    # mid-stop, no signal goes out on a set that may be missing the run's
+    # descendants, nothing is taken over, and the refusal is the stale 75.
+    verb_cleanup
+    verb_hung_holder keep
+    fleet_lock_acquire "$verb_lock" "$verb_hung" || fail "could not lock for the snapshot-failure fixture"
+    rm -rf "$verb_alerts"
+    verb_backdate '.'
+    verb_status=0
+    (
+      fleet_lock_stop_snapshot() { return 1; }
+      fleet_run_lock_take "$verb_store" vireo "$verb_lock"
+    ) 2>"$verb_root/snapfail-err" || verb_status=$?
+    [ "$verb_status" -eq 75 ] || fail "a failed process-table read did not refuse with 75 (got $verb_status)"
+    for verb_pid in "$verb_hung" "$verb_hung_child"; do
+      verb_alive "$verb_pid" || fail "process $verb_pid was signalled although the process table could not be read"
+    done
+    [ "$(fleet_lock_meta_field "$verb_lock" pid)" = "$verb_hung" ] && [ ! -d "$verb_alerts" ] ||
+      fail "a failed stop took the lock over or alerted"
+    verb_cleanup
+    fleet_lock_release "$verb_lock" "$(fleet_lock_identity "$verb_lock")" || rm -rf "$verb_lock"
+    # EVERY LOCK-OWNING VERB ENDS ON A SIGNAL, as the pass does: past the
+    # ceiling a publishing verb is stoppable too, and a TERM trap that only
+    # released the lock let it carry on, lockless, through the grace period.
+    for verb_fn in fleet_age_evidence_command fleet_compact_alerts_command fleet_disown_command; do
+      verb_body=$(cli_function_body "$verb_fn")
+      printf '%s\n' "$verb_body" | grep -q 'fleet_lock_signals_exit' &&
+        ! printf '%s\n' "$verb_body" | grep -E "trap 'fleet_lock_release" | grep -qE 'HUP|INT|TERM' ||
+        fail "$verb_fn does not exit on HUP/INT/TERM while it holds the lock"
+    done
+    # …and behaviourally: fleet-age-evidence, TERMed mid-way, runs not one
+    # more command and releases its lock.
+    rm -f "$verb_root/verb-started" "$verb_root/verb-continued" "$verb_root/verb-pid"
+    (
+      fleet_run_env() { :; }
+      fleet_records_retention_days() { printf '30\n'; }
+      fleet_fold() { printf '{}\n'; }
+      fleet_run_verb_begin() {
+        fleet_lock_acquire "$(fleet_lock_path)" || return 75
+        fleet_run_verb_nonce=$fleet_lock_nonce_held
+      }
+      fleet_records_age() {
+        : >"$verb_root/verb-started"
+        sleep 2
+        : >"$verb_root/verb-continued"
+      }
+      fleet_age_evidence_command >/dev/null 2>&1 &
+      printf '%s\n' "$!" >"$verb_root/verb-pid"
+      wait "$!" 2>/dev/null || :
+    ) &
+    verb_runner=$!
+    verb_tries=0
+    while [ ! -f "$verb_root/verb-started" ] && [ "$verb_tries" -lt 100 ]; do
+      sleep 0.1
+      verb_tries=$((verb_tries + 1))
+    done
+    [ -f "$verb_root/verb-started" ] || fail "the age-evidence fixture never started"
+    # TERM to the verb's whole tree, as the ceiling stop sends it (a `( )`
+    # function backgrounded is a fork with the body's subshell under it).
+    verb_term_tree=$(verb_tree "$(cat "$verb_root/verb-pid")")
+    # shellcheck disable=SC2086 # one pid per word
+    kill -TERM $verb_term_tree 2>/dev/null || :
+    wait "$verb_runner" 2>/dev/null || :
+    verb_tries=0
+    while [ -n "$(for verb_pid in $verb_term_tree; do verb_alive "$verb_pid" && printf x; done)" ] &&
+      [ "$verb_tries" -lt 50 ]; do
+      sleep 0.1
+      verb_tries=$((verb_tries + 1))
+    done
+    sleep 2.5
+    [ ! -f "$verb_root/verb-continued" ] ||
+      fail "fleet-age-evidence carried on after TERM"
+    [ ! -d "$verb_lock" ] || fail "fleet-age-evidence did not release its lock on TERM"
+    unset ROUNDHOUSE_TEST_PASS_CEILING
   ) || exit 1
 fi
 

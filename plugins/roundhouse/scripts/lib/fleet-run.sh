@@ -2665,11 +2665,34 @@ fleet_run_lock_take() {
   # takeover owes: evidence, not a refusal, so the run proceeds. Exit 0
   # acquired (by takeover or not), 10 held by a live run, 75 refused.
   fleet_run_lock_take_rc=0
-  fleet_lock_take "$3" "$(fleet_run_stale_after "$1" "$2")" || fleet_run_lock_take_rc=$?
-  [ "$fleet_run_lock_take_rc" -eq 11 ] || return "$fleet_run_lock_take_rc"
-  fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
-    "took over the run lock from a dead holder ($fleet_lock_taken_from); the run it belonged to did not finish" ||
-    :
+  fleet_lock_take "$3" "$(fleet_run_stale_after "$1" "$2")" "$(fleet_run_pass_ceiling)" ||
+    fleet_run_lock_take_rc=$?
+  case $fleet_run_lock_take_rc in
+    11)
+      fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
+        "took over the run lock from a dead holder ($fleet_lock_taken_from); the run it belonged to did not finish" ||
+        :
+      ;;
+    12)
+      fleet_alert_write "$1" "$2" lock-takeover lock-takeover \
+        "stopped a run that held the run lock past the $(fleet_run_pass_ceiling)s ceiling ($fleet_lock_taken_from) and took the lock over; that run did not finish" ||
+        :
+      ;;
+    *) return "$fleet_run_lock_take_rc" ;;
+  esac
+}
+
+fleet_run_pass_ceiling() {
+  # The longest a pass may hold the run lock before the next run stops it as
+  # hung (fleet_lock_take's ceiling): two hours. A converged full pass takes a
+  # few minutes; genuine package downloads are what the margin is for, so a
+  # pass that is still running at the ceiling is stuck, not busy. The test
+  # hook only shortens it, and only under the self-check.
+  if fleet_test_hook "${ROUNDHOUSE_TEST_PASS_CEILING:-}"; then
+    printf '%s\n' "$ROUNDHOUSE_TEST_PASS_CEILING"
+    return
+  fi
+  printf '7200\n'
 }
 
 # --- the commands -------------------------------------------------------------
@@ -2717,14 +2740,16 @@ fleet_run_command() (
   # Release by NONCE, never by path: a run that was judged dead and taken over
   # must not delete its live successor's lock when it finally exits.
   run_lock_nonce=$fleet_lock_nonce_held
-  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce" || :' EXIT HUP INT TERM
+  # A SIGNAL ENDS THE PASS (fleet_lock_signals_exit); the EXIT trap does the
+  # cleanup once.
+  trap 'fleet_lock_release "$run_lock" "$run_lock_nonce" || :' EXIT
+  fleet_lock_signals_exit
   run_tmp=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-fleet-run.XXXXXX")
   # Any exit — a refusal, an errexit, a signal, the ceiling stop — first lands
   # whatever the apply loop has queued (fleet_run_batch_open): an item it
   # already installed is recorded as owned, as the per-item writes recorded it.
   trap '[ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :
-    fleet_lock_release "$run_lock" "$run_lock_nonce" || :; rm -rf "$run_tmp"' \
-    EXIT HUP INT TERM
+    fleet_lock_release "$run_lock" "$run_lock_nonce" || :; rm -rf "$run_tmp"' EXIT
   # The pass's alert ledger: what each item-scoped condition check evaluated
   # and raised, for the end-of-pass sweep (fleet_alert_sweep).
   run_ledger=$run_tmp/alert-ledger
