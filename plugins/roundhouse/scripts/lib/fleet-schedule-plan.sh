@@ -564,12 +564,6 @@ fleet_schedule_command() (
   case $1 in
     status) fleet_schedule_status ;;
     uninstall)
-      # The opt-out is written FIRST, and a failed write stops before the
-      # scheduler is touched: from here on a trigger stamps and starts nothing,
-      # and a pass raises no schedule alert, until `install` is run again. A
-      # sealed uninstall that fails takes it back, so either both change or
-      # neither does — never a removed scheduler without the opt-out it
-      # promised, nor an opt-out beside jobs that are still installed.
       # A systemd user manager this session cannot reach still enables a timer
       # through its timers.target.wants link, which only that manager can
       # disable; removing the units would orphan the link. Refuse first.
@@ -581,19 +575,19 @@ fleet_schedule_command() (
           exit 75
         }
       done
-      uninstall_optout_was=false
-      [ ! -e "$(fleet_schedule_optout_path)" ] || uninstall_optout_was=true
+      errexit_capture uninstall_status fleet_schedule_sealed uninstall
+      [ "$uninstall_status" -eq 0 ] || exit "$uninstall_status"
+      # The opt-out: from here on a trigger stamps and starts nothing, and a
+      # pass raises no schedule alert, until `install` is run again. It is
+      # this host's own run state (store.run), like schedule-state, not a
+      # target the sealed plan mutates. A write that fails is reported, never
+      # swallowed: the jobs are gone, and re-running uninstall — a no-op for
+      # the scheduler — records it.
       { mkdir -p "$(dirname "$(fleet_schedule_optout_path)")" &&
         printf 'uninstalled_at: %s\n' "$(fleet_now)" >"$(fleet_schedule_optout_path)"; } || {
-        printf 'roundhouse: could not record the schedule opt-out (%s); nothing was changed\n' \
+        printf 'roundhouse: the scheduled jobs are removed, but the opt-out could not be recorded (%s); re-run `roundhouse fleet-schedule uninstall`\n' \
           "$(fleet_schedule_optout_path)" >&2
         exit 73
-      }
-      errexit_capture uninstall_status fleet_schedule_sealed uninstall
-      [ "$uninstall_status" -eq 0 ] || {
-        # Take back only the opt-out THIS run wrote; an earlier one stands.
-        [ "$uninstall_optout_was" = true ] || rm -f "$(fleet_schedule_optout_path)"
-        exit "$uninstall_status"
       }
       rm -f "$(fleet_schedule_marker)"
       for uninstall_mode in $fleet_schedule_modes; do
