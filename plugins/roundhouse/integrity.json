@@ -158,11 +158,11 @@
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
-      "sha256": "31d7b27e05dd90d7b73bbad0bbd8f1e41fd22b0bcd9973aeffb8f86486cd5234"
+      "sha256": "b93047361da7b114ec70b0f39cad923f497aa97e9fed3190313091a179c29b33"
     },
     {
       "path": "scripts/lib/fleet-schedule-windows.sh",
-      "sha256": "54ddb2ed0b2612f9681a80a3057dc0bfafd23e8a1934e0bbe011f0c002d65899"
+      "sha256": "fc5ec75015722421fb72381d9e7732643347ec982562ea8e68876d2f194c7cf8"
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
@@ -226,11 +226,11 @@
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
-      "sha256": "77777e50c374aa0fd9c9991cb49bf1339f2a69dac20b109771bd0eef5580a092"
+      "sha256": "01392cb190695a08b196433e2575fba90215ca90ae9a1a02c75a1469f59b4523"
     },
     {
       "path": "scripts/lib/plan-seal.sh",
-      "sha256": "c0f702af2ab83180629a027ac4064d57a11acfa2eb4d3e3d276e3034d1fb14f9"
+      "sha256": "ad201275454f261222957209c092148c7fe3d567f9bd719ac63e55b2069b4cf9"
     },
     {
       "path": "scripts/lib/plan-verify.sh",
@@ -255,6 +255,10 @@
     {
       "path": "scripts/node-fnm-windows.ps1",
       "sha256": "ffa923fe47e86116184fb210dddd84244bc1e6db1a6e823c6259ec18c6e4825b"
+    },
+    {
+      "path": "scripts/plugins-windows.ps1",
+      "sha256": "0355125138c95e88c3760b01ac8c99bb6b84ece3af36299233e21d4e69439a89"
     },
     {
       "path": "scripts/preflight",
@@ -294,11 +298,11 @@
     },
     {
       "path": "scripts/schedule-windows.ps1",
-      "sha256": "607fdb54bc6295ac5b93b7ec0dac1eed24ce4dd5e48a23c8bb732f1aeed10bf8"
+      "sha256": "77f800dc74ef96ad28edaa8382eb1658a7b559d02f5775d62bc57d692f7c96be"
     },
     {
       "path": "scripts/select-sections",
-      "sha256": "cd3f5feeb0d6160827ff67dc7a72972f0aebfd94a59b913696f14aa52ffdfb89"
+      "sha256": "a835a69c6698501d96b92e1c28785e775112c3bbefab25292bd4e30bee343b59"
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",
@@ -350,7 +354,7 @@
     },
     {
       "path": "skills/fleet-update/SKILL.md",
-      "sha256": "ac644c647395dcc6b8b48f8c8834c392d64b911b31a4e44aa9da9b321bf8a389"
+      "sha256": "8f33ea65ba44d86d0d9a93979747b87bb7791a40ba58db1b9180380b263f737a"
     },
     {
       "path": "skills/fleet-update/agents/openai.yaml",
