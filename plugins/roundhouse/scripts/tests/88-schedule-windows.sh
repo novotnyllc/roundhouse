@@ -71,8 +71,14 @@ STUB
 
     PATH="$win_bin:$fleet_fixture_path"
     ROUNDHOUSE_SELFTEST=1
+    # This host is the WSL side (test-host, local); test-windows is its
+    # configured Windows half, the sibling every native request names.
     jq '.machines["test-apt"].expected_hostname = "another-fixture-host" |
-      .machines["test-apt"].expected_user = "another-fixture-user"' \
+      .machines["test-apt"].expected_user = "another-fixture-user" |
+      .machines["test-host"].platform = "wsl" |
+      .machines["test-windows"].wsl_interop_via = "test-host" |
+      .machines["test-windows"].expected_hostname = "WREN-PC" |
+      .machines["test-windows"].expected_user = "Wren"' \
       "$tmp/config.json" >"$win_root/config.json"
     chmod 600 "$win_root/config.json"
     ROUNDHOUSE_CONFIG="$win_root/config.json"
@@ -140,11 +146,28 @@ fleet_schedule_command "$@"'
     esac
 
     # --- the result contract: nothing beyond the closed shape is believed ---
-    win_valid='{"schema":"roundhouse.schedule-windows-result","schema_version":1,"mode":"inspect","state":"completed","message":"","user_sid":"S-1-5-21-1","tasks":[{"name":"Roundhouse-Remaining-0123456789abcdef0123456789abcdef","path":"\\","class":"obsolete-oneshot","digest":"'"$(printf '%064d' 0)"'","state":"Ready","last_run":"2026-09-22T13:06:11Z","last_result":0}],"outcome":"","backup":""}'
+    win_valid='{"schema":"roundhouse.schedule-windows-result","schema_version":1,"mode":"inspect","state":"completed","message":"","host":"WREN-PC","user":"Wren","user_sid":"S-1-5-21-1","tasks":[{"name":"Roundhouse-Remaining-0123456789abcdef0123456789abcdef","path":"\\","class":"obsolete-oneshot","digest":"'"$(printf '%064d' 0)"'","state":"Ready","last_run":"2026-09-22T13:06:11Z","last_result":0}],"outcome":"","backup":""}'
     printf '%s\n' "$win_valid" >"$win_root/result.json"
     fleet_schedule_windows_result_valid "$win_root/result.json" ||
       fail "a well-formed native result was rejected"
+    # A task roundhouse does not recognise may carry any bounded name under
+    # a Roundhouse folder (#94): reported, never a failed inspection.
+    for win_good in \
+      '.tasks += [{name:"Routine Backup (weekly)",path:"\\Roundhouse\\",class:"unknown",digest:("0" * 64),state:"Ready",last_run:"",last_result:null}]' \
+      '.tasks += [{name:"Roundhouse Notes",path:"\\",class:"unknown",digest:("0" * 64),state:"Ready",last_run:"",last_result:null}]' \
+      '.tasks += [{name:"x",path:"\\Roundhouse Tools\\Nightly\\",class:"unknown",digest:("0" * 64),state:"Ready",last_run:"",last_result:null}]'; do
+      printf '%s\n' "$win_valid" | jq -c "$win_good" >"$win_root/result.json"
+      fleet_schedule_windows_result_valid "$win_root/result.json" ||
+        fail "a bounded unknown native task was not believed: $win_good"
+    done
     for win_bad in \
+      '.tasks[0] += {name:"Routine Backup",path:"\\Roundhouse\\"}' \
+      '.tasks += [{name:"Backup",path:"\\Other\\",class:"unknown",digest:("0" * 64),state:"Ready",last_run:"",last_result:null}]' \
+      '.tasks += [{name:"Roundhouse\u0007",path:"\\",class:"unknown",digest:("0" * 64),state:"Ready",last_run:"",last_result:null}]' \
+      '.tasks += [{name:"a/b",path:"\\Roundhouse\\",class:"unknown",digest:("0" * 64),state:"Ready",last_run:"",last_result:null}]' \
+      '.tasks += [{name:("R" * 129),path:"\\Roundhouse\\",class:"unknown",digest:("0" * 64),state:"Ready",last_run:"",last_result:null}]' \
+      '.tasks += [{name:"RoundhouseBrokerV1",path:"\\Roundhouse\\",class:"privilege-lane",digest:("0" * 64),state:"Ready",last_run:"",last_result:null}]' \
+      'del(.host)' \
       '.extra = 1' \
       '.tasks[0].class = "removable"' \
       '.tasks[0].name = "RoundhouseBrokerV1"' \
@@ -170,14 +193,54 @@ fleet_schedule_command "$@"'
       schedule_operations_valid "$win_root/draft.json" "$HOME"
     }
     win_step=$(jq -cn --arg name "$win_stale" --arg digest "$(printf '%064d' 0)" \
-      '{action:"unregister",mode:"native",name:$name,path:"\\",digest:$digest}')
+      '{action:"unregister",mode:"native",machine:"test-windows",name:$name,path:"\\",digest:$digest}')
     win_contract install "$win_step" || fail "the plan contract refused a native unregister step"
     ! win_contract uninstall "$win_step" || fail "an uninstall plan may unregister a native task"
     for win_bad in '.name = "RoundhouseBrokerV1"' '.path = "\\Roundhouse\\"' '.mode = "fast"' \
-      '.digest = "x"' '.argv = ["schtasks"]'; do
+      '.digest = "x"' '.argv = ["schtasks"]' 'del(.machine)' '.machine = "../x"'; do
       ! win_contract install "$(printf '%s\n' "$win_step" | jq -c "$win_bad")" ||
         fail "the plan contract accepted a widened unregister step: $win_bad"
     done
+
+    # --- the step budget: 64 native removals beside a fresh local install ---
+    # (#94) The native inspection reports at most 64 tasks; every one of them
+    # obsolete beside a fresh systemd install (seven local steps) still seals.
+    win_reset_units
+    win_record=$(fleet_schedule_observe | jq -c --arg stale "$win_stale" '
+      .native = {lane:"wsl-interop",machine:"test-windows",reachable:true,reason:null,
+        tasks:[range(64) as $i | {name:("Roundhouse-Remaining-" + ("\($i)" | ("0" * (32 - length)) + .)),
+          path:"\\",class:"obsolete-oneshot",digest:("0" * 64)}]}')
+    mkdir -p "$win_root/budget"
+    win_steps=$(fleet_schedule_plan_steps install "$win_record" "$win_root/budget") ||
+      fail "a plan with 64 obsolete native tasks could not be made"
+    [ "$(printf '%s\n' "$win_steps" | jq '[.[] | select(.action == "unregister")] | length')" -eq 64 ] &&
+      [ "$(printf '%s\n' "$win_steps" | jq '[.[] | select(.action != "unregister")] | length')" -ge 7 ] ||
+      fail "the budget fixture is not 64 native steps beside a fresh install: $win_steps"
+    jq -n --argjson steps "$win_steps" '{operations:[{type:"agent-update",kind:"agent_artifact",
+      id:"roundhouse:schedule",argv:["roundhouse","fleet-schedule","install"],steps:$steps}]}' \
+      >"$win_root/draft.json"
+    schedule_operations_valid "$win_root/draft.json" "$HOME" ||
+      fail "64 native removals beside a fresh local install broke the plan's step budget"
+    jq '.operations[0].steps += [.operations[0].steps[] | select(.action == "unregister")][:1]' \
+      "$win_root/draft.json" >"$win_root/draft-over.json"
+    ! schedule_operations_valid "$win_root/draft-over.json" "$HOME" ||
+      fail "a 65th native removal fitted the plan's step budget"
+    jq '.operations[0].steps = [range(65) as $i | {action:"run",mode:"all",effect:"reload",required:false,
+      argv:["systemctl","--user","daemon-reload"]}]' "$win_root/draft.json" >"$win_root/draft-over.json"
+    ! schedule_operations_valid "$win_root/draft-over.json" "$HOME" ||
+      fail "65 local steps fitted the plan's step budget"
+
+    # --- the configured Windows sibling: resolved from the inventory ---
+    [ "$(fleet_schedule_windows_sibling | jq -r '.machine')" = test-windows ] ||
+      fail "the configured Windows sibling of this WSL host was not resolved"
+    ! fleet_schedule_windows_sibling other-windows >/dev/null 2>&1 ||
+      fail "the sibling resolved as a machine the inventory does not configure"
+    jq 'del(.machines["test-windows"].wsl_interop_via)' "$ROUNDHOUSE_CONFIG" >"$win_root/no-sibling.json"
+    chmod 600 "$win_root/no-sibling.json"
+    win_out=$(ROUNDHOUSE_CONFIG="$win_root/no-sibling.json" fleet_schedule_native observe)
+    printf '%s\n' "$win_out" | jq -e '.reachable == false and .machine == null and
+      (.reason | test("no single configured Windows machine names test-host"))' >/dev/null ||
+      fail "a WSL host with no configured Windows sibling was observed as reachable: $win_out"
 
     # --- an unreachable Windows side never holds up the local jobs ---
     # (No pwsh.exe exists yet at the interop path.)
@@ -205,7 +268,7 @@ printf 'roundhouse-schedule-result %s\r\n' "$(printf '{"schema":"x"}' | base64)"
 SH
     chmod +x "$ROUNDHOUSE_INTEROP_PWSH"
     win_status=0
-    fleet_schedule_windows_call '{"schema":"roundhouse.schedule-windows-request","schema_version":1,"mode":"inspect"}' \
+    fleet_schedule_windows_call "$(fleet_schedule_windows_request "$(fleet_schedule_windows_sibling)" inspect)" \
       >/dev/null 2>&1 || win_status=$?
     [ "$win_status" -eq 70 ] || fail "a doubled, malformed native result was accepted ($win_status)"
 
@@ -219,18 +282,27 @@ SH
       cat >"$win_root/stubs.ps1" <<'PS1'
 # The ScheduledTasks cmdlets, as functions over $env:WIN_TASKS: one
 # <name>.xml per task in the root folder, <name>.running while it runs.
+# A subdirectory is a Task Scheduler folder: Roundhouse/<name>.xml is
+# \Roundhouse\<name>.
+function Get-FixtureFile([string]$TaskName, [string]$TaskPath) {
+    $Folder = $TaskPath.Trim('\') -replace '\\', [IO.Path]::DirectorySeparatorChar
+    return Join-Path (Join-Path $env:WIN_TASKS $Folder) "$TaskName.xml"
+}
 function Get-ScheduledTask {
     [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
-    foreach ($File in @(Get-ChildItem -LiteralPath $env:WIN_TASKS -Filter "*.xml" | Sort-Object Name)) {
+    foreach ($File in @(Get-ChildItem -LiteralPath $env:WIN_TASKS -Filter "*.xml" -Recurse | Sort-Object FullName)) {
         $Name = $File.BaseName
+        $Relative = [IO.Path]::GetRelativePath([IO.Path]::GetFullPath($env:WIN_TASKS), $File.DirectoryName)
+        $Path = if ($Relative -cne ".") { "\" + ($Relative -replace '/', '\') + "\" } else { "\" }
         if ($TaskName -and $Name -cne $TaskName) { continue }
-        $State = if (Test-Path -LiteralPath (Join-Path $env:WIN_TASKS "$Name.running")) { "Running" } else { "Ready" }
-        [pscustomobject]@{ TaskName = $Name; TaskPath = "\"; State = $State }
+        if ($TaskPath -and $Path -cne $TaskPath) { continue }
+        $State = if (Test-Path -LiteralPath (Join-Path $File.DirectoryName "$Name.running")) { "Running" } else { "Ready" }
+        [pscustomobject]@{ TaskName = $Name; TaskPath = $Path; State = $State }
     }
 }
 function Export-ScheduledTask {
     [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
-    return [IO.File]::ReadAllText((Join-Path $env:WIN_TASKS "$TaskName.xml"))
+    return [IO.File]::ReadAllText((Get-FixtureFile $TaskName $TaskPath))
 }
 function Get-ScheduledTaskInfo {
     [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
@@ -255,7 +327,8 @@ PS1
 # Decoded in ONE pipeline: UTF-16 carries NUL bytes a shell variable drops.
 boot=$(printf '%s' "$5" | base64 -d | iconv -f UTF-16LE -t UTF-8)
 script=". '$WIN_STUBS'; $boot"
-export TMPDIR="$WIN_TEMP/" LOCALAPPDATA="$WIN_LOCAL" ROUNDHOUSE_SCHEDULE_FIXTURE_SID="$WIN_SID"
+export TMPDIR="$WIN_TEMP/" LOCALAPPDATA="$WIN_LOCAL" ROUNDHOUSE_SCHEDULE_FIXTURE_SID="$WIN_SID" \
+  ROUNDHOUSE_SCHEDULE_FIXTURE_HOST="${WIN_HOST:-WREN-PC}" ROUNDHOUSE_SCHEDULE_FIXTURE_USER="${WIN_USER:-wren}"
 exec "$REAL_PWSH" -NoLogo -NoProfile -NonInteractive -EncodedCommand \
   "$(printf '%s' "$script" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')"
 SH
@@ -271,7 +344,7 @@ SH
           "$1" "${3:-<Triggers />}" "$2"
       }
       win_seed() {
-        rm -f "$win_tasks"/* "$WIN_UNREGISTER_LOG"
+        rm -rf "$win_tasks"/* "$WIN_UNREGISTER_LOG"
         : >"$WIN_UNREGISTER_LOG"
         win_task_xml "$win_sid" "$win_temp/roundhouse-release-gate.649j8Z/remaining-batch09-apply-limited-worker.ps1" \
           >"$win_tasks/$win_stale.xml"
@@ -283,6 +356,10 @@ SH
           >"$win_tasks/Roundhouse-Logon-00000000000000000000000000000001.xml"
         win_task_xml S-1-5-21-9 "$win_temp/roundhouse-release-gate.649j8Z/w.ps1" \
           >"$win_tasks/Roundhouse-Other-00000000000000000000000000000002.xml"
+        # The operator's own task under a Roundhouse folder, of any name.
+        mkdir -p "$win_tasks/Roundhouse"
+        win_task_xml "$win_sid" 'C:\Tools\backup.ps1' '<Triggers><CalendarTrigger /></Triggers>' \
+          >"$win_tasks/Roundhouse/Routine Backup.xml"
         cp "$win_tasks/$win_stale.xml" "$win_root/stale.xml.saved"
       }
 
@@ -290,11 +367,12 @@ SH
       win_seed
       win_out=$("$cli" fleet-schedule status) || fail "status failed with a reachable native half"
       for win_expect in \
-        'native Windows: no fleet-run task, by design' \
         "native Windows: \\$win_stale — an obsolete one-shot release-gate task (no trigger, last run 2026-09-22T13:06:11Z, result 0); \`fleet-schedule install\` removes it" \
         "native Windows: \\RoundhouseBrokerV1 — the privilege lane's task" \
         'native Windows: \Roundhouse-Logon-00000000000000000000000000000001 — not a task roundhouse recognises' \
-        'native Windows: \Roundhouse-Other-00000000000000000000000000000002 — not a task roundhouse recognises'; do
+        'native Windows: \Roundhouse-Other-00000000000000000000000000000002 — not a task roundhouse recognises' \
+        'native Windows: \Roundhouse\Routine Backup — not a task roundhouse recognises' \
+        'native Windows: test-windows — no fleet-run task, by design'; do
         assert_contains "$win_out" "$win_expect"
       done
       case $win_out in *'pwsh.exe'* | *'release-gate.649j8Z'* | *'one-shot verified'*)
@@ -314,8 +392,14 @@ SH
         Roundhouse-Other-00000000000000000000000000000002; do
         [ -f "$win_tasks/$win_kept.xml" ] || fail "install removed a task it does not own: $win_kept"
       done
-      cmp -s "$win_local/Roundhouse/schedule-removed/$win_stale.xml" "$win_root/stale.xml.saved" ||
-        fail "the removed task's definition was not kept byte for byte"
+      # Kept in the UTF-16 its declaration names (#94), byte order mark first,
+      # and the very definition once decoded.
+      win_backup="$win_local/Roundhouse/schedule-removed/$win_stale.xml"
+      [ "$(head -c 2 "$win_backup" | od -An -tx1 | tr -d ' \n')" = fffe ] ||
+        fail "the removed task's definition was not kept in its declared UTF-16"
+      iconv -f UTF-16 -t UTF-8 "$win_backup" | cmp -s - "$win_root/stale.xml.saved" ||
+        fail "the removed task's definition was not kept intact"
+      [ -f "$win_tasks/Roundhouse/Routine Backup.xml" ] || fail "install removed a foldered task it does not own"
       assert_contains "$win_out" "removed the obsolete one-shot task $win_stale; its definition is kept as"
       # Idempotent: nothing obsolete is left, so a repeat plans no native step.
       : >"$WIN_UNREGISTER_LOG"
@@ -338,6 +422,79 @@ SH
       assert_contains "$win_out" "Access is denied"
       assert_contains "$win_out" "Unregister-ScheduledTask -TaskName $win_stale -TaskPath \\ -Confirm:\$false"
       assert_contains "$win_out" "own desktop session"
+      assert_contains "$win_out" "is still registered"
+
+      # The central apply pipeline itself (#94): a direct apply-plan of the
+      # same sealed plan whose native removal is refused reports partial,
+      # not completed — the postcondition is apply's, not only install's.
+      win_seed
+      win_reset_units
+      ROUNDHOUSE_SCHEDULE_OBSERVE=1 "$cli" collect --target test-host --section agents \
+        --output "$win_root/planning.jsonl"
+      win_record=$(jq -c 'select(.kind == "agent_artifact" and .id == "roundhouse:schedule") | .data' \
+        "$win_root/planning.jsonl")
+      rm -rf "$win_root/direct" && mkdir -p "$win_root/direct"
+      win_steps=$(fleet_schedule_plan_steps install "$win_record" "$win_root/direct")
+      jq -n --argjson steps "$win_steps" '{domain:"agents",target:"test-host",operations:[{
+        type:"agent-update",kind:"agent_artifact",id:"roundhouse:schedule",
+        argv:["roundhouse","fleet-schedule","install"],steps:$steps}]}' >"$win_root/direct/draft.json"
+      "$cli" seal-plan "$win_root/direct/draft.json" "$win_root/planning.jsonl" "$win_root/direct/plan.json" ||
+        fail "the native removal plan did not seal"
+      win_status=0
+      WIN_DENY=1 ROUNDHOUSE_SCHEDULE_OBSERVE=1 "$cli" apply-plan "$win_root/direct/plan.json" \
+        "$(jq -r '.plan_id' "$win_root/direct/plan.json")" "$win_root/direct/result.jsonl" \
+        >/dev/null 2>"$win_root/direct/apply.err" || win_status=$?
+      [ "$win_status" -ne 0 ] &&
+        jq -s -e 'any(.[]; .kind == "operation" and .data.operation_status == "partial" and
+          .data.failed_operation_index == null)' "$win_root/direct/result.jsonl" >/dev/null ||
+        fail "a direct apply-plan whose native removal was refused did not report partial ($win_status)"
+      [ -f "$win_tasks/$win_stale.xml" ] || fail "the refused direct apply removed the task"
+
+      # Bound to the planning snapshot (#94): a hand-supplied unregister of a
+      # task the snapshot never observed — or observed on another machine —
+      # does not seal.
+      for win_forged in \
+        '.operations[0].steps += [{action:"unregister",mode:"native",machine:"test-windows",name:"Roundhouse-Forged-00000000000000000000000000000009",path:"\\",digest:("0" * 64)}]' \
+        '(.operations[0].steps[] | select(.action == "unregister")).machine = "other-windows"' \
+        '(.operations[0].steps[] | select(.action == "unregister")).digest = ("1" * 64)'; do
+        jq "$win_forged" "$win_root/direct/draft.json" >"$win_root/direct/forged.json"
+        ! "$cli" seal-plan "$win_root/direct/forged.json" "$win_root/planning.jsonl" \
+          "$win_root/direct/forged-plan.json" >/dev/null 2>&1 ||
+          fail "a native unregister the planning snapshot does not hold was sealed: $win_forged"
+      done
+      jq 'select(.id == "roundhouse:schedule") .data.native.reachable = false' \
+        "$win_root/planning.jsonl" >"$win_root/direct/unreached.jsonl"
+      ! "$cli" seal-plan "$win_root/direct/draft.json" "$win_root/direct/unreached.jsonl" \
+        "$win_root/direct/forged-plan.json" >/dev/null 2>&1 ||
+        fail "a native unregister sealed against an unreachable native observation"
+
+      # The configured sibling's identity (#94): a Windows session that is
+      # not the inventory's machine is neither inspected nor changed, and
+      # the local install goes ahead.
+      win_seed
+      win_reset_units
+      : >"$WIN_UNREGISTER_LOG"
+      win_out=$(WIN_HOST=OTHER-PC "$cli" fleet-schedule status)
+      assert_contains "$win_out" "native Windows: Task Scheduler not inspected"
+      assert_contains "$win_out" "not the configured WREN-PC"
+      win_out=$(WIN_USER=mallory "$cli" fleet-schedule install 2>&1) ||
+        fail "install failed because the native session was another account: $win_out"
+      [ -f "$win_units/roundhouse-fleet-fast.timer" ] || fail "a mismatched native identity held up the local jobs"
+      [ ! -s "$WIN_UNREGISTER_LOG" ] && [ -f "$win_tasks/$win_stale.xml" ] ||
+        fail "a native task was removed through a session that is not the configured machine"
+      # The executor's own gate, beneath the plan: a session that changed
+      # identity since the seal is refused by the Windows side.
+      WIN_HOST=OTHER-PC fleet_schedule_windows_unregister test-windows "$win_stale" \
+        "$(shasum -a 256 "$win_tasks/$win_stale.xml" | awk '{print $1}')" 2>"$win_root/unregister.err"
+      assert_contains "$(cat "$win_root/unregister.err")" "not the configured"
+      [ ! -s "$WIN_UNREGISTER_LOG" ] || fail "the Windows side unregistered a task for another machine"
+      # No sibling in the inventory: the native half is reported and skipped.
+      win_reset_units
+      win_out=$(ROUNDHOUSE_CONFIG="$win_root/no-sibling.json" "$cli" fleet-schedule install 2>&1) ||
+        fail "install failed with no configured Windows sibling: $win_out"
+      [ ! -s "$WIN_UNREGISTER_LOG" ] || fail "install changed a Windows side the inventory does not configure"
+      assert_contains "$(ROUNDHOUSE_CONFIG="$win_root/no-sibling.json" "$cli" fleet-schedule status)" \
+        'native Windows: Task Scheduler not inspected — no single configured Windows machine names test-host'
 
       # A task that changed between the seal and the apply is not the sealed
       # one: apply's recheck refuses, and nothing native is touched.
@@ -354,10 +511,10 @@ SH
       # The Windows side's own gate, beneath the recheck: a digest that is
       # not the task's, or a running task, is left in place.
       cp "$win_root/stale.xml.saved" "$win_tasks/$win_stale.xml"
-      fleet_schedule_windows_unregister "$win_stale" "$(printf '%064d' 0)" 2>"$win_root/unregister.err"
+      fleet_schedule_windows_unregister test-windows "$win_stale" "$(printf '%064d' 0)" 2>"$win_root/unregister.err"
       assert_contains "$(cat "$win_root/unregister.err")" "was left in place (changed)"
       : >"$win_tasks/$win_stale.running"
-      fleet_schedule_windows_unregister "$win_stale" \
+      fleet_schedule_windows_unregister test-windows "$win_stale" \
         "$(shasum -a 256 "$win_tasks/$win_stale.xml" | awk '{print $1}')" 2>"$win_root/unregister.err"
       assert_contains "$(cat "$win_root/unregister.err")" "was left in place (running)"
       [ -f "$win_tasks/$win_stale.xml" ] || fail "the Windows side removed a running or changed task"

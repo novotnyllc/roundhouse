@@ -305,12 +305,17 @@ validate_config_file() {
       # The WSL interop lane: a native-Windows entry may name its WSL sibling
       # on the same hardware. A bounded worker config carries only its own
       # target, so the sibling is resolved only in a full controller config.
+      # The sibling is reached over SSH from a controller, or is this very
+      # host (`local`) in the own config of the WSL side, where fleet-schedule
+      # finds its Windows half by it; only an SSH sibling carries the lane
+      # (wsl_interop_alias).
       ((.wsl_interop_via // null) == null or
         (.platform == "windows" and
          (.wsl_interop_via | type == "string" and test("^[A-Za-z0-9._-]+$")) and
          (if ($config.worker // null) == null then
             ($config.machines[$machine.wsl_interop_via] // null) as $sibling |
-            $sibling != null and $sibling.platform == "wsl" and $sibling.transport == "ssh" and
+            $sibling != null and $sibling.platform == "wsl" and
+            ($sibling.transport | IN("ssh","local")) and
             (($machine.physical_host // null) == null or ($sibling.physical_host // null) == null or
               $machine.physical_host == $sibling.physical_host)
           else true end))) and

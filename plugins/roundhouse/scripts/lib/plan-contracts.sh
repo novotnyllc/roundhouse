@@ -30,9 +30,15 @@ schedule_operations_valid() {
   # and steps that only write, keep, remove or absorb an absolute definition
   # path UNDER HOME, unlink a fleet timer's timers.target.wants link under
   # HOME, run a launchctl/systemctl argv for a named effect, or unregister one
-  # obsolete native Windows task by name and digest.
+  # obsolete native Windows task of the configured Windows sibling by name
+  # and digest.
   # Which paths and commands THIS host's jobs own is fleet_schedule_execute's
   # to check where they run.
+  #
+  # The step budget is two budgets: at most 64 local steps (an install needs
+  # at most seven), and at most 64 native unregisters — exactly the 64 tasks
+  # one native inspection may report (schedule-windows.ps1 $MaximumTasks) — so
+  # a host with that many obsolete tasks still seals its local jobs.
   jq -e --arg home "$2" '
     def abs: type == "string" and length > 0 and length <= 1024 and
       startswith("/") and (contains("\\") | not) and
@@ -46,7 +52,9 @@ schedule_operations_valid() {
       .type == "agent-update" and .kind == "agent_artifact" and
       (.argv | length) == 3 and .argv[0] == "roundhouse" and
       .argv[1] == "fleet-schedule" and (.argv[2] | IN("install","uninstall")) and
-      (.steps | type == "array" and length <= 64) and
+      (.steps | type == "array" and
+        ([.[] | select(.action? != "unregister")] | length) <= 64 and
+        ([.[] | select(.action? == "unregister")] | length) <= 64) and
       (.argv[2] as $action | all(.steps[]; . as $s |
         type == "object" and
         if .action == "write" then
@@ -72,9 +80,11 @@ schedule_operations_valid() {
           (.to | in_home) and (.to | startswith($s.path + ".absorbed"))
         elif .action == "unregister" then
           # The native Windows half of a WSL machine: one obsolete one-shot
-          # task in the Task Scheduler root, by its definition digest.
-          $action == "install" and exact(["action","digest","mode","name","path"]) and
+          # task in the Task Scheduler root of the configured Windows sibling, by
+          # its definition digest.
+          $action == "install" and exact(["action","digest","machine","mode","name","path"]) and
           .mode == "native" and .path == "\\" and (.digest | hex) and
+          (.machine | type == "string" and test("^[A-Za-z0-9._-]+$")) and
           (.name | type == "string" and test("^Roundhouse-[A-Za-z0-9]{1,32}-[0-9a-f]{32}$"))
         elif .action == "run" then
           exact(["action","argv","effect","mode","required"]) and
@@ -85,6 +95,44 @@ schedule_operations_valid() {
           (.argv[0] | IN("launchctl","systemctl"))
         else false end)))
   ' "$1" >/dev/null
+}
+
+schedule_postconditions_hold() {
+  # schedule_postconditions_hold OPERATION-JSON RECORDS-JSONL [local] — the
+  # sealed `roundhouse:schedule` operation's postconditions in a post-change
+  # collect: every definition a step wrote or kept is on disk at its sealed
+  # digest, every one it removed or absorbed is gone, once a superseded job
+  # was unloaded launchd holds none of them, and every native task a step
+  # unregistered is gone from a reachable inspection of the same configured
+  # Windows machine. `local` leaves the native steps out: fleet-schedule
+  # install reads a partial apply whose local half holds as the native
+  # refusal it reports, never as a failed install.
+  jq -e -n --argjson operation "$1" --arg scope "${3:-all}" --slurpfile records "$2" '
+    any($records[];
+      .kind == "agent_artifact" and .id == "roundhouse:schedule" and
+      (.status | IN("present","absent")) and
+      ((.data.legacy // []) as $legacy | ((.data.files // []) + $legacy) as $files |
+        (.data.native // null) as $native |
+        all($operation.steps[]; . as $s |
+          if .action == "write" or .action == "keep" then
+            any($files[]; .path == $s.path and .digest == $s.digest)
+          elif .action == "remove" then
+            all($files[]; .path != $s.path or .digest == null)
+          elif .action == "absorb" then
+            # An absorbed definition may have been bootstrapped after the
+            # precondition recheck: it is gone AND launchd holds no legacy
+            # job, whether or not a bootout step was planned.
+            all($files[]; .path != $s.path or .digest == null) and
+              all($legacy[]; (.loaded // false) | not)
+          elif .action == "run" and .mode == "legacy" then
+            all($legacy[]; (.loaded // false) | not)
+          elif .action == "unregister" then
+            $scope == "local" or
+              ($native != null and $native.reachable == true and $native.machine == $s.machine and
+                all($native.tasks[]; .name != $s.name or .path != $s.path))
+          elif .action == "run" or .action == "unlink" then true
+          else false end)))
+  ' >/dev/null
 }
 
 privilege_action_precondition_digest() {

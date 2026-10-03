@@ -35,9 +35,13 @@
 #
 # On a WSL distribution the record also carries the machine's NATIVE half:
 # the Windows Task Scheduler's Roundhouse tasks, observed through the interop
-# lane (lib/fleet-schedule-windows.sh). Native Windows never gets a fleet-run
-# task of its own; `install` only removes the obsolete one-shot tasks an
-# earlier session left there, each bound to its sealed definition digest.
+# lane (lib/fleet-schedule-windows.sh), of the Windows machine the inventory
+# configures as this WSL record's wsl_interop_via sibling, identity verified.
+# Native Windows never gets a fleet-run task of its own; `install` only
+# removes the obsolete one-shot tasks an earlier session left there, each
+# bound to its sealed definition digest. A native removal that does not
+# happen leaves the apply partial; install reports it and exits 75 with the
+# local jobs in place (fleet_schedule_native_partial).
 #
 # A definition that is replaced is kept as `.replaced`, one that is removed as
 # `.removed`; a backup that cannot be made stops the step. No definition's
@@ -494,18 +498,20 @@ EOF_ARGV
         ;;
       unregister)
         # The native half (lib/fleet-schedule-windows.sh): an obsolete
-        # one-shot task in the Windows root folder, by its sealed digest,
-        # and only on the WSL side of a machine. The Windows side re-checks
-        # both before it removes anything.
+        # one-shot task in the Windows root folder of the sealed configured
+        # Windows machine, by its sealed digest, and only on the WSL side of
+        # a machine. The Windows side checks its identity and re-checks the
+        # task before it removes anything.
         jq -e --arg oneshot "$fleet_schedule_windows_oneshot_re" '
           .mode == "native" and .path == "\\" and (.name | test($oneshot)) and
+          (.machine | type == "string" and test("^[A-Za-z0-9._-]+$")) and
           (.digest | test("^[0-9a-f]{64}$"))' "$execute_tmp/step.json" >/dev/null &&
           fleet_schedule_windows_host || {
           printf 'roundhouse: a sealed fleet-schedule step unregisters a native task this host does not reach\n' >&2
           exit 64
         }
-        fleet_schedule_native unregister "$(jq -r '.name' "$execute_tmp/step.json")" \
-          "$(jq -r '.digest' "$execute_tmp/step.json")"
+        fleet_schedule_native unregister "$(jq -r '.machine' "$execute_tmp/step.json")" \
+          "$(jq -r '.name' "$execute_tmp/step.json")" "$(jq -r '.digest' "$execute_tmp/step.json")"
         ;;
       *) exit 64 ;;
     esac
@@ -574,6 +580,25 @@ fleet_schedule_verify() {
   printf 'roundhouse: the sealed fleet-schedule %s applied, but status does not show it:\n' "$1" >&2
   fleet_schedule_status_render "$verify_facts" >&2
   return 70
+}
+
+fleet_schedule_native_partial() {
+  # fleet_schedule_native_partial APPLY-WORKDIR OPERATION-JSON — true when a
+  # failed sealed apply failed ONLY in its native half: every operation ran,
+  # the post-change collect completed, the operation unregisters a native
+  # task, and every local postcondition holds in that collect. A refused or
+  # failed native removal is then the operator's to finish (75), never a
+  # failed install of the local jobs; anything else is.
+  native_partial_plan=$(jq -r '.plan_id // empty' "$1/plan.json" 2>/dev/null) || return 1
+  [ -n "$native_partial_plan" ] && [ -f "$1/result.jsonl" ] || return 1
+  printf '%s
+' "$2" | jq -e 'any(.steps[]; .action == "unregister")' >/dev/null || return 1
+  jq -s -e --arg plan "$native_partial_plan" '
+    any(.[]; type == "object" and .kind == "operation" and .id == ("apply:" + $plan) and
+      .data.operation_status == "partial" and .data.failed_operation_index == null and
+      .data.post_inventory_status == "completed")
+  ' "$1/result.jsonl" >/dev/null 2>&1 || return 1
+  schedule_postconditions_hold "$2" "$1/result.jsonl" local
 }
 
 # --- one mutation at a time ---------------------------------------------------------------
@@ -777,11 +802,16 @@ fleet_schedule_sealed() (
     }]}' >"$sealed_tmp/draft.json"
   errexit_capture sealed_status local_plan_seal_apply "$sealed_tmp/draft.json" \
     "$sealed_tmp/planning.jsonl" "$sealed_tmp/apply"
-  [ "$sealed_status" -eq 0 ] || {
-    printf 'roundhouse: the sealed fleet-schedule %s did not complete; nothing past the failing step was changed\n' \
-      "$sealed_action" >&2
-    exit 70
-  }
+  sealed_native_partial=false
+  if [ "$sealed_status" -ne 0 ]; then
+    if fleet_schedule_native_partial "$sealed_tmp/apply" "$(jq -c '.operations[0]' "$sealed_tmp/draft.json")"; then
+      sealed_native_partial=true
+    else
+      printf 'roundhouse: the sealed fleet-schedule %s did not complete; nothing past the failing step was changed\n' \
+        "$sealed_action" >&2
+      exit 70
+    fi
+  fi
   fleet_schedule_report "$sealed_action" "$(jq -c '.operations[0]' "$sealed_tmp/draft.json")" \
     "$sealed_reachable" "$sealed_record"
   fleet_schedule_verify "$sealed_action" "$sealed_reachable" || exit $?
@@ -792,6 +822,13 @@ fleet_schedule_sealed() (
   if [ "$sealed_action" = install ] &&
     [ "$(printf '%s\n' "$sealed_record" | jq -r '.native.reachable == true')" = true ]; then
     fleet_schedule_native verify || sealed_native=$?
+  fi
+  # The apply's own postcondition found a native task it unregistered still
+  # there (or could not inspect it): never a clean install, even should a
+  # fresh look now find it gone.
+  if [ "$sealed_native_partial" = true ] && [ "$sealed_native" -eq 0 ]; then
+    printf 'roundhouse: native Windows: the apply could not confirm the removal of every obsolete one-shot task; re-run `roundhouse fleet-schedule install`\n' >&2
+    sealed_native=75
   fi
   # An install the scheduler could not take yet is 75 (written, loads later);
   # an uninstall has removed what it could see either way.
