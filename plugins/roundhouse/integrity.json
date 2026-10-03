@@ -298,7 +298,7 @@
     },
     {
       "path": "scripts/schedule-windows.ps1",
-      "sha256": "77f800dc74ef96ad28edaa8382eb1658a7b559d02f5775d62bc57d692f7c96be"
+      "sha256": "e39e36a4ed48bd308aae55c2254517ed065eba6848134909994cccd84f8a6c67"
     },
     {
       "path": "scripts/select-sections",

@@ -533,14 +533,23 @@ function Invoke-Register([object]$Value) {
     }
     $Directory = Get-BundleDirectory ([string]$Value.bundle)
     try {
+        # Verified BEFORE anything is written: a payload that is not the sealed
+        # bundle never touches a live bundle the task may already run.
+        $Payload = @(for ($Index = 0; $Index -lt $CurrencyFiles.Count; $Index++) {
+            , [Convert]::FromBase64String([string]$Value.files.($CurrencyFiles[$Index]))
+        })
+        $Digests = @(foreach ($Bytes in $Payload) { Get-BytesSha256 $Bytes })
+        if ((Get-BundleDigest $Digests) -cne [string]$Value.bundle) { throw "the bundle does not hash to the sealed digest" }
         [void][IO.Directory]::CreateDirectory($Directory)
-        $Digests = for ($Index = 0; $Index -lt $CurrencyFiles.Count; $Index++) {
-            $Bytes = [Convert]::FromBase64String([string]$Value.files.($CurrencyFiles[$Index]))
+        for ($Index = 0; $Index -lt $CurrencyFiles.Count; $Index++) {
             $Path = [IO.Path]::Combine($Directory, $CurrencyFiles[$Index])
-            [IO.File]::WriteAllBytes($Path, $Bytes)
-            Get-BytesSha256 ([IO.File]::ReadAllBytes($Path))
+            if ((Test-Path -LiteralPath $Path) -and (Get-BytesSha256 ([IO.File]::ReadAllBytes($Path))) -ceq $Digests[$Index]) { continue }
+            # A replacement lands whole: written beside it, then moved over it.
+            $Staged = "$Path.staged"
+            [IO.File]::WriteAllBytes($Staged, $Payload[$Index])
+            if ((Get-BytesSha256 ([IO.File]::ReadAllBytes($Staged))) -cne $Digests[$Index]) { throw "a staged bundle file did not read back" }
+            Move-Item -LiteralPath $Staged -Destination $Path -Force
         }
-        if ((Get-BundleDigest @($Digests)) -cne [string]$Value.bundle) { throw "the bundle does not hash to the sealed digest" }
         [IO.File]::WriteAllText([IO.Path]::Combine($Directory, "bundle.json"),
             (ConvertTo-Json -Compress -InputObject ([ordered]@{ bundle = [string]$Value.bundle; version = [string]$Value.version })), $Utf8)
     } catch {
@@ -844,6 +853,11 @@ if ($SelfTest) {
         }
         if ((Invoke-ScheduleRequest (New-Register -Script $Utf8.GetBytes("# other bytes"))).outcome -cne "failed" -or $Script:RegisterCalls -ne 0) {
             throw "Self-test registered a bundle that is not the sealed one"
+        }
+        $SealedScript = [IO.Path]::Combine((Get-BundleDirectory $Bundle), $CurrencyFiles[0])
+        if ((Test-Path -LiteralPath $SealedScript) -and
+            [IO.File]::ReadAllText($SealedScript).Contains("# other bytes")) {
+            throw "Self-test wrote an unverified payload over the sealed bundle before checking it"
         }
         $Script:Denied = $true
         if ((Invoke-ScheduleRequest (New-Register)).outcome -cne "refused") { throw "Self-test did not report a refused registration" }
