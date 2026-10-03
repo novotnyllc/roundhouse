@@ -5,69 +5,75 @@
 # standalone test file. See that driver for why.
 # shellcheck shell=bash
 
-# --- host-local path resolution, the run environment, store identity ---
-# No jj and no yq: pure path and file logic, so it runs everywhere.
-
 bootstrap_root="$tmp/fleet-bootstrap"
 mkdir -p "$bootstrap_root"
 
-(
-  # shellcheck source=/dev/null
-  ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+# Every later real-jj section sources this file as a prerequisite, for the
+# probe and fixture generators defined below the run-lock block. 90's own
+# assertions run only when 90 itself is selected: repeating them under each
+# of those units cost every one over a minute before its own work started.
 
-  # R5: two roundhouse instances live on one machine (the Windows host and its
-  # WSL sibling), each with its own certificate, store clone and repo config.
-  # Nothing in CI can exercise that, so what CI CAN prove is that "run it
-  # twice" is genuinely the same code: every host-local file resolves off the
-  # one store resolver, so two store paths give two disjoint instance roots.
-  for bootstrap_instance in alpha beta; do
-    ROUNDHOUSE_FLEET_STORE="$bootstrap_root/$bootstrap_instance/store"
-    export ROUNDHOUSE_FLEET_STORE
-    for bootstrap_file in local.yaml krl store.run store.local; do
-      fleet_instance_path "$bootstrap_file"
-    done
-    fleet_identity_path
-    fleet_allowed_signers_path
-  done >"$bootstrap_root/instance-paths"
-  unset ROUNDHOUSE_FLEET_STORE
-  [ "$(sort -u "$bootstrap_root/instance-paths" | grep -c .)" -eq 12 ] ||
-    fail "two fleet instance roots did not resolve to disjoint host-local paths"
-  grep -Fqx "$bootstrap_root/alpha/allowed_signers" "$bootstrap_root/instance-paths" ||
-    fail "fleet_allowed_signers_path ignored the instance root"
+# --- host-local path resolution, the run environment, store identity ---
+# No jj and no yq: pure path and file logic, so it runs everywhere.
+if section_requested 90; then
+  (
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$cli"
 
-  # The default instance root is the store's parent, so an unset override
-  # still lands on ~/.config/roundhouse.
-  [ "$(XDG_CONFIG_HOME="$bootstrap_root/xdg" fleet_instance_root)" = \
-    "$bootstrap_root/xdg/roundhouse" ] ||
-    fail "the default fleet instance root is not the store's parent"
+    # R5: two roundhouse instances live on one machine (the Windows host and its
+    # WSL sibling), each with its own certificate, store clone and repo config.
+    # Nothing in CI can exercise that, so what CI CAN prove is that "run it
+    # twice" is genuinely the same code: every host-local file resolves off the
+    # one store resolver, so two store paths give two disjoint instance roots.
+    for bootstrap_instance in alpha beta; do
+      ROUNDHOUSE_FLEET_STORE="$bootstrap_root/$bootstrap_instance/store"
+      export ROUNDHOUSE_FLEET_STORE
+      for bootstrap_file in local.yaml krl store.run store.local; do
+        fleet_instance_path "$bootstrap_file"
+      done
+      fleet_identity_path
+      fleet_allowed_signers_path
+    done >"$bootstrap_root/instance-paths"
+    unset ROUNDHOUSE_FLEET_STORE
+    [ "$(sort -u "$bootstrap_root/instance-paths" | grep -c .)" -eq 12 ] ||
+      fail "two fleet instance roots did not resolve to disjoint host-local paths"
+    grep -Fqx "$bootstrap_root/alpha/allowed_signers" "$bootstrap_root/instance-paths" ||
+      fail "fleet_allowed_signers_path ignored the instance root"
 
-  # §3.2: the run environment is one function, and it closes stdin. A run that
-  # can block on a human hangs a machine nobody is sitting at.
-  printf 'STDIN-LEAKED\n' >"$bootstrap_root/stdin-probe"
-  bootstrap_env=$(
-    fleet_run_env
-    printf '%s|%s|%s|%s|%s|' "$JJ_EDITOR" "$GIT_EDITOR" "$PAGER" \
-      "$GIT_TERMINAL_PROMPT" "$GIT_SSH_COMMAND"
-    cat
-  ) <"$bootstrap_root/stdin-probe"
-  [ "$bootstrap_env" = 'true|true|cat|0|ssh -o BatchMode=yes|' ] ||
-    fail "fleet_run_env did not pin the non-interactive environment and close stdin: $bootstrap_env"
+    # The default instance root is the store's parent, so an unset override
+    # still lands on ~/.config/roundhouse.
+    [ "$(XDG_CONFIG_HOME="$bootstrap_root/xdg" fleet_instance_root)" = \
+      "$bootstrap_root/xdg/roundhouse" ] ||
+      fail "the default fleet instance root is not the store's parent"
 
-  # The store scaffold carries NO identity marker file: §7.5's discriminator is
-  # the genesis commit id, because a marker file could be copied into a hostile
-  # store and a genesis commit cannot be produced without producing that commit.
-  mkdir -p "$bootstrap_root/identity/store"
-  fleet_write_store_scaffold "$bootstrap_root/identity/store"
-  grep -Fqx '*  -text' "$bootstrap_root/identity/store/.gitattributes" ||
-    fail "the store scaffold wrote no -text attribute"
-  [ ! -e "$bootstrap_root/identity/store/.roundhouse-sync-store" ] ||
-    fail "the store scaffold still writes an identity marker file (§7.5)"
-)
+    # §3.2: the run environment is one function, and it closes stdin. A run that
+    # can block on a human hangs a machine nobody is sitting at.
+    printf 'STDIN-LEAKED\n' >"$bootstrap_root/stdin-probe"
+    bootstrap_env=$(
+      fleet_run_env
+      printf '%s|%s|%s|%s|%s|' "$JJ_EDITOR" "$GIT_EDITOR" "$PAGER" \
+        "$GIT_TERMINAL_PROMPT" "$GIT_SSH_COMMAND"
+      cat
+    ) <"$bootstrap_root/stdin-probe"
+    [ "$bootstrap_env" = 'true|true|cat|0|ssh -o BatchMode=yes|' ] ||
+      fail "fleet_run_env did not pin the non-interactive environment and close stdin: $bootstrap_env"
+
+    # The store scaffold carries NO identity marker file: §7.5's discriminator is
+    # the genesis commit id, because a marker file could be copied into a hostile
+    # store and a genesis commit cannot be produced without producing that commit.
+    mkdir -p "$bootstrap_root/identity/store"
+    fleet_write_store_scaffold "$bootstrap_root/identity/store"
+    grep -Fqx '*  -text' "$bootstrap_root/identity/store/.gitattributes" ||
+      fail "the store scaffold wrote no -text attribute"
+    [ ! -e "$bootstrap_root/identity/store/.roundhouse-sync-store" ] ||
+      fail "the store scaffold still writes an identity marker file (§7.5)"
+  )
+fi
 
 # --- §6.3 the run lock: holder, nonce, takeover, release ---
 # No jj: pure file and process logic, so it runs wherever the fold does (the
 # stale threshold reads the store's policy through yq).
-if [ -n "$fleet_fixture_yq" ]; then
+if section_requested 90 && [ -n "$fleet_fixture_yq" ]; then
   (
     set -eu
     PATH=$fleet_fixture_path

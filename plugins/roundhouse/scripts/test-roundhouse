@@ -27,8 +27,9 @@ unset rh_inherited
 # Select a subset of test sections for a fast inner loop; unset runs everything,
 # which is the release gate. ROUNDHOUSE_TEST_ONLY is a space list of section
 # number prefixes (e.g. "94 95"); ROUNDHOUSE_TEST_TIER is fast (pre-jj) or jj
-# (real-jj). The 00/05/07 harness sections and the 90 real-jj fixtures are
-# prerequisites and run whenever a dependent section does.
+# (real-jj). The 00/05/07 harness sections and 90's real-jj definitions are
+# prerequisites and load whenever a dependent section does; 90's own
+# assertions run only when 90 is selected (section_requested).
 want_section() {
   n=$1
   case "$n" in 00|05|07) return 0 ;; esac
