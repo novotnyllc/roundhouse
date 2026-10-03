@@ -29,16 +29,18 @@ schedule_operations_valid() {
   # shared by seal-plan and verify-preconditions: at most one, its exact argv,
   # and steps that only write, keep, remove or absorb an absolute definition
   # path UNDER HOME, unlink a fleet timer's timers.target.wants link under
-  # HOME, run a launchctl/systemctl argv for a named effect, or unregister one
-  # obsolete native Windows task of the configured Windows sibling by name
-  # and digest.
+  # HOME, run a launchctl/systemctl argv for a named effect, or — on the
+  # configured Windows sibling — unregister one obsolete native task (install)
+  # or the plugin currency task (uninstall) by name and digest, or register
+  # the plugin currency task at a bundle digest (install).
   # Which paths and commands THIS host's jobs own is fleet_schedule_execute's
   # to check where they run.
   #
-  # The step budget is two budgets: at most 64 local steps (an install needs
-  # at most seven), and at most 64 native unregisters — exactly the 64 tasks
-  # one native inspection may report (schedule-windows.ps1 $MaximumTasks) — so
-  # a host with that many obsolete tasks still seals its local jobs.
+  # The step budget is three budgets: at most 64 local steps (an install
+  # needs at most seven), at most 64 native unregisters — exactly the 64
+  # tasks one native inspection may report (schedule-windows.ps1
+  # $MaximumTasks) — and at most one native register, so a host with that
+  # many obsolete tasks still seals its local jobs and its currency task.
   jq -e --arg home "$2" '
     def abs: type == "string" and length > 0 and length <= 1024 and
       startswith("/") and (contains("\\") | not) and
@@ -53,8 +55,9 @@ schedule_operations_valid() {
       (.argv | length) == 3 and .argv[0] == "roundhouse" and
       .argv[1] == "fleet-schedule" and (.argv[2] | IN("install","uninstall")) and
       (.steps | type == "array" and
-        ([.[] | select(.action? != "unregister")] | length) <= 64 and
-        ([.[] | select(.action? == "unregister")] | length) <= 64) and
+        ([.[] | select(.action? | IN("unregister","register") | not)] | length) <= 64 and
+        ([.[] | select(.action? == "unregister")] | length) <= 64 and
+        ([.[] | select(.action? == "register")] | length) <= 1) and
       (.argv[2] as $action | all(.steps[]; . as $s |
         type == "object" and
         if .action == "write" then
@@ -79,13 +82,23 @@ schedule_operations_valid() {
           (.path | in_home) and (.path | endswith(".plist")) and (.before | hex) and
           (.to | in_home) and (.to | startswith($s.path + ".absorbed"))
         elif .action == "unregister" then
-          # The native Windows half of a WSL machine: one obsolete one-shot
-          # task in the Task Scheduler root of the configured Windows sibling, by
-          # its definition digest.
-          $action == "install" and exact(["action","digest","machine","mode","name","path"]) and
+          # The native Windows half of a WSL machine: one task in the Task
+          # Scheduler root of the configured Windows sibling, by its definition
+          # digest — an obsolete one-shot task on install, the plugin currency
+          # task on uninstall.
+          exact(["action","digest","machine","mode","name","path"]) and
           .mode == "native" and .path == "\\" and (.digest | hex) and
           (.machine | type == "string" and test("^[A-Za-z0-9._-]+$")) and
-          (.name | type == "string" and test("^Roundhouse-[A-Za-z0-9]{1,32}-[0-9a-f]{32}$"))
+          (.name | type == "string") and
+          (if $action == "install" then .name | test("^Roundhouse-[A-Za-z0-9]{1,32}-[0-9a-f]{32}$")
+           else .name == "RoundhousePluginCurrency" end)
+        elif .action == "register" then
+          # The plugin currency task, at the bundle this version ships, over
+          # the definition observed (its digest) or its absence (null).
+          $action == "install" and exact(["action","before","bundle","machine","mode","name","path"]) and
+          .mode == "native" and .path == "\\" and .name == "RoundhousePluginCurrency" and
+          (.machine | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+          (.bundle | hex) and (.before == null or (.before | hex))
         elif .action == "run" then
           exact(["action","argv","effect","mode","required"]) and
           (.mode | IN("fast","full","legacy","all")) and (.required | type == "boolean") and
@@ -104,7 +117,8 @@ schedule_postconditions_hold() {
   # digest, every one it removed or absorbed is gone, once a superseded job
   # was unloaded launchd holds none of them, and every native task a step
   # unregistered is gone from a reachable inspection of the same configured
-  # Windows machine. `local` leaves the native steps out: fleet-schedule
+  # Windows machine, and a plugin currency task it registered is there,
+  # running the sealed bundle. `local` leaves the native steps out: fleet-schedule
   # install reads a partial apply whose local half holds as the native
   # refusal it reports, never as a failed install.
   jq -e -n --argjson operation "$1" --arg scope "${3:-all}" --slurpfile records "$2" '
@@ -130,6 +144,11 @@ schedule_postconditions_hold() {
             $scope == "local" or
               ($native != null and $native.reachable == true and $native.machine == $s.machine and
                 all($native.tasks[]; .name != $s.name or .path != $s.path))
+          elif .action == "register" then
+            $scope == "local" or
+              ($native != null and $native.reachable == true and $native.machine == $s.machine and
+                any($native.tasks[]; .name == $s.name and .path == $s.path and
+                  .class == "plugin-currency" and .bundle == $s.bundle))
           elif .action == "run" or .action == "unlink" then true
           else false end)))
   ' >/dev/null

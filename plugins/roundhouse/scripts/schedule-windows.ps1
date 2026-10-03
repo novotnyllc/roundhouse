@@ -5,7 +5,9 @@
 # from that distribution (docs/specs/2026-08-06-dsc-storage-design-v2.md
 # §9.2). So no `fleet-run` task is ever registered here. What the WSL
 # sibling's `roundhouse fleet-schedule` does need from this side is the
-# Task Scheduler's own view of Roundhouse tasks:
+# Task Scheduler's own view of Roundhouse tasks, and the ONE task native
+# Windows does get: RoundhousePluginCurrency, which keeps this user's plugins
+# current (scripts/plugins-windows.ps1):
 #
 #   inspect     every task named Roundhouse* (or under \Roundhouse*), each
 #               with the SHA-256 of its exported definition and a class:
@@ -14,6 +16,12 @@
 #                 obsolete-oneshot  a trigger-less, one-shot release-gate
 #                                   worker task left behind by an earlier
 #                                   session (see Get-TaskClass);
+#                 plugin-currency   \RoundhousePluginCurrency, whatever its
+#                                   definition; reported with the digest of
+#                                   the script bundle it runs, when it is
+#                                   exactly the definition `register` writes
+#                                   (Get-CurrencyBundle), and with the last
+#                                   run's status file;
 #                 unknown           anything else, reported and never changed;
 #                                   its name and folder are bounded text, so a
 #                                   task such as \Roundhouse\Routine Backup is
@@ -25,7 +33,15 @@
 #               %LOCALAPPDATA%\Roundhouse\schedule-removed\, in the encoding its
 #               XML declaration names, and the task is checked again after the
 #               copy; a copy that cannot be made, or a task that changed while
-#               it was made, is a removal that does not happen.
+#               it was made, is a removal that does not happen. The plugin
+#               currency task is unregistered the same way, by `uninstall`.
+#   register    the plugin currency task: the bundle (plugins-windows.ps1 and
+#               the hook helper beside it) written under
+#               %LOCALAPPDATA%\Roundhouse\plugin-currency\bundles\<digest>\ and
+#               checked against the sealed digest, then the task registered
+#               to run it every 20 minutes, per-user, unelevated, with no
+#               window and a 15-minute limit — only while the task is still
+#               the definition the plan observed (or still absent).
 #
 # Every request names the Windows machine the WSL side's inventory configures
 # (its expected hostname and user), and this session refuses one that is not
@@ -55,6 +71,12 @@ $TaskNamespace = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 $MaximumTasks = 64
 $HostPattern = '^[A-Za-z0-9._-]{1,253}$'
 $UserPattern = '^[A-Za-z0-9._@-]{1,128}$'
+$CurrencyName = "RoundhousePluginCurrency"
+$CurrencyInterval = "PT20M"
+$CurrencyLimit = "PT15M"
+$CurrencyBoundary = "2026-01-01T00:00:00"
+$CurrencyFiles = @("plugins-windows.ps1", "codex-plugin-hooks.mjs")
+$MaximumBundleBytes = 1048576
 
 function Test-Pattern([object]$Value, [string]$Pattern) {
     return $Value -is [string] -and $Value -cmatch $Pattern
@@ -155,6 +177,9 @@ function Get-TaskClass([string]$Name, [string]$Path, [string]$Xml, [string]$User
     #     the user's own %TEMP%\roundhouse-release-gate.<id>\ directory;
     #   - one principal, this very user's SID, at the Limited run level.
     if ($Path -ceq "\" -and $Name -cin $PrivilegeLaneTasks) { return "privilege-lane" }
+    # Named, never "unknown" or "obsolete": install keeps it current and
+    # uninstall removes it, whatever its definition says.
+    if ($Path -ceq "\" -and $Name -ceq $CurrencyName) { return "plugin-currency" }
     if ($Path -cne "\" -or -not (Test-Pattern $Name $OneShotName) -or [string]::IsNullOrEmpty($UserSid)) {
         return "unknown"
     }
@@ -200,6 +225,159 @@ function Get-TaskClass([string]$Name, [string]$Path, [string]$Xml, [string]$User
     return "obsolete-oneshot"
 }
 
+function Get-BytesSha256([byte[]]$Bytes) {
+    $Hash = [Security.Cryptography.SHA256]::Create()
+    try { return (-join ($Hash.ComputeHash($Bytes) | ForEach-Object { $_.ToString("x2") })) } finally { $Hash.Dispose() }
+}
+
+function Get-CurrencyRoot {
+    $Local = [string]$env:LOCALAPPDATA
+    if ([string]::IsNullOrEmpty($Local)) { $Local = [Environment]::GetFolderPath("LocalApplicationData") }
+    if ([string]::IsNullOrEmpty($Local)) { throw "No local application data directory for the plugin currency task" }
+    return [IO.Path]::Combine($Local, "Roundhouse", "plugin-currency")
+}
+
+function Get-BundleDigest([string[]]$FileDigests) {
+    # One digest over the bundle's files, in their fixed order; the WSL side
+    # computes the same (fleet_schedule_windows_bundle).
+    $Text = ""
+    for ($Index = 0; $Index -lt $CurrencyFiles.Count; $Index++) { $Text += "$($CurrencyFiles[$Index]) $($FileDigests[$Index])`n" }
+    return Get-TextSha256 $Text
+}
+
+function Get-BundlesRoot {
+    # Normalised (a doubled separator in %LOCALAPPDATA% is the same folder),
+    # so every comparison below is of one spelling.
+    return [IO.Path]::GetFullPath([IO.Path]::Combine((Get-CurrencyRoot), "bundles"))
+}
+
+function Get-BundleDirectory([string]$Bundle) {
+    return [IO.Path]::Combine((Get-BundlesRoot), $Bundle.Substring(0, 16))
+}
+
+function Get-DirectoryBundle([string]$Directory) {
+    # The digest of the bundle on disk in DIRECTORY, or "" when a file is
+    # missing or unreadable.
+    try {
+        $Digests = foreach ($File in $CurrencyFiles) {
+            Get-BytesSha256 ([IO.File]::ReadAllBytes([IO.Path]::Combine($Directory, $File)))
+        }
+        return Get-BundleDigest @($Digests)
+    } catch {
+        return ""
+    }
+}
+
+function Get-PwshPath {
+    # The PowerShell 7 the interop lane itself starts (lib/interop.sh).
+    return 'C:\Program Files\PowerShell\7\pwsh.exe'
+}
+
+function Get-ConhostPath {
+    $Windows = [string]$env:WINDIR
+    if ([string]::IsNullOrEmpty($Windows)) { $Windows = 'C:\Windows' }
+    return "$Windows\System32\conhost.exe"
+}
+
+function New-CurrencyTaskXml([string]$UserSid, [string]$ScriptPath) {
+    # The ONE definition `register` writes: this user, its own token, the
+    # least privilege; every 20 minutes from a fixed boundary; one instance at
+    # a time, stopped after 15 minutes; PowerShell 7 started headless (no
+    # window) on the bundle's script.
+    $Arguments = "--headless `"$(Get-PwshPath)`" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`""
+    return "<?xml version=`"1.0`" encoding=`"UTF-16`"?>`r`n" +
+        "<Task version=`"1.4`" xmlns=`"$TaskNamespace`">" +
+        "<RegistrationInfo><Description>Roundhouse: keeps this user's Claude Code and Codex plugins current (roundhouse fleet-schedule install, from the WSL side)</Description><URI>\$CurrencyName</URI></RegistrationInfo>" +
+        "<Principals><Principal id=`"Author`"><UserId>$([Security.SecurityElement]::Escape($UserSid))</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>" +
+        "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
+        "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable>" +
+        "<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>" +
+        "<ExecutionTimeLimit>$CurrencyLimit</ExecutionTimeLimit><Enabled>true</Enabled></Settings>" +
+        "<Triggers><TimeTrigger><StartBoundary>$CurrencyBoundary</StartBoundary><Repetition><Interval>$CurrencyInterval</Interval></Repetition><Enabled>true</Enabled></TimeTrigger></Triggers>" +
+        "<Actions Context=`"Author`"><Exec><Command>$([Security.SecurityElement]::Escape((Get-ConhostPath)))</Command>" +
+        "<Arguments>$([Security.SecurityElement]::Escape($Arguments))</Arguments></Exec></Actions></Task>"
+}
+
+function Get-CurrencyBundle([string]$Xml, [string]$UserSid) {
+    # The digest of the bundle the plugin currency task runs, when its
+    # definition is exactly the one `register` writes (other elements the
+    # Task Scheduler adds aside): one headless PowerShell 7 action on
+    # bundles\<16 hex>\plugins-windows.ps1, this user at the least privilege,
+    # one 20-minute time trigger, the 15-minute limit. Otherwise "", and
+    # install registers it again.
+    try { $Document = [xml]$Xml } catch { return "" }
+    $Ns = [Xml.XmlNamespaceManager]::new($Document.NameTable)
+    $Ns.AddNamespace("t", $TaskNamespace)
+    $Actions = @($Document.SelectNodes("/t:Task/t:Actions/*", $Ns))
+    if ($Actions.Count -ne 1 -or $Actions[0].LocalName -cne "Exec") { return "" }
+    $Command = $Actions[0].SelectSingleNode("t:Command", $Ns)
+    $ArgumentsNode = $Actions[0].SelectSingleNode("t:Arguments", $Ns)
+    if ($null -eq $Command -or $null -eq $ArgumentsNode -or
+        -not ([string]$Command.InnerText).Equals((Get-ConhostPath), [StringComparison]::OrdinalIgnoreCase)) { return "" }
+    $Match = [regex]::Match([string]$ArgumentsNode.InnerText,
+        '^--headless "(?<pwsh>[^"]+)" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "(?<file>[^"]+)"$')
+    if (-not $Match.Success -or -not $Match.Groups["pwsh"].Value.Equals((Get-PwshPath), [StringComparison]::OrdinalIgnoreCase)) { return "" }
+    try { $File = [IO.Path]::GetFullPath($Match.Groups["file"].Value) } catch { return "" }
+    $Bundles = Get-BundlesRoot
+    $Directory = [IO.Path]::GetDirectoryName($File)
+    if (-not ([string][IO.Path]::GetDirectoryName($Directory)).Equals($Bundles, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($Directory) -cnotmatch '^[0-9a-f]{16}$' -or
+        [IO.Path]::GetFileName($File) -cne $CurrencyFiles[0]) { return "" }
+    $Principals = @($Document.SelectNodes("/t:Task/t:Principals/t:Principal", $Ns))
+    if ($Principals.Count -ne 1 -or [string]::IsNullOrEmpty($UserSid)) { return "" }
+    $UserNode = $Principals[0].SelectSingleNode("t:UserId", $Ns)
+    $RunLevel = $Principals[0].SelectSingleNode("t:RunLevel", $Ns)
+    $LogonType = $Principals[0].SelectSingleNode("t:LogonType", $Ns)
+    if ($null -eq $UserNode -or -not ([string]$UserNode.InnerText).Equals($UserSid, [StringComparison]::OrdinalIgnoreCase) -or
+        ($null -ne $RunLevel -and [string]$RunLevel.InnerText -cne "LeastPrivilege") -or
+        $null -eq $LogonType -or [string]$LogonType.InnerText -cne "InteractiveToken") { return "" }
+    $Triggers = @($Document.SelectNodes("/t:Task/t:Triggers/*", $Ns))
+    if ($Triggers.Count -ne 1 -or $Triggers[0].LocalName -cne "TimeTrigger") { return "" }
+    $Interval = $Triggers[0].SelectSingleNode("t:Repetition/t:Interval", $Ns)
+    $Boundary = $Triggers[0].SelectSingleNode("t:StartBoundary", $Ns)
+    $TriggerOn = $Triggers[0].SelectSingleNode("t:Enabled", $Ns)
+    $TaskOn = $Document.SelectSingleNode("/t:Task/t:Settings/t:Enabled", $Ns)
+    $Limit = $Document.SelectSingleNode("/t:Task/t:Settings/t:ExecutionTimeLimit", $Ns)
+    if ($null -eq $Interval -or [string]$Interval.InnerText -cne $CurrencyInterval -or
+        $null -eq $Boundary -or [string]$Boundary.InnerText -cne $CurrencyBoundary -or
+        $null -eq $Limit -or [string]$Limit.InnerText -cne $CurrencyLimit) { return "" }
+    # A disabled task, or a disabled trigger, runs nothing: not current.
+    if (($null -ne $TriggerOn -and [string]$TriggerOn.InnerText -cne "true") -or
+        ($null -ne $TaskOn -and [string]$TaskOn.InnerText -cne "true")) { return "" }
+    $Bundle = Get-DirectoryBundle $Directory
+    if ($Bundle -and $Bundle.Substring(0, 16) -ceq [IO.Path]::GetFileName($Directory)) { return $Bundle }
+    return ""
+}
+
+function Get-CurrencyStatus {
+    # The last plugin currency run's status file, bounded; $null when there
+    # is none or it is not one.
+    try {
+        $Path = [IO.Path]::Combine((Get-CurrencyRoot), "status.json")
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or (Get-Item -LiteralPath $Path).Length -gt 65536) { return $null }
+        $Status = [IO.File]::ReadAllText($Path) | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+    if ($Status.schema -cne "roundhouse.plugin-currency-status" -or $Status.schema_version -ne 1 -or
+        [string]$Status.state -cnotin @("running", "current", "held", "timeout", "failed")) { return $null }
+    $Time = {
+        param($Value)
+        if ($Value -is [DateTime]) { return $Value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
+        if ([string]$Value -cmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$') { return [string]$Value }
+        return ""
+    }
+    return [ordered]@{
+        state = [string]$Status.state
+        version = if ([string]$Status.version -cmatch '^[0-9A-Za-z.+-]{1,64}$') { [string]$Status.version } else { "" }
+        started_at = & $Time $Status.started_at
+        finished_at = & $Time $Status.finished_at
+        updated = [Math]::Max(0, [Math]::Min(100000, [int]$Status.updated))
+        held = [Math]::Max(0, [Math]::Min(100000, [int]$Status.held))
+        messages = [string[]]@(@($Status.messages) | Select-Object -First 32 | ForEach-Object { Get-SafeText $_ 256 })
+    }
+}
+
 function Get-RoundhouseTasks {
     $UserSid = Get-CurrentUserSid
     $TempRoot = [IO.Path]::GetTempPath()
@@ -223,14 +401,16 @@ function Get-RoundhouseTasks {
             }
             if ($null -ne $Info.LastTaskResult) { $LastResult = [long]$Info.LastTaskResult }
         }
+        $Class = Get-TaskClass $Name $Path $Xml $UserSid $TempRoot
         # An unknown task's name and folder are reported, never acted on:
         # bounded text with no control characters and no path separator
         # inside a name, so any task under a Roundhouse folder can be listed.
         $Records.Add([ordered]@{
             name = ((Get-SafeText $Name 128) -replace '[\\/]', '_')
             path = Get-SafeText $Path 256
-            class = Get-TaskClass $Name $Path $Xml $UserSid $TempRoot
+            class = $Class
             digest = Get-TextSha256 $Xml
+            bundle = if ($Class -ceq "plugin-currency") { Get-CurrencyBundle $Xml $UserSid } else { "" }
             state = Get-SafeText $Task.State 32
             last_run = $LastRun
             last_result = $LastResult
@@ -248,6 +428,9 @@ function Test-AccessDenied([object]$ErrorRecord) {
 }
 
 function Invoke-Unregister([string]$Name, [string]$Digest) {
+    # The class a removable task must still have: the plugin currency task
+    # by its name (uninstall), else an obsolete one-shot task (install).
+    $Removable = if ($Name -ceq $CurrencyName) { "plugin-currency" } else { "obsolete-oneshot" }
     $Outcome = [ordered]@{ outcome = ""; backup = ""; message = "" }
     $Task = Get-ScheduledTask -TaskName $Name -TaskPath "\" -ErrorAction SilentlyContinue
     if ($null -eq $Task) {
@@ -260,9 +443,9 @@ function Invoke-Unregister([string]$Name, [string]$Digest) {
         $Outcome.message = "the task's definition changed since the plan was sealed"
         return $Outcome
     }
-    if ((Get-TaskClass $Name "\" $Xml (Get-CurrentUserSid) ([IO.Path]::GetTempPath())) -cne "obsolete-oneshot") {
+    if ((Get-TaskClass $Name "\" $Xml (Get-CurrentUserSid) ([IO.Path]::GetTempPath())) -cne $Removable) {
         $Outcome.outcome = "not-obsolete"
-        $Outcome.message = "the task no longer classifies as an obsolete one-shot task"
+        $Outcome.message = "the task no longer classifies as $Removable"
         return $Outcome
     }
     if ([string]$Task.State -ceq "Running") {
@@ -305,9 +488,9 @@ function Invoke-Unregister([string]$Name, [string]$Digest) {
         $Outcome.message = "the task's definition changed while its copy was made; it was left in place"
         return $Outcome
     }
-    if ((Get-TaskClass $Name "\" $Xml (Get-CurrentUserSid) ([IO.Path]::GetTempPath())) -cne "obsolete-oneshot") {
+    if ((Get-TaskClass $Name "\" $Xml (Get-CurrentUserSid) ([IO.Path]::GetTempPath())) -cne $Removable) {
         $Outcome.outcome = "not-obsolete"
-        $Outcome.message = "the task no longer classifies as an obsolete one-shot task"
+        $Outcome.message = "the task no longer classifies as $Removable"
         return $Outcome
     }
     if ([string]$Task.State -ceq "Running") {
@@ -336,22 +519,108 @@ function Invoke-Unregister([string]$Name, [string]$Digest) {
     return $Outcome
 }
 
+function Invoke-Register([object]$Value) {
+    # The plugin currency task, at the sealed bundle: the files are written
+    # and read back first, the task is still what the plan observed (its
+    # digest, or absent), and the task left behind runs that bundle.
+    $Outcome = [ordered]@{ outcome = ""; backup = ""; message = "" }
+    $Task = Get-ScheduledTask -TaskName $CurrencyName -TaskPath "\" -ErrorAction SilentlyContinue
+    $Now = if ($null -eq $Task) { "" } else { Get-TextSha256 (Get-TaskXml $CurrencyName "\") }
+    if ($Now -cne [string]$Value.before) {
+        $Outcome.outcome = "changed"
+        $Outcome.message = "the task changed since the plan was sealed"
+        return $Outcome
+    }
+    $Directory = Get-BundleDirectory ([string]$Value.bundle)
+    try {
+        # Verified BEFORE anything is written: a payload that is not the sealed
+        # bundle never touches a live bundle the task may already run.
+        $Payload = @(for ($Index = 0; $Index -lt $CurrencyFiles.Count; $Index++) {
+            , [Convert]::FromBase64String([string]$Value.files.($CurrencyFiles[$Index]))
+        })
+        $Digests = @(foreach ($Bytes in $Payload) { Get-BytesSha256 $Bytes })
+        if ((Get-BundleDigest $Digests) -cne [string]$Value.bundle) { throw "the bundle does not hash to the sealed digest" }
+        [void][IO.Directory]::CreateDirectory($Directory)
+        for ($Index = 0; $Index -lt $CurrencyFiles.Count; $Index++) {
+            $Path = [IO.Path]::Combine($Directory, $CurrencyFiles[$Index])
+            if ((Test-Path -LiteralPath $Path) -and (Get-BytesSha256 ([IO.File]::ReadAllBytes($Path))) -ceq $Digests[$Index]) { continue }
+            # A replacement lands whole: written beside it, then moved over it.
+            $Staged = "$Path.staged"
+            [IO.File]::WriteAllBytes($Staged, $Payload[$Index])
+            if ((Get-BytesSha256 ([IO.File]::ReadAllBytes($Staged))) -cne $Digests[$Index]) { throw "a staged bundle file did not read back" }
+            Move-Item -LiteralPath $Staged -Destination $Path -Force
+        }
+        [IO.File]::WriteAllText([IO.Path]::Combine($Directory, "bundle.json"),
+            (ConvertTo-Json -Compress -InputObject ([ordered]@{ bundle = [string]$Value.bundle; version = [string]$Value.version })), $Utf8)
+    } catch {
+        $Outcome.outcome = "failed"
+        $Outcome.message = "the plugin currency bundle could not be written under $Directory"
+        return $Outcome
+    }
+    $Xml = New-CurrencyTaskXml (Get-CurrentUserSid) ([IO.Path]::Combine($Directory, $CurrencyFiles[0]))
+    # Staging took time: the task is checked again, as it is now, so -Force
+    # never replaces a definition the plan did not observe.
+    $Task = Get-ScheduledTask -TaskName $CurrencyName -TaskPath "\" -ErrorAction SilentlyContinue
+    $Now = if ($null -eq $Task) { "" } else { Get-TextSha256 (Get-TaskXml $CurrencyName "\") }
+    if ($Now -cne [string]$Value.before) {
+        $Outcome.outcome = "changed"
+        $Outcome.message = "the task changed while its bundle was written; it was left as it is"
+        return $Outcome
+    }
+    try {
+        Register-ScheduledTask -TaskName $CurrencyName -TaskPath "\" -Xml $Xml -Force -ErrorAction Stop | Out-Null
+    } catch {
+        if (Test-AccessDenied $_) {
+            $Outcome.outcome = "refused"
+            $Outcome.message = "Task Scheduler refused this session (Access is denied)"
+        } else {
+            $Outcome.outcome = "failed"
+            $Outcome.message = Get-SafeText $_.Exception.Message 512
+        }
+        return $Outcome
+    }
+    if ($null -eq (Get-ScheduledTask -TaskName $CurrencyName -TaskPath "\" -ErrorAction SilentlyContinue) -or
+        (Get-CurrencyBundle (Get-TaskXml $CurrencyName "\") (Get-CurrentUserSid)) -cne [string]$Value.bundle) {
+        $Outcome.outcome = "failed"
+        $Outcome.message = "the registered task does not run the sealed bundle"
+        return $Outcome
+    }
+    # Earlier bundles are no longer run by anything.
+    foreach ($Stale in @(Get-ChildItem -LiteralPath (Get-BundlesRoot) -Directory -ErrorAction SilentlyContinue)) {
+        if ($Stale.Name -cmatch '^[0-9a-f]{16}$' -and $Stale.Name -cne [IO.Path]::GetFileName($Directory)) {
+            Remove-Item -LiteralPath $Stale.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $Outcome.outcome = "registered"
+    return $Outcome
+}
+
 function Assert-Request([object]$Value) {
     if ($null -eq $Value -or $Value.schema -cne "roundhouse.schedule-windows-request" -or
-        $Value.schema_version -ne 1 -or -not (Test-Pattern $Value.mode '^(inspect|unregister)$')) {
+        $Value.schema_version -ne 1 -or -not (Test-Pattern $Value.mode '^(inspect|unregister|register)$')) {
         throw "Invalid schedule request"
     }
-    $Expected = if ($Value.mode -ceq "inspect") { @("expected_hostname", "expected_user", "mode", "schema", "schema_version") }
-        else { @("digest", "expected_hostname", "expected_user", "mode", "name", "schema", "schema_version") }
+    $Expected = switch ($Value.mode) {
+        "inspect" { @("expected_hostname", "expected_user", "mode", "schema", "schema_version") }
+        "unregister" { @("digest", "expected_hostname", "expected_user", "mode", "name", "schema", "schema_version") }
+        default { @("before", "bundle", "expected_hostname", "expected_user", "files", "mode", "name", "schema", "schema_version", "version") }
+    }
     if (((Get-PropertyNames $Value) -join "`0") -cne ($Expected -join "`0")) {
         throw "Schedule request has unexpected fields"
     }
     if (-not (Test-Pattern $Value.expected_hostname $HostPattern) -or -not (Test-Pattern $Value.expected_user $UserPattern)) {
         throw "Schedule request names no valid Windows machine"
     }
-    if ($Value.mode -ceq "unregister" -and (-not (Test-Pattern $Value.name $OneShotName) -or
+    if ($Value.mode -ceq "unregister" -and ((-not (Test-Pattern $Value.name $OneShotName) -and $Value.name -cne $CurrencyName) -or
             -not (Test-Pattern $Value.digest '^[0-9a-f]{64}$'))) {
         throw "Invalid schedule unregister request"
+    }
+    if ($Value.mode -ceq "register" -and ($Value.name -cne $CurrencyName -or -not (Test-Pattern $Value.bundle '^[0-9a-f]{64}$') -or
+            -not (Test-Pattern $Value.before '^([0-9a-f]{64})?$') -or -not (Test-Pattern $Value.version '^[0-9A-Za-z.+-]{1,64}$') -or
+            ((Get-PropertyNames $Value.files) -join "`0") -cne (($CurrencyFiles | Sort-Object -CaseSensitive) -join "`0") -or
+            @($CurrencyFiles | Where-Object { -not (Test-Pattern $Value.files.$_ '^[A-Za-z0-9+/]+={0,2}$') -or
+                ([string]$Value.files.$_).Length -gt ($MaximumBundleBytes * 4 / 3 + 4) }).Count -ne 0)) {
+        throw "Invalid schedule register request"
     }
 }
 
@@ -359,6 +628,7 @@ function Invoke-ScheduleRequest([object]$Value) {
     $Result = [ordered]@{
         schema = "roundhouse.schedule-windows-result"; schema_version = 1; mode = ""
         state = "failed"; message = ""; host = ""; user = ""; user_sid = ""; tasks = [object[]]@(); outcome = ""; backup = ""
+        currency = $null
     }
     try {
         Assert-Request $Value
@@ -369,8 +639,10 @@ function Invoke-ScheduleRequest([object]$Value) {
         $Result.user_sid = Get-SafeText (Get-CurrentUserSid) 184
         if ($Value.mode -ceq "inspect") {
             $Result.tasks = Get-RoundhouseTasks
+            $Result.currency = Get-CurrencyStatus
         } else {
-            $Removal = Invoke-Unregister ([string]$Value.name) ([string]$Value.digest)
+            $Removal = if ($Value.mode -ceq "register") { Invoke-Register $Value }
+                else { Invoke-Unregister ([string]$Value.name) ([string]$Value.digest) }
             $Result.outcome = $Removal.outcome
             $Result.backup = $Removal.backup
             $Result.message = $Removal.message
@@ -455,7 +727,7 @@ if ($SelfTest) {
             [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
             $Script:Exports++
             if ($Script:ChangeOnExport -gt 0 -and $Script:Exports -ge $Script:ChangeOnExport) {
-                return $Fixture[$TaskName].Xml.Replace("<Triggers />", "<Triggers></Triggers>")
+                return $Fixture[$TaskName].Xml + "<!-- edited -->"
             }
             return $Fixture[$TaskName].Xml
         }
@@ -467,6 +739,16 @@ if ($SelfTest) {
             [CmdletBinding()] param([string]$TaskName, [string]$TaskPath, [switch]$Confirm)
             if ($Script:Denied) { throw [UnauthorizedAccessException]::new("Access is denied.") }
             [void]$Fixture.Remove($TaskName)
+        }
+        $Script:RegisterCalls = 0
+        function Register-ScheduledTask {
+            [CmdletBinding()] param([string]$TaskName, [string]$TaskPath, [string]$Xml, [switch]$Force)
+            if ($Script:Denied) { throw [UnauthorizedAccessException]::new("Access is denied.") }
+            [void]([xml]$Xml)
+            $Script:RegisterCalls++
+            # The Task Scheduler adds elements of its own on export.
+            $Fixture[$TaskName] = @{ Xml = $Xml.Replace("<Enabled>true</Enabled></Settings>",
+                "<Enabled>true</Enabled><Hidden>false</Hidden></Settings>"); State = "Ready"; Path = $TaskPath }
         }
         $Identity = @{ expected_hostname = "iris"; expected_user = "claire" }
         function New-Inspect([hashtable]$Who = $Identity) {
@@ -555,8 +837,95 @@ if ($SelfTest) {
         if ($Bytes.Length -lt 2 -or $Bytes[0] -ne 0xFF -or $Bytes[1] -ne 0xFE) { throw "Self-test backup is not the UTF-16 its declaration names" }
         try { [void][Xml.XmlDocument]::new().Load($Removed.backup) } catch { throw "Self-test backup does not load as XML: $($_.Exception.Message)" }
         if ((Invoke-ScheduleRequest (New-Unregister $Stale $StaleDigest)).outcome -cne "absent") { throw "Self-test repeat removal was not idempotent" }
+        # --- the plugin currency task ---
+        $ScriptBytes = $Utf8.GetBytes("# the currency script")
+        $HelperBytes = $Utf8.GetBytes("// the hook helper")
+        $Bundle = Get-BundleDigest @((Get-BytesSha256 $ScriptBytes), (Get-BytesSha256 $HelperBytes))
+        function New-Register([string]$Before = "", [string]$Digest = $Bundle, [byte[]]$Script = $ScriptBytes) {
+            return [pscustomobject]@{ schema = "roundhouse.schedule-windows-request"; schema_version = 1; mode = "register"
+                expected_hostname = "iris"; expected_user = "claire"; name = $CurrencyName; before = $Before; bundle = $Digest
+                version = "0.9.66"; files = [pscustomobject]@{ "plugins-windows.ps1" = [Convert]::ToBase64String($Script)
+                    "codex-plugin-hooks.mjs" = [Convert]::ToBase64String($HelperBytes) } }
+        }
+        function Get-Currency { return @((Invoke-ScheduleRequest (New-Inspect)).tasks | Where-Object { $_.name -ceq $CurrencyName }) }
+        if ((Invoke-ScheduleRequest (New-Register -Before ("0" * 64))).outcome -cne "changed" -or $Script:RegisterCalls -ne 0) {
+            throw "Self-test registered over a task the plan did not observe"
+        }
+        if ((Invoke-ScheduleRequest (New-Register -Script $Utf8.GetBytes("# other bytes"))).outcome -cne "failed" -or $Script:RegisterCalls -ne 0) {
+            throw "Self-test registered a bundle that is not the sealed one"
+        }
+        $SealedScript = [IO.Path]::Combine((Get-BundleDirectory $Bundle), $CurrencyFiles[0])
+        if ((Test-Path -LiteralPath $SealedScript) -and
+            [IO.File]::ReadAllText($SealedScript).Contains("# other bytes")) {
+            throw "Self-test wrote an unverified payload over the sealed bundle before checking it"
+        }
+        $Script:Denied = $true
+        if ((Invoke-ScheduleRequest (New-Register)).outcome -cne "refused") { throw "Self-test did not report a refused registration" }
+        $Script:Denied = $false
+        $RegisterResult = Invoke-ScheduleRequest (New-Register)
+        $Currency = @(Get-Currency)
+        if ($RegisterResult.outcome -cne "registered" -or $Currency.Count -ne 1 -or $Currency[0].class -cne "plugin-currency" -or
+            $Currency[0].bundle -cne $Bundle) {
+            throw "Self-test did not register the plugin currency task at its bundle"
+        }
+        $BundleDirectory = Get-BundleDirectory $Bundle
+        if ([IO.File]::ReadAllText([IO.Path]::Combine($BundleDirectory, "plugins-windows.ps1")) -cne "# the currency script" -or
+            (Get-Content -Raw ([IO.Path]::Combine($BundleDirectory, "bundle.json")) | ConvertFrom-Json).version -cne "0.9.66") {
+            throw "Self-test did not write the bundle beside the task"
+        }
+        # Exactly the written definition, or no bundle at all: install then
+        # registers it again. Never unknown, never obsolete.
+        foreach ($Edit in @(@("<RunLevel>LeastPrivilege</RunLevel>", "<RunLevel>HighestAvailable</RunLevel>"),
+                @("<Enabled>true</Enabled><Hidden>", "<Enabled>false</Enabled><Hidden>"),
+                @("<Enabled>true</Enabled></TimeTrigger>", "<Enabled>false</Enabled></TimeTrigger>"),
+                @("<StartBoundary>2026-01-01T00:00:00</StartBoundary>", "<StartBoundary>2099-01-01T00:00:00</StartBoundary>"),
+                @("<Interval>PT20M</Interval>", "<Interval>PT1M</Interval>"),
+                @("-ExecutionPolicy Bypass -File", "-ExecutionPolicy Bypass -Command x -File"),
+                @("<Triggers>", "<Triggers><LogonTrigger />"))) {
+            $Saved = $Fixture[$CurrencyName].Xml
+            $Fixture[$CurrencyName].Xml = $Saved.Replace($Edit[0], $Edit[1])
+            $Edited = @(Get-Currency)
+            $Fixture[$CurrencyName].Xml = $Saved
+            if ($Edited[0].class -cne "plugin-currency" -or $Edited[0].bundle -cne "") { throw "Self-test reported an edited currency task as current: $($Edit[1])" }
+        }
+        [IO.File]::WriteAllText([IO.Path]::Combine($BundleDirectory, "codex-plugin-hooks.mjs"), "// edited")
+        if (@(Get-Currency)[0].bundle -cne "") { throw "Self-test reported an edited bundle as current" }
+        # A task edited while the bundle is staged is left as it is.
+        $Script:Exports = 0; $Script:ChangeOnExport = 2
+        $Raced = Invoke-ScheduleRequest (New-Register -Before $Currency[0].digest)
+        $Script:ChangeOnExport = 0
+        if ($Raced.outcome -cne "changed" -or $Script:RegisterCalls -ne 1) { throw "Self-test registered over a task edited while its bundle was staged" }
+        # Re-pointing: a new bundle replaces the task bound to its digest, and
+        # the old bundle goes.
+        $OldDirectory = $BundleDirectory
+        $ScriptBytes = $Utf8.GetBytes("# the next currency script")
+        $Bundle = Get-BundleDigest @((Get-BytesSha256 $ScriptBytes), (Get-BytesSha256 $HelperBytes))
+        $Repointed = Invoke-ScheduleRequest (New-Register -Before $Currency[0].digest)
+        if ($Repointed.outcome -cne "registered" -or @(Get-Currency)[0].bundle -cne $Bundle -or (Test-Path -LiteralPath $OldDirectory)) {
+            throw "Self-test did not re-point the currency task at the new bundle"
+        }
+        # The last run's status, bounded; nothing that is not one.
+        $StatusPath = [IO.Path]::Combine((Get-CurrencyRoot), "status.json")
+        [IO.File]::WriteAllText($StatusPath, (ConvertTo-Json -InputObject ([ordered]@{ schema = "roundhouse.plugin-currency-status"
+            schema_version = 1; version = "0.9.66"; started_at = "2026-10-02T09:00:00Z"; finished_at = "2026-10-02T09:01:00Z"
+            state = "held"; updated = 2; held = 1; messages = @("hold x`u{7}y") })), $Utf8)
+        $Reported = (Invoke-ScheduleRequest (New-Inspect)).currency
+        if ($Reported.state -cne "held" -or $Reported.finished_at -cne "2026-10-02T09:01:00Z" -or $Reported.held -ne 1 -or
+            $Reported.messages[0] -cne "hold x y") {
+            throw "Self-test did not report the plugin currency status"
+        }
+        [IO.File]::WriteAllText($StatusPath, '{"schema":"other"}', $Utf8)
+        if ($null -ne (Invoke-ScheduleRequest (New-Inspect)).currency) { throw "Self-test reported a status file that is not one" }
+        # Uninstall removes it by its digest, like an obsolete task.
+        $CurrencyDigest = @(Get-Currency)[0].digest
+        $Gone = Invoke-ScheduleRequest (New-Unregister $CurrencyName $CurrencyDigest)
+        if ($Gone.outcome -cne "removed" -or $Fixture.ContainsKey($CurrencyName)) { throw "Self-test did not unregister the currency task" }
         foreach ($Bad in @(
                 [pscustomobject]@{ schema = "roundhouse.schedule-windows-request"; schema_version = 1; mode = "register"; expected_hostname = "iris"; expected_user = "claire" },
+                ((New-Register) | Add-Member -PassThru -NotePropertyName extra -NotePropertyValue 1),
+                ((New-Register) | ForEach-Object { $_.name = "RoundhouseOther"; $_ }),
+                ((New-Register) | ForEach-Object { $_.files = [pscustomobject]@{ "plugins-windows.ps1" = "AA==" }; $_ }),
+                ((New-Register) | ForEach-Object { $_.files."plugins-windows.ps1" = "not base64!"; $_ }),
                 [pscustomobject]@{ schema = "roundhouse.schedule-windows-request"; schema_version = 1; mode = "inspect"; expected_hostname = "iris"; expected_user = "claire"; argv = "x" },
                 [pscustomobject]@{ schema = "roundhouse.schedule-windows-request"; schema_version = 1; mode = "inspect" },
                 (New-Inspect @{ expected_hostname = "iris\x"; expected_user = "claire" }),

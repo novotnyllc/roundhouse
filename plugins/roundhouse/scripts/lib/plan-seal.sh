@@ -285,10 +285,12 @@ seal_plan_command() {
     # Bound to what was OBSERVED: every file a step writes over, keeps,
     # removes or absorbs is the observed file at its observed digest (or
     # observed absent), a wants link is unlinked only where it was observed
-    # with no user manager running, and a native task is unregistered only
-    # where a reachable inspection of the same configured Windows machine
-    # observed it obsolete at that digest, so the plan is the snapshot's and
-    # nothing else's.
+    # with no user manager running, a native task is unregistered only where
+    # a reachable inspection of the same configured Windows machine observed
+    # it removable (obsolete, or the plugin currency task) at that digest, and
+    # the plugin currency task is registered only over the definition that
+    # inspection observed, or over its observed absence, so the plan is the
+    # snapshot's and nothing else's.
     jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
       first($records[] | select(.kind == "agent_artifact" and
         .id == "roundhouse:schedule" and (.status | IN("present","absent")))) as $r |
@@ -309,8 +311,15 @@ seal_plan_command() {
         elif .action == "unregister" then
           ($r.data.native // null) as $n |
           $n != null and $n.reachable == true and $n.machine == $s.machine and
-            any($n.tasks[]; .class == "obsolete-oneshot" and .name == $s.name and
-              .path == $s.path and .digest == $s.digest)
+            any($n.tasks[];
+              .class == (if $s.name == "RoundhousePluginCurrency" then "plugin-currency"
+                else "obsolete-oneshot" end) and
+              .name == $s.name and .path == $s.path and .digest == $s.digest)
+        elif .action == "register" then
+          ($r.data.native // null) as $n |
+          $n != null and $n.reachable == true and $n.machine == $s.machine and
+            ([$n.tasks[] | select(.name == $s.name and .path == $s.path) | .digest] ==
+              (if $s.before == null then [] else [$s.before] end))
         elif .action == "run" then true
         else false end)
     ' >/dev/null || {
