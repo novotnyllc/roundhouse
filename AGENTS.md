@@ -42,3 +42,7 @@ prerequisite, and the Windows job — is in
   version; it is bumped once at release, then integrity and repin
 - [Transports and privileged lanes](docs/agents/transports.md) — SSH,
   remote-control contract, brokers
+
+## Merging
+
+PRs land through the Mergify merge queue (`.mergify.yml`), squashed into one commit on `main` titled and described by the PR; merge commits and rebase merges are turned off. Do not merge by hand. Mergify queues a PR once it is not a draft, its required checks are green, every review thread is resolved, and it is authored by clairernovotny or approved by someone with write access. Add the `do-not-merge` label to hold one back.
