@@ -2174,6 +2174,9 @@ Options:
   --print-shim-script            Print the full registration script (resolver +
                                    launch line) for --backend-url/--name/--app/etc and exit
   --help                        Show this message
+
+Lazy local stdio server (see mcp-lazy.mjs):
+  mcp-siding.mjs --lazy-stdio --name NAME [--cache-dir DIR] [--allow-unpinned] -- CMD [ARGS...]
 `;
 }
 
@@ -2354,6 +2357,14 @@ function emit(response) {
 }
 
 function run() {
+  // `--lazy-stdio` hands the whole command line to the sibling mcp-lazy.mjs
+  // (a lazy front for a LOCAL stdio server, not an HTTP backend). Routed
+  // through here so registrations reuse the installed launcher, which
+  // resolves this file - never a versioned plugin path - at every spawn.
+  if (process.argv[2] === "--lazy-stdio") {
+    import("./mcp-lazy.mjs").then((mod) => mod.cli(process.argv.slice(3)));
+    return;
+  }
   let flags;
   try {
     flags = parseArgs(process.argv.slice(2));
