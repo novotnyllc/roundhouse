@@ -241,12 +241,20 @@
       "sha256": "f09c288da6f18c26f77aa490b94ad4a4142219bf7ff368d912617b00eb162aaa"
     },
     {
+      "path": "scripts/mcp-lazy.mjs",
+      "sha256": "b25eb6df420d6d7b5adaea6a7c3fd06ec1ad94df0510d4afefe42a54613de1f8"
+    },
+    {
+      "path": "scripts/mcp-lazy.selftest.mjs",
+      "sha256": "152e5a441aebd9bc726209526f9e6fe3be5773bc20744c4799429e9e7a78ad1d"
+    },
+    {
       "path": "scripts/mcp-siding-windows.ps1",
       "sha256": "1ef2574ce5b41b730a37c868a1c2d01d5799acad3e82701e41791ff9b3c64f70"
     },
     {
       "path": "scripts/mcp-siding.mjs",
-      "sha256": "5217b8d36fce43a4268ac54fdf3dc9ad41804b3c89e6c16a82d8112a92517289"
+      "sha256": "4a73c2a293c4e3d75ecaa7f69b7a1407ab9231328a15ac1bbbfdacf2c75a6d4f"
     },
     {
       "path": "scripts/mcp-siding.selftest.mjs",
@@ -302,7 +310,7 @@
     },
     {
       "path": "scripts/select-sections",
-      "sha256": "a835a69c6698501d96b92e1c28785e775112c3bbefab25292bd4e30bee343b59"
+      "sha256": "494bbb4d3f3470fa34ced50cd59da44e0dc001102ff5fbc5f911f6a15efdea97"
     },
     {
       "path": "scripts/windows-native-canary-runner.ps1",
@@ -362,7 +370,7 @@
     },
     {
       "path": "skills/mcp-shim/SKILL.md",
-      "sha256": "2cfe5658985e3cbb440893401f3424b48a09d7cc45f3d4e7445b5dc4125af111"
+      "sha256": "ecb26cda1b867008f1e9bcfadc3b486da4b5a11aa553cf5298ee26bad037e120"
     },
     {
       "path": "skills/mcp-shim/agents/openai.yaml",
