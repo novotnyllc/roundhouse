@@ -3096,7 +3096,7 @@ fleet_run_reap_cask_temp() (
     cask_temp=$ROUNDHOUSE_TEST_CASK_TEMP
   fi
   # /tmp is a symlink on macOS; follow the root, never links below it.
-  find -H "$cask_temp" -maxdepth 1 -type d -name 'cask-*' -empty -mmin +60 \
+  find -H "$cask_temp" -mindepth 1 -maxdepth 1 -type d -name 'cask-*' -empty -mmin +60 \
     -exec rmdir {} + >/dev/null 2>&1 || :
 )
 

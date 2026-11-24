@@ -889,6 +889,14 @@ fleet_run_command --fast'
         fleet_schedule_rotate_logs
       )
       cmp -s "$sched_root/log-content" "$sched_log_full" || fail "failed archival truncated the log"
+      (
+        # Compression can leave both the copied log and a partial archive.
+        gzip() { printf 'partial\n' >"$1.gz"; return 1; }
+        fleet_schedule_rotate_logs
+      )
+      cmp -s "$sched_root/log-content" "$sched_log_full" || fail "failed compression changed the log"
+      set -- "$sched_log_full".*
+      [ "$#" -eq 1 ] && [ ! -e "$1" ] || fail "failed compression left an archive behind"
     )
 
     # --- fleet-schedule on macOS: install, idempotence, status, uninstall ---

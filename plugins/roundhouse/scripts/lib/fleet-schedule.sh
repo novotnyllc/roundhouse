@@ -46,7 +46,10 @@ fleet_schedule_rotate_logs() (
     if [ "$log_size" -gt "$log_limit" ]; then
       log_archive="$log_file.$(date -u +%Y%m%dT%H%M%SZ)"
       [ ! -e "$log_archive" ] && [ ! -e "$log_archive.gz" ] || continue
-      cp "$log_file" "$log_archive" && gzip "$log_archive" || continue
+      if ! { cp "$log_file" "$log_archive" && gzip "$log_archive"; }; then
+        rm -f "$log_archive" "$log_archive.gz" || :
+        continue
+      fi
       : >"$log_file" || continue
     fi
     # UTC names sort in time order; leave only the newest five copies.

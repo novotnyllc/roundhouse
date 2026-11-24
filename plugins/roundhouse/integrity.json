@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "e171efafc6e151d08a774eefff5382b926e4099005ce8fd6e44190041001ea64"
+      "sha256": "40e7715f10fe2decb5c0743ae02132bf25390744bb63fdaf39ff01a376118fc3"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -166,7 +166,7 @@
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
-      "sha256": "3265e434d91263b01cb00423f2a83eaeb652f4cd0f6e31c98ba492383e7e7bc1"
+      "sha256": "29740cc8babbd74e3f1147219685cf96300fc1bf1e236ce4310d98455a9f9ec1"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
@@ -258,7 +258,7 @@
     },
     {
       "path": "scripts/plugins-windows.ps1",
-      "sha256": "0355125138c95e88c3760b01ac8c99bb6b84ece3af36299233e21d4e69439a89"
+      "sha256": "d1784d9aad62ed3f6d8f844b5390f9427166e0a57cbbc41d0f562b0e8dc05462"
     },
     {
       "path": "scripts/preflight",

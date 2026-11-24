@@ -53,6 +53,9 @@ if [ -n "$fleet_fixture_yq" ]; then
       [ -z "$run_cask_out" ] && [ ! -d "$HOMEBREW_TEMP/cask-old" ] &&
         [ -d "$ROUNDHOUSE_TEST_CASK_TEMP/cask-old" ] ||
         fail "cask cleanup used a test override outside the self-check or printed output"
+      touch -t 200001010000 "$HOMEBREW_TEMP"
+      ROUNDHOUSE_SELFTEST=0 fleet_run_reap_cask_temp
+      [ -d "$HOMEBREW_TEMP" ] || fail "cask cleanup removed its old empty cask-* root"
       # macOS's /tmp is itself a symlink. Follow the root, but keep links
       # below it untouched rather than treating them as temp directories.
       mkdir -p "$run_root/cask-link-target"
