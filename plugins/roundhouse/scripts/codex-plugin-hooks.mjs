@@ -8,6 +8,8 @@ import { join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 
 const TIMEOUT_MS = 15_000;
+// Marketplace clones can keep Codex busy during sync listings and startup.
+const SYNC_TIMEOUT_MS = 60_000;
 const PLUGIN_ID = /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/;
 const CODEX_EXECUTABLE_FLAG = "--codex-executable";
 
@@ -107,7 +109,8 @@ function hookKeyPath(key) {
 }
 
 class AppServer {
-  constructor(codexExecutable) {
+  constructor(codexExecutable, timeoutMs = TIMEOUT_MS) {
+    this.timeoutMs = timeoutMs;
     this.nextId = 1;
     this.pending = new Map();
     this.stderr = "";
@@ -171,7 +174,7 @@ class AppServer {
         this.pending.delete(id);
         reject(new Error(`app-server ${method} timed out`));
         terminateCodexChild(this.child);
-      }, TIMEOUT_MS);
+      }, this.timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.send({ method, id, params });
     });
@@ -237,8 +240,8 @@ function matchingPluginHooks(hooks, pluginId) {
   return matching.filter((hook) => hook.isManaged !== true);
 }
 
-async function withAppServer(action, codexExecutable) {
-  const server = new AppServer(codexExecutable);
+async function withAppServer(action, codexExecutable, timeoutMs = TIMEOUT_MS) {
+  const server = new AppServer(codexExecutable, timeoutMs);
   try {
     await server.initialize();
     return await action(server);
@@ -355,7 +358,7 @@ function marketplaceRevision(root) {
   }
 }
 
-function codexJson(codexExecutable, args) {
+function codexJson(codexExecutable, args, timeoutMs = TIMEOUT_MS) {
   // A CLI listing (`codex plugin list`, `codex plugin marketplace list`):
   // neither starts an app server, so neither runs Codex's sync.
   return new Promise((resolve, reject) => {
@@ -369,7 +372,7 @@ function codexJson(codexExecutable, args) {
     const timer = setTimeout(() => {
       terminateCodexChild(child);
       reject(new Error(`codex ${args.join(" ")} timed out`));
-    }, TIMEOUT_MS);
+    }, timeoutMs);
     child.on("error", reject);
     child.on("exit", (code) => {
       clearTimeout(timer);
@@ -459,7 +462,7 @@ async function syncMarketplaces(targets, waitMs, codexExecutable) {
   // deadline passes. Read-only on our side: no request here changes anything.
   let names = new Map();
   try {
-    const listed = await codexJson(codexExecutable, ["plugin", "marketplace", "list", "--json"]);
+    const listed = await codexJson(codexExecutable, ["plugin", "marketplace", "list", "--json"], SYNC_TIMEOUT_MS);
     const markets = Array.isArray(listed) ? listed : listed?.marketplaces ?? [];
     names = new Map(markets.map((market) => [market?.root, market?.name]));
   } catch {
@@ -478,7 +481,7 @@ async function syncMarketplaces(targets, waitMs, codexExecutable) {
         }
         if (installed === null) {
           try {
-            installed = (await codexJson(codexExecutable, ["plugin", "list", "--json"]))?.installed;
+            installed = (await codexJson(codexExecutable, ["plugin", "list", "--json"], SYNC_TIMEOUT_MS))?.installed;
           } catch {
             installed = undefined;
           }
@@ -493,7 +496,7 @@ async function syncMarketplaces(targets, waitMs, codexExecutable) {
       if (!missing.length || Date.now() >= deadline) return { missing, unconfirmed };
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
-  }, codexExecutable);
+  }, codexExecutable, SYNC_TIMEOUT_MS);
 }
 
 function pluginInstalled(pluginId, codexExecutable) {
@@ -661,7 +664,8 @@ async function main() {
     }
     const targets = [];
     for (let index = 0; index < pairs.length; index += 2) targets.push([pairs[index], pairs[index + 1]]);
-    const waitMs = Number(process.env.ROUNDHOUSE_CODEX_SYNC_WAIT_MS || 30_000);
+    const requestedWait = Number(process.env.ROUNDHOUSE_CODEX_SYNC_WAIT_MS || 180_000);
+    const waitMs = Number.isFinite(requestedWait) && requestedWait >= 0 ? requestedWait : 180_000;
     const { missing, unconfirmed } = await syncMarketplaces(targets, waitMs, syncExecutable);
     process.stdout.write(`${JSON.stringify({ synced: targets.length - missing.length, missing, unconfirmed })}\n`);
     if (missing.length) process.exitCode = 75;

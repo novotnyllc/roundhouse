@@ -249,6 +249,57 @@ SH
       fleet_plugins_refresh "$pc/store" vireo '{}' '{}' fast "$pc" >/dev/null
       [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" = "$pc_codex_head" ] ||
         fail "a fast-pass Codex sync was not remembered"
+      # One startup syncs every marketplace. A slow root missing its
+      # deadline must not discard the result for a fast root that finished.
+      (
+        pc_codex_head=$(pc_commit codex-up 'one fast marketplace')
+        printf '%s\n' "$pc_codex_head" >"$PC_CODEX_SYNC_TO"
+        mkdir -p "$pc/codex-slow"
+        jq --arg root "$pc/codex-slow" '.marketplaces += [{name: "slow", root: $root}]' \
+          "$PC_CODEX_MARKETS" >"$pc/markets.next"
+        mv "$pc/markets.next" "$PC_CODEX_MARKETS"
+        printf 'novotnyllc%s%s%s%s\nslow%s%s%s%s\n' \
+          "$us" "$pc_codex_head" "$us" "$pc/codex-root" \
+          "$us" "$pc_codex_head" "$us" "$pc/codex-slow" >"$pc/sync-targets"
+        # Capture the real bound while keeping the helper and watchdog real.
+        eval "pc_$(declare -f run_bounded)"
+        run_bounded() {
+          # The shell's deadline must leave the helper time to report roots.
+          printf '%s %s\n' "$1" "$ROUNDHOUSE_CODEX_SYNC_WAIT_MS" >"$pc/sync-bound"
+          if [ "${pc_capture_only:-false}" = true ]; then
+            printf '{"missing":[],"unconfirmed":[]}\n'
+            return 0
+          fi
+          pc_run_bounded "$@"
+        }
+        : >"$PC_CODEX_LOG"
+        pc_out=$(ROUNDHOUSE_CODEX_SYNC_WAIT_MS=2500 fleet_plugins_codex_sync "$pc/sync-targets")
+        [ "$(cat "$PC_CODEX_LOG")" = app-server ] || fail "sync started more than one app server"
+        [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" = "$pc_codex_head" ] ||
+          fail "a slow marketplace prevented a finished marketplace from being remembered: $pc_out"
+        [ "$(fleet_plugins_memo_read codex slow attempted)" != "$pc_codex_head" ] ||
+          fail "a marketplace that missed the deadline was remembered"
+        case $pc_out in
+          *'hold  marketplace slow (codex) — Codex did not sync it'*) ;;
+          *) fail "the slow marketplace was not held: $pc_out" ;;
+        esac
+        read -r pc_bound pc_wait <"$pc/sync-bound"
+        [ "$pc_wait" -eq 2500 ] && [ "$((pc_bound * 1000))" -gt "$pc_wait" ] &&
+          [ "$pc_bound" -le "$(run_bounded_seconds install)" ] ||
+          fail "the outer sync bound did not exceed the effective wait inside the install ceiling"
+        pc_capture_only=true fleet_plugins_codex_sync "$pc/sync-targets" >/dev/null
+        read -r pc_bound pc_wait <"$pc/sync-bound"
+        [ "$pc_wait" -eq 180000 ] && [ "$((pc_bound * 1000))" -gt "$pc_wait" ] ||
+          fail "the default sync wait was not 180s inside a longer outer bound"
+        pc_capture_only=true ROUNDHOUSE_CODEX_SYNC_WAIT_MS=1800000 \
+          fleet_plugins_codex_sync "$pc/sync-targets" >/dev/null
+        read -r pc_bound pc_wait <"$pc/sync-bound"
+        [ "$pc_bound" -eq "$(run_bounded_seconds install)" ] &&
+          [ "$((pc_bound * 1000))" -gt "$pc_wait" ] ||
+          fail "an oversized sync wait did not leave overhead inside the install ceiling"
+        jq 'del(.marketplaces[] | select(.name == "slow"))' "$PC_CODEX_MARKETS" >"$pc/markets.next"
+        mv "$pc/markets.next" "$PC_CODEX_MARKETS"
+      )
       # Codex records the revision before it reinstalls: a sync whose
       # reinstall is still running at the deadline is NOT done. Nothing is
       # remembered and the pass says so; a slower reinstall inside the

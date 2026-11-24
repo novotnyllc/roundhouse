@@ -855,6 +855,9 @@ export ROUNDHOUSE_CONFIG="$tmp/config.json"
 # Every sync test hook (signature bypass, visibility probe, approval command)
 # is inert without this; the suite is the only thing allowed to set it.
 export ROUNDHOUSE_SELFTEST=1
+# Pass cleanup stays inside the fixture tree, including real-jj fleet runs.
+export ROUNDHOUSE_TEST_CASK_TEMP="$tmp/cask-temp"
+mkdir -p "$ROUNDHOUSE_TEST_CASK_TEMP"
 export BREW_STATE_FILE="$tmp/brew-state"
 export BREW_EXEC_MARKER="$tmp/brew-executed"
 export OP_SECRET_FILE="$tmp/op-secret"
@@ -1132,6 +1135,8 @@ printf '%s\n' '{"portable":"session"}' >"$OP_SECRET_FILE"
 # design (5.1); a host without it gets a loud skip rather than a mystery
 # failure, and CI runners carry it.
 fleet_fixture_tool() {
+  # Expose only this binary: its install directory may also contain real
+  # managers that would shadow the stubs when a section prepends it to PATH.
   fixture_found=$(command -v "$1" 2>/dev/null || true)
   if [ -z "$fixture_found" ]; then
     for fixture_candidate in "/opt/homebrew/bin/$1" "/usr/local/bin/$1" \
@@ -1142,7 +1147,12 @@ fleet_fixture_tool() {
       }
     done
   fi
-  printf '%s\n' "$fixture_found"
+  [ -n "$fixture_found" ] || return 0
+  mkdir -p "$tmp/native-tools" || return
+  if [ "$fixture_found" != "$tmp/native-tools/$1" ]; then
+    ln -sf "$fixture_found" "$tmp/native-tools/$1" || return
+  fi
+  printf '%s/native-tools/%s\n' "$tmp" "$1"
 }
 fleet_fixture_yq=$(fleet_fixture_tool yq)
 fleet_fixture_path=$PATH

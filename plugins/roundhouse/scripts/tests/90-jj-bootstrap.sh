@@ -783,6 +783,8 @@ fi
 # and a comment cannot verify it. The suite sanitizes PATH early, so probe the
 # standard install locations in addition to whatever survives on PATH.
 bootstrap_tool_path() {
+  # Expose only this binary: its install directory may also contain real
+  # managers that would shadow the stubs when a section prepends it to PATH.
   bootstrap_found=$(command -v "$1" 2>/dev/null || true)
   if [ -z "$bootstrap_found" ]; then
     for candidate in "/opt/homebrew/bin/$1" "/usr/local/bin/$1" \
@@ -793,7 +795,12 @@ bootstrap_tool_path() {
       }
     done
   fi
-  printf '%s\n' "$bootstrap_found"
+  [ -n "$bootstrap_found" ] || return 0
+  mkdir -p "$tmp/native-tools" || return
+  if [ "$bootstrap_found" != "$tmp/native-tools/$1" ]; then
+    ln -sf "$bootstrap_found" "$tmp/native-tools/$1" || return
+  fi
+  printf '%s/native-tools/%s\n' "$tmp" "$1"
 }
 real_jj=$(bootstrap_tool_path jj)
 real_yq=$(bootstrap_tool_path yq)

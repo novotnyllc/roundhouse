@@ -387,7 +387,20 @@ fleet_plugins_codex_sync() {
   # installed plugins reinstalled at it (Codex records the revision first).
   # A root counts only when the helper says so: a marker an earlier, cut-off
   # sync left at the head proves nothing about the plugins.
-  fleet_plugins_cs_out=$(run_bounded 45 "$fleet_plugins_cs_node" \
+  # Leave time for the marketplace listing, initialize and a final plugin
+  # listing (60s each), polling and shutdown, so even a partial sync prints
+  # its per-root result. Shorten the helper's wait too if the install ceiling
+  # cannot hold it; never let an outer timeout discard completed roots.
+  fleet_plugins_cs_budget=$("$fleet_plugins_cs_node" -e '
+    const cap = Number(process.argv[1]);
+    const requested = Number(process.env.ROUNDHOUSE_CODEX_SYNC_WAIT_MS || 180000);
+    const wait = Math.min(Number.isFinite(requested) && requested >= 0 ? requested : 180000,
+      Math.max(0, cap - 185) * 1000);
+    console.log(wait + " " + Math.min(cap, Math.ceil(wait / 1000) + 185));
+  ' "$(run_bounded_seconds install)") || return 0
+  read -r fleet_plugins_cs_wait fleet_plugins_cs_bound <<<"$fleet_plugins_cs_budget"
+  fleet_plugins_cs_out=$(ROUNDHOUSE_CODEX_SYNC_WAIT_MS="$fleet_plugins_cs_wait" \
+    run_bounded "$fleet_plugins_cs_bound" "$fleet_plugins_cs_node" \
     "$script_dir/codex-plugin-hooks.mjs" sync "${fleet_plugins_cs_args[@]}" 2>/dev/null </dev/null) || :
   # An UNCONFIRMED root synced but has unpinned remote installs whose
   # reinstall cannot be awaited: its head is not remembered, so the next pass

@@ -585,6 +585,10 @@ fleet_schedule_command "$@"'
       }
       fleet_host_name() { printf 'vireo\n'; }
       sched_calls="$sched_root/pass-calls"
+      ROUNDHOUSE_TEST_LOG_DIR="$sched_root/run-logs"
+      ROUNDHOUSE_TEST_LOG_LIMIT=8
+      mkdir -p "$ROUNDHOUSE_TEST_LOG_DIR"
+      printf 'rotate before the pass\n' >"$ROUNDHOUSE_TEST_LOG_DIR/roundhouse-fleet-fast.log"
       sched_run() {
         # sched_run ARG... — fleet_run_command, its status in sched_status and
         # its output in $sched_root/run.out.
@@ -593,6 +597,7 @@ fleet_schedule_command "$@"'
       fleet_run_pass() (
         run_tmp=$1
         run_mode=$2
+        [ ! -s "$ROUNDHOUSE_TEST_LOG_DIR/roundhouse-fleet-fast.log" ] || exit 72
         printf '%s %s\n' "$run_mode" "$run_tmp" >>"$sched_calls"
         [ -d "$run_tmp" ] || exit 70
         # PER PASS: a fresh, empty alert ledger inside this pass's run_tmp,
@@ -837,6 +842,55 @@ fleet_run_command --fast'
     fi
 
     if section_part 2; then
+    # --- launchd log maintenance keeps the scheduler's open descriptor ---
+    (
+      SCHED_UNAME=Darwin
+      ROUNDHOUSE_TEST_LOG_DIR="$sched_root/logs with spaces"
+      ROUNDHOUSE_TEST_LOG_LIMIT=8
+      mkdir -p "$ROUNDHOUSE_TEST_LOG_DIR"
+      sched_log_fast="$ROUNDHOUSE_TEST_LOG_DIR/roundhouse-fleet-fast.log"
+      sched_log_full="$ROUNDHOUSE_TEST_LOG_DIR/roundhouse-fleet-full.log"
+      printf 'a log larger than eight bytes\n' >"$sched_root/log-content"
+      cp "$sched_root/log-content" "$sched_log_fast"
+      printf 'small\n' >"$sched_log_full"
+      exec 7>>"$sched_log_fast"
+      sched_out=$(fleet_schedule_rotate_logs 2>&1)
+      [ -z "$sched_out" ] || fail "successful log rotation printed output: $sched_out"
+      [ ! -s "$sched_log_fast" ] || fail "log rotation did not truncate the original"
+      [ "$(cat "$sched_log_full")" = small ] || fail "log rotation changed an under-threshold log"
+      set -- "$sched_log_fast".*.gz
+      [ "$#" -eq 1 ] && [ -f "$1" ] || fail "log rotation did not create exactly one gzip archive"
+      gzip -cd "$1" >"$sched_root/log-restored"
+      cmp -s "$sched_root/log-content" "$sched_root/log-restored" ||
+        fail "the rotated archive lost the original content"
+      printf 'later\n' >&7
+      exec 7>&-
+      [ "$(cat "$sched_log_fast")" = later ] || fail "rotation replaced launchd's open log inode"
+      for sched_day in 01 02 03 04 05 06; do
+        gzip -c "$sched_root/log-content" >"$sched_log_fast.200001${sched_day}T000000Z.gz"
+      done
+      fleet_schedule_rotate_logs
+      set -- "$sched_log_fast".*.gz
+      [ "$#" -eq 5 ] || fail "log archive pruning did not keep five copies"
+      [ ! -e "$sched_log_fast.20000101T000000Z.gz" ] &&
+        [ ! -e "$sched_log_fast.20000102T000000Z.gz" ] &&
+        [ -e "$sched_log_fast.20000103T000000Z.gz" ] ||
+        fail "log pruning did not remove the oldest copies first"
+      cp "$sched_root/log-content" "$sched_log_full"
+      SCHED_UNAME=Linux
+      fleet_schedule_rotate_logs
+      cmp -s "$sched_root/log-content" "$sched_log_full" || fail "Linux rotated a launchd log"
+      SCHED_UNAME=Darwin
+      ROUNDHOUSE_SELFTEST=0 fleet_schedule_rotate_logs
+      cmp -s "$sched_root/log-content" "$sched_log_full" || fail "a log test hook was active outside self-test"
+      (
+        # A failed copy must neither truncate the log nor fail the run.
+        cp() { return 1; }
+        fleet_schedule_rotate_logs
+      )
+      cmp -s "$sched_root/log-content" "$sched_log_full" || fail "failed archival truncated the log"
+    )
+
     # --- fleet-schedule on macOS: install, idempotence, status, uninstall ---
     SCHED_UNAME=Darwin
     sched_reset
