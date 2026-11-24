@@ -2,7 +2,7 @@
 
 `.github/workflows/validate.yml` checks POSIX syntax/integrity in `posix`,
 the fixture suite in `sections`, and helper self-tests in `helpers`, each on
-ubuntu-latest and macos-latest. `select` uses `scripts/select-sections` and
+ubuntu-24.04 and macos-latest. `select` uses `scripts/select-sections` and
 its `--scopes`/`--helpers` modes to choose PR coverage from changed paths;
 main pushes select everything. Unknown inputs within the tested surface fall
 back to full coverage. Unrelated changes need no extra scopes or helpers.

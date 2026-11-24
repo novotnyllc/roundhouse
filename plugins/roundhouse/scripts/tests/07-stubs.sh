@@ -1135,8 +1135,6 @@ printf '%s\n' '{"portable":"session"}' >"$OP_SECRET_FILE"
 # design (5.1); a host without it gets a loud skip rather than a mystery
 # failure, and CI runners carry it.
 fleet_fixture_tool() {
-  # Expose only this binary: its install directory may also contain real
-  # managers that would shadow the stubs when a section prepends it to PATH.
   fixture_found=$(command -v "$1" 2>/dev/null || true)
   if [ -z "$fixture_found" ]; then
     for fixture_candidate in "/opt/homebrew/bin/$1" "/usr/local/bin/$1" \
@@ -1147,12 +1145,7 @@ fleet_fixture_tool() {
       }
     done
   fi
-  [ -n "$fixture_found" ] || return 0
-  mkdir -p "$tmp/native-tools" || return
-  if [ "$fixture_found" != "$tmp/native-tools/$1" ]; then
-    ln -sf "$fixture_found" "$tmp/native-tools/$1" || return
-  fi
-  printf '%s/native-tools/%s\n' "$tmp" "$1"
+  printf '%s\n' "$fixture_found"
 }
 fleet_fixture_yq=$(fleet_fixture_tool yq)
 fleet_fixture_path=$PATH
