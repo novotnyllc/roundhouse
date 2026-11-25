@@ -173,6 +173,16 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
           mkdir -p "$CODEX_HOME/plugins/cache/novotnyllc/inrepo"
           cp -R "$PC_CODEX_ROOT/plugins/inrepo" "$CODEX_HOME/plugins/cache/novotnyllc/inrepo/1") \
           >/dev/null 2>&1 </dev/null &
+        if [ -n "${PC_CODEX_WARNING:-}" ]; then
+          jq -cn --arg name "$PC_CODEX_WARNING" '{method:"warning",params:{threadId:null,
+            message:("Codex could not update marketplace `" + $name + "`: git clone marketplace source timed out after 30s: fixture")}}'
+        fi
+        if [ "${PC_CODEX_WARNING_BURST:-}" = 1 ]; then
+          for warning in $(seq 1 20); do
+            jq -cn --arg n "$warning" '{method:"warning",params:{threadId:null,
+              message:("unrelated warning " + $n)}}'
+          done
+        fi
         jq -cn --argjson id "$id" '{id:$id,result:{}}'
         ;;
     esac
@@ -180,8 +190,34 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
   exit 0
 fi
 case "$*" in
-  'plugin marketplace list --json') cat "$PC_CODEX_MARKETS"; exit 0 ;;
-  'plugin list --json') cat "$PC_CODEX_INSTALLED"; exit 0 ;;
+  'plugin marketplace list --json')
+    if [ "${PC_CODEX_MARKETS_BROKEN:-}" = 1 ]; then
+      printf '%s\n' 'Error: failed to load marketplace(s):' \
+        '- `dotnet-agent-skills` at …/.tmp/marketplaces/dotnet-agent-skills: marketplace root does not contain a supported manifest' >&2
+      exit 1
+    fi
+    cat "$PC_CODEX_MARKETS"; exit 0 ;;
+  'plugin list --json'*)
+    [ "${PC_CODEX_LIST_LOG:-}" != 1 ] || printf '%s\n' "$*" >>"$PC_CODEX_LOG"
+    if [ "${4:-}" = -m ]; then
+      if [ "${PC_CODEX_OLD:-}" = 1 ]; then
+        printf "error: unexpected argument '-m' found\n" >&2
+        exit 2
+      fi
+      if [ "${PC_CODEX_SCOPE_FAIL:-}" = 1 ]; then
+        printf '%s\n' 'Error: failed to load configured marketplace snapshot(s)' >&2
+        exit 1
+      fi
+      jq --arg name "$5" '{installed: [.installed[] | select(.marketplaceName == $name)]}' \
+        "$PC_CODEX_INSTALLED"
+    elif [ "${PC_CODEX_BROKEN:-}" = 1 ]; then
+      printf '%s\n' 'Error: failed to load configured marketplace snapshot(s):' \
+        '- `dotnet-agent-skills` at …/.tmp/marketplaces/dotnet-agent-skills: marketplace root does not contain a supported manifest' >&2
+      exit 1
+    else
+      cat "$PC_CODEX_INSTALLED"
+    fi
+    exit 0 ;;
 esac
 # Roundhouse must never drive Codex's own updates.
 printf 'FORBIDDEN %s\n' "$*" >>"$PC_CODEX_LOG"
@@ -299,6 +335,196 @@ SH
           fail "an oversized sync wait did not leave overhead inside the install ceiling"
         jq 'del(.marketplaces[] | select(.name == "slow"))' "$PC_CODEX_MARKETS" >"$pc/markets.next"
         mv "$pc/markets.next" "$PC_CODEX_MARKETS"
+      )
+      # A configured marketplace without a snapshot breaks the whole list,
+      # but scoped listings still let a completed sibling be remembered.
+      (
+        : >"$PC_CODEX_SYNC_TO"
+        jq --arg root "$pc/codex-broken" '.marketplaces += [{name: "dotnet-agent-skills", root: $root}]' \
+          "$PC_CODEX_MARKETS" >"$pc/markets.next"
+        mv "$pc/markets.next" "$PC_CODEX_MARKETS"
+        pc_good_head=$(fleet_plugins_codex_revision "$pc/codex-root")
+        printf 'novotnyllc%s%s%s%s\ndotnet-agent-skills%s%s%s%s\n' \
+          "$us" "$pc_good_head" "$us" "$pc/codex-root" \
+          "$us" "$pc_good_head" "$us" "$pc/codex-broken" >"$pc/sync-targets"
+        rm -f "$(fleet_plugins_memo_path codex novotnyllc attempted)"
+        : >"$PC_CODEX_LOG"
+        pc_out=$(PC_CODEX_BROKEN=1 PC_CODEX_LIST_LOG=1 ROUNDHOUSE_CODEX_SYNC_WAIT_MS=1000 \
+          fleet_plugins_codex_sync "$pc/sync-targets" "$pc/codex-sync-held")
+        grep -Fqx 'plugin list --json -m novotnyllc' "$PC_CODEX_LOG" &&
+          ! grep -Fqx 'plugin list --json' "$PC_CODEX_LOG" ||
+          fail "sync used the broken whole listing instead of the scoped listing"
+        [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" = "$pc_good_head" ] ||
+          fail "a broken marketplace made a completed sibling pending: $pc_out"
+        [ "$(cat "$pc/codex-sync-held")" = dotnet-agent-skills ] ||
+          fail "a broken marketplace was not held alone: $pc_out"
+        case $pc_out in
+          *'  codex sync: '*"$pc/codex-broken"*'revision mismatch'*) ;;
+          *) fail "the helper's missing-root reason did not reach pass output: $pc_out" ;;
+        esac
+        # Both the post-update approval and steady-state check stop before
+        # their first per-plugin query for a marketplace held by this sync.
+        fleet_run_codex_sync_holds=$pc/codex-sync-held
+        for pc_check in fleet_run_approve_plugin_hooks fleet_run_codex_hooks_settled; do
+          : >"$PC_CODEX_LOG"
+          pc_status=0
+          pc_out=$(PC_CODEX_LIST_LOG=1 "$pc_check" demo@dotnet-agent-skills "$pc_good_head") ||
+            pc_status=$?
+          [ "$pc_status" -eq 74 ] && [ ! -s "$PC_CODEX_LOG" ] &&
+            [ "$pc_out" = '  hold  plugin demo@dotnet-agent-skills (codex) — marketplace dotnet-agent-skills did not sync this pass; skipped' ] ||
+            fail "a held marketplace paid a per-plugin query in $pc_check (got $pc_status): $pc_out $(cat "$PC_CODEX_LOG")"
+        done
+        # The item loop preserves its transient hold and journal, without
+        # adding a second generic hold line after the specific skip reason.
+        (
+          fleet_run_runtime_hold() { printf '%s\n' "$2" >"$pc/skipped-hold"; }
+          fleet_run_journal_queue() { printf '%s\n' "$5" >"$pc/skipped-journal"; }
+          pc_status=0
+          PC_CODEX_LIST_LOG=1 fleet_run_approve_plugin_hooks demo@dotnet-agent-skills \
+            "$pc_good_head" || pc_status=$?
+          [ "$pc_status" -eq 74 ] || fail "a skipped plugin lost its transient status"
+          fleet_run_apply_held "$pc/store" vireo '{}' plugins.demo plugins digest \
+            "$pc_status" "$pc" now '{}'
+        ) >"$pc/skipped-output"
+        [ "$(wc -l <"$pc/skipped-output")" -eq 1 ] &&
+          grep -Fqx '  hold  plugin demo@dotnet-agent-skills (codex) — marketplace dotnet-agent-skills did not sync this pass; skipped' \
+            "$pc/skipped-output" &&
+          [ "$(cat "$pc/skipped-hold")" = 'apply status 74' ] &&
+          [ "$(cat "$pc/skipped-journal")" = held ] ||
+          fail "a skipped plugin lost its hold or journal, or printed duplicate hold lines"
+        # A warning has no response id. Once Codex gives up, the helper must
+        # return the root as missing without paying the ten-second wait.
+        pc_status=0
+        pc_started=$SECONDS
+        pc_out=$(PC_CODEX_WARNING=dotnet-agent-skills ROUNDHOUSE_CODEX_SYNC_WAIT_MS=10000 \
+          node "$script_dir/codex-plugin-hooks.mjs" sync \
+          "$pc/codex-broken" "$pc_good_head" 2>"$pc/sync-warning") || pc_status=$?
+        [ "$pc_status" -eq 75 ] && [ "$((SECONDS - pc_started))" -lt 6 ] &&
+          [ "$(printf '%s\n' "$pc_out" | jq -c '.missing')" = "[\"$pc/codex-broken\"]" ] ||
+          fail "a no-id clone warning did not end the target wait early (got $pc_status): $pc_out"
+        grep -Fq 'could not update marketplace `dotnet-agent-skills`' "$pc/sync-warning" ||
+          fail "the clone warning was not written to stderr"
+        # Failure state survives eviction from the bounded warning log.
+        pc_status=0
+        pc_started=$SECONDS
+        pc_out=$(PC_CODEX_WARNING=dotnet-agent-skills PC_CODEX_WARNING_BURST=1 \
+          ROUNDHOUSE_CODEX_SYNC_WAIT_MS=10000 node "$script_dir/codex-plugin-hooks.mjs" sync \
+          "$pc/codex-broken" "$pc_good_head" 2>"$pc/sync-warning") || pc_status=$?
+        [ "$pc_status" -eq 75 ] && [ "$((SECONDS - pc_started))" -lt 6 ] &&
+          [ "$(printf '%s\n' "$pc_out" | jq -c '.missing')" = "[\"$pc/codex-broken\"]" ] ||
+          fail "evicting the clone warning made its target wait again (got $pc_status): $pc_out"
+        [ "$(grep -c '^warning:' "$pc/sync-warning")" -eq 20 ] ||
+          fail "the app-server warning log was not bounded to twenty entries"
+        # Older Codex rejects -m: the successful whole listing remains usable.
+        pc_out=$(PC_CODEX_OLD=1 node "$script_dir/codex-plugin-hooks.mjs" sync \
+          "$pc/codex-root" "$pc_good_head") || fail "the old-Codex listing fallback failed: $pc_out"
+        [ "$(printf '%s\n' "$pc_out" | jq -r '.synced')" -eq 1 ] ||
+          fail "the old-Codex fallback did not confirm the root: $pc_out"
+        jq 'del(.marketplaces[] | select(.name == "dotnet-agent-skills"))' "$PC_CODEX_MARKETS" \
+          >"$pc/markets.next"
+        mv "$pc/markets.next" "$PC_CODEX_MARKETS"
+      )
+      # A failed marketplace listing can name only direct Codex snapshot
+      # roots; a successful scoped listing must still prove the good one.
+      (
+        : >"$PC_CODEX_SYNC_TO"
+        pc_good_root=$CODEX_HOME/.tmp/marketplaces/good
+        pc_broken_root=$CODEX_HOME/.tmp/marketplaces/dotnet-agent-skills
+        pc_outside_root=$pc/outside/good
+        mkdir -p "$(dirname "$pc_good_root")" "$(dirname "$pc_outside_root")"
+        cp -R "$pc/codex-root" "$pc_good_root"
+        cp -R "$pc/codex-root" "$pc_outside_root"
+        pc_good_head=$(fleet_plugins_codex_revision "$pc_good_root")
+        jq '.installed = [.installed[0] | .pluginId = "demo@good" |
+          .marketplaceName = "good"]' "$PC_CODEX_INSTALLED" >"$pc/fallback-installed.json"
+        export PC_CODEX_INSTALLED="$pc/fallback-installed.json" \
+          PC_CODEX_MARKETS_BROKEN=1 PC_CODEX_BROKEN=1 PC_CODEX_LIST_LOG=1
+        pc_status=0
+        pc_out=$(codex plugin list --json 2>"$pc/fallback-list-error") || pc_status=$?
+        [ "$pc_status" -eq 1 ] &&
+          grep -Fq 'Error: failed to load configured marketplace snapshot(s):' "$pc/fallback-list-error" ||
+          fail "the fallback fixture's unscoped plugin listing did not fail"
+        : >"$PC_CODEX_LOG"
+        pc_status=0
+        pc_out=$(ROUNDHOUSE_CODEX_SYNC_WAIT_MS=1000 node "$script_dir/codex-plugin-hooks.mjs" sync \
+          "$pc_good_root" "$pc_good_head" "$pc_broken_root" "$pc_good_head" \
+          "$pc_outside_root" "$pc_good_head") || pc_status=$?
+        [ "$pc_status" -eq 75 ] &&
+          [ "$pc_out" = "{\"synced\":1,\"missing\":[\"$pc_broken_root\",\"$pc_outside_root\"],\"unconfirmed\":[]}" ] ||
+          fail "failed marketplace listing did not isolate the good snapshot (got $pc_status): $pc_out"
+        grep -Fqx 'plugin list --json -m good' "$PC_CODEX_LOG" &&
+          ! grep -Fqx 'plugin list --json' "$PC_CODEX_LOG" ||
+          fail "snapshot fallback did not prove the good marketplace with its scoped listing"
+        printf 'good%s%s%s%s\ndotnet-agent-skills%s%s%s%s\noutside%s%s%s%s\n' \
+          "$us" "$pc_good_head" "$us" "$pc_good_root" \
+          "$us" "$pc_good_head" "$us" "$pc_broken_root" \
+          "$us" "$pc_good_head" "$us" "$pc_outside_root" >"$pc/fallback-targets"
+        rm -f "$(fleet_plugins_memo_path codex good attempted)"
+        pc_out=$(ROUNDHOUSE_CODEX_SYNC_WAIT_MS=1000 \
+          fleet_plugins_codex_sync "$pc/fallback-targets" "$pc/fallback-held")
+        [ "$(fleet_plugins_memo_read codex good attempted)" = "$pc_good_head" ] &&
+          [ -z "$(fleet_plugins_memo_read codex dotnet-agent-skills attempted)" ] &&
+          [ -z "$(fleet_plugins_memo_read codex outside attempted)" ] ||
+          fail "failed marketplace listing remembered the wrong sync heads: $pc_out"
+        [ "$(cat "$pc/fallback-held")" = "$(printf 'dotnet-agent-skills\noutside\n')" ] ||
+          fail "failed marketplace listing did not hold only the broken and outside roots: $pc_out"
+      )
+      # Per-plugin queries isolate the healthy marketplace too. Both readers
+      # share its cached listing, and invalidation discards that scoped entry.
+      (
+        jq '.installed = [.installed[0] | .pluginId = "demo@good" |
+          .marketplaceName = "good" | .enabled = false]' "$PC_CODEX_INSTALLED" >"$pc/good.json"
+        export PC_CODEX_INSTALLED="$pc/good.json" PC_CODEX_BROKEN=1 PC_CODEX_LIST_LOG=1
+        fleet_run_apply_ctx=$pc/list-cache
+        mkdir -p "$fleet_run_apply_ctx"
+        : >"$PC_CODEX_LOG"
+        fleet_run_approve_plugin_hooks demo@good "$pc_codex_head" &&
+          fleet_run_codex_hooks_settled demo@good "$pc_codex_head" ||
+          fail "a healthy marketplace's per-plugin approval or settlement was held"
+        [ "$(cat "$PC_CODEX_LOG")" = 'plugin list --json -m good' ] ||
+          fail "per-plugin queries did not share the healthy scoped listing"
+        fleet_run_cli_invalidate
+        fleet_run_codex_record demo@good >/dev/null || fail "the scoped record could not be reread"
+        [ "$(wc -l <"$PC_CODEX_LOG")" -eq 2 ] ||
+          fail "Codex cache invalidation left the per-marketplace listing cached"
+        fleet_run_cli_invalidate
+        : >"$PC_CODEX_LOG"
+        pc_status=0
+        PC_CODEX_SCOPE_FAIL=1 fleet_run_codex_record demo@good >/dev/null || pc_status=$?
+        [ "$pc_status" -eq 74 ] &&
+          [ "$(cat "$PC_CODEX_LOG")" = 'plugin list --json -m good' ] ||
+          fail "a failed scoped snapshot used the global fallback or lost its transient hold"
+        : >"$PC_CODEX_LOG"
+        unset PC_CODEX_BROKEN
+        pc_out=$(PC_CODEX_OLD=1 fleet_run_codex_record_state demo@good '') ||
+          fail "the older CLI's per-plugin fallback failed"
+        [ "$pc_out" = match ] &&
+          [ "$(grep -Fxc 'plugin list --json -m good' "$PC_CODEX_LOG")" -eq 1 ] &&
+          [ "$(grep -Fxc 'plugin list --json' "$PC_CODEX_LOG")" -eq 1 ] ||
+          fail "the older CLI's per-plugin fallback did not try each listing once"
+      )
+      # Sync diagnostics are advisory, bounded and redacted even when the
+      # helper fails. Keep the watchdog real in the other fixtures.
+      (
+        run_bounded() {
+          for pc_line in $(seq 1 30); do
+            printf 'diagnostic %s %0300d\n' "$pc_line" 0 >&2
+          done
+          printf '%s\n' 'https://u:p@example.invalid ghp_plantedSecret Bearer plantedBearer github_pat_plantedPat sk-plantedKey xoxb-plantedSlack' >&2
+          printf '{"synced":0,"missing":["%s"],"unconfirmed":[]}\n' "$pc/codex-root"
+          return 75
+        }
+        printf 'novotnyllc%s%s%s%s\n' "$us" "$pc_codex_head" "$us" "$pc/codex-root" >"$pc/sync-targets"
+        fleet_plugins_codex_sync "$pc/sync-targets" >"$pc/sync-diagnostics"
+        sed -n 's/^  codex sync: //p' "$pc/sync-diagnostics" >"$pc/sync-diagnostic-body"
+        [ -s "$pc/sync-diagnostic-body" ] &&
+          [ "$(wc -l <"$pc/sync-diagnostic-body")" -le 20 ] &&
+          [ "$(wc -c <"$pc/sync-diagnostic-body")" -le 4096 ] ||
+          fail "helper stderr did not reach pass output within its bounds"
+        ! grep -Eq 'ghp_|https://u:p@|plantedBearer|github_pat_|sk-planted|xoxb-' "$pc/sync-diagnostics" ||
+          fail "helper diagnostics exposed planted credentials"
+        grep -Fq 'https://***@example.invalid' "$pc/sync-diagnostics" ||
+          fail "helper diagnostics did not redact URL userinfo"
       )
       # Codex records the revision before it reinstalls: a sync whose
       # reinstall is still running at the deadline is NOT done. Nothing is
@@ -656,7 +882,18 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
   exit 0
 fi
 case "$*" in
-  'plugin list --json')
+  'plugin list --json'*)
+    printf '%s\n' "$*" >>"$st/list-log"
+    if [ "${4:-}" = -m ]; then
+      if [ -e "$st/old-cli" ]; then
+        printf "error: unexpected argument '-m' found\n" >&2
+        exit 2
+      fi
+      [ "$5" = m ] || { printf '{"installed":[]}\n'; exit 0; }
+    elif [ -e "$st/broken-list" ]; then
+      printf '%s\n' 'Error: failed to load configured marketplace snapshot(s)' >&2
+      exit 1
+    fi
     jq -cn --arg v "$ver" --arg sha "$(cat "$st/sha-$ver")" \
       --argjson src "$(cat "$st/source")" --argjson on "$(cat "$st/enabled")" '{installed:[{
       pluginId:"widget@m",name:"widget",marketplaceName:"m",version:$v,
@@ -682,7 +919,9 @@ SH
         >"$pc/hooks-state/source"
       printf '%s\n' '{"marketplaces":[]}' >"$pc/hooks-state/markets"
       rm -f "$pc/hooks-state/pending" "$pc/hooks-state/lists" "$pc/hooks-state/advance-at" \
-        "$pc/hooks-state/advance-after" "$pc/hooks-state/nohooks" "$pc/hooks-state/app-server-fail"
+        "$pc/hooks-state/advance-after" "$pc/hooks-state/nohooks" "$pc/hooks-state/app-server-fail" \
+        "$pc/hooks-state/broken-list" "$pc/hooks-state/old-cli"
+      : >"$pc/hooks-state/list-log"
       pc_claude_markets=
       printf '%s\n' cccccccccccccccccccccccccccccccccccccccc >"$pc/hooks-state/sha-newer"
       : >"$pc/hooks-state/log"
@@ -857,6 +1096,36 @@ SH
       fail "a byte-verified advanced copy's changed hook was not carried to its new hash (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
     [ -z "$(find "$pc/codex-home/plugins/cache/m/widget" -perm -g+w -print -quit)" ] ||
       fail "automatic approval trusted a group-writable Codex cache without sealing it"
+    # A missing sibling snapshot must not hold a healthy plugin's apply or
+    # the helper's installedRecord checks while carrying changed hook trust.
+    pc_hooks_reset
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    : >"$pc/hooks-state/broken-list"
+    pc_hooks_apply || fail "a healthy plugin was held by a sibling snapshot: $(cat "$pc/hooks-err")"
+    [ "$(cat "$pc/hooks-state/trusted")" = sha256:new ] &&
+      ! grep -Fqx 'plugin list --json' "$pc/hooks-state/list-log" ||
+      fail "healthy plugin approval did not carry trust using scoped listings"
+    # Hookless approval uses pluginInstalled; older Codex gets one fallback.
+    for pc_listing in broken-list old-cli; do
+      pc_hooks_reset
+      : >"$pc/hooks-state/nohooks"
+      : >"$pc/hooks-state/$pc_listing"
+      (cd "$pc" && CODEX_HOME="$pc/codex-home" PATH="$pc/hooks-bin:$PATH" \
+        PC_HOOKS_STATE="$pc/hooks-state" node "$script_dir/codex-plugin-hooks.mjs" \
+        approve widget@m >"$pc/hooks-out" 2>"$pc/hooks-err") ||
+        fail "hookless approval failed with $pc_listing: $(cat "$pc/hooks-err")"
+      [ "$(jq -r '.approved' "$pc/hooks-out")" -eq 0 ] &&
+        [ "$(grep -Fxc 'plugin list --json -m m' "$pc/hooks-state/list-log")" -eq 1 ] ||
+        fail "hookless approval did not use one scoped listing with $pc_listing"
+      if [ "$pc_listing" = old-cli ]; then
+        [ "$(grep -Fxc 'plugin list --json' "$pc/hooks-state/list-log")" -eq 1 ] ||
+          fail "hookless approval did not fall back exactly once for older Codex"
+      else
+        ! grep -Fqx 'plugin list --json' "$pc/hooks-state/list-log" ||
+          fail "hookless approval fell back for a broken snapshot"
+      fi
+    done
     # ...and the trust written is tied to the bytes verified: Codex
     # reinstalling the copy between the verification and the write (here,
     # on the helper's re-listing inside its one session) refuses with 75 and

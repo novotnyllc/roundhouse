@@ -1729,6 +1729,19 @@ fleet_run_plugin_enabled() {
   printf '%s\n' "$fleet_run_plugin_state"
 }
 
+fleet_run_codex_sync_ready() {
+  # A sync that Codex gave up on cannot settle any plugin from that market
+  # this pass. Skip its per-plugin listings rather than pay each timeout.
+  case ${1:-} in *@*) ;; *) return 0 ;; esac
+  [ -n "${fleet_run_codex_sync_holds:-}" ] &&
+    [ -f "$fleet_run_codex_sync_holds" ] &&
+    grep -Fqx -- "${1##*@}" "$fleet_run_codex_sync_holds" || return 0
+  printf '  hold  plugin %s (codex) — marketplace %s did not sync this pass; skipped\n' \
+    "$1" "${1##*@}"
+  fleet_run_codex_sync_skipped=true
+  return 74
+}
+
 fleet_run_approve_plugin_hooks() {
   # The DSC plugin item is a Claude manager operation, but the hook trust state
   # is Codex-local. Qualified marketplace IDs are the shared seam accepted by
@@ -1748,6 +1761,7 @@ fleet_run_approve_plugin_hooks() {
   # a false hold. If Codex is present, a malformed/failed list is a real
   # inability to prove ownership and remains held.
   command -v codex >/dev/null 2>&1 || return 0
+  fleet_run_codex_sync_ready "$1" || return $?
   # A failed listing is transient (74): kept, so the next fast pass retries.
   fleet_run_codex_plugin_state=$(fleet_run_codex_record_state "$1" '') || return $?
   [ "$fleet_run_codex_plugin_state" != absent ] || return 0
@@ -1912,6 +1926,7 @@ fleet_run_codex_hooks_settled() {
   # (75) with its reason, so the next pass asks again.
   case ${1:-} in *@*) ;; *) return 0 ;; esac
   command -v codex >/dev/null 2>&1 || return 0
+  fleet_run_codex_sync_ready "$1" || return $?
   fleet_run_hs_record=$(fleet_run_codex_record "$1") || return $?
   [ "$(printf '%s\n' "$fleet_run_hs_record" | jq -r '.enabled == true')" = true ] || return 0
   if [ -n "${2:-}" ] && [ "$(printf '%s\n' "$fleet_run_hs_record" | jq -r '.source.sha // ""')" != "$2" ]; then
@@ -1945,11 +1960,28 @@ fleet_run_codex_hooks_settled() {
   esac
 }
 
+fleet_run_codex_list() (
+  # Scope installed records to their marketplace; only old CLIs rejecting
+  # the filter may fall back to the global listing. Cache each scope separately.
+  fleet_run_codex_list_err=$(mktemp "${TMPDIR:-/tmp}/roundhouse-codex-list.XXXXXX") || return 74
+  trap 'rm -f "$fleet_run_codex_list_err"' EXIT
+  fleet_run_codex_list_status=0
+  fleet_run_cli_cached "codex.${1##*@}" \
+    codex plugin list --json -m "${1##*@}" 2>"$fleet_run_codex_list_err" ||
+    fleet_run_codex_list_status=$?
+  [ "$fleet_run_codex_list_status" -ne 0 ] || return 0
+  if grep -Eiq '(unexpected|unrecognized|unknown|invalid)[[:space:]]+(argument|option).*(-m|--marketplace)' \
+    "$fleet_run_codex_list_err"; then
+    fleet_run_cli_cached codex codex plugin list --json 2>/dev/null
+  else
+    return "$fleet_run_codex_list_status"
+  fi
+)
+
 fleet_run_codex_record() {
   # fleet_run_codex_record ID -> Codex's installed record for ID as compact
   # JSON (`{}` when there is none). Exit 75 when the list cannot be read.
-  fleet_run_codex_plugins=$(fleet_run_cli_cached codex \
-    codex plugin list --json 2>/dev/null) || return 74
+  fleet_run_codex_plugins=$(fleet_run_codex_list "$1") || return 74
   printf '%s\n' "$fleet_run_codex_plugins" | jq -e -c --arg id "$1" '
     if type == "array" then .
     elif type == "object" and (.installed | type == "array") then .installed
@@ -2026,8 +2058,7 @@ fleet_run_codex_record_state() {
   # fleet_run_codex_record_state ID EXPECTED-SHA -> `absent` when Codex has no
   # installed record for ID, else `match` or `mismatch` against EXPECTED-SHA
   # (an empty one matches any record). Exit 75 when the list cannot be read.
-  fleet_run_codex_plugins=$(fleet_run_cli_cached codex \
-    codex plugin list --json 2>/dev/null) || return 74
+  fleet_run_codex_plugins=$(fleet_run_codex_list "$1") || return 74
   printf '%s\n' "$fleet_run_codex_plugins" | jq -e -r \
     --arg id "$1" --arg expected_sha "$2" '
     def records:
@@ -2481,6 +2512,7 @@ fleet_run_apply_item() {
   #
   # STATE (optional) is fleet_run_state_of VALUE when the caller already has
   # it — the run loop reads it from its plan.
+  fleet_run_codex_sync_skipped=false
   fleet_item_split_set "$4" || return 70
   fleet_run_category=$fleet_item_category
   fleet_run_name=$fleet_item_name
@@ -3083,23 +3115,6 @@ fleet_run_pass_ceiling() {
 
 # --- the commands -------------------------------------------------------------
 
-fleet_run_reap_cask_temp() (
-  # Failed cask installs leave empty Homebrew temp directories behind. Reap
-  # only old, empty top-level directories; an install still using one keeps it.
-  case $(uname -s) in
-    Darwin) ;;
-    Linux) command -v brew >/dev/null 2>&1 || exit 0 ;;
-    *) exit 0 ;;
-  esac
-  cask_temp=${HOMEBREW_TEMP:-/tmp}
-  if fleet_test_hook "${ROUNDHOUSE_TEST_CASK_TEMP:-}"; then
-    cask_temp=$ROUNDHOUSE_TEST_CASK_TEMP
-  fi
-  # /tmp is a symlink on macOS; follow the root, never links below it.
-  find -H "$cask_temp" -mindepth 1 -maxdepth 1 -type d -name 'cask-*' -empty -mmin +60 \
-    -exec rmdir {} + >/dev/null 2>&1 || :
-)
-
 fleet_run_command() {
   # `roundhouse fleet-run [--fast|--full]` — §6.1's two cadences. Fast is the
   # propagation path; full is maintenance. Splitting them is what lets the
@@ -3157,7 +3172,6 @@ fleet_run_command() {
   trap '[ "$run_lock_held" != true ] || fleet_lock_release "$run_lock" "$run_lock_nonce" || :
     rm -rf "$run_tmp"' EXIT
   fleet_lock_signals_exit
-  fleet_schedule_rotate_logs >/dev/null 2>&1 || :
   # §8.6: the abort button for a bad local apply, captured ONCE per run,
   # before its first pass and deliberately WITHOUT --ignore-working-copy (that
   # flag suppresses the colocated auto-import, so restoring to the newest
@@ -3234,13 +3248,14 @@ fleet_run_pass() {
   run_tmp=$1
   run_mode=$2
   run_ledger="$run_tmp/alert-ledger"
+  fleet_run_codex_sync_holds="$run_tmp/codex-sync-held"
+  : >"$fleet_run_codex_sync_holds"
   # ANY way out of this pass — a refusal, an errexit, a signal — first lands
   # whatever the apply loop has queued (fleet_run_batch_open): an item it
   # already installed is recorded as owned, as the per-item writes recorded
   # it. HERE, in the pass's own subshell, because the batch is: a trap in
   # fleet_run_command never saw it open. A signal exits 128+N, which runs it.
-  trap '[ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :
-    fleet_run_reap_cask_temp >/dev/null 2>&1 || :' EXIT
+  trap '[ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :' EXIT
   fleet_lock_signals_exit
   # Captured BEFORE any fetch: what arrives is what §7.7 has to gate, and after
   # the fetch there is no other way to tell new from known. (The poll floor's
@@ -3820,6 +3835,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     printf '  review %s  %s  %s\n' "$run_item" "${run_value:-<none>}" "$run_digest"
     fleet_run_verdict_write "$run_item" "$run_digest" "$run_reason"
     run_status=0
+    fleet_run_codex_sync_skipped=false
     if [ "$run_tombstone" = true ]; then
       # The uninstall journals on its own: land what is queued first, so the
       # journal keeps the per-item order.
@@ -4365,6 +4381,11 @@ fleet_run_apply_held() {
       "$(fleet_hook_trust "$1" "$2" "$3" "${4#hooks.}" || :)" "$4" ||
     :
   fleet_run_journal_queue "$1" "$2" "$4" "$6" held "$9" || :
+  # The Codex guard already printed the specific reason for this hold.
+  if [ "$7" -eq 74 ] && [ "$5" = plugins ] &&
+    [ "${fleet_run_codex_sync_skipped:-false}" = true ]; then
+    return 0
+  fi
   if [ "$7" -eq 73 ]; then
     printf '  held    %s (deferred: a Node runtime switch is in flight or backing off on this host)\n' "$4"
   elif [ "$7" -eq 74 ]; then

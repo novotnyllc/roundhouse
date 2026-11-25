@@ -109,11 +109,12 @@ function hookKeyPath(key) {
 }
 
 class AppServer {
-  constructor(codexExecutable, timeoutMs = TIMEOUT_MS) {
+  constructor(codexExecutable, timeoutMs = TIMEOUT_MS, onWarning) {
     this.timeoutMs = timeoutMs;
     this.nextId = 1;
     this.pending = new Map();
     this.stderr = "";
+    this.warnings = [];
     this.child = spawnCodex(codexExecutable, ["app-server", "--stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
@@ -135,6 +136,11 @@ class AppServer {
         this.rejectAll(new Error("app-server returned invalid JSON"));
         terminateCodexChild(this.child);
         return;
+      }
+      if (message.method === "warning" && typeof message.params?.message === "string") {
+        onWarning?.(message.params.message);
+        this.warnings.push(message.params.message.slice(0, 500));
+        this.warnings = this.warnings.slice(-20);
       }
       if (message.id == null || !this.pending.has(message.id)) return;
       const { resolve, reject, timer } = this.pending.get(message.id);
@@ -240,8 +246,8 @@ function matchingPluginHooks(hooks, pluginId) {
   return matching.filter((hook) => hook.isManaged !== true);
 }
 
-async function withAppServer(action, codexExecutable, timeoutMs = TIMEOUT_MS) {
-  const server = new AppServer(codexExecutable, timeoutMs);
+async function withAppServer(action, codexExecutable, timeoutMs = TIMEOUT_MS, onWarning) {
+  const server = new AppServer(codexExecutable, timeoutMs, onWarning);
   try {
     await server.initialize();
     return await action(server);
@@ -303,50 +309,19 @@ async function verifyTrust(pluginId, cwd, wanted, rejectNewTrusted, requireAllPr
   return hooks;
 }
 
-function installedRecord(pluginId, codexExecutable) {
-  // The CLI listing does not run Codex's marketplace startup sync (an app
-  // server start does), so it reads the installed copy as it stands.
-  return new Promise((resolve, reject) => {
-    const child = spawnCodex(codexExecutable, ["plugin", "list", "--json"], {
-      stdio: ["ignore", "pipe", "inherit"],
-      windowsHide: true,
-    });
-    let out = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      out += chunk;
-      if (out.length > 4 * 1024 * 1024) {
-        terminateCodexChild(child);
-        reject(new Error("codex plugin list output exceeded 4 MiB"));
-      }
-    });
-    const timer = setTimeout(() => {
-      terminateCodexChild(child);
-      reject(new Error("codex plugin list timed out"));
-    }, TIMEOUT_MS);
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) return reject(new Error(`codex plugin list failed (${code ?? "signal"})`));
-      try {
-        const installed = JSON.parse(out)?.installed;
-        if (!Array.isArray(installed)) throw new Error("shape");
-        const record = installed.find((p) => p?.pluginId === pluginId && p?.installed !== false);
-        resolve(
-          record
-            ? JSON.stringify({
-                version: record.version ?? null,
-                sha: record.source?.sha ?? null,
-                kind: record.source?.source ?? null,
-                path: record.source?.path ?? null,
-              })
-            : null,
-        );
-      } catch {
-        reject(new Error("codex plugin list returned invalid JSON"));
-      }
-    });
-  });
+async function installedRecord(pluginId, codexExecutable) {
+  // The CLI listing reads the installed copy without running startup sync.
+  const installed = (await codexPluginList(codexExecutable, pluginId.split("@").at(-1)))?.installed;
+  if (!Array.isArray(installed)) throw new Error("codex plugin list returned invalid JSON");
+  const record = installed.find((p) => p?.pluginId === pluginId && p?.installed !== false);
+  return record
+    ? JSON.stringify({
+        version: record.version ?? null,
+        sha: record.source?.sha ?? null,
+        kind: record.source?.source ?? null,
+        path: record.source?.path ?? null,
+      })
+    : null;
 }
 
 function marketplaceRevision(root) {
@@ -362,8 +337,11 @@ function codexJson(codexExecutable, args, timeoutMs = TIMEOUT_MS) {
   // A CLI listing (`codex plugin list`, `codex plugin marketplace list`):
   // neither starts an app server, so neither runs Codex's sync.
   return new Promise((resolve, reject) => {
-    const child = spawnCodex(codexExecutable, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    const child = spawnCodex(codexExecutable, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let out = "";
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-8192); });
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       out += chunk;
@@ -376,7 +354,11 @@ function codexJson(codexExecutable, args, timeoutMs = TIMEOUT_MS) {
     child.on("error", reject);
     child.on("exit", (code) => {
       clearTimeout(timer);
-      if (code !== 0) return reject(new Error(`codex ${args.join(" ")} failed (${code ?? "signal"})`));
+      if (code !== 0) {
+        const error = new Error(`codex ${args.join(" ")} failed (${code ?? "signal"})`);
+        error.stderr = stderr;
+        return reject(error);
+      }
       try {
         resolve(JSON.parse(out));
       } catch {
@@ -384,6 +366,19 @@ function codexJson(codexExecutable, args, timeoutMs = TIMEOUT_MS) {
       }
     });
   });
+}
+
+function marketplaceFilterUnsupported(error) {
+  return /(?:unexpected|unrecognized|unknown|invalid)\s+(?:argument|option)[^\n]*(?:-m|--marketplace)/i.test(error.stderr || "");
+}
+
+async function codexPluginList(codexExecutable, marketplace) {
+  try {
+    return await codexJson(codexExecutable, ["plugin", "list", "--json", "-m", marketplace]);
+  } catch (error) {
+    if (!marketplaceFilterUnsupported(error)) throw error;
+    return codexJson(codexExecutable, ["plugin", "list", "--json"]);
+  }
 }
 
 // The catalog layouts Codex reads from a marketplace root, in its order.
@@ -461,76 +456,118 @@ async function syncMarketplaces(targets, waitMs, codexExecutable) {
   // installed from it is at that revision's catalog identity, or the
   // deadline passes. Read-only on our side: no request here changes anything.
   let names = new Map();
+  let listingFailed = false;
   try {
     const listed = await codexJson(codexExecutable, ["plugin", "marketplace", "list", "--json"], SYNC_TIMEOUT_MS);
     const markets = Array.isArray(listed) ? listed : listed?.marketplaces ?? [];
     names = new Map(markets.map((market) => [market?.root, market?.name]));
   } catch {
-    // An unreadable listing names no marketplace: every target stays missing.
+    // Codex 0.17x fails the WHOLE listing when any configured marketplace has
+    // no loadable snapshot (a clone it gave up on). Its Git snapshots live at
+    // CODEX_HOME/.tmp/marketplaces/NAME, so name only roots in that layout;
+    // the scoped plugin listing below still has to accept NAME. Anything
+    // else stays unnamed, and missing.
+    listingFailed = true;
+    const store = join(process.env.CODEX_HOME || join(homedir(), ".codex"), ".tmp", "marketplaces");
+    const canonical = (path) => {
+      try { return realpathSync(path); } catch { return resolve(path); }
+    };
+    for (const [root] of targets) {
+      const name = root.split(/[\\/]/).pop();
+      if (/^[A-Za-z0-9._-]+$/.test(name) && !/^\.+$/.test(name) &&
+        canonical(join(root, "..")) === canonical(store)) names.set(root, name);
+    }
   }
-  return withAppServer(async () => {
+  let scopedListing = true;
+  const targetNames = new Set(targets.map(([root]) => names.get(root)).filter(Boolean));
+  const failedNames = new Set();
+  return withAppServer(async (server) => {
     const deadline = Date.now() + waitMs;
+    let graceDeadline;
+    const abandoned = (name) => failedNames.has(name);
     for (;;) {
-      let installed = null;
+      const listings = new Map();
+      const listingDeadline = Date.now() + SYNC_TIMEOUT_MS;
+      let wholeListing;
+      const listWhole = () => {
+        wholeListing ??= codexJson(codexExecutable, ["plugin", "list", "--json"],
+          Math.max(1, listingDeadline - Date.now()));
+        return wholeListing;
+      };
+      const useScopedListing = scopedListing;
+      const wantedNames = new Set(targets.filter(([root, revision]) =>
+        names.get(root) && !abandoned(names.get(root)) && marketplaceRevision(root) === revision)
+        .map(([root]) => names.get(root)));
+      // Independent snapshots share one polling budget; a slow marketplace
+      // must not consume the outer bound before the others can be recorded.
+      await Promise.all([...wantedNames].map(async (name) => {
+        try {
+          let listing;
+          if (useScopedListing) {
+            try {
+              listing = await codexJson(codexExecutable, ["plugin", "list", "--json", "-m", name], SYNC_TIMEOUT_MS);
+            } catch (error) {
+              // Only an older CLI rejecting the filter gets the global
+              // fallback. A broken snapshot must stay marketplace-local.
+              if (!marketplaceFilterUnsupported(error)) throw error;
+              scopedListing = false;
+              listing = await listWhole();
+            }
+          } else listing = await listWhole();
+          listings.set(name, listing?.installed);
+        } catch {
+          listings.set(name, undefined);
+        }
+      }));
       const missing = [];
       const unconfirmed = [];
+      const reasons = new Map();
       for (const [root, revision] of targets) {
-        if (marketplaceRevision(root) !== revision || !names.get(root)) {
+        const name = names.get(root);
+        let reason;
+        if (!name) reason = listingFailed ? "listing failed" : "not listed";
+        else if (abandoned(name)) reason = "listing failed (Codex gave up updating the marketplace)";
+        else if (marketplaceRevision(root) !== revision) reason = "revision mismatch";
+        if (reason) {
           missing.push(root);
+          reasons.set(root, reason);
           continue;
         }
-        if (installed === null) {
-          try {
-            installed = (await codexJson(codexExecutable, ["plugin", "list", "--json"], SYNC_TIMEOUT_MS))?.installed;
-          } catch {
-            installed = undefined;
-          }
+        const installed = listings.get(name);
+        const state = Array.isArray(installed) ? catalogPluginsCurrent(root, name, installed) : "pending";
+        if (state === "pending" || abandoned(name)) {
+          missing.push(root);
+          reasons.set(root, Array.isArray(installed) ? "plugins pending" : "listing failed");
         }
-        const state = Array.isArray(installed) ? catalogPluginsCurrent(root, names.get(root), installed) : "pending";
-        if (state === "pending") missing.push(root);
         else if (state === "unconfirmed") unconfirmed.push(root);
       }
-      if (!missing.length && unconfirmed.length) {
-        await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(UNCONFIRMED_GRACE_MS, deadline - Date.now()))));
+      const waiting = missing.some((root) => !abandoned(names.get(root)));
+      if (!waiting && unconfirmed.length) {
+        graceDeadline ??= Math.min(Date.now() + UNCONFIRMED_GRACE_MS, deadline);
+        if (Date.now() < graceDeadline) {
+          await new Promise((resolve) => setTimeout(resolve, Math.min(500, graceDeadline - Date.now())));
+          continue;
+        }
       }
-      if (!missing.length || Date.now() >= deadline) return { missing, unconfirmed };
+      if (!waiting || Date.now() >= deadline) {
+        for (const warning of server.warnings) process.stderr.write(`warning: ${warning.replaceAll(/[\r\n]/g, " ")}\n`);
+        for (const root of missing) process.stderr.write(`${root}: ${reasons.get(root)}\n`);
+        return { missing, unconfirmed };
+      }
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
-  }, codexExecutable, SYNC_TIMEOUT_MS);
+  }, codexExecutable, SYNC_TIMEOUT_MS, (warning) => {
+    // Remember target failures independently of the bounded diagnostic tail.
+    for (const name of targetNames) {
+      if (warning.includes(`could not update marketplace \`${name}\``)) failedNames.add(name);
+    }
+  });
 }
 
-function pluginInstalled(pluginId, codexExecutable) {
-  return new Promise((resolve, reject) => {
-    const child = spawnCodex(codexExecutable, ["plugin", "list", "--json"], {
-      stdio: ["ignore", "pipe", "inherit"],
-      windowsHide: true,
-    });
-    let out = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      out += chunk;
-      if (out.length > 4 * 1024 * 1024) {
-        terminateCodexChild(child);
-        reject(new Error("codex plugin list output exceeded 4 MiB"));
-      }
-    });
-    const timer = setTimeout(() => {
-      terminateCodexChild(child);
-      reject(new Error("codex plugin list timed out"));
-    }, TIMEOUT_MS);
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) return reject(new Error(`codex plugin list failed (${code ?? "signal"})`));
-      try {
-        const installed = JSON.parse(out)?.installed;
-        resolve(Array.isArray(installed) &&
-          installed.some((p) => p?.pluginId === pluginId && p?.installed !== false));
-      } catch {
-        reject(new Error("codex plugin list returned invalid JSON"));
-      }
-    });
-  });
+async function pluginInstalled(pluginId, codexExecutable) {
+  const installed = (await codexPluginList(codexExecutable, pluginId.split("@").at(-1)))?.installed;
+  return Array.isArray(installed) &&
+    installed.some((p) => p?.pluginId === pluginId && p?.installed !== false);
 }
 
 function runCodexPluginAdd(pluginId, codexExecutable) {

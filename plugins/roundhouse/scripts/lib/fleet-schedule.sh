@@ -27,42 +27,6 @@
 
 fleet_schedule_modes='fast full'
 
-fleet_schedule_rotate_logs() (
-  # launchd keeps the log descriptor open: copy, compress, then truncate the
-  # same inode before the pass writes. Failed archival leaves the log intact.
-  [ "$(fleet_schedule_platform)" = launchd ] || exit 0
-  log_dir="$HOME/Library/Logs"
-  log_limit=$((50 * 1024 * 1024))
-  if fleet_test_hook "${ROUNDHOUSE_TEST_LOG_DIR:-}"; then
-    log_dir=$ROUNDHOUSE_TEST_LOG_DIR
-  fi
-  if fleet_test_hook "${ROUNDHOUSE_TEST_LOG_LIMIT:-}"; then
-    log_limit=$ROUNDHOUSE_TEST_LOG_LIMIT
-  fi
-  for log_mode in $fleet_schedule_modes; do
-    log_file="$log_dir/roundhouse-fleet-$log_mode.log"
-    [ -f "$log_file" ] || continue
-    log_size=$(wc -c <"$log_file") || continue
-    if [ "$log_size" -gt "$log_limit" ]; then
-      log_archive="$log_file.$(date -u +%Y%m%dT%H%M%SZ)"
-      [ ! -e "$log_archive" ] && [ ! -e "$log_archive.gz" ] || continue
-      if ! { cp "$log_file" "$log_archive" && gzip "$log_archive"; }; then
-        rm -f "$log_archive" "$log_archive.gz" || :
-        continue
-      fi
-      : >"$log_file" || continue
-    fi
-    # UTC names sort in time order; leave only the newest five copies.
-    for log_archive in "$log_file".[0-9]*.gz; do
-      [ ! -f "$log_archive" ] || printf '%s\n' "$log_archive"
-    done | LC_ALL=C sort -r | tail -n +6 |
-      while IFS= read -r log_archive; do
-        rm -f "$log_archive" || :
-      done
-  done
-  exit 0
-)
-
 # The superseded launchd entries fleet-update's absorb rule names: the old
 # autoupdate agent and the one-plist fleet agent. The ONE list; every reader
 # (the observation, the absorb plan, the executor's allowlist) derives from it.

@@ -50,7 +50,7 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
-      "sha256": "725af07faeae92f4ad0ead2ea71c2503cf164c5b23f4b915abf4b5a7550cf014"
+      "sha256": "d65c0734ff485933ad81e23c6fd95feb602e5f7b7f8bddc65cca0b6f7987e4b7"
     },
     {
       "path": "scripts/codex-plugin-hooks.ps1",
@@ -138,7 +138,7 @@
     },
     {
       "path": "scripts/lib/fleet-plugins.sh",
-      "sha256": "376999d805e5558ce42a605e0d71622834122de9ba09e625a0713ff5fd903a11"
+      "sha256": "da3707be21ea39c9eef405e59d942dd44be8b4ecc7b5931a6b5457adfc4340e5"
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "40e7715f10fe2decb5c0743ae02132bf25390744bb63fdaf39ff01a376118fc3"
+      "sha256": "96819bd3fa9a02340c5b1db7b187e94a6513b3c2685a0a91d2079713e60d4739"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -166,7 +166,7 @@
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
-      "sha256": "29740cc8babbd74e3f1147219685cf96300fc1bf1e236ce4310d98455a9f9ec1"
+      "sha256": "62a8c14e4089ce447ee67f6cb35aa9905e9027d3c96500674b4b93188fa22176"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
