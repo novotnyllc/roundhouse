@@ -103,19 +103,10 @@ fleet_schedule_windows_sibling() {
   # WSL entry whose expected hostname and user are this host's (the record a
   # host-local plan binds to, local_plan_target). With MACHINE it must be
   # that entry. Otherwise 69, with the reason on stderr; nothing is guessed.
-  # The local entry matches as local_plan_target does: on its
-  # hostname_source (lib/host-identity.sh), read only when one is set.
-  sibling_ts=
-  if jq -e '[.machines // {} | .[] | select(.transport == "local" and .hostname_source == "tailscale")] |
-      length > 0' "$(config_path)" >/dev/null 2>&1; then
-    sibling_ts=$(host_identity_tailscale_name 2>/dev/null) || sibling_ts=
-  fi
-  sibling_found=$(jq -c --arg hostname "$(hostname)" --arg ts "$sibling_ts" --arg user "$(id -un)" --arg want "${1:-}" '
+  sibling_found=$(jq -c --arg hostname "$(hostname)" --arg user "$(id -un)" --arg want "${1:-}" '
     [.machines // {} | to_entries[] | select(.value.platform == "wsl" and
-      .value.transport == "local" and .value.expected_user == $user and
-      (if (.value.hostname_source // "os") == "tailscale"
-       then $ts != "" and .value.expected_hostname == $ts
-       else .value.expected_hostname == $hostname end)) | .key] as $self |
+      .value.transport == "local" and .value.expected_hostname == $hostname and
+      .value.expected_user == $user) | .key] as $self |
     if ($self | length) != 1 then
       {reason:"no single configured local WSL machine is this host (\($hostname), \($user))"}
     else

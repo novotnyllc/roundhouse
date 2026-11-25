@@ -55,8 +55,7 @@ collect_command() {
     expected_hostname=$(jq -r --arg target "$target" '.machines[$target].expected_hostname // empty' "$config")
     expected_user=$(jq -r --arg target "$target" '.machines[$target].expected_user // empty' "$config")
     [ -n "$expected_hostname" ] && [ -n "$expected_user" ] &&
-      [ "$(host_identity_hostname "$config" "$target" 2>/dev/null)" = "$expected_hostname" ] &&
-        [ "$(id -un)" = "$expected_user" ] || {
+      [ "$(hostname)" = "$expected_hostname" ] && [ "$(id -un)" = "$expected_user" ] || {
       printf 'roundhouse: native target identity does not match configured hostname/user\n' >&2
       exit 65
     }

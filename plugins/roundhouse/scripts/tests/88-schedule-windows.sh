@@ -276,22 +276,6 @@ fleet_schedule_command "$@"'
       fail "the configured Windows sibling of this WSL host was not resolved"
     ! fleet_schedule_windows_sibling other-windows >/dev/null 2>&1 ||
       fail "the sibling resolved as a machine the inventory does not configure"
-    # A WSL entry bound to its Tailscale name resolves its sibling by that name.
-    mkdir -p "$win_root/ts-bin"
-    cat >"$win_root/ts-bin/tailscale" <<'STUB'
-#!/bin/sh
-printf '{"Self":{"DNSName":"%s"}}\n' "${TS_STUB_DNS:-wren-wsl.example.ts.net.}"
-STUB
-    chmod +x "$win_root/ts-bin/tailscale"
-    jq '.machines["test-host"] += {expected_hostname: "wren-wsl", hostname_source: "tailscale"}' \
-      "$ROUNDHOUSE_CONFIG" >"$win_root/ts-sibling.json"
-    chmod 600 "$win_root/ts-sibling.json"
-    [ "$(PATH="$win_root/ts-bin:$PATH" ROUNDHOUSE_CONFIG="$win_root/ts-sibling.json" fleet_schedule_windows_sibling |
-      jq -r '.machine')" = test-windows ] ||
-      fail "a Tailscale-bound WSL host did not resolve its Windows sibling"
-    ! TS_STUB_DNS=elsewhere.example.ts.net. PATH="$win_root/ts-bin:$PATH" ROUNDHOUSE_CONFIG="$win_root/ts-sibling.json" \
-      fleet_schedule_windows_sibling >/dev/null 2>&1 ||
-      fail "a Tailscale-bound WSL host resolved its sibling under another Tailscale name"
     jq 'del(.machines["test-windows"].wsl_interop_via)' "$ROUNDHOUSE_CONFIG" >"$win_root/no-sibling.json"
     chmod 600 "$win_root/no-sibling.json"
     win_out=$(ROUNDHOUSE_CONFIG="$win_root/no-sibling.json" fleet_schedule_native observe)

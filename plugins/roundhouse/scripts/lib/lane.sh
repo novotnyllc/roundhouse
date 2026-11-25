@@ -304,12 +304,6 @@ lane_enroll_identity_check() {
     lane_eic_answer=$(lane_remote_sh "$2" 'printf "%s\n%s\n" "$(hostname)" "$(id -un)"' </dev/null 2>/dev/null | tr -d '\r') || lane_eic_answer=
     lane_eic_host=$(sed -n 1p <<<"$lane_eic_answer")
     lane_eic_user=$(sed -n 2p <<<"$lane_eic_answer")
-    # A local entry may bind expected_hostname to another name source
-    # (hostname_source, lib/host-identity.sh); an unreadable name stays
-    # empty and is refused as unverifiable below.
-    if [ "$2" = local ]; then
-      lane_eic_host=$(host_identity_hostname "$(config_path)" "$1" </dev/null 2>/dev/null) || lane_eic_host=
-    fi
     if [ -z "$lane_eic_host" ] || [ -z "$lane_eic_user" ]; then
       lane_eic_reason=identity_unverifiable
       lane_eic_detail="$2 did not answer the identity probe"

@@ -27,21 +27,10 @@ local_plan_target() {
     printf '%s\n' "$local_plan_requested"
     return 0
   fi
-  # An entry with `hostname_source: "tailscale"` matches on this node's
-  # Tailscale machine name instead (lib/host-identity.sh); it is read only
-  # when such an entry exists, and an unreadable one matches nothing.
-  local_plan_ts=
-  if jq -e '[.machines[] | select(.transport == "local" and .hostname_source == "tailscale")] |
-      length > 0' "$local_plan_config" >/dev/null 2>&1; then
-    local_plan_ts=$(host_identity_tailscale_name 2>/dev/null) || local_plan_ts=
-  fi
-  local_plan_candidates=$(jq -r --arg hostname "$(hostname)" --arg ts "$local_plan_ts" \
-    --arg user "$(id -un)" '
+  local_plan_candidates=$(jq -r --arg hostname "$(hostname)" --arg user "$(id -un)" '
     .machines | to_entries[] |
-    select(.value.transport == "local" and .value.expected_user == $user and
-      (if (.value.hostname_source // "os") == "tailscale"
-       then $ts != "" and .value.expected_hostname == $ts
-       else .value.expected_hostname == $hostname end)) |
+    select(.value.transport == "local" and
+      .value.expected_hostname == $hostname and .value.expected_user == $user) |
     .key
   ' "$local_plan_config")
   [ "$(printf '%s\n' "$local_plan_candidates" | grep -c . || true)" -eq 1 ] || {

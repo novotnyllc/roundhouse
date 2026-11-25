@@ -863,7 +863,7 @@ fleet_readiness_command() (
       # "local" entry ships with neither field set. Requiring them here
       # would make that ordinary, common entry permanently unready.
       if [ -n "$fleet_readiness_expected_hostname" ] && [ -n "$fleet_readiness_expected_user" ] &&
-        { [ "$(host_identity_hostname "$(config_path)" "$fleet_readiness_host" 2>/dev/null)" != "$fleet_readiness_expected_hostname" ] ||
+        { [ "$(hostname)" != "$fleet_readiness_expected_hostname" ] ||
           [ "$(id -un)" != "$fleet_readiness_expected_user" ]; }; then
         fleet_readiness_row "$fleet_readiness_host" identity finding \
           'local target identity does not match configured hostname/user'
