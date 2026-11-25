@@ -1740,6 +1740,13 @@ fleet_run_codex_sync_ready() {
   # plugin from the same marketplace has no cache in CODEX_HOME, and the
   # ownership check after this guard would let it through.
   [ -d "${CODEX_HOME:-$HOME/.codex}/plugins/cache/${1##*@}/${1%@*}" ] || return 0
+  # Nor has a copy the operator DISABLED in Codex (`[plugins."ID"]` with
+  # `enabled = false` in its config): it runs no hooks, and both callers
+  # exempt it after the listing this guard skips.
+  awk -v h="[plugins.\"$1\"]" '
+    $0 == h { s = 1; next } /^\[/ { s = 0 }
+    s && /^[[:space:]]*enabled[[:space:]]*=[[:space:]]*false[[:space:]]*$/ { d = 1 }
+    END { exit !d }' "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null && return 0
   printf '  hold  plugin %s (codex) — marketplace %s did not sync this pass; skipped\n' \
     "$1" "${1##*@}"
   fleet_run_codex_sync_skipped=true

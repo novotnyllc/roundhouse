@@ -375,6 +375,16 @@ SH
           pc_status=$?
         [ "$pc_status" -eq 0 ] && case $pc_out in *'did not sync this pass'*) false ;; *) true ;; esac ||
           fail "a Claude-only plugin was held by its marketplace's Codex sync (got $pc_status): $pc_out"
+        # Nor is a copy disabled in Codex: it runs no hooks.
+        mkdir -p "$CODEX_HOME/plugins/cache/dotnet-agent-skills/off"
+        printf '[plugins."off@dotnet-agent-skills"]\nenabled = false\n\n[plugins."demo@dotnet-agent-skills"]\nenabled = true\n' \
+          >"$CODEX_HOME/config.toml"
+        for pc_check in fleet_run_approve_plugin_hooks fleet_run_codex_hooks_settled; do
+          pc_out=$(PC_CODEX_LIST_LOG=1 "$pc_check" off@dotnet-agent-skills "$pc_good_head" 2>&1) || :
+          case $pc_out in *'did not sync this pass'*)
+            fail "a plugin disabled in Codex was held by its marketplace's Codex sync in $pc_check: $pc_out" ;;
+          esac
+        done
         fleet_run_codex_sync_skipped=false
         for pc_check in fleet_run_approve_plugin_hooks fleet_run_codex_hooks_settled; do
           : >"$PC_CODEX_LOG"
