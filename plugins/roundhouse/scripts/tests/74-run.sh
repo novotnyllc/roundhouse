@@ -624,8 +624,10 @@ JSON
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
       'update example@test-market' ] ||
       fail "the stale post-update case did not enter the update ledger"
-    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
-      fail "hook approval ran before stale post-update identity was rejected"
+    # The one refresh this pass (uninstall, install) also left it stale.
+    [ "$(sed -n '2,$p' "$run_plugin_order_log" | tr '\n' ';')" = \
+      'uninstall example@test-market;install example@test-market;' ] ||
+      fail "hook approval ran before stale post-update identity was rejected, or the refresh was not tried once: $(tr '\n' ';' <"$run_plugin_order_log")"
 
     # A converged enable is not an enable operation. In particular, a locally
     # modified hook must not be laundered by the next scheduled pass merely
