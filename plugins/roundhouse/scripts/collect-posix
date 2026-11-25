@@ -2072,7 +2072,7 @@ if has_section packages; then
               "$(query_errors manager_query_failed 'brew package inventory failed')"
           fi
           query_reset
-          if casks=$(bounded_query brew list --cask --versions 2>/dev/null); then
+          if casks=$(bounded_brew_casks --versions 2>/dev/null); then
             printf '%s\n' "$casks" |
               awk 'NF >= 2 { print $1 "\t" $2 }' >"$installed_casks"
             join_package_candidates "$installed_casks" "$candidate_casks" |

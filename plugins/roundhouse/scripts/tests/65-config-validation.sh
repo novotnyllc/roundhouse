@@ -491,6 +491,26 @@ set -e
 [ "$brew_cask_failed_rc" -eq 2 ] || fail "failed brew cask query did not produce partial inventory"
 assert_contains "$(cat "$tmp/brew-cask-failed.jsonl")" '"id":"packages:homebrew-cask"'
 
+# A Homebrew with no Caskroom (a fresh Linuxbrew) has no casks: the formulae
+# are inventoried and the collection is complete, not partial.
+BREW_CASKROOM="$tmp/no-such-caskroom" "$cli" collect --target test-host --section packages \
+  --output "$tmp/brew-no-caskroom.jsonl" || fail "a Homebrew without a Caskroom failed the package inventory"
+! grep -q '"id":"packages:homebrew-cask"' "$tmp/brew-no-caskroom.jsonl" ||
+  fail "a missing Caskroom was reported as a cask inventory error"
+[ "$(jq -s 'map(select(.kind == "package" and .data.manager == "homebrew")) | length' \
+  "$tmp/brew-no-caskroom.jsonl")" -gt 0 ] || fail "a missing Caskroom dropped the formula inventory"
+[ "$(jq -s 'map(select(.kind == "package" and .data.manager == "homebrew-cask")) | length' \
+  "$tmp/brew-no-caskroom.jsonl")" -eq 0 ] || fail "a missing Caskroom produced cask records"
+# With a Caskroom present, a failing cask listing still surfaces.
+mkdir -p "$tmp/caskroom"
+set +e
+BREW_CASKROOM="$tmp/caskroom" BREW_CASK_FAIL=1 "$cli" collect --target test-host --section packages \
+  --output "$tmp/brew-cask-failed-room.jsonl"
+brew_cask_failed_rc=$?
+set -e
+[ "$brew_cask_failed_rc" -eq 2 ] && grep -q '"id":"packages:homebrew-cask"' "$tmp/brew-cask-failed-room.jsonl" ||
+  fail "a cask listing failure with a Caskroom present was not reported (rc $brew_cask_failed_rc)"
+
 "$cli" collect --target test-apt --section packages --output "$tmp/apt.jsonl"
 "$cli" validate "$tmp/apt.jsonl"
 [ "$(jq -r 'select(.id == "apt:native-qualified:amd64") | .data.candidate_version' \

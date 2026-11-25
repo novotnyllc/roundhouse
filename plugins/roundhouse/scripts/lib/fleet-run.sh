@@ -2538,7 +2538,7 @@ fleet_run_brew_current() {
     # names a tap formula in full while `brew list` and a definition may not.
     if command -v brew >/dev/null 2>&1 &&
       bounded_query brew list --formula -1 >"$fleet_run_apply_ctx/brew.formulae" 2>/dev/null </dev/null &&
-      bounded_query brew list --cask -1 >"$fleet_run_apply_ctx/brew.casks" 2>/dev/null </dev/null &&
+      bounded_brew_casks -1 >"$fleet_run_apply_ctx/brew.casks" 2>/dev/null </dev/null &&
       bounded_query brew outdated --json=v2 \
         >"$fleet_run_apply_ctx/brew.outdated.json" 2>/dev/null </dev/null &&
       jq -r '(.formulae, .casks) | arrays | .[].name | strings | ., (split("/") | last)' \
@@ -4961,7 +4961,7 @@ EOF
   # formula) still gets its own call, so one unresolvable name cannot abort
   # the upgrade of the rest. Failures are ignored here exactly as they were.
   if [ -s "$full_pkg_tmp/brew" ] && command -v brew >/dev/null 2>&1; then
-    { bounded_query brew list --formula -1 2>/dev/null; bounded_query brew list --cask -1 2>/dev/null; } </dev/null \
+    { bounded_query brew list --formula -1 2>/dev/null; bounded_brew_casks -1 2>/dev/null; } </dev/null \
       >"$full_pkg_tmp/brew.installed" || :
     : >"$full_pkg_tmp/brew.batch"
     : >"$full_pkg_tmp/brew.single"
