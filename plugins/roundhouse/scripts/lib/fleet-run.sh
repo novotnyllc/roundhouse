@@ -1754,14 +1754,50 @@ fleet_run_codex_sync_ready() {
 }
 
 fleet_run_codex_hooks_scoped() {
-  # fleet_run_codex_hooks_scoped ID STATUS — the Codex hook step of a Claude
-  # plugin item exited STATUS. A refusal (75) is Codex's alone: nothing was
-  # trusted, Codex keeps the hooks unapproved (it does not run them), and the
-  # reason is already in the log. It is logged as a hold of the Codex hooks,
-  # not of the Claude plugin, which IS applied; the next pass asks again.
-  # A transient failure (74) still holds the item, so the pass retries.
-  [ "$2" -eq 75 ] || return "$2"
+  # fleet_run_codex_hooks_scoped ID STATUS SHA — the Codex hook step of the
+  # Claude plugin item being applied exited STATUS. A refusal (75) is Codex's
+  # alone: nothing was trusted, Codex keeps the hooks unapproved (it does not
+  # run them), and the reason is already in the log. It is logged as a hold
+  # of the Codex hooks, not of the Claude plugin, which IS applied — and it
+  # is remembered as owed, because an applied item whose Claude identity
+  # still matches is skipped on later passes: fleet_run_codex_hooks_retry
+  # asks again for it every pass until Codex's hooks settle. A transient
+  # failure (74) still holds the item, so the pass retries it whole.
+  fleet_run_cxo=$(fleet_run_codex_hooks_owed_path "${fleet_run_apply_item_name:-$1}")
+  case $2 in
+    0) rm -f "$fleet_run_cxo"; return 0 ;;
+    75) ;;
+    *) return "$2" ;;
+  esac
   printf '  hold  Codex hooks for %s (codex) — not approved (reason above); the Claude plugin is applied\n' "$1"
+  mkdir -p "${fleet_run_cxo%/*}" 2>/dev/null &&
+    printf '%s %s\n' "$1" "${3:-}" >"$fleet_run_cxo" 2>/dev/null || :
+  return 0
+}
+
+fleet_run_codex_hooks_owed_path() {
+  printf '%s/codex-hooks-owed/%s\n' "$(fleet_run_state_dir)" "$(printf '%s' "$1" | tr '/' '_')"
+}
+
+fleet_run_codex_hooks_retry() {
+  # fleet_run_codex_hooks_retry ITEM — ITEM's Claude plugin is applied and
+  # unchanged, so the run skips it; if its Codex hooks are still owed (a
+  # refusal fleet_run_codex_hooks_scoped recorded), ask Codex again,
+  # read-only until it finds work, exactly as a steady-state apply does.
+  # Settled clears the debt; anything else is logged and kept. Never fails:
+  # the Claude item is not held for Codex's part.
+  fleet_run_cxr=$(fleet_run_codex_hooks_owed_path "$1")
+  [ -f "$fleet_run_cxr" ] || return 0
+  read -r fleet_run_cxr_id fleet_run_cxr_sha <"$fleet_run_cxr" || return 0
+  case $fleet_run_cxr_id in *@*) ;; *) rm -f "$fleet_run_cxr"; return 0 ;; esac
+  fleet_run_cxr_status=0
+  fleet_run_codex_hooks_settled "$fleet_run_cxr_id" "${fleet_run_cxr_sha:-}" ||
+    fleet_run_cxr_status=$?
+  case $fleet_run_cxr_status in
+    0) rm -f "$fleet_run_cxr" ;;
+    75) printf '  hold  Codex hooks for %s (codex) — not approved (reason above); the Claude plugin is applied\n' "$fleet_run_cxr_id" ;;
+    *) printf '  hold  Codex hooks for %s (codex) — could not be checked this pass; the next pass retries\n' "$fleet_run_cxr_id" ;;
+  esac
   return 0
 }
 
@@ -2546,6 +2582,7 @@ fleet_run_apply_item() {
   # STATE (optional) is fleet_run_state_of VALUE when the caller already has
   # it — the run loop reads it from its plan.
   fleet_run_codex_sync_skipped=false
+  fleet_run_apply_item_name=$4
   fleet_item_split_set "$4" || return 70
   fleet_run_category=$fleet_item_category
   fleet_run_name=$fleet_item_name
@@ -2732,9 +2769,11 @@ EOF
             fleet_run_plugin_at_identity "$fleet_run_reverified" || return 74
           fi
           if [ "$fleet_run_want_enabled" = true ]; then
+            fleet_run_cxs=0
             fleet_run_approve_plugin_hooks "$fleet_run_id" \
-              "$fleet_run_resolved_sha" refresh ||
-              fleet_run_codex_hooks_scoped "$fleet_run_id" $? || return $?
+              "$fleet_run_resolved_sha" refresh || fleet_run_cxs=$?
+            fleet_run_codex_hooks_scoped "$fleet_run_id" "$fleet_run_cxs" \
+              "$fleet_run_resolved_sha" || return $?
           fi
           fleet_run_plugin_mutated=true
         else
@@ -2751,8 +2790,9 @@ EOF
         # As above: seal what the manager wrote before approving its hooks.
         plugin_cache_seal_permissions "$fleet_run_id" || return 75
         if [ "$fleet_run_want_enabled" = true ]; then
-          fleet_run_approve_plugin_hooks "$fleet_run_id" ||
-            fleet_run_codex_hooks_scoped "$fleet_run_id" $? || return $?
+          fleet_run_cxs=0
+          fleet_run_approve_plugin_hooks "$fleet_run_id" || fleet_run_cxs=$?
+          fleet_run_codex_hooks_scoped "$fleet_run_id" "$fleet_run_cxs" '' || return $?
         fi
         fleet_run_plugin_mutated=true
       fi
@@ -2796,9 +2836,11 @@ EOF
       if [ "$fleet_run_want_enabled" = true ] &&
         [ "$fleet_run_enable_attempted" = true ] &&
         [ "$fleet_run_actual_enabled" = true ]; then
+        fleet_run_cxs=0
         fleet_run_approve_plugin_hooks "$fleet_run_id" \
-          "${fleet_run_resolved_sha:-}" ||
-          fleet_run_codex_hooks_scoped "$fleet_run_id" $? || return $?
+          "${fleet_run_resolved_sha:-}" || fleet_run_cxs=$?
+        fleet_run_codex_hooks_scoped "$fleet_run_id" "$fleet_run_cxs" \
+          "${fleet_run_resolved_sha:-}" || return $?
       fi
       # Steady state (nothing installed, updated or enabled this pass): an
       # approval an earlier pass could not make — Codex had not synced yet —
@@ -2806,8 +2848,11 @@ EOF
       # untrusted for good (fleet_run_codex_hooks_settled).
       if [ "$fleet_run_want_enabled" = true ] && [ "$fleet_run_actual_enabled" = true ] &&
         [ "$fleet_run_plugin_mutated" != true ] && [ "$fleet_run_enable_attempted" != true ]; then
+        fleet_run_cxs=0
         fleet_run_codex_hooks_settled "$fleet_run_id" "${fleet_run_resolved_sha:-}" ||
-          fleet_run_codex_hooks_scoped "$fleet_run_id" $? || return $?
+          fleet_run_cxs=$?
+        fleet_run_codex_hooks_scoped "$fleet_run_id" "$fleet_run_cxs" \
+          "${fleet_run_resolved_sha:-}" || return $?
       fi
       ;;
     skills)
@@ -3856,7 +3901,12 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         run_action_memo="$run_action_memo$run_in_applied$run_match=$run_action|"
         ;;
     esac
-    [ "$run_action" != nothing ] || continue
+    if [ "$run_action" = nothing ]; then
+      # Applied and unchanged; a Codex hook approval it still owes is asked
+      # for again here (fleet_run_codex_hooks_scoped).
+      [ "$run_category" != plugins ] || fleet_run_codex_hooks_retry "$run_item"
+      continue
+    fi
 
     # §10.8: a revert restores a value this host already passed before, so a
     # verdict keyed on (item, digest) alone matches a stale pass. Re-review is

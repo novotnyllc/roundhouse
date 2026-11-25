@@ -1019,6 +1019,26 @@ SH
       fail "a Codex copy at another revision was reinstalled or had trust written (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
     grep -q "Codex has not synced to $pc_sha_b yet; the next pass retries" "$pc/hooks-err" ||
       fail "the hold did not say Codex has not synced yet: $(tr '\n' ';' <"$pc/hooks-err")"
+    # The Claude item is applied, so later passes skip it while its identity
+    # matches: the Codex debt is remembered and asked for again every pass
+    # (fleet_run_codex_hooks_retry) until Codex's hooks settle.
+    pc_owed=$(fleet_run_codex_hooks_owed_path plugins.widget)
+    [ "$(cat "$pc_owed" 2>/dev/null)" = "widget@m $pc_sha_b" ] ||
+      fail "a scoped Codex hook refusal was not remembered as owed: $(cat "$pc_owed" 2>/dev/null)"
+    (
+      fleet_run_codex_hooks_settled() { printf '%s %s\n' "$1" "$2" >>"$pc/settled-calls"; return 75; }
+      : >"$pc/settled-calls"
+      pc_out=$(fleet_run_codex_hooks_retry plugins.widget) || fail "the Codex retry failed the item"
+      [ "$(cat "$pc/settled-calls")" = "widget@m $pc_sha_b" ] && [ -f "$pc_owed" ] &&
+        printf '%s\n' "$pc_out" | grep -q '^  hold  Codex hooks for widget@m (codex)' ||
+        fail "a still-refused Codex retry was not asked, kept and logged: $pc_out"
+      fleet_run_codex_hooks_settled() { printf '%s\n' settled >>"$pc/settled-calls"; return 0; }
+      fleet_run_codex_hooks_retry plugins.widget >/dev/null
+      [ ! -e "$pc_owed" ] || fail "a settled Codex retry kept its debt"
+      : >"$pc/settled-calls"
+      fleet_run_codex_hooks_retry plugins.widget >/dev/null
+      [ ! -s "$pc/settled-calls" ] || fail "a plugin that owes Codex nothing was asked again"
+    ) || exit 1
     # Codex already at the expected bytes, hooks unchanged upstream: the copy
     # is left alone (no reinstall) and approval passes as it is.
     pc_hooks_reset
