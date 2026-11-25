@@ -27,6 +27,80 @@ if [ -n "$fleet_fixture_yq" ]; then
     export ROUNDHOUSE_FLEET_STORE HOME
     mkdir -p "$HOME"
 
+    # Failed cask installs leave empty directories, but a fresh directory or
+    # one still holding files belongs to its installer. The pass's EXIT trap
+    # must reap them even when the fast poll floor skips convergence.
+    (
+      # The cleanup sees the fixture platform rather than this runner's OS.
+      uname() { printf 'Darwin\n'; }
+      HOMEBREW_TEMP="$run_root/cask-default"
+      ROUNDHOUSE_TEST_CASK_TEMP="$run_root/cask-test"
+      export HOMEBREW_TEMP ROUNDHOUSE_TEST_CASK_TEMP
+      mkdir -p "$HOMEBREW_TEMP/cask-old" \
+        "$ROUNDHOUSE_TEST_CASK_TEMP/cask-old" \
+        "$ROUNDHOUSE_TEST_CASK_TEMP/cask-fresh" \
+        "$ROUNDHOUSE_TEST_CASK_TEMP/cask-busy" \
+        "$ROUNDHOUSE_TEST_CASK_TEMP/other-old" \
+        "$ROUNDHOUSE_TEST_CASK_TEMP/parent/cask-nested"
+      printf 'in use\n' >"$ROUNDHOUSE_TEST_CASK_TEMP/cask-busy/file"
+      touch -t 200001010000 "$HOMEBREW_TEMP/cask-old" \
+        "$ROUNDHOUSE_TEST_CASK_TEMP/cask-old" \
+        "$ROUNDHOUSE_TEST_CASK_TEMP/cask-busy" \
+        "$ROUNDHOUSE_TEST_CASK_TEMP/other-old" \
+        "$ROUNDHOUSE_TEST_CASK_TEMP/parent/cask-nested"
+      run_cask_out=$(ROUNDHOUSE_SELFTEST=0 fleet_run_reap_cask_temp 2>&1) ||
+        fail "cask cleanup failed without the test hook"
+      [ -z "$run_cask_out" ] && [ ! -d "$HOMEBREW_TEMP/cask-old" ] &&
+        [ -d "$ROUNDHOUSE_TEST_CASK_TEMP/cask-old" ] ||
+        fail "cask cleanup used a test override outside the self-check or printed output"
+      touch -t 200001010000 "$HOMEBREW_TEMP"
+      ROUNDHOUSE_SELFTEST=0 fleet_run_reap_cask_temp
+      [ -d "$HOMEBREW_TEMP" ] || fail "cask cleanup removed its old empty cask-* root"
+      # macOS's /tmp is itself a symlink. Follow the root, but keep links
+      # below it untouched rather than treating them as temp directories.
+      mkdir -p "$run_root/cask-link-target"
+      touch -t 200001010000 "$run_root/cask-link-target"
+      ln -s "$run_root/cask-link-target" "$ROUNDHOUSE_TEST_CASK_TEMP/cask-link"
+      ln -s "$ROUNDHOUSE_TEST_CASK_TEMP" "$run_root/cask-root-link"
+      ROUNDHOUSE_TEST_CASK_TEMP="$run_root/cask-root-link"
+      run_cask_out=$(ROUNDHOUSE_SELFTEST=1 fleet_run_reap_cask_temp 2>&1) ||
+        fail "cask cleanup failed"
+      [ -z "$run_cask_out" ] && [ ! -d "$ROUNDHOUSE_TEST_CASK_TEMP/cask-old" ] ||
+        fail "cask cleanup left an old empty directory or printed output"
+      [ -L "$ROUNDHOUSE_TEST_CASK_TEMP/cask-link" ] &&
+        [ -d "$run_root/cask-link-target" ] ||
+        fail "cask cleanup followed a symlink below its root"
+      for run_cask_keep in cask-fresh cask-busy other-old parent/cask-nested; do
+        [ -d "$ROUNDHOUSE_TEST_CASK_TEMP/$run_cask_keep" ] ||
+          fail "cask cleanup removed $run_cask_keep"
+      done
+      [ "$(cat "$ROUNDHOUSE_TEST_CASK_TEMP/cask-busy/file")" = 'in use' ] ||
+        fail "cask cleanup changed a non-empty directory"
+      mkdir -p "$ROUNDHOUSE_TEST_CASK_TEMP/cask-linux"
+      touch -t 200001010000 "$ROUNDHOUSE_TEST_CASK_TEMP/cask-linux"
+      uname() { printf 'Linux\n'; }
+      # Its presence is the Linuxbrew gate; cleanup must not invoke brew.
+      brew() { :; }
+      ROUNDHOUSE_SELFTEST=1 fleet_run_reap_cask_temp
+      [ ! -d "$ROUNDHOUSE_TEST_CASK_TEMP/cask-linux" ] ||
+        fail "cask cleanup skipped a Linuxbrew host"
+      mkdir -p "$ROUNDHOUSE_TEST_CASK_TEMP/cask-unsupported"
+      touch -t 200001010000 "$ROUNDHOUSE_TEST_CASK_TEMP/cask-unsupported"
+      uname() { printf 'Windows_NT\n'; }
+      ROUNDHOUSE_SELFTEST=1 fleet_run_reap_cask_temp
+      [ -d "$ROUNDHOUSE_TEST_CASK_TEMP/cask-unsupported" ] ||
+        fail "cask cleanup acted on an unsupported platform"
+      uname() { printf 'Darwin\n'; }
+      # A filesystem failure is deliberately best-effort maintenance.
+      find() { return 42; }
+      run_cask_out=$(ROUNDHOUSE_SELFTEST=1 fleet_run_reap_cask_temp 2>&1) ||
+        fail "a failed cask cleanup failed the pass"
+      [ -z "$run_cask_out" ] || fail "a failed cask cleanup printed output"
+    )
+    cli_function_body fleet_run_pass |
+      grep -q 'fleet_run_reap_cask_temp.*EXIT' ||
+      fail "the pass EXIT trap does not reap cask temp directories on every exit"
+
     # --- which held applies keep the poll floor open (retry-owed) ---
     # The apply names the kind: a transient hold (74, a bounded manager verb
     # that failed or timed out), a tombstone's holds (a live-session deferral

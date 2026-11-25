@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "96819bd3fa9a02340c5b1db7b187e94a6513b3c2685a0a91d2079713e60d4739"
+      "sha256": "18103355b9f502f201e7189de39a2c8b69089755efdddae2f37210fd8f422c04"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -166,7 +166,7 @@
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
-      "sha256": "62a8c14e4089ce447ee67f6cb35aa9905e9027d3c96500674b4b93188fa22176"
+      "sha256": "29740cc8babbd74e3f1147219685cf96300fc1bf1e236ce4310d98455a9f9ec1"
     },
     {
       "path": "scripts/lib/fleet-store.sh",
