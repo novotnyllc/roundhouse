@@ -4400,6 +4400,16 @@ fleet_run_plugin_reinstall() {
   # the list). Enabled state is re-converged by the caller's state verbs.
   case " ${fleet_run_plugin_refreshed:-} " in *" $1 "*) return 1 ;; esac
   fleet_run_plugin_refreshed="${fleet_run_plugin_refreshed:-} $1"
+  # The uninstall removes the files a running session uses (the tombstone
+  # path defers for the same reason): only with no session, and a probe that
+  # could not answer counts as one.
+  fleet_run_refresh_live=0
+  fleet_run_claude_running || fleet_run_refresh_live=$?
+  if [ "$fleet_run_refresh_live" -ne 1 ]; then
+    printf 'roundhouse: claude plugin update left %s at %s, not %s; not reinstalling while a claude session may be running; the next pass retries\n' \
+      "$1" "$2" "$fleet_run_resolved_sha" >&2
+    return 1
+  fi
   printf 'roundhouse: claude plugin update left %s at %s, not %s; reinstalling it once this pass\n' \
     "$1" "$2" "$fleet_run_resolved_sha" >&2
   fleet_run_cli_invalidate

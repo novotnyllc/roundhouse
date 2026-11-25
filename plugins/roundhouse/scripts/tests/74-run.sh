@@ -541,6 +541,24 @@ JSON
     printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
     : >"$run_plugin_order_log"
     fleet_run_marketplace_repair_reset
+    run_saved_running=$(declare -f fleet_run_claude_running)
+    # A live (or unknowable) Claude session defers the refresh: no uninstall.
+    for run_live in 0 75; do
+      eval "fleet_run_claude_running() { return $run_live; }"
+      run_status=0
+      CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+        CLAUDE_CONFIG_DIR="$HOME/.claude" \
+        CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+        CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+          '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
+      [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" &&
+        grep -q 'not reinstalling while a claude session may be running' "$run_root/refresh-err" ||
+        fail "a plugin refresh did not defer for a live session (probe $run_live, got $run_status): $(tr '\n' ';' <"$run_plugin_order_log")"
+      fleet_run_marketplace_repair_reset
+      : >"$run_plugin_order_log"
+    done
+    fleet_run_claude_running() { return 1; }
     run_status=0
     CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
@@ -570,6 +588,7 @@ JSON
     fleet_run_marketplace_repair_reset
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
     : >"$run_plugin_order_log"
+    eval "$run_saved_running"
 
     # A native manager may persist the enabled state and then report a
     # nonzero exit. The verified post-state must still trigger approval and
