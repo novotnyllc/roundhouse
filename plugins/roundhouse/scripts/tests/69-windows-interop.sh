@@ -127,7 +127,7 @@ SH
   export ROUNDHOUSE_INTEROP_PWSH="$interop_drive/Program Files/PowerShell/7/pwsh.exe"
   interop_stage_clean() {
     [ -z "$(ls -A "$tmp/interop-windows-temp")" ] ||
-      fail "interop staging directory was not removed: $1"
+      fail "interop staging directory was not removed: $1: $(cd "$tmp/interop-windows-temp" && ls -lAR | tr '\n' ';')"
   }
 
   # Collect: the installed, integrity-verified executor in the "Windows"
