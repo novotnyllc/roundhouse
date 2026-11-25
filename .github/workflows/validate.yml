@@ -11,7 +11,8 @@ permissions:
 jobs:
   actionlint:
     timeout-minutes: 5
-    runs-on: ubuntu-latest
+    # Pinned until roundhouse trusted-path checks support the 26.04 coreutils layout.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Lint GitHub Actions workflows
@@ -23,7 +24,7 @@ jobs:
   posix:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
     timeout-minutes: 10
     runs-on: ${{ matrix.os }}
     steps:
@@ -125,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
         fixture: ${{ fromJSON(needs.select.outputs.helpers) }}
     runs-on: ${{ matrix.os }}
     steps:
@@ -173,7 +174,7 @@ jobs:
   # the account's macOS runner concurrency, not the tests, set the wall clock:
   # PR runs queued in waves for 13-16 minutes.
   select:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       only: ${{ steps.pick.outputs.only }}
@@ -254,7 +255,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
         shard: ${{ fromJSON(needs.select.outputs.shards) }}
     runs-on: ${{ matrix.os }}
     steps:
@@ -422,7 +423,7 @@ jobs:
     needs: [actionlint, posix, helpers, select, sections, windows]
     if: always()
     timeout-minutes: 5
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: All required jobs succeeded
         shell: bash
