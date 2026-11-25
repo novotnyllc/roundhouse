@@ -1066,7 +1066,8 @@ SH
     ln -s "$pc/claude-cache-real" "$pc_claude_cache"
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    pc_codex_held ||
+    # A Claude-side hold (the seal), not a Codex one: the item itself holds.
+    [ "$pc_status" -eq 75 ] ||
       fail "an update into a symlinked cache root did not hold (got $pc_status)"
     grep -q 'is a symlink, not a directory, or owned by another user' "$pc/hooks-err" ||
       fail "the symlinked cache root hold did not say why: $(tr '\n' ';' <"$pc/hooks-err")"
