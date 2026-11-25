@@ -162,7 +162,7 @@
     },
     {
       "path": "scripts/lib/fleet-schedule-windows.sh",
-      "sha256": "fc5ec75015722421fb72381d9e7732643347ec982562ea8e68876d2f194c7cf8"
+      "sha256": "2ef187761558f6eb57b0e435f586aea51252d1406d469d4f5849888e8da51f60"
     },
     {
       "path": "scripts/lib/fleet-schedule.sh",
