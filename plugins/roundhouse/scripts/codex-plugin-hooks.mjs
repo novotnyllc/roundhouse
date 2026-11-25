@@ -103,9 +103,19 @@ function terminateCodexChild(child) {
   killer.once("error", () => child.kill());
 }
 
-function hookKeyPath(key) {
+function hookKeyPath(key, field = "trusted_hash") {
   const escaped = key.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
-  return `hooks.state."${escaped}".trusted_hash`;
+  return `hooks.state."${escaped}".${field}`;
+}
+
+// Codex stores a compound hash `sha256:<command>/sha256:<script>` as two
+// fields, trusted_hash and trusted_content_hash (what its own approval
+// writes). The whole string in trusted_hash reads back as `modified`.
+function trustEdits(hook) {
+  const [command, content] = hook.currentHash.split("/");
+  const edits = [{ keyPath: hookKeyPath(hook.key), value: command, mergeStrategy: "replace" }];
+  if (content) edits.push({ keyPath: hookKeyPath(hook.key, "trusted_content_hash"), value: content, mergeStrategy: "replace" });
+  return edits;
 }
 
 class AppServer {
@@ -226,12 +236,12 @@ function validateHooks(result, cwd, pluginId) {
 
 // A hook's hash is `sha256:...`, or, for a command hook that runs a script
 // from its plugin, Codex's compound `sha256:<command>/sha256:<script>` (0.171
-// and 0.172 both report impeccable's hooks that way). Bound each part and
-// the count; the value is only ever copied back into trust, never parsed.
+// and 0.172 both report impeccable's hooks that way). Each part is bounded,
+// and only the two-part shape Codex stores (trustEdits) is accepted.
 function validHookHash(hash) {
-  if (typeof hash !== "string" || hash.length > 2048) return false;
+  if (typeof hash !== "string") return false;
   const parts = hash.split("/");
-  return parts.length <= 16 && parts.every((part) => part.startsWith("sha256:") && part.length > 7 && part.length <= 128);
+  return parts.length <= 2 && parts.every((part) => part.startsWith("sha256:") && part.length > 7 && part.length <= 128);
 }
 
 function matchingPluginHooks(hooks, pluginId) {
@@ -278,9 +288,7 @@ async function writeTrust(pluginId, cwd, wanted, codexExecutable) {
     const current = new Map(matchingPluginHooks(hooks, pluginId).map((hook) => [hook.key, hook]));
     const edits = wanted.flatMap((key) => {
       const hook = current.get(key);
-      return hook
-        ? [{ keyPath: hookKeyPath(key), value: hook.currentHash, mergeStrategy: "replace" }]
-        : [];
+      return hook ? trustEdits(hook) : [];
     });
     if (edits.length) {
       await server.request("config/batchWrite", {
@@ -809,7 +817,7 @@ async function main() {
       // A sub-second window remains between this last check and the write;
       // closing it would need a lock on Codex itself, which no Codex API offers.
       await server.request("config/batchWrite", {
-        edits: hooks.map((hook) => ({ keyPath: hookKeyPath(hook.key), value: hook.currentHash, mergeStrategy: "replace" })),
+        edits: hooks.flatMap(trustEdits),
         filePath: null,
         expectedVersion: null,
         reloadUserConfig: true,

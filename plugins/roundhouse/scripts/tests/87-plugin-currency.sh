@@ -905,7 +905,9 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
         fi
         ;;
       config/batchWrite)
-        printf '%s\n' "$req" | jq -r '.params.edits[0].value' >"$st/trusted"
+        # Codex keeps a compound hash as trusted_hash + trusted_content_hash.
+        printf '%s\n' "$req" | jq -r '[.params.edits[].value] | join("/")' >"$st/trusted"
+        printf '%s\n' "$req" | jq -r '[.params.edits[].keyPath | split(".") | last] | join(" ")' >"$st/trusted-fields"
         printf 'trust %s\n' "$(cat "$st/trusted")" >>"$st/log"
         jq -cn --argjson id "$id" '{id:$id,result:{}}'
         ;;
@@ -1096,8 +1098,9 @@ SH
     (cd "$pc" && CODEX_HOME="$pc/codex-home" PATH="$pc/hooks-bin:$PATH" \
       PC_HOOKS_STATE="$pc/hooks-state" node "$script_dir/codex-plugin-hooks.mjs" \
       approve widget@m >/dev/null 2>"$pc/hooks-err") || pc_status=$?
-    [ "$pc_status" -eq 0 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:new/sha256:script-new ] ||
-      fail "a compound hook hash was not approved as is (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    [ "$pc_status" -eq 0 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:new/sha256:script-new ] &&
+      [ "$(cat "$pc/hooks-state/trusted-fields")" = 'trusted_hash trusted_content_hash' ] ||
+      fail "a compound hook hash was not approved as Codex stores it (got $pc_status): $(cat "$pc/hooks-state/trusted-fields" 2>/dev/null) $(tr '\n' ';' <"$pc/hooks-err")"
     rm -f "$pc/hooks-state/compound"
     # ...and an entry it cannot tighten (immutable) is a STANDING refusal (75),
     # not a transient one every fast pass would retry. chflags is macOS/BSD.
