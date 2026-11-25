@@ -126,7 +126,11 @@ SH
   export ROUNDHOUSE_INTEROP_ROOT="$interop_drive"
   export ROUNDHOUSE_INTEROP_PWSH="$interop_drive/Program Files/PowerShell/7/pwsh.exe"
   interop_stage_clean() {
-    [ -z "$(ls -A "$tmp/interop-windows-temp")" ] ||
+    # The real pwsh runs with this as its TMPDIR, and the .NET runtime keeps
+    # its own cross-process state there (`.dotnet/lockfiles`, `.dotnet/shm`,
+    # created by .NET on macOS 26 runners). That is the runtime's, not a
+    # roundhouse staging directory; everything else must be gone.
+    [ -z "$(ls -A "$tmp/interop-windows-temp" | grep -vxF .dotnet)" ] ||
       fail "interop staging directory was not removed: $1: $(cd "$tmp/interop-windows-temp" && ls -lAR | tr '\n' ';')"
   }
 
