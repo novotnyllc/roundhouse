@@ -1729,32 +1729,6 @@ fleet_run_plugin_enabled() {
   printf '%s\n' "$fleet_run_plugin_state"
 }
 
-fleet_run_plugin_at_identity() {
-  # fleet_run_plugin_at_identity RECORD — the installed record is at the
-  # resolved catalog identity (fleet_run_resolved_sha/_version).
-  [ "$(printf '%s\n' "$1" | jq -r '.gitCommitSha // empty')" = "$fleet_run_resolved_sha" ] &&
-    { [ -z "$fleet_run_resolved_version" ] ||
-      [ "$(printf '%s\n' "$1" | jq -r '.version // empty')" = "$fleet_run_resolved_version" ]; }
-}
-
-fleet_run_plugin_reinstall() {
-  # fleet_run_plugin_reinstall ID HAVE — the Claude CLI has no forced
-  # reinstall: uninstall (keeping the plugin's data) and install again. At
-  # most once per plugin per pass (fleet_run_marketplace_repair_reset clears
-  # the list). Enabled state is re-converged by the caller's state verbs.
-  case " ${fleet_run_plugin_refreshed:-} " in *" $1 "*) return 1 ;; esac
-  fleet_run_plugin_refreshed="${fleet_run_plugin_refreshed:-} $1"
-  printf 'roundhouse: claude plugin update left %s at %s, not %s; reinstalling it once this pass\n' \
-    "$1" "$2" "$fleet_run_resolved_sha" >&2
-  fleet_run_cli_invalidate
-  bounded_verb claude plugin uninstall --scope user --keep-data "$1" >/dev/null 2>&1 || return 1
-  fleet_run_cli_invalidate
-  bounded_verb claude plugin install "$1" --scope user >/dev/null 2>&1 || {
-    printf 'roundhouse: reinstalling %s failed after its uninstall; the next pass installs it\n' "$1" >&2
-    return 1
-  }
-}
-
 fleet_run_approve_plugin_hooks() {
   # The DSC plugin item is a Claude manager operation, but the hook trust state
   # is Codex-local. Qualified marketplace IDs are the shared seam accepted by
@@ -4363,6 +4337,32 @@ fleet_run_hold_owes_retry() {
   # waits, not inabilities.
   [ "$1" = 75 ] || return 0
   [ "$2" = true ]
+}
+
+fleet_run_plugin_at_identity() {
+  # fleet_run_plugin_at_identity RECORD — the installed record is at the
+  # resolved catalog identity (fleet_run_resolved_sha/_version).
+  [ "$(printf '%s\n' "$1" | jq -r '.gitCommitSha // empty')" = "$fleet_run_resolved_sha" ] &&
+    { [ -z "$fleet_run_resolved_version" ] ||
+      [ "$(printf '%s\n' "$1" | jq -r '.version // empty')" = "$fleet_run_resolved_version" ]; }
+}
+
+fleet_run_plugin_reinstall() {
+  # fleet_run_plugin_reinstall ID HAVE — the Claude CLI has no forced
+  # reinstall: uninstall (keeping the plugin's data) and install again. At
+  # most once per plugin per pass (fleet_run_marketplace_repair_reset clears
+  # the list). Enabled state is re-converged by the caller's state verbs.
+  case " ${fleet_run_plugin_refreshed:-} " in *" $1 "*) return 1 ;; esac
+  fleet_run_plugin_refreshed="${fleet_run_plugin_refreshed:-} $1"
+  printf 'roundhouse: claude plugin update left %s at %s, not %s; reinstalling it once this pass\n' \
+    "$1" "$2" "$fleet_run_resolved_sha" >&2
+  fleet_run_cli_invalidate
+  bounded_verb claude plugin uninstall --scope user --keep-data "$1" >/dev/null 2>&1 || return 1
+  fleet_run_cli_invalidate
+  bounded_verb claude plugin install "$1" --scope user >/dev/null 2>&1 || {
+    printf 'roundhouse: reinstalling %s failed after its uninstall; the next pass installs it\n' "$1" >&2
+    return 1
+  }
 }
 
 fleet_run_apply_held() {
