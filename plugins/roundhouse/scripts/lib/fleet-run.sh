@@ -1729,6 +1729,32 @@ fleet_run_plugin_enabled() {
   printf '%s\n' "$fleet_run_plugin_state"
 }
 
+fleet_run_plugin_at_identity() {
+  # fleet_run_plugin_at_identity RECORD — the installed record is at the
+  # resolved catalog identity (fleet_run_resolved_sha/_version).
+  [ "$(printf '%s\n' "$1" | jq -r '.gitCommitSha // empty')" = "$fleet_run_resolved_sha" ] &&
+    { [ -z "$fleet_run_resolved_version" ] ||
+      [ "$(printf '%s\n' "$1" | jq -r '.version // empty')" = "$fleet_run_resolved_version" ]; }
+}
+
+fleet_run_plugin_reinstall() {
+  # fleet_run_plugin_reinstall ID HAVE — the Claude CLI has no forced
+  # reinstall: uninstall (keeping the plugin's data) and install again. At
+  # most once per plugin per pass (fleet_run_marketplace_repair_reset clears
+  # the list). Enabled state is re-converged by the caller's state verbs.
+  case " ${fleet_run_plugin_refreshed:-} " in *" $1 "*) return 1 ;; esac
+  fleet_run_plugin_refreshed="${fleet_run_plugin_refreshed:-} $1"
+  printf 'roundhouse: claude plugin update left %s at %s, not %s; reinstalling it once this pass\n' \
+    "$1" "$2" "$fleet_run_resolved_sha" >&2
+  fleet_run_cli_invalidate
+  bounded_verb claude plugin uninstall --scope user --keep-data "$1" >/dev/null 2>&1 || return 1
+  fleet_run_cli_invalidate
+  bounded_verb claude plugin install "$1" --scope user >/dev/null 2>&1 || {
+    printf 'roundhouse: reinstalling %s failed after its uninstall; the next pass installs it\n' "$1" >&2
+    return 1
+  }
+}
+
 fleet_run_approve_plugin_hooks() {
   # The DSC plugin item is a Claude manager operation, but the hook trust state
   # is Codex-local. Qualified marketplace IDs are the shared seam accepted by
@@ -2654,11 +2680,18 @@ EOF
           # install, a race against a catalog refresh) must not journal as
           # applied on stale bytes.
           fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 74
-          [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // empty')" \
-            = "$fleet_run_resolved_sha" ] &&
-            { [ -z "$fleet_run_resolved_version" ] ||
-              [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
-                = "$fleet_run_resolved_version" ]; } || return 74
+          if ! fleet_run_plugin_at_identity "$fleet_run_reverified"; then
+            # `claude plugin update` exits 0 without reinstalling when the
+            # version did not change, even though the bytes did (a relative
+            # source whose checkout moved: last30days at 4.6.0). Refresh it
+            # for real once this pass, then hold if it is still not there.
+            [ -n "$fleet_run_installed_sha" ] || return 74
+            fleet_run_plugin_reinstall "$fleet_run_id" \
+              "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // "none"')" || return 74
+            plugin_cache_seal_permissions "$fleet_run_id" || return 75
+            fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 74
+            fleet_run_plugin_at_identity "$fleet_run_reverified" || return 74
+          fi
           if [ "$fleet_run_want_enabled" = true ]; then
             fleet_run_approve_plugin_hooks "$fleet_run_id" \
               "$fleet_run_resolved_sha" refresh || return $?

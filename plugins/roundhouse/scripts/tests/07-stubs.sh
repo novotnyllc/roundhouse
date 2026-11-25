@@ -417,6 +417,8 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
   # catalog-resolved identity to land in installed_plugins.json.
   [ -z "\${CLAUDE_INSTALL_MARKER:-}" ] || printf '%s\n' "\$3" >>"\$CLAUDE_INSTALL_MARKER"
   [ -z "\${CLAUDE_PLUGIN_ACTION_LOG:-}" ] || printf '%s %s\n' update "\$3" >>"\$CLAUDE_PLUGIN_ACTION_LOG"
+  # The real manager's same-version no-op: exit 0, record untouched.
+  [ "\${CLAUDE_UPDATE_NOOP:-0}" != 1 ] || exit 0
   if [ -z "\${CLAUDE_INSTALL_SKIP_RECORD:-}" ] &&
     [ -n "\${CLAUDE_CONFIG_DIR:-}" ] &&
     [ -n "\${CLAUDE_PLUGIN_CATALOG_FILE:-}" ] && [ -f "\${CLAUDE_PLUGIN_CATALOG_FILE}" ]; then

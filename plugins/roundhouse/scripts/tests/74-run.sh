@@ -533,6 +533,44 @@ JSON
     [ "$(sed -n '4p' "$run_plugin_order_log")" = approve ] ||
       fail "hook approval did not follow the plugin enable"
 
+    # `claude plugin update` that exits 0 but leaves the old bytes (the real
+    # manager's same-version no-op) gets ONE real refresh this pass:
+    # uninstall keeping data, then install. A second stale apply in the same
+    # pass holds (74) without another refresh.
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_old\"}]}}" >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    : >"$run_plugin_order_log"
+    fleet_run_marketplace_repair_reset
+    run_status=0
+    CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
+    [ "$run_status" -eq 0 ] &&
+      [ "$(grep -E '^(update|uninstall|install) ' "$run_plugin_order_log" | tr '\n' ';')" = \
+        'update example@test-market;uninstall example@test-market;install example@test-market;' ] ||
+      fail "a no-op plugin update was not refreshed once (got $run_status): $(tr '\n' ';' <"$run_plugin_order_log") $(cat "$run_root/refresh-err")"
+    grep -q "claude plugin update left example@test-market at $run_sha_old, not $run_sha_new; reinstalling it once this pass" \
+      "$run_root/refresh-err" || fail "the plugin refresh was not logged: $(cat "$run_root/refresh-err")"
+    [ "$(jq -r '.plugins["example@test-market"][0].gitCommitSha' "$run_plugin_installed")" = "$run_sha_new" ] ||
+      fail "the plugin refresh did not reach the catalog identity"
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_old\"}]}}" >"$run_plugin_installed"
+    : >"$run_plugin_order_log"
+    run_status=0
+    CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" ||
+      fail "a second stale apply in one pass refreshed again or did not hold (got $run_status): $(tr '\n' ';' <"$run_plugin_order_log")"
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
+    : >"$run_plugin_order_log"
+
     # A native manager may persist the enabled state and then report a
     # nonzero exit. The verified post-state must still trigger approval and
     # let the apply path finish with an honest ledger.

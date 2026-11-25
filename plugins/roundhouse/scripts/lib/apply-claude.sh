@@ -321,6 +321,7 @@ fleet_run_marketplace_repair_reset() {
   fleet_run_repaired_failed=
   fleet_run_repaired_transient=
   fleet_run_repaired_reasons=
+  fleet_run_plugin_refreshed=
   fleet_run_source_ok=
   fleet_run_source_bad=
   fleet_run_source_reasons=
