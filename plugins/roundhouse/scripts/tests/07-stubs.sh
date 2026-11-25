@@ -57,6 +57,17 @@ if [ "${1:-}" = info ] && [ "${2:-}" = --json=v2 ] &&
   esac
   exit 0
 fi
+# `brew --caskroom` names the Caskroom only when a test sets one; like real
+# brew, listing casks fails when that directory does not exist.
+if [ "${1:-}" = --caskroom ]; then
+  [ -n "${BREW_CASKROOM:-}" ] || exit 1
+  printf '%s\n' "$BREW_CASKROOM"
+  exit 0
+fi
+if [ "${1:-}" = list ] && [ "${2:-}" = --cask ] && [ -n "${BREW_CASKROOM:-}" ] && [ ! -d "$BREW_CASKROOM" ]; then
+  printf 'Error: No such file or directory @ dir_initialize - %s\n' "$BREW_CASKROOM" >&2
+  exit 1
+fi
 if [ "${1:-}" = list ] && [ "${2:-}" = --cask ] && [ "${3:-}" = --versions ]; then
   [ "${BREW_CASK_FAIL:-0}" != 1 ] || exit 1
   printf 'visual-tool 1.0.0\n'

@@ -58,7 +58,7 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "119d1d963638f4b9265eabb2376f8562cbec0a9def5332082b539c24783b9678"
+      "sha256": "f653bc4f74b9c9e4b0c0af5c61ca86144ebbe87820105c6d3363b4f5c68b7375"
     },
     {
       "path": "scripts/collect-windows.ps1",
@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "0edfa43c75e6fb7fb6aa8178e04296aea78b099d93d518a1e7776c5df0154580"
+      "sha256": "b28447502ebbb4c6a8a12ce10f9d77fbb7d5cabde4ea72b8b5b3840a7df0c73f"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -238,7 +238,7 @@
     },
     {
       "path": "scripts/lib/timeout.sh",
-      "sha256": "f09c288da6f18c26f77aa490b94ad4a4142219bf7ff368d912617b00eb162aaa"
+      "sha256": "fda31a9d8e2f543c83d9c62ca98005a175daa77d82e57c8baa6c912cf5459363"
     },
     {
       "path": "scripts/mcp-siding-windows.ps1",

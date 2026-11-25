@@ -179,6 +179,21 @@ bounded_query() {
   run_bounded "$(run_bounded_seconds list)" "$@"
 }
 
+bounded_brew_casks() {
+  # `bounded_brew_casks [ARG...]` — `brew list --cask ARG...` as a bounded
+  # query, where a Homebrew with no Caskroom has no casks: empty output,
+  # status 0. A fresh Linuxbrew that never installed a cask has no Caskroom
+  # directory, and `brew list --cask` then fails, which read as a broken
+  # inventory. Only a Caskroom path that brew names and that does not exist
+  # counts; if `brew --caskroom` itself fails, the listing runs as before so
+  # a real brew error still surfaces.
+  bounded_brew_caskroom=$(bounded_query brew --caskroom 2>/dev/null </dev/null) || bounded_brew_caskroom=
+  if [ -n "$bounded_brew_caskroom" ] && [ ! -e "$bounded_brew_caskroom" ]; then
+    return 0
+  fi
+  bounded_query brew list --cask "$@"
+}
+
 bounded_verb() {
   # `bounded_verb COMMAND [ARG...]` — a manager VERB that may download and
   # install (install, update, upgrade, marketplace refresh) under the install
