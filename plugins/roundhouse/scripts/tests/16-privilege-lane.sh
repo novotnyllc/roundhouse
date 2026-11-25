@@ -401,6 +401,86 @@ lane_rc=0
 ROUNDHOUSE_CONFIG="$lane_tmp/config-legacy.json" "$cli" privilege-enroll test-apt >/dev/null 2>&1 </dev/null || lane_rc=$?
 [ "$lane_rc" -eq 69 ] || fail "privilege-enroll with a legacy route exited $lane_rc, expected 69"
 
+# --- a host that answers to its Tailscale name, and is scheduled externally ---
+# A box replaced with a new instance keeps its Tailscale node but not its OS
+# hostname: `hostname_source: "tailscale"` binds expected_hostname to the
+# Tailscale machine name. `scheduler: "external"` is ready without jobs.
+mkdir -p "$lane_tmp/ts-bin"
+cat >"$lane_tmp/ts-bin/tailscale" <<'STUB'
+#!/bin/sh
+[ "$1 $2 $3" = "status --self --json" ] || exit 64
+[ -z "${TS_STUB_FAIL:-}" ] || exit 1
+printf '{"Self":{"HostName":"grok-bot-vm-1","DNSName":"%s"}}\n' "${TS_STUB_DNS:-grokbox.example.ts.net.}"
+STUB
+chmod +x "$lane_tmp/ts-bin/tailscale"
+jq '.machines["test-apt"] += {expected_hostname: "grokbox", hostname_source: "tailscale",
+    scheduler: "external", privilege_lane: "disabled"} |
+  .machines["test-host"].expected_hostname = "another-fixture-host"' \
+  "$tmp/config.json" >"$lane_tmp/config-box.json"
+chmod 600 "$lane_tmp/config-box.json"
+box_env() { PATH="$lane_tmp/ts-bin:$PATH" ROUNDHOUSE_CONFIG="$lane_tmp/config-box.json" "$@"; }
+box_env "$cli" validate-config >/dev/null || fail 'hostname_source: tailscale with scheduler: external was rejected'
+for box_bad in '.machines["test-apt"].hostname_source = "dns"' '.machines["test-apt"].scheduler = "cron"' \
+  '.machines["test-ssh"].hostname_source = "tailscale"' '.machines["test-ssh"].scheduler = "external"'; do
+  jq "$box_bad" "$tmp/config.json" >"$lane_tmp/config-box-bad.json"
+  chmod 600 "$lane_tmp/config-box-bad.json"
+  if ROUNDHOUSE_CONFIG="$lane_tmp/config-box-bad.json" "$cli" validate-config >/dev/null 2>&1; then
+    fail "validate-config accepted $box_bad"
+  fi
+done
+# Readiness: the Tailscale name matches (the OS hostname is not grokbox), the
+# lane is disabled cleanly, and the schedule row says externally scheduled.
+box_env "$cli" fleet-readiness test-apt >"$lane_tmp/box-readiness.txt" 2>/dev/null || :
+! grep -q 'local target identity does not match' "$lane_tmp/box-readiness.txt" ||
+  fail "readiness did not match the Tailscale name: $(cat "$lane_tmp/box-readiness.txt")"
+grep -Eq '^ok       test-apt +schedule +externally scheduled \(scheduler: external\)' "$lane_tmp/box-readiness.txt" ||
+  fail "readiness did not report the host as externally scheduled: $(cat "$lane_tmp/box-readiness.txt")"
+grep -Eq '^ok       test-apt +privilege-lane +disabled by configuration$' "$lane_tmp/box-readiness.txt" ||
+  fail "readiness did not report the disabled lane cleanly: $(cat "$lane_tmp/box-readiness.txt")"
+! grep -Eq '^FINDING  test-apt +(schedule|privilege-lane|identity) ' "$lane_tmp/box-readiness.txt" ||
+  fail "readiness counted the box's schedule, lane or identity as a finding: $(cat "$lane_tmp/box-readiness.txt")"
+# Another Tailscale name, or none readable, is a mismatch: never the OS hostname.
+for box_case in other unreadable; do
+  if [ "$box_case" = other ]; then
+    TS_STUB_DNS=elsewhere.example.ts.net. box_env "$cli" fleet-readiness test-apt >"$lane_tmp/box-readiness.txt" 2>/dev/null || :
+  else
+    TS_STUB_FAIL=1 box_env "$cli" fleet-readiness test-apt >"$lane_tmp/box-readiness.txt" 2>/dev/null || :
+  fi
+  grep -Eq '^FINDING  test-apt +identity +local target identity does not match' "$lane_tmp/box-readiness.txt" ||
+    fail "a $box_case Tailscale name passed the identity check: $(cat "$lane_tmp/box-readiness.txt")"
+done
+# Default unchanged: the same entry with `hostname_source: "os"` (or none)
+# compares the OS hostname, and no schedule row appears.
+jq '.machines["test-apt"].hostname_source = "os" | del(.machines["test-apt"].scheduler)' \
+  "$lane_tmp/config-box.json" >"$lane_tmp/config-box-os.json"
+chmod 600 "$lane_tmp/config-box-os.json"
+PATH="$lane_tmp/ts-bin:$PATH" ROUNDHOUSE_CONFIG="$lane_tmp/config-box-os.json" \
+  "$cli" fleet-readiness test-apt >"$lane_tmp/box-readiness.txt" 2>/dev/null || :
+grep -Eq '^FINDING  test-apt +identity +local target identity does not match' "$lane_tmp/box-readiness.txt" ||
+  fail "hostname_source: os matched a Tailscale name instead of the OS hostname"
+! grep -q ' schedule ' "$lane_tmp/box-readiness.txt" ||
+  fail "a host without scheduler: external got a schedule row"
+(
+  # shellcheck source=/dev/null
+  ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+  PATH="$lane_tmp/ts-bin:$PATH"
+  [ "$(host_identity_hostname "$lane_tmp/config-box.json" test-apt)" = grokbox ] ||
+    fail "host_identity_hostname did not answer with the Tailscale name"
+  [ "$(host_identity_hostname "$lane_tmp/config-box.json" test-host)" = "$(hostname)" ] ||
+    fail "host_identity_hostname changed the default (OS hostname)"
+  # The host-local plan target is chosen by the Tailscale name for that entry.
+  [ "$(ROUNDHOUSE_CONFIG="$lane_tmp/config-box.json" local_plan_target test 2>/dev/null)" = test-apt ] ||
+    fail "local_plan_target did not select the entry by its Tailscale name"
+  ! TS_STUB_DNS=elsewhere.example.ts.net. ROUNDHOUSE_CONFIG="$lane_tmp/config-box.json" \
+    local_plan_target test >/dev/null 2>&1 ||
+    fail "local_plan_target selected a Tailscale entry whose name does not match"
+) || exit 1
+# The collected host record a host-local plan binds to carries that name.
+PATH="$lane_tmp/ts-bin:$PATH" "$script_dir/collect-posix" "$lane_tmp/config-box.json" test-apt \
+  box-snapshot host >"$lane_tmp/box-host.jsonl" 2>/dev/null || :
+jq -e -s 'any(.[]; .kind == "host" and .data.hostname == "grokbox")' "$lane_tmp/box-host.jsonl" >/dev/null ||
+  fail "the collected host record did not carry the Tailscale name: $(cat "$lane_tmp/box-host.jsonl")"
+
 # --- no ceremony anywhere in the user-facing text ----------------------------------
 for lane_skill in fleet-hosts fleet-readiness fleet-update fleet-auth; do
   lane_text=$(cat "$script_dir/../skills/$lane_skill/SKILL.md")

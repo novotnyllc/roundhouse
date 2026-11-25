@@ -298,6 +298,20 @@ validate_config_file() {
         (.expected_hostname | type == "string" and test("^[A-Za-z0-9._-]+$"))) and
       ((.expected_user // null) == null or
         (.expected_user | type == "string" and test("^[A-Za-z0-9._@-]+$"))) and
+      # What expected_hostname is compared with: the OS hostname (default) or,
+      # on a local entry only, the Tailscale machine name of this node
+      # (lib/host-identity.sh).
+      ((.hostname_source // null) == null or
+        (.hostname_source | IN("os","tailscale")) and
+        (if .hostname_source == "tailscale" then .transport == "local" else true end)) and
+      # Who starts the passes of this host: its own launchd/systemd jobs
+      # (`native`, the default, installed by `fleet-schedule install`) or
+      # something outside roundhouse running `roundhouse fleet-run --fast` and
+      # `--full` (`external`): fleet-schedule installs nothing and the
+      # schedule checks report it as externally scheduled.
+      ((.scheduler // null) == null or
+        (.scheduler | IN("native","external")) and
+        (if .scheduler == "external" then .transport == "local" else true end)) and
       (if .platform == "windows" then .transport == "codex-remote-control" else true end) and
       (if .transport == "codex-remote-control" then
         .platform == "windows" and (.codex_host | type == "string" and length > 0)

@@ -1669,6 +1669,45 @@ EOF_SPACED
       done
     )
 
+    # `scheduler: "external"` on this host's own entry (vireo): a host with no
+    # systemd user manager whose passes something else starts. install and
+    # status touch no scheduler and write nothing; the pass's check raises
+    # nothing and clears what a native schedule left.
+    (
+      SCHED_UNAME=Linux
+      jq '.machines.vireo = {platform: "linux", transport: "local", scheduler: "external",
+        privilege_lane: "disabled", groups: [], package_managers: []}' \
+        "$ROUNDHOUSE_CONFIG" >"$sched_root/external-config.json"
+      chmod 600 "$sched_root/external-config.json"
+      ROUNDHOUSE_CONFIG="$sched_root/external-config.json"
+      export ROUNDHOUSE_CONFIG SCHED_UNAME
+      sched_ext_units=$(find "$sched_units" -name 'roundhouse-fleet-*' -exec cksum {} + 2>/dev/null | sort)
+      : >"$SCHED_LOG"
+      sched_out=$("$cli" fleet-schedule install 2>&1) ||
+        fail "fleet-schedule install failed on an externally scheduled host: $sched_out"
+      case $sched_out in
+        *'vireo is externally scheduled (scheduler: external)'*'roundhouse fleet-run --fast'*) ;;
+        *) fail "install did not say the host is externally scheduled: $sched_out" ;;
+      esac
+      sched_out=$("$cli" fleet-schedule status 2>&1) ||
+        fail "fleet-schedule status failed on an externally scheduled host: $sched_out"
+      for sched_mode in fast full; do
+        printf '%s\n' "$sched_out" | grep -q "^fleet-$sched_mode  externally scheduled (scheduler: external)" ||
+          fail "status did not report fleet-$sched_mode as externally scheduled: $sched_out"
+      done
+      ! grep -Eq '^(systemctl|launchctl|loginctl)' "$SCHED_LOG" ||
+        fail "an externally scheduled host asked a scheduler: $(cat "$SCHED_LOG")"
+      [ "$(find "$sched_units" -name 'roundhouse-fleet-*' -exec cksum {} + 2>/dev/null | sort)" = "$sched_ext_units" ] ||
+        fail "install on an externally scheduled host wrote or changed a unit"
+      fleet_alert_set "$ROUNDHOUSE_FLEET_STORE" vireo schedule-missing fleet-fast true 'left by a native schedule' ||
+        fail "could not seed a schedule alert"
+      fleet_schedule_check "$ROUNDHOUSE_FLEET_STORE" vireo 2>/dev/null
+      [ -z "$(find "$ROUNDHOUSE_FLEET_STORE/alerts/vireo" -name 'schedule-*' 2>/dev/null)" ] ||
+        fail "the pass's check kept or raised a schedule alert on an externally scheduled host"
+      ! grep -Eq '^(systemctl|launchctl|loginctl)' "$SCHED_LOG" ||
+        fail "the pass's check asked a scheduler on an externally scheduled host: $(cat "$SCHED_LOG")"
+    ) || exit 1
+
     # Native Windows is out of scope, and says so; bad arguments never reach a job.
     SCHED_UNAME=MINGW64_NT-10.0
     sched_status=0

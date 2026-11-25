@@ -12,6 +12,9 @@ observed_at=${ROUNDHOUSE_OBSERVED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
 # its own inventory UNKNOWN for this collection and nothing else.
 # shellcheck source=lib/timeout.sh
 . "$script_dir/lib/timeout.sh"
+# What this host answers to for expected_hostname (hostname_source).
+# shellcheck source=lib/host-identity.sh
+. "$script_dir/lib/host-identity.sh"
 # The npm manager's durable-path resolution is shared with the executor and
 # the desired-state run, so all three agree on which Node owns the globals.
 # shellcheck source=lib/npm.sh
@@ -1933,7 +1936,7 @@ has_section auth && auth_verify_allowed=true
 emit_local_host() {
   # The identity record a host-local plan binds to: this host's hostname and
   # user, which verify-preconditions compares with the configured ones.
-  local_hostname=$(hostname 2>/dev/null | clip || printf unknown)
+  local_hostname=$(host_identity_hostname "$config" "$host_id" 2>/dev/null | clip || printf unknown)
   local_user=$(id -un 2>/dev/null | clip || printf unknown)
   local_host_data=$(jq -cn --arg name "$1" --arg hostname "$local_hostname" \
     --arg user "$local_user" --arg home "$HOME" \
@@ -2000,7 +2003,7 @@ fi
 emit_privilege_readiness
 
 if has_section host; then
-  hostname_value=$(hostname 2>/dev/null | clip || printf unknown)
+  hostname_value=$(host_identity_hostname "$config" "$host_id" 2>/dev/null | clip || printf unknown)
   user_value=$(id -un 2>/dev/null | clip || printf unknown)
   os_value=$(uname -s 2>/dev/null | clip || printf unknown)
   kernel_value=$(uname -r 2>/dev/null | clip || printf unknown)

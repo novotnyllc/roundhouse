@@ -33,7 +33,13 @@ lane. Validation requires that sibling to be a configured `platform: wsl`,
    `"$CLI" privilege-enroll HOST`: a single `sudo` password typed in the
    terminal running the command (over `ssh -t` for a remote host). It
    first checks that the host answers as the entry's `expected_hostname`
-   and `expected_user` (both must be configured) and refuses otherwise. The
+   and `expected_user` (both must be configured) and refuses otherwise.
+   "Answers as" is the OS hostname by default. A local entry whose OS
+   hostname changes when the machine is replaced (a box that keeps its
+   Tailscale node across instances) sets `"hostname_source": "tailscale"`;
+   it then answers with its Tailscale machine name (the first label of
+   `tailscale status --self --json`'s `Self.DNSName`), and an unreadable
+   one fails the check instead of falling back to the OS hostname. The
    approval installs a root-owned copy of the lane helper, an owner-only
    request queue and one exact sudoers grant; after it, every privileged
    apt action the fleet needs runs unattended. Without a terminal the

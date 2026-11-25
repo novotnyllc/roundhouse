@@ -68,6 +68,23 @@ fleet_schedule_rotate_logs() (
 # (the observation, the absorb plan, the executor's allowlist) derives from it.
 fleet_schedule_legacy_labels='com.novotnyllc.roundhouse.autoupdate com.novotnyllc.roundhouse.fleet'
 
+fleet_schedule_external() {
+  # True when this host's config.json entry says `scheduler: "external"`:
+  # its passes are started by something outside roundhouse (a routine, a
+  # supervisor) running `roundhouse fleet-run --fast` / `--full`, on a host
+  # that may have no launchd or systemd user manager at all (a container
+  # whose PID 1 is tini). The entry is this host's fleet name
+  # (fleet_host_name).
+  fleet_schedule_ext_host=$(fleet_host_name 2>/dev/null) || return 1
+  [ -n "$fleet_schedule_ext_host" ] || return 1
+  jq -e --arg h "$fleet_schedule_ext_host" '.machines[$h].scheduler == "external"' \
+    "$(config_path)" >/dev/null 2>&1
+}
+
+fleet_schedule_external_note() {
+  printf 'externally scheduled (scheduler: external): passes run from `roundhouse fleet-run --fast` and `roundhouse fleet-run --full`; no launchd or systemd job is installed\n'
+}
+
 fleet_schedule_platform() {
   # launchd | systemd | windows | unsupported. WSL is Linux, and gets the
   # systemd jobs when the distribution runs a user manager.
@@ -872,6 +889,16 @@ fleet_schedule_check() {
   # the store's policy as this pass folds it: a fold that fails decides
   # nothing (rendering against the built-in defaults would raise a false
   # alert whose fix, `install`, writes the wrong cadence).
+  # An externally scheduled host has no jobs to miss, disable or drift: any
+  # alert an earlier native schedule left is cleared, and nothing is read.
+  if fleet_schedule_external; then
+    for check_mode in $fleet_schedule_modes; do
+      for check_kind in schedule-drift schedule-disabled schedule-missing; do
+        fleet_schedule_alert "$1" "$2" "$check_kind" "$check_mode" false '' ''
+      done
+    done
+    return 0
+  fi
   case $(fleet_schedule_platform) in launchd | systemd) ;; *) return 0 ;; esac
   check_optout=false
   [ ! -e "$(fleet_schedule_optout_path)" ] || check_optout=true
