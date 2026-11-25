@@ -559,6 +559,41 @@ JSON
       : >"$run_plugin_order_log"
     done
     fleet_run_claude_running() { return 1; }
+    # A plugin with saved options or secrets is not refreshed (uninstall
+    # drops them), and neither is one whose options cannot be read.
+    for run_opts in configured fail; do
+      run_status=0
+      if [ "$run_opts" = configured ]; then run_env=CLAUDE_PLUGIN_CONFIGURED='["token"]'; else run_env=CLAUDE_PLUGIN_CONFIGURE_FAIL=1; fi
+      export "${run_env?}"
+      CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+        CLAUDE_CONFIG_DIR="$HOME/.claude" \
+        CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+        CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+          '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
+      unset CLAUDE_PLUGIN_CONFIGURED CLAUDE_PLUGIN_CONFIGURE_FAIL
+      [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" &&
+        grep -q 'refresh skipped: example@test-market has saved options or secrets (or they cannot be read); reinstall it manually' "$run_root/refresh-err" ||
+        fail "a plugin with saved options was refreshed ($run_opts, got $run_status): $(tr '\n' ';' <"$run_plugin_order_log") $(cat "$run_root/refresh-err")"
+      fleet_run_marketplace_repair_reset
+      : >"$run_plugin_order_log"
+    done
+    # Options saved in settings.json count even when the CLI lists none.
+    run_settings="$HOME/.claude/settings.json"
+    run_settings_saved=$(cat "$run_settings" 2>/dev/null || :)
+    printf '%s\n' '{"pluginConfigs":{"example@test-market":{"options":{"region":"eu"}}}}' >"$run_settings"
+    run_status=0
+    CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
+    if [ -n "$run_settings_saved" ]; then printf '%s\n' "$run_settings_saved" >"$run_settings"; else rm -f "$run_settings"; fi
+    [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" ||
+      fail "a plugin with options saved in settings.json was refreshed (got $run_status): $(tr '\n' ';' <"$run_plugin_order_log")"
+    fleet_run_marketplace_repair_reset
+    : >"$run_plugin_order_log"
     run_status=0
     CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
@@ -588,7 +623,6 @@ JSON
     fleet_run_marketplace_repair_reset
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
     : >"$run_plugin_order_log"
-    eval "$run_saved_running"
 
     # A native manager may persist the enabled state and then report a
     # nonzero exit. The verified post-state must still trigger approval and
@@ -647,6 +681,9 @@ JSON
     [ "$(sed -n '2,$p' "$run_plugin_order_log" | tr '\n' ';')" = \
       'uninstall example@test-market;install example@test-market;' ] ||
       fail "hook approval ran before stale post-update identity was rejected, or the refresh was not tried once: $(tr '\n' ';' <"$run_plugin_order_log")"
+    # The no-session stub stays in force through the fixture above, so a
+    # claude process on the test host cannot defer its refresh.
+    eval "$run_saved_running"
 
     # A converged enable is not an enable operation. In particular, a locally
     # modified hook must not be laundered by the next scheduled pass merely

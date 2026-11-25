@@ -4410,6 +4410,20 @@ fleet_run_plugin_reinstall() {
       "$1" "$2" "$fleet_run_resolved_sha" >&2
     return 1
   fi
+  # The uninstall also deletes the plugin's saved options (settings.json
+  # pluginConfigs) and secrets, which the reinstall does not restore. Refresh
+  # only a plugin proven to have none: the CLI lists no configured option and
+  # settings.json holds no pluginConfigs entry. Anything unreadable skips.
+  fleet_run_refresh_opts=$(bounded_query claude plugin configure "$1" --json 2>/dev/null </dev/null) &&
+    printf '%s\n' "$fleet_run_refresh_opts" | jq -e '(.configured | type) == "array" and (.configured | length) == 0' >/dev/null 2>&1 &&
+    fleet_run_refresh_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" &&
+    { [ ! -e "$fleet_run_refresh_settings" ] ||
+      jq -e --arg id "$1" '((.pluginConfigs // {})[$id] // {}) | length == 0' \
+        "$fleet_run_refresh_settings" >/dev/null 2>&1; } || {
+    printf 'roundhouse: refresh skipped: %s has saved options or secrets (or they cannot be read); reinstall it manually (claude plugin update left it at %s, not %s)\n' \
+      "$1" "$2" "$fleet_run_resolved_sha" >&2
+    return 1
+  }
   printf 'roundhouse: claude plugin update left %s at %s, not %s; reinstalling it once this pass\n' \
     "$1" "$2" "$fleet_run_resolved_sha" >&2
   fleet_run_cli_invalidate

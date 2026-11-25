@@ -439,6 +439,13 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = update ] &&
   fi
   exit 0
 fi
+if [ "\${1:-}" = plugin ] && [ "\${2:-}" = configure ]; then
+  # \`claude plugin configure ID --json\`: which options (secrets included)
+  # hold a saved value.
+  [ "\${CLAUDE_PLUGIN_CONFIGURE_FAIL:-0}" != 1 ] || exit 1
+  printf '{"pluginId":"%s","configured":%s}\n' "\$3" "\${CLAUDE_PLUGIN_CONFIGURED:-[]}"
+  exit 0
+fi
 if [ "\${1:-}" = plugin ] && { [ "\${2:-}" = uninstall ] || [ "\${2:-}" = remove ]; }; then
   # \`claude plugin uninstall --scope user --keep-data ID\`: the id is the one
   # argument that is neither an option nor an option's value. --keep-data is
