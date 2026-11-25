@@ -364,12 +364,18 @@ fleet_plugins_order() {
 }
 
 fleet_plugins_codex_sync() {
-  # fleet_plugins_codex_sync TARGETS — TARGETS holds `NAME HEAD ROOT` lines
+  # fleet_plugins_codex_sync TARGETS [HELD] — TARGETS holds `NAME HEAD ROOT` lines
   # (\037-separated): Codex Git marketplaces whose upstream is at HEAD.
   # Trigger Codex's OWN sync once (an app server held open until every ROOT
   # records its HEAD, or the deadline), and remember a HEAD only for a
   # marketplace Codex actually reached: a sync that did not happen is retried.
   # Nothing here upgrades, installs or re-trusts anything.
+  fleet_plugins_cs_held=${2:-}
+  # Until confirmed, every target is held for this pass's Codex item work,
+  # including when Node or the helper cannot start. Never persist this list.
+  if [ -n "$fleet_plugins_cs_held" ]; then
+    cut -d "$fleet_run_sep" -f 1 "$1" >"$fleet_plugins_cs_held" || :
+  fi
   [ -s "$1" ] || return 0
   command -v codex >/dev/null 2>&1 || return 0
   fleet_plugins_cs_node=$(fleet_node_path) || {
@@ -387,17 +393,55 @@ fleet_plugins_codex_sync() {
   # installed plugins reinstalled at it (Codex records the revision first).
   # A root counts only when the helper says so: a marker an earlier, cut-off
   # sync left at the head proves nothing about the plugins.
-  fleet_plugins_cs_out=$(run_bounded 45 "$fleet_plugins_cs_node" \
-    "$script_dir/codex-plugin-hooks.mjs" sync "${fleet_plugins_cs_args[@]}" 2>/dev/null </dev/null) || :
+  # Leave time for the marketplace listing, initialize and a final plugin
+  # listing (60s each), polling and shutdown, so even a partial sync prints
+  # its per-root result. Shorten the helper's wait too if the install ceiling
+  # cannot hold it; never let an outer timeout discard completed roots.
+  fleet_plugins_cs_budget=$("$fleet_plugins_cs_node" -e '
+    const cap = Number(process.argv[1]);
+    const requested = Number(process.env.ROUNDHOUSE_CODEX_SYNC_WAIT_MS || 180000);
+    const wait = Math.min(Number.isFinite(requested) && requested >= 0 ? requested : 180000,
+      Math.max(0, cap - 185) * 1000);
+    console.log(wait + " " + Math.min(cap, Math.ceil(wait / 1000) + 185));
+  ' "$(run_bounded_seconds install)") || return 0
+  read -r fleet_plugins_cs_wait fleet_plugins_cs_bound <<<"$fleet_plugins_cs_budget"
+  fleet_plugins_cs_err=$(mktemp "${TMPDIR:-/tmp}/roundhouse-codex-sync.stderr.XXXXXX") || return 0
+  fleet_plugins_cs_out=$(ROUNDHOUSE_CODEX_SYNC_WAIT_MS="$fleet_plugins_cs_wait" \
+    run_bounded "$fleet_plugins_cs_bound" "$fleet_plugins_cs_node" \
+    "$script_dir/codex-plugin-hooks.mjs" sync "${fleet_plugins_cs_args[@]}" 2>"$fleet_plugins_cs_err" </dev/null) || :
+  # Diagnostics belong in the pass log, with credentials removed before the
+  # byte cap so a clipped token cannot leak its suffix. Logging never holds
+  # or fails a pass.
+  tail -n 40 "$fleet_plugins_cs_err" | "$fleet_plugins_cs_node" -e '
+    let input = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", chunk => { input += chunk; });
+    process.stdin.on("end", () => {
+      const clean = input.replace(/(:\/\/)[^\s/@]+@/g, "$1***@")
+        .replace(/\bBearer\s+[^\s]+/gi, "Bearer ***")
+        .replace(/\b(?:gh[pousr]_|github_pat_|sk-|xox[abp]-)[A-Za-z0-9_-]+/g, "***");
+      const bounded = Buffer.from(clean).subarray(-4096).toString("utf8").trimEnd();
+      if (bounded) for (const line of bounded.split("\n")) console.log("  codex sync: " + line);
+    });
+  ' || :
+  rm -f "$fleet_plugins_cs_err" || :
   # An UNCONFIRMED root synced but has unpinned remote installs whose
   # reinstall cannot be awaited: its head is not remembered, so the next pass
   # syncs it again rather than trusting a reinstall that may have been cut off.
+  # It is NOT held for this pass's Codex item work: the marketplace is at its
+  # head, and an unpinned catalog never becomes confirmable, so holding it
+  # would hold its plugins on every pass.
   fleet_plugins_cs_missing='*unknown*'
+  fleet_plugins_cs_unconfirmed=
   [ -z "$fleet_plugins_cs_out" ] ||
     fleet_plugins_cs_missing=$(printf '%s\n' "$fleet_plugins_cs_out" |
       jq -r '(.missing | if type == "array" then .[] else error("shape") end),
         (.unconfirmed // [] | if type == "array" then .[] else error("shape") end)' 2>/dev/null) ||
     fleet_plugins_cs_missing='*unknown*'
+  [ "$fleet_plugins_cs_missing" = '*unknown*' ] ||
+    fleet_plugins_cs_unconfirmed=$(printf '%s\n' "$fleet_plugins_cs_out" |
+      jq -r '.unconfirmed // [] | .[]' 2>/dev/null) || fleet_plugins_cs_unconfirmed=
+  [ -z "$fleet_plugins_cs_held" ] || : >"$fleet_plugins_cs_held"
   while IFS=$fleet_run_sep read -r fleet_plugins_cs_m fleet_plugins_cs_head \
     fleet_plugins_cs_root; do
     fleet_upstream_id_valid "$fleet_plugins_cs_m" && [ -n "$fleet_plugins_cs_head" ] || continue
@@ -406,7 +450,15 @@ fleet_plugins_codex_sync() {
       [ "$(fleet_plugins_codex_revision "$fleet_plugins_cs_root" 2>/dev/null)" = \
         "$fleet_plugins_cs_head" ]; then
       fleet_plugins_memo_write codex "$fleet_plugins_cs_m" attempted "$fleet_plugins_cs_head" || :
+    elif [ -n "$fleet_plugins_cs_unconfirmed" ] &&
+      printf '%s\n' "$fleet_plugins_cs_unconfirmed" | grep -Fqx -- "$fleet_plugins_cs_root" &&
+      [ "$(fleet_plugins_codex_revision "$fleet_plugins_cs_root" 2>/dev/null)" = \
+        "$fleet_plugins_cs_head" ]; then
+      printf '  sync  marketplace %s (codex) — at %s; an unpinned plugin cannot be confirmed, so the next pass syncs it again\n' \
+        "$fleet_plugins_cs_m" "$fleet_plugins_cs_head"
     else
+      [ -z "$fleet_plugins_cs_held" ] ||
+        printf '%s\n' "$fleet_plugins_cs_m" >>"$fleet_plugins_cs_held" || :
       printf '  hold  marketplace %s (codex) — Codex did not sync it to %s this pass\n' \
         "$fleet_plugins_cs_m" "$fleet_plugins_cs_head"
     fi
@@ -457,7 +509,8 @@ fleet_plugins_refresh() (
   fi
 
   # Codex first: the item loop's automatic approval reads Codex's copy.
-  fleet_plugins_codex_sync "$fleet_plugins_r_tmp/codex" || :
+  fleet_plugins_codex_sync "$fleet_plugins_r_tmp/codex" \
+    "${fleet_plugins_r_holds:+$fleet_plugins_r_holds/codex-sync-held}" || :
 
   if [ -s "$fleet_plugins_r_tmp/claude" ]; then
     fleet_plugins_owned "$fleet_plugins_r_desired" "$fleet_plugins_r_defs" \
