@@ -559,6 +559,25 @@ JSON
       : >"$run_plugin_order_log"
     done
     fleet_run_claude_running() { return 1; }
+    # Claude Code inside the desktop app (Claude.app) counts as a live
+    # session too, as does a probe that cannot rule it out.
+    run_saved_desktop=$(declare -f fleet_run_claude_desktop_running)
+    for run_live in 0 75; do
+      eval "fleet_run_claude_desktop_running() { return $run_live; }"
+      run_status=0
+      CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+        CLAUDE_CONFIG_DIR="$HOME/.claude" \
+        CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+        CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+          '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
+      [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" &&
+        grep -q 'refresh skipped: Claude Desktop (Claude.app) is running or cannot be ruled out' "$run_root/refresh-err" ||
+        fail "a plugin refresh did not defer for Claude Desktop (probe $run_live, got $run_status): $(tr '\n' ';' <"$run_plugin_order_log") $(cat "$run_root/refresh-err")"
+      fleet_run_marketplace_repair_reset
+      : >"$run_plugin_order_log"
+    done
+    fleet_run_claude_desktop_running() { return 1; }
     # A plugin with saved options or secrets is not refreshed (uninstall
     # drops them), and neither is one whose options cannot be read.
     for run_opts in configured fail; do
@@ -684,6 +703,7 @@ JSON
     # The no-session stub stays in force through the fixture above, so a
     # claude process on the test host cannot defer its refresh.
     eval "$run_saved_running"
+    eval "$run_saved_desktop"
 
     # A converged enable is not an enable operation. In particular, a locally
     # modified hook must not be laundered by the next scheduled pass merely
@@ -700,9 +720,11 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
-        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
-    [ "$run_status" -eq 75 ] ||
-      fail "a steady-state plugin with untrusted Codex hooks read as converged (got $run_status)"
+        '"enabled"' '' >"$run_root/hooks-out" 2>&1 || run_status=$?
+    # The hold is the Codex hooks' alone: the Claude item itself applies.
+    [ "$run_status" -eq 0 ] &&
+      grep -q '^  hold  Codex hooks for example@test-market (codex) — not approved' "$run_root/hooks-out" ||
+      fail "a steady-state plugin with untrusted Codex hooks read as converged (got $run_status): $(cat "$run_root/hooks-out")"
     [ ! -s "$run_plugin_order_log" ] ||
       fail "steady-state enable invoked automatic hook approval"
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
@@ -744,15 +766,16 @@ JSON
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
-        '{"state":"enabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
+        '{"state":"enabled","marketplace":"test-market"}' '' >"$run_root/hooks-out" 2>&1 ||
       run_status=$?
-    [ "$run_status" -eq 75 ] ||
-      fail "automatic approval accepted a locally modified Codex hook (got $run_status)"
+    # Refused and nothing trusted; the hold is scoped to the Codex hooks, so
+    # the Claude update (and its enable) still apply.
+    [ "$run_status" -eq 0 ] &&
+      grep -q '^  hold  Codex hooks for example@test-market (codex) — not approved' "$run_root/hooks-out" ||
+      fail "automatic approval accepted a locally modified Codex hook (got $run_status): $(cat "$run_root/hooks-out")"
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
       'update example@test-market' ] ||
       fail "modified-hook refusal did not enter the update ledger"
-    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
-      fail "modified-hook refusal attempted a later state verb"
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
       fail "modified-hook refusal wrote Codex hook trust"
 
@@ -770,15 +793,16 @@ JSON
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
-        '{"state":"enabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
+        '{"state":"enabled","marketplace":"test-market"}' '' >"$run_root/hooks-out" 2>&1 ||
       run_status=$?
-    [ "$run_status" -eq 75 ] ||
-      fail "automatic approval accepted an untrusted Codex hook (got $run_status)"
+    # Refused and nothing trusted; the hold is scoped to the Codex hooks, so
+    # the Claude update (and its enable) still apply.
+    [ "$run_status" -eq 0 ] &&
+      grep -q '^  hold  Codex hooks for example@test-market (codex) — not approved' "$run_root/hooks-out" ||
+      fail "automatic approval accepted an untrusted Codex hook (got $run_status): $(cat "$run_root/hooks-out")"
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
       'update example@test-market' ] ||
       fail "untrusted-hook refusal did not enter the update ledger"
-    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
-      fail "untrusted-hook refusal attempted a later state verb"
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
       fail "untrusted-hook refusal wrote Codex hook trust"
 

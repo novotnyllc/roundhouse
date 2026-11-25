@@ -997,7 +997,13 @@ SH
         CLAUDE_PLUGIN_ENABLED_FILE="$pc/hooks-enabled.json" \
         CLAUDE_INSTALL_MARKER="$pc/hooks-installs" \
         fleet_run_apply_item "$pc/store" vireo '{}' plugins.widget \
-          '{"state":"enabled","marketplace":"m"}' '' >/dev/null 2>"$pc/hooks-err"
+          '{"state":"enabled","marketplace":"m"}' '' >"$pc/hooks-out" 2>"$pc/hooks-err"
+    }
+    pc_codex_held() {
+      # A Codex hook refusal holds the Codex hooks, not the Claude item: the
+      # apply succeeds and the hold is logged for the Codex part alone.
+      [ "$pc_status" -eq 0 ] &&
+        grep -q '^  hold  Codex hooks for widget@m (codex) — not approved' "$pc/hooks-out"
     }
     # Codex's copy is NOT at the expected SHA (it has not synced yet, or its
     # catalog pins the same repository to another revision). The run never
@@ -1007,7 +1013,7 @@ SH
     fleet_run_marketplace_repair_reset
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] && [ ! -s "$pc/hooks-state/log" ] &&
+    pc_codex_held && [ ! -s "$pc/hooks-state/log" ] &&
       [ "$(cat "$pc/hooks-state/version")" = old ] &&
       [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
       fail "a Codex copy at another revision was reinstalled or had trust written (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
@@ -1060,7 +1066,7 @@ SH
     ln -s "$pc/claude-cache-real" "$pc_claude_cache"
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] ||
+    pc_codex_held ||
       fail "an update into a symlinked cache root did not hold (got $pc_status)"
     grep -q 'is a symlink, not a directory, or owned by another user' "$pc/hooks-err" ||
       fail "the symlinked cache root hold did not say why: $(tr '\n' ';' <"$pc/hooks-err")"
@@ -1199,7 +1205,7 @@ SH
     printf '%s\n' 2 >"$pc/hooks-state/advance-at"
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+    pc_codex_held && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
       ! grep -q '^trust' "$pc/hooks-state/log" ||
       fail "trust was written after Codex advanced the copy under the check (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
     grep -q 'changed under the trust check' "$pc/hooks-err" ||
@@ -1212,7 +1218,7 @@ SH
     printf '%s\n' 2 >"$pc/hooks-state/advance-after"
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+    pc_codex_held && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
       ! grep -q '^trust' "$pc/hooks-state/log" ||
       fail "trust was written after Codex advanced the copy past the last listing (got $pc_status): $(tr '\n' ';' <"$pc/hooks-state/log")"
     # An approval refused because Codex had not synced is RETRIED: Claude is
@@ -1222,7 +1228,7 @@ SH
     fleet_run_marketplace_repair_reset
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] || fail "an unsynced Codex copy did not hold the first pass (got $pc_status)"
+    pc_codex_held || fail "an unsynced Codex copy did not hold the first pass (got $pc_status)"
     printf '%s\n' new >"$pc/hooks-state/version"
     : >"$pc/hooks-state/log"
     fleet_run_marketplace_repair_reset
@@ -1238,7 +1244,7 @@ SH
     printf 'widget 1.1.1\n' >"$pc/codex-home/plugins/cache/m/widget/new/README.md"
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+    pc_codex_held && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
       fail "a locally edited Codex copy had its modified hook trusted (got $pc_status)"
     grep -q "differs byte-for-byte from Claude's verified install" "$pc/hooks-err" ||
       fail "the refusal did not name the byte mismatch: $(tr '\n' ';' <"$pc/hooks-err")"
@@ -1253,7 +1259,7 @@ SH
     done
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+    pc_codex_held && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
       ! grep -q '^trust' "$pc/hooks-state/log" ||
       fail "a Codex copy with a symlink escaping the plugin root had its modified hook trusted (got $pc_status)"
     # ...and so is one that escapes INDIRECTLY, through an excluded marker.
@@ -1266,7 +1272,7 @@ SH
     done
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+    pc_codex_held && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
       ! grep -q '^trust' "$pc/hooks-state/log" ||
       fail "a symlink escaping through an excluded marker had its modified hook trusted (got $pc_status)"
     # ...or into a nested `.git`, which the comparison skips at every depth.
@@ -1282,7 +1288,7 @@ SH
     done
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
+    pc_codex_held && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] &&
       ! grep -q '^trust' "$pc/hooks-state/log" ||
       fail "a symlink into a nested .git had its modified hook trusted (got $pc_status)"
     # ...a hook that was NEVER trusted is not carried over: no new grants.
@@ -1292,7 +1298,7 @@ SH
     : >"$pc/hooks-state/trusted"
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] && [ ! -s "$pc/hooks-state/trusted" ] ||
+    pc_codex_held && [ ! -s "$pc/hooks-state/trusted" ] ||
       fail "automatic approval granted trust to a never-trusted hook (got $pc_status)"
     # ...and with no Claude install at that SHA there is nothing to compare.
     pc_hooks_reset
@@ -1301,7 +1307,7 @@ SH
     rm -rf "$pc/claude-installs"
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+    pc_codex_held && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
       fail "a modified hook was trusted with no Claude install to compare against (got $pc_status)"
     grep -q 'no Claude install of widget@m' "$pc/hooks-err" ||
       fail "the refusal did not name the missing Claude install: $(tr '\n' ';' <"$pc/hooks-err")"
@@ -1342,7 +1348,7 @@ SH
     printf 'widget 1.1.1\n' >"$pc/codex-home/plugins/cache/m/widget/new/README.md"
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
+    pc_codex_held && [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
       fail "an edited in-repo Codex copy had its modified hook trusted (got $pc_status)"
     grep -q "differs byte-for-byte" "$pc/hooks-err" ||
       fail "the in-repo refusal did not name the byte mismatch: $(tr '\n' ';' <"$pc/hooks-err")"
@@ -1372,7 +1378,7 @@ SH
       >"$pc/hooks-state/source"
     pc_status=0
     pc_hooks_apply || pc_status=$?
-    [ "$pc_status" -eq 75 ] ||
+    pc_codex_held ||
       fail "a Codex copy from another source was approved (got $pc_status)"
     [ ! -s "$pc/hooks-state/log" ] && [ "$(cat "$pc/hooks-state/version")" = old ] &&
       [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
@@ -1412,6 +1418,36 @@ SH
       fail "an in-marketplace Codex copy from another repository was accepted"
     ! pc_relative https://github.com/owner/mkt.git /codex/m/plugins/other ||
       fail "an in-marketplace Codex copy at another path was accepted"
+    # Codex's catalog may name the plugin by repository instead (last30days:
+    # `./` in Claude's, its repository URL in Codex's). The record is then a
+    # repository source: accepted only for that same repository at that path.
+    pc_relative_repo() {
+      # pc_relative_repo RECORD-SOURCE-JSON -> fleet_run_codex_source_ok's status
+      jq -n '{marketplaces: [{name: "m", root: "/codex/m",
+        marketplaceSource: {sourceType: "git", source: "https://github.com/owner/mkt.git"}}]}' \
+        >"$pc/hooks-state/markets"
+      printf '%s\n' "$1" >"$pc/hooks-state/source"
+      PATH="$pc/hooks-bin:$PATH" PC_HOOKS_STATE="$pc/hooks-state" \
+        CLAUDE_PLUGIN_CATALOG_FILE="$pc/hooks-catalog.json" \
+        CLAUDE_PLUGIN_MARKETPLACE_FILE="$pc/claude-markets.json" \
+        fleet_run_codex_source_ok widget@m
+    }
+    pc_relative_repo '{"source":"git-subdir","url":"https://github.com/Owner/mkt.git","path":"plugins/widget/"}' ||
+      fail "a Codex copy of the same repository and path, by repository source, was refused"
+    ! pc_relative_repo '{"source":"git","url":"https://github.com/owner/mkt.git"}' ||
+      fail "a Codex copy of the whole marketplace repository passed for a plugin in a subdirectory"
+    ! pc_relative_repo '{"source":"git-subdir","url":"https://github.com/attacker/mkt.git","path":"plugins/widget"}' ||
+      fail "a Codex copy from another repository, by repository source, was accepted"
+    ! pc_relative_repo '{"source":"git-subdir","url":"https://example.invalid/owner/mkt.git","path":"plugins/widget"}' ||
+      fail "a Codex copy from another host was accepted as the GitHub marketplace repository"
+    jq -n --arg b "$pc_sha_b" '{available: [{pluginId: "widget@m", version: "1.1.0",
+      source: {source: "relative", path: "./", sha: $b}}]}' >"$pc/hooks-catalog.json"
+    pc_relative_repo '{"source":"git","url":"https://github.com/owner/mkt.git"}' ||
+      fail "a root plugin (./) whose Codex copy names its repository URL was refused"
+    pc_relative_repo '{"source":"url","url":"https://github.com/owner/mkt/"}' ||
+      fail "a root plugin whose Codex copy names its repository with a trailing slash was refused"
+    ! pc_relative_repo '{"source":"git","url":"https://github.com/owner/other.git"}' ||
+      fail "a root plugin whose Codex copy names another repository was accepted"
     # Disabled: the Codex copy and its hook trust are never touched.
     pc_hooks_reset
     fleet_run_marketplace_repair_reset
