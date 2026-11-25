@@ -311,7 +311,9 @@ function Sync-Codex([string]$Node, [string]$Helper, [string]$Codex, [object[]]$M
         $Pairs.Add($Head)
     }
     if ($Pairs.Count -eq 0) { return }
-    $Result = Invoke-Tool $Node (@($Helper, "sync", "--codex-executable", $Codex) + $Pairs.ToArray()) 240 @{ ROUNDHOUSE_CODEX_SYNC_WAIT_MS = "180000" }
+    $SyncWaitMs = 180000
+    $SyncTimeoutSeconds = [int][Math]::Ceiling($SyncWaitMs / 1000) + 185
+    $Result = Invoke-Tool $Node (@($Helper, "sync", "--codex-executable", $Codex) + $Pairs.ToArray()) $SyncTimeoutSeconds @{ ROUNDHOUSE_CODEX_SYNC_WAIT_MS = [string]$SyncWaitMs }
     $Report = ConvertFrom-ToolJson ([pscustomobject]@{ ExitCode = 0; Stdout = $Result.Stdout })
     if ($null -eq $Report) {
         Add-Note "hold" "Codex's marketplace sync did not report"
@@ -599,7 +601,7 @@ if ($SelfTest) {
         function Invoke-Tool {
             param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds, [hashtable]$Environment = @{})
             $Line = (@([IO.Path]::GetFileNameWithoutExtension($FilePath)) + $Arguments) -join " "
-            $Script:Calls.Add([pscustomobject]@{ Line = $Line; Environment = $Environment.Clone() })
+            $Script:Calls.Add([pscustomobject]@{ Line = $Line; TimeoutSeconds = $TimeoutSeconds; Environment = $Environment.Clone() })
             $Ok = { param($Out) [pscustomobject]@{ ExitCode = 0; Stdout = $Out; TimedOut = $false } }
             if ($Script:Hang -and $Line -clike $Script:Hang) {
                 $Script:TimedOut = $true
@@ -652,6 +654,8 @@ if ($SelfTest) {
         # enabled copy behind its catalog — the roundhouse that a clone at
         # the latest revision left old — and of nothing else.
         Assert-True ($Lines -ccontains "node $Helper sync --codex-executable codex $CodexMarket $New") "Codex's sync was not triggered to the upstream head"
+        $SyncCall = @($Script:Calls | Where-Object { $_.Line -ceq "node $Helper sync --codex-executable codex $CodexMarket $New" })[0]
+        Assert-True ($SyncCall.TimeoutSeconds -eq 365 -and $SyncCall.Environment.ROUNDHOUSE_CODEX_SYNC_WAIT_MS -ceq "180000") "Codex's sync bound did not leave 185 seconds beyond its wait for the helper to report"
         Assert-True (-not ($Lines -clike "* sync *$ThirdMarket*")) "a marketplace with no known upstream head was synced to a guessed revision"
         Assert-True ($Lines -ccontains "codex plugin add roundhouse@novotnyllc --json") "a Codex copy older than its catalog was not reinstalled"
         Assert-True ($Lines -ccontains "codex plugin add tool@third --json") "a stale third-party Codex copy was not reinstalled"
