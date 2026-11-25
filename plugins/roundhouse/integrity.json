@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "18103355b9f502f201e7189de39a2c8b69089755efdddae2f37210fd8f422c04"
+      "sha256": "a8b645295feb7e32e6134f11b09eaaab793c937ba1a85872c66b3d1f2f45cd1b"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",

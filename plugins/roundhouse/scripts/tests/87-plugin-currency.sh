@@ -365,6 +365,17 @@ SH
         # Both the post-update approval and steady-state check stop before
         # their first per-plugin query for a marketplace held by this sync.
         fleet_run_codex_sync_holds=$pc/codex-sync-held
+        pc_saved_codex_home=${CODEX_HOME-}
+        export CODEX_HOME=$pc/held-codex-home
+        mkdir -p "$CODEX_HOME/plugins/cache/dotnet-agent-skills/demo"
+        # A Claude-only plugin from the held marketplace (no Codex copy) is
+        # not held: the ownership check finds nothing for Codex to settle.
+        pc_status=0
+        pc_out=$(PC_CODEX_LIST_LOG=1 fleet_run_approve_plugin_hooks claudeonly@dotnet-agent-skills "$pc_good_head") ||
+          pc_status=$?
+        [ "$pc_status" -eq 0 ] && case $pc_out in *'did not sync this pass'*) false ;; *) true ;; esac ||
+          fail "a Claude-only plugin was held by its marketplace's Codex sync (got $pc_status): $pc_out"
+        fleet_run_codex_sync_skipped=false
         for pc_check in fleet_run_approve_plugin_hooks fleet_run_codex_hooks_settled; do
           : >"$PC_CODEX_LOG"
           pc_status=0
@@ -392,6 +403,7 @@ SH
           [ "$(cat "$pc/skipped-hold")" = 'apply status 74' ] &&
           [ "$(cat "$pc/skipped-journal")" = held ] ||
           fail "a skipped plugin lost its hold or journal, or printed duplicate hold lines"
+        if [ -n "$pc_saved_codex_home" ]; then export CODEX_HOME=$pc_saved_codex_home; else unset CODEX_HOME; fi
         # A warning has no response id. Once Codex gives up, the helper must
         # return the root as missing without paying the ten-second wait.
         pc_status=0

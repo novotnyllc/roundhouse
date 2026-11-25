@@ -1736,6 +1736,10 @@ fleet_run_codex_sync_ready() {
   [ -n "${fleet_run_codex_sync_holds:-}" ] &&
     [ -f "$fleet_run_codex_sync_holds" ] &&
     grep -Fqx -- "${1##*@}" "$fleet_run_codex_sync_holds" || return 0
+  # Only a plugin Codex has a copy of has Codex work to hold. A Claude-only
+  # plugin from the same marketplace has no cache in CODEX_HOME, and the
+  # ownership check after this guard would let it through.
+  [ -d "${CODEX_HOME:-$HOME/.codex}/plugins/cache/${1##*@}/${1%@*}" ] || return 0
   printf '  hold  plugin %s (codex) — marketplace %s did not sync this pass; skipped\n' \
     "$1" "${1##*@}"
   fleet_run_codex_sync_skipped=true
