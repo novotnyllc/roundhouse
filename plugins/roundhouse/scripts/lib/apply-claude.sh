@@ -321,6 +321,7 @@ fleet_run_marketplace_repair_reset() {
   fleet_run_repaired_failed=
   fleet_run_repaired_transient=
   fleet_run_repaired_reasons=
+  fleet_run_plugin_refreshed=
   fleet_run_source_ok=
   fleet_run_source_bad=
   fleet_run_source_reasons=
@@ -618,6 +619,20 @@ fleet_run_claude_running() {
     END { exit(found ? 0 : 1) }' && return 0
   fleet_run_ps_out=$(ps -A -ww -o command= 2>/dev/null) || return 75
   printf '%s\n' "$fleet_run_ps_out" | fleet_run_claude_cmdline_match
+}
+
+fleet_run_claude_desktop_running() {
+  # Is the Claude desktop app, or any process from inside its bundle (its
+  # helpers, the Claude Code it runs), running? Matched on the executable's
+  # path inside Claude.app — /Applications or ~/Applications, nothing looser —
+  # so a process merely named "Claude" elsewhere does not count. Exit 0
+  # running, 1 not, 75 when `ps` cannot answer (the caller holds).
+  fleet_run_ps_out=$(ps -A -ww -o comm= 2>/dev/null) || return 75
+  printf '%s\n' "$fleet_run_ps_out" | awk -v home="${HOME:-}" '
+    { sub(/^[[:space:]]+/, "") }
+    index($0, "/Applications/Claude.app/Contents/") == 1 { found = 1; exit }
+    home != "" && index($0, home "/Applications/Claude.app/Contents/") == 1 { found = 1; exit }
+    END { exit(found ? 0 : 1) }'
 }
 
 fleet_run_claude_cmdline_match() {

@@ -1753,6 +1753,72 @@ fleet_run_codex_sync_ready() {
   return 74
 }
 
+fleet_run_codex_hooks_scoped() {
+  # fleet_run_codex_hooks_scoped ID STATUS SHA — the Codex hook step of the
+  # Claude plugin item being applied exited STATUS. A refusal (75) is Codex's
+  # alone: nothing was trusted, Codex keeps the hooks unapproved (it does not
+  # run them), and the reason is already in the log. It is logged as a hold
+  # of the Codex hooks, not of the Claude plugin, which IS applied — and it
+  # is remembered as owed, because an applied item whose Claude identity
+  # still matches is skipped on later passes: fleet_run_codex_hooks_retry
+  # asks again for it every pass until Codex's hooks settle. A transient
+  # failure (74) still holds the item, so the pass retries it whole.
+  fleet_run_cxo=$(fleet_run_codex_hooks_owed_path "${fleet_run_apply_item_name:-$1}")
+  case $2 in
+    0) rm -f "$fleet_run_cxo"; return 0 ;;
+    75) ;;
+    *) return "$2" ;;
+  esac
+  printf '  hold  Codex hooks for %s (codex) — not approved (reason above); the Claude plugin is applied\n' "$1"
+  mkdir -p "${fleet_run_cxo%/*}" 2>/dev/null &&
+    printf '%s %s\n' "$1" "${3:-}" >"$fleet_run_cxo" 2>/dev/null || :
+  return 0
+}
+
+fleet_run_codex_hooks_owed_path() {
+  printf '%s/codex-hooks-owed/%s\n' "$(fleet_run_state_dir)" "$(printf '%s' "$1" | tr '/' '_')"
+}
+
+fleet_run_codex_hooks_retry() {
+  # fleet_run_codex_hooks_retry ITEM VALUE — ITEM's Claude plugin is applied and
+  # unchanged, so the run skips it; if its Codex hooks are still owed (a
+  # refusal fleet_run_codex_hooks_scoped recorded), ask Codex again,
+  # read-only until it finds work, exactly as a steady-state apply does.
+  # Settled clears the debt; anything else is logged and kept. The Claude
+  # item is never held for Codex's part. Exit 1 only when the check could
+  # not run (transient): the caller keeps the poll floor open for it, as
+  # for any transient hold. A standing refusal (75) waits for the next full
+  # pass, as a standing item hold does (fleet_run_hold_owes_retry), so a
+  # Codex copy that never settles does not turn every fast pass into a full one.
+  fleet_run_cxr=$(fleet_run_codex_hooks_owed_path "$1")
+  [ -f "$fleet_run_cxr" ] || return 0
+  read -r fleet_run_cxr_id fleet_run_cxr_sha <"$fleet_run_cxr" || return 0
+  case $fleet_run_cxr_id in *@*) ;; *) rm -f "$fleet_run_cxr"; return 0 ;; esac
+  # Only for an item that is still desired enabled (VALUE, as the plan has
+  # it now) and is enabled in Claude: approval follows the enabled item,
+  # never a disabled or removed one, whatever Codex's own copy says.
+  fleet_run_cxr_want=$(fleet_run_state_of "${2:-}" 2>/dev/null) || fleet_run_cxr_want=
+  fleet_run_cxr_enabled=$(fleet_run_plugin_enabled "$fleet_run_cxr_id" 2>/dev/null) ||
+    fleet_run_cxr_enabled=unknown
+  if [ "$fleet_run_cxr_want" != enabled ] || [ "$fleet_run_cxr_enabled" != true ]; then
+    [ "$fleet_run_cxr_enabled" = unknown ] || { rm -f "$fleet_run_cxr"; return 0; }
+    [ "$fleet_run_cxr_want" = enabled ] || { rm -f "$fleet_run_cxr"; return 0; }
+    return 1
+  fi
+  fleet_run_cxr_status=0
+  fleet_run_codex_hooks_settled "$fleet_run_cxr_id" "${fleet_run_cxr_sha:-}" ||
+    fleet_run_cxr_status=$?
+  case $fleet_run_cxr_status in
+    0) rm -f "$fleet_run_cxr" ;;
+    75) printf '  hold  Codex hooks for %s (codex) — not approved (reason above); the Claude plugin is applied\n' "$fleet_run_cxr_id" ;;
+    *)
+      printf '  hold  Codex hooks for %s (codex) — could not be checked this pass; the next pass retries\n' "$fleet_run_cxr_id"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
 fleet_run_approve_plugin_hooks() {
   # The DSC plugin item is a Claude manager operation, but the hook trust state
   # is Codex-local. Qualified marketplace IDs are the shared seam accepted by
@@ -2054,14 +2120,24 @@ fleet_run_codex_source_ok() {
   # A ref is not part of this comparison: an older revision of the same
   # repository is the same source.
   [ "${fleet_run_cso_claude%%#*}" = "${fleet_run_cso_codex%%#*}" ] || return 75
+  # The record is either Codex's local copy at that path under its root, or
+  # (a Codex catalog that names the plugin by its repository URL instead:
+  # last30days, `./` in Claude's, `https://github.com/mvanhorn/last30days-skill.git`
+  # in Codex's) a repository source that IS that marketplace repository, at
+  # that same path inside it. GitHub spellings fold as above; nothing else does.
+  fleet_run_cso_mrepo=${fleet_run_cso_claude%%#*}
+  fleet_run_cso_mrepo=${fleet_run_cso_mrepo#url:}
   printf '%s\n' "$fleet_run_cso_xentry" "$fleet_run_cso_record" \
-    "$fleet_run_cso_catalog" | jq -es '
+    "$fleet_run_cso_catalog" | jq -es --arg mrepo "$fleet_run_cso_mrepo" "$fleet_run_cso_srcid"'
       def norm: tostring | gsub("/+"; "/") | sub("/$"; "") | sub("/[.]$"; "");
-      def rel: (. // "") | tostring | sub("^[.]/"; "") | sub("^[.]$"; "") | sub("/+$"; "");
       .[0].root as $root | .[1].source as $s | (.[2].source.path | rel) as $rel |
-      ($root | type) == "string" and ($s.source // "") == "local" and
-      (($s.path // "") | norm) ==
-        (if $rel == "" then $root else $root + "/" + $rel end | norm)' \
+      if ($s.source // "") == "local" then
+        ($root | type) == "string" and
+        (($s.path // "") | norm) ==
+          (if $rel == "" then $root else $root + "/" + $rel end | norm)
+      else
+        $mrepo != "" and ([$s | srcid] == [$mrepo + "|" + $rel])
+      end' \
     >/dev/null 2>&1 || return 75
 }
 
@@ -2524,6 +2600,7 @@ fleet_run_apply_item() {
   # STATE (optional) is fleet_run_state_of VALUE when the caller already has
   # it — the run loop reads it from its plan.
   fleet_run_codex_sync_skipped=false
+  fleet_run_apply_item_name=$4
   fleet_item_split_set "$4" || return 70
   fleet_run_category=$fleet_item_category
   fleet_run_name=$fleet_item_name
@@ -2697,14 +2774,24 @@ EOF
           # install, a race against a catalog refresh) must not journal as
           # applied on stale bytes.
           fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 74
-          [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // empty')" \
-            = "$fleet_run_resolved_sha" ] &&
-            { [ -z "$fleet_run_resolved_version" ] ||
-              [ "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.version // empty')" \
-                = "$fleet_run_resolved_version" ]; } || return 74
+          if ! fleet_run_plugin_at_identity "$fleet_run_reverified"; then
+            # `claude plugin update` exits 0 without reinstalling when the
+            # version did not change, even though the bytes did (a relative
+            # source whose checkout moved: last30days at 4.6.0). Refresh it
+            # for real once this pass, then hold if it is still not there.
+            [ -n "$fleet_run_installed_sha" ] || return 74
+            fleet_run_plugin_reinstall "$fleet_run_id" \
+              "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // "none"')" || return 74
+            plugin_cache_seal_permissions "$fleet_run_id" || return 75
+            fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 74
+            fleet_run_plugin_at_identity "$fleet_run_reverified" || return 74
+          fi
           if [ "$fleet_run_want_enabled" = true ]; then
+            fleet_run_cxs=0
             fleet_run_approve_plugin_hooks "$fleet_run_id" \
-              "$fleet_run_resolved_sha" refresh || return $?
+              "$fleet_run_resolved_sha" refresh || fleet_run_cxs=$?
+            fleet_run_codex_hooks_scoped "$fleet_run_id" "$fleet_run_cxs" \
+              "$fleet_run_resolved_sha" || return $?
           fi
           fleet_run_plugin_mutated=true
         else
@@ -2721,7 +2808,9 @@ EOF
         # As above: seal what the manager wrote before approving its hooks.
         plugin_cache_seal_permissions "$fleet_run_id" || return 75
         if [ "$fleet_run_want_enabled" = true ]; then
-          fleet_run_approve_plugin_hooks "$fleet_run_id" || return $?
+          fleet_run_cxs=0
+          fleet_run_approve_plugin_hooks "$fleet_run_id" || fleet_run_cxs=$?
+          fleet_run_codex_hooks_scoped "$fleet_run_id" "$fleet_run_cxs" '' || return $?
         fi
         fleet_run_plugin_mutated=true
       fi
@@ -2749,6 +2838,9 @@ EOF
         fi
       else
         fleet_run_want_enabled=false
+        # A disabled item owes Codex no hook approval: drop any debt an
+        # enabled one left (fleet_run_codex_hooks_scoped).
+        rm -f "$(fleet_run_codex_hooks_owed_path "$4")"
         if [ "$fleet_run_plugin_mutated" = true ] ||
           [ "$fleet_run_before_enabled" != false ]; then
           fleet_run_cli_invalidate
@@ -2765,7 +2857,10 @@ EOF
       if [ "$fleet_run_want_enabled" = true ] &&
         [ "$fleet_run_enable_attempted" = true ] &&
         [ "$fleet_run_actual_enabled" = true ]; then
+        fleet_run_cxs=0
         fleet_run_approve_plugin_hooks "$fleet_run_id" \
+          "${fleet_run_resolved_sha:-}" || fleet_run_cxs=$?
+        fleet_run_codex_hooks_scoped "$fleet_run_id" "$fleet_run_cxs" \
           "${fleet_run_resolved_sha:-}" || return $?
       fi
       # Steady state (nothing installed, updated or enabled this pass): an
@@ -2774,7 +2869,11 @@ EOF
       # untrusted for good (fleet_run_codex_hooks_settled).
       if [ "$fleet_run_want_enabled" = true ] && [ "$fleet_run_actual_enabled" = true ] &&
         [ "$fleet_run_plugin_mutated" != true ] && [ "$fleet_run_enable_attempted" != true ]; then
-        fleet_run_codex_hooks_settled "$fleet_run_id" "${fleet_run_resolved_sha:-}" || return $?
+        fleet_run_cxs=0
+        fleet_run_codex_hooks_settled "$fleet_run_id" "${fleet_run_resolved_sha:-}" ||
+          fleet_run_cxs=$?
+        fleet_run_codex_hooks_scoped "$fleet_run_id" "$fleet_run_cxs" \
+          "${fleet_run_resolved_sha:-}" || return $?
       fi
       ;;
     skills)
@@ -3823,7 +3922,13 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
         run_action_memo="$run_action_memo$run_in_applied$run_match=$run_action|"
         ;;
     esac
-    [ "$run_action" != nothing ] || continue
+    if [ "$run_action" = nothing ]; then
+      # Applied and unchanged; a Codex hook approval it still owes is asked
+      # for again here (fleet_run_codex_hooks_scoped).
+      [ "$run_category" != plugins ] ||
+        fleet_run_codex_hooks_retry "$run_item" "$run_value" || run_retry_owed=true
+      continue
+    fi
 
     # §10.8: a revert restores a value this host already passed before, so a
     # verdict keyed on (item, digest) alone matches a stale pass. Re-review is
@@ -4376,6 +4481,64 @@ fleet_run_hold_owes_retry() {
   # waits, not inabilities.
   [ "$1" = 75 ] || return 0
   [ "$2" = true ]
+}
+
+fleet_run_plugin_at_identity() {
+  # fleet_run_plugin_at_identity RECORD — the installed record is at the
+  # resolved catalog identity (fleet_run_resolved_sha/_version).
+  [ "$(printf '%s\n' "$1" | jq -r '.gitCommitSha // empty')" = "$fleet_run_resolved_sha" ] &&
+    { [ -z "$fleet_run_resolved_version" ] ||
+      [ "$(printf '%s\n' "$1" | jq -r '.version // empty')" = "$fleet_run_resolved_version" ]; }
+}
+
+fleet_run_plugin_reinstall() {
+  # fleet_run_plugin_reinstall ID HAVE — the Claude CLI has no forced
+  # reinstall: uninstall (keeping the plugin's data) and install again. At
+  # most once per plugin per pass (fleet_run_marketplace_repair_reset clears
+  # the list). Enabled state is re-converged by the caller's state verbs.
+  case " ${fleet_run_plugin_refreshed:-} " in *" $1 "*) return 1 ;; esac
+  fleet_run_plugin_refreshed="${fleet_run_plugin_refreshed:-} $1"
+  # The uninstall removes the files a running session uses (the tombstone
+  # path defers for the same reason): only with no session, and a probe that
+  # could not answer counts as one.
+  fleet_run_refresh_live=0
+  fleet_run_claude_running || fleet_run_refresh_live=$?
+  if [ "$fleet_run_refresh_live" -ne 1 ]; then
+    printf 'roundhouse: claude plugin update left %s at %s, not %s; not reinstalling while a claude session may be running; the next pass retries\n' \
+      "$1" "$2" "$fleet_run_resolved_sha" >&2
+    return 1
+  fi
+  # Claude Code also runs inside the desktop app, with the same plugins.
+  fleet_run_refresh_live=0
+  fleet_run_claude_desktop_running || fleet_run_refresh_live=$?
+  if [ "$fleet_run_refresh_live" -ne 1 ]; then
+    printf 'roundhouse: refresh skipped: Claude Desktop (Claude.app) is running or cannot be ruled out; quit it to let %s refresh (claude plugin update left it at %s, not %s); the next pass retries\n' \
+      "$1" "$2" "$fleet_run_resolved_sha" >&2
+    return 1
+  fi
+  # The uninstall also deletes the plugin's saved options (settings.json
+  # pluginConfigs) and secrets, which the reinstall does not restore. Refresh
+  # only a plugin proven to have none: the CLI lists no configured option and
+  # settings.json holds no pluginConfigs entry. Anything unreadable skips.
+  fleet_run_refresh_opts=$(bounded_query claude plugin configure "$1" --json 2>/dev/null </dev/null) &&
+    printf '%s\n' "$fleet_run_refresh_opts" | jq -e '(.configured | type) == "array" and (.configured | length) == 0' >/dev/null 2>&1 &&
+    fleet_run_refresh_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" &&
+    { [ ! -e "$fleet_run_refresh_settings" ] ||
+      jq -e --arg id "$1" '((.pluginConfigs // {})[$id] // {}) | length == 0' \
+        "$fleet_run_refresh_settings" >/dev/null 2>&1; } || {
+    printf 'roundhouse: refresh skipped: %s has saved options or secrets (or they cannot be read); reinstall it manually (claude plugin update left it at %s, not %s)\n' \
+      "$1" "$2" "$fleet_run_resolved_sha" >&2
+    return 1
+  }
+  printf 'roundhouse: claude plugin update left %s at %s, not %s; reinstalling it once this pass\n' \
+    "$1" "$2" "$fleet_run_resolved_sha" >&2
+  fleet_run_cli_invalidate
+  bounded_verb claude plugin uninstall --scope user --keep-data "$1" >/dev/null 2>&1 || return 1
+  fleet_run_cli_invalidate
+  bounded_verb claude plugin install "$1" --scope user >/dev/null 2>&1 || {
+    printf 'roundhouse: reinstalling %s failed after its uninstall; the next pass installs it\n' "$1" >&2
+    return 1
+  }
 }
 
 fleet_run_apply_held() {

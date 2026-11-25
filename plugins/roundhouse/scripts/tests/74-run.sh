@@ -533,6 +533,116 @@ JSON
     [ "$(sed -n '4p' "$run_plugin_order_log")" = approve ] ||
       fail "hook approval did not follow the plugin enable"
 
+    # `claude plugin update` that exits 0 but leaves the old bytes (the real
+    # manager's same-version no-op) gets ONE real refresh this pass:
+    # uninstall keeping data, then install. A second stale apply in the same
+    # pass holds (74) without another refresh.
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_old\"}]}}" >"$run_plugin_installed"
+    printf '%s\n' '{"example@test-market":true}' >"$run_plugin_enabled_file"
+    : >"$run_plugin_order_log"
+    fleet_run_marketplace_repair_reset
+    run_saved_running=$(declare -f fleet_run_claude_running)
+    # A live (or unknowable) Claude session defers the refresh: no uninstall.
+    for run_live in 0 75; do
+      eval "fleet_run_claude_running() { return $run_live; }"
+      run_status=0
+      CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+        CLAUDE_CONFIG_DIR="$HOME/.claude" \
+        CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+        CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+          '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
+      [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" &&
+        grep -q 'not reinstalling while a claude session may be running' "$run_root/refresh-err" ||
+        fail "a plugin refresh did not defer for a live session (probe $run_live, got $run_status): $(tr '\n' ';' <"$run_plugin_order_log")"
+      fleet_run_marketplace_repair_reset
+      : >"$run_plugin_order_log"
+    done
+    fleet_run_claude_running() { return 1; }
+    # Claude Code inside the desktop app (Claude.app) counts as a live
+    # session too, as does a probe that cannot rule it out.
+    run_saved_desktop=$(declare -f fleet_run_claude_desktop_running)
+    for run_live in 0 75; do
+      eval "fleet_run_claude_desktop_running() { return $run_live; }"
+      run_status=0
+      CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+        CLAUDE_CONFIG_DIR="$HOME/.claude" \
+        CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+        CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+          '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
+      [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" &&
+        grep -q 'refresh skipped: Claude Desktop (Claude.app) is running or cannot be ruled out' "$run_root/refresh-err" ||
+        fail "a plugin refresh did not defer for Claude Desktop (probe $run_live, got $run_status): $(tr '\n' ';' <"$run_plugin_order_log") $(cat "$run_root/refresh-err")"
+      fleet_run_marketplace_repair_reset
+      : >"$run_plugin_order_log"
+    done
+    fleet_run_claude_desktop_running() { return 1; }
+    # A plugin with saved options or secrets is not refreshed (uninstall
+    # drops them), and neither is one whose options cannot be read.
+    for run_opts in configured fail; do
+      run_status=0
+      if [ "$run_opts" = configured ]; then run_env=CLAUDE_PLUGIN_CONFIGURED='["token"]'; else run_env=CLAUDE_PLUGIN_CONFIGURE_FAIL=1; fi
+      export "${run_env?}"
+      CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+        CLAUDE_CONFIG_DIR="$HOME/.claude" \
+        CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+        CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+          '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
+      unset CLAUDE_PLUGIN_CONFIGURED CLAUDE_PLUGIN_CONFIGURE_FAIL
+      [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" &&
+        grep -q 'refresh skipped: example@test-market has saved options or secrets (or they cannot be read); reinstall it manually' "$run_root/refresh-err" ||
+        fail "a plugin with saved options was refreshed ($run_opts, got $run_status): $(tr '\n' ';' <"$run_plugin_order_log") $(cat "$run_root/refresh-err")"
+      fleet_run_marketplace_repair_reset
+      : >"$run_plugin_order_log"
+    done
+    # Options saved in settings.json count even when the CLI lists none.
+    run_settings="$HOME/.claude/settings.json"
+    run_settings_saved=$(cat "$run_settings" 2>/dev/null || :)
+    printf '%s\n' '{"pluginConfigs":{"example@test-market":{"options":{"region":"eu"}}}}' >"$run_settings"
+    run_status=0
+    CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
+    if [ -n "$run_settings_saved" ]; then printf '%s\n' "$run_settings_saved" >"$run_settings"; else rm -f "$run_settings"; fi
+    [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" ||
+      fail "a plugin with options saved in settings.json was refreshed (got $run_status): $(tr '\n' ';' <"$run_plugin_order_log")"
+    fleet_run_marketplace_repair_reset
+    : >"$run_plugin_order_log"
+    run_status=0
+    CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
+    [ "$run_status" -eq 0 ] &&
+      [ "$(grep -E '^(update|uninstall|install) ' "$run_plugin_order_log" | tr '\n' ';')" = \
+        'update example@test-market;uninstall example@test-market;install example@test-market;' ] ||
+      fail "a no-op plugin update was not refreshed once (got $run_status): $(tr '\n' ';' <"$run_plugin_order_log") $(cat "$run_root/refresh-err")"
+    grep -q "claude plugin update left example@test-market at $run_sha_old, not $run_sha_new; reinstalling it once this pass" \
+      "$run_root/refresh-err" || fail "the plugin refresh was not logged: $(cat "$run_root/refresh-err")"
+    [ "$(jq -r '.plugins["example@test-market"][0].gitCommitSha' "$run_plugin_installed")" = "$run_sha_new" ] ||
+      fail "the plugin refresh did not reach the catalog identity"
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_old\"}]}}" >"$run_plugin_installed"
+    : >"$run_plugin_order_log"
+    run_status=0
+    CLAUDE_UPDATE_NOOP=1 CODEX_PLUGIN_SHA="$run_sha_new" CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
+      CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
+      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
+    [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" ||
+      fail "a second stale apply in one pass refreshed again or did not hold (got $run_status): $(tr '\n' ';' <"$run_plugin_order_log")"
+    fleet_run_marketplace_repair_reset
+    printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
+    : >"$run_plugin_order_log"
+
     # A native manager may persist the enabled state and then report a
     # nonzero exit. The verified post-state must still trigger approval and
     # let the apply path finish with an honest ledger.
@@ -586,8 +696,14 @@ JSON
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
       'update example@test-market' ] ||
       fail "the stale post-update case did not enter the update ledger"
-    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
-      fail "hook approval ran before stale post-update identity was rejected"
+    # The one refresh this pass (uninstall, install) also left it stale.
+    [ "$(sed -n '2,$p' "$run_plugin_order_log" | tr '\n' ';')" = \
+      'uninstall example@test-market;install example@test-market;' ] ||
+      fail "hook approval ran before stale post-update identity was rejected, or the refresh was not tried once: $(tr '\n' ';' <"$run_plugin_order_log")"
+    # The no-session stub stays in force through the fixture above, so a
+    # claude process on the test host cannot defer its refresh.
+    eval "$run_saved_running"
+    eval "$run_saved_desktop"
 
     # A converged enable is not an enable operation. In particular, a locally
     # modified hook must not be laundered by the next scheduled pass merely
@@ -604,9 +720,11 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
-        '"enabled"' '' >/dev/null 2>&1 || run_status=$?
-    [ "$run_status" -eq 75 ] ||
-      fail "a steady-state plugin with untrusted Codex hooks read as converged (got $run_status)"
+        '"enabled"' '' >"$run_root/hooks-out" 2>&1 || run_status=$?
+    # The hold is the Codex hooks' alone: the Claude item itself applies.
+    [ "$run_status" -eq 0 ] &&
+      grep -q '^  hold  Codex hooks for example@test-market (codex) — not approved' "$run_root/hooks-out" ||
+      fail "a steady-state plugin with untrusted Codex hooks read as converged (got $run_status): $(cat "$run_root/hooks-out")"
     [ ! -s "$run_plugin_order_log" ] ||
       fail "steady-state enable invoked automatic hook approval"
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
@@ -648,15 +766,16 @@ JSON
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
-        '{"state":"enabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
+        '{"state":"enabled","marketplace":"test-market"}' '' >"$run_root/hooks-out" 2>&1 ||
       run_status=$?
-    [ "$run_status" -eq 75 ] ||
-      fail "automatic approval accepted a locally modified Codex hook (got $run_status)"
+    # Refused and nothing trusted; the hold is scoped to the Codex hooks, so
+    # the Claude update (and its enable) still apply.
+    [ "$run_status" -eq 0 ] &&
+      grep -q '^  hold  Codex hooks for example@test-market (codex) — not approved' "$run_root/hooks-out" ||
+      fail "automatic approval accepted a locally modified Codex hook (got $run_status): $(cat "$run_root/hooks-out")"
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
       'update example@test-market' ] ||
       fail "modified-hook refusal did not enter the update ledger"
-    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
-      fail "modified-hook refusal attempted a later state verb"
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
       fail "modified-hook refusal wrote Codex hook trust"
 
@@ -674,15 +793,16 @@ JSON
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
-        '{"state":"enabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
+        '{"state":"enabled","marketplace":"test-market"}' '' >"$run_root/hooks-out" 2>&1 ||
       run_status=$?
-    [ "$run_status" -eq 75 ] ||
-      fail "automatic approval accepted an untrusted Codex hook (got $run_status)"
+    # Refused and nothing trusted; the hold is scoped to the Codex hooks, so
+    # the Claude update (and its enable) still apply.
+    [ "$run_status" -eq 0 ] &&
+      grep -q '^  hold  Codex hooks for example@test-market (codex) — not approved' "$run_root/hooks-out" ||
+      fail "automatic approval accepted an untrusted Codex hook (got $run_status): $(cat "$run_root/hooks-out")"
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
       'update example@test-market' ] ||
       fail "untrusted-hook refusal did not enter the update ledger"
-    [ -z "$(sed -n '2p' "$run_plugin_order_log")" ] ||
-      fail "untrusted-hook refusal attempted a later state verb"
     [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
       fail "untrusted-hook refusal wrote Codex hook trust"
 

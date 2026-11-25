@@ -613,6 +613,37 @@ JSON
     [ "$run_status" -eq 75 ] ||
       fail "an unresolvable tombstone definition did not hold (got $run_status)"
     ) || exit 1
+    # The desktop probe matches processes from inside Claude.app's bundle
+    # only (the app, its helpers, the Claude Code it runs), never a process
+    # that is merely named Claude elsewhere; a failed ps is unknown (75).
+    (
+      run_ps_bin="$run_root/ps-desktop-bin"
+      mkdir -p "$run_ps_bin"
+      printf '#!/bin/sh\ncat "$RUN_PS_FIXTURE"\n' >"$run_ps_bin/ps"
+      chmod +x "$run_ps_bin/ps"
+      run_desktop() {
+        printf '%s\n' "$1" >"$run_root/ps-fixture"
+        run_status=0
+        RUN_PS_FIXTURE="$run_root/ps-fixture" PATH="$run_ps_bin:$PATH" \
+          fleet_run_claude_desktop_running || run_status=$?
+      }
+      run_desktop '/Applications/Claude.app/Contents/MacOS/Claude'
+      [ "$run_status" -eq 0 ] || fail "the running desktop app was not seen (got $run_status)"
+      run_desktop '/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper'
+      [ "$run_status" -eq 0 ] || fail "a desktop helper process was not seen (got $run_status)"
+      run_desktop "$HOME/Applications/Claude.app/Contents/MacOS/Claude"
+      [ "$run_status" -eq 0 ] || fail "a desktop app in ~/Applications was not seen (got $run_status)"
+      run_desktop '/usr/sbin/cron
+/Applications/Claude Notes.app/Contents/MacOS/Claude
+/opt/tools/Claude
+/tmp/x/Applications/Claude.app/Contents/MacOS/Claude
+/usr/bin/grep'
+      [ "$run_status" -eq 1 ] || fail "a process merely named Claude read as the desktop app (got $run_status)"
+      printf '#!/bin/sh\nexit 1\n' >"$run_ps_bin/ps"
+      run_status=0
+      PATH="$run_ps_bin:$PATH" fleet_run_claude_desktop_running || run_status=$?
+      [ "$run_status" -eq 75 ] || fail "a failed desktop probe did not read as unknown (got $run_status)"
+    ) || exit 1
     # #40 review (d): a ps that FAILS is "unknown", never "no session" — an
     # enabled plugin is not uninstalled out from under a session nobody could
     # see. A subshell, because the probe is replaced again below.
