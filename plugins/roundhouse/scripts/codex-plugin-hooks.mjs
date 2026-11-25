@@ -224,6 +224,16 @@ function validateHooks(result, cwd, pluginId) {
   return row.hooks;
 }
 
+// A hook's hash is `sha256:...`, or, for a command hook that runs a script
+// from its plugin, Codex's compound `sha256:<command>/sha256:<script>` (0.171
+// and 0.172 both report impeccable's hooks that way). Bound each part and
+// the count; the value is only ever copied back into trust, never parsed.
+function validHookHash(hash) {
+  if (typeof hash !== "string" || hash.length > 2048) return false;
+  const parts = hash.split("/");
+  return parts.length <= 16 && parts.every((part) => part.startsWith("sha256:") && part.length > 7 && part.length <= 128);
+}
+
 function matchingPluginHooks(hooks, pluginId) {
   const matching = hooks.filter((hook) => hook?.pluginId === pluginId);
   for (const hook of matching) {
@@ -232,9 +242,7 @@ function matchingPluginHooks(hooks, pluginId) {
       !hook.key.length ||
       hook.key.length > 8192 ||
       /[\u0000-\u001f\u007f]/.test(hook.key) ||
-      typeof hook.currentHash !== "string" ||
-      !hook.currentHash.startsWith("sha256:") ||
-      hook.currentHash.length > 128 ||
+      !validHookHash(hook.currentHash) ||
       !["managed", "modified", "trusted", "untrusted"].includes(hook.trustStatus)
     ) {
       fail("hooks/list returned invalid hook metadata");
@@ -551,7 +559,13 @@ async function syncMarketplaces(targets, waitMs, codexExecutable) {
       }
       if (!waiting || Date.now() >= deadline) {
         for (const warning of server.warnings) process.stderr.write(`warning: ${warning.replaceAll(/[\r\n]/g, " ")}\n`);
-        for (const root of missing) process.stderr.write(`${root}: ${reasons.get(root)}\n`);
+        // One line per root, so a pass log says what happened to each.
+        for (const [root, revision] of targets) {
+          const status = missing.includes(root) ? `missing (${reasons.get(root)})`
+            : unconfirmed.includes(root) ? "unconfirmed (synced; an enabled plugin has no pinned identity to wait for)"
+            : "synced";
+          process.stderr.write(`${root}: ${status}; revision seen ${marketplaceRevision(root) ?? "none"}, wanted ${revision}\n`);
+        }
         return { missing, unconfirmed };
       }
       await new Promise((resolve) => setTimeout(resolve, 500));

@@ -412,7 +412,7 @@ fleet_plugins_codex_sync() {
   # Diagnostics belong in the pass log, with credentials removed before the
   # byte cap so a clipped token cannot leak its suffix. Logging never holds
   # or fails a pass.
-  tail -n 20 "$fleet_plugins_cs_err" | "$fleet_plugins_cs_node" -e '
+  tail -n 40 "$fleet_plugins_cs_err" | "$fleet_plugins_cs_node" -e '
     let input = "";
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", chunk => { input += chunk; });
@@ -428,12 +428,19 @@ fleet_plugins_codex_sync() {
   # An UNCONFIRMED root synced but has unpinned remote installs whose
   # reinstall cannot be awaited: its head is not remembered, so the next pass
   # syncs it again rather than trusting a reinstall that may have been cut off.
+  # It is NOT held for this pass's Codex item work: the marketplace is at its
+  # head, and an unpinned catalog never becomes confirmable, so holding it
+  # would hold its plugins on every pass.
   fleet_plugins_cs_missing='*unknown*'
+  fleet_plugins_cs_unconfirmed=
   [ -z "$fleet_plugins_cs_out" ] ||
     fleet_plugins_cs_missing=$(printf '%s\n' "$fleet_plugins_cs_out" |
       jq -r '(.missing | if type == "array" then .[] else error("shape") end),
         (.unconfirmed // [] | if type == "array" then .[] else error("shape") end)' 2>/dev/null) ||
     fleet_plugins_cs_missing='*unknown*'
+  [ "$fleet_plugins_cs_missing" = '*unknown*' ] ||
+    fleet_plugins_cs_unconfirmed=$(printf '%s\n' "$fleet_plugins_cs_out" |
+      jq -r '.unconfirmed // [] | .[]' 2>/dev/null) || fleet_plugins_cs_unconfirmed=
   [ -z "$fleet_plugins_cs_held" ] || : >"$fleet_plugins_cs_held"
   while IFS=$fleet_run_sep read -r fleet_plugins_cs_m fleet_plugins_cs_head \
     fleet_plugins_cs_root; do
@@ -443,6 +450,12 @@ fleet_plugins_codex_sync() {
       [ "$(fleet_plugins_codex_revision "$fleet_plugins_cs_root" 2>/dev/null)" = \
         "$fleet_plugins_cs_head" ]; then
       fleet_plugins_memo_write codex "$fleet_plugins_cs_m" attempted "$fleet_plugins_cs_head" || :
+    elif [ -n "$fleet_plugins_cs_unconfirmed" ] &&
+      printf '%s\n' "$fleet_plugins_cs_unconfirmed" | grep -Fqx -- "$fleet_plugins_cs_root" &&
+      [ "$(fleet_plugins_codex_revision "$fleet_plugins_cs_root" 2>/dev/null)" = \
+        "$fleet_plugins_cs_head" ]; then
+      printf '  sync  marketplace %s (codex) — at %s; an unpinned plugin cannot be confirmed, so the next pass syncs it again\n' \
+        "$fleet_plugins_cs_m" "$fleet_plugins_cs_head"
     else
       [ -z "$fleet_plugins_cs_held" ] ||
         printf '%s\n' "$fleet_plugins_cs_m" >>"$fleet_plugins_cs_held" || :

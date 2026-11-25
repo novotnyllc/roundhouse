@@ -601,6 +601,23 @@ SH
         fleet_plugins_refresh "$pc/store" vireo '{}' '{}' fast "$pc")
       [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" != "$pc_codex_head" ] ||
         fail "an unconfirmed Codex sync was remembered as done: $pc_out"
+      # ...but it is not HELD: the marketplace reached its head, so its
+      # plugins' Codex work still runs this pass, and the log says why.
+      printf 'novotnyllc%s%s%s%s\n' "$us" "$pc_codex_head" "$us" "$pc/codex-root" >"$pc/unconfirmed-targets"
+      pc_out=$(ROUNDHOUSE_CODEX_UNCONFIRMED_GRACE_MS=200 \
+        fleet_plugins_codex_sync "$pc/unconfirmed-targets" "$pc/unconfirmed-held")
+      [ ! -s "$pc/unconfirmed-held" ] ||
+        fail "an unconfirmed Codex marketplace was held for this pass: $pc_out"
+      case $pc_out in
+        *'  sync  marketplace novotnyllc (codex) — at '*'unpinned plugin cannot be confirmed'*) ;;
+        *) fail "an unconfirmed Codex marketplace did not say why it is not remembered: $pc_out" ;;
+      esac
+      case $pc_out in
+        *'  codex sync: '*"$pc/codex-root: unconfirmed"*"wanted $pc_codex_head"*) ;;
+        *) fail "the helper's per-root result did not reach pass output: $pc_out" ;;
+      esac
+      [ "$(fleet_plugins_memo_read codex novotnyllc attempted)" != "$pc_codex_head" ] ||
+        fail "an unconfirmed Codex sync was remembered as done: $pc_out"
     )
     jq '(.installed[] | select(.name == "loose") | .enabled) = false' "$PC_CODEX_INSTALLED" \
       >"$PC_CODEX_INSTALLED.tmp" && mv "$PC_CODEX_INSTALLED.tmp" "$PC_CODEX_INSTALLED"
@@ -856,6 +873,9 @@ if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
         fi
         ver=$(cat "$st/version")
         current="sha256:$ver"
+        # Codex 0.171/0.172 hash a command hook that runs a plugin script as
+        # `sha256:<command>/sha256:<script>` (impeccable's hooks do).
+        [ ! -e "$st/compound" ] || current="sha256:$ver/sha256:script-$ver"
         trusted=$(cat "$st/trusted" 2>/dev/null || :)
         status=untrusted
         [ -z "$trusted" ] || status=modified
@@ -920,7 +940,7 @@ SH
       printf '%s\n' '{"marketplaces":[]}' >"$pc/hooks-state/markets"
       rm -f "$pc/hooks-state/pending" "$pc/hooks-state/lists" "$pc/hooks-state/advance-at" \
         "$pc/hooks-state/advance-after" "$pc/hooks-state/nohooks" "$pc/hooks-state/app-server-fail" \
-        "$pc/hooks-state/broken-list" "$pc/hooks-state/old-cli"
+        "$pc/hooks-state/broken-list" "$pc/hooks-state/old-cli" "$pc/hooks-state/compound"
       : >"$pc/hooks-state/list-log"
       pc_claude_markets=
       printf '%s\n' cccccccccccccccccccccccccccccccccccccccc >"$pc/hooks-state/sha-newer"
@@ -1049,6 +1069,24 @@ SH
       fail "an explicit approve failed (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
     [ -z "$(find "$pc/codex-home/plugins/cache" -perm -g+w -print -quit)" ] ||
       fail "an explicit approve trusted a group-writable Codex cache without sealing it"
+    # A compound hook hash (Codex 0.171's shape for a hook that runs a plugin
+    # script) is valid metadata: status reads it and approve trusts it as is.
+    pc_hooks_reset
+    printf '%s\n' new >"$pc/hooks-state/version"
+    : >"$pc/hooks-state/compound"
+    pc_status=0
+    pc_hs=$(cd "$pc" && CODEX_HOME="$pc/codex-home" PATH="$pc/hooks-bin:$PATH" \
+      PC_HOOKS_STATE="$pc/hooks-state" node "$script_dir/codex-plugin-hooks.mjs" \
+      status widget@m 2>"$pc/hooks-err") || pc_status=$?
+    [ "$pc_status" -eq 0 ] && [ "$(printf '%s' "$pc_hs" | jq -c '[.hooks, .modified]')" = '[1,1]' ] ||
+      fail "a compound hook hash was rejected by status (got $pc_status): $pc_hs $(tr '\n' ';' <"$pc/hooks-err")"
+    pc_status=0
+    (cd "$pc" && CODEX_HOME="$pc/codex-home" PATH="$pc/hooks-bin:$PATH" \
+      PC_HOOKS_STATE="$pc/hooks-state" node "$script_dir/codex-plugin-hooks.mjs" \
+      approve widget@m >/dev/null 2>"$pc/hooks-err") || pc_status=$?
+    [ "$pc_status" -eq 0 ] && [ "$(cat "$pc/hooks-state/trusted")" = sha256:new/sha256:script-new ] ||
+      fail "a compound hook hash was not approved as is (got $pc_status): $(tr '\n' ';' <"$pc/hooks-err")"
+    rm -f "$pc/hooks-state/compound"
     # ...and an entry it cannot tighten (immutable) is a STANDING refusal (75),
     # not a transient one every fast pass would retry. chflags is macOS/BSD.
     if command -v chflags >/dev/null 2>&1; then
