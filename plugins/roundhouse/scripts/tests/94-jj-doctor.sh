@@ -547,6 +547,20 @@ docjj_doctor_clean() {
     machine-truth clock; do
     docjj_row_ok "$docjj_expect"
   done
+  # No schedule row by default: a natively scheduled host is unchanged.
+  ! printf '%s\n' "$docjj_rows" | grep -qE '^(ok|FINDING) +schedule ' ||
+    fail "doctor reported a schedule row for a host without scheduler: external"
+  # `scheduler: "external"` on this host's own entry is healthy, and says so.
+  # (platform and groups as the store's hosts/vireo.yaml has them: machine truth)
+  jq '.machines.vireo = {platform: "macos", transport: "local", scheduler: "external",
+    groups: ["development"], package_managers: []}' \
+    "$ROUNDHOUSE_CONFIG" >"$rjj/external-config.json"
+  chmod 600 "$rjj/external-config.json"
+  ROUNDHOUSE_CONFIG="$rjj/external-config.json" docjj_doctor >/dev/null
+  [ "$docjj_status" -eq 0 ] ||
+    fail "doctor found something on an externally scheduled host: $(printf '%s\n' "$docjj_rows" | grep '^FINDING')"
+  printf '%s\n' "$docjj_rows" | grep -qE '^ok +schedule +externally scheduled \(scheduler: external\)' ||
+    fail "doctor did not report the host as externally scheduled: $(printf '%s\n' "$docjj_rows" | grep schedule || printf '<absent>')"
   [ "$(printf '%s\n' "$docjj_rows" | grep -c '^ok ')" -ge 30 ] ||
     fail "doctor printed fewer than the ~30 rows §10.7 tables"
   [ "$(git -C "$doc" for-each-ref --format='%(refname) %(objectname)')" = "$docjj_refs_before" ] ||

@@ -166,6 +166,17 @@ since the install, or the file was edited by hand — raises `schedule-drift`,
 each one keyed alert for as long as it lasts, cleared by the check itself once
 it ends.
 
+**Externally scheduled hosts.** A host with no launchd or systemd user
+manager (a container whose PID 1 is tini, a box that pauses when idle) sets
+`"scheduler": "external"` on its own `transport: "local"` entry in
+`config.json`; the default is `"native"`. Its passes are started by something
+outside roundhouse running `roundhouse fleet-run --fast` and
+`roundhouse fleet-run --full`. `fleet-schedule install` and `status` then
+install and read nothing and say the host is externally scheduled
+(`uninstall` still removes jobs the host had before), the pass's own check
+raises no schedule alert there and clears any it left, and `fleet-doctor`
+and `fleet-readiness` report an `ok schedule` row saying so.
+
 **Heartbeats.** Every pass records a host-local heartbeat
 (`store.run/alive`). The `outcome: alive` journal record is *published* at most
 every `heartbeat_publish_hours` (default 6), and always after a pass that applied

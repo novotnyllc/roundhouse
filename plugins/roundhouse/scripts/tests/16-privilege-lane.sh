@@ -401,6 +401,37 @@ lane_rc=0
 ROUNDHOUSE_CONFIG="$lane_tmp/config-legacy.json" "$cli" privilege-enroll test-apt >/dev/null 2>&1 </dev/null || lane_rc=$?
 [ "$lane_rc" -eq 69 ] || fail "privilege-enroll with a legacy route exited $lane_rc, expected 69"
 
+# --- an externally scheduled host with no expected_hostname, lane off ---
+# A box whose OS hostname changes per instance carries no expected_hostname
+# (as a WSL entry may not), runs its passes from outside roundhouse
+# (`scheduler: "external"`) and has the lane disabled: all three are ready.
+jq '.machines["test-apt"] |= (del(.expected_hostname) + {scheduler: "external", privilege_lane: "disabled"})' \
+  "$tmp/config.json" >"$lane_tmp/config-box.json"
+chmod 600 "$lane_tmp/config-box.json"
+ROUNDHOUSE_CONFIG="$lane_tmp/config-box.json" "$cli" validate-config >/dev/null ||
+  fail 'scheduler: external with no expected_hostname was rejected'
+for box_bad in '.machines["test-apt"].scheduler = "cron"' '.machines["test-ssh"].scheduler = "external"' \
+  '.machines["test-apt"].scheduler = false' '.machines["test-apt"].scheduler = true'; do
+  jq "$box_bad" "$tmp/config.json" >"$lane_tmp/config-box-bad.json"
+  chmod 600 "$lane_tmp/config-box-bad.json"
+  if ROUNDHOUSE_CONFIG="$lane_tmp/config-box-bad.json" "$cli" validate-config >/dev/null 2>&1; then
+    fail "validate-config accepted $box_bad"
+  fi
+done
+ROUNDHOUSE_CONFIG="$lane_tmp/config-box.json" "$cli" fleet-readiness test-apt >"$lane_tmp/box-readiness.txt" 2>/dev/null || :
+grep -Eq '^ok       test-apt +schedule +externally scheduled \(scheduler: external\)' "$lane_tmp/box-readiness.txt" ||
+  fail "readiness did not report the host as externally scheduled: $(cat "$lane_tmp/box-readiness.txt")"
+grep -Eq '^ok       test-apt +privilege-lane +disabled by configuration$' "$lane_tmp/box-readiness.txt" ||
+  fail "readiness did not report the disabled lane cleanly: $(cat "$lane_tmp/box-readiness.txt")"
+! grep -Eq '^FINDING  test-apt +(schedule|privilege-lane|identity) ' "$lane_tmp/box-readiness.txt" ||
+  fail "readiness counted the box's schedule, lane or identity as a finding: $(cat "$lane_tmp/box-readiness.txt")"
+# Default unchanged: without the key no schedule row appears.
+jq 'del(.machines["test-apt"].scheduler)' "$lane_tmp/config-box.json" >"$lane_tmp/config-box-native.json"
+chmod 600 "$lane_tmp/config-box-native.json"
+ROUNDHOUSE_CONFIG="$lane_tmp/config-box-native.json" "$cli" fleet-readiness test-apt >"$lane_tmp/box-readiness.txt" 2>/dev/null || :
+! grep -q ' schedule ' "$lane_tmp/box-readiness.txt" ||
+  fail "a host without scheduler: external got a schedule row"
+
 # --- no ceremony anywhere in the user-facing text ----------------------------------
 for lane_skill in fleet-hosts fleet-readiness fleet-update fleet-auth; do
   lane_text=$(cat "$script_dir/../skills/$lane_skill/SKILL.md")

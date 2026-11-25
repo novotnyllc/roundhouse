@@ -1026,6 +1026,13 @@ fleet_readiness_command() (
         "unsupported transport: $fleet_readiness_transport"
     fi
 
+    # A host whose passes something outside roundhouse starts is ready
+    # without launchd/systemd jobs: say so, so the absence is explained.
+    if [ "$fleet_readiness_transport" = local ] &&
+      jq -e --arg host "$fleet_readiness_host" '.machines[$host].scheduler == "external"' \
+        "$(config_path)" >/dev/null 2>&1; then
+      fleet_readiness_row "$fleet_readiness_host" schedule ok "$(fleet_schedule_external_note)"
+    fi
     fleet_readiness_lane_row "$fleet_readiness_host"
   done <<EOF
 $fleet_readiness_targets
@@ -1125,6 +1132,11 @@ fleet_doctor_command() (
     doctor_krl=
     fleet_doctor_row finding signature-skip \
       "$(tr '\n' ' ' <"$doctor_tmp/krlerr"); every commit converges UNVERIFIED — run \`roundhouse fleet-enroll\`"
+  fi
+
+  # --- the schedule: an externally scheduled host is healthy without jobs ---
+  if fleet_schedule_external; then
+    fleet_doctor_row ok schedule "$(fleet_schedule_external_note)"
   fi
 
   # --- §7.9 the privileged materialization lane and its custody ---

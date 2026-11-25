@@ -877,6 +877,24 @@ fleet_schedule_command() (
       ;;
   esac
   exec </dev/null
+  # `scheduler: external`: nothing to install, and nothing to report but
+  # that. `uninstall` still runs, so jobs a host had before it switched can
+  # be removed.
+  if [ "$1" != uninstall ] && fleet_schedule_external; then
+    case $1 in
+      status)
+        for status_mode in $fleet_schedule_modes; do
+          printf 'fleet-%s  %s' "$status_mode" "$(fleet_schedule_external_note)"
+          printf '\n'
+        done
+        ;;
+      install)
+        printf 'roundhouse: fleet-schedule install: %s is %s' "$(fleet_host_name)" "$(fleet_schedule_external_note)"
+        printf '\n'
+        ;;
+    esac
+    exit 0
+  fi
   case $(fleet_schedule_platform) in
     launchd | systemd) ;;
     windows)
