@@ -3083,6 +3083,23 @@ fleet_run_pass_ceiling() {
 
 # --- the commands -------------------------------------------------------------
 
+fleet_run_reap_cask_temp() (
+  # Failed cask installs leave empty Homebrew temp directories behind. Reap
+  # only old, empty top-level directories; an install still using one keeps it.
+  case $(uname -s) in
+    Darwin) ;;
+    Linux) command -v brew >/dev/null 2>&1 || exit 0 ;;
+    *) exit 0 ;;
+  esac
+  cask_temp=${HOMEBREW_TEMP:-/tmp}
+  if fleet_test_hook "${ROUNDHOUSE_TEST_CASK_TEMP:-}"; then
+    cask_temp=$ROUNDHOUSE_TEST_CASK_TEMP
+  fi
+  # /tmp is a symlink on macOS; follow the root, never links below it.
+  find -H "$cask_temp" -mindepth 1 -maxdepth 1 -type d -name 'cask-*' -empty -mmin +60 \
+    -exec rmdir {} + >/dev/null 2>&1 || :
+)
+
 fleet_run_command() {
   # `roundhouse fleet-run [--fast|--full]` — §6.1's two cadences. Fast is the
   # propagation path; full is maintenance. Splitting them is what lets the
@@ -3140,6 +3157,7 @@ fleet_run_command() {
   trap '[ "$run_lock_held" != true ] || fleet_lock_release "$run_lock" "$run_lock_nonce" || :
     rm -rf "$run_tmp"' EXIT
   fleet_lock_signals_exit
+  fleet_schedule_rotate_logs >/dev/null 2>&1 || :
   # §8.6: the abort button for a bad local apply, captured ONCE per run,
   # before its first pass and deliberately WITHOUT --ignore-working-copy (that
   # flag suppresses the colocated auto-import, so restoring to the newest
@@ -3221,7 +3239,8 @@ fleet_run_pass() {
   # already installed is recorded as owned, as the per-item writes recorded
   # it. HERE, in the pass's own subshell, because the batch is: a trap in
   # fleet_run_command never saw it open. A signal exits 128+N, which runs it.
-  trap '[ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :' EXIT
+  trap '[ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :
+    fleet_run_reap_cask_temp >/dev/null 2>&1 || :' EXIT
   fleet_lock_signals_exit
   # Captured BEFORE any fetch: what arrives is what §7.7 has to gate, and after
   # the fetch there is no other way to tell new from known. (The poll floor's

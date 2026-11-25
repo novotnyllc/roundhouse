@@ -855,6 +855,9 @@ export ROUNDHOUSE_CONFIG="$tmp/config.json"
 # Every sync test hook (signature bypass, visibility probe, approval command)
 # is inert without this; the suite is the only thing allowed to set it.
 export ROUNDHOUSE_SELFTEST=1
+# Pass cleanup stays inside the fixture tree, including real-jj fleet runs.
+export ROUNDHOUSE_TEST_CASK_TEMP="$tmp/cask-temp"
+mkdir -p "$ROUNDHOUSE_TEST_CASK_TEMP"
 export BREW_STATE_FILE="$tmp/brew-state"
 export BREW_EXEC_MARKER="$tmp/brew-executed"
 export OP_SECRET_FILE="$tmp/op-secret"
