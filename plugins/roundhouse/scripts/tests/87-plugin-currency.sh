@@ -1027,16 +1027,27 @@ SH
       fail "a scoped Codex hook refusal was not remembered as owed: $(cat "$pc_owed" 2>/dev/null)"
     (
       fleet_run_codex_hooks_settled() { printf '%s %s\n' "$1" "$2" >>"$pc/settled-calls"; return 75; }
+      fleet_run_plugin_enabled() { printf '%s\n' "${PC_CLAUDE_ENABLED:-true}"; }
       : >"$pc/settled-calls"
-      pc_out=$(fleet_run_codex_hooks_retry plugins.widget) || fail "the Codex retry failed the item"
+      # Never for an item now desired disabled, nor one Claude has disabled:
+      # the debt is dropped and Codex is not asked.
+      fleet_run_codex_hooks_retry plugins.widget '{"state":"disabled","marketplace":"m"}' >/dev/null
+      [ ! -s "$pc/settled-calls" ] && [ ! -e "$pc_owed" ] ||
+        fail "a Codex debt was retried or kept for an item desired disabled"
+      printf '%s\n' "widget@m $pc_sha_b" >"$pc_owed"
+      PC_CLAUDE_ENABLED=false fleet_run_codex_hooks_retry plugins.widget '"enabled"' >/dev/null
+      [ ! -s "$pc/settled-calls" ] && [ ! -e "$pc_owed" ] ||
+        fail "a Codex debt was retried or kept for a plugin Claude has disabled"
+      printf '%s\n' "widget@m $pc_sha_b" >"$pc_owed"
+      pc_out=$(fleet_run_codex_hooks_retry plugins.widget '"enabled"') || fail "the Codex retry failed the item"
       [ "$(cat "$pc/settled-calls")" = "widget@m $pc_sha_b" ] && [ -f "$pc_owed" ] &&
         printf '%s\n' "$pc_out" | grep -q '^  hold  Codex hooks for widget@m (codex)' ||
         fail "a still-refused Codex retry was not asked, kept and logged: $pc_out"
       fleet_run_codex_hooks_settled() { printf '%s\n' settled >>"$pc/settled-calls"; return 0; }
-      fleet_run_codex_hooks_retry plugins.widget >/dev/null
+      fleet_run_codex_hooks_retry plugins.widget '"enabled"' >/dev/null
       [ ! -e "$pc_owed" ] || fail "a settled Codex retry kept its debt"
       : >"$pc/settled-calls"
-      fleet_run_codex_hooks_retry plugins.widget >/dev/null
+      fleet_run_codex_hooks_retry plugins.widget '"enabled"' >/dev/null
       [ ! -s "$pc/settled-calls" ] || fail "a plugin that owes Codex nothing was asked again"
     ) || exit 1
     # Codex already at the expected bytes, hooks unchanged upstream: the copy
@@ -1473,6 +1484,8 @@ SH
     pc_hooks_reset
     fleet_run_marketplace_repair_reset
     printf '%s\n' '{"widget@m":false}' >"$pc/hooks-enabled.json"
+    pc_owed=$(fleet_run_codex_hooks_owed_path plugins.widget)
+    mkdir -p "${pc_owed%/*}" && printf '%s\n' "widget@m $pc_sha_b" >"$pc_owed"
     PATH="$pc/hooks-bin:$PATH" PC_HOOKS_STATE="$pc/hooks-state" \
       CLAUDE_PLUGIN_CATALOG_FILE="$pc/hooks-catalog.json" \
       CLAUDE_PLUGIN_ENABLED_FILE="$pc/hooks-enabled.json" \
@@ -1483,5 +1496,6 @@ SH
     [ ! -s "$pc/hooks-state/log" ] &&
       [ "$(cat "$pc/hooks-state/trusted")" = sha256:old ] ||
       fail "a disabled desired state refreshed the Codex copy or its hook trust: $(tr '\n' ';' <"$pc/hooks-state/log")"
+    [ ! -e "$pc_owed" ] || fail "a disabled apply kept an owed Codex hook approval"
   )
 fi

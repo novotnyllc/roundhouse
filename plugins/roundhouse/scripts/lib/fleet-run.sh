@@ -1780,7 +1780,7 @@ fleet_run_codex_hooks_owed_path() {
 }
 
 fleet_run_codex_hooks_retry() {
-  # fleet_run_codex_hooks_retry ITEM — ITEM's Claude plugin is applied and
+  # fleet_run_codex_hooks_retry ITEM VALUE — ITEM's Claude plugin is applied and
   # unchanged, so the run skips it; if its Codex hooks are still owed (a
   # refusal fleet_run_codex_hooks_scoped recorded), ask Codex again,
   # read-only until it finds work, exactly as a steady-state apply does.
@@ -1790,6 +1790,16 @@ fleet_run_codex_hooks_retry() {
   [ -f "$fleet_run_cxr" ] || return 0
   read -r fleet_run_cxr_id fleet_run_cxr_sha <"$fleet_run_cxr" || return 0
   case $fleet_run_cxr_id in *@*) ;; *) rm -f "$fleet_run_cxr"; return 0 ;; esac
+  # Only for an item that is still desired enabled (VALUE, as the plan has
+  # it now) and is enabled in Claude: approval follows the enabled item,
+  # never a disabled or removed one, whatever Codex's own copy says.
+  fleet_run_cxr_want=$(fleet_run_state_of "${2:-}" 2>/dev/null) || fleet_run_cxr_want=
+  fleet_run_cxr_enabled=$(fleet_run_plugin_enabled "$fleet_run_cxr_id" 2>/dev/null) ||
+    fleet_run_cxr_enabled=unknown
+  if [ "$fleet_run_cxr_want" != enabled ] || [ "$fleet_run_cxr_enabled" != true ]; then
+    [ "$fleet_run_cxr_enabled" = unknown ] || rm -f "$fleet_run_cxr"
+    return 0
+  fi
   fleet_run_cxr_status=0
   fleet_run_codex_hooks_settled "$fleet_run_cxr_id" "${fleet_run_cxr_sha:-}" ||
     fleet_run_cxr_status=$?
@@ -2820,6 +2830,9 @@ EOF
         fi
       else
         fleet_run_want_enabled=false
+        # A disabled item owes Codex no hook approval: drop any debt an
+        # enabled one left (fleet_run_codex_hooks_scoped).
+        rm -f "$(fleet_run_codex_hooks_owed_path "$4")"
         if [ "$fleet_run_plugin_mutated" = true ] ||
           [ "$fleet_run_before_enabled" != false ]; then
           fleet_run_cli_invalidate
@@ -3904,7 +3917,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     if [ "$run_action" = nothing ]; then
       # Applied and unchanged; a Codex hook approval it still owes is asked
       # for again here (fleet_run_codex_hooks_scoped).
-      [ "$run_category" != plugins ] || fleet_run_codex_hooks_retry "$run_item"
+      [ "$run_category" != plugins ] || fleet_run_codex_hooks_retry "$run_item" "$run_value"
       continue
     fi
 
