@@ -114,7 +114,7 @@
     },
     {
       "path": "scripts/lib/config.sh",
-      "sha256": "62e27bb0d601b8aee962b1943b647450a77b75826be3380b8b67306bd3a6dd28"
+      "sha256": "b2bd3336270dd59e1b6f363e53696c9b3be8267e323b0cfb5b94967dbd8a4bbb"
     },
     {
       "path": "scripts/lib/fleet-alerts.sh",
@@ -210,7 +210,7 @@
     },
     {
       "path": "scripts/lib/lane.sh",
-      "sha256": "f6759ec3ff4a2555af17bf715b9ff7fb5aac717846491dd56e765a4c783add9c"
+      "sha256": "ccc03603811ac5cd2bc977f7a2a054b5bd1b4404f62b8195fbd00c6848e79428"
     },
     {
       "path": "scripts/lib/local-plan.sh",

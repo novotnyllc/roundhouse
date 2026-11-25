@@ -421,7 +421,9 @@ chmod 600 "$lane_tmp/config-box.json"
 box_env() { PATH="$lane_tmp/ts-bin:$PATH" ROUNDHOUSE_CONFIG="$lane_tmp/config-box.json" "$@"; }
 box_env "$cli" validate-config >/dev/null || fail 'hostname_source: tailscale with scheduler: external was rejected'
 for box_bad in '.machines["test-apt"].hostname_source = "dns"' '.machines["test-apt"].scheduler = "cron"' \
-  '.machines["test-ssh"].hostname_source = "tailscale"' '.machines["test-ssh"].scheduler = "external"'; do
+  '.machines["test-ssh"].hostname_source = "tailscale"' '.machines["test-ssh"].scheduler = "external"' \
+  '.machines["test-apt"].hostname_source = false' '.machines["test-apt"].scheduler = false' \
+  '.machines["test-apt"].hostname_source = true' '.machines["test-apt"].scheduler = true'; do
   jq "$box_bad" "$tmp/config.json" >"$lane_tmp/config-box-bad.json"
   chmod 600 "$lane_tmp/config-box-bad.json"
   if ROUNDHOUSE_CONFIG="$lane_tmp/config-box-bad.json" "$cli" validate-config >/dev/null 2>&1; then
@@ -448,6 +450,23 @@ for box_case in other unreadable; do
   fi
   grep -Eq '^FINDING  test-apt +identity +local target identity does not match' "$lane_tmp/box-readiness.txt" ||
     fail "a $box_case Tailscale name passed the identity check: $(cat "$lane_tmp/box-readiness.txt")"
+done
+# Enrollment probes the same identity: with the lane enabled, the Tailscale
+# name passes the identity check and another name is refused.
+jq 'del(.machines["test-apt"].privilege_lane)' "$lane_tmp/config-box.json" >"$lane_tmp/config-box-lane.json"
+chmod 600 "$lane_tmp/config-box-lane.json"
+for box_case in match other; do
+  lane_rc=0
+  TS_STUB_DNS=$([ "$box_case" = match ] && echo grokbox.example.ts.net. || echo elsewhere.example.ts.net.) \
+    PATH="$lane_tmp/ts-bin:$PATH" ROUNDHOUSE_CONFIG="$lane_tmp/config-box-lane.json" ROUNDHOUSE_LANE_ENROLL_COMMAND="exit 99" \
+    lane_env "$cli" privilege-enroll test-apt >"$lane_tmp/box-enroll.json" 2>/dev/null </dev/null || lane_rc=$?
+  if [ "$box_case" = match ]; then
+    ! jq -e '.reason == "identity_mismatch" or .reason == "identity_unverifiable"' "$lane_tmp/box-enroll.json" >/dev/null 2>&1 ||
+      fail "privilege-enroll ignored the Tailscale name (rc $lane_rc): $(cat "$lane_tmp/box-enroll.json")"
+  else
+    [ "$lane_rc" -eq 65 ] && jq -e '.reason == "identity_mismatch" and (.detail | contains("elsewhere"))' "$lane_tmp/box-enroll.json" >/dev/null ||
+      fail "privilege-enroll accepted another Tailscale name (rc $lane_rc): $(cat "$lane_tmp/box-enroll.json")"
+  fi
 done
 # Default unchanged: the same entry with `hostname_source: "os"` (or none)
 # compares the OS hostname, and no schedule row appears.

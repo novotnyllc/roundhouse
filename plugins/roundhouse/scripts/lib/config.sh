@@ -301,7 +301,7 @@ validate_config_file() {
       # What expected_hostname is compared with: the OS hostname (default) or,
       # on a local entry only, the Tailscale machine name of this node
       # (lib/host-identity.sh).
-      ((.hostname_source // null) == null or
+      (has("hostname_source") == false or .hostname_source == null or
         (.hostname_source | IN("os","tailscale")) and
         (if .hostname_source == "tailscale" then .transport == "local" else true end)) and
       # Who starts the passes of this host: its own launchd/systemd jobs
@@ -309,7 +309,7 @@ validate_config_file() {
       # something outside roundhouse running `roundhouse fleet-run --fast` and
       # `--full` (`external`): fleet-schedule installs nothing and the
       # schedule checks report it as externally scheduled.
-      ((.scheduler // null) == null or
+      (has("scheduler") == false or .scheduler == null or
         (.scheduler | IN("native","external")) and
         (if .scheduler == "external" then .transport == "local" else true end)) and
       (if .platform == "windows" then .transport == "codex-remote-control" else true end) and
