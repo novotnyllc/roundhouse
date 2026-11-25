@@ -1784,8 +1784,12 @@ fleet_run_codex_hooks_retry() {
   # unchanged, so the run skips it; if its Codex hooks are still owed (a
   # refusal fleet_run_codex_hooks_scoped recorded), ask Codex again,
   # read-only until it finds work, exactly as a steady-state apply does.
-  # Settled clears the debt; anything else is logged and kept. Never fails:
-  # the Claude item is not held for Codex's part.
+  # Settled clears the debt; anything else is logged and kept. The Claude
+  # item is never held for Codex's part. Exit 1 only when the check could
+  # not run (transient): the caller keeps the poll floor open for it, as
+  # for any transient hold. A standing refusal (75) waits for the next full
+  # pass, as a standing item hold does (fleet_run_hold_owes_retry), so a
+  # Codex copy that never settles does not turn every fast pass into a full one.
   fleet_run_cxr=$(fleet_run_codex_hooks_owed_path "$1")
   [ -f "$fleet_run_cxr" ] || return 0
   read -r fleet_run_cxr_id fleet_run_cxr_sha <"$fleet_run_cxr" || return 0
@@ -1797,8 +1801,9 @@ fleet_run_codex_hooks_retry() {
   fleet_run_cxr_enabled=$(fleet_run_plugin_enabled "$fleet_run_cxr_id" 2>/dev/null) ||
     fleet_run_cxr_enabled=unknown
   if [ "$fleet_run_cxr_want" != enabled ] || [ "$fleet_run_cxr_enabled" != true ]; then
-    [ "$fleet_run_cxr_enabled" = unknown ] || rm -f "$fleet_run_cxr"
-    return 0
+    [ "$fleet_run_cxr_enabled" = unknown ] || { rm -f "$fleet_run_cxr"; return 0; }
+    [ "$fleet_run_cxr_want" = enabled ] || { rm -f "$fleet_run_cxr"; return 0; }
+    return 1
   fi
   fleet_run_cxr_status=0
   fleet_run_codex_hooks_settled "$fleet_run_cxr_id" "${fleet_run_cxr_sha:-}" ||
@@ -1806,7 +1811,10 @@ fleet_run_codex_hooks_retry() {
   case $fleet_run_cxr_status in
     0) rm -f "$fleet_run_cxr" ;;
     75) printf '  hold  Codex hooks for %s (codex) — not approved (reason above); the Claude plugin is applied\n' "$fleet_run_cxr_id" ;;
-    *) printf '  hold  Codex hooks for %s (codex) — could not be checked this pass; the next pass retries\n' "$fleet_run_cxr_id" ;;
+    *)
+      printf '  hold  Codex hooks for %s (codex) — could not be checked this pass; the next pass retries\n' "$fleet_run_cxr_id"
+      return 1
+      ;;
   esac
   return 0
 }
@@ -3917,7 +3925,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     if [ "$run_action" = nothing ]; then
       # Applied and unchanged; a Codex hook approval it still owes is asked
       # for again here (fleet_run_codex_hooks_scoped).
-      [ "$run_category" != plugins ] || fleet_run_codex_hooks_retry "$run_item" "$run_value"
+      [ "$run_category" != plugins ] ||
+        fleet_run_codex_hooks_retry "$run_item" "$run_value" || run_retry_owed=true
       continue
     fi
 

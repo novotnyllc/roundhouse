@@ -1043,6 +1043,17 @@ SH
       [ "$(cat "$pc/settled-calls")" = "widget@m $pc_sha_b" ] && [ -f "$pc_owed" ] &&
         printf '%s\n' "$pc_out" | grep -q '^  hold  Codex hooks for widget@m (codex)' ||
         fail "a still-refused Codex retry was not asked, kept and logged: $pc_out"
+      # A check that could not run (74) keeps the debt and owes a retry
+      # (exit 1: the caller keeps the poll floor open); a standing refusal
+      # (75, above) owes none, so fast passes stay fast.
+      fleet_run_codex_hooks_settled() { return 74; }
+      ! fleet_run_codex_hooks_retry plugins.widget '"enabled"' >/dev/null && [ -f "$pc_owed" ] ||
+        fail "a Codex retry that could not run did not keep its debt and owe a retry"
+      PC_CLAUDE_ENABLED=unknown
+      fleet_run_plugin_enabled() { return 74; }
+      ! fleet_run_codex_hooks_retry plugins.widget '"enabled"' >/dev/null && [ -f "$pc_owed" ] ||
+        fail "an unreadable Claude state dropped the Codex debt or owed no retry"
+      fleet_run_plugin_enabled() { printf '%s\n' true; }
       fleet_run_codex_hooks_settled() { printf '%s\n' settled >>"$pc/settled-calls"; return 0; }
       fleet_run_codex_hooks_retry plugins.widget '"enabled"' >/dev/null
       [ ! -e "$pc_owed" ] || fail "a settled Codex retry kept its debt"
