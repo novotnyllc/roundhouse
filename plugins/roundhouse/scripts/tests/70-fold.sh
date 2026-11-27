@@ -494,18 +494,44 @@ if [ -n "$fleet_fixture_yq" ]; then
     # tombstone there, and a host-layer `absent` over a fleet `enabled` is.
     run_tomb_layers="$run_root/tomb-layers"
     mkdir -p "$run_tomb_layers/hosts"
-    printf 'plugins:\n  gone: absent\n  readded: absent\n  kept: enabled\n' \
+    printf 'plugins:\n  gone: absent\n  readded: absent\n  kept: enabled\n  object: {state: absent}\nskills:\n  retired: absent\n' \
       >"$run_tomb_layers/fleet.yaml"
-    printf 'platform: macos\nplugins:\n  readded: enabled\n  local-retire: absent\n' \
+    printf 'platform: macos\nliveness_alert_hours: 72\nplugins:\n  readded: enabled\n  local-retire: absent\n' \
       >"$run_tomb_layers/hosts/vireo.yaml"
     [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo plugins | jq -c '.plugins | keys')" = \
       '["gone","local-retire"]' ] ||
       fail "the tombstone set did not follow last-layer-wins: $(fleet_fold_tombstones "$run_tomb_layers" vireo plugins)"
     [ "$(fleet_fold "$run_tomb_layers" vireo | jq -c '.plugins | keys')" = \
-      '["kept","readded"]' ] ||
+      '["kept","object","readded"]' ] ||
       fail "reading tombstones changed what the ordinary fold knocks out"
-    [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo skills)" = '{}' ] ||
+    fleet_fold "$run_tomb_layers" vireo raw | jq -e '
+      .plugins.gone == "absent" and .plugins.object.state == "absent" and
+      .skills.retired == "absent" and .liveness_alert_hours == 72
+    ' >/dev/null || fail "the raw fold dropped a tombstone or host fact"
+    fleet_fold "$run_tomb_layers" vireo keep-plugin-tombstones | jq -e '
+      .plugins.gone == "absent" and .plugins.object.state == "absent" and .skills == {}
+    ' >/dev/null || fail "the plugin view did not preserve just the plugin tombstones"
+    if fleet_fold "$run_tomb_layers" vireo invalid >/dev/null 2>&1; then
+      fail "the fold accepted an unknown view"
+    fi
+    [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo agents)" = '{}' ] ||
       fail "a category with no tombstones produced some"
+
+    # Match the YAML knockout before JSON serialization resolves aliases.
+    cat >"$run_root/fleet.yaml" <<'YAML'
+skills:
+  retired: &skill absent
+  alias: *skill
+plugins:
+  retired: &plugin absent
+  alias: *plugin
+YAML
+    fleet_fold "$run_root" vireo | jq -e '
+      .skills == {alias:"absent"} and .plugins == {alias:"absent"}
+    ' >/dev/null || fail "the effective fold knocked out an alias"
+    fleet_fold "$run_root" vireo keep-plugin-tombstones | jq -e '
+      .skills == {alias:"absent"} and .plugins == {retired:"absent",alias:"absent"}
+    ' >/dev/null || fail "the plugin view changed the knockout for another category"
 
     # Knocking `absent` out once, after the merge, is the same as knocking it
     # out after every layer: a narrower layer that speaks again replaces the
@@ -522,5 +548,77 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$(fleet_fold "$run_mid" vireo | jq -c '.plugins.x // "gone"')" = '"gone"' ] &&
       [ "$(fleet_fold_tombstones "$run_mid" vireo plugins | jq -c '.plugins.x')" = '"absent"' ] ||
       fail "an absent over a wider map was not knocked out of the fold and read as a tombstone"
+  )
+fi
+
+# --- differential: the fold views against main's original programs. 96 layer
+# combinations (fleet x os x group x host) in a store path with spaces and glob
+# characters; every view must equal what the pre-rewrite code produced.
+if [ -n "$fleet_fixture_yq" ]; then
+  printf 'fold: differential against the original programs\n'
+  (
+    set -eu
+    PATH=$fleet_fixture_path
+    export PATH
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+    # The programs exactly as main had them before the view rewrite.
+    old_absent='(.[] | select(tag == "!!map")) |= with_entries(select(.value != "absent"))'
+    old_effective="($fleet_fold_merge_program) | $old_absent"
+    diff_root="$tmp/fold diff [*] ?"
+    diff_count=0
+    for diff_f in 1 2 3 4; do
+      for diff_o in 1 2; do
+        for diff_g in 1 2 3; do
+          for diff_h in 1 2 3 4; do
+            rm -rf "$diff_root"
+            mkdir -p "$diff_root/hosts" "$diff_root/os" "$diff_root/groups"
+            case $diff_f in
+              1) printf 'plugins:\n  a: enabled\n  b: absent\n  c: {state: absent}\nskills:\n  s: absent\n' ;;
+              2) printf 'config_files:\n  "f one.json": {k: absent, n: null}\nplugins:\n  a: absent\n' ;;
+              3) printf 'plugins:\n  a: &x absent\n  b: *x\nskills:\n  t: &y enabled\n  u: *y\n' ;;
+              4) printf 'plugins:\n  "\303\274": enabled\n  d: null\nagents:\n  g: absent\n' ;;
+            esac >"$diff_root/fleet.yaml"
+            [ "$diff_o" = 1 ] ||
+              printf 'plugins:\n  a: {state: disabled}\n  e: absent\n' >"$diff_root/os/macos.yaml"
+            case $diff_g in
+              2) printf 'plugins:\n  b: enabled\n  a: absent\n' >"$diff_root/groups/dev.yaml" ;;
+              3) printf 'skills:\n  s: enabled\nplugins: null\n' >"$diff_root/groups/dev.yaml" ;;
+            esac
+            {
+              printf 'platform: macos\ngroups: [dev]\n'
+              case $diff_h in
+                2) printf 'plugins:\n  a: enabled\n' ;;
+                3) printf 'liveness_alert_hours: 72\nplugins:\n  b: absent\n  c: enabled\n' ;;
+                4) printf 'plugins:\n  "\303\274": absent\n  e: {marketplace: m}\n' ;;
+              esac
+            } >"$diff_root/hosts/vireo.yaml"
+            diff_case="f$diff_f o$diff_o g$diff_g h$diff_h"
+            diff_files=$(fleet_layer_files "$diff_root" vireo)
+            # shellcheck disable=SC2086 # the file list, split on newlines only
+            diff_old=$(IFS='
+'; set -f; yq ea -o=json -I=0 "$old_effective" $diff_files)
+            # shellcheck disable=SC2086
+            diff_old_raw=$(IFS='
+'; set -f; yq ea -o=json -I=0 "$fleet_fold_merge_program" $diff_files)
+            diff_old_tomb=$(printf '%s\n' "$diff_old_raw" | jq -c '
+              (.plugins // {}) as $e | if ($e | type) != "object" then {}
+              else ($e | with_entries(select(.value == "absent"))) as $d |
+                if $d == {} then {} else {plugins: $d} end end')
+            diff_old_desired=$(printf '%s\n%s\n' "$diff_old" "$diff_old_tomb" | jq -c -s '.[0] * .[1]')
+            jq -en --argjson a "$diff_old" --argjson b "$(fleet_fold "$diff_root" vireo)" '$a == $b' >/dev/null ||
+              fail "differential $diff_case: the effective fold changed"
+            jq -en --argjson a "$diff_old_raw" --argjson b "$(fleet_fold "$diff_root" vireo raw)" '$a == $b' >/dev/null ||
+              fail "differential $diff_case: the raw fold changed"
+            jq -en --argjson a "$diff_old_tomb" --argjson b "$(fleet_fold_tombstones "$diff_root" vireo plugins)" '$a == $b' >/dev/null ||
+              fail "differential $diff_case: the tombstone reader changed"
+            jq -en --argjson a "$diff_old_desired" --argjson b "$(fleet_run_desired "$diff_root" vireo)" '$a == $b' >/dev/null ||
+              fail "differential $diff_case: the desired document changed"
+            diff_count=$((diff_count + 1))
+          done
+        done
+      done
+    done
+    [ "$diff_count" -eq 96 ] || fail "differential ran $diff_count fixtures, not 96"
   )
 fi

@@ -3008,8 +3008,7 @@ fleet_run_desired() {
   # verbs, so `fleet-review`, `fleet-apply` and the run all see a scalar
   # `absent` tombstone the same way. The plain fold stays what every reader of
   # desired STATE wants — policy, package managers, the alert detections.
-  printf '%s\n' "$(fleet_fold "$1" "$2")" \
-    "$(fleet_fold_tombstones "$1" "$2" plugins)" | jq -c -s '.[0] * .[1]'
+  fleet_fold "$1" "$2" keep-plugin-tombstones
 }
 
 fleet_run_tombstone_items() {
