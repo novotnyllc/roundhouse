@@ -188,12 +188,14 @@ enrolled host that has published no heartbeat within `liveness_alert_hours`
 published heartbeat, and clears it when the peer is heard from again. Both keys are ordinary store policy;
 `0` turns the throttle or the alert off.
 
-A machine entry may set the same `liveness_alert_hours` key in `config.json`,
-next to `"scheduler"`, as a per-host override of that store policy. The value
-is a positive integer; omitted or null keeps the policy (and hosts that do
-not set it are unchanged). Peers use that host's window when they check it,
-so an externally scheduled host whose routine is weekday-only can cover the
-weekend gap without widening the window for the rest of the fleet.
+A host file may set the same `liveness_alert_hours` key in
+`hosts/<name>.yaml` as a per-host override of that store policy. The value is
+a positive integer (a host fact, not a category). Omitted or a non-positive
+or non-integer value keeps the policy, and hosts that do not set it are
+unchanged. Peers read that host's window from the signed store when they
+check it, so one reviewed edit covers the fleet: an externally scheduled
+host whose routine is weekday-only can cover the weekend gap without
+widening the window for everyone else.
 
 **Plugins are always current**, from every marketplace, in both harnesses,
 and never wait on the canary (`plugins.*` and `definitions.plugins.*` skip

@@ -306,14 +306,6 @@ validate_config_file() {
       (has("scheduler") == false or .scheduler == null or
         (.scheduler | IN("native","external")) and
         (if .scheduler == "external" then .transport == "local" else true end)) and
-      # Per-host override of the store policy `liveness_alert_hours` (default
-      # 12). A host whose passes are rarer than that window — an externally
-      # scheduled weekday-only routine, for example — sets a longer one so
-      # peers do not raise stale-host between its passes. Omitted or null
-      # keeps the store policy. When set, a positive integer only; 0 does
-      # not disable the alert here (the store policy still can).
-      (has("liveness_alert_hours") == false or .liveness_alert_hours == null or
-        (.liveness_alert_hours | type == "number" and floor == . and . >= 1)) and
       (if .platform == "windows" then .transport == "codex-remote-control" else true end) and
       (if .transport == "codex-remote-control" then
         .platform == "windows" and (.codex_host | type == "string" and length > 0)

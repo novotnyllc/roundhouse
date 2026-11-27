@@ -26,10 +26,11 @@
 # The window is never shorter than TWO publication windows
 # (2 × heartbeat_publish_hours): a shorter one would alert on every healthy,
 # quiet host between its heartbeats.
-# A machine entry may set the same `liveness_alert_hours` key in config.json
-# to override the store policy for that host only; peers use it when they
-# check that host. Omitted, the policy (and the 12h default) still apply.
-# Store policy `0` still turns the alert off for every host.
+# A host file may set the same `liveness_alert_hours` key in
+# hosts/<peer>.yaml to override the store policy for that host only; peers
+# read it from the signed store (the reviewed tree) when they check that
+# host. Omitted, the policy (and the 12h default) still apply. Store policy
+# `0` still turns the alert off for every host.
 # It reads only the store's own journal, so it works whether or not any other
 # tool (fleet-chezmoi included) is installed.
 #
@@ -123,25 +124,28 @@ fleet_heartbeat_publish() {
 }
 
 fleet_host_liveness_alert_hours() {
-  # fleet_host_liveness_alert_hours PEER FOLD — this peer's stale-host
-  # window in hours. A positive integer on the peer's config.json entry
-  # (`liveness_alert_hours`, next to `scheduler`) overrides the store
-  # policy; missing config, a missing key, null, or a non-positive value
-  # keeps the policy (default 12). Store policy `0` still disables the
-  # alert for every host, override or not. A positive window is then
-  # clamped to at least 2 × heartbeat_publish_hours.
-  host_liveness_policy=$(fleet_policy_int "$2" liveness_alert_hours)
+  # fleet_host_liveness_alert_hours LAYERS PEER FOLD — this peer's stale-host
+  # window in hours. A positive integer host fact `liveness_alert_hours` on
+  # the peer's hosts/<peer>.yaml (folded from LAYERS, the reviewed tree)
+  # overrides the store policy; missing layers, a missing key, or a
+  # non-positive or non-integer value keeps the policy (default 12). Store
+  # policy `0` still disables the alert for every host, override or not.
+  # A positive window is then clamped to at least 2 × heartbeat_publish_hours.
+  host_liveness_policy=$(fleet_policy_int "$3" liveness_alert_hours)
   if [ "$host_liveness_policy" -le 0 ] 2>/dev/null; then
     printf '0\n'
     return
   fi
-  host_liveness_hours=$(jq -r --arg h "$1" '
-      try (.machines[$h].liveness_alert_hours
-           | if type == "number" and floor == . and . >= 1
-             then floor | tostring else empty end)
-      catch empty' "$(config_path)" 2>/dev/null) || host_liveness_hours=
+  host_liveness_hours=
+  if [ -n "$1" ]; then
+    host_liveness_hours=$(fleet_host_facts "$1" "$2" 2>/dev/null | jq -r '
+        try (.liveness_alert_hours
+             | if type == "number" and floor == . and . >= 1
+               then floor | tostring else empty end)
+        catch empty') || host_liveness_hours=
+  fi
   [ -n "$host_liveness_hours" ] || host_liveness_hours=$host_liveness_policy
-  host_liveness_floor=$(($(fleet_policy_int "$2" heartbeat_publish_hours) * 2))
+  host_liveness_floor=$(($(fleet_policy_int "$3" heartbeat_publish_hours) * 2))
   [ "$host_liveness_hours" -ge "$host_liveness_floor" ] 2>/dev/null ||
     host_liveness_hours=$host_liveness_floor
   printf '%s\n' "$host_liveness_hours"
@@ -163,17 +167,17 @@ fleet_liveness_last_alive() {
 }
 
 fleet_liveness_alerts() {
-  # fleet_liveness_alerts STORE HOST HOSTS-FILE ROSTER-FILE FOLD NOW-ISO [SCANNED-REV]
+  # fleet_liveness_alerts STORE HOST HOSTS-FILE ROSTER-FILE FOLD NOW-ISO [SCANNED-REV [LAYERS]]
   #
   # Every OTHER enrolled host — and, when the reviewed roster is readable, only
   # those still in it, so a retired or expired member is not a silent one — is
   # checked for a published heartbeat inside that peer's liveness window
   # (fleet_host_liveness_alert_hours): the store policy `liveness_alert_hours`
   # (default 12, clamped to at least 2 × heartbeat_publish_hours), or that
-  # peer's config.json override when it sets the same key. A host that has
-  # never journaled is not silent: enrolled-but-never-run is what
-  # fleet-doctor's enrollment rows are for. Store policy `0` turns the scan
-  # off for every host.
+  # peer's hosts/<peer>.yaml override when it sets the same key as a host
+  # fact. A host that has never journaled is not silent: enrolled-but-never-run
+  # is what fleet-doctor's enrollment rows are for. Store policy `0` turns
+  # the scan off for every host.
   #
   # `stale-host` is a store-scoped CONDITION (lib/fleet-alerts.sh), one keyed
   # alert per peer (`stale-host--<peer>.yaml`): this check raises it while the
@@ -186,12 +190,14 @@ fleet_liveness_alerts() {
   # Prints `stale <host>` per silent host, and records when the scan is next
   # owed (fleet_liveness_record) against SCANNED-REV, the commit whose journal
   # it read.
-  liveness_hours=$(fleet_policy_int "$5" liveness_alert_hours)
+  liveness_policy=$(fleet_policy_int "$5" liveness_alert_hours)
+  liveness_hours=$liveness_policy
+  liveness_layers=${8:-$1}
   liveness_checked=" "
   liveness_heard=
   liveness_watch=
   liveness_dir="$1/alerts/$2"
-  if [ "$liveness_hours" -gt 0 ] 2>/dev/null; then
+  if [ "$liveness_policy" -gt 0 ] 2>/dev/null; then
     liveness_now=$(jq -rn --arg at "$6" '$at | fromdateiso8601') || return 1
     while IFS= read -r liveness_peer; do
       [ -n "$liveness_peer" ] && [ "$liveness_peer" != "$2" ] || continue
@@ -201,7 +207,7 @@ fleet_liveness_alerts() {
       fi
       liveness_slug=$(printf '%s' "$liveness_peer" | tr -c 'A-Za-z0-9._-' '-')
       liveness_checked="$liveness_checked$liveness_slug "
-      liveness_hours=$(fleet_host_liveness_alert_hours "$liveness_peer" "$5")
+      liveness_hours=$(fleet_host_liveness_alert_hours "$liveness_layers" "$liveness_peer" "$5")
       liveness_cutoff=$(jq -rn --argjson e "$((liveness_now - liveness_hours * 3600))" \
         '$e | todate') || return 1
       liveness_status=0
@@ -238,7 +244,9 @@ fleet_liveness_alerts() {
     case $liveness_checked in *" $liveness_slug "*) continue ;; esac
     fleet_alert_clear "$1" "$2" stale-host "$liveness_slug" || :
   done
-  fleet_liveness_record "$liveness_heard" "$liveness_watch" "$liveness_hours" \
+  # HOURS is the store policy, not the last peer's window: heard lines already
+  # carry per-peer hours, and this is only the fallback when a line omits them.
+  fleet_liveness_record "$liveness_heard" "$liveness_watch" "$liveness_policy" \
     "${7:-}"
 }
 

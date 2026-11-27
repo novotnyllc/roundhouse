@@ -45,6 +45,7 @@ user
 package_managers
 groups
 wsl_sibling
+liveness_alert_hours
 EOF
 }
 
