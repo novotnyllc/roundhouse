@@ -26,39 +26,137 @@ fleet_capture_id_valid() {
   esac
 }
 
-fleet_agent_pending_path() {
+fleet_agent_journal_path() {
   local id=$1
   fleet_capture_id_valid "$id" || return 1
+  case $id in *@__unqualified__) return 1 ;; esac
   if [ "${#id}" -gt 200 ]; then
     id=$(printf '%s' "$id" | sha256_stream) || return 1
   fi
-  fleet_instance_path "store.run/agent-pending/${id/:/.}"
+  fleet_instance_path "store.run/agent-journal/${id/:/.}"
 }
 
-fleet_agent_pending_mark() {
-  local id=$1:$2 path record
-  path=$(fleet_agent_pending_path "$id") || return 1
-  record=$(jq -cn --arg id "$id" --arg from "$3" --arg to "$4" --arg via "${5:-}" \
-    '{id:$id,from:$from,to:$to} + if $via == "" then {} else {via:$via} end') || return 1
-  fleet_capture_json_write "$path" "$record"
+fleet_capture_home() {
+  local dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude} suffix=
+  # A first install may not have created its home yet.
+  case $dir in /*) ;; *) dir=$PWD/$dir ;; esac
+  while [ ! -d "$dir" ]; do
+    [ ! -L "$dir" ] || return 1
+    case ${dir##*/} in .|..) return 1 ;; esac
+    suffix=/${dir##*/}$suffix
+    dir=${dir%/*}
+    [ -n "$dir" ] || dir=/
+  done
+  dir=$(CDPATH='' cd -P -- "$dir" && pwd -P) || return 1
+  if [ "$dir" = / ] && [ -z "$suffix" ]; then printf '/\n'
+  else printf '%s%s\n' "${dir%/}" "$suffix"; fi
 }
 
-fleet_agent_pending_matches() {
-  [ -f "$1" ] && [ ! -L "$1" ] || return 1
-  jq -se --arg id "$2" --arg from "$3" --arg to "$4" '
-    length == 1 and (.[0] | .id == $id and .from == $from and
-      (.to == $to or .via == $to) and $from != $to)
-  ' "$1" >/dev/null 2>&1
+fleet_agent_journal_read() {
+  local path record home
+  path=$(fleet_agent_journal_path "$1") || return 1
+  home=$(fleet_capture_home) || return 1
+  record=$(fleet_capture_json_read "$path" '{}') || return 1
+  jq -ce --arg id "$1" --arg home "$home" '
+    if . == {} then {id:$id,home:$home}
+    elif .id == $id then . else error("journal identity mismatch") end' <<<"$record"
+}
+
+fleet_capture_next_seq() {
+  # All mutating entrypoints hold the instance run lock.
+  local path seq
+  path=$(fleet_instance_path store.run/agent-seq)
+  seq=$(fleet_capture_json_read "$path" '{"seq":0}') || return 1
+  seq=$(jq -er '.seq | if type == "number" and . >= 0 and floor == . then . + 1
+    else error("invalid sequence") end' <<<"$seq") || return 1
+  fleet_capture_json_write "$path" "{\"seq\":$seq}" || return 1
+  printf '%s\n' "$seq"
+}
+
+fleet_agent_journal_unresolved() {
+  local home
+  home=$(fleet_capture_home) || return 0
+  jq -e --arg home "$home" --arg active "${fleet_capture_active_op:-}" '
+    .home != $home or (.intent != null and
+      (.intent.op_id != $active or $active == ""))' >/dev/null <<<"$1"
+}
+
+fleet_agent_receipt_matches() {
+  jq -e --arg state "$2" '
+    .receipt as $r | $r != null and
+    (if $state == "absent" then $r.installed == false
+     elif $state | IN("enabled","disabled") then
+       $r.installed == true and $r.state == $state
+     else false end)' >/dev/null <<<"$1"
+}
+
+fleet_capture_journal_clear() {
+  local path
+  path=$(fleet_agent_journal_path "$1") || return 1
+  rm -f "$path"
+}
+
+fleet_capture_quarantine_path() {
+  local key
+  key=$(printf '%s' "$1" | sha256_stream) || return 1
+  fleet_instance_path "store.run/agent-quarantine/$key"
+}
+
+fleet_capture_quarantined() {
+  local path
+  path=$(fleet_capture_quarantine_path "$1") || return 0
+  [ -e "$path" ]
+}
+
+fleet_capture_name_unique() {
+  jq -e --arg name "$1" '[.[] | select(.id != null) | .id |
+    select((ltrimstr("claude:") | split("@")[0]) == $name)] | unique | length == 1' \
+    >/dev/null <<<"$2"
+}
+
+fleet_capture_migrate_pending() {
+  local dir path id journal home record seq name
+  dir=$(fleet_instance_path store.run)
+  for path in "$dir"/agent-pending/*; do
+    [ -f "$path" ] && [ ! -L "$path" ] || continue
+    record=$(fleet_capture_json_read "$path" '{}') || record='{}'
+    id=$(jq -r '.id // empty' <<<"$record") || id=
+    if ! fleet_capture_id_valid "$id"; then
+      # A damaged marker still has its physical filename; never infer a marketplace.
+      id=${path##*/}
+      id=${id/claude./claude:}
+    fi
+    fleet_capture_id_valid "$id" || continue
+    case $id in
+      *@__unqualified__)
+        # Old bare-name intent cannot establish which marketplace was mutated.
+        name=${id#claude:}; name=${name%@*}
+        journal=$(fleet_capture_quarantine_path "$name") || return 1
+        record=$(jq -cn --arg name "$name" --argjson old "$record" \
+          '{name:$name,intent:$old}') || return 1
+        fleet_capture_json_write "$journal" "$record" || return 1
+        rm -f "$path" || return 1
+        continue ;;
+    esac
+    journal=$(fleet_agent_journal_path "$id") || return 1
+    home=$(fleet_capture_home) || return 1
+    seq=$(fleet_capture_next_seq) || return 1
+    # Even a pre-existing receipt cannot resolve an older ambiguous intent.
+    record=$(fleet_agent_journal_read "$id") || return 1
+    record=$(jq -c --argjson seq "$seq" '.intent = {op:"legacy",to:null,
+      from:null,op_id:"legacy-unresolved",pid:0,start:"",seq:$seq}' <<<"$record") || return 1
+    fleet_capture_json_write "$journal" "$record" || return 1
+    rm -f "$path" || return 1
+  done
 }
 
 fleet_capture_pending_ids() (
   local dir path id
   dir=$(fleet_instance_path store.run)
-  for path in "$dir"/agent-pending/*; do
+  for path in "$dir"/agent-journal/*; do
     [ -f "$path" ] && [ ! -L "$path" ] || continue
     id=$(jq -er '.id | strings' "$path") || continue
-    case $id in claude:*@__unqualified__) continue ;; esac
-    [ "$path" = "$(fleet_agent_pending_path "$id")" ] || continue
+    [ "$path" = "$(fleet_agent_journal_path "$id")" ] || continue
     printf '%s\n' "$id"
   done
 )
@@ -129,8 +227,19 @@ fleet_capture_claude_observe() {
     end'
 }
 
+fleet_capture_owned_absent() (
+  local id journal
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    journal=$(fleet_agent_journal_read "$id") || continue
+    ! fleet_agent_journal_unresolved "$journal" || continue
+    jq -e '.intent == null and .receipt.installed == false' >/dev/null <<<"$journal" || continue
+    printf '%s\n' "$id"
+  done < <(fleet_capture_pending_ids)
+)
+
 fleet_capture_observe() {
-  local lists claude retry=false
+  local lists claude retry=false owned_absent
   lists=$(jq -cs "$fleet_capture_listing_filter"'
     {claude:listing, retry:any(.[]; .kind == "plugin_manager" and
       .data.agent == "claude" and .status == "unavailable")}' "$1") ||
@@ -144,7 +253,9 @@ fleet_capture_observe() {
       [ -e "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json" ]; }; then
     retry=true
   fi
-  jq -cn --argjson claude "$claude" --argjson retry "$retry" '{claude:$claude,retry:$retry}'
+  owned_absent=$(fleet_capture_owned_absent | jq -Rn '[inputs]') || return 1
+  jq -cn --argjson claude "$claude" --argjson retry "$retry" --argjson owned_absent "$owned_absent" \
+    '{claude:$claude,retry:$retry,owned_absent:$owned_absent}'
 }
 
 fleet_capture_collect() {
@@ -166,7 +277,11 @@ fleet_capture_authority_filter='
     $observed[$h] != null and
     (any($observed[$h][]?; .value | IN("enabled","disabled")) or
       all($baseline | to_entries[] | select(.key | startswith($h + ":"));
-        .value | (if type == "object" then .value else null end) | IN("enabled","disabled") | not));'
+        .value | (if type == "object" then .value else null end) |
+        IN("enabled","disabled") | not) or
+      all($baseline | to_entries[] | select(.key | startswith($h + ":")) |
+        select(.value | objects | .value | IN("enabled","disabled"));
+        .key as $id | ($observed.owned_absent // [] | index($id)) != null));'
 
 fleet_capture_rows() {
   # Join desired item names to physical harness IDs. Claude can omit the
@@ -297,19 +412,29 @@ fleet_capture_rebaseline() {
   if [ "$updated" != "$baseline" ]; then
     fleet_capture_json_write "$dir/agent-baseline.json" "$updated" || return 1
   fi
-  settled=$(jq -r --argjson updated "$updated" '.[] |
-    if .id == null and .ours == "absent" and .theirs == "absent" and
-      $updated[.item] == {value:"absent"} then "claude:" + .name + "@__unqualified__"
-    else select(.id != null and (.ours | IN("enabled","disabled","absent")) and
-      ((.ours == .theirs and $updated[.id] == {value:.theirs}) or
-       (.theirs == "missing" and
-        (.base == null or $updated[.id] == null or .base == {value:.ours,ignored:true})))) |
-      .id, (select(.unqualified == true) | (.id | split("@")[0]) + "@__unqualified__")
-    end' <<<"$rows") || return 1
+  settled=$(jq -r --argjson updated "$updated" --argjson observed "$observed" \
+    --argjson baseline "$baseline" "$fleet_capture_authority_filter"'
+    .[] | select(.id != null and authoritative($observed; $baseline; .harness)) |
+    select((.ours == .theirs and $updated[.id] == {value:.theirs}) or
+      (.theirs == "missing" and (.base == null or $updated[.id] == null or
+        .base == {value:.ours,ignored:true}))) | .id' <<<"$rows") || return 1
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    local marker
-    marker=$(fleet_agent_pending_path "$id") || continue
-    rm -f "$marker" || return 1
+    # An interrupted verb settles only on trusted store agreement or discard.
+    local journal
+    journal=$(fleet_agent_journal_read "$id") || return 1
+    if fleet_agent_journal_unresolved "$journal" &&
+      ! jq -e --arg id "$id" 'any(.[]; .id == $id and .ours == .theirs)' >/dev/null <<<"$rows"; then
+      continue
+    fi
+    fleet_capture_journal_clear "$id" || return 1
+    if jq -e --arg id "$id" 'any(.[]; .id == $id and .ours == .theirs)' >/dev/null <<<"$rows"; then
+      local quarantine name
+      name=${id#claude:}; name=${name%@*}
+      if fleet_capture_name_unique "$name" "$rows"; then
+        quarantine=$(fleet_capture_quarantine_path "$name") || return 1
+        rm -f "$quarantine" || return 1
+      fi
+    fi
   done <<<"$settled"
 }

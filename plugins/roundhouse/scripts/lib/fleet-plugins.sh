@@ -323,14 +323,12 @@ fleet_plugins_claude_update_unowned() {
         continue
         ;;
     esac
-    fleet_run_cli_invalidate
     # The manager writes under the caller's umask (002 leaves the cache
     # group-writable): seal it before its identity is accepted, as the item
     # loop does, so a group member cannot edit the hooks it will run.
     fleet_plugins_cu_status=0
-    if ! fleet_capture_claude_update "$fleet_plugins_cu_id" \
-      bounded_verb claude plugin update "$fleet_plugins_cu_id" --scope user \
-      >/dev/null 2>&1 </dev/null; then
+    if ! fleet_capture_verb "claude:$fleet_plugins_cu_id" update unchanged -- \
+      fleet_run_claude_plugin_verb update "$fleet_plugins_cu_id" --scope user </dev/null; then
       fleet_plugins_cu_status=74
     elif ! plugin_cache_seal_permissions "$fleet_plugins_cu_id"; then
       printf '  hold  plugin %s — its updated cache cannot be sealed\n' "$fleet_plugins_cu_id"

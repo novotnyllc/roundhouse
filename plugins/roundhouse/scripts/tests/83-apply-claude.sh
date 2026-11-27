@@ -493,7 +493,7 @@ JSON
     }
     run_tomb_apply() {
       run_status=0
-      CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_PLUGIN_LIST_FROM_RECORDS=1 \
         CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
         fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
           "$1" '' >"$run_root/tomb-out" 2>&1 || run_status=$?

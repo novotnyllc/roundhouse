@@ -88,6 +88,7 @@ record-write           condition  item
 agent-local-change     condition  item
 agent-capture-conflict condition  item
 agent-capture-ambiguous condition item
+agent-capture-interrupted condition item
 identity-unavailable   condition  item
 uninstall-deferred     condition  item
 package-deferred       condition  item

@@ -43,6 +43,14 @@ MERGE
     mkdir -p "$rh_capture_store/fleet" "$rh_capture_store/hosts" "$rh_capture_tmp" \
       "$CLAUDE_CONFIG_DIR/plugins"
     rh_capture_dir=$(fleet_instance_path store.run)
+    capture_receipt() {
+      local id=$1 state=$2 record
+      record=$(jq -cn --arg id "$id" --arg home "$(cd "$CLAUDE_CONFIG_DIR" && pwd -P)" \
+        --arg state "$state" '{id:$id,home:$home,receipt:{installed:($state != "absent"),
+          state:(if $state == "absent" then null else $state end),seq:1,
+          op:(if $state == "absent" then "uninstall" else "disable" end)}}')
+      fleet_capture_json_write "$(fleet_agent_journal_path "$id")" "$record"
+    }
     cat >"$rh_capture_store/fleet.yaml" <<'YAML'
 plugins:
   keeper: {state: enabled, marketplace: m}
@@ -77,40 +85,44 @@ YAML
 
     fleet_capture_fingerprint >"$rh_capture_dir/agent-fingerprint"
     if fleet_capture_dirty; then fail "agreed fingerprints kept polling open"; fi
-    fleet_agent_pending_mark claude keeper@m enabled disabled
-    fleet_capture_dirty || fail "a pending marker let the fast pass skip re-observation"
-    rh_mark=$(fleet_agent_pending_path claude:keeper@m)
-    cp "$rh_mark" "$rh_capture_root/before-update.json"
-    [ "$(fleet_capture_claude_update keeper@m printf 'updated\n')" = updated ] &&
-      cmp "$rh_mark" "$rh_capture_root/before-update.json" ||
-      fail "a version update did not run or replaced a pending state transition"
+    capture_receipt claude:keeper@m disabled
+    fleet_capture_dirty || fail "a pending receipt let the fast pass skip re-observation"
+    rh_journal=$(fleet_agent_journal_path claude:keeper@m)
+    cp "$rh_journal" "$rh_capture_root/before-update.json"
+    (
+      fleet_run_installed_plugins() { printf '%s\n' '{"keeper@m":[{"scope":"user"}]}'; }
+      fleet_run_plugin_enabled() { printf 'false\n'; }
+      [ "$(fleet_capture_verb claude:keeper@m update unchanged -- printf 'updated\n')" = updated ] &&
+        cmp "$rh_journal" "$rh_capture_root/before-update.json"
+    ) ||
+      fail "a version update did not run or replaced a state receipt"
     rh_capture_changed=$(jq -c '.claude["keeper@m"].value = "disabled"' <<<"$rh_capture_ours")
     fleet_capture_prepare "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true true "$rh_capture_tmp"
-    # With usable inventory, pending keeper stays eligible; the local install against absent stays held.
+    # Keeper's verified state stays eligible; the local install against absent stays held.
     jq -e 'has("plugins.keeper") | not' <<<"$fleet_capture_skip" >/dev/null ||
-      fail "a marked plugin difference stopped ordinary convergence"
+      fail "a verified plugin change stopped ordinary convergence"
     jq -e 'has("plugins.capped")' <<<"$fleet_capture_skip" >/dev/null ||
       fail "the disabled local install lost its first-pass hold against the absent baseline"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true
-    [ -f "$rh_mark" ] || fail "cleared the marker before agreement"
+    [ -f "$rh_journal" ] || fail "cleared the receipt before agreement"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true
-    [ ! -e "$rh_mark" ] || fail "agreed marker did not clear"
+    [ ! -e "$rh_journal" ] || fail "agreed receipt did not clear"
     fleet_capture_prepare "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true true "$rh_capture_tmp"
     jq -e 'has("plugins.keeper")' <<<"$fleet_capture_skip" >/dev/null ||
-      fail "the same unmarked difference would be reverted"
+      fail "the same difference without a receipt would be reverted"
 
     rh_capture_legacy=$(jq -c '.plugins.legacy = "absent"' <<<"$rh_capture_fold")
-    fleet_agent_pending_mark claude legacy@m enabled absent
+    capture_receipt claude:legacy@m absent
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_legacy" "$rh_capture_ours" true
     jq -e '.["claude:legacy@m"].value == "absent"' "$rh_capture_dir/agent-baseline.json" >/dev/null &&
-      [ ! -e "$(fleet_agent_pending_path claude:legacy@m)" ] ||
-      fail "an unqualified tombstone lost the identity recorded by its marker"
-    fleet_capture_mark_claude retired enabled absent
-    rh_mark=$(fleet_agent_pending_path claude:retired@__unqualified__)
+      [ ! -e "$(fleet_agent_journal_path claude:legacy@m)" ] ||
+      fail "an unqualified tombstone lost the identity recorded by its receipt"
+    capture_receipt claude:retired@m absent
+    rh_journal=$(fleet_agent_journal_path claude:retired@m)
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" '{"claude":null}' true
-    [ -f "$rh_mark" ] || fail "an unknown observation cleared the unqualified marker"
+    [ -f "$rh_journal" ] || fail "an unknown observation cleared the unqualified tombstone's receipt"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true
-    [ ! -e "$rh_mark" ] || fail "the agreed unqualified tombstone left its marker pending"
+    [ ! -e "$rh_journal" ] || fail "the agreed unqualified tombstone left its receipt pending"
 
     # Capture and apply must resolve an empty override through definitions.
     (
@@ -221,7 +233,7 @@ JSONL
       fail "a wiped inventory was read as a known local removal"
 
     (
-      # #133: removal markers must explain every baseline install, including disabled ones.
+      # #133: a partial set of removal receipts cannot explain an empty inventory.
       ROUNDHOUSE_FLEET_STORE="$rh_capture_root/empty-controls/store"
       mkdir -p "$ROUNDHOUSE_FLEET_STORE/fleet" "$ROUNDHOUSE_FLEET_STORE/hosts"
       rh_empty_dir=$(fleet_instance_path store.run)
@@ -229,15 +241,14 @@ JSONL
       rh_empty_fold='{"plugins":{"keeper":{"state":"absent","marketplace":"m"},"extra":{"state":"disabled","marketplace":"m"}}}'
       fleet_capture_json_write "$rh_empty_dir/agent-baseline.json" "$rh_empty_base"
       cp "$rh_empty_dir/agent-baseline.json" "$rh_capture_root/empty-baseline.json"
-      for rh_empty_case in unexplained some-marked; do
-        if [ "$rh_empty_case" = some-marked ]; then
-          fleet_agent_pending_mark claude keeper@m enabled absent
-          fleet_agent_pending_mark claude extra@m enabled disabled
+      for rh_empty_case in unexplained some-receipts; do
+        if [ "$rh_empty_case" = some-receipts ]; then
+          capture_receipt claude:keeper@m absent
+          capture_receipt claude:extra@m disabled
         fi
         rh_empty_observed=$(fleet_capture_observe "$rh_capture_root/empty.jsonl")
-        jq -e --arg case "$rh_empty_case" '.claude == {} and
-          ((.owned_absent // []) == (if $case == "some-marked" then ["claude:keeper@m"] else [] end))' \
-          <<<"$rh_empty_observed" >/dev/null || fail "$rh_empty_case empty inventory lost its marker provenance"
+        jq -e '.claude == {}' <<<"$rh_empty_observed" >/dev/null ||
+          fail "$rh_empty_case empty inventory did not produce an empty observation"
         fleet_capture_rows "$ROUNDHOUSE_FLEET_STORE" "$rh_empty_fold" "$rh_empty_observed" "$rh_empty_base" |
           jq -e 'length == 2 and all(.[]; .ours == "unobserved")' >/dev/null ||
           fail "$rh_empty_case empty inventory manufactured a known absence"
@@ -253,24 +264,28 @@ JSONL
           fail "$rh_empty_case empty inventory changed agreement"
       done
       for rh_empty_id in keeper@m extra@m; do
-        [ -f "$(fleet_agent_pending_path "claude:$rh_empty_id")" ] ||
-          fail "partly explained empty inventory cleared $rh_empty_id's marker"
-        fleet_agent_pending_mark claude "$rh_empty_id" enabled absent
+        jq -e --arg id "$rh_empty_id" '.id == ("claude:" + $id) and
+          (if $id == "keeper@m" then .receipt.installed == false and .receipt.state == null
+          else .receipt.installed == true and .receipt.state == "disabled" end)' \
+          "$(fleet_agent_journal_path "claude:$rh_empty_id")" >/dev/null ||
+          fail "partly explained empty inventory lost $rh_empty_id's receipt"
+        capture_receipt "claude:$rh_empty_id" absent
       done
-      # Even a complete set of removal markers cannot authorize a bad listing.
+      # Even a complete set of removal receipts cannot authorize a bad listing.
       for rh_bad_listing in partial failed; do
         rh_empty_observed=$(fleet_capture_observe "$rh_capture_root/$rh_bad_listing.jsonl")
-        jq -e '.claude == null and .retry == true and (has("owned_absent") | not)' \
-          <<<"$rh_empty_observed" >/dev/null || fail "removal markers authorized a $rh_bad_listing listing"
+        jq -e '.claude == null and .retry == true' \
+          <<<"$rh_empty_observed" >/dev/null || fail "removal receipts authorized a $rh_bad_listing listing"
         fleet_capture_rows "$ROUNDHOUSE_FLEET_STORE" "$rh_empty_fold" "$rh_empty_observed" "$rh_empty_base" |
           jq -e 'length == 2 and all(.[]; .ours == "unobserved")' >/dev/null ||
           fail "$rh_bad_listing listing manufactured absence despite unknown inventory"
         fleet_capture_rebaseline "$ROUNDHOUSE_FLEET_STORE" mac "$rh_empty_fold" "$rh_empty_observed" true
         cmp "$rh_empty_dir/agent-baseline.json" "$rh_capture_root/empty-baseline.json" >/dev/null ||
-          fail "$rh_bad_listing listing advanced agreement with removal markers"
+          fail "$rh_bad_listing listing advanced agreement with removal receipts"
         for rh_empty_id in keeper@m extra@m; do
-          [ -f "$(fleet_agent_pending_path "claude:$rh_empty_id")" ] ||
-            fail "$rh_bad_listing listing cleared $rh_empty_id's removal marker"
+          jq -e '.receipt.installed == false and .receipt.state == null' \
+            "$(fleet_agent_journal_path "claude:$rh_empty_id")" >/dev/null ||
+            fail "$rh_bad_listing listing lost $rh_empty_id's removal receipt"
         done
       done
     )
@@ -292,13 +307,13 @@ JSONL
       fleet_vcs_desired_digest() {
         if [ "$2" = observed ]; then printf 'old-tree\n'; else printf 'new-tree\n'; fi
       }
-      fleet_agent_pending_mark claude keeper@m enabled disabled
+      capture_receipt claude:keeper@m disabled
       cp "$rh_capture_dir/agent-baseline.json" "$rh_capture_root/before-recovery.json"
       fleet_capture_pass_agree "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_store" observed
       cmp "$rh_capture_dir/agent-baseline.json" "$rh_capture_root/before-recovery.json" >/dev/null ||
         fail "publish recovery advanced agreement against the wrong desired tree"
-      [ -e "$(fleet_agent_pending_path claude:keeper@m)" ] && [ -e "$rh_capture_dir/retry-owed" ] ||
-        fail "publish recovery cleared a marker or failed to request a fresh pass"
+      [ -e "$(fleet_agent_journal_path claude:keeper@m)" ] && [ -e "$rh_capture_dir/retry-owed" ] ||
+        fail "publish recovery cleared a receipt or failed to request a fresh pass"
     )
 
     (

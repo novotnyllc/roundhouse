@@ -1,6 +1,6 @@
 # roundhouse self-check — plugin ownership through a signed fixture fleet pass.
 # Reuses the fixture manager commands from 07 and the local jj remote from 90.
-# roundhouse-test: parts=3
+# roundhouse-test: parts=5
 # shellcheck shell=bash
 
 if [ "$real_jj_ok" = true ]; then
@@ -131,6 +131,10 @@ YAML
         mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
     }
     baseline="$rjj/vireo/store.run/agent-baseline.json"
+    journal="${baseline%/*}/agent-journal/claude.keeper@test-market"
+    capture_interrupted_alert() {
+      capture_remote grep -Eq 'kind: agent-capture-interrupted' main -- alerts/vireo
+    }
     capture_pass first
     jq -e '
       ._initialized.claude == true and
@@ -280,20 +284,24 @@ JSONL
     fi
 
     if section_part 2; then
-    # An interrupted Roundhouse mutation may leave a state change and marker.
-    capture_lib fleet_agent_pending_mark claude keeper@test-market enabled disabled
-    marker=$(capture_lib fleet_agent_pending_path claude:keeper@test-market)
+    # A legacy pre-action marker records no proof of who disabled the plugin.
+    legacy="${baseline%/*}/agent-pending/claude.keeper@test-market"
+    mkdir -p "${legacy%/*}"
+    printf '%s\n' '{"id":"claude:keeper@test-market","from":"enabled","to":"disabled"}' >"$legacy"
     jq '.["keeper@test-market"] = false' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
       mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
     printf '{"fixture_touch":true}\n' >"$settings"
     : >"$CLAUDE_PLUGIN_ACTION_LOG"
-    capture_pass marked-disable
-    grep -Fqx 'enable keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
-      fail "the interrupted apply was not converged back to the fleet"
-    [ ! -e "$marker" ] || fail "agreement did not clear the crash marker"
-    if grep -Fq 'keeper@test-market disabled locally' "$rjj/pass.log"; then
-      fail "a marked change was reported as local"
-    fi
+    capture_pass interrupted-owner-disable
+    [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] ||
+      fail "A1 interrupted disable let the next pass revert the owner's disable"
+    capture_interrupted_alert || fail "A1 migrated interrupted disable did not publish its alert"
+    [ ! -e "$legacy" ] && jq -e '.intent != null and .receipt == null' "$journal" >/dev/null ||
+      fail "A1 legacy marker was not migrated to unresolved intent"
+    jq '.["keeper@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
+      mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
+    capture_pass interrupted-owner-agreement
+    [ ! -e "$journal" ] || fail "agreement did not clear the migrated intent"
 
     before_hold=$(capture_remote rev-parse main)
     capture_owner_remove keeper@test-market
@@ -346,8 +354,7 @@ JSONL
       ([to_entries[] | select(.value | type == "object") |
         select(.value.value | IN("enabled","disabled"))] | length) == 1' \
       "$baseline" >/dev/null || fail "last-plugin regression did not start with exactly one agreed install"
-    marker=$(capture_lib fleet_agent_pending_path claude:keeper@test-market)
-    [ ! -e "$marker" ] || fail "last-plugin baseline retained a pending marker"
+    [ ! -e "$journal" ] || fail "last-plugin baseline retained a pending receipt or intent"
     cat >"$rjj/last-installed.jsonl" <<'JSONL'
 {"kind":"plugin_manager","status":"present","data":{"agent":"claude","authoritative":true,"installed_count":1}}
 {"kind":"plugin","status":"present","data":{"agent":"claude","inventory_source":"manager","manager_id":"keeper@test-market","name":"keeper","marketplace":"test-market","scope":"user","enabled":true,"installed_version":"1.0.0"}}
@@ -362,7 +369,7 @@ JSONL
     [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "an unexplained empty inventory caused a plugin mutation"
     cmp "$baseline" "$rjj/last-baseline.json" >/dev/null ||
       fail "an unexplained empty inventory changed signed-pass agreement"
-    [ ! -e "$marker" ] || fail "an unexplained empty inventory manufactured a removal marker"
+    [ ! -e "$journal" ] || fail "an unexplained empty inventory manufactured a removal receipt"
     if grep -Eq ' (added|removed|enabled|disabled) locally' "$rjj/pass.log"; then
       fail "an unexplained empty inventory generated a local hold"
     fi
@@ -373,15 +380,17 @@ JSONL
     [ "$(cat "$CLAUDE_PLUGIN_ACTION_LOG")" = 'uninstall keeper@test-market' ] ||
       fail "last-plugin tombstone did not uninstall exactly the agreed plugin"
     jq -e '.plugins == {}' "$installed" >/dev/null || fail "last-plugin removal left a nonempty inventory"
-    jq -e '. == {id:"claude:keeper@test-market",from:"enabled",to:"absent"}' "$marker" >/dev/null ||
-      fail "last-plugin removal did not leave its Roundhouse marker"
+    jq -e '.id == "claude:keeper@test-market" and .intent == null and
+      .receipt.op == "uninstall" and .receipt.installed == false and .receipt.state == null and
+      (.receipt.seq | type) == "number"' "$journal" >/dev/null ||
+      fail "last-plugin removal did not leave its verified receipt"
     jq -e '.["claude:keeper@test-market"] == {value:"enabled"}' "$baseline" >/dev/null ||
       fail "the stale listing advanced last-plugin agreement before a fresh pass"
     : >"$CLAUDE_PLUGIN_ACTION_LOG"
     capture_pass last-plugin-agreement
     jq -e '.["claude:keeper@test-market"] == {value:"absent"}' "$baseline" >/dev/null ||
       fail "#133: empty inventory did not advance last-plugin agreement to absent"
-    [ ! -e "$marker" ] || fail "#133: last-plugin agreement did not clear the removal marker"
+    [ ! -e "$journal" ] || fail "#133: last-plugin agreement did not clear the removal receipt"
     [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "last-plugin agreement mutated an empty inventory"
 
     capture_owner_install keeper@test-market
@@ -394,6 +403,80 @@ JSONL
     jq -e '.["claude:keeper@test-market"] == {value:"absent"}' "$baseline" >/dev/null ||
       fail "#133: the held reinstall advanced agreement"
     printf 'real-jj: OK (#133 last-plugin removal, empty agreement, and held owner reinstall)\n'
+    fi
+
+    if section_part 4; then
+    # The same observation could mean the operation never ran or the owner reverted it.
+    mkdir -p "${journal%/*}"
+    jq -cn --arg home "$(cd "$CLAUDE_CONFIG_DIR" && pwd -P)" '{
+      id:"claude:keeper@test-market", home:$home,
+      intent:{op:"disable",to:"disabled",from:{installed:true,state:"enabled"},
+        op_id:"dead",pid:2147483647,start:"dead",seq:1}
+    }' >"$journal"
+    yq -i '.plugins.keeper.state = "disabled" | .plugins.ponytail.state = "enabled"' \
+      "$store/fleet/capture-probe.yaml"
+    : >"$CLAUDE_PLUGIN_ACTION_LOG"
+    capture_pass interrupted-without-owner-change
+    ! grep -Eq '^(disable|uninstall) keeper@test-market$' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+      fail "A1 unchanged interrupted intent let the pass disable the plugin"
+    capture_interrupted_alert || fail "A1 unchanged interrupted intent did not publish its alert"
+    jq -e '.intent.op_id == "dead" and .receipt == null' "$journal" >/dev/null ||
+      fail "A1 observation alone cleared the unchanged interrupted intent"
+    grep -Fqx 'install ponytail@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+      fail "A1 the interrupted keeper blocked an unrelated plugin's convergence"
+
+    yq -i '.plugins.keeper.state = "enabled"' "$store/fleet/capture-probe.yaml"
+    capture_pass interrupted-agreement
+    [ ! -e "$journal" ] || fail "A1 trusted agreement did not clear the interrupted intent"
+    if capture_interrupted_alert; then
+      fail "A1 interrupted alert outlived trusted agreement"
+    fi
+    fi
+
+    if section_part 5; then
+    yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
+    memo=$(capture_lib fleet_run_tombstone_memo_path plugins.keeper)
+    before_owned=$(capture_lib fleet_applied_digest "$store" vireo plugins.keeper)
+    [ -n "$before_owned" ] || fail "Attack #11 fixture did not start with applied ownership"
+    : >"$CLAUDE_PLUGIN_ACTION_LOG"
+    (
+      trap 'rc=$?; if [ "$rc" -ne 0 ]; then cat "$rjj/pass.log" >&6; fi' EXIT
+      # shellcheck source=/dev/null
+      ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+      eval "$(declare -f fleet_run_tombstone_target | sed '1s/fleet_run_tombstone_target/capture_original_target/')"
+      eval "$(declare -f fleet_capture_pass_observe_after | sed '1s/fleet_capture_pass_observe_after/capture_original_observe_after/')"
+      fleet_run_tombstone_target() {
+        if [ "$2" = keeper ]; then
+          if [ -e "$rjj/keeper-target-seen" ] && [ ! -e "$rjj/keeper-owner-removed" ]; then
+            capture_owner_remove keeper@test-market
+            : >"$rjj/keeper-owner-removed"
+          else
+            : >"$rjj/keeper-target-seen"
+          fi
+        fi
+        capture_original_target "$@"
+      }
+      fleet_capture_pass_observe_after() {
+        # Reinstall before the post-pass observation can agree on absence.
+        capture_owner_install keeper@test-market
+        jq '.["keeper@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
+          mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
+        capture_original_observe_after "$@"
+      }
+      fleet_run_command --fast
+    ) 6>&2 >"$rjj/pass.log" 2>&1
+    [ -e "$rjj/keeper-owner-removed" ] || fail "Attack #11 fixture did not remove keeper before apply lookup"
+    [ ! -e "$memo" ] || fail "Attack #11 already-absent owner removal wrote a tombstone memo"
+    [ "$(capture_lib fleet_applied_digest "$store" vireo plugins.keeper)" = "$before_owned" ] ||
+      fail "Attack #11 already-absent owner removal changed ownership"
+    ! grep -Fqx 'uninstall keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+      fail "Attack #11 pass ran an uninstall after the owner removed keeper"
+
+    capture_pass raced-removal-reinstall
+    ! grep -Fqx 'uninstall keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+      fail "Attack #11 a later pass uninstalled the owner's reinstall"
+    jq -e '.plugins | has("keeper@test-market")' "$installed" >/dev/null ||
+      fail "Attack #11 the owner's reinstall did not stay installed"
     fi
 
     printf 'real-jj: OK (silent baseline, guarded local changes, discard, and agreement)\n'

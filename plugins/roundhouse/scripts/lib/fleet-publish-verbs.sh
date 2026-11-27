@@ -64,7 +64,7 @@ fleet_discard_command() (
   # Discard only authorizes convergence; it writes host-local state, never the store.
   fleet_run_env
   require_jq
-  local key=$1 dir status=0 decisions item kind alert held=false physical= physical_hash=
+  local key=$1 dir status=0 decisions item kind alert held=false physical= physical_hash= journal_id= journal= quarantine=
   [[ $key =~ ^(plugins\.[A-Za-z0-9_-][A-Za-z0-9._-]*(@[A-Za-z0-9_-][A-Za-z0-9._-]*)?|claude:[A-Za-z0-9_-][A-Za-z0-9._-]*@[A-Za-z0-9_-][A-Za-z0-9._-]*)$ ]] || {
     printf 'roundhouse: %s is not a Claude plugin item\n' "$key" >&2
     exit 64
@@ -86,7 +86,7 @@ fleet_discard_command() (
   case $key in *@*) physical=claude:$key ;; esac
   [ -z "$physical" ] || physical_hash="claude:sha256:$(printf '%s' "$physical" | sha256_stream | sed 's/.\{16\}/&-/g;s/-$//')"
   for item in "plugins.$key" "plugins.${key%@*}"; do
-    for kind in agent-local-change agent-capture-conflict; do
+    for kind in agent-local-change agent-capture-conflict agent-capture-interrupted; do
       alert="$(fleet_store_path)/alerts/$(fleet_host_name)/$(fleet_alert_name "$kind" "$kind" "$item")"
       if [ -f "$alert" ] && [ ! -L "$alert" ] &&
         fleet_record_read "$alert" '{}' | jq -e --arg kind "$kind" --arg item "$item" \
@@ -99,6 +99,15 @@ fleet_discard_command() (
     done
   done
   dir=$(fleet_run_state_dir)
+  journal_id=$(fleet_capture_pending_ids | jq -Rsr --arg physical "$physical" --arg name "$key" '
+    split("\n") | map(select(length > 0) |
+      select(if $physical != "" then . == $physical else startswith("claude:" + $name + "@") end)) |
+    if length == 1 then .[0] else empty end') || exit 65
+  if [ -n "$journal_id" ]; then
+    journal=$(fleet_agent_journal_read "$journal_id") || exit 65
+    ! fleet_agent_journal_unresolved "$journal" || held=true
+  fi
+  if [ -z "$physical" ] && fleet_capture_quarantined "$key"; then held=true; fi
   if [ "$held" != true ]; then
     local baseline
     baseline=$(fleet_capture_json_read "$dir/agent-baseline.json" '{}') || exit 65
@@ -118,6 +127,13 @@ fleet_discard_command() (
   decisions=$(jq -ce --arg key "$key" '.[$key] = true' <<<"$decisions") || exit 65
   mkdir -p "$dir" && : >"$dir/retry-owed" || exit 65
   fleet_capture_json_write "$dir/agent-discard.json" "$decisions" || exit 65
+  # Retire only the evidence this explicit discard saw, never a later retry's intent.
+  [ -z "$journal_id" ] || fleet_capture_journal_clear "$journal_id" || exit 65
+  case $key in
+    plugins.*)
+      quarantine=$(fleet_capture_quarantine_path "${key#plugins.}") || exit 65
+      rm -f "$quarantine" || exit 65 ;;
+  esac
   printf 'roundhouse: recorded discard for %s; the next fleet pass will converge it\n' "$key"
 )
 

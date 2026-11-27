@@ -569,6 +569,33 @@ fleet_run_plugin_identity_matches() {
 
 # --- §3.4/§3.5 tombstones: `absent` uninstalls through the harness ----------
 
+fleet_run_user_plugin_id() {
+  jq -er --arg name "$1" '
+    [to_entries[] | select((.key | split("@")[0]) == $name) |
+      select(any(.value[]; .scope == "user")) | .key] |
+    if length <= 1 then (.[0] // "") else error("ambiguous plugin name") end' <<<"$2"
+}
+
+fleet_run_qualify_plugin() {
+  local name=$1 records id catalog
+  records=$(fleet_run_installed_plugins) || return 75
+  id=$(fleet_run_user_plugin_id "$name" "$records") || return 75
+  if [ -z "$id" ]; then
+    catalog=$(fleet_run_cli_cached available claude plugin list --available --json 2>/dev/null) ||
+      return 74
+    id=$(jq -er --arg name "$name" '
+      (if type == "array" then . else .available end) |
+      [ .[] | (.pluginId // .id) | strings | select(split("@")[0] == $name) ] |
+      unique | if length == 1 then .[0] else empty end' <<<"$catalog") || return 75
+  fi
+  fleet_capture_id_valid "claude:$id" || return 75
+  printf '%s\n' "$id"
+}
+
+fleet_run_claude_plugin_verb() {
+  bounded_verb claude plugin "$@" >/dev/null 2>&1
+}
+
 fleet_run_tombstone_target() {
   # fleet_run_tombstone_target DEFS NAME VALUE -> the installed user-scoped
   # Claude plugin id a tombstone names, or nothing when it is not installed.
@@ -591,15 +618,21 @@ fleet_run_tombstone_target() {
     return 0
   fi
   fleet_run_tomb_map=$(fleet_run_installed_plugins) || return 75
-  fleet_run_tomb_ids=$(printf '%s\n' "$fleet_run_tomb_map" | jq -r --arg name "$2" '
-    to_entries[] |
-    select((.key | split("@")[0]) == $name and
-      any((.value // [])[]; .scope == "user")) | .key' 2>/dev/null) || return 75
-  case $(printf '%s\n' "$fleet_run_tomb_ids" | grep -c .) in
-    0) return 0 ;;
-    1) printf '%s\n' "$fleet_run_tomb_ids" ;;
-    *) return 75 ;;
-  esac
+  fleet_run_user_plugin_id "$2" "$fleet_run_tomb_map" 2>/dev/null || return 75
+}
+
+fleet_run_tombstone_before_target() {
+  local market id observed=${fleet_capture_before_observed:-'{}'}
+  [ -n "${fleet_capture_before_records:-}" ] || return 0
+  market=$(fleet_run_plugin_market "$1" "$2" "$3" 2>/dev/null) || return 75
+  case $2 in *@*) id=$2 ;; *) id=${market:+$2@$market} ;; esac
+  jq -er --arg id "$id" --arg name "$2" --argjson observed "$observed" '
+    [(.registry // {} | to_entries[] | select(any(.value[]; .scope == "user")) | .key),
+     ($observed.claude // {} | to_entries[] |
+       select(.value.value | IN("enabled","disabled")) | .key)] |
+    map(select(if $id != "" then . == $id else split("@")[0] == $name end)) |
+    unique | if length <= 1 then (.[0] // "") else error("ambiguous plugin name") end
+  ' <<<"$fleet_capture_before_records" 2>/dev/null || return 75
 }
 
 fleet_run_claude_running() {
@@ -724,13 +757,32 @@ fleet_run_uninstall_plugin() {
   # `--keep-data`: the native uninstall otherwise deletes the plugin's
   # persistent data directory (~/.claude/plugins/data/<id>/), and
   # `fleet-rollback` restores the plugin, never that data.
+  local before_target expected admitted
   fleet_run_uninstall_deferral=$(fleet_run_deferral_path "$2")
   fleet_run_uninstall_target=$(fleet_run_tombstone_target "$1" "$3" "$4") || return 75
   [ -n "$fleet_run_uninstall_target" ] || {
+    before_target=$(fleet_run_tombstone_before_target "$1" "$3" "$4") || return 75
+    if [ -n "$before_target" ]; then
+      expected=$(fleet_capture_guard_target "$before_target" "$fleet_capture_before_records" \
+        "$fleet_capture_before_observed") || return 74
+      expected=$(jq -c --arg id "$before_target" '.installed = [$id]' <<<"$expected") || return 74
+      fleet_capture_guard_current='{"installed":[]}' \
+        fleet_capture_guard_remember "$before_target" "$expected" unknown raced_removal || return 74
+      printf '  defer %s — its Claude plugin was removed during this pass\n' "$2"
+      return 74
+    fi
     # Gone already, by whatever route: a deferral window for it is over too.
     rm -f "$fleet_run_uninstall_deferral"
     return 70
   }
+  if [ -n "${fleet_run_tombstone_admitted:-}" ]; then
+    admitted=$(awk -F '\t' -v item="$2" '$1 == item { print $2 }' "$fleet_run_tombstone_admitted")
+    if [ "$fleet_run_uninstall_target" != "$admitted" ]; then
+      fleet_capture_guard_destructive "$fleet_run_uninstall_target" || return 74
+      printf '  defer %s — its Claude plugin differs from the removal cap target\n' "$2"
+      return 74
+    fi
+  fi
   command -v claude >/dev/null 2>&1 || return 75
   fleet_run_uninstall_enabled=$(fleet_run_plugin_enabled \
     "$fleet_run_uninstall_target" true) || return 75
@@ -773,12 +825,9 @@ fleet_run_uninstall_plugin() {
     fi
     printf '  defer %s — the 24h live-session window has elapsed; uninstalling\n' "$2"
   fi
-  fleet_capture_guard_destructive "$fleet_run_uninstall_target" '' "$fleet_run_uninstall_enabled" || return 74
-  fleet_run_cli_invalidate
-  fleet_capture_mark_claude "$fleet_run_uninstall_target" "$fleet_run_uninstall_enabled" absent || return 75
-  bounded_verb claude plugin uninstall --scope user --keep-data "$fleet_run_uninstall_target" \
-    >/dev/null 2>&1 || return 75
-  # The manager's exit status proves it ran, not that the record is gone.
-  [ "$(fleet_run_installed_plugin "$fleet_run_uninstall_target")" = '{}' ] || return 75
+  fleet_capture_verb_initial=$fleet_run_uninstall_enabled \
+    fleet_capture_verb "claude:$fleet_run_uninstall_target" uninstall absent -- \
+    fleet_run_claude_plugin_verb uninstall --scope user --keep-data "$fleet_run_uninstall_target" ||
+    return $?
   rm -f "$fleet_run_uninstall_deferral"
 }

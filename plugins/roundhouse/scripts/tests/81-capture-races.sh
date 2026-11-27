@@ -138,7 +138,8 @@ if [ -n "$fleet_fixture_yq" ]; then
   export ROUNDHOUSE_FLEET_STORE="$store"
   mkdir -p "$store"
   printf '%s\n' '{"plugins":{}}' >"$registry"
-  printf '%s\n' '{}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
+  # A fresh install starts enabled, so the requested disable must really run.
+  printf '%s\n' '{"claude-example@test-market":true}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
   fixture_observed='{"claude":{}}'
   race_prepare '{"plugins":{"claude-example":{"state":"disabled","marketplace":"test-market"}}}'
   fleet_run_apply_item "$store" mac '{}' plugins.claude-example "$disabled" '' ||
