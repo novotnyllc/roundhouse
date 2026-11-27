@@ -66,10 +66,10 @@ fleet_definitions_file_path() {
 fleet_fold_merge_program='. as $layer ireduce ({};
   . *d ($layer | with_entries(select(.value != null))
     | (.[] | select(tag == "!!map")) |= with_entries(select(.value != null))))'
-fleet_fold_absent_program='(.[] | select(tag == "!!map")) |= with_entries(select(.value != "absent"))'
-fleet_fold_program="($fleet_fold_merge_program) | $fleet_fold_absent_program"
+fleet_fold_knockout_items='with_entries(select(.value != "absent"))'
+fleet_fold_program="($fleet_fold_merge_program) | (.[] | select(tag == \"!!map\")) |= $fleet_fold_knockout_items"
 # The merge rule, in two steps — MERGE, then the `absent` KNOCKOUT — so the
-# tombstone reader runs the identical merge instead of a hand copy. Knocking
+# raw view and the tombstone reader see the identical merge. Knocking
 # out once at the end equals knocking out per layer: `absent` is a scalar, and
 # a narrower layer that speaks again replaces it whole.
 #
@@ -97,11 +97,11 @@ fleet_fold_program="($fleet_fold_merge_program) | $fleet_fold_absent_program"
 #           a null nested inside a config_files value is data.
 #   *d      map+map deep merge, anything else replaced whole by the higher
 #           layer, a null document contributing nothing — §4, verbatim.
-#   the knockout  fleet_fold_absent_program, applied to the merged result and
+#   the knockout  applied to the merged result according to the view and
 #           scoped to exactly <category>.<item>. Never a recursive del(.. ==
 #           "absent"): a legitimate string "absent" nested inside a
-#           config_files value is data and must survive. `select(tag ==
-#           "!!map")` skips the host file's scalar and sequence facts
+#           config_files value is data and must survive. The map check skips
+#           the host file's scalar and sequence facts
 #           (platform, groups) rather than trying to knock out entries they do
 #           not have.
 
@@ -129,13 +129,19 @@ fleet_tier_files() (
 )
 
 fleet_fold_files() {
+  fleet_fold_read "$fleet_fold_program" "$@"
+}
+
+fleet_fold_read() {
   # The fold over an explicit, ordered file list. No files is an empty
   # document, not an error: a store with no layers yet wants nothing.
+  local program=$1
+  shift
   [ "$#" -gt 0 ] || {
     printf '{}\n'
     return
   }
-  yq ea -o=json -I=0 "$fleet_fold_program" "$@"
+  yq ea -o=json -I=0 "$program" "$@"
 }
 
 fleet_host_facts() (
@@ -171,39 +177,42 @@ EOF
 }
 
 fleet_fold() (
-  # The effective desired state for one host, as compact JSON. Subshell, IFS
-  # and noglob for the same reason as fleet_host_facts.
+  # The desired state for one host, as compact JSON. Subshell, IFS and noglob
+  # for the same reason as fleet_host_facts.
   IFS='
 '
   set -f
-  # shellcheck disable=SC2046 # deliberate word splitting over the file list
-  fleet_fold_files $(fleet_layer_files "$1" "$2")
+  local program fold_layers
+  case ${3:-effective} in
+    effective) program=$fleet_fold_program ;;
+    raw) program=$fleet_fold_merge_program ;;
+    keep-plugin-tombstones)
+      program="($fleet_fold_merge_program) | (.[] | select(tag == \"!!map\" and key != \"plugins\")) |= $fleet_fold_knockout_items"
+      ;;
+    *) printf 'roundhouse: invalid fold view: %s\n' "$3" >&2; exit 65 ;;
+  esac
+  fold_layers=$(fleet_layer_files "$1" "$2") || exit 65
+  # Knock out while yq still distinguishes YAML aliases from scalar values.
+  # shellcheck disable=SC2086 # deliberate word splitting over the file list
+  fleet_fold_read "$program" $fold_layers
 )
 
-fleet_fold_tombstones() (
+fleet_fold_tombstones() {
   # `fleet_fold_tombstones LAYERDIR HOST CATEGORY` — the items of CATEGORY whose
   # effective value at HOST is the scalar `absent`, as a fold-shaped document
   # (`{"plugins":{"x":"absent"}}`, or `{}`).
   #
-  # §3.4. A SEPARATE read, because the knockout is right for every reader of
-  # desired state: the fold's own merge step without it, so the last layer to
-  # speak still wins. `{state: absent}` is never knocked out at all.
-  IFS='
-'
-  set -f
-  # shellcheck disable=SC2046 # deliberate word splitting over the file list
-  set -- "$3" $(fleet_layer_files "$1" "$2")
-  tombstone_category=$1
-  shift
-  [ "$#" -gt 0 ] || { printf '{}\n'; return; }
-  yq ea -o=json -I=0 "$fleet_fold_merge_program" "$@" |
-    jq -c --arg c "$tombstone_category" '
+  # Use the same fold before knockout. The object form `{state: absent}` is
+  # never knocked out.
+  local raw
+  raw=$(fleet_fold "$1" "$2" raw) || return $?
+  printf '%s\n' "$raw" | jq -c --arg c "$3" '
       (.[$c] // {}) as $entries |
       if ($entries | type) != "object" then {}
       else ($entries | with_entries(select(.value == "absent"))) as $dead |
         if $dead == {} then {} else {($c): $dead} end
       end'
-)
+}
 
 fleet_item_split() {
   # `<category>.<name>` -> two lines, category then name. The split is on the

@@ -126,7 +126,7 @@
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
-      "sha256": "20295d273f5399a0fd2238e098d13672a385fdbf4410dbcc48ab97e1ea8575dd"
+      "sha256": "8b2db559040ab39b714418133b059c50b3e4ec840a583327e42dfe002c0e1f20"
     },
     {
       "path": "scripts/lib/fleet-init.sh",
@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "3302ccd90927dc7dffda70e1b755dd0d2641d3b555fc7a2fa28463b51653dbff"
+      "sha256": "1c0256cd642176008144a0c30c662b74a8bf642cad4c42ec3a09da428e0e6088"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
