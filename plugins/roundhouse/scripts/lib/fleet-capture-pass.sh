@@ -8,7 +8,7 @@ fleet_capture_mark_claude() {
     *) id=$id@__unqualified__ ;;
   esac
   case $from in true) from=enabled ;; false) from=disabled ;; esac
-  fleet_agent_pending_mark claude "$id" "$from" "$3"
+  fleet_agent_pending_mark claude "$id" "$from" "$3" "${4:-}"
 }
 
 fleet_capture_claude_update() {
@@ -87,7 +87,7 @@ fleet_capture_prepare() {
   # Local differences and conflicts are held, never written into the store.
   local store=$1 host=$2 desired=$3 observed=$4 layers=${8:-$1}
   local dir baseline initialized discard rows fields id item theirs ours base first ambiguous unqualified
-  local marker fallback fallback_id from merged direction kind message
+  local marker fallback fallback_id from merged direction kind message detail
   local skip=() discards=()
   fleet_capture_skip='{}'
   fleet_capture_discards='[]'
@@ -99,6 +99,9 @@ fleet_capture_prepare() {
   fleet_capture_authoritative=$(jq -r --argjson baseline "$baseline" "$fleet_capture_authority_filter"'
     authoritative(.; $baseline; "claude")' <<<"$observed") || return 1
   rows=$(fleet_capture_rows "$layers" "$desired" "$observed" "$baseline") || return 1
+  fleet_capture_race_holds=$(jq -c --argjson discard "$discard" '
+    [.[] | select(.id != null and .ours == "unobserved" and (.base | objects | .raced == true)) |
+      select($discard[.id] != true and $discard[.item] != true) | .id] | unique' <<<"$rows") || return 1
   fields=$(jq -r --argjson initialized "$initialized" '
     def state: IN("enabled","disabled","absent");
     .[] | (if .base == null then "missing"
@@ -164,7 +167,13 @@ fleet_capture_prepare() {
     fi
     message="$message Edit the store to agree or run roundhouse fleet-discard $item to converge."
     printf 'roundhouse: %s\n' "$message"
-    fleet_alert_raise "$7/alert-ledger" "$store" "$host" "$kind" "$kind" "$message" "$item" || return 1
+    detail="$id $direction locally"
+    [ "$merged" != conflict ] || detail="$detail and changed in the fleet"
+    detail="$detail; holding this item."
+    if [ "${#detail}" -gt "$fleet_replicated_cap" ]; then
+      detail="claude:sha256:$(printf '%s' "$id" | sha256_stream | sed 's/.\{16\}/&-/g;s/-$//') $direction locally; holding this item. See fleet-run output."
+    fi
+    fleet_alert_raise "$7/alert-ledger" "$store" "$host" "$kind" "$kind" "$detail" "$item" || return 1
   done <<<"$fields"
   if [ "${#skip[@]}" -gt 0 ]; then
     fleet_capture_skip=$(printf '%s\n' "${skip[@]}" | jq -Rn '
@@ -269,7 +278,7 @@ fleet_capture_guard_target() {
     (.registry | target | if . == null then null else
       [to_entries[] | select(any(.value[]?; .scope == "user")) | .key] | sort end) as $installed |
     (.enabled | target) as $settings |
-    {installed:$installed, settings:$settings,
+    {installed:$installed, settings:$settings, manager_state:$state,
       state:(if $state != "unknown" then
           # Capture already used the explicit state for this installed identity.
           [$installed[]? | $settings[.] | booleans] |
@@ -288,21 +297,65 @@ fleet_capture_guard_live() {
   fleet_capture_guard_target "$1" "$records" '{}' "$enabled"
 }
 
+fleet_capture_guard_remember() {
+  # A retry must recognize this local change even if both pass scans failed.
+  local id prior path baseline initialized updated
+  id=$(jq -r --arg id "$1" --argjson before "$2" '
+    if $id | contains("@") then $id
+    else (($before.installed // []) + (.installed // []) | unique) |
+      if length == 1 then .[0] else empty end end
+  ' <<<"$fleet_capture_guard_current") || return 1
+  fleet_capture_id_valid "claude:$id" || return 0
+  prior=$(jq -r --arg id "$id" --arg initial "$3" '
+    (if .state == "unknown" then $initial else .state end) as $state |
+    if .installed == [] then "absent"
+    elif $state == "true" then "enabled"
+    elif $state == "false" then "disabled"
+    elif ((.installed // []) | index($id) != null) and (.settings[$id] | type == "boolean") then
+      if .settings[$id] then "enabled" else "disabled" end
+    else empty end' <<<"$2") || return 1
+  path="$(fleet_run_state_dir)/agent-baseline.json"
+  baseline=$(fleet_capture_json_read "$path" '{}') || return 1
+  initialized=$(fleet_capture_initialized "$baseline") || return 1
+  updated=$(jq -c --arg id "claude:$id" --arg prior "$prior" --argjson initialized "$initialized" '
+    if has($id) then .[$id].raced = true
+    elif $prior != "" then .[$id] = {value:$prior,raced:true} | ._initialized = $initialized
+    else . end
+  ' <<<"$baseline") || return 1
+  [ "$updated" = "$baseline" ] || fleet_capture_json_write "$path" "$updated"
+}
+
+fleet_capture_race_held() {
+  local id=$1
+  [ "${fleet_capture_race_holds:-[]}" != '[]' ] || return 1
+  jq -e --arg id "$id" 'any(.[]; if $id | contains("@") then . == ("claude:" + $id)
+    else startswith("claude:" + $id + "@") end)' >/dev/null <<<"${fleet_capture_race_holds:-[]}"
+}
+
 fleet_capture_guard_destructive() {
   # Standalone supervised operations have no fleet-run observation to compare.
-  local expected=${2:-}
+  local expected=${2:-} initial=${3:-unknown} changed
   fleet_capture_guard_current=
   [ -n "${fleet_capture_before_records:-}" ] || return 0
+  if fleet_capture_race_held "$1"; then
+    printf '  defer %s — a previous Claude change still awaits verification\n' "$1"
+    return 1
+  fi
   if [ -z "$expected" ]; then
     expected=$(fleet_capture_guard_target "$1" "$fleet_capture_before_records" \
       "$fleet_capture_before_observed") || return 1
   fi
   fleet_capture_guard_current=$(fleet_capture_guard_live "$1") || return 1
-  if ! jq -e --argjson before "$expected" '
+  changed=$(jq -r --argjson before "$expected" --arg initial "$initial" '
     def changed($old): . != null and $old != null and . != $old;
-    ((.installed | changed($before.installed)) or (.settings | changed($before.settings)) or
-      (.state != "unknown" and $before.state != "unknown" and .state != $before.state)) | not
-  ' >/dev/null <<<"$fleet_capture_guard_current"; then
+    (.installed | changed($before.installed)) or (.settings | changed($before.settings)) or
+      (if $before.state == "unknown" then
+        $initial != "unknown" and .manager_state != "unknown" and .manager_state != $initial
+      else .state != "unknown" and .state != $before.state end)
+  ' <<<"$fleet_capture_guard_current") || return 1
+  if [ "$changed" = true ]; then
+    fleet_capture_guard_remember "$1" "$expected" "$initial" ||
+      printf 'roundhouse: could not remember the previous Claude observation for %s\n' "$1" >&2
     printf '  defer %s — its Claude observation changed during this pass\n' "$1"
     return 1
   fi

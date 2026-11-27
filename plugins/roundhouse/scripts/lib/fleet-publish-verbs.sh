@@ -64,7 +64,7 @@ fleet_discard_command() (
   # Discard only authorizes convergence; it writes host-local state, never the store.
   fleet_run_env
   require_jq
-  local key=$1 dir lock nonce status=0 decisions item kind alert held=false physical=
+  local key=$1 dir lock nonce status=0 decisions item kind alert held=false physical= physical_hash=
   [[ $key =~ ^(plugins\.[A-Za-z0-9_-][A-Za-z0-9._-]*(@[A-Za-z0-9_-][A-Za-z0-9._-]*)?|claude:[A-Za-z0-9_-][A-Za-z0-9._-]*@[A-Za-z0-9_-][A-Za-z0-9._-]*)$ ]] || {
     printf 'roundhouse: %s is not a Claude plugin item\n' "$key" >&2
     exit 64
@@ -84,23 +84,36 @@ fleet_discard_command() (
   key=${key#claude:}
   key=${key#plugins.}
   case $key in *@*) physical=claude:$key ;; esac
+  [ -z "$physical" ] || physical_hash="claude:sha256:$(printf '%s' "$physical" | sha256_stream | sed 's/.\{16\}/&-/g;s/-$//')"
   for item in "plugins.$key" "plugins.${key%@*}"; do
     for kind in agent-local-change agent-capture-conflict; do
       alert="$(fleet_store_path)/alerts/$(fleet_host_name)/$(fleet_alert_name "$kind" "$kind" "$item")"
       if [ -f "$alert" ] && [ ! -L "$alert" ] &&
-        fleet_record_read "$alert" '{}' | jq -e --arg kind "$kind" --arg item "$item" --arg physical "$physical" \
+        fleet_record_read "$alert" '{}' | jq -e --arg kind "$kind" --arg item "$item" \
+          --arg physical "$physical" --arg physical_hash "$physical_hash" \
           '.kind == $kind and .items == [$item] and
-            ($physical == "" or (.detail | startswith($physical + " ")))' >/dev/null; then
+            ($physical == "" or (.detail | startswith($physical + " ") or
+              startswith($physical_hash + " ")))' >/dev/null; then
         held=true
       fi
     done
   done
-  [ "$held" = true ] || {
-    printf 'roundhouse: no held Claude plugin %s\n' "$key" >&2
-    exit 65
-  }
-  case $key in *@*) key=claude:$key ;; *) key=plugins.$key ;; esac
   dir=$(fleet_run_state_dir)
+  if [ "$held" != true ]; then
+    local baseline
+    baseline=$(fleet_capture_json_read "$dir/agent-baseline.json" '{}') || exit 65
+    physical=$(jq -r --arg physical "$physical" --arg name "$key" '
+      [to_entries[] | select(.value | objects | .raced == true) | .key |
+        select(if $physical == "" then startswith("claude:" + $name + "@") else . == $physical end)] |
+      if length == 1 then .[0] else empty end' <<<"$baseline") || exit 65
+    [ -n "$physical" ] || {
+      printf 'roundhouse: no held Claude plugin %s\n' "$key" >&2
+      exit 65
+    }
+    key=$physical
+  else
+    case $key in *@*) key=claude:$key ;; *) key=plugins.$key ;; esac
+  fi
   decisions=$(fleet_capture_json_read "$dir/agent-discard.json" '{}') || exit 65
   decisions=$(jq -ce --arg key "$key" '.[$key] = true' <<<"$decisions") || exit 65
   mkdir -p "$dir" && : >"$dir/retry-owed" || exit 65

@@ -38,15 +38,16 @@ fleet_agent_pending_path() {
 fleet_agent_pending_mark() {
   local id=$1:$2 path record
   path=$(fleet_agent_pending_path "$id") || return 1
-  record=$(jq -cn --arg id "$id" --arg from "$3" --arg to "$4" \
-    '{id:$id,from:$from,to:$to}') || return 1
+  record=$(jq -cn --arg id "$id" --arg from "$3" --arg to "$4" --arg via "${5:-}" \
+    '{id:$id,from:$from,to:$to} + if $via == "" then {} else {via:$via} end') || return 1
   fleet_capture_json_write "$path" "$record"
 }
 
 fleet_agent_pending_matches() {
   [ -f "$1" ] && [ ! -L "$1" ] || return 1
-  jq -e --arg id "$2" --arg from "$3" --arg to "$4" '
-    .id == $id and .from == $from and .to == $to and $from != $to
+  jq -se --arg id "$2" --arg from "$3" --arg to "$4" '
+    length == 1 and (.[0] | .id == $id and .from == $from and
+      (.to == $to or .via == $to) and $from != $to)
   ' "$1" >/dev/null 2>&1
 }
 
@@ -163,8 +164,7 @@ fleet_capture_collect() {
 fleet_capture_authority_filter='
   def authoritative($observed; $baseline; $h):
     $observed[$h] != null and
-    (any($observed[$h][]?; (.value | IN("enabled","disabled")) or
-      (has("user_scope") and .user_scope == null)) or
+    (any($observed[$h][]?; .value | IN("enabled","disabled")) or
       all($baseline | to_entries[] | select(.key | startswith($h + ":"));
         .value | (if type == "object" then .value else null end) | IN("enabled","disabled") | not));'
 
@@ -225,15 +225,17 @@ fleet_capture_rows() {
             (if $market == "" then $baseline[$item] else null end))
         }
       ] as $managed |
-      $managed +
       [
-        $known_ids[] as $id | ($id | split("@")) as $parts |
-        $parts[0] as $name |
+        $known_ids[] as $id | ($id | split("@")[0]) as $name |
         select(all($managed[]; .id != physical($h; $id) and (.id != null or .name != $name))) |
         select($local[$id].user_scope != false or $base[physical($h; $id)] != null or
-          ($pending_ids | index($id)) != null) |
+          ($pending_ids | index($id)) != null) | $id
+      ] | group_by(split("@")[0]) | map(
+        (length > 1) as $duplicate_name | .[] as $id |
+        ($id | split("@")) as $parts | $parts[0] as $name |
         ($category + "." +
-          (if any($managed[]; (.name | split("@")[0]) == $name) then $id else $name end)) as $item |
+          (if $duplicate_name or any($managed[]; (.name | split("@")[0]) == $name)
+            then $id else $name end)) as $item |
         {
           id:physical($h; $id), item:$item, name:$name,
           harness:$h, marketplace:$parts[1], theirs:"missing",
@@ -241,7 +243,7 @@ fleet_capture_rows() {
             else ($local[$id].value // "absent") end),
           base:($base[physical($h; $id)] // $baseline[$item])
         }
-      ];
+      ) | $managed + .;
     ($markets | split("\n") | map(select(length > 0) | split("\t") |
       {key:.[0],value:.[1]}) | from_entries) as $market_map |
     plugin_rows("claude"; "plugins"; $market_map) |

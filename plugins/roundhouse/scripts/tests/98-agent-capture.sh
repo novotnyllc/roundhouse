@@ -117,6 +117,15 @@ YAML
       fail "holding the owner install blocked convergence of the declared identity"
     fi
 
+    rh_unmanaged_aliases=$(jq -c '.claude["extra@a"] = {value:"enabled",marketplace:"a"}' <<<"$rh_capture_ours")
+    fleet_capture_prepare "$rh_capture_store" mac "$rh_capture_fold" "$rh_unmanaged_aliases" \
+      true true "$rh_capture_tmp"
+    fleet_capture_skip_id claude extra@a ||
+      fail "a same-name unmanaged sibling hid the owner install"
+    if fleet_capture_skip_id claude extra@m; then
+      fail "an unchanged unmanaged identity was held because its sibling was installed"
+    fi
+
     # A healthy user row is enough to identify a damaged installation.
     rh_registry="$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
     printf '%s\n' '{"plugins":{"keeper@m":[{"scope":"user","installPath":"/missing-fixture"}]}}' >"$rh_registry"
@@ -196,6 +205,17 @@ JSONL
     fleet_capture_rows "$rh_capture_store" "$rh_capture_fold" "$rh_observed" "$rh_capture_base" |
       jq -e 'any(.[]; .item == "plugins.keeper" and .ours == "unobserved")' >/dev/null ||
       fail "a wiped inventory was read as a known local removal"
+
+    jq -c 'select(.data.manager_id != "keeper@m") |
+      if .kind == "plugin_manager" then .data.installed_count=1 else . end' \
+      "$rh_capture_root/scope.jsonl" >"$rh_capture_root/scope-only.jsonl"
+    rh_observed=$(fleet_capture_observe "$rh_capture_root/scope-only.jsonl")
+    fleet_capture_rows "$rh_capture_store" "$rh_scope_fold" "$rh_observed" "$rh_capture_base" |
+      jq -e 'length > 0 and all(.[]; .ours == "unobserved")' >/dev/null ||
+      fail "an unknown scope row made a wiped user inventory authoritative"
+    fleet_capture_prepare "$rh_capture_store" mac "$rh_scope_fold" "$rh_observed" true true "$rh_capture_tmp"
+    jq -e 'length == 0' <<<"$fleet_capture_skip" >/dev/null ||
+      fail "an unknown scope row held items on a wiped user inventory"
 
     # Plain publication can recover a remote move after this pass observed its tree.
     (

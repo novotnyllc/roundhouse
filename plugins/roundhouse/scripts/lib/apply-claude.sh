@@ -773,7 +773,7 @@ fleet_run_uninstall_plugin() {
     fi
     printf '  defer %s — the 24h live-session window has elapsed; uninstalling\n' "$2"
   fi
-  fleet_capture_guard_destructive "$fleet_run_uninstall_target" || return 74
+  fleet_capture_guard_destructive "$fleet_run_uninstall_target" '' "$fleet_run_uninstall_enabled" || return 74
   fleet_run_cli_invalidate
   fleet_capture_mark_claude "$fleet_run_uninstall_target" "$fleet_run_uninstall_enabled" absent || return 75
   bounded_verb claude plugin uninstall --scope user --keep-data "$fleet_run_uninstall_target" \

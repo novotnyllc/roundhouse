@@ -2715,6 +2715,7 @@ EOF
       fleet_run_plugin_mutated=false
       local capture_expected= capture_before_install=
       fleet_run_plugin_mark_from=unknown
+      fleet_run_plugin_mark_via=
       fleet_run_resolved_sha=
       if [ -n "$fleet_run_market" ]; then
         # A catalog that cannot prove the bytes — no entry (an unregistered
@@ -2762,6 +2763,12 @@ EOF
           # verb (the target-native refresh sequence in
           # fleet-agents/SKILL.md), which installing an already-installed
           # plugin can reject or no-op instead of actually refreshing it.
+          if [ "$fleet_run_installed" = '{}' ]; then
+            fleet_run_plugin_mark_from=absent
+          else
+            fleet_run_plugin_mark_from=$(fleet_run_plugin_enabled "$fleet_run_id" true) ||
+              fleet_run_plugin_mark_from=unknown
+          fi
           if [ -n "$fleet_run_installed_sha" ]; then
             fleet_run_cli_invalidate
             fleet_capture_claude_update "$fleet_run_id" \
@@ -2772,9 +2779,9 @@ EOF
               capture_before_install=$fleet_capture_guard_current
             fi
             fleet_run_cli_invalidate
-            [ "$fleet_run_installed" != '{}' ] || fleet_run_plugin_mark_from=absent
             fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" enabled || return 75
             bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
+            fleet_run_plugin_mark_via=enabled
           fi
           # The manager wrote the cache under its caller's umask, and 002
           # leaves it group-writable. Seal it before it is re-verified, its
@@ -2793,6 +2800,7 @@ EOF
             [ -n "$fleet_run_installed_sha" ] || return 74
             fleet_run_plugin_reinstall "$fleet_run_id" \
               "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // "none"')" || return 74
+            fleet_run_plugin_mark_via=enabled
             if [ "$fleet_run_want_enabled" = false ] && [ -n "${fleet_capture_before_records:-}" ]; then
               capture_expected=$(fleet_capture_guard_live "$fleet_run_id") || return 74
             fi
@@ -2817,14 +2825,19 @@ EOF
           plugin_cache_seal_permissions "$fleet_run_id" || return 75
         fi
       else
+        if fleet_run_plugin_mark_from=$(fleet_run_plugin_enabled "$fleet_run_id" true); then
+          [ "$fleet_run_plugin_mark_from" != unknown ] || fleet_run_plugin_mark_from=absent
+        else
+          fleet_run_plugin_mark_from=unknown
+        fi
         if [ "$fleet_run_want_enabled" = false ]; then
           fleet_capture_guard_destructive "$fleet_run_id" || return 74
           capture_before_install=$fleet_capture_guard_current
         fi
         fleet_run_cli_invalidate
-        fleet_run_plugin_mark_from=absent
         fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" enabled || return 75
         bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
+        fleet_run_plugin_mark_via=enabled
         # As above: seal what the manager wrote before approving its hooks.
         plugin_cache_seal_permissions "$fleet_run_id" || return 75
         if [ "$fleet_run_want_enabled" = true ]; then
@@ -2871,12 +2884,17 @@ EOF
           [ "$fleet_run_before_enabled" != false ]; then
           fleet_capture_guard_destructive "$fleet_run_id" "$capture_expected" || return 74
           fleet_run_cli_invalidate
-          fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" disabled || return 75
+          # An interruption before disable may leave the enable from our install.
+          fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" disabled \
+            "$fleet_run_plugin_mark_via" || return 75
           bounded_verb claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
         fi
       fi
       fleet_run_actual_enabled=$(fleet_run_plugin_enabled "$fleet_run_id") || return $?
       [ "$fleet_run_actual_enabled" = "$fleet_run_want_enabled" ] || return 74
+      if [ "$fleet_run_want_enabled" = false ] && [ -n "$fleet_run_plugin_mark_via" ]; then
+        fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" disabled || return 75
+      fi
       # Approval follows the verified post-state, not the manager's exit code.
       # Some native managers write enabled state and then return nonzero; the
       # before/after read is the authoritative transition proof. Install/update
@@ -3772,6 +3790,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     run_tomb_target=$(fleet_run_tombstone_target "$run_defs" \
       "${run_tomb_item#plugins.}" "$run_tomb_value") || run_tomb_target=undecidable
     [ -n "$run_tomb_target" ] || continue
+    ! fleet_capture_race_held "$run_tomb_target" || continue
     # A late arrival cannot be removed by this pass, so it must not inflate the cap.
     if [ "$run_tomb_target" != undecidable ] &&
       jq -e --arg id "$run_tomb_target" '
@@ -4608,11 +4627,13 @@ fleet_run_plugin_reinstall() {
   fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" absent || return 75
   bounded_verb claude plugin uninstall --scope user --keep-data "$1" >/dev/null 2>&1 || return 1
   fleet_run_cli_invalidate
-  fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" enabled || return 75
+  fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" enabled absent || return 75
   bounded_verb claude plugin install "$1" --scope user >/dev/null 2>&1 || {
+    fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" absent || return 75
     printf 'roundhouse: reinstalling %s failed after its uninstall; the next pass installs it\n' "$1" >&2
     return 1
   }
+  fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" enabled || return 75
 }
 
 fleet_run_apply_held() {

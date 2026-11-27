@@ -40,11 +40,62 @@ if [ -n "$fleet_fixture_yq" ]; then
         jq -e 'has("plugins.claude-example")' <<<"$fleet_capture_skip" >/dev/null ||
           fail "A2 a wrong origin or unqualified marker masked the owner's enable"
 
+        interrupted=0
+        (
+          fleet_run_plugin_market() { printf 'm\n'; }
+          fleet_run_marketplace_source_ok() { :; }
+          fleet_run_plugin_catalog_proven() {
+            printf '%s\n' '{"source":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+          }
+          fleet_run_installed_plugin() {
+            if [ -e "$capture_root/fresh-installed" ]; then
+              printf '%s\n' '{"gitCommitSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+            else
+              printf '{}\n'
+            fi
+          }
+          bounded_verb() {
+            case $3 in
+              install) : >"$capture_root/fresh-installed" ;;
+              disable) exit 42 ;;
+              *) exit 1 ;;
+            esac
+          }
+          fleet_run_apply_item "$store" mac '{}' plugins.fresh '"disabled"' '{}'
+        ) || interrupted=$?
+        [ "$interrupted" = 42 ] || fail "A2 fixture did not interrupt the install before it disabled"
+        jq '.["claude:fresh@m"] = {value:"absent"}' "$baseline" >"$baseline.next"
+        mv "$baseline.next" "$baseline"
+        fleet_capture_prepare "$store" mac '{"plugins":{"fresh":{"state":"disabled","marketplace":"m"}}}' \
+          '{"claude":{"fresh@m":{"value":"enabled"}}}' true true "$capture_root/pass"
+        jq -e 'has("plugins.fresh") | not' <<<"$fleet_capture_skip" >/dev/null ||
+          fail "A2 interrupted install was mistaken for an owner enable"
+
+        (
+          fleet_run_claude_running() { return 1; }
+          fleet_run_claude_desktop_running() { return 1; }
+          fleet_run_plugin_enabled() { printf 'false\n'; }
+          bounded_query() { printf '{"configured":[]}\n'; }
+          bounded_verb() { [ "$3" = uninstall ]; }
+          fleet_run_resolved_sha=fixture
+          rc=0
+          fleet_run_plugin_reinstall claude-example@test-market previous || rc=$?
+          [ "$rc" = 1 ] || fail "A2 fixture did not fail to reinstall after uninstall"
+          fleet_capture_prepare "$store" mac "$desired" \
+            '{"claude":{"anchor@m":{"value":"enabled"}}}' true true "$capture_root/pass"
+          jq -e 'has("plugins.claude-example") | not' <<<"$fleet_capture_skip" >/dev/null ||
+            fail "A2 failed reinstall was mistaken for an owner removal"
+          fleet_capture_prepare "$store" mac "$desired" "$observed" true true "$capture_root/pass"
+          jq -e 'has("plugins.claude-example")' <<<"$fleet_capture_skip" >/dev/null ||
+            fail "A2 failed reinstall masked the owner's later install"
+        )
+
         export CLAUDE_PLUGIN_ACTION_LOG="$capture_root/actions"
         : >"$capture_root/owned"
         fleet_run_installed_plugins() { printf '%s\n' '{"claude-example@test-market":[{"scope":"user"}]}'; }
         fleet_run_plugin_identity_matches() { [ -s "$CLAUDE_PLUGIN_ACTION_LOG" ]; }
-        rm -f "$baseline" "$marker" "$(fleet_agent_pending_path claude:claude-example@__unqualified__)"
+        rm -f "$baseline" "$marker" "$(fleet_agent_pending_path claude:fresh@m)" \
+          "$(fleet_agent_pending_path claude:claude-example@__unqualified__)"
         fleet_capture_observed='{"claude":null}'
         fleet_capture_prepare "$store" mac '{}' "$fleet_capture_observed" true true "$capture_root/pass"
         fleet_plugins_claude_update_unowned '{}' test-market "$capture_root/owned" ||
@@ -61,6 +112,8 @@ if [ -n "$fleet_fixture_yq" ]; then
       fleet_capture_rebaseline "$store" mac "$desired" "$observed" true
       jq -e '.["claude:keeper@m"].value == "enabled"' "$baseline" >/dev/null ||
         fail "A3 the healthy item did not record agreement"
+      jq '._initialized.claude = false' "$baseline" >"$baseline.next"
+      mv "$baseline.next" "$baseline"
       observed=$(jq -c '.claude["keeper@m"].value = "disabled"' <<<"$observed")
       fleet_capture_prepare "$store" mac "$desired" "$observed" true true "$capture_root/pass"
       jq -e 'has("plugins.keeper")' <<<"$fleet_capture_skip" >/dev/null ||
@@ -92,6 +145,30 @@ if [ -n "$fleet_fixture_yq" ]; then
       alert="$store/alerts/mac/agent-capture-ignored.yaml"
       jq -e '.detail | test("12") and length < 400' <<<"$(yq -o=json "$alert")" >/dev/null ||
         fail "A7 ignored extras alert was missing or unbounded"
+
+      # Qualified hold reports stay bounded while local output keeps the identity.
+      long_name=$(printf '%080d' 0 | tr 0 n)
+      for market_length in 70 350; do
+        long_market=$(printf "%0${market_length}d" 0 | tr 0 m)
+        long_id="$long_name@$long_market"
+        printf '%s\n' '{"_initialized":{"claude":true}}' >"$baseline"
+        desired=$(jq -cn --arg name "$long_name" '{plugins:{($name):{state:"enabled",marketplace:"m"}}}')
+        observed=$(jq -cn --arg id "$long_id" '{claude:{($id):{value:"enabled",user_scope:true}}}')
+        fleet_capture_prepare "$store" mac "$desired" "$observed" true true "$capture_root/pass" \
+          >"$capture_root/long-report"
+        assert_contains "$(cat "$capture_root/long-report")" "claude:$long_id added locally"
+        alert="$store/alerts/mac/$(fleet_alert_name agent-local-change agent-local-change "plugins.$long_id")"
+        yq -o=json "$alert" | jq -e '.detail | utf8bytelength <= 400' >/dev/null ||
+          fail "A7 a qualified local change exceeded the alert bound"
+        (
+          fleet_run_env() { :; }
+          fleet_host_name() { printf 'mac\n'; }
+          fleet_store_path() { printf '%s\n' "$store"; }
+          fleet_lock_path() { printf '%s\n' "$capture_root/discard.lock"; }
+          fleet_run_stale_after() { printf '600\n'; }
+          fleet_discard_command "claude:$long_id" >/dev/null
+        ) || fail "A7 a bounded qualified report could not be discarded"
+      done
     fi
   )
 fi
