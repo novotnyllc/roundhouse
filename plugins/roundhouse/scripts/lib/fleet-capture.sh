@@ -144,7 +144,18 @@ fleet_capture_observe() {
       [ -e "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json" ]; }; then
     retry=true
   fi
-  jq -cn --argjson claude "$claude" --argjson retry "$retry" '{claude:$claude,retry:$retry}'
+  jq -cn --argjson claude "$claude" --argjson retry "$retry" --argjson owned "$(fleet_capture_owned_absent "$claude")" \
+    '{claude:$claude,retry:$retry} + if $owned == [] then {} else {owned_absent:$owned} end'
+}
+
+fleet_capture_owned_absent() {
+  # An empty listing is explained only by Roundhouse's own marked removals (to: absent).
+  local id path
+  jq -e 'type == "object" and length == 0' >/dev/null 2>&1 <<<"$1" || { printf '[]\n'; return 0; }
+  fleet_capture_pending_ids | while IFS= read -r id; do
+    path=$(fleet_agent_pending_path "$id") || continue
+    jq -er 'select(.to == "absent") | .id' "$path" 2>/dev/null
+  done | jq -Rsc 'split("\n") | map(select(length > 0))'
 }
 
 fleet_capture_collect() {
@@ -165,8 +176,10 @@ fleet_capture_authority_filter='
   def authoritative($observed; $baseline; $h):
     $observed[$h] != null and
     (any($observed[$h][]?; .value | IN("enabled","disabled")) or
-      all($baseline | to_entries[] | select(.key | startswith($h + ":"));
-        .value | (if type == "object" then .value else null end) | IN("enabled","disabled") | not));'
+      # Empty is trusted only when every agreed install has a pending removal by Roundhouse.
+      all($baseline | to_entries[] | select(.key | startswith($h + ":")) |
+        select(.value | (if type == "object" then .value else null end) | IN("enabled","disabled")) | .key;
+        . as $k | ($observed.owned_absent // []) | index($k) != null));'
 
 fleet_capture_rows() {
   # Join desired item names to physical harness IDs. Claude can omit the
