@@ -79,6 +79,7 @@ scope:u5-contracts	184
 98-agent-capture	4
 99-capture-pass#1	160
 99-capture-pass#2	170
+99-capture-pass#3	140
 81-capture-races	70
 82-capture-transitions	20
 89-capture-repairs	4
