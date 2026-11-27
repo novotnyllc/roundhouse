@@ -584,7 +584,7 @@ fleet_vcs_git_conflict_paths() {
 fleet_vcs_publish() {
   fleet_vcs_pushed_target=
   fleet_vcs_push_uncertain=false
-  local capture_transaction
+  local capture_transaction capture_parent capture_push_arg= capture_push_remote=
   capture_transaction=$(fleet_capture_transaction_path) || return 65
   if { [ -e "$capture_transaction" ] || [ -L "$capture_transaction" ]; } &&
     [ "${fleet_capture_active_txn:-}" != "$capture_transaction" ]; then
@@ -657,8 +657,15 @@ fleet_vcs_publish() {
   # this class: auth, network, a no-description refusal and every other rejection
   # stay fail-closed exactly as the guards above intend. `$3 == no-recover` is
   # the internal one-shot guard so the retry cannot itself re-enter the recovery.
+  if [ -n "${fleet_capture_active_txn:-}" ]; then
+    [ "$(jj --ignore-working-copy -R "$1" log -r 'heads(bookmarks(exact:"main"))' \
+      --no-graph -T commit_id)" = "$2" ] || return 65
+    capture_push_arg=--ignore-working-copy
+    capture_push_remote=origin
+  fi
+  fleet_capture_transaction_target "$2" || return 65
   fleet_vcs_push_uncertain=true
-  fleet_vcs_pusherr=$(jj -R "$1" git push --bookmark main 2>&1 >/dev/null) || {
+  fleet_vcs_pusherr=$(jj -R "$1" git push --bookmark main ${capture_push_arg:+"$capture_push_arg"} ${capture_push_remote:+--remote "$capture_push_remote"} 2>&1 >/dev/null) || {
     fleet_vcs_pushrc=$?
     case $fleet_vcs_pusherr in
       *'stale info'* | *'unexpectedly moved'*)
@@ -712,7 +719,13 @@ fleet_vcs_publish() {
   fleet_vcs_pushed_target=$2
   fleet_vcs_push_uncertain=false
   fleet_vcs_reset_rc=0
-  jj -R "$1" new "$2" >/dev/null || fleet_vcs_reset_rc=$?
+  if [ -n "${fleet_capture_active_txn:-}" ]; then
+    # Push already creates the child; snapshot owner saves instead of checking them out.
+    capture_parent=$(jj -R "$1" log -r @- --no-graph -T commit_id) || fleet_vcs_reset_rc=$?
+    [ "$fleet_vcs_reset_rc" -ne 0 ] || [ "$capture_parent" = "$2" ] || fleet_vcs_reset_rc=65
+  else
+    jj -R "$1" new "$2" >/dev/null || fleet_vcs_reset_rc=$?
+  fi
   # §7.12.3: the push SUCCEEDED, so what this host just published becomes the
   # rollback mark. Left at the fetched head, the mark lagged one publication
   # and an origin forked from below this push was accepted. Here, in the one

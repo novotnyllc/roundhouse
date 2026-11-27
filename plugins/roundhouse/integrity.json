@@ -126,7 +126,7 @@
     },
     {
       "path": "scripts/lib/fleet-capture-pass.sh",
-      "sha256": "47da4017185765130eba9419993f4ee89055129dc2c381acb4122b82cba14e68"
+      "sha256": "1ec6391f54f22d472acde05723166fd9e833643368f95ca5c45650273ff8a035"
     },
     {
       "path": "scripts/lib/fleet-capture.sh",
@@ -170,7 +170,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "117ff3e840e64c5d452d8845f5c068b5de305a91432e7fcad49343e7f3296d39"
+      "sha256": "4ae1c447d5dd25f5ec69f17e440a619ab1e86bce4835246ff4d7c9b193068654"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -202,7 +202,7 @@
     },
     {
       "path": "scripts/lib/fleet-vcs.sh",
-      "sha256": "721a7d259ae3867a9b292663e972a8cf500f234d77bfa94a4625d3148bff93c1"
+      "sha256": "7f250dc8eb96c7d13184145a146f363eebcee12453bb08ac5b44041cfeb0a255"
     },
     {
       "path": "scripts/lib/host.sh",

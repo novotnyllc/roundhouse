@@ -236,11 +236,10 @@ YAML
     # published while this pass was applying its local state.
     capture_owner_install
     capture_publish_race() {
-      local scratch="$rjj/race" layers desired observed head workcopy peer rc=0
+      local scratch="$rjj/race" layers desired observed head peer rc=0
       fleet_run_env
       fleet_vcs_fetch "$store" origin
       head=$(fleet_vcs_head_origin "$store")
-      workcopy=$(jj -R "$store" log -r @ --no-graph -T 'commit_id')
       layers="$scratch/layers"
       fleet_run_export "$store" "$head" "$layers"
       desired=$(fleet_run_desired "$layers" vireo)
@@ -306,8 +305,53 @@ YAML
         [ ! -e "$transaction" ] ||
         fail "recovery did not restore an interrupted staging transaction"
       fleet_alert_clear "$store" vireo agent-capture-interrupted agent-capture-interrupted
-      workcopy=$(jj -R "$store" log -r @ --no-graph -T 'commit_id')
       printf 'real-jj: OK (interrupted staging rolls back and uncertain publication holds)\n'
+      # Stop after commit creation, or at the push boundary with an unknown outcome.
+      local stop
+      for stop in described push; do
+        rc=0
+        (
+          jj() {
+            if [ "$stop" = described ] && [ "${3:-}" = describe ]; then
+              command jj "$@" || return $?
+              exit 74
+            fi
+            if [ "$stop" = push ] && [ "${3:-} ${4:-}" = 'git push' ]; then
+              return 74
+            fi
+            command jj "$@"
+          }
+          fleet_capture_pass_publish "$store" vireo "$scratch/interrupted-$stop" "$desired" "$layers" \
+            'fixture interrupted publish' -
+        ) >"$scratch/interrupted-$stop.log" 2>&1 || rc=$?
+        { [ "$stop:$rc" = described:74 ] || [ "$stop:$rc" = push:75 ]; } && jq -e --arg stop "$stop" '
+          if $stop == "described" then .phase == "staged" and .target == null
+          else .phase == "publishing" and (.target | test("^[0-9a-f]{40,64}$")) end
+          ' "$transaction/publishing" >/dev/null || fail "interrupted $stop did not persist its publication phase"
+        # Each offline pass holds, and the next online pass tries again.
+        (
+          fleet_vcs_fetch() { return 1; }
+          local attempt status
+          for attempt in 1 2; do
+            status=0
+            fleet_capture_transaction_recover "$store" || status=$?
+            [ "$status" -eq 75 ] && [ -e "$transaction/publishing" ] &&
+              cmp -s "$baseline" "$scratch/baseline" || fail "offline recovery consumed an uncertain capture"
+          done
+        ) >"$scratch/offline-$stop.log" 2>&1
+        : >"$transaction/.roundhouse-capture.interrupted-write"
+        printf '# owner save outside the capture\n' >>"$store/hosts/vireo.yaml"
+        fleet_capture_transaction_recover "$store"
+        [ ! -e "$transaction" ] && [ "$(capture_remote rev-parse main)" = "$head" ] &&
+          cmp -s "$store/fleet/capture-probe.yaml" "$layers/fleet/capture-probe.yaml" &&
+          diff -qr "$store/journal/vireo" "$scratch/original-journal" >/dev/null &&
+          cmp -s "$baseline" "$scratch/baseline" &&
+          grep -q '^# owner save outside the capture' "$store/hosts/vireo.yaml" &&
+          [ "$(fleet_vcs_heads_local "$store")" = "$head" ] ||
+          fail "verified-absent $stop did not roll back and clear its publication hold"
+        cp "$layers/hosts/vireo.yaml" "$store/hosts/vireo.yaml"
+      done
+      printf 'real-jj: OK (commit/push interruption holds offline, then rolls back verified absence)\n'
       (
         fleet_vcs_op_id() {
           command jj -R "$1" op log --no-graph --limit 1 -T 'id ++ "\n"'
@@ -342,7 +386,8 @@ YAML
         cmp -s "$baseline" "$scratch/baseline" ||
         fail "the stale capture left staged bytes or advanced agreement"
       [ "$(fleet_vcs_heads_local "$store")" = "$head" ] &&
-        [ "$(jj -R "$store" log -r @ --no-graph -T 'commit_id')" = "$workcopy" ] ||
+        [ "$(jj -R "$store" log -r @- --no-graph -T 'commit_id')" = "$head" ] &&
+        [ -z "$(jj -R "$store" log -r @ --no-graph -T description)" ] ||
         fail "the stale capture left its unpublished commit reachable from main or @"
 
       fleet_vcs_fetch "$store" origin
@@ -360,10 +405,14 @@ YAML
       # when jj resets the working copy after its real, successful push.
       jj -R "$store" bookmark set main -r "$peer_head" >/dev/null
       jj -R "$store" new "$peer_head" >/dev/null
+      jj -R "$store" config set --repo git.push non-origin-fixture
       jj() {
-        if [ "${3:-}" = new ]; then
+        if [ "${3:-} ${4:-} ${5:-}" = 'log -r @-' ]; then
           printf 'fixture: checkout failed after push\n' >&2
           return 74
+        fi
+        if [ "${3:-} ${4:-}" = 'git push' ]; then
+          printf '# owner save during push\n' >>"$store/hosts/vireo.yaml"
         fi
         command jj "$@"
       }
@@ -379,10 +428,52 @@ YAML
         fail "the checkout failure rolled back an already published capture"
       [ "$(fleet_vcs_heads_local "$store")" = "$(capture_remote rev-parse main)" ] ||
         fail "the checkout failure reset the local bookmark past the published capture"
+      grep -q '^# owner save during push' "$store/hosts/vireo.yaml" &&
+        ! capture_remote show main:hosts/vireo.yaml | grep -q '^# owner save during push' ||
+        fail "the push changed its recorded target or erased a later owner save"
       jq -e '.["claude:ponytail@test-market"].value == "enabled"' "$baseline" >/dev/null &&
         [ ! -e "$transaction" ] ||
         fail "the checkout failure left agreement behind an already published capture"
       printf 'real-jj: OK (a checkout failure preserves and rebaselines the published capture)\n'
+      unset -f jj
+      jj -R "$store" config set --repo git.push origin
+      capture_owner_remove
+      head=$(capture_remote rev-parse main)
+      fleet_run_export "$store" "$head" "$scratch/before-interrupted-push"
+      desired=$(fleet_run_desired "$scratch/before-interrupted-push" vireo)
+      observed=$(fleet_capture_collect "$scratch/before-interrupted-observed")
+      fleet_capture_prepare "$store" vireo "$desired" "$observed" true true "$scratch" "$scratch/before-interrupted-push"
+      rc=0
+      (
+        jj() {
+          command jj "$@" || return $?
+          if [ "${3:-} ${4:-}" = 'git push' ]; then return 74; fi
+        }
+        fleet_capture_pass_publish "$store" vireo "$scratch/interrupted-push" "$desired" \
+          "$scratch/before-interrupted-push" 'fixture pushed without acknowledgement' -
+      ) >"$scratch/interrupted-push.log" 2>&1 || rc=$?
+      [ "$rc" -eq 75 ] && [ -e "$transaction/publishing" ] &&
+        [ "$(capture_layer | yq -r '.plugins.ponytail.state')" = absent ] &&
+        jq -e '.["claude:ponytail@test-market"].value == "enabled"' "$baseline" >/dev/null ||
+        fail "the fixture did not interrupt between a real push and its acknowledgement"
+      # A later owner reinstall must not be swallowed by publication recovery.
+      capture_owner_install
+      (
+        fleet_run_signature_holds() { printf '!hold fixture unverified history\n'; }
+        local status=0
+        fleet_capture_transaction_recover "$store" || status=$?
+        [ "$status" -eq 75 ] && [ -e "$transaction/publishing" ] &&
+          jq -e '.["claude:ponytail@test-market"].value == "enabled"' "$baseline" >/dev/null ||
+          fail "unverified remote history settled a publication hold"
+      ) >"$scratch/unverified-recovery.log" 2>&1
+      fleet_capture_transaction_recover "$store"
+      [ ! -e "$transaction" ] &&
+        jq -e '.["claude:ponytail@test-market"].value == "absent"' "$baseline" >/dev/null ||
+        fail "verified remote publication did not finish the captured agreement"
+      capture_pass recovered-publication
+      [ "$(capture_layer | yq -r '.plugins.ponytail.state')" = enabled ] ||
+        fail "publication recovery lost the owner's later reinstall"
+      printf 'real-jj: OK (verified remote publication finishes and preserves a later owner edit)\n'
     }
     capture_lib capture_publish_race
   )

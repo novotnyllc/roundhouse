@@ -126,39 +126,58 @@ fleet_capture_transaction_hold() {
 
 fleet_capture_transaction_remove() {
   # Keep the publishing marker until no backups can be replayed.
-  rm -rf "$1/capture-stage" && rm -f "$1/basis" "$1/publishing" && rmdir "$1"
+  rm -rf "$1/capture-stage" && rm -rf "$1"
 }
 
 fleet_capture_transaction_target() {
   [ -n "${fleet_capture_active_txn:-}" ] || return 0
   local state
   state=$(fleet_capture_json_read "$fleet_capture_active_txn/publishing" '{}') || return 1
-  state=$(jq -c --arg target "$1" '.target = $target | .phase = "publishing"' <<<"$state") || return 1
+  state=$(jq -ce --arg target "$1" 'select($target | test("^[0-9a-f]{40,64}$")) |
+    .target = $target | .phase = "publishing"' <<<"$state") || return 1
   fleet_capture_json_write "$fleet_capture_active_txn/publishing" "$state"
 }
 
+fleet_capture_transaction_rollback() {
+  local store=$1 transaction=$2 operation=$3 identity before current main description
+  identity='change_id ++ " " ++ parents.map(|c| c.commit_id()).join(" ")'
+  before=$(jj --at-operation "$operation" -R "$store" log -r @ --no-graph -T "$identity") || return 1
+  current=$(jj -R "$store" log -r @ --no-graph -T "$identity") || return 1
+  [ -n "$before" ] && [ "$before" = "$current" ] || return 1
+  main=$(jj --at-operation "$operation" -R "$store" log \
+    -r 'heads(bookmarks(exact:"main"))' --no-graph -T 'commit_id') || return 1
+  description=$(jj --at-operation "$operation" -R "$store" log -r @ --no-graph -T description) || return 1
+  fleet_capture_abort "$store" "$transaction" || return 1
+  # Restore only publication's metadata; an operation restore erases owner saves.
+  jj -R "$store" bookmark set main --allow-backwards -r "$main" >/dev/null &&
+    jj -R "$store" describe -r @ -m "$description" >/dev/null
+}
+
 fleet_capture_transaction_resolve() (
-  local store=$1 transaction=$2 state target operation remote scratch holds observed desired host
+  local store=$1 transaction=$2 state target operation remote scratch holds observed desired host range reviewed
   state=$(fleet_capture_json_read "$transaction/publishing" '{}') || exit 1
   operation=$(jq -er '.operation | select(test("^[0-9a-f]+$"))' <<<"$state") || exit 1
-  target=$(jq -er '.target // "" | select(. == "" or test("^[0-9a-f]{40,64}$"))' <<<"$state") || exit 1
+  target=$(jq -er 'if .phase == "staged" then ""
+    elif .phase == "publishing" then .target | select(test("^[0-9a-f]{40,64}$"))
+    else error("unknown publication phase") end' <<<"$state") || exit 1
   host=$(fleet_host_name) || exit 1
   # A cached remote ref cannot settle an interrupted push.
   fleet_vcs_fetch "$store" origin >/dev/null 2>&1 || exit 1
   remote=$(fleet_vcs_head_origin "$store") || exit 1
   [ -n "$remote" ] || exit 1
   holds=$(fleet_trust_catch_up "$store" "$remote") && [ -z "$holds" ] || exit 1
-  local reviewed
   reviewed=$(fleet_trust_reviewed_ref) || exit 1
+  range=::$remote
   if [ -n "$reviewed" ]; then
     [ -n "$(jj -R "$store" log -r "$reviewed & ::$remote" --no-graph -T commit_id)" ] || exit 1
+    range=$reviewed..$remote
   fi
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-capture-recover.XXXXXX") || exit 1
   trap 'rm -rf "$scratch"' EXIT
   fleet_run_export "$store" "$remote" "$scratch/layers" || exit 1
   fleet_vcs_enrolled_hosts "$store" "$remote" >"$scratch/hosts" || exit 1
   fleet_trust_roster_at_head "$store" "$remote" "$scratch/roster" || exit 1
-  holds=$(fleet_run_signature_holds "$store" "::$remote" "$scratch/hosts" \
+  holds=$(fleet_run_signature_holds "$store" "$range" "$scratch/hosts" \
     "$scratch/layers" "$host" "$scratch/roster" "$scratch/verify") && [ -z "$holds" ] || exit 1
   if [ -n "$target" ]; then
     holds=$(jj -R "$store" log -r "$target & ::$remote" --no-graph -T commit_id) || exit 1
@@ -166,18 +185,18 @@ fleet_capture_transaction_resolve() (
     holds=
   fi
   if [ -n "$holds" ]; then
-    observed=$(fleet_capture_collect "$scratch/observed") || exit 1
-    desired=$(fleet_run_desired "$scratch/layers" "$host") || exit 1
+    # Finish the agreement we published; a later owner edit belongs to the next pass.
+    observed=$(jq -ce '.observed | select(type == "object")' <<<"$state") || exit 1
+    fleet_run_export "$store" "$target" "$scratch/published" || exit 1
+    desired=$(fleet_run_desired "$scratch/published" "$host") || exit 1
     fleet_capture_items=$(jq -c '.items' <<<"$state") || exit 1
     fleet_capture_discards=$(jq -c '.discards' <<<"$state") || exit 1
     fleet_capture_consume_batch=$(jq -r '.consume_batch' <<<"$state") || exit 1
-    fleet_capture_rebaseline "$store" "$host" "$desired" "$observed" true "$scratch/layers" &&
-      fleet_capture_verified_discards "$(fleet_run_state_dir)" "$scratch/layers" "$desired" "$observed" &&
+    fleet_capture_rebaseline "$store" "$host" "$desired" "$observed" true "$scratch/published" &&
+      fleet_capture_verified_discards "$(fleet_run_state_dir)" "$scratch/published" "$desired" "$observed" &&
       fleet_capture_done || exit 1
   else
-    fleet_capture_abort "$store" "$transaction" || exit 1
-    # Restore the graph without overwriting unrelated owner saves or undoing fetch.
-    jj --ignore-working-copy -R "$store" op restore "$operation" --what repo >/dev/null || exit 1
+    fleet_capture_transaction_rollback "$store" "$transaction" "$operation" || exit 1
   fi
   fleet_capture_transaction_remove "$transaction" || exit 1
   fleet_alert_clear "$store" "$host" agent-capture-interrupted agent-capture-interrupted
@@ -272,7 +291,8 @@ fleet_capture_pass_publish() {
     fleet_capture_json_write "$fleet_capture_active_txn/publishing" \
       "$(jq -cn --arg operation "$capture_publish_op" --argjson items "$fleet_capture_items" \
         --argjson discards "$fleet_capture_discards" --argjson consume "$fleet_capture_consume_batch" \
-        '{phase:"staged",operation:$operation,items:$items,discards:$discards,consume_batch:$consume}')" || return 65
+        --argjson observed "$capture_after" \
+        '{phase:"staged",operation:$operation,items:$items,discards:$discards,consume_batch:$consume,observed:$observed}')" || return 65
     capture_publish_mode=no-recover
   fi
   fleet_run_publish "$1" "$2" scheduled/agent "$6" \
@@ -281,8 +301,7 @@ fleet_capture_pass_publish() {
   if [ -z "$fleet_vcs_pushed_target" ]; then
     if [ -n "$fleet_capture_active_txn" ]; then
       [ "$fleet_vcs_push_uncertain" != true ] || { fleet_capture_transaction_hold "$1" "$fleet_capture_active_txn"; return 75; }
-      fleet_capture_abort "$1" "$fleet_capture_active_txn" &&
-        fleet_vcs_op_restore "$1" "$capture_publish_op" &&
+      fleet_capture_transaction_rollback "$1" "$fleet_capture_active_txn" "$capture_publish_op" &&
         fleet_capture_transaction_remove "$fleet_capture_active_txn" || return 65
     fi
     return "$capture_publish_rc"

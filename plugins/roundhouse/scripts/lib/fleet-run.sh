@@ -3115,7 +3115,6 @@ fleet_run_publish() {
     jj -R "$1" describe -r @ -m "${6:-converge on $2}
 
 $(fleet_vcs_trailers "$2" "$3" "$4" "$5")" >/dev/null || return 65
-    fleet_capture_transaction_target "$(jj -R "$1" log -r @ --no-graph -T 'commit_id')" || return 65
     jj -R "$1" bookmark set main \
       -r "$(jj -R "$1" log -r @ --no-graph -T 'commit_id')" >/dev/null || {
       printf 'roundhouse: could not move main to the new commit (it does not descend from main); nothing published\n' >&2
