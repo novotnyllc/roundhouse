@@ -63,12 +63,13 @@ YAML
     [ ! -e "$rh_capture_dir/agent-baseline.json" ] ||
       fail "an unavailable first scan initialized Claude"
     fleet_capture_prepare "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true true "$rh_capture_tmp"
-    jq -e 'keys == ["plugins.ambiguous"]' <<<"$fleet_capture_skip" >/dev/null ||
-      fail "Claude's first usable observation held more than its ambiguous item"
+    jq -e 'keys == ["plugins.ambiguous", "plugins.capped"]' <<<"$fleet_capture_skip" >/dev/null ||
+      fail "Claude's first usable observation did not hold just the ambiguous item and local install"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true
     rh_capture_base=$(cat "$rh_capture_dir/agent-baseline.json")
     jq -e '._initialized.claude == true and .["claude:extra@m"] == {value:"enabled",ignored:true} and
-      .["plugins.retired"] == {value:"absent"} and .["claude:keeper@m"] == {value:"enabled"} and
+      .["plugins.retired"] == {value:"absent"} and .["claude:capped@m"] == {value:"absent"} and
+      .["claude:keeper@m"] == {value:"enabled"} and
       all(keys[]; startswith("claude:ambiguous@") | not)' <<<"$rh_capture_base" >/dev/null ||
       fail "first observation lost agreed values, extras, or wrote an ambiguous value"
 
@@ -85,8 +86,8 @@ YAML
     fleet_capture_prepare "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true true "$rh_capture_tmp"
     jq -e 'has("plugins.keeper") | not' <<<"$fleet_capture_skip" >/dev/null ||
       fail "a marked plugin difference stopped ordinary convergence"
-    jq -e 'has("plugins.capped") | not' <<<"$fleet_capture_skip" >/dev/null ||
-      fail "an unchanged plugin kept by the first pass's removal cap became an owner edit"
+    jq -e 'has("plugins.capped")' <<<"$fleet_capture_skip" >/dev/null ||
+      fail "a local install held on the first pass lost its hold"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true
     [ -f "$rh_mark" ] || fail "cleared the marker before agreement"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true
@@ -176,10 +177,12 @@ JSONL
     fleet_capture_prepare "$rh_capture_store" mac "$rh_scope_fold" "$rh_observed" true true "$rh_capture_tmp"
     jq -e 'keys == ["plugins.uncertain"]' <<<"$fleet_capture_skip" >/dev/null ||
       fail "one unknown scope did not hold only its own plugin"
-    fleet_capture_prepare "$rh_capture_store" mac "$rh_scope_fold" '{"claude":null,"retry":true}' \
+    rh_changed_fold=$(jq -c '.plugins.keeper.state = "disabled"' <<<"$rh_scope_fold")
+    fleet_capture_prepare "$rh_capture_store" mac "$rh_changed_fold" '{"claude":null,"retry":true}' \
       true true "$rh_capture_tmp"
-    jq -e 'length == 0' <<<"$fleet_capture_skip" >/dev/null ||
-      fail "an untrustworthy listing prevented ordinary convergence"
+    jq -e 'keys == ["plugins.ambiguous", "plugins.capped", "plugins.retired", "plugins.uncertain", "plugins.untouched"]' \
+      <<<"$fleet_capture_skip" >/dev/null ||
+      fail "an unavailable listing did not hold exactly the unchanged or unbaselined plugins"
 
     sed 's/"scope":"user"/"scope":"project"/' "$rh_capture_root/inventory.jsonl" >"$rh_capture_root/project.jsonl"
     fleet_capture_observe "$rh_capture_root/project.jsonl" | jq -e '.claude == null' >/dev/null ||

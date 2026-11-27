@@ -39,8 +39,9 @@ TOML
 policy:
   max_removal_fraction: 1
 plugins:
-  claude-example: {state: enabled, marketplace: test-market}
+  keeper: {state: enabled, marketplace: test-market}
   ponytail: {state: absent, marketplace: test-market}
+  stale-local: {state: absent, marketplace: test-market}
 YAML
     export CLAUDE_CONFIG_DIR="$HOME/.claude"
     export CLAUDE_PLUGIN_LIST_FROM_RECORDS=1
@@ -54,7 +55,7 @@ YAML
     settings="$CLAUDE_CONFIG_DIR/settings.json"
     sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     jq -cn --arg sha "$sha" '{available: [
-      {pluginId:"claude-example@test-market",version:"1.0.0",source:{source:"git",sha:$sha}},
+      {pluginId:"keeper@test-market",version:"1.0.0",source:{source:"git",sha:$sha}},
       {pluginId:"ponytail@test-market",version:"1.0.0",source:{source:"git",sha:$sha}}]}' \
       >"$CLAUDE_PLUGIN_CATALOG_FILE"
     printf '%s\n' '[{"name":"test-market","source":"url","url":"https://market.example.invalid/catalog.json"}]' \
@@ -63,10 +64,10 @@ YAML
       >"$CLAUDE_CONFIG_DIR/plugins/known_marketplaces.json"
     jq -cn --arg sha "$sha" '
       {version:2,plugins: {
-        "claude-example@test-market":[{scope:"user",version:"1.0.0",gitCommitSha:$sha}],
+        "stale-local@test-market":[{scope:"user",version:"1.0.0",gitCommitSha:$sha}],
         "local-extra@test-market":[{scope:"user",version:"1.0.0",gitCommitSha:$sha}]
       }}' >"$installed"
-    printf '%s\n' '{"claude-example@test-market":true,"local-extra@test-market":true}' \
+    printf '%s\n' '{"stale-local@test-market":true,"local-extra@test-market":true}' \
       >"$CLAUDE_PLUGIN_ENABLED_FILE"
     printf '{}\n' >"$settings"
     : >"$CLAUDE_PLUGIN_ACTION_LOG"
@@ -126,19 +127,30 @@ YAML
     jq -e '
       ._initialized.claude == true and
       .["claude:ponytail@test-market"] == {value:"absent"} and
-      .["claude:claude-example@test-market"] == {value:"enabled"} and
+      .["claude:keeper@test-market"] == {value:"enabled"} and
+      .["claude:stale-local@test-market"] == {value:"absent"} and
       .["claude:local-extra@test-market"] == {value:"enabled", ignored:true}
     ' "$baseline" >/dev/null || fail "first pass did not record agreement and ignore its extra"
-    [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "the first pass reverted an ignored extra"
-    if grep -Eq ' (added|removed|enabled|disabled) locally' "$rjj/pass.log"; then
-      fail "the silent first pass reported a local change"
+    grep -Fqx 'install keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+      fail "the first pass did not install a store-enabled missing plugin"
+    if grep -Eq '^uninstall ' "$CLAUDE_PLUGIN_ACTION_LOG"; then
+      fail "the first pass uninstalled a local plugin"
     fi
+    capture_report claude:stale-local@test-market added
+    : >"$CLAUDE_PLUGIN_ACTION_LOG"
+    capture_pass first-pass-hold-retry
+    [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "the second pass reverted the first-pass local add"
+    capture_report claude:stale-local@test-market added
+    jq -e '.["claude:stale-local@test-market"] == {value:"absent"}' "$baseline" >/dev/null ||
+      fail "the second pass advanced agreement for the held local add"
+    capture_owner_remove stale-local@test-market
+    capture_pass first-pass-hold-agreement
     capture_layer >"$rjj/before-layer.yaml"
     if section_part 1; then
     before_hold=$(capture_remote rev-parse main)
 
     capture_owner_install ponytail@test-market
-    # Untrustworthy observations produce no holds; ordinary apply still verifies its target.
+    # Unknown inventory must not revert either an owner install or removal.
     cat >"$rjj/partial.jsonl" <<'JSONL'
 {"kind":"plugin_manager","status":"present","data":{"agent":"claude","authoritative":true,"installed_count":2}}
 JSONL
@@ -152,17 +164,23 @@ JSONL
     [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] ||
       fail "an unreadable registry caused a plugin mutation"
     mv "$rjj/registry" "$installed"
+    capture_owner_remove keeper@test-market
     for listing in partial failed; do
       capture_owner_install ponytail@test-market
       : >"$CLAUDE_PLUGIN_ACTION_LOG"
       ROUNDHOUSE_SEED_SNAPSHOT="$rjj/$listing.jsonl" capture_pass "$listing-listing"
-      if grep -Fq 'ponytail@test-market added locally' "$rjj/pass.log"; then
+      if grep -Eq ' (added|removed|enabled|disabled) locally' "$rjj/pass.log"; then
         fail "$listing inventory generated a local change alert"
       fi
-      grep -Fqx 'uninstall ponytail@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
-        fail "$listing inventory stopped normal convergence of an unchanged target"
+      [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] ||
+        fail "$listing inventory reverted an owner install or removal"
+      [ "$(grep -Ec 'Claude plugin inventory unavailable; making no plugin reverts this pass \([0-9]+ items held, retried next pass\)\.' "$rjj/pass.log")" -eq 1 ] ||
+        fail "$listing inventory did not report held items once"
     done
-    if capture_remote grep -q 'ponytail@test-market added locally' main -- alerts/vireo; then
+    capture_owner_install keeper@test-market
+    jq '.["keeper@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
+      mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
+    if capture_remote grep -Eq '(ponytail@test-market added|keeper@test-market removed) locally' main -- alerts/vireo; then
       fail "unavailable or incomplete inventory published a local hold alert"
     fi
 
@@ -197,43 +215,43 @@ JSONL
 
     if section_part 2; then
     # An interrupted Roundhouse mutation may leave a state change and marker.
-    capture_lib fleet_agent_pending_mark claude claude-example@test-market enabled disabled
-    marker=$(capture_lib fleet_agent_pending_path claude:claude-example@test-market)
-    jq '.["claude-example@test-market"] = false' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
+    capture_lib fleet_agent_pending_mark claude keeper@test-market enabled disabled
+    marker=$(capture_lib fleet_agent_pending_path claude:keeper@test-market)
+    jq '.["keeper@test-market"] = false' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
       mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
     printf '{"fixture_touch":true}\n' >"$settings"
     : >"$CLAUDE_PLUGIN_ACTION_LOG"
     capture_pass marked-disable
-    grep -Fqx 'enable claude-example@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+    grep -Fqx 'enable keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
       fail "the interrupted apply was not converged back to the fleet"
     [ ! -e "$marker" ] || fail "agreement did not clear the crash marker"
-    if grep -Fq 'claude-example@test-market disabled locally' "$rjj/pass.log"; then
+    if grep -Fq 'keeper@test-market disabled locally' "$rjj/pass.log"; then
       fail "a marked change was reported as local"
     fi
 
     before_hold=$(capture_remote rev-parse main)
-    capture_owner_remove claude-example@test-market
+    capture_owner_remove keeper@test-market
     : >"$CLAUDE_PLUGIN_ACTION_LOG"
     capture_pass owner-uninstall
     [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] ||
       fail "the pass reinstalled the plugin the owner removed"
-    capture_report claude:claude-example@test-market removed
+    capture_report claude:keeper@test-market removed
     capture_store_unchanged "$before_hold"
 
     # The owner changes the fleet side too. A conflict still protects local state.
-    yq -i '.plugins.claude-example.state = "disabled"' "$store/fleet/capture-probe.yaml"
+    yq -i '.plugins.keeper.state = "disabled"' "$store/fleet/capture-probe.yaml"
     capture_pass owner-conflict
     [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "the pass reverted a conflict"
-    assert_contains "$(cat "$rjj/pass.log")" 'claude:claude-example@test-market removed locally and changed in the fleet'
-    capture_remote grep -q 'claude-example@test-market removed locally and changed in the fleet' main -- alerts/vireo ||
+    assert_contains "$(cat "$rjj/pass.log")" 'claude:keeper@test-market removed locally and changed in the fleet'
+    capture_remote grep -q 'keeper@test-market removed locally and changed in the fleet' main -- alerts/vireo ||
       fail "the pass did not report the conflict"
     [ ! -e "${baseline%/*}/agent-conflicts.json" ] || fail "the pass persisted a conflict record"
 
-    yq -i '.plugins.claude-example.state = "absent"' "$store/fleet/capture-probe.yaml"
+    yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
     capture_pass agreement
-    jq -e '.["claude:claude-example@test-market"] == {value:"absent"}' "$baseline" >/dev/null ||
+    jq -e '.["claude:keeper@test-market"] == {value:"absent"}' "$baseline" >/dev/null ||
       fail "store agreement did not settle the held removal"
-    if capture_remote grep -q 'claude-example@test-market.*removed locally' main -- alerts/vireo; then
+    if capture_remote grep -q 'keeper@test-market.*removed locally' main -- alerts/vireo; then
       fail "the local change alert outlived store agreement"
     fi
 
