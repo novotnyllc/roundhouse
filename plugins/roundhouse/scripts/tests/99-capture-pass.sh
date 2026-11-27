@@ -180,6 +180,32 @@ JSONL
     capture_owner_install keeper@test-market
     jq '.["keeper@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
       mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
+
+    # A failed listing cannot expose a pre-pass owner disable to a fleet removal.
+    jq -e '.["claude:keeper@test-market"] == {value:"enabled"}' "$baseline" >/dev/null ||
+      fail "unknown-inventory removal did not start from agreed enabled"
+    capture_owner_install keeper@test-market
+    printf '%s\n' '{"enabledPlugins":{"keeper@test-market":false}}' >"$settings"
+    yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
+    capture_lib fleet_capture_observe "$rjj/failed.jsonl" |
+      jq -e '.claude == null' >/dev/null || fail "failed listing was not unknown"
+    printf 'capture regression: agreed enabled, store absent, readable owner state disabled, Claude inventory null\n'
+    : >"$CLAUDE_PLUGIN_ACTION_LOG"
+    ROUNDHOUSE_SEED_SNAPSHOT="$rjj/failed.jsonl" capture_pass unknown-inventory-fleet-removal
+    if grep -Fqx 'uninstall keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG"; then
+      cat "$CLAUDE_PLUGIN_ACTION_LOG" >&2
+      fail "unknown inventory let a fleet removal overwrite the owner's pre-pass disable"
+    fi
+    mkdir -p "$rjj/unknown-removal"
+    ROUNDHOUSE_SEED_SNAPSHOT="$rjj/failed.jsonl" capture_lib fleet_capture_pass_prepare \
+      "$store" vireo "$(capture_lib fleet_run_desired "$store" vireo)" \
+      true true "$rjj/unknown-removal" "$store"
+    grep -Fqx plugins.keeper "$rjj/unknown-removal/capture-skip" ||
+      fail "unknown inventory did not hold the fleet-removed plugin in capture-skip"
+    yq -i '.plugins.keeper.state = "enabled"' "$store/fleet/capture-probe.yaml"
+    jq '.["keeper@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
+      mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
+    printf '{}\n' >"$settings"
     if capture_remote grep -Eq '(ponytail@test-market added|keeper@test-market removed) locally' main -- alerts/vireo; then
       fail "unavailable or incomplete inventory published a local hold alert"
     fi

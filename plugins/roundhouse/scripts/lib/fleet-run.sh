@@ -4658,7 +4658,17 @@ fleet_run_plugin_reinstall() {
   fleet_run_plugin_mark_from=$(fleet_run_plugin_pending_origin "claude:$1" "$marker" "$state") || return 75
   fleet_run_cli_invalidate
   fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" absent || return 75
-  bounded_verb claude plugin uninstall --scope user --keep-data "$1" >/dev/null 2>&1 || return 1
+  bounded_verb claude plugin uninstall --scope user --keep-data "$1" >/dev/null 2>&1 || {
+    # A failed uninstall that left the plugin must not later attribute an owner removal to us.
+    fleet_run_cli_invalidate
+    installed=$(fleet_run_installed_plugin "$1") || installed=
+    if [ -n "$installed" ] && [ "$installed" != '{}' ]; then
+      if [ "$fleet_run_plugin_mark_from" = "$state" ] || [ "$state" = unknown ]; then
+        rm -f "$marker" || return 75
+      else fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" "$state" || return 75; fi
+    fi
+    return 1
+  }
   fleet_run_cli_invalidate
   fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" enabled absent || return 75
   bounded_verb claude plugin install "$1" --scope user >/dev/null 2>&1 || install_status=$?

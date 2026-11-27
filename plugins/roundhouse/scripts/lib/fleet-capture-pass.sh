@@ -102,7 +102,7 @@ fleet_capture_prepare() {
   discard=$(fleet_capture_json_read "$dir/agent-discard.json" '{}') || return 1
   fleet_capture_authoritative=$(jq -r --argjson baseline "$baseline" "$fleet_capture_authority_filter"'
     authoritative(.; $baseline; "claude")' <<<"$observed") || return 1
-  # No trustworthy inventory means no evidence for which side changed: make no reverts this pass.
+  # No trustworthy inventory: defer anything the pre-pass records cannot prove unchanged.
   inventory_unknown=$(jq -r '.claude == null' <<<"$observed") || return 1
   rows=$(fleet_capture_rows "$layers" "$desired" "$observed" "$baseline") || return 1
   fleet_capture_race_holds=$(jq -c --argjson discard "$discard" '
@@ -126,9 +126,10 @@ fleet_capture_prepare() {
       continue
     fi
     if [ "$ours" = unobserved ]; then
-      # Only a fleet change (store moved away from agreement) may act without an inventory.
+      # A fleet change may act only while pre-pass records still show the agreed value.
       if [ "$inventory_unknown" = true ] && [ "$theirs" != missing ] &&
-        { [ "$base" = missing ] || [ "${base#ignored:}" = "$theirs" ]; }; then
+        { [ "$base" = missing ] || [ "${base#ignored:}" = "$theirs" ] ||
+          [ "$(fleet_capture_prepass_state "$id")" != "${base#ignored:}" ]; }; then
         skip+=("$item"$'\t'"$id")
         unknown_held=$((unknown_held + 1))
         fleet_capture_retry_unknown=true
@@ -315,6 +316,18 @@ fleet_capture_guard_target() {
         end)}' <<<"$records"
 }
 
+fleet_capture_prepass_state() {
+  # ID -> enabled|disabled|absent from registry, settings and the CLI's state; unknown on any doubt.
+  local id=${1#claude:}
+  fleet_capture_id_valid "claude:$id" || { printf 'unknown\n'; return 0; }
+  fleet_capture_guard_live "$id" 2>/dev/null | jq -r --arg id "$id" '
+    if .installed == null then "unknown" elif .installed == [] then "absent"
+    elif .installed != [$id] then "unknown"
+    else [(.settings[$id] | booleans), (.manager_state | select(IN("true","false")) | . == "true")] |
+      unique | if length != 1 then "unknown" elif .[0] then "enabled" else "disabled" end end' ||
+    printf 'unknown\n'
+}
+
 fleet_capture_guard_live() {
   local records enabled
   # Bypass the plan's manager cache. Read the on-disk evidence after the query.
@@ -375,6 +388,9 @@ fleet_capture_guard_destructive() {
   comparison=$(jq -r --argjson before "$expected" --arg initial "$initial" '
     def changed($old): . != null and $old != null and . != $old;
     if (.installed | changed($before.installed)) or (.settings | changed($before.settings)) or
+      # The CLI enabled state is checked on its own: settings must not mask an owner enable.
+      ($before.state != "unknown" and (.manager_state | IN("true","false")) and
+        .manager_state != $before.state) or
       (if $before.state == "unknown" then
         $initial != "unknown" and .manager_state != "unknown" and .manager_state != $initial
       else .state != "unknown" and .state != $before.state end)

@@ -271,13 +271,15 @@ by authorizing the next pass to converge to the store. It writes no store data.
 With an authoritative Claude `plugin_manager` listing whose plugin row count
 matches, unmarked local user-scope plugin changes and conflicts are held and reported by
 the run and `fleet-doctor` until the store agrees or the owner discards the
-change. An unreadable, partial, failed or wiped listing is unknown: it places
-no new hold, makes no plugin reverts (no uninstall or reinstall of an item
-whose store value has not changed since agreement), and destructive removals
+change. An unreadable, partial or failed listing is unknown: it places
+no new local-change hold and makes no plugin reverts: an item whose store value
+has not changed since agreement is left alone, and a store change acts only when
+the pre-pass registry, settings and CLI state all still show the agreed value
+(otherwise it is deferred to a pass with usable inventory). Destructive removals
 require usable pre-pass evidence. The first pass on a host is silent except
 that a plugin installed locally but marked `absent` in the store is held as an
-owner addition, never uninstalled. Roundhouse never holds its own plugin
-(`roundhouse@novotnyllc`): it always converges to the fleet.
+owner addition, never uninstalled. With usable inventory, Roundhouse never
+holds its own plugin (`roundhouse@novotnyllc`): it always converges to the fleet.
 
 Two rules make this surface safe, and neither is a formality:
 

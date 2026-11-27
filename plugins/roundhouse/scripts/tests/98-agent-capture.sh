@@ -51,6 +51,8 @@ plugins:
   ambiguous: disabled
 YAML
     rh_capture_fold=$(fleet_run_desired "$rh_capture_store" mac)
+    # Despite its name, capped tests the first-pass hold: disabled locally, absent in the store, no baseline.
+    # Removal-cap coverage with an established baseline lives in 93-jj-run.sh.
     rh_capture_ours='{"claude":{
       "keeper@m":{"value":"enabled","marketplace":"m"},
       "capped@m":{"value":"disabled","marketplace":"m"},
@@ -64,7 +66,7 @@ YAML
       fail "an unavailable first scan initialized Claude"
     fleet_capture_prepare "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true true "$rh_capture_tmp"
     jq -e 'keys == ["plugins.ambiguous", "plugins.capped"]' <<<"$fleet_capture_skip" >/dev/null ||
-      fail "Claude's first usable observation did not hold just the ambiguous item and local install"
+      fail "Claude's first usable observation did not hold the ambiguous item and disabled local install against absent"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true
     rh_capture_base=$(cat "$rh_capture_dir/agent-baseline.json")
     jq -e '._initialized.claude == true and .["claude:extra@m"] == {value:"enabled",ignored:true} and
@@ -84,10 +86,11 @@ YAML
       fail "a version update did not run or replaced a pending state transition"
     rh_capture_changed=$(jq -c '.claude["keeper@m"].value = "disabled"' <<<"$rh_capture_ours")
     fleet_capture_prepare "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true true "$rh_capture_tmp"
+    # With usable inventory, pending keeper stays eligible; the local install against absent stays held.
     jq -e 'has("plugins.keeper") | not' <<<"$fleet_capture_skip" >/dev/null ||
       fail "a marked plugin difference stopped ordinary convergence"
     jq -e 'has("plugins.capped")' <<<"$fleet_capture_skip" >/dev/null ||
-      fail "a local install held on the first pass lost its hold"
+      fail "the disabled local install lost its first-pass hold against the absent baseline"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true
     [ -f "$rh_mark" ] || fail "cleared the marker before agreement"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true
@@ -180,9 +183,9 @@ JSONL
     rh_changed_fold=$(jq -c '.plugins.keeper.state = "disabled"' <<<"$rh_scope_fold")
     fleet_capture_prepare "$rh_capture_store" mac "$rh_changed_fold" '{"claude":null,"retry":true}' \
       true true "$rh_capture_tmp"
-    jq -e 'keys == ["plugins.ambiguous", "plugins.capped", "plugins.retired", "plugins.uncertain", "plugins.untouched"]' \
+    jq -e 'keys == ["plugins.ambiguous", "plugins.capped", "plugins.keeper", "plugins.retired", "plugins.uncertain", "plugins.untouched"]' \
       <<<"$fleet_capture_skip" >/dev/null ||
-      fail "an unavailable listing did not hold exactly the unchanged or unbaselined plugins"
+      fail "an unavailable listing did not hold every store-managed plugin, including the fleet-changed keeper"
 
     sed 's/"scope":"user"/"scope":"project"/' "$rh_capture_root/inventory.jsonl" >"$rh_capture_root/project.jsonl"
     fleet_capture_observe "$rh_capture_root/project.jsonl" | jq -e '.claude == null' >/dev/null ||
