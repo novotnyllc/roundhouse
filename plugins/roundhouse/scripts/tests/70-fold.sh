@@ -316,6 +316,23 @@ YAML
       fail "a document of known categories and host facts reported an unknown one"
     rm -f "$fold_store/hosts/oddball.yaml"
 
+    # liveness_alert_hours is a host fact, not a category, so a signed
+    # hosts/<peer>.yaml can set a per-host stale-host window without holding
+    # the run.
+    cat >"$fold_store/hosts/boxy.yaml" <<'YAML'
+platform: linux
+groups: []
+liveness_alert_hours: 96
+YAML
+    fold_boxy=$(fleet_fold "$fold_store" boxy)
+    [ -z "$(fleet_unknown_categories "$fold_boxy")" ] ||
+      fail "liveness_alert_hours on a host file was treated as an unknown category: $(fleet_unknown_categories "$fold_boxy")"
+    [ "$(printf '%s\n' "$fold_boxy" | jq -r '.liveness_alert_hours')" = 96 ] ||
+      fail "the host-file liveness_alert_hours fact did not survive the fold"
+    ! fleet_items "$fold_boxy" | grep -q '^liveness_alert_hours' ||
+      fail "liveness_alert_hours was enumerated as an item"
+    rm -f "$fold_store/hosts/boxy.yaml"
+
     # An unrecognised directory at the store root is the same class of
     # finding: it may carry desired state nothing folded.
     mkdir -p "$fold_store/journal/vireo" "$fold_store/regions"

@@ -432,33 +432,6 @@ ROUNDHOUSE_CONFIG="$lane_tmp/config-box-native.json" "$cli" fleet-readiness test
 ! grep -q ' schedule ' "$lane_tmp/box-readiness.txt" ||
   fail "a host without scheduler: external got a schedule row"
 
-# --- per-host liveness_alert_hours (next to scheduler on the machine entry) ---
-# A positive integer is accepted; omitted or null keeps the store policy.
-# 0, a negative, a non-integer, a boolean or a string is rejected.
-jq '.machines["test-apt"].liveness_alert_hours = 96' \
-  "$tmp/config.json" >"$lane_tmp/config-liveness.json"
-chmod 600 "$lane_tmp/config-liveness.json"
-ROUNDHOUSE_CONFIG="$lane_tmp/config-liveness.json" "$cli" validate-config >/dev/null ||
-  fail 'liveness_alert_hours: 96 was rejected'
-jq '.machines["test-apt"].liveness_alert_hours = null' \
-  "$tmp/config.json" >"$lane_tmp/config-liveness-null.json"
-chmod 600 "$lane_tmp/config-liveness-null.json"
-ROUNDHOUSE_CONFIG="$lane_tmp/config-liveness-null.json" "$cli" validate-config >/dev/null ||
-  fail 'liveness_alert_hours: null was rejected'
-for box_bad in \
-  '.machines["test-apt"].liveness_alert_hours = 0' \
-  '.machines["test-apt"].liveness_alert_hours = -1' \
-  '.machines["test-apt"].liveness_alert_hours = 12.5' \
-  '.machines["test-apt"].liveness_alert_hours = false' \
-  '.machines["test-apt"].liveness_alert_hours = true' \
-  '.machines["test-apt"].liveness_alert_hours = "12"'; do
-  jq "$box_bad" "$tmp/config.json" >"$lane_tmp/config-liveness-bad.json"
-  chmod 600 "$lane_tmp/config-liveness-bad.json"
-  if ROUNDHOUSE_CONFIG="$lane_tmp/config-liveness-bad.json" "$cli" validate-config >/dev/null 2>&1; then
-    fail "validate-config accepted $box_bad"
-  fi
-done
-
 # --- no ceremony anywhere in the user-facing text ----------------------------------
 for lane_skill in fleet-hosts fleet-readiness fleet-update fleet-auth; do
   lane_text=$(cat "$script_dir/../skills/$lane_skill/SKILL.md")

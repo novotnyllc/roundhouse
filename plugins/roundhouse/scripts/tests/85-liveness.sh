@@ -232,12 +232,14 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$(fleet_policy_int '{}' liveness_alert_hours)" = 12 ] ||
       fail "liveness_alert_hours does not default to 12"
 
-    # --- per-host liveness_alert_hours: a config.json override of the policy ---
+    # --- per-host liveness_alert_hours: a hosts/<peer>.yaml override ---
     # A weekday-only external schedule needs a longer window than the 12h
     # policy so peers do not raise stale-host between its passes. The
-    # override is per-peer: a host that does not set it still uses 12h.
-    live_cfg="$live_root/config-liveness.json"
-    jq -n '{machines:{finch:{liveness_alert_hours:96},sparrow:{}}}' >"$live_cfg"
+    # override is a signed host fact: one store edit, every peer reads it.
+    # A host that does not set it still uses 12h.
+    mkdir -p "$live_store/hosts"
+    printf 'liveness_alert_hours: 96\n' >"$live_store/hosts/finch.yaml"
+    printf 'platform: linux\n' >"$live_store/hosts/sparrow.yaml"
     printf 'vireo\nfinch\nsparrow\n' >"$live_root/hosts-override"
     rm -rf "$live_store/journal/finch" "$live_store/journal/sparrow"
     rm -f "$live_store/alerts/vireo/"stale-host--*.yaml
@@ -247,9 +249,8 @@ if [ -n "$fleet_fixture_yq" ]; then
       "$(jq -cn --arg at "$(live_at 76)" '{outcome:"alive",at:$at}')"
     fleet_journal_append "$live_store" sparrow \
       "$(jq -cn --arg at "$(live_at 87)" '{outcome:"alive",at:$at}')"
-    live_override_out=$(
-      ROUNDHOUSE_CONFIG="$live_cfg" fleet_liveness_alerts "$live_store" vireo \
-        "$live_root/hosts-override" /dev/null "$live_fold" "$(live_at 100)")
+    live_override_out=$(fleet_liveness_alerts "$live_store" vireo \
+      "$live_root/hosts-override" /dev/null "$live_fold" "$(live_at 100)")
     [ "$live_override_out" = 'stale sparrow' ] ||
       fail "a 24h-old heartbeat inside a 96h host window was treated as stale, or the 13h-old 12h peer was not: $live_override_out"
     [ -z "$(find "$live_store/alerts/vireo" -name 'stale-host--finch.yaml')" ] ||
@@ -262,9 +263,8 @@ if [ -n "$fleet_fixture_yq" ]; then
     rm -f "$live_store/alerts/vireo/"stale-host--finch.yaml
     fleet_journal_append "$live_store" finch \
       "$(jq -cn --arg at "$(live_at 3)" '{outcome:"alive",at:$at}')"
-    live_override_out=$(
-      ROUNDHOUSE_CONFIG="$live_cfg" fleet_liveness_alerts "$live_store" vireo \
-        "$live_root/hosts-override" /dev/null "$live_fold" "$(live_at 100)")
+    live_override_out=$(fleet_liveness_alerts "$live_store" vireo \
+      "$live_root/hosts-override" /dev/null "$live_fold" "$(live_at 100)")
     case $live_override_out in
       *'stale finch'*) ;;
       *) fail "a heartbeat older than the 96h host window was not stale: $live_override_out" ;;
@@ -279,12 +279,34 @@ if [ -n "$fleet_fixture_yq" ]; then
     # by 96h, not by the 12h policy. Sparrow stays silent (watch).
     fleet_journal_append "$live_store" finch \
       "$(jq -cn --arg at "$(live_at 40)" '{outcome:"alive",at:$at}')"
-    ROUNDHOUSE_CONFIG="$live_cfg" fleet_liveness_alerts "$live_store" vireo \
+    fleet_liveness_alerts "$live_store" vireo \
       "$live_root/hosts-override" /dev/null "$live_fold" "$(live_at 100)" \
       scanned-rev >/dev/null
     [ "$(jq -r '.due' "$(fleet_run_state_dir)/liveness.json")" = \
       "$(jq -rn --arg at "$(live_at $((40 + 96)))" '$at | fromdateiso8601')" ] ||
       fail "a 96h host window did not move the scan's next-owed instant: $(cat "$(fleet_run_state_dir)/liveness.json")"
+
+    # An override below 2 × heartbeat_publish_hours is clamped up: a 1h
+    # window over a 6h heartbeat would fire on a healthy, quiet host.
+    printf 'liveness_alert_hours: 1\n' >"$live_store/hosts/finch.yaml"
+    rm -rf "$live_store/journal/finch"
+    rm -f "$live_store/alerts/vireo/"stale-host--finch.yaml
+    fleet_journal_append "$live_store" finch \
+      "$(jq -cn --arg at "$(live_at 95)" '{outcome:"alive",at:$at}')"
+    # 5h ago: stale under a raw 1h window, live under the 12h floor.
+    live_override_out=$(fleet_liveness_alerts "$live_store" vireo \
+      "$live_root/hosts-override" /dev/null "$live_fold" "$(live_at 100)")
+    case $live_override_out in
+      *finch*) fail "a 1h host override was not clamped to 2 × heartbeat_publish_hours: $live_override_out" ;;
+    esac
+
+    # Store policy 0 still disables the alert for every host, even one with
+    # a 96h override.
+    printf 'liveness_alert_hours: 96\n' >"$live_store/hosts/finch.yaml"
+    [ -z "$(fleet_liveness_alerts "$live_store" vireo \
+      "$live_root/hosts-override" /dev/null \
+      '{"policy":{"liveness_alert_hours":0}}' "$(live_at 100)")" ] ||
+      fail "policy liveness_alert_hours: 0 did not disable a host with a 96h override"
 
   )
 fi

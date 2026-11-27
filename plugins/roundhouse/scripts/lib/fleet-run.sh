@@ -4122,7 +4122,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   # `liveness_alert_hours` is alerted on, from this store's journal alone.
   fleet_liveness_alerts "$run_store" "$run_host" "$run_tmp/hosts" \
     "$run_tmp/reviewed-roster" "$run_fold" "$run_alive_at" \
-    "$(fleet_vcs_heads_local "$run_store" | head -1)" |
+    "$(fleet_vcs_heads_local "$run_store" | head -1)" "$run_layers" |
     while read -r _ run_silent; do
       printf 'roundhouse: %s has published no heartbeat within liveness_alert_hours (stale-host alert)\n' \
         "$run_silent" >&2
