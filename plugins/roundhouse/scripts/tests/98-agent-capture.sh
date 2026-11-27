@@ -220,6 +220,61 @@ JSONL
       jq -e 'any(.[]; .item == "plugins.keeper" and .ours == "unobserved")' >/dev/null ||
       fail "a wiped inventory was read as a known local removal"
 
+    (
+      # #133: removal markers must explain every baseline install, including disabled ones.
+      ROUNDHOUSE_FLEET_STORE="$rh_capture_root/empty-controls/store"
+      mkdir -p "$ROUNDHOUSE_FLEET_STORE/fleet" "$ROUNDHOUSE_FLEET_STORE/hosts"
+      rh_empty_dir=$(fleet_instance_path store.run)
+      rh_empty_base='{"_initialized":{"claude":true},"claude:keeper@m":{"value":"enabled"},"claude:extra@m":{"value":"disabled"}}'
+      rh_empty_fold='{"plugins":{"keeper":{"state":"absent","marketplace":"m"},"extra":{"state":"disabled","marketplace":"m"}}}'
+      fleet_capture_json_write "$rh_empty_dir/agent-baseline.json" "$rh_empty_base"
+      cp "$rh_empty_dir/agent-baseline.json" "$rh_capture_root/empty-baseline.json"
+      for rh_empty_case in unexplained some-marked; do
+        if [ "$rh_empty_case" = some-marked ]; then
+          fleet_agent_pending_mark claude keeper@m enabled absent
+          fleet_agent_pending_mark claude extra@m enabled disabled
+        fi
+        rh_empty_observed=$(fleet_capture_observe "$rh_capture_root/empty.jsonl")
+        jq -e --arg case "$rh_empty_case" '.claude == {} and
+          ((.owned_absent // []) == (if $case == "some-marked" then ["claude:keeper@m"] else [] end))' \
+          <<<"$rh_empty_observed" >/dev/null || fail "$rh_empty_case empty inventory lost its marker provenance"
+        fleet_capture_rows "$ROUNDHOUSE_FLEET_STORE" "$rh_empty_fold" "$rh_empty_observed" "$rh_empty_base" |
+          jq -e 'length == 2 and all(.[]; .ours == "unobserved")' >/dev/null ||
+          fail "$rh_empty_case empty inventory manufactured a known absence"
+        fleet_capture_prepare "$ROUNDHOUSE_FLEET_STORE" mac "$rh_empty_fold" "$rh_empty_observed" \
+          true true "$rh_capture_tmp" >"$rh_capture_root/empty-prepare.log"
+        [ "$fleet_capture_authoritative" = false ] && [ "$fleet_capture_skip" = '{}' ] ||
+          fail "$rh_empty_case empty inventory became authoritative or held a plugin"
+        if grep -Eq ' (added|removed|enabled|disabled) locally' "$rh_capture_root/empty-prepare.log"; then
+          fail "$rh_empty_case empty inventory reported a local change"
+        fi
+        fleet_capture_rebaseline "$ROUNDHOUSE_FLEET_STORE" mac "$rh_empty_fold" "$rh_empty_observed" true
+        cmp "$rh_empty_dir/agent-baseline.json" "$rh_capture_root/empty-baseline.json" >/dev/null ||
+          fail "$rh_empty_case empty inventory changed agreement"
+      done
+      for rh_empty_id in keeper@m extra@m; do
+        [ -f "$(fleet_agent_pending_path "claude:$rh_empty_id")" ] ||
+          fail "partly explained empty inventory cleared $rh_empty_id's marker"
+        fleet_agent_pending_mark claude "$rh_empty_id" enabled absent
+      done
+      # Even a complete set of removal markers cannot authorize a bad listing.
+      for rh_bad_listing in partial failed; do
+        rh_empty_observed=$(fleet_capture_observe "$rh_capture_root/$rh_bad_listing.jsonl")
+        jq -e '.claude == null and .retry == true and (has("owned_absent") | not)' \
+          <<<"$rh_empty_observed" >/dev/null || fail "removal markers authorized a $rh_bad_listing listing"
+        fleet_capture_rows "$ROUNDHOUSE_FLEET_STORE" "$rh_empty_fold" "$rh_empty_observed" "$rh_empty_base" |
+          jq -e 'length == 2 and all(.[]; .ours == "unobserved")' >/dev/null ||
+          fail "$rh_bad_listing listing manufactured absence despite unknown inventory"
+        fleet_capture_rebaseline "$ROUNDHOUSE_FLEET_STORE" mac "$rh_empty_fold" "$rh_empty_observed" true
+        cmp "$rh_empty_dir/agent-baseline.json" "$rh_capture_root/empty-baseline.json" >/dev/null ||
+          fail "$rh_bad_listing listing advanced agreement with removal markers"
+        for rh_empty_id in keeper@m extra@m; do
+          [ -f "$(fleet_agent_pending_path "claude:$rh_empty_id")" ] ||
+            fail "$rh_bad_listing listing cleared $rh_empty_id's removal marker"
+        done
+      done
+    )
+
     jq -c 'select(.data.manager_id != "keeper@m") |
       if .kind == "plugin_manager" then .data.installed_count=1 else . end' \
       "$rh_capture_root/scope.jsonl" >"$rh_capture_root/scope-only.jsonl"

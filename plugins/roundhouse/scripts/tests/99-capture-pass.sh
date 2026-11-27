@@ -1,6 +1,6 @@
 # roundhouse self-check — plugin ownership through a signed fixture fleet pass.
 # Reuses the fixture manager commands from 07 and the local jj remote from 90.
-# roundhouse-test: parts=2
+# roundhouse-test: parts=3
 # shellcheck shell=bash
 
 if [ "$real_jj_ok" = true ]; then
@@ -331,6 +331,69 @@ JSONL
     [ ! -e "${baseline%/*}/agent-discard.json" ] ||
       fail "an authoritatively disappeared unmanaged plugin stranded its discard"
     [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "discard mutated a disappeared plugin"
+    fi
+
+    if section_part 3; then
+    # #133: the last Roundhouse removal must settle before an owner reinstall.
+    jq -cn --arg sha "$sha" '{version:2,plugins:{
+      "keeper@test-market":[{scope:"user",version:"1.0.0",gitCommitSha:$sha}]
+    }}' >"$installed"
+    printf '%s\n' '{"keeper@test-market":true}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
+    printf '{}\n' >"$settings"
+    yq -i '.plugins.keeper.state = "enabled"' "$store/fleet/capture-probe.yaml"
+    capture_pass last-plugin-baseline
+    jq -e '.["claude:keeper@test-market"] == {value:"enabled"} and
+      ([to_entries[] | select(.value | type == "object") |
+        select(.value.value | IN("enabled","disabled"))] | length) == 1' \
+      "$baseline" >/dev/null || fail "last-plugin regression did not start with exactly one agreed install"
+    marker=$(capture_lib fleet_agent_pending_path claude:keeper@test-market)
+    [ ! -e "$marker" ] || fail "last-plugin baseline retained a pending marker"
+    cat >"$rjj/last-installed.jsonl" <<'JSONL'
+{"kind":"plugin_manager","status":"present","data":{"agent":"claude","authoritative":true,"installed_count":1}}
+{"kind":"plugin","status":"present","data":{"agent":"claude","inventory_source":"manager","manager_id":"keeper@test-market","name":"keeper","marketplace":"test-market","scope":"user","enabled":true,"installed_version":"1.0.0"}}
+JSONL
+    yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
+    : >"$CLAUDE_PLUGIN_ACTION_LOG"
+    cp "$installed" "$rjj/last-installed.json"
+    cp "$CLAUDE_PLUGIN_ENABLED_FILE" "$rjj/last-enabled.json"
+    cp "$baseline" "$rjj/last-baseline.json"
+    capture_owner_remove keeper@test-market
+    capture_pass last-plugin-unexplained-empty
+    [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "an unexplained empty inventory caused a plugin mutation"
+    cmp "$baseline" "$rjj/last-baseline.json" >/dev/null ||
+      fail "an unexplained empty inventory changed signed-pass agreement"
+    [ ! -e "$marker" ] || fail "an unexplained empty inventory manufactured a removal marker"
+    if grep -Eq ' (added|removed|enabled|disabled) locally' "$rjj/pass.log"; then
+      fail "an unexplained empty inventory generated a local hold"
+    fi
+    mv "$rjj/last-installed.json" "$installed"
+    mv "$rjj/last-enabled.json" "$CLAUDE_PLUGIN_ENABLED_FILE"
+    # Freeze the pre-apply listing so agreement requires the next fresh pass.
+    ROUNDHOUSE_SEED_SNAPSHOT="$rjj/last-installed.jsonl" capture_pass last-plugin-removal
+    [ "$(cat "$CLAUDE_PLUGIN_ACTION_LOG")" = 'uninstall keeper@test-market' ] ||
+      fail "last-plugin tombstone did not uninstall exactly the agreed plugin"
+    jq -e '.plugins == {}' "$installed" >/dev/null || fail "last-plugin removal left a nonempty inventory"
+    jq -e '. == {id:"claude:keeper@test-market",from:"enabled",to:"absent"}' "$marker" >/dev/null ||
+      fail "last-plugin removal did not leave its Roundhouse marker"
+    jq -e '.["claude:keeper@test-market"] == {value:"enabled"}' "$baseline" >/dev/null ||
+      fail "the stale listing advanced last-plugin agreement before a fresh pass"
+    : >"$CLAUDE_PLUGIN_ACTION_LOG"
+    capture_pass last-plugin-agreement
+    jq -e '.["claude:keeper@test-market"] == {value:"absent"}' "$baseline" >/dev/null ||
+      fail "#133: empty inventory did not advance last-plugin agreement to absent"
+    [ ! -e "$marker" ] || fail "#133: last-plugin agreement did not clear the removal marker"
+    [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "last-plugin agreement mutated an empty inventory"
+
+    capture_owner_install keeper@test-market
+    printf '%s\n' '{"keeper@test-market":true}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
+    capture_pass last-plugin-owner-reinstall
+    [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "#133: the tombstone reverted the owner's reinstall"
+    jq -e --arg sha "$sha" '.plugins["keeper@test-market"] == [{scope:"user",version:"1.0.0",gitCommitSha:$sha}]' \
+      "$installed" >/dev/null || fail "#133: the owner's reinstall did not stay installed"
+    capture_report claude:keeper@test-market added
+    jq -e '.["claude:keeper@test-market"] == {value:"absent"}' "$baseline" >/dev/null ||
+      fail "#133: the held reinstall advanced agreement"
+    printf 'real-jj: OK (#133 last-plugin removal, empty agreement, and held owner reinstall)\n'
     fi
 
     printf 'real-jj: OK (silent baseline, guarded local changes, discard, and agreement)\n'
