@@ -1,6 +1,6 @@
 # roundhouse self-check — plugin ownership through a signed fixture fleet pass.
 # Reuses the fixture manager commands from 07 and the local jj remote from 90.
-# roundhouse-test: parts=5
+# roundhouse-test: parts=10
 # shellcheck shell=bash
 
 if [ "$real_jj_ok" = true ]; then
@@ -79,6 +79,7 @@ YAML
       >"$CLAUDE_PLUGIN_ENABLED_FILE"
     printf '{}\n' >"$settings"
     : >"$CLAUDE_PLUGIN_ACTION_LOG"
+    untrusted_message="roundhouse: Claude plugin inventory not trusted; making no Claude plugin changes this pass"
 
     capture_pass() {
       "$cli" fleet-run --fast >"$rjj/pass.log" 2>&1 || {
@@ -186,22 +187,14 @@ JSONL
       fi
       [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] ||
         fail "$listing inventory reverted an owner install or removal"
-      [ "$(grep -Ec 'Claude plugin inventory unavailable; making no plugin reverts this pass \([0-9]+ items held, retried next pass\)\.' "$rjj/pass.log")" -eq 1 ] ||
-        fail "$listing inventory did not report held items once"
+      [ "$(grep -Fxc "$untrusted_message" "$rjj/pass.log")" -eq 1 ] ||
+        fail "$listing inventory did not report untrusted inventory once"
     done
     capture_owner_install keeper@test-market
     jq '.["keeper@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
       mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
 
     # Failed inventory must defer store changes when the owner changed first.
-    mkdir -p "$rjj/unknown-change"
-    capture_unknown_prepare() {
-      ROUNDHOUSE_SEED_SNAPSHOT="$rjj/failed.jsonl" capture_lib fleet_capture_pass_prepare \
-        "$store" vireo "$(capture_lib fleet_run_desired "$store" vireo)" \
-        true true "$rjj/unknown-change" "$store"
-    }
-    capture_lib fleet_capture_observe "$rjj/failed.jsonl" |
-      jq -e '.claude == null' >/dev/null || fail "failed listing was not unknown"
     for owner_change in settings-and-cli cli-only uninstall; do
       jq -e '.["claude:keeper@test-market"] == {value:"enabled"}' "$baseline" >/dev/null ||
         fail "unknown-inventory $owner_change did not start from agreed enabled"
@@ -216,9 +209,6 @@ JSONL
       store_state=absent
       [ "$owner_change" != uninstall ] || store_state=disabled
       yq -i ".plugins.keeper.state = \"$store_state\"" "$store/fleet/capture-probe.yaml"
-      capture_unknown_prepare
-      grep -Fqx plugins.keeper "$rjj/unknown-change/capture-skip" ||
-        fail "unknown inventory did not hold $owner_change in capture-skip"
       : >"$CLAUDE_PLUGIN_ACTION_LOG"
       ROUNDHOUSE_SEED_SNAPSHOT="$rjj/failed.jsonl" capture_pass "unknown-inventory-$owner_change"
       if grep -Eq '^(uninstall|install|disable) keeper@test-market$' "$CLAUDE_PLUGIN_ACTION_LOG"; then
@@ -263,19 +253,14 @@ JSONL
       fail "the discarded install stayed installed"
     [ ! -e "${baseline%/*}/agent-discard.json" ] || fail "agreed discard was not consumed"
 
-    # Store changes still act with failed inventory when all pre-pass records agree.
+    # A fleet removal still waits for trust when the owner has made no edit.
     printf '%s\n' '{"enabledPlugins":{"keeper@test-market":true}}' >"$settings"
     yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
-    capture_unknown_prepare
-    if grep -Fqx plugins.keeper "$rjj/unknown-change/capture-skip"; then
-      fail "unknown inventory held a store change despite unchanged owner records"
-    fi
     : >"$CLAUDE_PLUGIN_ACTION_LOG"
     ROUNDHOUSE_SEED_SNAPSHOT="$rjj/failed.jsonl" capture_pass unknown-inventory-unchanged-owner
-    grep -Fqx 'uninstall keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" || {
-      cat "$rjj/pass.log" >&2
-      fail "unknown inventory blocked the unchanged owner's fleet removal"
-    }
+    ! grep -Fqx 'uninstall keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+      fail "unknown inventory let a fleet removal bypass the boundary"
+    [ -e "${baseline%/*}/retry-owed" ] || fail "unknown inventory did not leave retry debt"
     yq -i '.plugins.keeper.state = "enabled"' "$store/fleet/capture-probe.yaml"
     capture_owner_install keeper@test-market
     jq '.["keeper@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
@@ -477,6 +462,135 @@ JSONL
       fail "Attack #11 a later pass uninstalled the owner's reinstall"
     jq -e '.plugins | has("keeper@test-market")' "$installed" >/dev/null ||
       fail "Attack #11 the owner's reinstall did not stay installed"
+    fi
+
+    if section_part 6; then
+      capture_owner_remove local-extra@test-market
+      jq '.plugins["keeper@test-market"] += [{scope:"future-scope",version:"1.0.0"}]' "$installed" >"$installed.next" &&
+        mv "$installed.next" "$installed"
+      printf '%s\n' '{"keeper@test-market":false}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
+      printf '%s\n' '{"enabledPlugins":{"keeper@test-market":false}}' >"$settings"
+      yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
+      : >"$CLAUDE_PLUGIN_ACTION_LOG"
+      capture_pass future-scope-owner-disable
+      ! grep -Fqx 'uninstall keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+        fail "A2 untrusted future scope allowed uninstall after the owner disabled keeper"
+    fi
+
+    if section_part 7; then
+      receipt_dir="${journal%/*}"
+      cp "$baseline" "$rjj/before-last-removal.json"
+      failed=0
+      for evidence in none partial; do
+        cp "$rjj/before-last-removal.json" "$baseline"
+        capture_owner_remove local-extra@test-market
+        capture_owner_remove keeper@test-market
+        printf '{}\n' >"$settings"
+        if [ "$evidence" = partial ]; then
+          jq '.["claude:ponytail@test-market"] = {value:"enabled"}' "$baseline" >"$baseline.next" &&
+            mv "$baseline.next" "$baseline"
+          mkdir -p "$receipt_dir"
+          jq -cn --arg home "$(cd "$CLAUDE_CONFIG_DIR" && pwd -P)" '{
+            id:"claude:ponytail@test-market",home:$home,
+            receipt:{op:"uninstall",installed:false,state:null,seq:1}
+          }' >"$receipt_dir/claude.ponytail@test-market"
+        fi
+        cp "$baseline" "$rjj/expected-empty-agreement.json"
+        yq -i '.plugins.keeper.state = "disabled"' "$store/fleet/capture-probe.yaml"
+        : >"$CLAUDE_PLUGIN_ACTION_LOG"
+        capture_pass "owner-removed-last-$evidence"
+        if grep -Fqx 'install keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG"; then
+          printf 'FAIL: #136 reinstalled the last plugin removed by the owner (%s receipts)\n' "$evidence" >&2
+          failed=1
+        else
+          cmp "$baseline" "$rjj/expected-empty-agreement.json" >/dev/null ||
+            fail "#136 empty inventory changed agreement ($evidence receipts)"
+        fi
+        yq -i '.plugins.keeper.state = "enabled"' "$store/fleet/capture-probe.yaml"
+      done
+      [ "$failed" = 0 ] || exit 1
+    fi
+
+    if section_part 8; then
+      cat >"$rjj/no-claude.jsonl" <<'JSONL'
+{"kind":"plugin_manager","status":"absent","data":{"agent":"claude","authoritative":false}}
+JSONL
+      # Leave the registry behind to model an uninstalled CLI with its old home.
+      yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
+      : >"$CLAUDE_PLUGIN_ACTION_LOG"
+      ROUNDHOUSE_SEED_SNAPSHOT="$rjj/no-claude.jsonl" capture_pass no-claude-tombstone
+      [ ! -e "${baseline%/*}/retry-owed" ] ||
+        fail "an absent Claude harness left blanket retry debt"
+      [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "an absent Claude harness ran a plugin verb"
+      grep -Eq '^  satisfied plugins\.keeper([ (]|$)' "$rjj/pass.log" ||
+        fail "an absent Claude harness did not satisfy the tombstone"
+    fi
+
+    if section_part 9; then
+      # New plugin names avoid a previously applied item's version/identity memo.
+      rm -f "$baseline"
+      for name in first-off first-on; do capture_owner_install "$name@test-market"; done
+      jq '.["first-on@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
+        mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
+      jq --arg sha "$sha" '.available += (["first-off","first-on","first-missing"] |
+        map({pluginId:(.+"@test-market"),version:"1.0.0",source:{source:"git",sha:$sha}}))' \
+        "$CLAUDE_PLUGIN_CATALOG_FILE" >"$rjj/catalog.next" &&
+        mv "$rjj/catalog.next" "$CLAUDE_PLUGIN_CATALOG_FILE"
+      yq -i '.plugins."first-off" = {"state":"enabled","marketplace":"test-market"} |
+        .plugins."first-on" = {"state":"disabled","marketplace":"test-market"} |
+        .plugins."first-missing" = {"state":"enabled","marketplace":"test-market"}' "$store/fleet/capture-probe.yaml"
+      : >"$CLAUDE_PLUGIN_ACTION_LOG"
+      capture_pass first-pass-state-disagreement
+      failed=0
+      for action in 'enable first-off' 'disable first-on'; do
+        if grep -Fqx "$action@test-market" "$CLAUDE_PLUGIN_ACTION_LOG"; then
+          printf 'FAIL: first observation ran %s@test-market despite owner state\n' "$action" >&2
+          failed=1
+        fi
+      done
+      [ "$failed" = 0 ] || exit 1
+      grep -Fqx 'install first-missing@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+        fail "the first pass did not install the missing control plugin"
+      capture_report claude:first-off@test-market disabled
+      capture_report claude:first-on@test-market enabled
+      jq -e '.["claude:first-off@test-market"].value == "enabled" and
+        .["claude:first-on@test-market"].value == "disabled"' "$baseline" >/dev/null ||
+        fail "first observation replaced the store agreement with held local state"
+      : >"$CLAUDE_PLUGIN_ACTION_LOG"
+      capture_pass first-pass-state-disagreement-retry
+      ! grep -Eq '^(enable first-off|disable first-on)@test-market$' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+        fail "the second pass reverted a first-observation state disagreement"
+      capture_report claude:first-off@test-market disabled
+      capture_report claude:first-on@test-market enabled
+    fi
+
+    if section_part 10; then
+      cat >"$rjj/claude-unavailable.jsonl" <<'JSONL'
+{"kind":"plugin_manager","status":"unavailable","data":{"agent":"claude","authoritative":false}}
+JSONL
+      (
+        # shellcheck source=/dev/null
+        ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+        fleet_plugins_probe() {
+          fleet_plugins_probed=true
+          fleet_plugins_moved=$(printf 'codex%sfixture%shead%s%s' \
+            "$fleet_run_sep" "$fleet_run_sep" "$fleet_run_sep" "$rjj")
+          return 0
+        }
+        fleet_plugins_codex_sync() {
+          [ ! -s "$1" ] || cp "$1" "$rjj/codex-sync"
+        }
+        fleet_run_codex_hooks_settled() {
+          if [ "$1" = keeper@test-market ] && [ "$2" = "$sha" ]; then
+            : >"$rjj/hook-retry"
+          fi
+        }
+        ROUNDHOUSE_SEED_SNAPSHOT="$rjj/claude-unavailable.jsonl" fleet_run_command --fast
+      ) >"$rjj/pass.log" 2>&1
+      [ -s "$rjj/codex-sync" ] || fail "untrusted Claude inventory blocked Codex sync"
+      [ -e "$rjj/hook-retry" ] || fail "untrusted Claude inventory skipped the independent hook retry"
+      [ "$(grep -Fxc "$untrusted_message" "$rjj/pass.log")" -eq 1 ] ||
+        fail "the pass with Codex sync did not report untrusted Claude inventory once"
     fi
 
     printf 'real-jj: OK (silent baseline, guarded local changes, discard, and agreement)\n'

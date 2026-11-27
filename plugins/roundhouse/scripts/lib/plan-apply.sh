@@ -665,6 +665,10 @@ EOF
             return 64
           }
           (
+            local fleet_capture_target=$target fleet_capture_native_target=false
+            if jq -e --arg target "$target" '.machines[$target].transport == "ssh"' "$config" >/dev/null; then
+              fleet_capture_native_target=true
+            fi
             fleet_run_lock_plugin_mutation || exit $?
             fleet_capture_verb "claude:$plugin_id" update unchanged -- "$@" || exit $?
             plugin_cache_seal_permissions "$plugin_id" || exit 65

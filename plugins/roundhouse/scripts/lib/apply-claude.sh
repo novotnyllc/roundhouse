@@ -758,6 +758,9 @@ fleet_run_uninstall_plugin() {
   # persistent data directory (~/.claude/plugins/data/<id>/), and
   # `fleet-rollback` restores the plugin, never that data.
   local before_target expected admitted
+  if jq -e '.inapplicable == true' >/dev/null <<<"${fleet_capture_observed:-'{}'}"; then
+    return 70
+  fi
   fleet_run_uninstall_deferral=$(fleet_run_deferral_path "$2")
   fleet_run_uninstall_target=$(fleet_run_tombstone_target "$1" "$3" "$4") || return 75
   [ -n "$fleet_run_uninstall_target" ] || {
@@ -769,6 +772,10 @@ fleet_run_uninstall_plugin() {
       fleet_capture_guard_current='{"installed":[]}' \
         fleet_capture_guard_remember "$before_target" "$expected" unknown raced_removal || return 74
       printf '  defer %s — its Claude plugin was removed during this pass\n' "$2"
+      return 74
+    fi
+    if [ -n "${fleet_capture_observed:-}" ] &&
+      ! jq -e '.trusted == true' >/dev/null <<<"$fleet_capture_observed"; then
       return 74
     fi
     # Gone already, by whatever route: a deferral window for it is over too.

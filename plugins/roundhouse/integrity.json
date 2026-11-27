@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/apply-claude.sh",
-      "sha256": "de91a85581ee449befc3f04d47c650d929157a079ee5dec42fa6490fa7411c02"
+      "sha256": "70446cdf5f8ecfd84656dc1fa0bf8b36c7fc5038104ca1f473b47fcc9a8b3093"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
@@ -122,11 +122,11 @@
     },
     {
       "path": "scripts/lib/fleet-capture-pass.sh",
-      "sha256": "06eabbd95d10082c18bd4e770e9e5080a601ef83399e799bbe746a233a878782"
+      "sha256": "e6b321345e09fff0edda7b8e2f371a4b789ae7b2b3985acef35432517d47f6ea"
     },
     {
       "path": "scripts/lib/fleet-capture.sh",
-      "sha256": "4e90cb0de9c92e4c548b349bfba081e5d8322fc26d4f9cff7c31345109441d72"
+      "sha256": "b25b906cee4ace719382c1ffb56a1d17c1fc22b0c5669a335e75acf95f73dbba"
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
@@ -150,7 +150,7 @@
     },
     {
       "path": "scripts/lib/fleet-plugins.sh",
-      "sha256": "8ee2dab25878435df2cae7789cd291ee380739d3a0488d38c705f3639212a6cf"
+      "sha256": "5bfad80f9a32007ce594032ff0781518e3ac24f6efccbc3b1d363f1d9dea4e90"
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
@@ -234,7 +234,7 @@
     },
     {
       "path": "scripts/lib/plan-apply.sh",
-      "sha256": "fc66e42925cc8b13d83fa0f80becaa278c204195b451d667cfb0196aca420340"
+      "sha256": "4a4583917f0319850c8f8cd2bf9a83a30ff8147fedacfc953ac36cdc6a560940"
     },
     {
       "path": "scripts/lib/plan-contracts.sh",

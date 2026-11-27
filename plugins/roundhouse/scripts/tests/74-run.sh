@@ -18,6 +18,8 @@ if [ -n "$fleet_fixture_yq" ]; then
     export PATH
     # shellcheck source=/dev/null
     ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+    # Native helper fixtures supply the trusted pass separately from collector coverage.
+    fleet_capture_observed='{"trusted":true}'
 
     run_root="$tmp/run"
     run_store="$run_root/store"

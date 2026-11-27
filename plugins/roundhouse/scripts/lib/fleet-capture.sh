@@ -164,35 +164,41 @@ fleet_capture_pending_ids() (
 fleet_capture_listing_filter='
   def id_ok: type == "string" and test("^[A-Za-z0-9_-][A-Za-z0-9._-]*@[A-Za-z0-9_-][A-Za-z0-9._-]*$");
   def known_scope: IN("user","project","local","managed");
+  def claude_manager: [.[] | select(.kind == "plugin_manager" and .data.agent == "claude")];
+  def claude_plugins:
+    [.[] | select(.kind == "plugin" and .data.agent == "claude" and .data.inventory_source == "manager")];
   def listing:
-    [.[] | select(.kind == "plugin_manager" and .data.agent == "claude")] as $manager |
-    [.[] | select(.kind == "plugin" and .data.agent == "claude" and .data.inventory_source == "manager")] as $rows |
+    claude_manager as $manager |
+    claude_plugins as $rows |
     if ($manager | length) == 1 and $manager[0].status == "present" and
       $manager[0].data.authoritative == true and $manager[0].data.installed_count == ($rows | length) and
       all($rows[]; .status == "present" and (.data.manager_id | id_ok) and
         (.data.enabled | type) == "boolean" and
         .data.manager_id == (.data.name + "@" + .data.marketplace))
-    then [$rows[].data | select(.scope == "user" or (.scope | known_scope | not))] |
-      group_by(.manager_id) | map({
-        key:.[0].manager_id,
-        value:(if length == 1 and .[0].scope == "user" then .[0] else {uncertain:true} end)
-      }) | from_entries
+    then {
+      items:([$rows[].data | select(.scope == "user" or (.scope | known_scope | not))] |
+        group_by(.manager_id) | map({
+          key:.[0].manager_id,
+          value:(if length == 1 and .[0].scope == "user" then .[0] else {uncertain:true} end)
+        }) | from_entries),
+      users:([$rows[].data | select(.scope == "user")] |
+        group_by(.manager_id) | map({key:.[0].manager_id,value:map(.enabled)}) | from_entries)
+    }
     else null end;'
 
 fleet_capture_claude_observe() {
-  local listing=$1 installed settings installed_path settings_path
+  local listing=$1 records installed_path
   installed_path="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
-  settings_path=$(fleet_run_settings_path)
-  installed=$(fleet_run_installed_plugins) || return 1
+  records=$(fleet_capture_guard_records) || return 1
   if [ -e "$installed_path" ]; then
     jq -es 'length == 1 and (.[0].plugins | type) == "object"' "$installed_path" >/dev/null || return 1
   fi
-  settings=$(fleet_capture_json_read "$settings_path" '{}') || return 1
   local missing id path
-  missing=$(jq -rc --argjson listing "$listing" --argjson settings "$settings" "$fleet_capture_listing_filter"'
+  missing=$(jq -rc --argjson listing "$listing" "$fleet_capture_listing_filter"'
+    .enabled as $enabled | .registry |
     to_entries[] | .key as $id | select($listing[$id] == null and all(.value[]; .scope | known_scope)) |
     .value[] | select(.scope == "user") |
-    [$id, ($settings.enabledPlugins[$id] | type), (.installPath // "")] | @tsv' <<<"$installed") || return 1
+    [$id, ($enabled[$id] | type), (.installPath // "")] | @tsv' <<<"$records") || return 1
   local known_state
   while IFS=$'\t' read -r id known_state path; do
     [ -n "$id" ] || continue
@@ -200,9 +206,8 @@ fleet_capture_claude_observe() {
     # intact user record and explicit enabled state.
     [ "$known_state" = boolean ] && [ -n "$path" ] && [ ! -e "$path" ] || return 1
   done <<<"$missing"
-  jq -cn --argjson listing "$listing" --argjson installed "$installed" \
-    --argjson settings "$settings" "$fleet_capture_listing_filter"'
-    (if $settings | has("enabledPlugins") then $settings.enabledPlugins else {} end) as $enabled |
+  jq -c --argjson listing "$listing" "$fleet_capture_listing_filter"'
+    . as $raw | .registry as $installed | .enabled as $enabled |
     if ($enabled | type) != "object" or any($enabled[]; type != "boolean") or
       any($installed | to_entries[]; (.key | id_ok | not) or
         (.value | type) != "array" or (.value | length) == 0 or
@@ -222,66 +227,85 @@ fleet_capture_claude_observe() {
           then "enabled" else "disabled" end),
         marketplace:$market, user_scope:(if $uncertain then null else ($user | length) > 0 end)
       }}) | from_entries as $records |
-      ($enabled | with_entries(select(.key | id_ok) | .value = {value:"unknown"})) + $records +
-      ($listing | with_entries(select(.value.uncertain) | .value = {value:"unknown",user_scope:null}))
-    end'
+      {claude:(($enabled | with_entries(select(.key | id_ok) | .value = {value:"unknown"})) + $records +
+        ($listing | with_entries(select(.value.uncertain) | .value = {value:"unknown",user_scope:null}))),
+        records:$raw}
+    end' <<<"$records"
 }
 
-fleet_capture_owned_absent() (
-  local id journal
-  while IFS= read -r id; do
+fleet_capture_observe() {
+  local lists listing reconciliation=null
+  lists=$(jq -cs "$fleet_capture_listing_filter"'
+    {listing:listing, inapplicable:((claude_manager | length == 1 and .[0].status == "absent") and
+      (claude_plugins | length == 0))}' "$1") || return 1
+  listing=$(jq -c '.listing.items' <<<"$lists") || return 1
+  if [ "$listing" != null ]; then
+    reconciliation=$(fleet_capture_claude_observe "$listing" 2>/dev/null) || reconciliation=null
+  fi
+  printf '%s\n' "$lists" "$reconciliation" | jq -cs '
+    .[0] as $list | .[1] as $scan |
+    {claude:$scan.claude,records:$scan.records,users:$list.listing.users,
+      inapplicable:$list.inapplicable,retry:($scan == null and ($list.inapplicable | not))}'
+}
+
+fleet_capture_empty_agrees() {
+  local baseline records id journal capture_home
+  baseline=$(fleet_capture_json_read "$(fleet_instance_path store.run/agent-baseline.json)" '{}') || return 1
+  capture_home=$(fleet_capture_home) || return 1
+  records=$(while IFS= read -r id; do
     [ -n "$id" ] || continue
     journal=$(fleet_agent_journal_read "$id") || continue
-    ! fleet_agent_journal_unresolved "$journal" || continue
-    jq -e '.intent == null and .receipt.installed == false' >/dev/null <<<"$journal" || continue
-    printf '%s\n' "$id"
-  done < <(fleet_capture_pending_ids)
-)
-
-fleet_capture_observe() {
-  local lists claude retry=false owned_absent
-  lists=$(jq -cs "$fleet_capture_listing_filter"'
-    {claude:listing, retry:any(.[]; .kind == "plugin_manager" and
-      .data.agent == "claude" and .status == "unavailable")}' "$1") ||
-    lists='{"claude":null,"retry":true}'
-  claude=$(jq -c .claude <<<"$lists")
-  if [ "$claude" != null ]; then
-    claude=$(fleet_capture_claude_observe "$claude" 2>/dev/null) || claude=null
-  fi
-  if jq -e '.retry' >/dev/null <<<"$lists" ||
-    { [ "$claude" = null ] &&
-      [ -e "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json" ]; }; then
-    retry=true
-  fi
-  owned_absent=$(fleet_capture_owned_absent | jq -Rn '[inputs]') || return 1
-  jq -cn --argjson claude "$claude" --argjson retry "$retry" --argjson owned_absent "$owned_absent" \
-    '{claude:$claude,retry:$retry,owned_absent:$owned_absent}'
+    jq -c --arg base_home "$capture_home" '
+      select(.home == $base_home and (.receipt.seq | type == "number" and . > 0 and floor == .) and
+        (.receipt.installed | type) == "boolean") |
+      {key:.id,value:.receipt}' <<<"$journal"
+  done < <(fleet_capture_pending_ids) | jq -cs from_entries) || return 1
+  jq -e --argjson receipts "$records" '
+    . as $base | all((keys + ($receipts | keys)) | unique[] | select(startswith("claude:"));
+      . as $id | $base[$id] as $agreed | $receipts[$id] as $receipt |
+      if $receipt != null and $receipt.seq > ($agreed.seq // 0) then $receipt.installed == false
+      else ($agreed.value | IN("enabled","disabled") | not) end)' >/dev/null <<<"$baseline"
 }
 
 fleet_capture_collect() {
-  local snapshot=$1/agents.jsonl rc=0
+  local snapshot=$1/agents.jsonl rc=0 before after observed trusted=false
   mkdir -p "$1" || return 1
+  before=$(fleet_capture_guard_records) || before=null
   if fleet_test_hook "${ROUNDHOUSE_SEED_SNAPSHOT:-}"; then
     cp "$ROUNDHOUSE_SEED_SNAPSHOT" "$snapshot" || return 1
   else
-    collect_command --section agents --output "$snapshot" >/dev/null || rc=$?
+    set -- --section agents --output "$snapshot"
+    [ -z "${fleet_capture_target:-}" ] || set -- "$@" --target "$fleet_capture_target"
+    [ "${fleet_capture_native_target:-false}" != true ] || set -- "$@" --native-target
+    collect_command "$@" >/dev/null || rc=$?
   fi
+  observed='{"claude":null,"inapplicable":false}'
   case $rc in
-    0|2) [ ! -s "$snapshot" ] || { fleet_capture_observe "$snapshot"; return; } ;;
+    0|2) if [ -s "$snapshot" ]; then
+      observed=$(fleet_capture_observe "$snapshot") || observed='{"claude":null,"inapplicable":false}'
+    fi ;;
   esac
-  printf '{"claude":null,"retry":true}\n'
+  after=$(fleet_capture_guard_records) || after=null
+  if printf '%s\n' "$observed" "$before" "$after" | jq -se "$fleet_capture_listing_filter"'
+    def evidence:
+      {scopes:(.registry | objects | with_entries(
+        .value |= (map(.scope | select(. == "user" or (known_scope | not))) | sort) |
+        select(.value | length > 0))), enabled, registry_present, settings_present};
+    .[1] as $before | .[2] as $after | .[0] | select(.claude != null) |
+    ($before | evidence) as $guard |
+    $guard == ($after | evidence) and $guard == (.records | evidence) and
+    ([$guard.scopes | to_entries[] | select(.value | index("user") != null) | .key] | sort) == (.users | keys) and
+    all(.users | to_entries[]; $guard.enabled[.key] as $enabled |
+      $enabled == null or (.value | length != 1 or .[0] == $enabled))' >/dev/null 2>&1 &&
+    { jq -e 'any(.claude[]; .value | IN("enabled","disabled"))' >/dev/null <<<"$observed" ||
+      fleet_capture_empty_agrees; }; then
+    trusted=true
+  fi
+  jq -c --argjson trusted "$trusted" '
+    {claude,inapplicable,trusted:$trusted,retry:($trusted == false and (.inapplicable | not))}' <<<"$observed"
 }
 
-fleet_capture_authority_filter='
-  def authoritative($observed; $baseline; $h):
-    $observed[$h] != null and
-    (any($observed[$h][]?; .value | IN("enabled","disabled")) or
-      all($baseline | to_entries[] | select(.key | startswith($h + ":"));
-        .value | (if type == "object" then .value else null end) |
-        IN("enabled","disabled") | not) or
-      all($baseline | to_entries[] | select(.key | startswith($h + ":")) |
-        select(.value | objects | .value | IN("enabled","disabled"));
-        .key as $id | ($observed.owned_absent // [] | index($id)) != null));'
+fleet_capture_authority_filter='def authoritative($observed): $observed.trusted == true;'
 
 fleet_capture_rows() {
   # Join desired item names to physical harness IDs. Claude can omit the
@@ -311,7 +335,7 @@ fleet_capture_rows() {
       ($base | keys | map(ltrimstr($h + ":"))) as $base_ids |
       ($pending | map(select(startswith($h + ":")) | ltrimstr($h + ":"))) as $pending_ids |
       (($local_ids + $base_ids + $pending_ids) | unique) as $known_ids |
-      (authoritative($observed; $baseline; $h) | not) as $unknown |
+      (authoritative($observed) | not) as $unknown |
       [
         ($desired[$category] // {} | to_entries[]) |
         .key as $name | (.value | state) as $theirs |
@@ -332,7 +356,7 @@ fleet_capture_rows() {
           marketplace:($id // "" | split("@")[1] // ""),
           theirs:(if $market == "@" or ($market == null and ($name | id_ok | not))
             then "malformed" else $theirs end),
-          ours:(if $unknown and $local[$id // ""].value != "absent" then "unobserved"
+          ours:(if $unknown then "unobserved"
             elif $id != null then ($local[$id].value // "absent")
             elif ($ids | length) == 0 and $theirs == "absent" then "absent"
             else "unresolved" end),
@@ -354,7 +378,7 @@ fleet_capture_rows() {
         {
           id:physical($h; $id), item:$item, name:$name,
           harness:$h, marketplace:$parts[1], theirs:"missing",
-          ours:(if $unknown and $local[$id].value != "absent" then "unobserved"
+          ours:(if $unknown then "unobserved"
             else ($local[$id].value // "absent") end),
           base:($base[physical($h; $id)] // $baseline[$item])
         }
@@ -365,7 +389,9 @@ fleet_capture_rows() {
     group_by(.id // .item) | map(if length == 1 then .[0]
       else .[] | .ambiguous = true end) |
     group_by(.item) | map((length > 1) as $duplicate | .[] |
-      if $duplicate or .ambiguous == true then .ambiguous = true | .ours = "unknown" else . end)'
+      if $duplicate or .ambiguous == true then
+        .ambiguous = true | if .ours == "unobserved" then . else .ours = "unknown" end
+      else . end)'
 }
 
 fleet_capture_initialized() {
@@ -379,27 +405,23 @@ fleet_capture_rebaseline() {
   local desired=$3 observed=$4 fetched=$5 layers=${6:-$1}
   local dir baseline initialized rows updated id settled
   [ "$fetched" = true ] || return 0
+  jq -e '.trusted == true' >/dev/null <<<"$observed" || return 0
   dir=$(fleet_instance_path store.run)
   baseline=$(fleet_capture_json_read "$dir/agent-baseline.json" '{}') || return 1
   initialized=$(fleet_capture_initialized "$baseline") || return 1
   rows=$(fleet_capture_rows "$layers" "$desired" "$observed" "$baseline") || return 1
-  # A first pass with no usable harness must still get a silent observation.
-  if jq -e '.claude == null' <<<"$observed" >/dev/null; then
-    return 0
-  fi
   updated=$(jq -c --argjson base "$baseline" --argjson discard "${fleet_capture_discards:-[]}" \
-    --argjson initialized "$initialized" --argjson observed "$observed" "$fleet_capture_authority_filter"'
+    --argjson initialized "$initialized" '
     reduce (.[] | select(.theirs != "malformed" and (.ours | IN("enabled","disabled","absent")))) as $r ($base;
       if $r.ours == $r.theirs then
         .[$r.id // $r.item] = {value:$r.theirs} |
         if $r.id != null then del(.[$r.item]) else . end
-      elif $r.id != null and $r.theirs == "absent" and $r.ours != "absent" and $r.base == null and
-        $initialized[$r.harness] != true and authoritative($observed; $base; $r.harness) then
-        # First-pass hold: agree on the store value so the install stays an owner addition.
-        .[$r.id] = {value:"absent"}
+      elif ($r.base.raced? // false) == true and ($discard | index($r.id)) == null then .
       elif $r.id != null and $r.theirs != "missing" and $r.base == null and
-        $initialized[$r.harness] != true and authoritative($observed; $base; $r.harness) then
-        .[$r.id] = {value:$r.ours}
+        $initialized[$r.harness] != true then
+        # First-pass disagreements with an installed plugin stay held after initialization.
+        .[$r.id] = {value:(if $r.ours != "absent" and $r.id != "claude:roundhouse@novotnyllc"
+          then $r.theirs else $r.ours end)}
       elif $r.id == null or $r.theirs != "missing" then .
       elif $r.ours != "absent" and
         ($initialized[$r.harness] != true or $r.base != null or ($discard | index($r.id)) != null) then
@@ -407,14 +429,12 @@ fleet_capture_rebaseline() {
       elif ($r.base | objects | .ignored) // false then del(.[$r.id])
       elif $r.base != null then .[$r.id] = {value:$r.ours,ignored:true}
       else . end) |
-    ._initialized = (reduce ["claude"][] as $h ($initialized;
-      if authoritative($observed; $base; $h) then .[$h] = true else . end))' <<<"$rows") || return 1
+    ._initialized = ($initialized | .claude = true)' <<<"$rows") || return 1
   if [ "$updated" != "$baseline" ]; then
     fleet_capture_json_write "$dir/agent-baseline.json" "$updated" || return 1
   fi
-  settled=$(jq -r --argjson updated "$updated" --argjson observed "$observed" \
-    --argjson baseline "$baseline" "$fleet_capture_authority_filter"'
-    .[] | select(.id != null and authoritative($observed; $baseline; .harness)) |
+  settled=$(jq -r --argjson updated "$updated" '
+    .[] | select(.id != null) |
     select((.ours == .theirs and $updated[.id] == {value:.theirs}) or
       (.theirs == "missing" and (.base == null or $updated[.id] == null or
         .base == {value:.ours,ignored:true}))) | .id' <<<"$rows") || return 1

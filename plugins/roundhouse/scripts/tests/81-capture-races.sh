@@ -49,7 +49,7 @@ if [ -n "$fleet_fixture_yq" ]; then
   }
 
   for fixture_observed in \
-    '{"claude":{"untouched@test-market":{"value":"enabled","user_scope":true}}}' \
+    '{"trusted":true,"claude":{"untouched@test-market":{"value":"enabled","user_scope":true}}}' \
     '{"claude":null,"retry":true}'; do
     printf '%s\n' '{"plugins":{}}' >"$registry"
     printf '%s\n' '{"untouched@test-market":true}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
@@ -61,10 +61,14 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$(fleet_run_tombstone_target '{}' late "$absent")" = late@test-market ] ||
       fail "the live removal scan did not find the owner install"
     race_deferred fleet_run_uninstall_plugin '{}' plugins.late late "$absent"
-    fleet_run_uninstall_plugin '{}' plugins.untouched untouched "$absent" ||
-      fail "the late install prevented a stable unrelated uninstall"
-    grep -Fqx 'uninstall untouched@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
-      fail "the stable unrelated tombstone did not converge"
+    if jq -e '.trusted == true' >/dev/null <<<"$fixture_observed"; then
+      fleet_run_uninstall_plugin '{}' plugins.untouched untouched "$absent" ||
+        fail "the late install prevented a stable unrelated uninstall"
+      grep -Fqx 'uninstall untouched@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+        fail "the stable unrelated tombstone did not converge"
+    else
+      race_deferred fleet_run_uninstall_plugin '{}' plugins.untouched untouched "$absent"
+    fi
   done
   printf '%s\n' '{}' >"$CLAUDE_CONFIG_DIR/settings.json"
 
@@ -80,25 +84,24 @@ if [ -n "$fleet_fixture_yq" ]; then
     race_deferred fleet_run_uninstall_plugin '{}' plugins.late late "$absent"
   )
 
-  # Simulate a first pass whose before and after manager scans both failed.
-  # The next healthy pass must remember the exact tombstone's pre-verb absence.
+  # A trusted pre-scan catches a late install; a later outage keeps that race held.
   store="$race/retry/store"
   export ROUNDHOUSE_FLEET_STORE="$store"
   mkdir -p "$store"
   printf 'name: mac\n' >"${store%/*}/identity.yaml"
   race_desired='{"plugins":{"late":{"state":"absent","marketplace":"test-market"}}}'
-  fixture_observed='{"claude":null,"retry":true}'
+  fixture_observed='{"trusted":true,"claude":{}}'
   printf '%s\n' '{"plugins":{}}' >"$registry"
   race_prepare "$race_desired"
   race_install late@test-market
   race_deferred fleet_run_uninstall_plugin '{}' plugins.late late "$absent"
+  fixture_observed='{"claude":null,"retry":true}'
   fleet_capture_rebaseline "$store" mac "$race_desired" "$fixture_observed" true
   race_install stable@test-market
   race_prepare "$race_desired"
   race_deferred fleet_run_uninstall_plugin '{}' plugins.late late "$absent"
-  fleet_run_uninstall_plugin '{}' plugins.stable stable "$absent" ||
-    fail "the previous race stopped an unrelated uninstall during a second outage"
-  fixture_observed='{"claude":{"late@test-market":{"value":"disabled","user_scope":true}}}'
+  race_deferred fleet_run_uninstall_plugin '{}' plugins.stable stable "$absent"
+  fixture_observed='{"trusted":true,"claude":{"late@test-market":{"value":"disabled","user_scope":true}}}'
   race_prepare "$race_desired"
   jq -e 'keys == ["plugins.late"]' <<<"$fleet_capture_skip" >/dev/null ||
     fail "the next healthy scan forgot the late tombstone install"
@@ -115,9 +118,13 @@ if [ -n "$fleet_fixture_yq" ]; then
     fail "a race discard was not bound to the observed physical ID"
   fixture_observed='{"claude":null,"retry":true}'
   race_prepare "$race_desired"
+  race_deferred fleet_run_uninstall_plugin '{}' plugins.late late "$absent"
+  printf '%s\n' '{"late@test-market":false}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
+  fixture_observed='{"trusted":true,"claude":{"late@test-market":{"value":"disabled","user_scope":true}}}'
+  race_prepare "$race_desired"
   fleet_run_uninstall_plugin '{}' plugins.late late "$absent" ||
-    fail "the explicit discard did not release the raced target during an outage"
-  fleet_capture_rebaseline "$store" mac "$race_desired" '{"claude":{}}' true
+    fail "the explicit discard did not release the raced target with trusted inventory"
+  fleet_capture_rebaseline "$store" mac "$race_desired" '{"trusted":true,"claude":{}}' true
   jq -e '.["claude:late@test-market"] == {value:"absent"}' "$(fleet_run_state_dir)/agent-baseline.json" >/dev/null ||
     fail "verified agreement did not clear the race evidence"
 
@@ -125,7 +132,7 @@ if [ -n "$fleet_fixture_yq" ]; then
   jq -cn --arg sha "$sha" \
     '{available:[{pluginId:"claude-example@test-market",version:"1.0.0",source:{source:"git",sha:$sha}}]}' \
     >"$CLAUDE_PLUGIN_CATALOG_FILE"
-  fixture_observed='{"claude":{"claude-example@test-market":{"value":"disabled","user_scope":true}}}'
+  fixture_observed='{"trusted":true,"claude":{"claude-example@test-market":{"value":"disabled","user_scope":true}}}'
   race_prepare '{"plugins":{"claude-example":{"state":"disabled","marketplace":"test-market"}}}'
   # The owner enables it after capture without changing the registry or settings.
   printf '%s\n' '{"claude-example@test-market":true}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
@@ -140,7 +147,7 @@ if [ -n "$fleet_fixture_yq" ]; then
   printf '%s\n' '{"plugins":{}}' >"$registry"
   # A fresh install starts enabled, so the requested disable must really run.
   printf '%s\n' '{"claude-example@test-market":true}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
-  fixture_observed='{"claude":{}}'
+  fixture_observed='{"trusted":true,"claude":{}}'
   race_prepare '{"plugins":{"claude-example":{"state":"disabled","marketplace":"test-market"}}}'
   fleet_run_apply_item "$store" mac '{}' plugins.claude-example "$disabled" '' ||
     fail "the destructive guard rejected a pass's own fresh install"

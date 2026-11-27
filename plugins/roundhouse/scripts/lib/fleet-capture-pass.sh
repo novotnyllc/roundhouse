@@ -39,10 +39,29 @@ fleet_capture_verb() {
   [ "$op" != uninstall ] || failure=75
   read_failure=$failure
   case $op in enable|disable) read_failure=75 ;; esac
+  local observed=${fleet_capture_observed:-${fleet_capture_before_observed:-}} collect_dir baseline discard
+  local name=${id#claude:}
+  if [ -z "$observed" ]; then
+    collect_dir=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-capture-verb.XXXXXX") || return 74
+    observed=$(fleet_capture_collect "$collect_dir") || observed='{"trusted":false}'
+    rm -rf "$collect_dir"
+    if ! jq -e '.trusted == true' >/dev/null <<<"$observed"; then
+      printf 'roundhouse: Claude plugin inventory not trusted; making no Claude plugin changes this pass\n'
+    fi
+  fi
+  jq -e '.trusted == true' >/dev/null <<<"$observed" || return 74
   fleet_capture_id_valid "$id" || return "$failure"
+  if [ "$id" != claude:roundhouse@novotnyllc ] && [ -z "${fleet_capture_before_records:-}" ]; then
+    baseline=$(fleet_capture_json_read "$(fleet_run_state_dir)/agent-baseline.json" '{}') || return 74
+    if jq -e --arg id "$id" '.[$id].raced == true' >/dev/null <<<"$baseline"; then
+      discard=$(fleet_capture_json_read "$(fleet_run_state_dir)/agent-discard.json" '{}') || return 74
+      jq -e --arg id "$id" --arg qualified "$name" '
+        .[$id] == true or .["plugins." + $qualified] == true' \
+        >/dev/null <<<"$discard" || return 74
+    fi
+  fi
   path=$(fleet_agent_journal_path "$id") || return "$failure"
   fleet_capture_migrate_pending || return "$failure"
-  local name=${id#claude:}
   if [ "$id" != claude:roundhouse@novotnyllc ] &&
     fleet_capture_quarantined "${name%@*}"; then return "$failure"; fi
   journal=$(fleet_agent_journal_read "$id") || return "$failure"
@@ -147,7 +166,7 @@ fleet_capture_state_matches() {
   esac
   printf '%s\n' "$observed" | jq -e --arg id "$name" \
     --arg state "$(fleet_run_state_of "$value")" '
-      .claude != null and ((.claude[$id].value // "absent") == $state)' >/dev/null
+      .trusted == true and ((.claude[$id].value // "absent") == $state)' >/dev/null
 }
 
 fleet_capture_fingerprint() {
@@ -185,22 +204,22 @@ fleet_capture_prepare() {
   local store=$1 host=$2 desired=$3 observed=$4 layers=${8:-$1}
   local dir baseline initialized discard rows fields id item theirs ours base first ambiguous unqualified
   local journal merged direction kind message detail
-  local skip=() discards=() unknown_held=0 inventory_unknown
+  local skip=() discards=() first_holds=()
   fleet_capture_skip='{}'
   fleet_capture_discards='[]'
-  fleet_capture_retry_unknown=$(jq -r '.retry == true' <<<"$observed") || return 1
+  fleet_capture_retry_unknown=$(jq -r '.inapplicable != true and .trusted != true' <<<"$observed") || return 1
   dir=$(fleet_run_state_dir)
   fleet_capture_migrate_pending || return 1
   baseline=$(fleet_capture_json_read "$dir/agent-baseline.json" '{}') || return 1
   initialized=$(fleet_capture_initialized "$baseline") || return 1
   discard=$(fleet_capture_json_read "$dir/agent-discard.json" '{}') || return 1
-  fleet_capture_authoritative=$(jq -r --argjson baseline "$baseline" "$fleet_capture_authority_filter"'
-    authoritative(.; $baseline; "claude")' <<<"$observed") || return 1
-  # No trustworthy inventory: defer anything the pre-pass records cannot prove unchanged.
-  inventory_unknown=$(jq -r '.claude == null' <<<"$observed") || return 1
+  fleet_capture_authoritative=$(jq -r '.trusted == true' <<<"$observed") || return 1
+  if [ "$fleet_capture_retry_unknown" = true ]; then
+    printf 'roundhouse: Claude plugin inventory not trusted; making no Claude plugin changes this pass\n'
+  fi
   rows=$(fleet_capture_rows "$layers" "$desired" "$observed" "$baseline") || return 1
   fleet_capture_race_holds=$(jq -c --argjson discard "$discard" '
-    [.[] | select(.id != null and .ours == "unobserved" and (.base | objects | .raced == true)) |
+    [.[] | select(.id != null and .id != "claude:roundhouse@novotnyllc" and (.base | objects | .raced == true)) |
       select($discard[.id] != true and $discard[.item] != true) | .id] | unique' <<<"$rows") || return 1
   fields=$(jq -r --argjson initialized "$initialized" '
     def state: IN("enabled","disabled","absent");
@@ -219,6 +238,8 @@ fleet_capture_prepare() {
       printf 'roundhouse: holding %s: malformed plugin state.\n' "$item"
       continue
     fi
+    # The self plugin follows the fleet even when its individual state is uncertain.
+    [ "$id" != claude:roundhouse@novotnyllc ] || continue
     local quarantine_name=${item#plugins.}
     quarantine_name=${quarantine_name%@*}
     if [ "$id" != claude:roundhouse@novotnyllc ] && fleet_capture_quarantined "$quarantine_name"; then
@@ -262,29 +283,20 @@ fleet_capture_prepare() {
       else
         fleet_alert_checked "$7/alert-ledger" agent-capture-interrupted "$item"
       fi
-      if jq -e --arg id "$id" '.[$id].raced_removal == true' >/dev/null <<<"$baseline" &&
-        [ "$ours" != "$theirs" ] &&
+      if jq -e --arg id "$id" '.[$id].raced == true' >/dev/null <<<"$baseline" &&
+        { [ "$fleet_capture_authoritative" != true ] || [ "$ours" != "$theirs" ]; } &&
         ! jq -e --arg id "$id" --arg item "$item" '.[$id] == true or .[$item] == true' >/dev/null <<<"$discard"; then
         skip+=("$item"$'\t'"$id")
-        detail="$id removed locally during tombstone resolution; holding this item."
+        detail="$id changed locally during a previous pass; holding this item."
         printf 'roundhouse: %s\n' "$detail"
-        detail=$(fleet_capture_alert_detail "$id" 'removed locally during tombstone resolution; holding this item.') || return 1
+        detail=$(fleet_capture_alert_detail "$id" 'changed locally during a previous pass; holding this item.') || return 1
         fleet_alert_raise "$7/alert-ledger" "$store" "$host" agent-local-change \
           agent-local-change "$detail" "$item" || return 1
         continue
       fi
     fi
-    if [ "$ours" = unobserved ]; then
-      # A fleet change may act only while pre-pass records still show the agreed value.
-      if [ "$inventory_unknown" = true ] && [ "$theirs" != missing ] &&
-        { [ "$base" = missing ] || [ "${base#ignored:}" = "$theirs" ] ||
-          [ "$(fleet_capture_prepass_state "$id")" != "${base#ignored:}" ]; }; then
-        skip+=("$item"$'\t'"$id")
-        unknown_held=$((unknown_held + 1))
-        fleet_capture_retry_unknown=true
-      fi
-      continue
-    fi
+    # Untrusted passes reach independent hook work; the Claude verb boundary defers writes.
+    [ "$ours" != unobserved ] || continue
     if [ "$ours" = unknown ]; then
       skip+=("$item"$'\t'"$id")
       fleet_capture_retry_unknown=true
@@ -307,8 +319,8 @@ fleet_capture_prepare() {
       discards+=("$id" "$item")
       continue
     fi
-    # A silent first pass still never uninstalls: store-absent but installed is held as added.
-    if [ "$first" = true ] && { [ "$theirs" != absent ] || [ "$ours" = absent ]; }; then
+    # First observation adopts missing installs, but preserves an installed state disagreement.
+    if [ "$first" = true ] && { [ "$ours" = absent ] || [ "$ours" = "$theirs" ] || [ "$theirs" = missing ]; }; then
       continue
     fi
     ! fleet_agent_receipt_matches "$journal" "$ours" || continue
@@ -320,11 +332,16 @@ fleet_capture_prepare() {
     case $merged in local | conflict) ;; *) continue ;; esac
     case $ours in
       absent) direction=removed ;;
-      *) case $base in missing | absent | ignored:absent) direction=added ;;
+      *) case $base in missing)
+           if [ "$first" = true ] && { [ "$theirs" = enabled ] || [ "$theirs" = disabled ]; }; then
+             direction=$ours
+           else direction=added; fi ;;
+           absent | ignored:absent) direction=added ;;
            *) if [ "$ours" = disabled ]; then direction=disabled; else direction=enabled; fi ;;
          esac ;;
     esac
     skip+=("$item"$'\t'"$id")
+    if [ "$first" = true ]; then first_holds+=("$id"$'\t'"$theirs"); fi
     kind=agent-local-change
     message="$id $direction locally; holding $item."
     if [ "$merged" = conflict ]; then
@@ -341,13 +358,18 @@ fleet_capture_prepare() {
     fi
     fleet_alert_raise "$7/alert-ledger" "$store" "$host" "$kind" "$kind" "$detail" "$item" || return 1
   done <<<"$fields"
-  if [ "$unknown_held" -gt 0 ]; then
-    printf 'roundhouse: Claude plugin inventory unavailable; making no plugin reverts this pass (%s items held, retried next pass).\n' "$unknown_held"
-  fi
   if [ "${#skip[@]}" -gt 0 ]; then
     fleet_capture_skip=$(printf '%s\n' "${skip[@]}" | jq -Rn '
       [inputs | split("\t") | {key:.[0],value:(if .[1] == "-" then true else .[1] end)}] | from_entries') ||
       return 1
+  fi
+  if [ "${#first_holds[@]}" -gt 0 ]; then
+    # Persist the trusted first observation even if the post-scan cannot be trusted.
+    baseline=$(printf '%s\n' "${first_holds[@]}" | jq -Rn --argjson base "$baseline" \
+      --argjson initialized "$initialized" '
+      [inputs | split("\t") | {key:.[0],value:{value:.[1]}}] | from_entries |
+      . + $base | ._initialized = $initialized') || return 1
+    fleet_capture_json_write "$dir/agent-baseline.json" "$baseline" || return 1
   fi
   if [ "${#discards[@]}" -gt 0 ]; then
     fleet_capture_discards=$(printf '%s\n' "${discards[@]}" | jq -Rn '[inputs] | unique') || return 1
@@ -359,7 +381,7 @@ fleet_capture_pass_prepare() {
   fleet_capture_before_records=$(fleet_capture_guard_records) || return 1
   fleet_capture_before_fingerprint=$(fleet_capture_fingerprint) || fleet_capture_before_fingerprint=
   fleet_capture_observed=$(fleet_capture_collect "$6/capture-before") ||
-    fleet_capture_observed='{"claude":null,"retry":true}'
+    fleet_capture_observed='{"claude":null,"trusted":false,"retry":true}'
   fleet_capture_before_observed=$fleet_capture_observed
   fleet_capture_prepare "$1" "$2" "$3" "$fleet_capture_observed" "$4" "$5" "$6" "$7" || return $?
   printf '%s\n' "$fleet_capture_skip" | jq -r 'keys[]' >"$6/capture-skip"
@@ -372,9 +394,9 @@ fleet_capture_pass_observe_after() {
   fleet_run_cli_invalidate
   fleet_capture_after_fingerprint=$(fleet_capture_fingerprint) || fleet_capture_after_fingerprint=
   fleet_capture_after_observed=$(fleet_capture_collect "$3/capture-after") ||
-    fleet_capture_after_observed='{"claude":null,"retry":true}'
+    fleet_capture_after_observed='{"claude":null,"trusted":false,"retry":true}'
   if [ "$fleet_capture_retry_unknown" = true ] ||
-    ! jq -e --argjson after "$fleet_capture_after_observed" '. == $after and .retry != true' \
+    ! jq -e --argjson after "$fleet_capture_after_observed" '. == $after and (.trusted == true or .inapplicable == true)' \
       >/dev/null <<<"$fleet_capture_before_observed"; then
     : >"$dir/retry-owed" || return 1
     fleet_capture_after_fingerprint=$fleet_capture_before_fingerprint
@@ -413,10 +435,11 @@ fleet_capture_pass_agree() {
       "$fleet_capture_authority_filter"'
       . as $rows | [.[] |
         . as $row | select(.id != null and ($discard | index($row.id)) != null) |
+        select($observed.trusted == true) |
         select((.ours == .theirs) or (.theirs == "missing" and
           (.base == {value:.ours,ignored:true} or (.ours == "absent" and .base == null)))) |
         .id,.item] +
-      [select(authoritative($observed; $baseline; "claude")) | $decisions | keys[] |
+      [select(authoritative($observed)) | $decisions | keys[] |
         . as $key | select(all($rows[]; .id != $key and .item != $key))] | unique' <<<"$rows") || return 1
     discard=$(jq -c --argjson verified "$verified" 'delpaths($verified | map([.]))' <<<"$discard") || return 1
     if [ "$discard" = '{}' ]; then rm -f "$dir/agent-discard.json" || return 1
@@ -427,12 +450,15 @@ fleet_capture_pass_agree() {
 
 fleet_capture_guard_records() {
   # Keep independent evidence even when the manager inventory cannot be trusted.
-  local registry settings
+  local registry settings registry_present=false settings_present=false
   registry=$(fleet_run_installed_plugins | jq -cse '
     if length == 1 then .[0] else null end') || registry=null
   settings=$(fleet_capture_json_read "$(fleet_run_settings_path)" '{}' 2>/dev/null) || settings=null
-  jq -cn --argjson registry "$registry" --argjson settings "$settings" '
-    {registry:$registry, enabled:(if $settings == null then null
+  [ ! -e "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json" ] || registry_present=true
+  [ ! -e "$(fleet_run_settings_path)" ] || settings_present=true
+  jq -cn --argjson registry "$registry" --argjson settings "$settings" \
+    --argjson registry_present "$registry_present" --argjson settings_present "$settings_present" '
+    {registry:$registry,registry_present:$registry_present,settings_present:$settings_present, enabled:(if $settings == null then null
       elif $settings | has("enabledPlugins") then
         $settings.enabledPlugins | if type == "object" then . else null end
       else {} end)}'
@@ -459,18 +485,6 @@ fleet_capture_guard_target() {
           .value.value | select(IN("enabled","disabled"))] |
           if length == 1 then (.[0] == "enabled" | tostring) else "unknown" end
         end)}' <<<"$records"
-}
-
-fleet_capture_prepass_state() {
-  # ID -> enabled|disabled|absent from registry, settings and the CLI's state; unknown on any doubt.
-  local id=${1#claude:}
-  fleet_capture_id_valid "claude:$id" || { printf 'unknown\n'; return 0; }
-  fleet_capture_guard_live "$id" 2>/dev/null | jq -r --arg id "$id" '
-    if .installed == null then "unknown" elif .installed == [] then "absent"
-    elif .installed != [$id] then "unknown"
-    else [(.settings[$id] | booleans), (.manager_state | select(IN("true","false")) | . == "true")] |
-      unique | if length != 1 then "unknown" elif .[0] then "enabled" else "disabled" end end' ||
-    printf 'unknown\n'
 }
 
 fleet_capture_guard_live() {
@@ -534,7 +548,9 @@ fleet_capture_guard_destructive() {
   fleet_capture_guard_current=$(fleet_capture_guard_live "$1") || return 1
   comparison=$(jq -r --argjson before "$expected" --arg initial "$initial" '
     def changed($old): . != null and $old != null and . != $old;
-    if (.installed | changed($before.installed)) or (.settings | changed($before.settings)) or
+    if .query_ok == false or .uncertain == true or .installed == null or .settings == null or
+      any(.settings[]; type != "boolean") then "unobserved"
+    elif (.installed | changed($before.installed)) or (.settings | changed($before.settings)) or
       # The CLI enabled state is checked on its own: settings must not mask an owner enable.
       ($before.state != "unknown" and (.manager_state | IN("true","false")) and
         .manager_state != $before.state) or

@@ -285,6 +285,10 @@ fleet_plugins_claude_update_unowned() {
   # failed or timed out, an update that did not verify yet), and 1 when the
   # installed list cannot be read. Only 0 and 75 let the caller remember the
   # marketplace as caught up; anything else and the next pass retries.
+  if [ -n "${fleet_capture_observed:-}" ] &&
+    ! jq -e '.trusted == true or .inapplicable == true' >/dev/null <<<"$fleet_capture_observed"; then
+    return 74
+  fi
   fleet_plugins_cu_map=$(fleet_run_installed_plugins 2>/dev/null) || return 1
   fleet_plugins_cu_ids=$(printf '%s\n' "$fleet_plugins_cu_map" | jq -r --arg m "$2" '
     to_entries[] | select(any((.value // [])[]?; .scope == "user")) |
@@ -520,6 +524,12 @@ fleet_plugins_refresh() (
   # Codex first: the item loop's automatic approval reads Codex's copy.
   fleet_plugins_codex_sync "$fleet_plugins_r_tmp/codex" \
     "${fleet_plugins_r_holds:+$fleet_plugins_r_holds/codex-sync-held}" || :
+
+  # Claude currency must keep its debt and marketplace memo until inventory is trusted.
+  if [ -n "${fleet_capture_observed:-}" ] &&
+    ! jq -e '.trusted == true' >/dev/null <<<"$fleet_capture_observed"; then
+    exit 0
+  fi
 
   if [ -s "$fleet_plugins_r_tmp/claude" ]; then
     fleet_plugins_owned "$fleet_plugins_r_desired" "$fleet_plugins_r_defs" \
