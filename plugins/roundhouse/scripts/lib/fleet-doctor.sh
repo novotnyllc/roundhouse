@@ -1833,6 +1833,14 @@ EOF
       'the two sources of machine truth have drifted (B-1)'
   fi
 
+  # Local plugin holds are already replicated alerts; show the item and direction.
+  fleet_records_read_dir "$doctor_store/alerts/$doctor_host" "$doctor_tmp/agent-alerts"
+  while IFS= read -r doctor_agent_detail; do
+    fleet_doctor_row finding agent-local-change "$doctor_agent_detail"
+  done < <(jq -r '.rec | objects | select(.kind == "agent-local-change" or
+    .kind == "agent-capture-conflict" or .kind == "agent-capture-ambiguous") | .detail' \
+    "$doctor_tmp/agent-alerts")
+
   # --- clocks, because every canary wait is only as good as them ---
   doctor_skew=$(for doctor_journal in "$doctor_store"/journal/*/; do
     [ -d "$doctor_journal" ] || continue

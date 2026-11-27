@@ -494,17 +494,27 @@ if [ -n "$fleet_fixture_yq" ]; then
     # tombstone there, and a host-layer `absent` over a fleet `enabled` is.
     run_tomb_layers="$run_root/tomb-layers"
     mkdir -p "$run_tomb_layers/hosts"
-    printf 'plugins:\n  gone: absent\n  readded: absent\n  kept: enabled\n' \
+    printf 'plugins:\n  gone: absent\n  readded: absent\n  kept: enabled\n  object: {state: absent}\nskills:\n  retired: absent\n' \
       >"$run_tomb_layers/fleet.yaml"
-    printf 'platform: macos\nplugins:\n  readded: enabled\n  local-retire: absent\n' \
+    printf 'platform: macos\nliveness_alert_hours: 72\nplugins:\n  readded: enabled\n  local-retire: absent\n' \
       >"$run_tomb_layers/hosts/vireo.yaml"
     [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo plugins | jq -c '.plugins | keys')" = \
       '["gone","local-retire"]' ] ||
       fail "the tombstone set did not follow last-layer-wins: $(fleet_fold_tombstones "$run_tomb_layers" vireo plugins)"
     [ "$(fleet_fold "$run_tomb_layers" vireo | jq -c '.plugins | keys')" = \
-      '["kept","readded"]' ] ||
+      '["kept","object","readded"]' ] ||
       fail "reading tombstones changed what the ordinary fold knocks out"
-    [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo skills)" = '{}' ] ||
+    fleet_fold "$run_tomb_layers" vireo raw | jq -e '
+      .plugins.gone == "absent" and .plugins.object.state == "absent" and
+      .skills.retired == "absent" and .liveness_alert_hours == 72
+    ' >/dev/null || fail "the raw fold dropped a tombstone or host fact"
+    fleet_fold "$run_tomb_layers" vireo keep-plugin-tombstones | jq -e '
+      .plugins.gone == "absent" and .plugins.object.state == "absent" and .skills == {}
+    ' >/dev/null || fail "the plugin view did not preserve just the plugin tombstones"
+    if fleet_fold "$run_tomb_layers" vireo invalid >/dev/null 2>&1; then
+      fail "the fold accepted an unknown view"
+    fi
+    [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo agents)" = '{}' ] ||
       fail "a category with no tombstones produced some"
 
     # Knocking `absent` out once, after the merge, is the same as knocking it

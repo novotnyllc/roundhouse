@@ -348,6 +348,14 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] &&
   if [ -f "\$enabled_file" ]; then
     enabled_ledger=\$(jq -e -c 'if type == "object" then . else error("ledger") end' \
       "\$enabled_file") || { printf '%s\n' '[]'; exit 0; }
+    if [ "\${CLAUDE_PLUGIN_LIST_FROM_RECORDS:-0}" = 1 ]; then
+      jq -c --argjson enabled "\$enabled_ledger" '
+        [.plugins | to_entries[] | .key as \$id | .value[] |
+          {id:\$id, version:.version, scope:.scope,
+           enabled:(\$enabled[\$id] // false), installPath:.installPath}]' \
+        "\$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+      exit \$?
+    fi
     fixed_enabled=\$(printf '%s\n' "\$enabled_ledger" | jq -r --arg id "\$fixed_id" \
       'if has(\$id) then .[\$id] else true end')
     extra=\$(printf '%s\n' "\$enabled_ledger" | jq -c --arg id "\$fixed_id" \
@@ -1169,7 +1177,12 @@ fleet_fixture_tool() {
 }
 fleet_fixture_yq=$(fleet_fixture_tool yq)
 fleet_fixture_path=$PATH
-[ -z "$fleet_fixture_yq" ] || fleet_fixture_path="$(dirname "$fleet_fixture_yq"):$PATH"
+if [ -n "$fleet_fixture_yq" ]; then
+  # Expose yq alone: its real bin directory can shadow fixture agent stubs.
+  mkdir -p "$tmp/yq-only"
+  ln -s "$fleet_fixture_yq" "$tmp/yq-only/yq"
+  fleet_fixture_path="$tmp/yq-only:$PATH"
+fi
 
 # Longer than the 8192-byte setting ceiling 65 and 67 both probe.
 oversized_setting=$(awk 'BEGIN { for (i = 0; i < 8193; i++) printf "x" }')

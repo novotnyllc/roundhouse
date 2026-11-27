@@ -60,6 +60,54 @@ fleet_run_verb_begin() {
   }
 }
 
+fleet_discard_command() (
+  # Discard only authorizes convergence; it writes host-local state, never the store.
+  fleet_run_env
+  require_jq
+  local key=$1 dir lock nonce status=0 decisions item kind alert held=false physical=
+  [[ $key =~ ^(plugins\.[A-Za-z0-9_-][A-Za-z0-9._-]*(@[A-Za-z0-9_-][A-Za-z0-9._-]*)?|claude:[A-Za-z0-9_-][A-Za-z0-9._-]*@[A-Za-z0-9_-][A-Za-z0-9._-]*)$ ]] || {
+    printf 'roundhouse: %s is not a Claude plugin item\n' "$key" >&2
+    exit 64
+  }
+  lock=$(fleet_lock_path)
+  mkdir -p "${lock%/*}" || exit 75
+  fleet_lock_take "$lock" "$(fleet_run_stale_after "$(fleet_store_path)" "$(fleet_host_name)")" || status=$?
+  case $status in
+    0 | 11) ;;
+    10) printf 'roundhouse: a fleet run holds %s; retry discard when it finishes\n' "$lock" >&2; exit 75 ;;
+    *) exit "$status" ;;
+  esac
+  nonce=$fleet_lock_nonce_held
+  trap 'fleet_lock_release "$lock" "$nonce" || :' EXIT
+  fleet_lock_signals_exit
+  # A typo must not authorize convergence of an unrelated future local edit.
+  key=${key#claude:}
+  key=${key#plugins.}
+  case $key in *@*) physical=claude:$key ;; esac
+  for item in "plugins.$key" "plugins.${key%@*}"; do
+    for kind in agent-local-change agent-capture-conflict; do
+      alert="$(fleet_store_path)/alerts/$(fleet_host_name)/$(fleet_alert_name "$kind" "$kind" "$item")"
+      if [ -f "$alert" ] && [ ! -L "$alert" ] &&
+        fleet_record_read "$alert" '{}' | jq -e --arg kind "$kind" --arg item "$item" --arg physical "$physical" \
+          '.kind == $kind and .items == [$item] and
+            ($physical == "" or (.detail | startswith($physical + " ")))' >/dev/null; then
+        held=true
+      fi
+    done
+  done
+  [ "$held" = true ] || {
+    printf 'roundhouse: no held Claude plugin %s\n' "$key" >&2
+    exit 65
+  }
+  case $key in *@*) key=claude:$key ;; *) key=plugins.$key ;; esac
+  dir=$(fleet_run_state_dir)
+  decisions=$(fleet_capture_json_read "$dir/agent-discard.json" '{}') || exit 65
+  decisions=$(jq -ce --arg key "$key" '.[$key] = true' <<<"$decisions") || exit 65
+  mkdir -p "$dir" && : >"$dir/retry-owed" || exit 65
+  fleet_capture_json_write "$dir/agent-discard.json" "$decisions" || exit 65
+  printf 'roundhouse: recorded discard for %s; the next fleet pass will converge it\n' "$key"
+)
+
 fleet_age_evidence_command() (
   # `roundhouse fleet-age-evidence [--dry-run]` — the full pass's evidence
   # aging (fleet_records_age), run by hand. `--dry-run` prints what it

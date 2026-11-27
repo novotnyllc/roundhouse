@@ -1,0 +1,185 @@
+# roundhouse self-check — Claude observation, its agreed baseline, and merge.
+# shellcheck shell=bash
+
+if [ -n "$fleet_fixture_yq" ]; then
+  printf 'agent observation: merge, baseline, and inventory trust\n'
+  (
+    set -eu
+    PATH=$fleet_fixture_path
+    export PATH
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+
+    while read -r base ours theirs answer; do
+      [ "$(fleet_merge3 "$base" "$ours" "$theirs")" = "$answer" ] ||
+        fail "merge3 $base $ours $theirs did not yield $answer"
+    done <<'MERGE'
+enabled enabled enabled same
+enabled enabled disabled converge
+enabled absent enabled local
+enabled disabled disabled agree
+enabled absent disabled conflict
+absent enabled absent local
+enabled unknown disabled unknown
+enabled enabled missing ignore
+enabled absent missing ignore
+missing enabled missing local
+missing absent missing same
+missing absent enabled converge
+missing enabled disabled conflict
+ignored:enabled enabled missing ignore
+ignored:enabled disabled missing ignore
+ignored:enabled absent missing forget
+ignored:enabled enabled disabled converge
+ignored:enabled absent disabled conflict
+MERGE
+
+    rh_capture_root="$tmp/agent-capture"
+    rh_capture_store="$rh_capture_root/store"
+    rh_capture_tmp="$rh_capture_root/pass"
+    ROUNDHOUSE_FLEET_STORE=$rh_capture_store
+    CLAUDE_CONFIG_DIR="$rh_capture_root/claude"
+    export ROUNDHOUSE_FLEET_STORE CLAUDE_CONFIG_DIR
+    mkdir -p "$rh_capture_store/fleet" "$rh_capture_store/hosts" "$rh_capture_tmp" \
+      "$CLAUDE_CONFIG_DIR/plugins"
+    rh_capture_dir=$(fleet_instance_path store.run)
+    cat >"$rh_capture_store/fleet.yaml" <<'YAML'
+plugins:
+  keeper: {state: enabled, marketplace: m}
+  retired: absent
+  ambiguous: disabled
+YAML
+    rh_capture_fold=$(fleet_run_desired "$rh_capture_store" mac)
+    rh_capture_ours='{"claude":{
+      "keeper@m":{"value":"enabled","marketplace":"m"},
+      "extra@m":{"value":"enabled","marketplace":"m"},
+      "ambiguous@m":{"value":"enabled","marketplace":"m"},
+      "ambiguous@m2":{"value":"disabled","marketplace":"m2"}
+    }}'
+
+    fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" '{"claude":null}' true
+    [ ! -e "$rh_capture_dir/agent-baseline.json" ] ||
+      fail "an unavailable first scan initialized Claude"
+    fleet_capture_prepare "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true true "$rh_capture_tmp"
+    jq -e 'keys == ["plugins.ambiguous"]' <<<"$fleet_capture_skip" >/dev/null ||
+      fail "Claude's first usable observation held more than its ambiguous item"
+    fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true
+    rh_capture_base=$(cat "$rh_capture_dir/agent-baseline.json")
+    jq -e '._initialized.claude == true and .["claude:extra@m"] == {value:"enabled",ignored:true} and
+      .["plugins.retired"] == {value:"absent"} and .["claude:keeper@m"] == {value:"enabled"} and
+      all(keys[]; startswith("claude:ambiguous@") | not)' <<<"$rh_capture_base" >/dev/null ||
+      fail "first observation lost agreed values, extras, or wrote an ambiguous value"
+
+    fleet_capture_fingerprint >"$rh_capture_dir/agent-fingerprint"
+    if fleet_capture_dirty; then fail "agreed fingerprints kept polling open"; fi
+    fleet_agent_pending_mark claude keeper@m
+    fleet_capture_dirty || fail "a pending marker let the fast pass skip re-observation"
+    rh_mark=$(fleet_agent_pending_path claude:keeper@m)
+    rh_capture_changed=$(jq -c '.claude["keeper@m"].value = "disabled"' <<<"$rh_capture_ours")
+    fleet_capture_prepare "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true true "$rh_capture_tmp"
+    jq -e 'has("plugins.keeper") | not' <<<"$fleet_capture_skip" >/dev/null ||
+      fail "a marked plugin difference stopped ordinary convergence"
+    fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true
+    [ -f "$rh_mark" ] || fail "cleared the marker before agreement"
+    fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true
+    [ ! -e "$rh_mark" ] || fail "agreed marker did not clear"
+    fleet_capture_prepare "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true true "$rh_capture_tmp"
+    jq -e 'has("plugins.keeper")' <<<"$fleet_capture_skip" >/dev/null ||
+      fail "the same unmarked difference would be reverted"
+
+    rh_capture_legacy=$(jq -c '.plugins.legacy = "absent"' <<<"$rh_capture_fold")
+    fleet_agent_pending_mark claude legacy@m
+    fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_legacy" "$rh_capture_ours" true
+    jq -e '.["claude:legacy@m"].value == "absent"' "$rh_capture_dir/agent-baseline.json" >/dev/null &&
+      [ ! -e "$(fleet_agent_pending_path claude:legacy@m)" ] ||
+      fail "an unqualified tombstone lost the identity recorded by its marker"
+    fleet_capture_mark_claude retired
+    rh_mark=$(fleet_agent_pending_path claude:retired@__unqualified__)
+    fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" '{"claude":null}' true
+    [ -f "$rh_mark" ] || fail "an unknown observation cleared the unqualified marker"
+    fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true
+    [ ! -e "$rh_mark" ] || fail "the agreed unqualified tombstone left its marker pending"
+
+    # A healthy user row is enough to identify a damaged installation.
+    rh_registry="$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+    printf '%s\n' '{"plugins":{"keeper@m":[{"scope":"user","installPath":"/missing-fixture"}]}}' >"$rh_registry"
+    printf '%s\n' '{"enabledPlugins":{"keeper@m":true}}' >"$CLAUDE_CONFIG_DIR/settings.json"
+    cat >"$rh_capture_root/inventory.jsonl" <<'JSONL'
+{"kind":"plugin_manager","status":"present","data":{"agent":"claude","authoritative":true,"installed_count":1}}
+{"kind":"plugin","status":"present","data":{"agent":"claude","inventory_source":"manager","manager_id":"keeper@m","name":"keeper","marketplace":"m","scope":"user","enabled":true,"installed_version":"100"}}
+JSONL
+    fleet_capture_observe "$rh_capture_root/inventory.jsonl" |
+      jq -e '.claude["keeper@m"].value == "enabled"' >/dev/null ||
+      fail "authoritative CLI and registry did not describe a damaged install as installed"
+    for rh_settings in false null; do
+      printf '{"enabledPlugins":%s}\n' "$rh_settings" >"$CLAUDE_CONFIG_DIR/settings.json"
+      fleet_capture_observe "$rh_capture_root/inventory.jsonl" | jq -e '.claude == null' >/dev/null ||
+        fail "invalid enabledPlugins state was read as authoritative"
+    done
+
+    # Unreadable and partial records must never manufacture a user removal.
+    mv "$rh_registry" "$rh_capture_root/original.json"
+    printf '{broken\n' >"$rh_registry"
+    fleet_capture_observe "$rh_capture_root/inventory.jsonl" | jq -e '.claude == null' >/dev/null ||
+      fail "unparseable registry read as authoritative"
+    mv "$rh_capture_root/original.json" "$rh_registry"
+    head -1 "$rh_capture_root/inventory.jsonl" >"$rh_capture_root/partial.jsonl"
+    fleet_capture_observe "$rh_capture_root/partial.jsonl" | jq -e '.claude == null' >/dev/null ||
+      fail "partial CLI listing read as authoritative"
+    sed 's/"status":"present"/"status":"unavailable"/' "$rh_capture_root/partial.jsonl" >"$rh_capture_root/failed.jsonl"
+    fleet_capture_observe "$rh_capture_root/failed.jsonl" | jq -e '.claude == null' >/dev/null ||
+      fail "failed CLI listing read as authoritative"
+    sed 's/"scope":"user"/"scope":"unrecognized"/' "$rh_capture_root/inventory.jsonl" >"$rh_capture_root/scope.jsonl"
+    fleet_capture_observe "$rh_capture_root/scope.jsonl" | jq -e '.claude == null' >/dev/null ||
+      fail "an unrecognized scope was treated as evidence"
+
+    sed 's/"scope":"user"/"scope":"project"/' "$rh_capture_root/inventory.jsonl" >"$rh_capture_root/project.jsonl"
+    printf '{}\n' >"$CLAUDE_CONFIG_DIR/settings.json"
+    fleet_capture_observe "$rh_capture_root/project.jsonl" | jq -e '.claude == null' >/dev/null ||
+      fail "a project-only CLI listing overruled the registry's user install"
+    printf '%s\n' '{"plugins":{"keeper@m":[{"scope":"project"}]}}' >"$rh_registry"
+    rh_observed=$(fleet_capture_observe "$rh_capture_root/project.jsonl")
+    fleet_capture_rows "$rh_capture_store" "$rh_capture_fold" "$rh_observed" "$rh_capture_base" |
+      jq -e 'any(.[]; .item == "plugins.keeper" and .ours == "absent")' >/dev/null ||
+      fail "matching project-only records did not count as absent in user scope"
+
+    printf '%s\n' '{"plugins":{"keeper@m":[{"scope":"user"}],"keeper@other":[{"scope":"project"}]}}' \
+      >"$rh_registry"
+    jq -c 'if .kind == "plugin_manager" then .data.installed_count=2 else . end' \
+      "$rh_capture_root/inventory.jsonl" >"$rh_capture_root/mixed.jsonl"
+    jq -c 'select(.kind == "plugin") | .data |= (.manager_id="keeper@other" | .marketplace="other")' \
+      "$rh_capture_root/project.jsonl" >>"$rh_capture_root/mixed.jsonl"
+    rh_observed=$(fleet_capture_observe "$rh_capture_root/mixed.jsonl")
+    rh_unqualified=$(jq -c '.plugins.keeper = "enabled"' <<<"$rh_capture_fold")
+    fleet_capture_rows "$rh_capture_store" "$rh_unqualified" "$rh_observed" "$rh_capture_base" |
+      jq -e 'any(.[]; .item == "plugins.keeper" and .id == "claude:keeper@m" and
+        .ours == "enabled" and .ambiguous == false)' >/dev/null ||
+      fail "a project-only alias made a user-scope installation ambiguous"
+    fleet_capture_state_matches plugins.keeper '"enabled"' "$rh_observed" '{}' ||
+      fail "a project-only alias prevented user-scope state matching"
+
+    printf '%s\n' '{"plugins":{}}' >"$rh_registry"
+    sed -n '1s/"installed_count":1/"installed_count":0/p' "$rh_capture_root/inventory.jsonl" >"$rh_capture_root/empty.jsonl"
+    rh_observed=$(fleet_capture_observe "$rh_capture_root/empty.jsonl")
+    jq -e '.claude == {}' <<<"$rh_observed" >/dev/null ||
+      fail "matching empty inventories did not yield an empty observation"
+    fleet_capture_rows "$rh_capture_store" "$rh_capture_fold" "$rh_observed" "$rh_capture_base" |
+      jq -e 'any(.[]; .item == "plugins.keeper" and .ours == "unknown")' >/dev/null ||
+      fail "a wiped inventory was read as a known local removal"
+
+    # Plain publication can recover a remote move after this pass observed its tree.
+    (
+      fleet_vcs_heads_local() { printf 'published\n'; }
+      fleet_vcs_desired_digest() {
+        if [ "$2" = observed ]; then printf 'old-tree\n'; else printf 'new-tree\n'; fi
+      }
+      fleet_agent_pending_mark claude keeper@m
+      cp "$rh_capture_dir/agent-baseline.json" "$rh_capture_root/before-recovery.json"
+      fleet_capture_pass_agree "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_store" observed
+      cmp "$rh_capture_dir/agent-baseline.json" "$rh_capture_root/before-recovery.json" >/dev/null ||
+        fail "publish recovery advanced agreement against the wrong desired tree"
+      [ -e "$(fleet_agent_pending_path claude:keeper@m)" ] && [ -e "$rh_capture_dir/retry-owed" ] ||
+        fail "publish recovery cleared a marker or failed to request a fresh pass"
+    )
+  )
+fi

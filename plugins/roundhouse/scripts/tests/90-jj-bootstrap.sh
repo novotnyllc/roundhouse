@@ -815,6 +815,14 @@ fi
 if [ "${ROUNDHOUSE_REQUIRE_REAL_JJ:-false}" = true ] && [ "$real_jj_ok" != true ]; then
   fail "ROUNDHOUSE_REQUIRE_REAL_JJ is set but jj >= 0.43 and yq are not both usable (jj ${real_jj_version:-none}, yq ${real_yq:-none})"
 fi
+if [ "$real_jj_ok" = true ]; then
+  # Keep installed agent binaries beside jj/yq out of fixture PATHs.
+  mkdir -p "$tmp/jj-tools-only"
+  ln -s "$real_jj" "$tmp/jj-tools-only/jj"
+  ln -s "$real_yq" "$tmp/jj-tools-only/yq"
+  real_jj="$tmp/jj-tools-only/jj"
+  real_yq="$tmp/jj-tools-only/yq"
+fi
 
 # --- the key/roster/KRL fixture generator, shared by every real-jj section ---
 # Real ed25519 node keys, a real hand-editable roster listing them by value,

@@ -266,6 +266,11 @@ roundhouse fleet-journal ENTRY.json|-
 roundhouse fleet-lock / fleet-unlock     # the run-lock, by hand
 ```
 
+`roundhouse fleet-discard ITEM` is host-local: it clears a Claude plugin hold
+by authorizing the next pass to converge to the store. It writes no store data.
+Unmarked local plugin changes and conflicts are held and reported by the run
+and `fleet-doctor` until the store agrees or the owner discards the change.
+
 Two rules make this surface safe, and neither is a formality:
 
 - **A verdict binds to a digest.** `fleet-review ITEM hold REASON` stops *this

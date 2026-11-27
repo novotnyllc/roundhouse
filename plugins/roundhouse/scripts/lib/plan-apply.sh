@@ -664,8 +664,12 @@ EOF
             printf 'roundhouse: unsafe Claude plugin update argv\n' >&2
             return 64
           }
-          "$@" || return
-          plugin_cache_seal_permissions "$plugin_id" || return 65
+          (
+            fleet_run_lock_plugin_mutation || exit $?
+            fleet_capture_mark_claude "$plugin_id" || exit 75
+            "$@" || exit $?
+            plugin_cache_seal_permissions "$plugin_id" || exit 65
+          ) || return $?
           return
           ;;
         *)
