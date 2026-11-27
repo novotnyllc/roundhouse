@@ -1,12 +1,9 @@
-# roundhouse — the supervised verbs that PUBLISH: fleet-compact-alerts and
-# fleet-disown.
+# roundhouse — supervised publication and plugin capture decisions.
 #
 # Every other supervised verb writes into the working copy and stops (the
-# block above fleet_review_command in lib/fleet-run.sh says why). These two
-# exist only to change replicated records, so each takes the run lock, refuses
-# a diverged main or a working copy carrying anything but this host's own
-# records (fleet_run_verb_begin), and commits through the same publish path the
-# run uses.
+# block above fleet_review_command in lib/fleet-run.sh says why). Verbs here
+# either publish replicated records or queue a decision for the next pass.
+# They share the run lock and working-copy guard (fleet_run_verb_begin).
 #
 # Sourced by scripts/roundhouse; carries definitions only.
 # shellcheck shell=bash
@@ -58,6 +55,72 @@ fleet_run_verb_begin() {
       "$3" >&2
     return 65
   }
+}
+
+fleet_capture_decision() (
+  # Queue an operator decision under the run lock. The next pass checks it
+  # against fresh observations and a fetched head before writing any layer.
+  fleet_run_env
+  require_jq
+  require_yq
+  decision_action=$1
+  decision_key=$2
+  decision_item='^(plugins\.[A-Za-z0-9._-]+|codex_plugins\.[A-Za-z0-9._-]+@[A-Za-z0-9._-]+|(claude|codex):[A-Za-z0-9._-]+@[A-Za-z0-9._-]+)$'
+  if [ "$decision_action" = take-local ] && ! [[ $decision_key =~ $decision_item ]]; then
+    printf 'roundhouse: %s is not a plugin item\n' "$decision_key" >&2
+    exit 64
+  fi
+  decision_store=$(fleet_store_path)
+  decision_host=$(fleet_host_name)
+  fleet_run_verb_begin "$decision_store" "$decision_host" "fleet-$decision_action" || exit $?
+  decision_lock=$(fleet_lock_path)
+  trap 'fleet_lock_release "$decision_lock" "$fleet_run_verb_nonce" || :' EXIT
+  fleet_lock_signals_exit
+
+  decision_dir=$(fleet_run_state_dir)
+  decision_file="$decision_dir/agent-pending-confirm.json"
+  decision_batch='{}'
+  if [ "$decision_action" != take-local ]; then
+    decision_batch=$(fleet_capture_json_read "$decision_file" '{}') || exit 65
+  fi
+  if [ "$decision_action" != take-local ] &&
+    jq -e --arg key "$decision_key" '.id == $key and (.items | type == "array" and length > 0)' \
+      >/dev/null <<<"$decision_batch"; then
+    case $decision_action in
+      confirm)
+        decision_json=$(jq -ce 'select(.discarded != true) | .confirmed = true' <<<"$decision_batch") || {
+          printf 'roundhouse: batch %s was discarded\n' "$decision_key" >&2
+          exit 65
+        }
+        ;;
+      discard) decision_json=$(jq -ce '.discarded = true | .confirmed = false' <<<"$decision_batch") || exit 65 ;;
+    esac
+  else
+    if [ "$decision_action" = confirm ] || ! [[ $decision_key =~ $decision_item ]]; then
+      printf 'roundhouse: no pending plugin batch %s\n' "$decision_key" >&2
+      exit 65
+    fi
+    decision_file="$decision_dir/agent-$decision_action.json"
+    decision_json=$(fleet_capture_json_read "$decision_file" '{}') || exit 65
+    decision_json=$(jq -ce --arg key "$decision_key" '.[$key] = true' <<<"$decision_json") || exit 65
+  fi
+  # The local decision is work even when the remote did not move.
+  mkdir -p "$decision_dir" && : >"$decision_dir/retry-owed" || exit 65
+  fleet_capture_json_write "$decision_file" "$decision_json" || exit 65
+  printf 'roundhouse: recorded %s for %s; the next fleet pass will check it\n' \
+    "$decision_action" "$decision_key"
+)
+
+fleet_take_local_command() {
+  fleet_capture_decision take-local "$1"
+}
+
+fleet_confirm_command() {
+  fleet_capture_decision confirm "$1"
+}
+
+fleet_discard_command() {
+  fleet_capture_decision discard "$1"
 }
 
 fleet_age_evidence_command() (

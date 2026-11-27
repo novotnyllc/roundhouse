@@ -297,8 +297,18 @@ fleet_plugins_claude_update_unowned() {
   while IFS= read -r fleet_plugins_cu_id <&9; do
     [ -n "$fleet_plugins_cu_id" ] || continue
     fleet_plugins_cu_name=${fleet_plugins_cu_id%@*}
+    ! fleet_capture_skip_id claude "$fleet_plugins_cu_id" || continue
     ! grep -Fqx -e "id $fleet_plugins_cu_id" -e "name $fleet_plugins_cu_name" "$3" ||
       continue
+    # A late owner install must reach the next capture scan before currency can mark it.
+    if [ -n "${fleet_capture_observed:-}" ] &&
+      ! jq -e --arg id "$fleet_plugins_cu_id" '
+        .claude[$id].value | IN("enabled","disabled")' \
+        >/dev/null <<<"$fleet_capture_observed"; then
+      printf '  hold  plugin %s — capture has not verified this install yet\n' "$fleet_plugins_cu_id"
+      fleet_plugins_cu_hold 74
+      continue
+    fi
     fleet_plugins_cu_value=$(jq -cn --arg m "$2" '{marketplace: $m}')
     fleet_plugins_cu_status=0
     fleet_run_plugin_identity_matches "$1" "$fleet_plugins_cu_name" \
@@ -318,6 +328,7 @@ fleet_plugins_claude_update_unowned() {
     # group-writable): seal it before its identity is accepted, as the item
     # loop does, so a group member cannot edit the hooks it will run.
     fleet_plugins_cu_status=0
+    fleet_capture_mark_claude "$fleet_plugins_cu_id" || return 1
     if ! bounded_verb claude plugin update "$fleet_plugins_cu_id" --scope user \
       >/dev/null 2>&1 </dev/null; then
       fleet_plugins_cu_status=74

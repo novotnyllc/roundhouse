@@ -774,6 +774,7 @@ fleet_run_uninstall_plugin() {
     printf '  defer %s — the 24h live-session window has elapsed; uninstalling\n' "$2"
   fi
   fleet_run_cli_invalidate
+  fleet_capture_mark_claude "$fleet_run_uninstall_target" || return 75
   bounded_verb claude plugin uninstall --scope user --keep-data "$fleet_run_uninstall_target" \
     >/dev/null 2>&1 || return 75
   # The manager's exit status proves it ran, not that the record is gone.

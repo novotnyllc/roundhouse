@@ -23,6 +23,7 @@ fleet_categories() {
 policy
 packages
 plugins
+codex_plugins
 skills
 agents
 hooks
@@ -46,6 +47,8 @@ package_managers
 groups
 wsl_sibling
 liveness_alert_hours
+capture
+default_agent_state
 EOF
 }
 
@@ -129,13 +132,19 @@ fleet_tier_files() (
 )
 
 fleet_fold_files() {
+  fleet_fold_read "$fleet_fold_program" "$@"
+}
+
+fleet_fold_read() {
   # The fold over an explicit, ordered file list. No files is an empty
   # document, not an error: a store with no layers yet wants nothing.
+  local program=$1
+  shift
   [ "$#" -gt 0 ] || {
     printf '{}\n'
     return
   }
-  yq ea -o=json -I=0 "$fleet_fold_program" "$@"
+  yq ea -o=json -I=0 "$program" "$@"
 }
 
 fleet_host_facts() (
@@ -151,13 +160,16 @@ fleet_host_facts() (
 '
   set -f
   # shellcheck disable=SC2046 # deliberate word splitting over the file list
-  fleet_fold_files $(fleet_tier_files "$1" "hosts/$2")
+  fleet_fold_read "${3:-$fleet_fold_program}" $(fleet_tier_files "$1" "hosts/$2")
 )
 
 fleet_layer_files() {
   # The four tiers, low to high, as a file list. Group order is the host's own
-  # list order, left to right, last wins.
-  layer_facts=$(fleet_host_facts "$1" "$2") || return 1
+  # list order, left to right, last wins. A fold can pass already-read facts.
+  layer_facts=${3:-}
+  if [ -z "$layer_facts" ]; then
+    layer_facts=$(fleet_host_facts "$1" "$2") || return 1
+  fi
   fleet_tier_files "$1" fleet
   layer_platform=$(printf '%s\n' "$layer_facts" | jq -r '.platform // empty')
   [ -z "$layer_platform" ] || fleet_tier_files "$1" "os/$layer_platform"
@@ -176,34 +188,73 @@ fleet_fold() (
   IFS='
 '
   set -f
-  # shellcheck disable=SC2046 # deliberate word splitting over the file list
-  fleet_fold_files $(fleet_layer_files "$1" "$2")
+  fold_host=$(fleet_host_facts "$1" "$2" "$fleet_fold_merge_program") || exit 65
+  fold_layers=$(fleet_layer_files "$1" "$2" "$fold_host") || exit 65
+  # shellcheck disable=SC2086 # deliberate word splitting over the file list
+  fold_doc=$(fleet_fold_read "$fleet_fold_merge_program" $fold_layers) || exit 65
+  fold_definitions='{}'
+  if jq -e '.default_agent_state != null' >/dev/null <<<"$fold_host"; then
+    fold_definitions=$(fleet_definitions_load "$1") || exit 65
+  fi
+  printf '%s\n' "$fold_host" "$fold_doc" | jq -cse --arg view "${3:-effective}" \
+    --argjson definitions "$fold_definitions" "${fleet_agent_schema_jq:?}"'
+    def plugin_identity($key; $values):
+      if ($key | contains("@")) then $key | split("@")
+      else [$key, ([$values[$key], ($definitions.plugins | objects)[$key]] |
+        map(objects | .marketplace | strings | select(length > 0)) | first // null)]
+      end;
+    def may_alias_pin($key; $values; $pins):
+      plugin_identity($key; $values) as $id |
+      any(($pins | objects | keys[]); plugin_identity(.; $values) as $pin |
+        $pin[0] == $id[0] and ($pin[1] == $id[1] or $pin[1] == null or $id[1] == null));
+    .[0] as $host | .[1] |
+    if ($host | agent_host_facts_valid | not) then error("invalid plugin host facts")
+    elif (.policy | agent_policy_valid | not) then error("invalid plugin capture policy")
+    elif has("codex_plugins") and (.codex_plugins | codex_plugins_valid | not) then
+      error("invalid codex_plugins item")
+    else . end |
+    del(.capture, .default_agent_state) +
+      ($host | with_entries(select(.key | IN("capture","default_agent_state")))) |
+    $host.default_agent_state as $default |
+    if $default == null then .
+    else reduce ["plugins","codex_plugins"][] as $category (.;
+      if (.[$category] | type) != "object" then .
+      else .[$category] as $values | .[$category] |= with_entries(
+        .key as $key |
+        (.value | if type == "object" and has("state") then .state
+                  elif type == "object" then "enabled" else . end) as $state |
+        if ($state | IN("enabled","disabled","absent")) and
+          (($host[$category] | type == "object" and has($key)) | not) then
+          if $category == "plugins" and may_alias_pin($key; $values; $host[$category]) then empty
+          else .value |= if type == "object" then .state = $default else {state: $default} end end
+        else . end)
+      end)
+    end |
+    if $view == "raw" then .
+    else with_entries(
+      if (.value | type) != "object" or
+        ($view == "keep-plugin-tombstones" and (.key | IN("plugins","codex_plugins"))) then .
+      else .value |= with_entries(select(.value != "absent"))
+      end)
+    end'
 )
 
-fleet_fold_tombstones() (
+fleet_fold_tombstones() {
   # `fleet_fold_tombstones LAYERDIR HOST CATEGORY` — the items of CATEGORY whose
   # effective value at HOST is the scalar `absent`, as a fold-shaped document
   # (`{"plugins":{"x":"absent"}}`, or `{}`).
   #
-  # §3.4. A SEPARATE read, because the knockout is right for every reader of
-  # desired state: the fold's own merge step without it, so the last layer to
-  # speak still wins. `{state: absent}` is never knocked out at all.
-  IFS='
-'
-  set -f
-  # shellcheck disable=SC2046 # deliberate word splitting over the file list
-  set -- "$3" $(fleet_layer_files "$1" "$2")
-  tombstone_category=$1
-  shift
-  [ "$#" -gt 0 ] || { printf '{}\n'; return; }
-  yq ea -o=json -I=0 "$fleet_fold_merge_program" "$@" |
-    jq -c --arg c "$tombstone_category" '
+  # Use the same fold before knockout, including the host's plugin default.
+  # The object form `{state: absent}` is never knocked out.
+  local raw
+  raw=$(fleet_fold "$1" "$2" raw) || return $?
+  printf '%s\n' "$raw" | jq -c --arg c "$3" '
       (.[$c] // {}) as $entries |
       if ($entries | type) != "object" then {}
       else ($entries | with_entries(select(.value == "absent"))) as $dead |
         if $dead == {} then {} else {($c): $dead} end
       end'
-)
+}
 
 fleet_item_split() {
   # `<category>.<name>` -> two lines, category then name. The split is on the

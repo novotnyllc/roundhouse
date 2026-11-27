@@ -752,6 +752,7 @@ fleet_run_poll_floor() {
   # on the remote moved.
   [ ! -e "$(fleet_run_state_dir)/canary-waiting" ] || return 1
   [ ! -e "$(fleet_run_state_dir)/retry-owed" ] || return 1
+  ! fleet_capture_dirty || return 1
 
   fleet_run_fetched=$(fleet_vcs_floor_fetch "$1") || return 1
   [ -n "$fleet_run_fetched" ] || return 1
@@ -2637,10 +2638,13 @@ fleet_run_apply_item() {
   # a Claude plugin (§3.4's tombstone). Everywhere else it is still held.
   case $fleet_run_item_state in
     enabled | disabled) ;;
-    absent) [ "$fleet_run_category" = plugins ] || return 75 ;;
+    absent) case $fleet_run_category in plugins | codex_plugins) ;; *) return 75 ;; esac ;;
     *) return 75 ;;
   esac
   case $fleet_run_category in
+    codex_plugins)
+      fleet_run_apply_codex "$fleet_run_name" "$fleet_run_item_state"
+      ;;
     packages)
       # SATISFIED, and asked BEFORE the resolver: a desired state of `disabled`
       # has no removal verb by design (§10.3 makes removal a separate, capped
@@ -2760,9 +2764,11 @@ EOF
           # plugin can reject or no-op instead of actually refreshing it.
           if [ -n "$fleet_run_installed_sha" ]; then
             fleet_run_cli_invalidate
+            fleet_capture_mark_claude "$fleet_run_id" || return 75
             bounded_verb claude plugin update "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
           else
             fleet_run_cli_invalidate
+            fleet_capture_mark_claude "$fleet_run_id" || return 75
             bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
           fi
           # The manager wrote the cache under its caller's umask, and 002
@@ -2804,6 +2810,7 @@ EOF
         fi
       else
         fleet_run_cli_invalidate
+        fleet_capture_mark_claude "$fleet_run_id" || return 75
         bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
         # As above: seal what the manager wrote before approving its hooks.
         plugin_cache_seal_permissions "$fleet_run_id" || return 75
@@ -2833,6 +2840,7 @@ EOF
           fleet_run_enable_attempted=true
           fleet_run_enable_status=0
           fleet_run_cli_invalidate
+          fleet_capture_mark_claude "$fleet_run_id" || return 75
           bounded_verb claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1 ||
             fleet_run_enable_status=$?
         fi
@@ -2844,6 +2852,7 @@ EOF
         if [ "$fleet_run_plugin_mutated" = true ] ||
           [ "$fleet_run_before_enabled" != false ]; then
           fleet_run_cli_invalidate
+          fleet_capture_mark_claude "$fleet_run_id" || return 75
           bounded_verb claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
         fi
       fi
@@ -3008,18 +3017,18 @@ fleet_run_desired() {
   # verbs, so `fleet-review`, `fleet-apply` and the run all see a scalar
   # `absent` tombstone the same way. The plain fold stays what every reader of
   # desired STATE wants — policy, package managers, the alert detections.
-  printf '%s\n' "$(fleet_fold "$1" "$2")" \
-    "$(fleet_fold_tombstones "$1" "$2" plugins)" | jq -c -s '.[0] * .[1]'
+  fleet_fold "$1" "$2" keep-plugin-tombstones
 }
 
 fleet_run_tombstone_items() {
   # fleet_run_tombstone_items DESIRED -> every `plugins.<name>` whose desired
   # value is a tombstone: the scalar `absent` or `{state: absent}`.
   printf '%s\n' "$1" | jq -r '
-    [(.plugins // {}) | select(type == "object") | to_entries[] |
+    [to_entries[] | select(.key == "plugins" or .key == "codex_plugins") |
+      .key as $category | .value | select(type == "object") | to_entries[] |
       select(.value == "absent" or
         ((.value | type) == "object" and .value.state == "absent")) |
-      "plugins." + .key] | unique | .[]'
+      $category + "." + .key] | unique | .[]'
 }
 
 # --- §5/§10.4 the alert surface -----------------------------------------------
@@ -3100,10 +3109,13 @@ fleet_run_publish() {
   # nothing while the caller reports success and the work sits in an orphan.
   # No --allow-backwards: a move that would drop main's own commits is exactly
   # what must not happen quietly.
-  if [ "$(jj -R "$1" log -r @ --no-graph -T 'if(empty,"y","n")')" = n ]; then
+  fleet_run_publish_empty=$(jj -R "$1" log -r @ --no-graph -T 'if(empty,"y","n")') || return 65
+  case $fleet_run_publish_empty in y | n) ;; *) return 65 ;; esac
+  if [ "$fleet_run_publish_empty" = n ]; then
     jj -R "$1" describe -r @ -m "${6:-converge on $2}
 
-$(fleet_vcs_trailers "$2" "$3" "$4" "$5")" >/dev/null
+$(fleet_vcs_trailers "$2" "$3" "$4" "$5")" >/dev/null || return 65
+    fleet_capture_transaction_target "$(jj -R "$1" log -r @ --no-graph -T 'commit_id')" || return 65
     jj -R "$1" bookmark set main \
       -r "$(jj -R "$1" log -r @ --no-graph -T 'commit_id')" >/dev/null || {
       printf 'roundhouse: could not move main to the new commit (it does not descend from main); nothing published\n' >&2
@@ -3112,7 +3124,7 @@ $(fleet_vcs_trailers "$2" "$3" "$4" "$5")" >/dev/null
   fi
   fleet_run_target=$(fleet_vcs_heads_local "$1" | head -1)
   [ -n "$fleet_run_target" ] || return 65
-  fleet_vcs_publish "$1" "$fleet_run_target"
+  fleet_vcs_publish "$1" "$fleet_run_target" "${7:-}"
 }
 
 fleet_run_nudge() {
@@ -3223,6 +3235,23 @@ fleet_run_pass_ceiling() {
   printf '7200\n'
 }
 
+fleet_run_lock_plugin_mutation() {
+  # Standalone plugin mutations hold the scheduled run's lock through their marker and verb.
+  local lock_status=0
+  plugin_mutation_lock=$(fleet_lock_path)
+  mkdir -p "${plugin_mutation_lock%/*}" || return 75
+  fleet_run_lock_take "$(fleet_store_path)" "$(fleet_host_name)" "$plugin_mutation_lock" || lock_status=$?
+  case $lock_status in
+    0) ;;
+    10) printf 'roundhouse: a fleet run holds %s; retry the plugin change when it finishes\n' "$plugin_mutation_lock" >&2
+      return 75 ;;
+    *) return "$lock_status" ;;
+  esac
+  plugin_mutation_nonce=$fleet_lock_nonce_held
+  trap 'fleet_lock_release "$plugin_mutation_lock" "$plugin_mutation_nonce" || :' EXIT
+  fleet_lock_signals_exit
+}
+
 # --- the commands -------------------------------------------------------------
 
 fleet_run_reap_cask_temp() (
@@ -3299,6 +3328,7 @@ fleet_run_command() {
   trap '[ "$run_lock_held" != true ] || fleet_lock_release "$run_lock" "$run_lock_nonce" || :
     rm -rf "$run_tmp"' EXIT
   fleet_lock_signals_exit
+  fleet_capture_transaction_recover "$run_store" || exit $?
   fleet_schedule_rotate_logs >/dev/null 2>&1 || :
   # §8.6: the abort button for a bad local apply, captured ONCE per run,
   # before its first pass and deliberately WITHOUT --ignore-working-copy (that
@@ -3383,7 +3413,9 @@ fleet_run_pass() {
   # already installed is recorded as owned, as the per-item writes recorded
   # it. HERE, in the pass's own subshell, because the batch is: a trap in
   # fleet_run_command never saw it open. A signal exits 128+N, which runs it.
-  trap '[ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :
+  fleet_capture_transaction_recover "$run_store" || exit $?
+  trap 'fleet_capture_transaction_recover "$run_store" staging-only || :
+    [ -z "${fleet_run_batch:-}" ] || fleet_run_batch_close "$run_store" "$run_host" || :
     fleet_run_reap_cask_temp >/dev/null 2>&1 || :' EXIT
   fleet_lock_signals_exit
   # Captured BEFORE any fetch: what arrives is what §7.7 has to gate, and after
@@ -3473,6 +3505,7 @@ fleet_run_pass() {
   fi
 
   # --- §8.3: the hold set, from per-head folds over real commits ---
+  run_capture_initial_state=$run_state
   # THE HEADS ARE THE BOOKMARK HEADS, recomputed — never parents($M), which is
   # the heads PLUS the operator's in-flight edit.
   if [ "$run_state" = conflicted ]; then
@@ -3664,6 +3697,13 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fi
   fi
 
+  run_capture_clean=false
+  [ "$run_state" != clean ] || run_capture_clean=true
+  [ "$run_capture_initial_state" = clean ] || run_capture_clean=false
+  [ -z "${run_broken:-}" ] || run_capture_clean=false
+  [ ! -s "$run_tmp/sigholds" ] || run_capture_clean=false
+  fleet_capture_pass_prepare "$run_store" "$run_host" "$run_desired" \
+    "$run_capture_clean" "$run_fetched" "$run_tmp" "$run_layers"
   # --- §6 step 6: review -> verdict -> apply -> applied/ -> journal ---
   # PER PASS, not per process: one marketplace repair per marketplace per pass
   # (fleet_run_marketplace_repair), forgotten here so a later pass in the same
@@ -3685,7 +3725,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   run_canary_waiting=false
   # Set by a runtime or transient hold (an apply that failed, an identity that
   # could not be read): retried next pass even if the remote never moves.
-  run_retry_owed=false
+  run_retry_owed=$fleet_capture_retry_unknown
 
   # §10.3's removal set, capped BEFORE any removal applies: ONE tagged list,
   # `prune ITEM` (owned, gone from the layers) and `uninstall ITEM` (a
@@ -3718,12 +3758,23 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   fleet_run_tombstone_items "$run_desired" >"$run_tmp/tombstones"
   while IFS= read -r run_tomb_item; do
     [ -n "$run_tomb_item" ] || continue
+    ! grep -Fqx "$run_tomb_item" "$run_tmp/capture-skip" || continue
     ! grep -Fqx "held $run_tomb_item" "$run_tmp/verdicts" || continue
     run_tomb_value=$(fleet_item_value "$run_desired" "$run_tomb_item")
-    run_tomb_target=$(fleet_run_tombstone_target "$run_defs" \
-      "${run_tomb_item#plugins.}" "$run_tomb_value") || run_tomb_target=undecidable
+    case $run_tomb_item in
+      codex_plugins.*)
+        run_tomb_target=$(fleet_run_codex_apply_state "${run_tomb_item#codex_plugins.}") ||
+          run_tomb_target=undecidable
+        [ "$run_tomb_target" != absent ] || run_tomb_target=
+        ;;
+      *) run_tomb_target=$(fleet_run_tombstone_target "$run_defs" \
+        "${run_tomb_item#plugins.}" "$run_tomb_value") || run_tomb_target=undecidable ;;
+    esac
     [ -z "$run_tomb_target" ] || printf 'uninstall %s\n' "$run_tomb_item"
   done <"$run_tmp/tombstones" >>"$run_tmp/removals"
+  awk 'FILENAME == ARGV[1] { skip[$0] = 1; next } !($2 in skip)' \
+    "$run_tmp/capture-skip" "$run_tmp/removals" >"$run_tmp/removals.next"
+  mv "$run_tmp/removals.next" "$run_tmp/removals"
   run_removals_held=$(fleet_run_removals_over "$run_tmp/removals" \
     "$(fleet_applied_count "$run_store" "$run_host")" "$run_fold")
   run_cap_over=false
@@ -3786,8 +3837,9 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   # `brew`, `claude` and `git clone`; measured, one greedy child consumed the
   # rest of the list and silently cut a four-item run to one.
   while IFS="$fleet_run_sep" read -r run_verdict run_item run_digest run_value \
-    run_applied run_review_held run_revert run_state run_hold <&9; do
+    run_applied run_review_held run_revert run_item_state run_hold <&9; do
     [ -n "${run_item:-}" ] || continue
+    ! grep -Fqx "$run_item" "$run_tmp/capture-skip" || continue
     if [ "$run_verdict" = held ]; then
       fleet_run_runtime_hold "$run_item" 'verdict held' "$run_tmp/sigholds" || {
         fleet_run_batch_close "$run_store" "$run_host"
@@ -3877,6 +3929,12 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     [ -z "$run_applied" ] || run_in_applied=yes
     run_match=no
     [ "$run_applied" != "$run_digest" ] || run_match=yes
+    case $run_category in
+      plugins | codex_plugins)
+        fleet_capture_state_matches "$run_item" "$run_value" \
+          "$fleet_capture_observed" "$run_defs" || run_match=no
+        ;;
+    esac
     if [ "$run_category" = plugins ] && [ "$run_in_applied" = yes ] &&
       [ "$run_match" = yes ]; then
       run_plugin_identity_status=0
@@ -4023,7 +4081,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       [ "$run_category" != hooks ] ||
         fleet_run_batch_flush "$run_store" "$run_host" applied-only
       fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
-        "$run_value" "$run_managers" "$run_state" || run_status=$?
+        "$run_value" "$run_managers" "$run_item_state" || run_status=$?
     fi
     case $run_status in
       0)
@@ -4149,8 +4207,9 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     printf 'roundhouse: converged from last known; nothing published (the remote was unreachable, journaled source: none)\n'
     exit 0
   fi
-  fleet_run_publish "$run_store" "$run_host" scheduled/agent \
-    "$run_mode convergence" "${run_applied_items:--}" || exit $?
+  fleet_capture_pass_publish "$run_store" "$run_host" "$run_tmp" \
+    "$run_desired" "$run_layers" "$run_mode convergence" \
+    "${run_applied_items:--}" || exit $?
   # The poll floor's converged-here condition and its comparison base: the
   # head this host now sits on, and the desired state of the reference it
   # converged FROM (fleet_run_poll_floor says why it is not the head's).
@@ -4533,8 +4592,10 @@ fleet_run_plugin_reinstall() {
   printf 'roundhouse: claude plugin update left %s at %s, not %s; reinstalling it once this pass\n' \
     "$1" "$2" "$fleet_run_resolved_sha" >&2
   fleet_run_cli_invalidate
+  fleet_capture_mark_claude "$1" || return 75
   bounded_verb claude plugin uninstall --scope user --keep-data "$1" >/dev/null 2>&1 || return 1
   fleet_run_cli_invalidate
+  fleet_capture_mark_claude "$1" || return 75
   bounded_verb claude plugin install "$1" --scope user >/dev/null 2>&1 || {
     printf 'roundhouse: reinstalling %s failed after its uninstall; the next pass installs it\n' "$1" >&2
     return 1
@@ -5574,6 +5635,9 @@ fleet_apply_command() (
   require_jq
   require_yq
   apply_item=$1
+  case $apply_item in
+    plugins.* | codex_plugins.*) fleet_run_lock_plugin_mutation || exit $? ;;
+  esac
   apply_store=$(fleet_store_path)
   apply_host=$(fleet_host_name)
   apply_fold=$(fleet_run_desired "$apply_store" "$apply_host")
@@ -5590,7 +5654,7 @@ fleet_apply_command() (
   apply_now=$(fleet_now)
   apply_value=$(fleet_item_value "$apply_fold" "$apply_item")
   case $apply_item in
-    plugins.*)
+    plugins.* | codex_plugins.*)
       if [ "$(fleet_run_state_of "$apply_value")" = absent ]; then
         fleet_run_tombstone_converge "$apply_store" "$apply_host" \
           "$(fleet_definitions_load "$apply_store")" "$apply_item" "$apply_value" \

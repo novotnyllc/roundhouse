@@ -28,7 +28,10 @@ else
       "$node_home/.config/roundhouse" "$node_home/.ssh"
     # A login profile may enable failglob. The remote CLI resolver must still
     # skip the absent Claude cache and select the valid Codex cache.
-    printf '%s\n' 'shopt -s failglob' >"$node_home/.bash_profile"
+    cat >"$node_home/.bash_profile" <<'SH'
+shopt -s failglob
+export PATH="$ROUNDHOUSE_REENROLL_NODE_BIN"
+SH
 
     # The fake SSH transport executes the exact remote shell produced by
     # ssh_run, but keeps the two host-local roots disjoint. It also gives the

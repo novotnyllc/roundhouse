@@ -740,6 +740,15 @@ async function main() {
   if (!PLUGIN_ID.test(pluginId ?? "")) {
     fail("usage: codex-plugin-hooks.mjs approve|update PLUGIN@MARKETPLACE");
   }
+  if (command === "enabled" || command === "disabled") {
+    await withAppServer((server) => server.request("config/batchWrite", {
+      edits: [{ keyPath: `plugins."${pluginId}".enabled`, value: command === "enabled", mergeStrategy: "replace" }],
+      filePath: null,
+      expectedVersion: null,
+      reloadUserConfig: true,
+    }), codexExecutable);
+    return;
+  }
   const cwd = process.cwd();
   if (command === "status") {
     // Read-only: how many of the plugin's hooks are trusted, modified (trusted
@@ -889,7 +898,7 @@ async function main() {
     );
     return;
   }
-  fail("usage: codex-plugin-hooks.mjs approve|update|status PLUGIN@MARKETPLACE | sync ROOT REVISION...");
+  fail("usage: codex-plugin-hooks.mjs approve|update|status|enabled|disabled PLUGIN@MARKETPLACE | sync ROOT REVISION...");
 }
 
 main().catch((error) => {

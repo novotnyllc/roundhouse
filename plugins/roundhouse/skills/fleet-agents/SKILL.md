@@ -317,6 +317,27 @@ pass instead of stalling it. The next pass whose query answers clears it.
 `rm` on the file still resolves any alert by hand; a condition alert that is
 removed while its condition holds is raised again on the next pass.
 
+### Plugin ownership
+
+After its first agreement with the published store, a host can capture local
+Claude plugin installs, removals, enables, and disables from known marketplaces.
+The first pass leaves existing local extras in place. Codex capture requires
+`policy.capture_codex: true`. A host can opt out with `capture: false` or set
+`default_agent_state: absent` or `disabled` for plugins shared by the fleet.
+Explicit host declarations still take precedence.
+
+- `roundhouse fleet-take-local ITEM` requests the local state for an ignored
+  extra or pin, or the saved local state for a conflict. For a pin, the next
+  eligible pass writes the host's declaration.
+- `roundhouse fleet-confirm ID` releases an entire pending batch for the next
+  eligible pass to publish.
+- `roundhouse fleet-discard ID|ITEM` drops a pending batch or local decision
+  and lets declared plugins converge to the fleet or host declaration.
+
+Use the item or batch identifier printed in the alert. Decisions are local to
+the host where the change was observed. The next pass checks them against the
+fetched store before any publication.
+
 ### Record maintenance and ownership
 
 Three verbs that **publish** rather than stopping at the working copy, because
