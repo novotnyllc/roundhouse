@@ -10,6 +10,14 @@ if [ "$real_jj_ok" = true ]; then
     mkdir -p "$rjj/bin" "$rjj/vireo" "$rjj/home"
     ln -s "$real_jj" "$rjj/bin/jj"
     ln -s "$real_yq" "$rjj/bin/yq"
+    # Fixture plugins have no live sessions; keep enabled-removal checks off the host.
+    capture_ps=$(command -v ps)
+    cat >"$rjj/bin/ps" <<SH
+#!/bin/sh
+case "\$*" in '-A -o comm='|'-A -ww -o command=') exit 0 ;; esac
+exec "$capture_ps" "\$@"
+SH
+    chmod +x "$rjj/bin/ps"
     export PATH="$rjj/bin:$tmp/bin:$PATH"
     export HOME="$rjj/home" XDG_CONFIG_HOME="$rjj/xdg" JJ_CONFIG="$rjj/jj.toml"
     cat >"$JJ_CONFIG" <<'TOML'
@@ -181,28 +189,41 @@ JSONL
     jq '.["keeper@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
       mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
 
-    # A failed listing cannot expose a pre-pass owner disable to a fleet removal.
-    jq -e '.["claude:keeper@test-market"] == {value:"enabled"}' "$baseline" >/dev/null ||
-      fail "unknown-inventory removal did not start from agreed enabled"
-    capture_owner_install keeper@test-market
-    printf '%s\n' '{"enabledPlugins":{"keeper@test-market":false}}' >"$settings"
-    yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
+    # Failed inventory must defer store changes when the owner changed first.
+    mkdir -p "$rjj/unknown-change"
+    capture_unknown_prepare() {
+      ROUNDHOUSE_SEED_SNAPSHOT="$rjj/failed.jsonl" capture_lib fleet_capture_pass_prepare \
+        "$store" vireo "$(capture_lib fleet_run_desired "$store" vireo)" \
+        true true "$rjj/unknown-change" "$store"
+    }
     capture_lib fleet_capture_observe "$rjj/failed.jsonl" |
       jq -e '.claude == null' >/dev/null || fail "failed listing was not unknown"
-    printf 'capture regression: agreed enabled, store absent, readable owner state disabled, Claude inventory null\n'
-    : >"$CLAUDE_PLUGIN_ACTION_LOG"
-    ROUNDHOUSE_SEED_SNAPSHOT="$rjj/failed.jsonl" capture_pass unknown-inventory-fleet-removal
-    if grep -Fqx 'uninstall keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG"; then
-      cat "$CLAUDE_PLUGIN_ACTION_LOG" >&2
-      fail "unknown inventory let a fleet removal overwrite the owner's pre-pass disable"
-    fi
-    mkdir -p "$rjj/unknown-removal"
-    ROUNDHOUSE_SEED_SNAPSHOT="$rjj/failed.jsonl" capture_lib fleet_capture_pass_prepare \
-      "$store" vireo "$(capture_lib fleet_run_desired "$store" vireo)" \
-      true true "$rjj/unknown-removal" "$store"
-    grep -Fqx plugins.keeper "$rjj/unknown-removal/capture-skip" ||
-      fail "unknown inventory did not hold the fleet-removed plugin in capture-skip"
-    yq -i '.plugins.keeper.state = "enabled"' "$store/fleet/capture-probe.yaml"
+    for owner_change in settings-and-cli cli-only uninstall; do
+      jq -e '.["claude:keeper@test-market"] == {value:"enabled"}' "$baseline" >/dev/null ||
+        fail "unknown-inventory $owner_change did not start from agreed enabled"
+      capture_owner_install keeper@test-market
+      printf '%s\n' '{"enabledPlugins":{"keeper@test-market":true}}' >"$settings"
+      case $owner_change in
+        settings-and-cli)
+          printf '%s\n' '{"enabledPlugins":{"keeper@test-market":false}}' >"$settings" ;;
+        cli-only) : ;;
+        uninstall) capture_owner_remove keeper@test-market ;;
+      esac
+      store_state=absent
+      [ "$owner_change" != uninstall ] || store_state=disabled
+      yq -i ".plugins.keeper.state = \"$store_state\"" "$store/fleet/capture-probe.yaml"
+      capture_unknown_prepare
+      grep -Fqx plugins.keeper "$rjj/unknown-change/capture-skip" ||
+        fail "unknown inventory did not hold $owner_change in capture-skip"
+      : >"$CLAUDE_PLUGIN_ACTION_LOG"
+      ROUNDHOUSE_SEED_SNAPSHOT="$rjj/failed.jsonl" capture_pass "unknown-inventory-$owner_change"
+      if grep -Eq '^(uninstall|install|disable) keeper@test-market$' "$CLAUDE_PLUGIN_ACTION_LOG"; then
+        cat "$CLAUDE_PLUGIN_ACTION_LOG" >&2
+        fail "unknown inventory let a store change overwrite owner $owner_change"
+      fi
+      yq -i '.plugins.keeper.state = "enabled"' "$store/fleet/capture-probe.yaml"
+    done
+    capture_owner_install keeper@test-market
     jq '.["keeper@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
       mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
     printf '{}\n' >"$settings"
@@ -237,6 +258,25 @@ JSONL
     jq -e '(.plugins | has("ponytail@test-market")) | not' "$installed" >/dev/null ||
       fail "the discarded install stayed installed"
     [ ! -e "${baseline%/*}/agent-discard.json" ] || fail "agreed discard was not consumed"
+
+    # Store changes still act with failed inventory when all pre-pass records agree.
+    printf '%s\n' '{"enabledPlugins":{"keeper@test-market":true}}' >"$settings"
+    yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
+    capture_unknown_prepare
+    if grep -Fqx plugins.keeper "$rjj/unknown-change/capture-skip"; then
+      fail "unknown inventory held a store change despite unchanged owner records"
+    fi
+    : >"$CLAUDE_PLUGIN_ACTION_LOG"
+    ROUNDHOUSE_SEED_SNAPSHOT="$rjj/failed.jsonl" capture_pass unknown-inventory-unchanged-owner
+    grep -Fqx 'uninstall keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" || {
+      cat "$rjj/pass.log" >&2
+      fail "unknown inventory blocked the unchanged owner's fleet removal"
+    }
+    yq -i '.plugins.keeper.state = "enabled"' "$store/fleet/capture-probe.yaml"
+    capture_owner_install keeper@test-market
+    jq '.["keeper@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
+      mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
+    printf '{}\n' >"$settings"
     fi
 
     if section_part 2; then

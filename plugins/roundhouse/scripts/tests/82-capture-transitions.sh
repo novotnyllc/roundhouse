@@ -33,8 +33,11 @@ if [ -n "$fleet_fixture_yq" ]; then
     fleet_run_claude_desktop_running() { return 1; }
     bounded_query() { printf '{"configured":[]}\n'; }
     bounded_verb() {
+      printf '%s\n' "$3" >>"$capture/actions"
       case $3 in
-        uninstall) rm -f "$capture/state" ;;
+        uninstall)
+          [ "${uninstall_behavior:-uninstall}" != fail ] || return 1
+          rm -f "$capture/state" ;;
         install)
           case ${install_behavior:-install} in
             install) printf 'true\n' >"$capture/state" ;;
@@ -71,6 +74,44 @@ if [ -n "$fleet_fixture_yq" ]; then
       jq -e '.to == "absent" and (has("via") | not)' "$marker" >/dev/null ||
         fail "reinstall recorded a transition it did not reach"
     done
+
+    # A failed uninstall that leaves the plugin cannot own a later owner removal.
+    (
+      rm -f "$marker"
+      printf 'true\n' >"$capture/state"
+      uninstall_behavior=fail
+      install_behavior=install
+      fleet_run_plugin_refreshed=
+      reinstall_status=0
+      : >"$capture/actions"
+      fleet_run_plugin_reinstall demo@m previous >/dev/null 2>&1 || reinstall_status=$?
+      grep -Fqx uninstall "$capture/actions" || fail "reinstall did not attempt uninstall"
+      [ "$reinstall_status" = 1 ] && [ "$(cat "$capture/state")" = true ] ||
+        fail "failed uninstall did not leave the plugin installed with failure status"
+      [ ! -e "$marker" ] || fail "failed uninstall left an absent transition marker"
+
+      rm "$capture/state"
+      mkdir -p "$capture/pass" "$(fleet_run_state_dir)"
+      printf '%s\n' '{"_initialized":{"claude":true},"claude:demo@m":{"value":"enabled"}}' \
+        >"$(fleet_run_state_dir)/agent-baseline.json"
+      # The anchor distinguishes an authoritative removal from a wiped inventory.
+      fleet_capture_collect() {
+        printf '%s\n' '{"claude":{"anchor@m":{"value":"enabled","marketplace":"m"}}}'
+      }
+      fleet_capture_pass_prepare "$ROUNDHOUSE_FLEET_STORE" mac \
+        '{"plugins":{"demo":{"state":"enabled","marketplace":"m"}}}' \
+        true true "$capture/pass" "$ROUNDHOUSE_FLEET_STORE" >"$capture/pass.log"
+      [ "$fleet_capture_authoritative" = true ] || fail "owner removal pass was not authoritative"
+      : >"$capture/actions"
+      if ! grep -Fqx plugins.demo "$capture/pass/capture-skip"; then
+        transition_apply enabled 0
+      fi
+      [ ! -e "$capture/state" ] && ! grep -Fqx install "$capture/actions" ||
+        fail "the next pass reinstalled the plugin the owner removed"
+      assert_contains "$(cat "$capture/pass.log")" 'claude:demo@m removed locally'
+      grep -Fqx plugins.demo "$capture/pass/capture-skip" ||
+        fail "the next pass did not hold the owner's removal after a failed uninstall"
+    )
 
     # An install can retain the disabled state even when its CLI exit is nonzero.
     for install_behavior in disabled disabled-error; do

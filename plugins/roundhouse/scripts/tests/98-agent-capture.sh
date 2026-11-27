@@ -185,7 +185,7 @@ JSONL
       true true "$rh_capture_tmp"
     jq -e 'keys == ["plugins.ambiguous", "plugins.capped", "plugins.keeper", "plugins.retired", "plugins.uncertain", "plugins.untouched"]' \
       <<<"$fleet_capture_skip" >/dev/null ||
-      fail "an unavailable listing did not hold every store-managed plugin, including the fleet-changed keeper"
+      fail "an unavailable listing did not hold unchanged store values and the changed keeper without agreed pre-pass evidence"
 
     sed 's/"scope":"user"/"scope":"project"/' "$rh_capture_root/inventory.jsonl" >"$rh_capture_root/project.jsonl"
     fleet_capture_observe "$rh_capture_root/project.jsonl" | jq -e '.claude == null' >/dev/null ||
@@ -244,6 +244,25 @@ JSONL
         fail "publish recovery advanced agreement against the wrong desired tree"
       [ -e "$(fleet_agent_pending_path claude:keeper@m)" ] && [ -e "$rh_capture_dir/retry-owed" ] ||
         fail "publish recovery cleared a marker or failed to request a fresh pass"
+    )
+
+    (
+      # Explicit settings false must not mask an owner enable in the live CLI.
+      printf '%s\n' '{"plugins":{"keeper@m":[{"scope":"user"}]}}' >"$rh_registry"
+      printf '%s\n' '{"enabledPlugins":{"keeper@m":false}}' >"$CLAUDE_CONFIG_DIR/settings.json"
+      fleet_capture_before_records=$(fleet_capture_guard_records)
+      fleet_capture_before_observed='{"claude":{"keeper@m":{"value":"disabled","marketplace":"m"}}}'
+      fleet_capture_race_holds='[]'
+      rh_manager_state=false
+      fleet_run_plugin_enabled() { printf '%s\n' "$rh_manager_state"; }
+      fleet_capture_guard_destructive keeper@m >"$rh_capture_root/guard.log" ||
+        fail "unchanged disabled manager and settings did not pass the destructive guard"
+      [ ! -s "$rh_capture_root/guard.log" ] || fail "unchanged state printed a deferral"
+      rh_manager_state=true
+      rh_status=0
+      fleet_capture_guard_destructive keeper@m >"$rh_capture_root/guard.log" || rh_status=$?
+      [ "$rh_status" -ne 0 ] || fail "settings false masked an owner enable in the live CLI"
+      assert_contains "$(cat "$rh_capture_root/guard.log")" 'defer keeper@m'
     )
 
     (

@@ -52,7 +52,7 @@ if [ -n "$fleet_fixture_yq" ]; then
     '{"claude":{"untouched@test-market":{"value":"enabled","user_scope":true}}}' \
     '{"claude":null,"retry":true}'; do
     printf '%s\n' '{"plugins":{}}' >"$registry"
-    printf '%s\n' '{}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
+    printf '%s\n' '{"untouched@test-market":true}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
     printf '%s\n' '{"enabledPlugins":{"untouched@test-market":true}}' >"$CLAUDE_CONFIG_DIR/settings.json"
     race_install untouched@test-market
     race_prepare '{"plugins":{"late":{"state":"absent","marketplace":"test-market"}}}'

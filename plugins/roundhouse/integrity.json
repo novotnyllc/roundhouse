@@ -122,7 +122,7 @@
     },
     {
       "path": "scripts/lib/fleet-capture-pass.sh",
-      "sha256": "aa98e3f01aa7e69b0adaae9377bd8e1f5e496f56c91fb9c3cdcd29d8712ebf01"
+      "sha256": "0b06882443ee09bdf80d5a8b60c76291d2631d0aeb702ba6e56d0b89709a03fa"
     },
     {
       "path": "scripts/lib/fleet-capture.sh",
@@ -166,7 +166,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "84325cb4ae657987bedb626fee8690eddf1c992f029fc1110c06c3430cf9d5a6"
+      "sha256": "4f05d744f1fffd3bf248f29ca11e4cf7472335a52794a73d62fec55d77dc2c97"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -322,7 +322,7 @@
     },
     {
       "path": "skills/fleet-agents/SKILL.md",
-      "sha256": "1eec48c2bac54c25503f002166f7e4750bc7ccd721109110cbd06e86321ae39c"
+      "sha256": "f1ca03a06720ea46f7917ffec09a032ff747363c508bf9d01814792e5f06dc73"
     },
     {
       "path": "skills/fleet-agents/agents/openai.yaml",
