@@ -106,9 +106,10 @@ if [ -n "$fleet_fixture_yq" ]; then
   # Drop the healthy scan's unpublished fixture alert to exercise discard
   # during the outage, where only the recorded physical ID is available.
   rm -f "$store/alerts/mac/$(fleet_alert_name agent-local-change agent-local-change plugins.late)"
-  if fleet_discard_command claude:late@wrong-market >/dev/null 2>&1; then
-    fail "a race discard accepted the wrong marketplace"
-  fi
+  discard_status=0
+  fleet_discard_command claude:late@wrong-market >/dev/null 2>&1 || discard_status=$?
+  [ "$discard_status" -eq 65 ] || fail "a race discard did not reject the wrong marketplace"
+  [ ! -e "$(fleet_lock_path)" ] || fail "the rejected discard did not release the run lock"
   fleet_discard_command plugins.late >/dev/null || fail "could not discard the recorded race"
   jq -e '. == {"claude:late@test-market":true}' "$(fleet_run_state_dir)/agent-discard.json" >/dev/null ||
     fail "a race discard was not bound to the observed physical ID"

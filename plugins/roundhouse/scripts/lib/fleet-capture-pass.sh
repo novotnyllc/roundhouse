@@ -16,6 +16,10 @@ fleet_capture_claude_update() {
   local id=$1 marker rc=0
   shift
   marker=$(fleet_agent_pending_path "claude:$id") || return 75
+  if [ -f "$marker" ] && [ ! -L "$marker" ]; then
+    "$@"
+    return $?
+  fi
   fleet_capture_mark_claude "$id" unchanged unchanged || return 75
   "$@" || rc=$?
   rm -f "$marker" || return 75
@@ -334,7 +338,7 @@ fleet_capture_race_held() {
 
 fleet_capture_guard_destructive() {
   # Standalone supervised operations have no fleet-run observation to compare.
-  local expected=${2:-} initial=${3:-unknown} changed
+  local expected=${2:-} initial=${3:-unknown} comparison
   fleet_capture_guard_current=
   [ -n "${fleet_capture_before_records:-}" ] || return 0
   if fleet_capture_race_held "$1"; then
@@ -346,17 +350,24 @@ fleet_capture_guard_destructive() {
       "$fleet_capture_before_observed") || return 1
   fi
   fleet_capture_guard_current=$(fleet_capture_guard_live "$1") || return 1
-  changed=$(jq -r --argjson before "$expected" --arg initial "$initial" '
+  comparison=$(jq -r --argjson before "$expected" --arg initial "$initial" '
     def changed($old): . != null and $old != null and . != $old;
-    (.installed | changed($before.installed)) or (.settings | changed($before.settings)) or
+    if (.installed | changed($before.installed)) or (.settings | changed($before.settings)) or
       (if $before.state == "unknown" then
         $initial != "unknown" and .manager_state != "unknown" and .manager_state != $initial
       else .state != "unknown" and .state != $before.state end)
+    then "changed"
+    elif (.installed != null and $before.installed != null) or
+      (.state != "unknown" and $before.state != "unknown") then "stable"
+    else "unobserved" end
   ' <<<"$fleet_capture_guard_current") || return 1
-  if [ "$changed" = true ]; then
+  if [ "$comparison" = changed ]; then
     fleet_capture_guard_remember "$1" "$expected" "$initial" ||
       printf 'roundhouse: could not remember the previous Claude observation for %s\n' "$1" >&2
     printf '  defer %s — its Claude observation changed during this pass\n' "$1"
+    return 1
+  elif [ "$comparison" = unobserved ]; then
+    printf '  defer %s — no comparable Claude observation for this pass\n' "$1"
     return 1
   fi
 }

@@ -64,25 +64,25 @@ fleet_discard_command() (
   # Discard only authorizes convergence; it writes host-local state, never the store.
   fleet_run_env
   require_jq
-  local key=$1 dir lock nonce status=0 decisions item kind alert held=false physical= physical_hash=
+  local key=$1 dir status=0 decisions item kind alert held=false physical= physical_hash=
   [[ $key =~ ^(plugins\.[A-Za-z0-9_-][A-Za-z0-9._-]*(@[A-Za-z0-9_-][A-Za-z0-9._-]*)?|claude:[A-Za-z0-9_-][A-Za-z0-9._-]*@[A-Za-z0-9_-][A-Za-z0-9._-]*)$ ]] || {
     printf 'roundhouse: %s is not a Claude plugin item\n' "$key" >&2
     exit 64
   }
-  lock=$(fleet_lock_path)
-  mkdir -p "${lock%/*}" || exit 75
-  fleet_lock_take "$lock" "$(fleet_run_stale_after "$(fleet_store_path)" "$(fleet_host_name)")" || status=$?
+  discard_lock=$(fleet_lock_path)
+  mkdir -p "${discard_lock%/*}" || exit 75
+  fleet_lock_take "$discard_lock" "$(fleet_run_stale_after "$(fleet_store_path)" "$(fleet_host_name)")" || status=$?
   case $status in
     0 | 11) ;;
-    10) printf 'roundhouse: a fleet run holds %s; retry discard when it finishes\n' "$lock" >&2; exit 75 ;;
+    10) printf 'roundhouse: a fleet run holds %s; retry discard when it finishes\n' "$discard_lock" >&2; exit 75 ;;
     *) exit "$status" ;;
   esac
-  nonce=$fleet_lock_nonce_held
-  trap 'fleet_lock_release "$lock" "$nonce" || :' EXIT
+  # Bash 3.2 drops function locals before an explicit exit runs this trap.
+  discard_nonce=$fleet_lock_nonce_held
+  trap 'fleet_lock_release "$discard_lock" "$discard_nonce" || :' EXIT
   fleet_lock_signals_exit
   # A typo must not authorize convergence of an unrelated future local edit.
-  key=${key#claude:}
-  key=${key#plugins.}
+  case $key in claude:*) key=${key#claude:} ;; plugins.*) key=${key#plugins.} ;; esac
   case $key in *@*) physical=claude:$key ;; esac
   [ -z "$physical" ] || physical_hash="claude:sha256:$(printf '%s' "$physical" | sha256_stream | sed 's/.\{16\}/&-/g;s/-$//')"
   for item in "plugins.$key" "plugins.${key%@*}"; do

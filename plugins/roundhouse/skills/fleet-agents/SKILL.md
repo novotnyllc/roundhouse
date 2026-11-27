@@ -268,8 +268,11 @@ roundhouse fleet-lock / fleet-unlock     # the run-lock, by hand
 
 `roundhouse fleet-discard ITEM` is host-local: it clears a Claude plugin hold
 by authorizing the next pass to converge to the store. It writes no store data.
-Unmarked local plugin changes and conflicts are held and reported by the run
-and `fleet-doctor` until the store agrees or the owner discards the change.
+With an authoritative Claude `plugin_manager` listing whose plugin row count
+matches, unmarked local user-scope plugin changes and conflicts are held and reported by
+the run and `fleet-doctor` until the store agrees or the owner discards the
+change. An unreadable, partial, failed or wiped listing is unknown: it places
+no new hold, and destructive removals require usable pre-pass evidence.
 
 Two rules make this surface safe, and neither is a formality:
 

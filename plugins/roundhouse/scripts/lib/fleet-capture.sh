@@ -278,6 +278,9 @@ fleet_capture_rebaseline() {
       if $r.ours == $r.theirs then
         .[$r.id // $r.item] = {value:$r.theirs} |
         if $r.id != null then del(.[$r.item]) else . end
+      elif $r.id != null and $r.theirs != "missing" and $r.base == null and
+        $initialized[$r.harness] != true and authoritative($observed; $base; $r.harness) then
+        .[$r.id] = {value:$r.ours}
       elif $r.id == null or $r.theirs != "missing" then .
       elif $r.ours != "absent" and
         ($initialized[$r.harness] != true or $r.base != null or ($discard | index($r.id)) != null) then

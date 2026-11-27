@@ -1,5 +1,6 @@
 # roundhouse self-check — plugin ownership through a signed fixture fleet pass.
 # Reuses the fixture manager commands from 07 and the local jj remote from 90.
+# roundhouse-test: parts=2
 # shellcheck shell=bash
 
 if [ "$real_jj_ok" = true ]; then
@@ -133,6 +134,7 @@ YAML
       fail "the silent first pass reported a local change"
     fi
     capture_layer >"$rjj/before-layer.yaml"
+    if section_part 1; then
     before_hold=$(capture_remote rev-parse main)
 
     capture_owner_install ponytail@test-market
@@ -191,7 +193,9 @@ JSONL
     jq -e '(.plugins | has("ponytail@test-market")) | not' "$installed" >/dev/null ||
       fail "the discarded install stayed installed"
     [ ! -e "${baseline%/*}/agent-discard.json" ] || fail "agreed discard was not consumed"
+    fi
 
+    if section_part 2; then
     # An interrupted Roundhouse mutation may leave a state change and marker.
     capture_lib fleet_agent_pending_mark claude claude-example@test-market enabled disabled
     marker=$(capture_lib fleet_agent_pending_path claude:claude-example@test-market)
@@ -243,6 +247,8 @@ JSONL
     [ ! -e "${baseline%/*}/agent-discard.json" ] ||
       fail "an authoritatively disappeared unmanaged plugin stranded its discard"
     [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "discard mutated a disappeared plugin"
+    fi
+
     printf 'real-jj: OK (silent baseline, guarded local changes, discard, and agreement)\n'
   )
 else

@@ -1731,6 +1731,47 @@ fleet_run_plugin_enabled() {
   printf '%s\n' "$fleet_run_plugin_state"
 }
 
+fleet_run_plugin_pending_origin() {
+  local pending
+  pending=$(fleet_capture_json_read "$2" '{}') || return 75
+  jq -r --arg id "$1" --arg current "$3" '
+    if .id == $id and ($current | IN("enabled","disabled","absent")) and
+      (.to == $current or .via == $current) then .from
+    elif $current != "" then $current else "unknown" end' <<<"$pending"
+}
+
+fleet_run_plugin_set_state() {
+  local id=$1 before=$2 want=$3 via=$4 marker_id marker= from after target verb
+  case $want in true) target=enabled; verb=enable ;; false) target=disabled; verb=disable ;; esac
+  if [ "$before" != "$want" ]; then
+    case $before in true) via=enabled ;; false) via=disabled ;; esac
+    marker_id="claude:$id"
+    case $id in *@*) ;; *) marker_id="$marker_id@__unqualified__" ;; esac
+    marker=$(fleet_agent_pending_path "$marker_id") || return 75
+    # Keep the origin of an install or a prior attempt that reached this state.
+    from=$(fleet_run_plugin_pending_origin "$marker_id" "$marker" "$via") || return 75
+    [ "$from" != "$via" ] || via=
+    fleet_capture_mark_claude "$id" "$from" "$target" "$via" || return 75
+  fi
+  fleet_run_cli_invalidate
+  bounded_verb claude plugin "$verb" "$id" --scope user >/dev/null 2>&1 || :
+  after=$(fleet_run_plugin_enabled "$id") || return $?
+  if [ "$after" = "$want" ]; then
+    if [ -n "$marker" ] && [ -n "$via" ]; then
+      fleet_capture_mark_claude "$id" "$from" "$target" || return 75
+    fi
+    return 0
+  fi
+  if [ -n "$marker" ] && [ "$after" = "$before" ]; then
+    if [ -n "$via" ]; then
+      fleet_capture_mark_claude "$id" "$from" "$via" || return 75
+    else
+      rm -f "$marker" || return 75
+    fi
+  fi
+  return 74
+}
+
 fleet_run_codex_sync_ready() {
   # A sync that Codex gave up on cannot settle any plugin from that market
   # this pass. Skip its per-plugin listings rather than pay each timeout.
@@ -2713,7 +2754,7 @@ EOF
       fleet_run_want_enabled=false
       [ "$fleet_run_item_state" = enabled ] && fleet_run_want_enabled=true
       fleet_run_plugin_mutated=false
-      local capture_expected= capture_before_install=
+      local capture_expected= capture_before_install= capture_pre_status=0
       fleet_run_plugin_mark_from=unknown
       fleet_run_plugin_mark_via=
       fleet_run_resolved_sha=
@@ -2835,9 +2876,11 @@ EOF
           capture_before_install=$fleet_capture_guard_current
         fi
         fleet_run_cli_invalidate
-        fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" enabled || return 75
+        if [ "$fleet_run_plugin_mark_from" != true ]; then
+          fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" enabled || return 75
+          fleet_run_plugin_mark_via=enabled
+        fi
         bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
-        fleet_run_plugin_mark_via=enabled
         # As above: seal what the manager wrote before approving its hooks.
         plugin_cache_seal_permissions "$fleet_run_id" || return 75
         if [ "$fleet_run_want_enabled" = true ]; then
@@ -2854,46 +2897,33 @@ EOF
       # State-verb status is not convergence: read it before attempting the
       # verb. A no-op enable is not an enable operation, and must not turn a
       # locally modified Codex hook into a newly trusted hook on every pass.
-      # A fresh install/update has already gone through the identity and hook
-      # gates, but some native managers do not expose the state row until the
-      # first state verb. In that case the verb result is the transition proof.
+      # Some managers do not expose the state row until the first state verb
+      # after install/update. Still try the verb and verify its post-state.
       fleet_run_enable_attempted=false
-      fleet_run_enable_status=125
-      fleet_run_before_enabled=unknown
-      [ "$fleet_run_plugin_mutated" = true ] || {
-        fleet_run_before_enabled=$(fleet_run_plugin_enabled "$fleet_run_id" true) ||
-          return $?
-        fleet_run_plugin_mark_from=$fleet_run_before_enabled
+      fleet_run_before_enabled=$(fleet_run_plugin_enabled "$fleet_run_id" true) || {
+        capture_pre_status=$?
+        [ "$fleet_run_plugin_mutated" = true ] || return "$capture_pre_status"
+        fleet_run_before_enabled=unknown
       }
-      if [ "$fleet_run_want_enabled" = true ]; then
-        if [ "$fleet_run_plugin_mutated" = true ] ||
-          [ "$fleet_run_before_enabled" != true ]; then
-          fleet_run_enable_attempted=true
-          fleet_run_enable_status=0
-          fleet_run_cli_invalidate
-          fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" enabled || return 75
-          bounded_verb claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1 ||
-            fleet_run_enable_status=$?
-        fi
-      else
-        fleet_run_want_enabled=false
+      if [ -n "$fleet_run_plugin_mark_via" ] && [ "$fleet_run_before_enabled" = false ]; then
+        fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" disabled || return 75
+      fi
+      if [ "$fleet_run_want_enabled" = false ]; then
         # A disabled item owes Codex no hook approval: drop any debt an
         # enabled one left (fleet_run_codex_hooks_scoped).
         rm -f "$(fleet_run_codex_hooks_owed_path "$4")"
-        if [ "$fleet_run_plugin_mutated" = true ] ||
-          [ "$fleet_run_before_enabled" != false ]; then
-          fleet_capture_guard_destructive "$fleet_run_id" "$capture_expected" || return 74
-          fleet_run_cli_invalidate
-          # An interruption before disable may leave the enable from our install.
-          fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" disabled \
-            "$fleet_run_plugin_mark_via" || return 75
-          bounded_verb claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
-        fi
       fi
-      fleet_run_actual_enabled=$(fleet_run_plugin_enabled "$fleet_run_id") || return $?
-      [ "$fleet_run_actual_enabled" = "$fleet_run_want_enabled" ] || return 74
-      if [ "$fleet_run_want_enabled" = false ] && [ -n "$fleet_run_plugin_mark_via" ]; then
-        fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" disabled || return 75
+      if [ "$fleet_run_plugin_mutated" = true ] ||
+        [ "$fleet_run_before_enabled" != "$fleet_run_want_enabled" ]; then
+        if [ "$fleet_run_want_enabled" = false ]; then
+          fleet_capture_guard_destructive "$fleet_run_id" "$capture_expected" || return 74
+        fi
+        fleet_run_plugin_set_state "$fleet_run_id" "$fleet_run_before_enabled" \
+          "$fleet_run_want_enabled" "$fleet_run_plugin_mark_via" || return $?
+        fleet_run_enable_attempted=$fleet_run_want_enabled
+      else
+        fleet_run_actual_enabled=$(fleet_run_plugin_enabled "$fleet_run_id") || return $?
+        [ "$fleet_run_actual_enabled" = "$fleet_run_want_enabled" ] || return 74
       fi
       # Approval follows the verified post-state, not the manager's exit code.
       # Some native managers write enabled state and then return nonzero; the
@@ -2901,8 +2931,7 @@ EOF
       # approval above covers byte changes; a steady-state enable is not a
       # mutation and must not launder a locally modified hook.
       if [ "$fleet_run_want_enabled" = true ] &&
-        [ "$fleet_run_enable_attempted" = true ] &&
-        [ "$fleet_run_actual_enabled" = true ]; then
+        [ "$fleet_run_enable_attempted" = true ]; then
         fleet_run_cxs=0
         fleet_run_approve_plugin_hooks "$fleet_run_id" \
           "${fleet_run_resolved_sha:-}" || fleet_run_cxs=$?
@@ -2913,7 +2942,7 @@ EOF
       # approval an earlier pass could not make — Codex had not synced yet —
       # is retried here, or Claude reads converged and the changed hooks stay
       # untrusted for good (fleet_run_codex_hooks_settled).
-      if [ "$fleet_run_want_enabled" = true ] && [ "$fleet_run_actual_enabled" = true ] &&
+      if [ "$fleet_run_want_enabled" = true ] &&
         [ "$fleet_run_plugin_mutated" != true ] && [ "$fleet_run_enable_attempted" != true ]; then
         fleet_run_cxs=0
         fleet_run_codex_hooks_settled "$fleet_run_id" "${fleet_run_resolved_sha:-}" ||
@@ -4585,6 +4614,7 @@ fleet_run_plugin_reinstall() {
   # reinstall: uninstall (keeping the plugin's data) and install again. At
   # most once per plugin per pass (fleet_run_marketplace_repair_reset clears
   # the list). Enabled state is re-converged by the caller's state verbs.
+  local install_status=0 installed state marker
   case " ${fleet_run_plugin_refreshed:-} " in *" $1 "*) return 1 ;; esac
   fleet_run_plugin_refreshed="${fleet_run_plugin_refreshed:-} $1"
   # The uninstall removes the files a running session uses (the tombstone
@@ -4622,18 +4652,28 @@ fleet_run_plugin_reinstall() {
   fleet_capture_guard_destructive "$1" || return 74
   printf 'roundhouse: claude plugin update left %s at %s, not %s; reinstalling it once this pass\n' \
     "$1" "$2" "$fleet_run_resolved_sha" >&2
-  fleet_run_plugin_mark_from=$(fleet_run_plugin_enabled "$1" true) || fleet_run_plugin_mark_from=unknown
+  state=$(fleet_run_plugin_enabled "$1" true) || state=unknown
+  case $state in true) state=enabled ;; false) state=disabled ;; esac
+  marker=$(fleet_agent_pending_path "claude:$1") || return 75
+  fleet_run_plugin_mark_from=$(fleet_run_plugin_pending_origin "claude:$1" "$marker" "$state") || return 75
   fleet_run_cli_invalidate
   fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" absent || return 75
   bounded_verb claude plugin uninstall --scope user --keep-data "$1" >/dev/null 2>&1 || return 1
   fleet_run_cli_invalidate
   fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" enabled absent || return 75
-  bounded_verb claude plugin install "$1" --scope user >/dev/null 2>&1 || {
+  bounded_verb claude plugin install "$1" --scope user >/dev/null 2>&1 || install_status=$?
+  installed=$(fleet_run_installed_plugin "$1") || return 74
+  if [ "$installed" = '{}' ]; then
     fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" absent || return 75
     printf 'roundhouse: reinstalling %s failed after its uninstall; the next pass installs it\n' "$1" >&2
     return 1
-  }
-  fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" enabled || return 75
+  fi
+  state=$(fleet_run_plugin_enabled "$1" true) || state=unknown
+  case $state in
+    true) fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" enabled || return 75 ;;
+    false) fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" disabled || return 75 ;;
+  esac
+  [ "$install_status" -eq 0 ]
 }
 
 fleet_run_apply_held() {

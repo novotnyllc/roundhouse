@@ -47,11 +47,13 @@ MERGE
 plugins:
   keeper: {state: enabled, marketplace: m}
   retired: absent
+  capped: {state: absent, marketplace: m}
   ambiguous: disabled
 YAML
     rh_capture_fold=$(fleet_run_desired "$rh_capture_store" mac)
     rh_capture_ours='{"claude":{
       "keeper@m":{"value":"enabled","marketplace":"m"},
+      "capped@m":{"value":"disabled","marketplace":"m"},
       "extra@m":{"value":"enabled","marketplace":"m"},
       "ambiguous@m":{"value":"enabled","marketplace":"m"},
       "ambiguous@m2":{"value":"disabled","marketplace":"m2"}
@@ -75,10 +77,16 @@ YAML
     fleet_agent_pending_mark claude keeper@m enabled disabled
     fleet_capture_dirty || fail "a pending marker let the fast pass skip re-observation"
     rh_mark=$(fleet_agent_pending_path claude:keeper@m)
+    cp "$rh_mark" "$rh_capture_root/before-update.json"
+    [ "$(fleet_capture_claude_update keeper@m printf 'updated\n')" = updated ] &&
+      cmp "$rh_mark" "$rh_capture_root/before-update.json" ||
+      fail "a version update did not run or replaced a pending state transition"
     rh_capture_changed=$(jq -c '.claude["keeper@m"].value = "disabled"' <<<"$rh_capture_ours")
     fleet_capture_prepare "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true true "$rh_capture_tmp"
     jq -e 'has("plugins.keeper") | not' <<<"$fleet_capture_skip" >/dev/null ||
       fail "a marked plugin difference stopped ordinary convergence"
+    jq -e 'has("plugins.capped") | not' <<<"$fleet_capture_skip" >/dev/null ||
+      fail "an unchanged plugin kept by the first pass's removal cap became an owner edit"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_changed" true
     [ -f "$rh_mark" ] || fail "cleared the marker before agreement"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true
@@ -230,6 +238,21 @@ JSONL
         fail "publish recovery advanced agreement against the wrong desired tree"
       [ -e "$(fleet_agent_pending_path claude:keeper@m)" ] && [ -e "$rh_capture_dir/retry-owed" ] ||
         fail "publish recovery cleared a marker or failed to request a fresh pass"
+    )
+
+    (
+      fleet_capture_collect() { return 1; }
+      fleet_run_plugin_enabled() { printf 'false\n'; }
+      bounded_verb() { : >"$rh_capture_root/uninstall-attempt"; }
+      rh_removal='{"state":"absent","marketplace":"m"}'
+      printf '{unreadable\n' >"$rh_registry"
+      fleet_capture_pass_prepare "$rh_capture_store" mac '{"plugins":{"keeper":"absent"}}' \
+        true true "$rh_capture_tmp" "$rh_capture_store"
+      printf '%s\n' '{"plugins":{"keeper@m":[{"scope":"user"}]}}' >"$rh_registry"
+      rh_status=0
+      fleet_run_uninstall_plugin '{}' plugins.keeper keeper "$rh_removal" || rh_status=$?
+      [ "$rh_status" = 74 ] && [ ! -e "$rh_capture_root/uninstall-attempt" ] ||
+        fail "a later readable registry authorized removal without a pre-pass observation"
     )
   )
 fi

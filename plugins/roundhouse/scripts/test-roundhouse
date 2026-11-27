@@ -703,6 +703,8 @@ if false; then
   . "$script_dir/tests/80-alerts.sh"
   # shellcheck source=tests/81-capture-races.sh
   . "$script_dir/tests/81-capture-races.sh"
+  # shellcheck source=tests/82-capture-transitions.sh
+  . "$script_dir/tests/82-capture-transitions.sh"
   # shellcheck source=tests/83-apply-claude.sh
   . "$script_dir/tests/83-apply-claude.sh"
   # shellcheck source=tests/84-schedule.sh

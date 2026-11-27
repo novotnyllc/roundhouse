@@ -169,6 +169,29 @@ if [ -n "$fleet_fixture_yq" ]; then
           fleet_discard_command "claude:$long_id" >/dev/null
         ) || fail "A7 a bounded qualified report could not be discarded"
       done
+
+      (
+        fleet_run_env() { :; }
+        fleet_host_name() { printf 'mac\n'; }
+        fleet_store_path() { printf '%s\n' "$store"; }
+        fleet_lock_path() { printf '%s\n' "$capture_root/discard.lock"; }
+        fleet_run_stale_after() { printf '600\n'; }
+        fleet_alert_write "$store" mac agent-local-change agent-local-change \
+          'claude:foo@m added locally' plugins.foo@m
+        rm -f "$state_dir/agent-discard.json"
+        status=0
+        fleet_discard_command claude:plugins.foo@m >/dev/null 2>&1 || status=$?
+        [ "$status" = 65 ] && [ ! -e "$state_dir/agent-discard.json" ] ||
+          fail "discard stripped a second prefix and authorized another plugin"
+        [ ! -e "$(fleet_lock_path)" ] || fail "rejected discard leaked its run lock"
+        fleet_alert_write "$store" mac agent-local-change agent-local-change \
+          'claude:plugins.foo@m added locally' plugins.plugins.foo@m
+        for item in claude:plugins.foo@m plugins.plugins.foo@m; do
+          fleet_discard_command "$item" >/dev/null || fail "discard rejected a plugins.-prefixed name"
+          jq -e '. == {"claude:plugins.foo@m":true}' "$state_dir/agent-discard.json" >/dev/null ||
+            fail "discard did not preserve the plugin name's own prefix"
+        done
+      )
     fi
   )
 fi
