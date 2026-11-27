@@ -1,6 +1,6 @@
 ---
 name: mcp-shim
-description: Install, update, or remove a resilient stdio MCP shim in front of a desktop app's HTTP MCP server (Autodesk Fusion, Figma, or any other app/URL), for Claude Code and/or Codex. Use when the user wants to "set up MCP for" a desktop app, register an MCP server that should survive the app being closed, or fix an MCP server that dies when its host app quits.
+description: Install, update, or remove a resilient stdio MCP shim in front of a desktop app's HTTP MCP server (Autodesk Fusion, Figma, or any other app/URL), or a lazy front for a rarely used local stdio MCP server (rea, ...) that starts the real server only on first tool call, for Claude Code and/or Codex. Use when the user wants to "set up MCP for" a desktop app, register an MCP server that should survive the app being closed, fix an MCP server that dies when its host app quits, or stop a heavy local MCP server from starting in every session.
 ---
 
 # MCP Shim
@@ -469,6 +469,103 @@ not block through the roughly one-minute cold start — with a message noting
 the app was just started, to retry shortly, and that a freshly launched app
 may have no active document yet.
 
+## Lazy local stdio server
+
+A different problem from the desktop-app case above, solved by the sibling
+`scripts/mcp-lazy.mjs`: a **local stdio** MCP server (an `npx`/`uvx`
+package or a binary, not an HTTP URL) that is rarely used but heavy.
+Both harnesses spawn every configured stdio server at session start and keep
+it for the whole session; `rea` (`npx -y rea-agents@<ver> mcp`) costs
+~470 MB and 2 processes per session that way while almost never being
+called. The lazy front answers `initialize`, `ping` and the
+`tools/list` / `prompts/list` / `resources/list` /
+`resources/templates/list` calls (every page) from a disk cache and starts
+the real server only on the first other request - in practice the first
+`tools/call` - replaying the client's `initialize` to it first. The model
+sees the identical tool list; only the memory and processes go away until
+a tool is actually used. Measured 2026-10-17 on a Mac Studio, Codex 0.163,
+headless: peak RSS per session 1,286-1,320 MB -> 870-882 MB, rea's
+footprint ~472 MB -> ~37 MB, startup tokens unchanged, a real
+`tools/call` through the front returned the same result as direct.
+
+When to use it: a server you *keep available* but call rarely. Not for a
+server used in most sessions (the first call pays the full cold start, and
+then the server runs anyway), and not for HTTP servers (nothing to spawn) or
+plugin-provided servers (the plugin manifest owns their command; disable or
+replace those instead).
+
+It rides the same launcher as the HTTP shim - `mcp-siding --lazy-stdio`
+dispatches to `mcp-lazy.mjs` - so install the launcher exactly as in
+Install a server (same snippet, same Node 18+ resolver), and never register
+a literal path to either script. Ask the user for the server name and the
+exact real command, and **pin it to one exact version** (`pkg@6.4.0`,
+`tool==0.4.1`): the cache key is the name plus the exact argv, so a version
+bump is a new key and re-records automatically. An unpinned launcher spec
+(`npx pkg`, `pkg@latest`, a `^`/`~` range) is never cached - the front logs
+that on stderr and runs the server eagerly, i.e. no saving and no staleness -
+unless `--allow-unpinned` is passed, which is a deliberate choice to accept a
+stale list until `--refresh`. A bare binary command (not a launcher) is keyed
+on its resolved path, size and mtime as well, so an in-place upgrade also
+re-records.
+
+State the exact command, run it, then verify. Replace the server's existing
+registration (Codex silently overwrites the same name; Claude needs the
+remove first - see Update):
+
+| Harness | Add | Remove (rollback = re-add the original command) |
+| --- | --- | --- |
+| Claude Code | `claude mcp remove <NAME> -s user; claude mcp add <NAME> -s user -- "$LAUNCHER" --lazy-stdio --name <NAME> -- <CMD> <ARGS...>` | `claude mcp remove <NAME> -s user; claude mcp add <NAME> -s user -- <CMD> <ARGS...>` |
+| Codex | `codex mcp add <NAME> -- "$LAUNCHER" --lazy-stdio --name <NAME> -- <CMD> <ARGS...>` | `codex mcp add <NAME> -- <CMD> <ARGS...>` (overwrites in place) |
+
+Example for rea: `<NAME>` = `rea`, `<CMD> <ARGS...>` = `npx -y rea-agents@6.4.0 mcp`.
+Record the original registration (`claude mcp get <NAME>` / `codex mcp get
+<NAME>`) before replacing it, so the rollback re-adds exactly that,
+including any `-e`/`--env` values; carry those env values onto the lazy
+registration as well - the real server inherits the front's environment.
+
+Verify (both harnesses - this probe is real for each, since it runs the
+registered command directly):
+
+```bash
+probe='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'
+# The very first run has no cache: it starts the real server, answers through
+# it, and records the cache once the client is initialized. A one-line probe
+# exits before that, so seed the cache with one real session (open the
+# harness, or run the probe with initialized + tools/list as below).
+printf '%s\n' "$probe" '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' |
+  { cat; sleep 15; } | "$LAUNCHER" --lazy-stdio --name <NAME> -- <CMD> <ARGS...>
+# Then the warm check: answered from cache, stderr must NOT say "starting".
+printf '%s\n' "$probe" | "$LAUNCHER" --lazy-stdio --name <NAME> -- <CMD> <ARGS...>
+```
+
+A valid warm answer is a JSON-RPC result carrying `protocolVersion` and the
+real server's `serverInfo`, with nothing on stderr. Also run `claude mcp get
+<NAME>` (must be `Connected`) / `codex mcp get <NAME>` as usual.
+
+Cache and refresh. Files live in `${XDG_CACHE_HOME:-~/.cache}/mcp-lazy/`
+(`<name>-<argv hash>.json`, mode 600). Besides the automatic re-record on a
+version bump, every lazy start re-reads the lists from the live server and
+rewrites the cache if they changed (stderr: `tool list changed; cache
+refreshed for next session`), so drift heals on the following session. To
+force a re-record now: `"$LAUNCHER" --lazy-stdio --refresh --name <NAME> --
+<CMD> <ARGS...>` (deletes that one entry; the next session runs eagerly once).
+A client asking a different MCP protocol version than the cache was recorded
+with also gets the real server, never a mismatched cached answer.
+
+Fusion: Fusion is an HTTP backend and already gets the equivalent behaviour
+from the desktop-app shim above (cached tool list, app launched only from a
+real `tools/call`). Use `--lazy-stdio` for Fusion only if it is ever exposed
+as a local stdio command instead.
+
+Limits, stated plainly: nothing the real server would push before it starts
+(log or list-changed notifications) reaches the client until the first
+call; client notifications sent before that (e.g. `roots/list_changed`) are
+dropped; environment values are not part of the cache key; native Windows is
+unverified (`npx` there is a `.cmd` shim that `spawn` without a shell cannot
+start - use WSL). Self-check: `node "$SKILL_DIR/../../scripts/mcp-lazy.mjs"
+--selftest` (fake stdio server, temp dirs only).
+
 ## Update
 
 Nothing to re-copy — the resolver picks up a plugin update on the very next
@@ -536,6 +633,7 @@ above) names exactly which paths it checked there.
 
 ```bash
 node "$SKILL_DIR/../../scripts/mcp-siding.mjs" --selftest
+node "$SKILL_DIR/../../scripts/mcp-lazy.mjs" --selftest
 ```
 
 Exercises the shim end to end — parsing, timeouts, caching, recovery,
