@@ -126,7 +126,7 @@
     },
     {
       "path": "scripts/lib/fleet-capture.sh",
-      "sha256": "1e04b7679498d2f830e890dfc67ef4048770846c199ce906e55506c3fbed718e"
+      "sha256": "e218fa986a7211f8943eef6dd7385ad52da9db34c529e80b9b6ac57f91c215fa"
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
