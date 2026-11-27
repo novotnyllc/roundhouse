@@ -26,6 +26,10 @@
 # The window is never shorter than TWO publication windows
 # (2 × heartbeat_publish_hours): a shorter one would alert on every healthy,
 # quiet host between its heartbeats.
+# A machine entry may set the same `liveness_alert_hours` key in config.json
+# to override the store policy for that host only; peers use it when they
+# check that host. Omitted, the policy (and the 12h default) still apply.
+# Store policy `0` still turns the alert off for every host.
 # It reads only the store's own journal, so it works whether or not any other
 # tool (fleet-chezmoi included) is installed.
 #
@@ -118,6 +122,31 @@ fleet_heartbeat_publish() {
     mv -f "$heartbeat_dir/heartbeat.json.next" "$heartbeat_dir/heartbeat.json"
 }
 
+fleet_host_liveness_alert_hours() {
+  # fleet_host_liveness_alert_hours PEER FOLD — this peer's stale-host
+  # window in hours. A positive integer on the peer's config.json entry
+  # (`liveness_alert_hours`, next to `scheduler`) overrides the store
+  # policy; missing config, a missing key, null, or a non-positive value
+  # keeps the policy (default 12). Store policy `0` still disables the
+  # alert for every host, override or not. A positive window is then
+  # clamped to at least 2 × heartbeat_publish_hours.
+  host_liveness_policy=$(fleet_policy_int "$2" liveness_alert_hours)
+  if [ "$host_liveness_policy" -le 0 ] 2>/dev/null; then
+    printf '0\n'
+    return
+  fi
+  host_liveness_hours=$(jq -r --arg h "$1" '
+      try (.machines[$h].liveness_alert_hours
+           | if type == "number" and floor == . and . >= 1
+             then floor | tostring else empty end)
+      catch empty' "$(config_path)" 2>/dev/null) || host_liveness_hours=
+  [ -n "$host_liveness_hours" ] || host_liveness_hours=$host_liveness_policy
+  host_liveness_floor=$(($(fleet_policy_int "$2" heartbeat_publish_hours) * 2))
+  [ "$host_liveness_hours" -ge "$host_liveness_floor" ] 2>/dev/null ||
+    host_liveness_hours=$host_liveness_floor
+  printf '%s\n' "$host_liveness_hours"
+}
+
 fleet_liveness_last_alive() {
   # fleet_liveness_last_alive STORE HOST [SINCE-ISO] -> the newest published
   # `alive` (at or after SINCE when given), exit 0. Exit 1 when there is none;
@@ -138,10 +167,13 @@ fleet_liveness_alerts() {
   #
   # Every OTHER enrolled host — and, when the reviewed roster is readable, only
   # those still in it, so a retired or expired member is not a silent one — is
-  # checked for a published heartbeat inside `liveness_alert_hours`, which is
-  # clamped to at least 2 × heartbeat_publish_hours. A host that has never
-  # journaled is not silent: enrolled-but-never-run is what fleet-doctor's
-  # enrollment rows are for.
+  # checked for a published heartbeat inside that peer's liveness window
+  # (fleet_host_liveness_alert_hours): the store policy `liveness_alert_hours`
+  # (default 12, clamped to at least 2 × heartbeat_publish_hours), or that
+  # peer's config.json override when it sets the same key. A host that has
+  # never journaled is not silent: enrolled-but-never-run is what
+  # fleet-doctor's enrollment rows are for. Store policy `0` turns the scan
+  # off for every host.
   #
   # `stale-host` is a store-scoped CONDITION (lib/fleet-alerts.sh), one keyed
   # alert per peer (`stale-host--<peer>.yaml`): this check raises it while the
@@ -160,11 +192,7 @@ fleet_liveness_alerts() {
   liveness_watch=
   liveness_dir="$1/alerts/$2"
   if [ "$liveness_hours" -gt 0 ] 2>/dev/null; then
-    liveness_floor=$(($(fleet_policy_int "$5" heartbeat_publish_hours) * 2))
-    [ "$liveness_hours" -ge "$liveness_floor" ] || liveness_hours=$liveness_floor
     liveness_now=$(jq -rn --arg at "$6" '$at | fromdateiso8601') || return 1
-    liveness_cutoff=$(jq -rn --argjson e "$((liveness_now - liveness_hours * 3600))" \
-      '$e | todate') || return 1
     while IFS= read -r liveness_peer; do
       [ -n "$liveness_peer" ] && [ "$liveness_peer" != "$2" ] || continue
       if [ -s "${4:-}" ]; then
@@ -173,11 +201,16 @@ fleet_liveness_alerts() {
       fi
       liveness_slug=$(printf '%s' "$liveness_peer" | tr -c 'A-Za-z0-9._-' '-')
       liveness_checked="$liveness_checked$liveness_slug "
+      liveness_hours=$(fleet_host_liveness_alert_hours "$liveness_peer" "$5")
+      liveness_cutoff=$(jq -rn --argjson e "$((liveness_now - liveness_hours * 3600))" \
+        '$e | todate') || return 1
       liveness_status=0
       liveness_seen=$(fleet_liveness_last_alive "$1" "$liveness_peer" \
         "$liveness_cutoff") || liveness_status=$?
       if [ "$liveness_status" -eq 0 ]; then
-        liveness_heard="$liveness_heard$liveness_seen
+        # Include the peer's window so the next-owed instant is
+        # min(heard_at + that peer's window), not a single global span.
+        liveness_heard="$liveness_heard$liveness_seen $liveness_hours
 "
       else
         # Silent or never heard from: what changes either arrives as records.
@@ -214,22 +247,27 @@ fleet_liveness_record() {
   # what the poll floor needs to know when the scan is next owed:
   #
   #   due    the first instant a peer heard from now (HEARD, its newest
-  #          heartbeat per line) ages past the HOURS window; null when none
-  #          was, so time alone owes nothing. The scan compares `at` as a
-  #          string against a whole-second cutoff, so its first 19 characters
-  #          decide the crossing: `…:00.123Z` and `…:00+00:00` age out like
-  #          `…:00Z`. An `at` whose first 19 do not parse is left out; it is
-  #          not a time, and no instant of the clock moves its answer.
+  #          heartbeat per line) ages past its window; null when none was,
+  #          so time alone owes nothing. Each HEARD line is `<iso> [hours]`;
+  #          hours default to HOURS when omitted, so a uniform-window scan
+  #          is unchanged. The scan compares `at` as a string against a
+  #          whole-second cutoff, so its first 19 characters decide the
+  #          crossing: `…:00.123Z` and `…:00+00:00` age out like `…:00Z`.
+  #          An `at` whose first 19 do not parse is left out; it is not a
+  #          time, and no instant of the clock moves its answer.
   #   watch  the peers that were silent or never heard from: their next
   #          journal record is what changes the answer.
   #   base   SCANNED-REV, the commit whose journal the scan read.
   liveness_state_dir=$(fleet_run_state_dir)
   mkdir -p "$liveness_state_dir"
-  jq -cn --arg heard "$1" --arg watch "$2" --argjson span "$(($3 * 3600))" \
+  jq -cn --arg heard "$1" --arg watch "$2" --argjson hours "$3" \
     --arg base "$4" '
-      {due: ([$heard | splits("\n") | select(length > 0)
-              | (try (.[0:19] + "Z" | fromdateiso8601) catch empty)]
-             | if length == 0 then null else min + $span end),
+      {due: ([$heard | splits("\n") | select(length > 0) | split(" ")
+              | . as $f
+              | (try ($f[0][0:19] + "Z" | fromdateiso8601) catch null)
+              | if type != "number" then empty
+                else . + ((($f[1] // $hours) | tonumber) * 3600) end]
+             | if length == 0 then null else min end),
        watch: [$watch | splits("\n") | select(length > 0)],
        base: $base}' >"$liveness_state_dir/liveness.json.next" &&
     mv -f "$liveness_state_dir/liveness.json.next" "$liveness_state_dir/liveness.json"
