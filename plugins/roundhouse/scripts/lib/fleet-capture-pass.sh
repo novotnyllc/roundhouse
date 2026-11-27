@@ -92,7 +92,7 @@ fleet_capture_prepare() {
   local store=$1 host=$2 desired=$3 observed=$4 layers=${8:-$1}
   local dir baseline initialized discard rows fields id item theirs ours base first ambiguous unqualified
   local marker fallback fallback_id from merged direction kind message detail
-  local skip=() discards=()
+  local skip=() discards=() unknown_held=0 inventory_unknown
   fleet_capture_skip='{}'
   fleet_capture_discards='[]'
   fleet_capture_retry_unknown=$(jq -r '.retry == true' <<<"$observed") || return 1
@@ -102,6 +102,8 @@ fleet_capture_prepare() {
   discard=$(fleet_capture_json_read "$dir/agent-discard.json" '{}') || return 1
   fleet_capture_authoritative=$(jq -r --argjson baseline "$baseline" "$fleet_capture_authority_filter"'
     authoritative(.; $baseline; "claude")' <<<"$observed") || return 1
+  # No trustworthy inventory means no evidence for which side changed: make no reverts this pass.
+  inventory_unknown=$(jq -r '.claude == null' <<<"$observed") || return 1
   rows=$(fleet_capture_rows "$layers" "$desired" "$observed" "$baseline") || return 1
   fleet_capture_race_holds=$(jq -c --argjson discard "$discard" '
     [.[] | select(.id != null and .ours == "unobserved" and (.base | objects | .raced == true)) |
@@ -123,7 +125,16 @@ fleet_capture_prepare() {
       printf 'roundhouse: holding %s: malformed plugin state.\n' "$item"
       continue
     fi
-    [ "$ours" != unobserved ] || continue
+    if [ "$ours" = unobserved ]; then
+      # Only a fleet change (store moved away from agreement) may act without an inventory.
+      if [ "$inventory_unknown" = true ] && [ "$theirs" != missing ] &&
+        { [ "$base" = missing ] || [ "${base#ignored:}" = "$theirs" ]; }; then
+        skip+=("$item"$'\t'"$id")
+        unknown_held=$((unknown_held + 1))
+        fleet_capture_retry_unknown=true
+      fi
+      continue
+    fi
     if [ "$ours" = unknown ]; then
       skip+=("$item"$'\t'"$id")
       fleet_capture_retry_unknown=true
@@ -138,6 +149,7 @@ fleet_capture_prepare() {
     done
     [ "$ours" != unresolved ] || continue
     fleet_capture_id_valid "$id" || continue
+    # Roundhouse never holds itself: its own plugin always converges to the fleet.
     [ "$id" != claude:roundhouse@novotnyllc ] || continue
     marker=$(fleet_agent_pending_path "$id") || return 1
     if jq -e --arg id "$id" --arg item "$item" '.[$id] == true or .[$item] == true' \
@@ -145,7 +157,10 @@ fleet_capture_prepare() {
       discards+=("$id" "$item")
       continue
     fi
-    [ "$first" = false ] || continue
+    # A silent first pass still never uninstalls: store-absent but installed is held as added.
+    if [ "$first" = true ] && { [ "$theirs" != absent ] || [ "$ours" = absent ]; }; then
+      continue
+    fi
     from=${base#ignored:}
     [ "$from" != missing ] || from=absent
     ! fleet_agent_pending_matches "$marker" "$id" "$from" "$ours" || continue
@@ -154,7 +169,11 @@ fleet_capture_prepare() {
       fallback=$(fleet_agent_pending_path "$fallback_id") || return 1
       ! fleet_agent_pending_matches "$fallback" "$fallback_id" "$from" "$ours" || continue
     fi
-    merged=$(fleet_merge3 "$base" "$ours" "$theirs") || return 1
+    if [ "$first" = true ]; then
+      merged=local
+    else
+      merged=$(fleet_merge3 "$base" "$ours" "$theirs") || return 1
+    fi
     case $merged in local | conflict) ;; *) continue ;; esac
     case $ours in
       absent) direction=removed ;;
@@ -179,6 +198,9 @@ fleet_capture_prepare() {
     fi
     fleet_alert_raise "$7/alert-ledger" "$store" "$host" "$kind" "$kind" "$detail" "$item" || return 1
   done <<<"$fields"
+  if [ "$unknown_held" -gt 0 ]; then
+    printf 'roundhouse: Claude plugin inventory unavailable; making no plugin reverts this pass (%s items held, retried next pass).\n' "$unknown_held"
+  fi
   if [ "${#skip[@]}" -gt 0 ]; then
     fleet_capture_skip=$(printf '%s\n' "${skip[@]}" | jq -Rn '
       [inputs | split("\t") | {key:.[0],value:(if .[1] == "-" then true else .[1] end)}] | from_entries') ||
