@@ -582,6 +582,15 @@ fleet_vcs_git_conflict_paths() {
 }
 
 fleet_vcs_publish() {
+  fleet_vcs_pushed_target=
+  fleet_vcs_push_uncertain=false
+  local capture_transaction capture_parent capture_push_arg= capture_push_remote=
+  capture_transaction=$(fleet_capture_transaction_path) || return 65
+  if { [ -e "$capture_transaction" ] || [ -L "$capture_transaction" ]; } &&
+    [ "${fleet_capture_active_txn:-}" != "$capture_transaction" ]; then
+    fleet_capture_transaction_hold "$1" "$capture_transaction"
+    return
+  fi
   # §8.2 step 5: fleet_vcs_publish <store> <target>. No conflicted commit is
   # ever pushed; history MAY contain a commit that was conflicted and was
   # resolved in place, which is exactly what step 4 produces.
@@ -648,10 +657,19 @@ fleet_vcs_publish() {
   # this class: auth, network, a no-description refusal and every other rejection
   # stay fail-closed exactly as the guards above intend. `$3 == no-recover` is
   # the internal one-shot guard so the retry cannot itself re-enter the recovery.
-  fleet_vcs_pusherr=$(jj -R "$1" git push --bookmark main 2>&1 >/dev/null) || {
+  if [ -n "${fleet_capture_active_txn:-}" ]; then
+    [ "$(jj --ignore-working-copy -R "$1" log -r 'heads(bookmarks(exact:"main"))' \
+      --no-graph -T commit_id)" = "$2" ] || return 65
+    capture_push_arg=--ignore-working-copy
+    capture_push_remote=origin
+  fi
+  fleet_capture_transaction_target "$2" || return 65
+  fleet_vcs_push_uncertain=true
+  fleet_vcs_pusherr=$(jj -R "$1" git push --bookmark main ${capture_push_arg:+"$capture_push_arg"} ${capture_push_remote:+--remote "$capture_push_remote"} 2>&1 >/dev/null) || {
     fleet_vcs_pushrc=$?
     case $fleet_vcs_pusherr in
       *'stale info'* | *'unexpectedly moved'*)
+        fleet_vcs_push_uncertain=false
         [ "${3:-}" != no-recover ] || {
           printf '%s\n' "$fleet_vcs_pusherr" >&2
           return "$fleet_vcs_pushrc"
@@ -698,8 +716,16 @@ fleet_vcs_publish() {
   # line that keeps the §8.1 invariant true between runs, and it is what
   # preserves fleet-enroll's post-enrollment authorship: @ ends every run
   # empty, described by nothing, and parented on main.
+  fleet_vcs_pushed_target=$2
+  fleet_vcs_push_uncertain=false
   fleet_vcs_reset_rc=0
-  jj -R "$1" new "$2" >/dev/null || fleet_vcs_reset_rc=$?
+  if [ -n "${fleet_capture_active_txn:-}" ]; then
+    # Push already creates the child; snapshot owner saves instead of checking them out.
+    capture_parent=$(jj -R "$1" log -r @- --no-graph -T commit_id) || fleet_vcs_reset_rc=$?
+    [ "$fleet_vcs_reset_rc" -ne 0 ] || [ "$capture_parent" = "$2" ] || fleet_vcs_reset_rc=65
+  else
+    jj -R "$1" new "$2" >/dev/null || fleet_vcs_reset_rc=$?
+  fi
   # §7.12.3: the push SUCCEEDED, so what this host just published becomes the
   # rollback mark. Left at the fetched head, the mark lagged one publication
   # and an origin forked from below this push was accepted. Here, in the one

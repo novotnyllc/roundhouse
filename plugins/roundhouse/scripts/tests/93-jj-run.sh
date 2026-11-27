@@ -692,9 +692,9 @@ p0jj_tombstone() {
   # through the tombstone read, and the installed record names its one
   # marketplace. Disabled, so the live-session deferral does not apply.
   mkdir -p "$HOME/.claude/plugins"
-  printf '{"version":2,"plugins":{"retired@test-market":[{"scope":"user","version":"1.0.0"}]}}\n' \
+  printf '%s\n' '{"version":2,"plugins":{"retired@test-market":[{"scope":"user","version":"1.0.0"}],"claude-example@test-market":[{"scope":"user","version":"1.0.0"}]}}' \
     >"$HOME/.claude/plugins/installed_plugins.json"
-  printf '{"retired@test-market":false}\n' >"$rjj/plugin-enabled.json"
+  printf '{"retired@test-market":false,"claude-example@test-market":true}\n' >"$rjj/plugin-enabled.json"
   : >"$rjj/plugin-actions"
   runjj_dev_group() {
     cat >"$vireo/groups/development.yaml" <<YAML
@@ -710,6 +710,7 @@ YAML
   }
   runjj_tomb_run() {
     runjj vireo env CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_LIST_FROM_RECORDS=1 \
       CLAUDE_PLUGIN_ENABLED_FILE="$rjj/plugin-enabled.json" \
       CLAUDE_PLUGIN_ACTION_LOG="$rjj/plugin-actions" "$cli" fleet-run --fast
   }
@@ -717,6 +718,14 @@ YAML
     grep -rh -A2 'item: plugins.retired' "$vireo/journal/vireo" 2>/dev/null |
       grep -c 'outcome:' || true
   }
+  # This plugin predates the fleet tombstone. Seed the fixture's authoritative
+  # local observation before publishing the tombstone so the unchanged
+  # ignored extra converges to the fleet change.
+  rm -f "$rjj/vireo/store.run/agent-baseline.json"
+  runjj_tomb_run >/dev/null || fail "the initial local plugin observation failed"
+  jq -e '.["claude:retired@test-market"] == {value:"disabled",ignored:true}' \
+    "$rjj/vireo/store.run/agent-baseline.json" >/dev/null ||
+    fail "the local plugin was not observed before the fleet changed its state"
   # Over the cap, the uninstall is a removal like any other and holds.
   runjj_dev_group 0
   runjj_out=$(runjj_tomb_run) || fail "the capped tombstone run failed: $runjj_out"
@@ -1403,6 +1412,7 @@ plugins:
 YAML
   runjj_plugin_env() {
     runjj vireo env CLAUDE_CONFIG_DIR="$HOME/.claude" \
+      CLAUDE_PLUGIN_LIST_FROM_RECORDS=1 \
       CLAUDE_PLUGIN_CATALOG_FILE="$rjj/catalog.json" \
       CLAUDE_PLUGIN_ENABLED_FILE="$rjj/plugin-enabled.json" \
       CLAUDE_PLUGIN_ACTION_LOG="$rjj/plugin-actions" \

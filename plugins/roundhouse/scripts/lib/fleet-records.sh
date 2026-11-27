@@ -159,6 +159,10 @@ fleet_journal_entry_ok() {
         ((.sides // []) | length) == 2 and
         all(.sides[]; (.change | type == "string") and (.host | type == "string")) and
         (.resolution | type == "string")
+      elif $o == "captured" then
+        (.item | type == "string") and (.digest | type == "string") and
+        (.who == "user") and (.host | type == "string") and
+        (.harness == "claude" or .harness == "codex")
       elif ($o == "applied" or $o == "satisfied" or $o == "held" or
             $o == "reverted" or $o == "disowned") then
         # `disowned` is an OWNERSHIP record, not a value one: this host
@@ -744,7 +748,7 @@ fleet_canary_exempt() {
   # non-canary host waited on the canary forever. The removal cap, review,
   # holds and the identity proof all still apply; only the soak is gone.
   case ${1:-} in
-    plugins.* | definitions.plugins.*) return 0 ;;
+    plugins.* | codex_plugins.* | definitions.plugins.*) return 0 ;;
   esac
   return 1
 }

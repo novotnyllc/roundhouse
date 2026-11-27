@@ -713,6 +713,8 @@ if false; then
   . "$script_dir/tests/87-plugin-currency.sh"
   # shellcheck source=tests/88-schedule-windows.sh
   . "$script_dir/tests/88-schedule-windows.sh"
+  # shellcheck source=tests/89-codex-state.sh
+  . "$script_dir/tests/89-codex-state.sh"
   # shellcheck source=tests/90-jj-bootstrap.sh
   . "$script_dir/tests/90-jj-bootstrap.sh"
   # shellcheck source=tests/91-jj-integrity.sh
@@ -729,6 +731,10 @@ if false; then
   . "$script_dir/tests/96-u20-chezmoi-absent.sh"
   # shellcheck source=tests/97-jj-reenrollment.sh
   . "$script_dir/tests/97-jj-reenrollment.sh"
+  # shellcheck source=tests/98-agent-capture.sh
+  . "$script_dir/tests/98-agent-capture.sh"
+  # shellcheck source=tests/99-capture-pass.sh
+  . "$script_dir/tests/99-capture-pass.sh"
 fi
 
 printf 'PASS: roundhouse self-check\n'

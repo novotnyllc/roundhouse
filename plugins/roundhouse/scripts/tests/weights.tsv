@@ -76,3 +76,6 @@ scope:u2-upgrade-rollback-contracts	169
 scope:u4-contracts	278
 scope:u5-contracts	184
 88-schedule-windows	240
+89-codex-state	15
+98-agent-capture	40
+99-capture-pass	30

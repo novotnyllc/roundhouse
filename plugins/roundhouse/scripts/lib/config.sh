@@ -230,6 +230,22 @@ materialize_policy_proposal() (
   validate_privilege_policy_file "$output" "policy proposal for $target"
 )
 
+fleet_agent_schema_jq='
+  def agent_host_facts_valid:
+    (if has("capture") then (.capture | type == "boolean") else true end) and
+    (if has("default_agent_state") then (.default_agent_state | IN("absent","disabled")) else true end);
+  def agent_policy_valid:
+    if type != "object" then true else
+      all(to_entries[] | select(.key | IN("capture_codex","capture_mirror_codex")); .value | type == "boolean") and
+      (if has("max_changes_per_run") then (.max_changes_per_run | type == "number" and . >= 0 and floor == .) else true end) and
+      (if has("max_change_fraction") then (.max_change_fraction | type == "number" and . >= 0 and . <= 1) else true end)
+    end;
+  def codex_plugins_valid:
+    type == "object" and all(to_entries[];
+      (.key | test("^[A-Za-z0-9_-]+([.][A-Za-z0-9_-]+)*@[A-Za-z0-9_-]+$")) and
+      (.value | type == "object" and keys == ["state"] and (.state | IN("enabled","disabled","absent"))));
+'
+
 validate_config_file() {
   require_jq
   path=$(config_path)
@@ -239,7 +255,7 @@ validate_config_file() {
   }
   # npm_jq_grammar (lib/npm.sh) is the shared grammar for package updaters
   # and post-switch hooks.
-  jq -e "${npm_jq_grammar:?}"'
+  jq -e "${npm_jq_grammar:?}${fleet_agent_schema_jq:?}"'
     def valid_capability_provider:
       (.provider | IN("plugin","skills-cli","jsm","manual","plugin-source")) and
       (.source | type == "string" and length > 0) and
@@ -252,6 +268,8 @@ validate_config_file() {
       ((.name // null) == null or (.name | type == "string" and test("^[A-Za-z0-9._-]+$")));
     . as $config |
     .version == 1 and
+    (.policy | agent_policy_valid) and
+    (if has("codex_plugins") then (.codex_plugins | codex_plugins_valid) else true end) and
     ((.worker // null) == null or
       ((.worker | type == "object") and
        (.worker.target | type == "string" and test("^[A-Za-z0-9._-]+$")) and
@@ -288,6 +306,7 @@ validate_config_file() {
     (.machines | length > 0) and
     ([.machines | keys[] | test("^[A-Za-z0-9._-]+$")] | all) and
     ([.machines[] | . as $machine |
+      agent_host_facts_valid and
       (.platform | IN("macos","linux","wsl","windows")) and
       (.transport | IN("local","ssh","codex-remote-control")) and
       ((.codex_host // null) == null or (.codex_host | type == "string" and length > 0)) and

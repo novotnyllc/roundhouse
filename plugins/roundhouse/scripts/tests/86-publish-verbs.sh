@@ -127,5 +127,40 @@ EOF
     fi
     [ -z "$verb_bad" ] || fail "a malformed host file selected: $verb_bad"
     mv "$verb_store/hosts/vireo.yaml.good" "$verb_store/hosts/vireo.yaml"
+
+    # Capture decisions use the real lock and file writer, with jj's readiness
+    # and cleanliness checks stubbed for this file-only fixture.
+    fleet_vcs_store_ready() { [ "$1" = "$verb_store" ]; }
+    fleet_vcs_heads_local() { printf 'one-head\n'; }
+    fleet_run_wc_foreign_paths() { :; }
+    verb_run=$(fleet_run_state_dir)
+    verb_pending="$verb_run/agent-pending-confirm.json"
+    mkdir -p "$verb_run"
+    printf '%s\n' '{"id":"batch-one","confirmed":false,"items":[{"id":"claude:demo@market","item":"plugins.demo","value":"absent"}]}' \
+      >"$verb_pending"
+    if fleet_confirm_command batch-stale >/dev/null 2>&1; then
+      fail "a stale batch ID was confirmed"
+    fi
+    jq -e '.confirmed == false' "$verb_pending" >/dev/null || fail "stale confirmation modified the batch"
+    fleet_confirm_command batch-one >/dev/null || fail "pending capture batch could not be confirmed"
+    jq -e '.confirmed and (.items[0].value == "absent")' "$verb_pending" >/dev/null ||
+      fail "confirmation lost the batch items"
+    [ -f "$verb_run/retry-owed" ] || fail "confirmation let the fast pass skip the batch"
+    fleet_discard_command batch-one >/dev/null || fail "confirmed capture batch could not be discarded"
+    jq -e '.discarded and (.confirmed == false) and (.items | length == 1)' "$verb_pending" >/dev/null ||
+      fail "discard did not retain the items for convergence"
+    if fleet_confirm_command batch-one >/dev/null 2>&1; then
+      fail "confirm revived a discarded batch"
+    fi
+    fleet_take_local_command claude:demo@market >/dev/null || fail "take-local did not queue an item"
+    jq -e '.["claude:demo@market"] == true' "$verb_run/agent-take-local.json" >/dev/null ||
+      fail "take-local did not record the qualified plugin key"
+    fleet_discard_command plugins.demo >/dev/null || fail "discard did not queue an item"
+    jq -e '.["plugins.demo"] == true' "$verb_run/agent-discard.json" >/dev/null ||
+      fail "discard did not record the fleet item key"
+    if fleet_take_local_command '../agent-baseline.json' >/dev/null 2>&1; then
+      fail "take-local accepted a non-plugin item"
+    fi
+    [ ! -e "$(fleet_lock_path)" ] || fail "a capture decision leaked the run lock"
   )
 fi

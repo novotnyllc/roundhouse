@@ -2802,6 +2802,7 @@ if (Test-Section "agents") {
                         $PluginEntry.id -isnot [string] -or [string]::IsNullOrWhiteSpace($PluginEntry.id) -or
                         $PluginEntry.version -isnot [string] -or [string]::IsNullOrWhiteSpace($PluginEntry.version) -or
                         $PluginEntry.enabled -isnot [bool] -or
+                        ($null -ne $PluginEntry.scope -and $PluginEntry.scope -isnot [string]) -or
                         ($null -ne $PluginEntry.installPath -and $PluginEntry.installPath -isnot [string]) -or
                         (
                             $null -ne $PluginEntry.installedAt -and
@@ -2844,6 +2845,7 @@ if (Test-Section "agents") {
                     name = $Name
                     installed_version = Limit-Text $PluginEntry.version
                     enabled = $PluginEntry.enabled
+                    scope = Limit-Text $(if ($Agent -eq "claude") { $PluginEntry.scope } else { $null })
                     path = Limit-Text $(if ($Agent -eq "codex") { $PluginEntry.source.path } else { $PluginEntry.installPath })
                     installed_at = Limit-Text $(if ($Agent -eq "claude") { $PluginEntry.installedAt } else { $null })
                     last_updated = Limit-Text $(if ($Agent -eq "claude") { $PluginEntry.lastUpdated } else { $null })
@@ -3248,7 +3250,7 @@ if (Test-Section "agents") {
             }
             $Key = "$Agent`:$($ActivePlugin.marketplace):$($ActivePlugin.name):$($ActivePlugin.installed_version)"
             $SeenPlugins[$Key] = $true
-            Add-Record -Kind "plugin" -Id $Key -Status "present" -Confidence "high" -Data @{
+            $PluginData = @{
                 agent = $Agent
                 manager_id = Limit-Text $ActivePlugin.manager_id
                 marketplace = Limit-Text $ActivePlugin.marketplace
@@ -3265,7 +3267,10 @@ if (Test-Section "agents") {
                 inferred_installed_at = $InferredInstalledAt
                 inferred_installed_at_evidence = $(if ($null -ne $InferredInstalledAt) { "filesystem_creation_time" } else { $null })
                 inferred_installed_at_confidence = $(if ($null -ne $InferredInstalledAt) { "low" } else { "unknown" })
-            } -Evidence @(@{ source = "manager-cli"; method = "plugin-list-json" })
+            }
+            if ($Agent -eq "claude") { $PluginData.scope = $ActivePlugin.scope }
+            Add-Record -Kind "plugin" -Id $Key -Status "present" -Confidence "high" -Data $PluginData `
+                -Evidence @(@{ source = "manager-cli"; method = "plugin-list-json" })
         }
 
         if (-not (Test-Path -LiteralPath $Cache -PathType Container)) { continue }

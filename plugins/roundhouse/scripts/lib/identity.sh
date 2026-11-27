@@ -438,7 +438,7 @@ fleet_node_path() {
   return 69
 }
 
-codex_plugin_hooks_command() {
+codex_plugin_hooks_command() (
   action=$1
   shift
   plugin_id=$1
@@ -452,5 +452,11 @@ codex_plugin_hooks_command() {
     printf 'roundhouse: Node.js is required for Codex hook approval\n' >&2
     exit 69
   }
-  "$codex_hooks_node" "$script_dir/codex-plugin-hooks.mjs" "$action" "$plugin_id"
-}
+  if [ "$action" = update ]; then
+    fleet_run_lock_plugin_mutation || exit $?
+    fleet_codex_marked_verb "$plugin_id" "$codex_hooks_node" \
+      "$script_dir/codex-plugin-hooks.mjs" "$action" "$plugin_id"
+  else
+    "$codex_hooks_node" "$script_dir/codex-plugin-hooks.mjs" "$action" "$plugin_id"
+  fi
+)

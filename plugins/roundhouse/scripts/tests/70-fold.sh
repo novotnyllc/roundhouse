@@ -118,6 +118,63 @@ YAML
     # The knockout: scoped to <category>.<item>, and never recursive.
     [ "$(printf '%s\n' "$fold_vireo" | jq -r '.plugins | has("legal")')" = false ] ||
       fail "a scalar absent at item position did not knock the item out"
+
+    # The host default applies to future shared entries and existing tombstones.
+    # Both host file shapes can pin a plugin.
+    fold_capture="$tmp/fold/capture"
+    mkdir -p "$fold_capture/fleet" "$fold_capture/hosts/grokbox"
+    cat >"$fold_capture/hosts/grokbox.yaml" <<'YAML'
+platform: linux
+capture: false
+default_agent_state: absent
+plugins:
+  kept: enabled
+YAML
+    cat >"$fold_capture/hosts/grokbox/pins.yaml" <<'YAML'
+codex_plugins:
+  kept@example: {state: enabled}
+YAML
+    cat >"$fold_capture/hosts/disabled-default.yaml" <<'YAML'
+default_agent_state: disabled
+plugins:
+  pinned-absent: absent
+YAML
+    cat >"$fold_capture/fleet/99-canonical-agents.yaml" <<'YAML'
+plugins:
+  mac-add: {state: enabled, marketplace: example}
+  kept: disabled
+  removed: {state: absent, marketplace: example}
+  scalar-remove: absent
+  pinned-absent: enabled
+codex_plugins:
+  mac-add@example: {state: enabled}
+  kept@example: {state: disabled}
+YAML
+    fold_grokbox=$(fleet_fold "$fold_capture" grokbox)
+    printf '%s\n' "$fold_grokbox" | jq -e '
+      .capture == false and .default_agent_state == "absent" and
+      .plugins."mac-add" == {state: "absent", marketplace: "example"} and
+      .plugins.kept == "enabled" and
+      .codex_plugins."mac-add@example".state == "absent" and
+      .codex_plugins."kept@example".state == "enabled"
+    ' >/dev/null || fail "the host default did not respect plugin pins or capture:false"
+    [ -z "$(fleet_unknown_categories "$fold_grokbox")" ] ||
+      fail "new plugin host facts or Codex category were treated as unknown"
+    fleet_fold "$fold_capture" vireo | jq -e '
+      .plugins."mac-add".state == "enabled" and
+      .codex_plugins."mac-add@example".state == "enabled"
+    ' >/dev/null || fail "host defaults leaked to another host"
+    fleet_fold "$fold_capture" disabled-default | jq -e '
+      .plugins."mac-add".state == "disabled" and .plugins.removed.state == "disabled" and
+      .plugins."scalar-remove".state == "disabled" and
+      .codex_plugins."mac-add@example".state == "disabled"
+    ' >/dev/null || fail "a disabled default did not replace every shared plugin state"
+    [ "$(fleet_fold_tombstones "$fold_capture" disabled-default plugins)" = '{"plugins":{"pinned-absent":"absent"}}' ] ||
+      fail "the tombstone reader ignored the disabled host default or the host pin"
+    printf 'default_agent_state: missing\n' >"$fold_capture/hosts/invalid.yaml"
+    if fleet_fold "$fold_capture" invalid >/dev/null 2>&1; then
+      fail "fold accepted an unknown default_agent_state"
+    fi
     [ "$(printf '%s\n' "$fold_vireo" |
       jq -r '.config_files["~/.claude/settings.json"].keys["ui.theme"]')" = absent ] ||
       fail "the knockout pass deleted a legitimate nested string \"absent\""

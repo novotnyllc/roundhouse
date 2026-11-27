@@ -10,6 +10,18 @@ if ROUNDHOUSE_CONFIG="$tmp/invalid-capability-reference.json" \
   "$cli" validate-config >/dev/null 2>&1; then
   fail "capability accepted an unknown auth dependency"
 fi
+jq '
+  .machines["test-host"] += {capture: false, default_agent_state: "absent"} |
+  .policy += {capture_codex: true, capture_mirror_codex: false, max_changes_per_run: 5, max_change_fraction: 0.25} |
+  .codex_plugins["capture-probe@fixture"] = {state: "enabled"}
+' "$tmp/config.json" >"$tmp/agent-capture-config.json"
+ROUNDHOUSE_CONFIG="$tmp/agent-capture-config.json" "$cli" validate-config
+jq '.machines["test-host"].default_agent_state = "missing"' \
+  "$tmp/agent-capture-config.json" >"$tmp/invalid-default-agent-state.json"
+if ROUNDHOUSE_CONFIG="$tmp/invalid-default-agent-state.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "validate-config accepted an unknown default_agent_state"
+fi
 jq '.handoff_project = "missing-project"' \
   "$tmp/config.json" >"$tmp/invalid-handoff-project.json"
 if ROUNDHOUSE_CONFIG="$tmp/invalid-handoff-project.json" \

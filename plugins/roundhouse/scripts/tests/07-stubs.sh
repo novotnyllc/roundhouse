@@ -348,6 +348,14 @@ if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] &&
   if [ -f "\$enabled_file" ]; then
     enabled_ledger=\$(jq -e -c 'if type == "object" then . else error("ledger") end' \
       "\$enabled_file") || { printf '%s\n' '[]'; exit 0; }
+    if [ "\${CLAUDE_PLUGIN_LIST_FROM_RECORDS:-0}" = 1 ]; then
+      jq -c --argjson enabled "\$enabled_ledger" '
+        [.plugins | to_entries[] | .key as \$id | .value[] |
+          {id:\$id, version:.version, scope:.scope,
+           enabled:(\$enabled[\$id] // false), installPath:.installPath}]' \
+        "\$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+      exit \$?
+    fi
     fixed_enabled=\$(printf '%s\n' "\$enabled_ledger" | jq -r --arg id "\$fixed_id" \
       'if has(\$id) then .[\$id] else true end')
     extra=\$(printf '%s\n' "\$enabled_ledger" | jq -c --arg id "\$fixed_id" \
@@ -1169,7 +1177,12 @@ fleet_fixture_tool() {
 }
 fleet_fixture_yq=$(fleet_fixture_tool yq)
 fleet_fixture_path=$PATH
-[ -z "$fleet_fixture_yq" ] || fleet_fixture_path="$(dirname "$fleet_fixture_yq"):$PATH"
+if [ -n "$fleet_fixture_yq" ]; then
+  # Expose yq alone: its real bin directory can shadow fixture agent stubs.
+  mkdir -p "$tmp/yq-only"
+  ln -s "$fleet_fixture_yq" "$tmp/yq-only/yq"
+  fleet_fixture_path="$tmp/yq-only:$PATH"
+fi
 
 # Longer than the 8192-byte setting ceiling 65 and 67 both probe.
 oversized_setting=$(awk 'BEGIN { for (i = 0; i < 8193; i++) printf "x" }')
@@ -1248,4 +1261,79 @@ fixture_group_kill() {
     awk -v g="$1" -v n="$2" '$2 == g && (index($0, n) || $3 == "sleep") { print $1 }'); do
     kill -KILL "$fixture_group_pid" 2>/dev/null || :
   done
+}
+
+codex_state_fixture_init() {
+  mkdir -p "$1/bin"
+  cat >"$1/bin/codex" <<'SH'
+#!/usr/bin/env bash
+set -eu
+case "$*" in
+  'plugin list --json'|'plugin list --json -m test-market')
+    if [ "$*" = 'plugin list --json' ] && [ "${CODEX_STATE_GLOBAL_FAILURE:-false}" = true ]; then
+      exit 1
+    fi
+    state=$(cat "$CODEX_STATE_RECORD")
+    case $state in
+      absent) records='[]' ;;
+      malformed) records='[{}]' ;;
+      *) records=$(jq -cn --arg id "$CODEX_STATE_ID" --arg state "$state" '
+        [{pluginId:$id,installed:true,enabled:($state == "enabled")}]')
+        ;;
+    esac
+    if [ "$*" = 'plugin list --json' ] && [ -n "${CODEX_STATE_SIBLINGS:-}" ]; then
+      jq -cn --argjson records "$records" --slurpfile siblings "$CODEX_STATE_SIBLINGS" \
+        '{installed:($records + $siblings[0])}'
+    else
+      jq -cn --argjson records "$records" '{installed:$records}'
+    fi
+    ;;
+  "plugin add --json -- $CODEX_STATE_ID")
+    [ -f "$CODEX_STATE_PENDING" ]
+    printf '%s\n' add >>"$CODEX_STATE_ACTIONS"
+    printf '%s\n' enabled >"$CODEX_STATE_RECORD"
+    if [ "${CODEX_STATE_DROP_SIBLING:-false}" = true ]; then
+      jq 'map(select(.pluginId != "lost@other-market"))' "$CODEX_STATE_SIBLINGS" >"$CODEX_STATE_SIBLINGS.next"
+      mv "$CODEX_STATE_SIBLINGS.next" "$CODEX_STATE_SIBLINGS"
+    fi
+    ;;
+  "plugin remove --json -- $CODEX_STATE_ID")
+    [ -f "$CODEX_STATE_PENDING" ]
+    printf '%s\n' remove >>"$CODEX_STATE_ACTIONS"
+    printf '%s\n' absent >"$CODEX_STATE_RECORD"
+    ;;
+  'app-server --stdio')
+    while IFS= read -r request; do
+      id=$(jq -r '.id // empty' <<<"$request")
+      case $(jq -r '.method' <<<"$request") in
+        initialize) result='{}' ;;
+        initialized) continue ;;
+        config/batchWrite)
+          [ -f "$CODEX_STATE_PENDING" ]
+          jq -e --arg key "plugins.\"$CODEX_STATE_ID\".enabled" '
+            .params.edits | length == 1 and .[0].keyPath == $key and
+            (.[0].value | type) == "boolean" and .[0].mergeStrategy == "replace"
+          ' <<<"$request" >/dev/null
+          state=disabled
+          [ "$(jq -r '.params.edits[0].value' <<<"$request")" = false ] || state=enabled
+          printf '%s\n' "$state" >>"$CODEX_STATE_ACTIONS"
+          printf '%s\n' "$state" >"$CODEX_STATE_RECORD"
+          result='{}'
+          ;;
+        hooks/list)
+          cwd=$(jq -r '.params.cwds[0]' <<<"$request")
+          result=$(jq -cn --arg cwd "$cwd" --arg plugin "$CODEX_STATE_ID" \
+            --arg status "$CODEX_STATE_HOOK_TRUST" '
+            {data:[{cwd:$cwd,errors:[],warnings:[],
+              hooks:[{key:"session-start",pluginId:$plugin,currentHash:"sha256:fixture",trustStatus:$status}]}]}')
+          ;;
+        *) exit 64 ;;
+      esac
+      jq -cn --argjson id "$id" --argjson result "$result" '{id:$id,result:$result}'
+    done
+    ;;
+  *) exit 64 ;;
+esac
+SH
+  chmod +x "$1/bin/codex"
 }
