@@ -517,6 +517,22 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$(fleet_fold_tombstones "$run_tomb_layers" vireo agents)" = '{}' ] ||
       fail "a category with no tombstones produced some"
 
+    # Match the YAML knockout before JSON serialization resolves aliases.
+    cat >"$run_root/fleet.yaml" <<'YAML'
+skills:
+  retired: &skill absent
+  alias: *skill
+plugins:
+  retired: &plugin absent
+  alias: *plugin
+YAML
+    fleet_fold "$run_root" vireo | jq -e '
+      .skills == {alias:"absent"} and .plugins == {alias:"absent"}
+    ' >/dev/null || fail "the effective fold knocked out an alias"
+    fleet_fold "$run_root" vireo keep-plugin-tombstones | jq -e '
+      .skills == {alias:"absent"} and .plugins == {retired:"absent",alias:"absent"}
+    ' >/dev/null || fail "the plugin view changed the knockout for another category"
+
     # Knocking `absent` out once, after the merge, is the same as knocking it
     # out after every layer: a narrower layer that speaks again replaces the
     # scalar whole, so the last layer to speak wins either way.

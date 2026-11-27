@@ -136,7 +136,7 @@ YAML
     before_hold=$(capture_remote rev-parse main)
 
     capture_owner_install ponytail@test-market
-    # None of these have enough authority to act on the installed tombstone.
+    # Untrustworthy observations produce no holds; ordinary apply still verifies its target.
     cat >"$rjj/partial.jsonl" <<'JSONL'
 {"kind":"plugin_manager","status":"present","data":{"agent":"claude","authoritative":true,"installed_count":2}}
 JSONL
@@ -147,19 +147,25 @@ JSONL
     if grep -Fq 'ponytail@test-market added locally' "$rjj/pass.log"; then
       fail "an unreadable registry generated a local change alert"
     fi
+    [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] ||
+      fail "an unreadable registry caused a plugin mutation"
     mv "$rjj/registry" "$installed"
     for listing in partial failed; do
+      capture_owner_install ponytail@test-market
+      : >"$CLAUDE_PLUGIN_ACTION_LOG"
       ROUNDHOUSE_SEED_SNAPSHOT="$rjj/$listing.jsonl" capture_pass "$listing-listing"
       if grep -Fq 'ponytail@test-market added locally' "$rjj/pass.log"; then
         fail "$listing inventory generated a local change alert"
       fi
+      grep -Fqx 'uninstall ponytail@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
+        fail "$listing inventory stopped normal convergence of an unchanged target"
     done
-    [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] ||
-      fail "an unavailable or incomplete inventory caused a plugin mutation"
     if capture_remote grep -q 'ponytail@test-market added locally' main -- alerts/vireo; then
       fail "unavailable or incomplete inventory published a local hold alert"
     fi
 
+    capture_owner_install ponytail@test-market
+    : >"$CLAUDE_PLUGIN_ACTION_LOG"
     capture_pass owner-install
     [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "the pass reverted the owner's install"
     capture_report claude:ponytail@test-market added
@@ -187,7 +193,7 @@ JSONL
     [ ! -e "${baseline%/*}/agent-discard.json" ] || fail "agreed discard was not consumed"
 
     # An interrupted Roundhouse mutation may leave a state change and marker.
-    capture_lib fleet_agent_pending_mark claude claude-example@test-market
+    capture_lib fleet_agent_pending_mark claude claude-example@test-market enabled disabled
     marker=$(capture_lib fleet_agent_pending_path claude:claude-example@test-market)
     jq '.["claude-example@test-market"] = false' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
       mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"

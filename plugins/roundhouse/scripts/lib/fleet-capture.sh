@@ -36,9 +36,18 @@ fleet_agent_pending_path() {
 }
 
 fleet_agent_pending_mark() {
-  local id=$1:$2 path
+  local id=$1:$2 path record
   path=$(fleet_agent_pending_path "$id") || return 1
-  fleet_capture_json_write "$path" "{\"id\":\"$id\"}"
+  record=$(jq -cn --arg id "$id" --arg from "$3" --arg to "$4" \
+    '{id:$id,from:$from,to:$to}') || return 1
+  fleet_capture_json_write "$path" "$record"
+}
+
+fleet_agent_pending_matches() {
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  jq -e --arg id "$2" --arg from "$3" --arg to "$4" '
+    .id == $id and .from == $from and .to == $to and $from != $to
+  ' "$1" >/dev/null 2>&1
 }
 
 fleet_capture_pending_ids() (
@@ -55,6 +64,7 @@ fleet_capture_pending_ids() (
 
 fleet_capture_listing_filter='
   def id_ok: type == "string" and test("^[A-Za-z0-9_-][A-Za-z0-9._-]*@[A-Za-z0-9_-][A-Za-z0-9._-]*$");
+  def known_scope: IN("user","project","local","managed");
   def listing:
     [.[] | select(.kind == "plugin_manager" and .data.agent == "claude")] as $manager |
     [.[] | select(.kind == "plugin" and .data.agent == "claude" and .data.inventory_source == "manager")] as $rows |
@@ -62,10 +72,12 @@ fleet_capture_listing_filter='
       $manager[0].data.authoritative == true and $manager[0].data.installed_count == ($rows | length) and
       all($rows[]; .status == "present" and (.data.manager_id | id_ok) and
         (.data.enabled | type) == "boolean" and
-        .data.manager_id == (.data.name + "@" + .data.marketplace)) and
-      all($rows[]; .data.scope | IN("user","project","local","managed"))
-    then [$rows[].data | select(.scope == "user")] |
-      if ([.[].manager_id] | length == (unique | length)) then INDEX(.manager_id) else null end
+        .data.manager_id == (.data.name + "@" + .data.marketplace))
+    then [$rows[].data | select(.scope == "user" or (.scope | known_scope | not))] |
+      group_by(.manager_id) | map({
+        key:.[0].manager_id,
+        value:(if length == 1 and .[0].scope == "user" then .[0] else {uncertain:true} end)
+      }) | from_entries
     else null end;'
 
 fleet_capture_claude_observe() {
@@ -78,8 +90,8 @@ fleet_capture_claude_observe() {
   fi
   settings=$(fleet_capture_json_read "$settings_path" '{}') || return 1
   local missing id path
-  missing=$(jq -rc --argjson listing "$listing" --argjson settings "$settings" '
-    to_entries[] | .key as $id | select($listing[$id] == null) |
+  missing=$(jq -rc --argjson listing "$listing" --argjson settings "$settings" "$fleet_capture_listing_filter"'
+    to_entries[] | .key as $id | select($listing[$id] == null and all(.value[]; .scope | known_scope)) |
     .value[] | select(.scope == "user") |
     [$id, ($settings.enabledPlugins[$id] | type), (.installPath // "")] | @tsv' <<<"$installed") || return 1
   local known_state
@@ -95,20 +107,24 @@ fleet_capture_claude_observe() {
     if ($enabled | type) != "object" or any($enabled[]; type != "boolean") or
       any($installed | to_entries[]; (.key | id_ok | not) or
         (.value | type) != "array" or (.value | length) == 0 or
-        any(.value[]; type != "object" or (.scope | IN("user","project","local","managed") | not))) or
-      any($listing | keys[]; . as $id | all($installed[$id][]?; .scope != "user"))
+        any(.value[]; type != "object")) or
+      any($listing | to_entries[];
+        .key as $id | .value.uncertain != true and all($installed[$id][]?; .scope != "user" and (.scope | known_scope)))
     then error("Claude records and plugin list disagree")
     else $installed | to_entries | map(
       .key as $id | ($id | split("@")[1]) as $market |
       [.value[] | select(.scope == "user")] as $user |
+      any(.value[]; .scope | known_scope | not) as $uncertain |
       {key:$id, value:{
-        value:(if ($user | length) == 0 then "absent"
+        value:(if $uncertain then "unknown"
+          elif ($user | length) == 0 then "absent"
           elif ($user | length) != 1 then "unknown"
           elif ($enabled[$id] // $listing[$id].enabled) == true and $enabled[$id] != false
           then "enabled" else "disabled" end),
-        marketplace:$market, user_scope:(($user | length) > 0)
+        marketplace:$market, user_scope:(if $uncertain then null else ($user | length) > 0 end)
       }}) | from_entries as $records |
-      ($enabled | with_entries(select(.key | id_ok) | .value = {value:"unknown"})) + $records
+      ($enabled | with_entries(select(.key | id_ok) | .value = {value:"unknown"})) + $records +
+      ($listing | with_entries(select(.value.uncertain) | .value = {value:"unknown",user_scope:null}))
     end'
 }
 
@@ -147,23 +163,33 @@ fleet_capture_collect() {
 fleet_capture_authority_filter='
   def authoritative($observed; $baseline; $h):
     $observed[$h] != null and
-    (any($observed[$h][]?; .value | IN("enabled","disabled")) or
+    (any($observed[$h][]?; (.value | IN("enabled","disabled")) or
+      (has("user_scope") and .user_scope == null)) or
       all($baseline | to_entries[] | select(.key | startswith($h + ":"));
-        .value.value | IN("enabled","disabled") | not));'
+        .value | (if type == "object" then .value else null end) | IN("enabled","disabled") | not));'
 
 fleet_capture_rows() {
   # Join desired item names to physical harness IDs. Claude can omit the
   # marketplace in YAML when the local inventory uniquely resolves its name.
-  local definitions pending
+  local definitions pending plugins markets name value market
   definitions=$(fleet_definitions_load "$1") || return 1
   pending=$(fleet_capture_pending_ids | jq -Rn '[inputs]') || return 1
+  plugins=$(jq -r '(.plugins // {}) | to_entries[] |
+    select(.key | test("^[A-Za-z0-9_-][A-Za-z0-9._-]*$")) | "\(.key)\t\(.value | tojson)"' <<<"$2") || return 1
+  markets=$(while IFS=$'\t' read -r name value; do
+    [ -n "$name" ] || continue
+    market=$(fleet_run_plugin_market "$definitions" "$name" "$value" 2>/dev/null) || market=@
+    if [ -n "$market" ] && ! fleet_capture_id_valid "claude:$name@$market"; then market=@; fi
+    printf '%s\t%s\n' "$name" "$market"
+  done <<<"$plugins") || return 1
   jq -cn --argjson desired "$2" --argjson observed "$3" --argjson baseline "$4" \
-    --argjson defs "$definitions" --argjson pending "$pending" "$fleet_capture_authority_filter"'
-    def state: if type == "object" and has("state") then .state
-      elif type == "object" then "enabled" else . end;
-    def market: if type == "object" then .marketplace else null end;
+    --arg markets "$markets" --argjson pending "$pending" \
+    "$fleet_capture_authority_filter$fleet_capture_listing_filter"'
+    def state: (if type == "object" and has("state") then .state
+      elif type == "object" then "enabled" else . end) |
+      if IN("enabled","disabled","absent") then . else "malformed" end;
     def physical($h; $id): $h + ":" + $id;
-    def plugin_rows($h; $category):
+    def plugin_rows($h; $category; $markets):
       ($observed[$h]) as $local |
       ($baseline | with_entries(select(.key | startswith($h + ":")))) as $base |
       ($local | keys? // []) as $local_ids |
@@ -174,9 +200,10 @@ fleet_capture_rows() {
       [
         ($desired[$category] // {} | to_entries[]) |
         .key as $name | (.value | state) as $theirs |
-        ((.value | market) // ($defs[$category][$name] | market)) as $market |
-        (if ($name | contains("@")) then [$name]
-         elif $market != null then [$name + "@" + $market]
+        $markets[$name] as $market |
+        (if ($name | id_ok) then [$name]
+         elif $market == null or $market == "@" then []
+         elif $market != "" then [$name + "@" + $market]
          else [$known_ids[] | select(startswith($name + "@"))] |
            [.[] | select($local[.].user_scope != false)] as $user_ids |
            if ($user_ids | length) > 0 then $user_ids else . end
@@ -186,31 +213,38 @@ fleet_capture_rows() {
         {
           id:(if $id == null then null else physical($h; $id) end),
           item:$item, name:$name, harness:$h, ambiguous:(($ids | length) > 1),
+          unqualified:($market == ""),
           marketplace:($id // "" | split("@")[1] // ""),
-          theirs:$theirs, ours:(if $unknown and $local[$id // ""].value != "absent" then "unknown"
+          theirs:(if $market == "@" or ($market == null and ($name | id_ok | not))
+            then "malformed" else $theirs end),
+          ours:(if $unknown and $local[$id // ""].value != "absent" then "unobserved"
             elif $id != null then ($local[$id].value // "absent")
             elif ($ids | length) == 0 and $theirs == "absent" then "absent"
             else "unresolved" end),
           base:((if $id == null then null else $base[physical($h; $id)] end) //
-            (if $market == null and ($name | contains("@") | not) then $baseline[$item] else null end))
+            (if $market == "" then $baseline[$item] else null end))
         }
       ] as $managed |
       $managed +
       [
         $known_ids[] as $id | ($id | split("@")) as $parts |
         $parts[0] as $name |
-        select(all($managed[]; .name != $name and .id != physical($h; $id))) |
+        select(all($managed[]; .id != physical($h; $id) and (.id != null or .name != $name))) |
         select($local[$id].user_scope != false or $base[physical($h; $id)] != null or
           ($pending_ids | index($id)) != null) |
+        ($category + "." +
+          (if any($managed[]; (.name | split("@")[0]) == $name) then $id else $name end)) as $item |
         {
-          id:physical($h; $id), item:($category + "." + $name), name:$name,
+          id:physical($h; $id), item:$item, name:$name,
           harness:$h, marketplace:$parts[1], theirs:"missing",
-          ours:(if $unknown and $local[$id].value != "absent" then "unknown"
+          ours:(if $unknown and $local[$id].value != "absent" then "unobserved"
             else ($local[$id].value // "absent") end),
-          base:($base[physical($h; $id)] // $baseline[$category + "." + $name])
+          base:($base[physical($h; $id)] // $baseline[$item])
         }
       ];
-    plugin_rows("claude"; "plugins") |
+    ($markets | split("\n") | map(select(length > 0) | split("\t") |
+      {key:.[0],value:.[1]}) | from_entries) as $market_map |
+    plugin_rows("claude"; "plugins"; $market_map) |
     group_by(.id // .item) | map(if length == 1 then .[0]
       else .[] | .ambiguous = true end) |
     group_by(.item) | map((length > 1) as $duplicate | .[] |
@@ -226,7 +260,7 @@ fleet_capture_initialized() {
 
 fleet_capture_rebaseline() {
   local desired=$3 observed=$4 fetched=$5 layers=${6:-$1}
-  local dir baseline initialized rows updated id fallback
+  local dir baseline initialized rows updated id settled
   [ "$fetched" = true ] || return 0
   dir=$(fleet_instance_path store.run)
   baseline=$(fleet_capture_json_read "$dir/agent-baseline.json" '{}') || return 1
@@ -238,8 +272,7 @@ fleet_capture_rebaseline() {
   fi
   updated=$(jq -c --argjson base "$baseline" --argjson discard "${fleet_capture_discards:-[]}" \
     --argjson initialized "$initialized" --argjson observed "$observed" "$fleet_capture_authority_filter"'
-    . as $rows |
-    reduce (.[] | select(.ours | IN("enabled","disabled","absent"))) as $r ($base;
+    reduce (.[] | select(.theirs != "malformed" and (.ours | IN("enabled","disabled","absent")))) as $r ($base;
       if $r.ours == $r.theirs then
         .[$r.id // $r.item] = {value:$r.theirs} |
         if $r.id != null then del(.[$r.item]) else . end
@@ -247,31 +280,27 @@ fleet_capture_rebaseline() {
       elif $r.ours != "absent" and
         ($initialized[$r.harness] != true or $r.base != null or ($discard | index($r.id)) != null) then
         .[$r.id] = {value:$r.ours,ignored:true}
-      elif $r.base.ignored then del(.[$r.id])
+      elif ($r.base | objects | .ignored) // false then del(.[$r.id])
       elif $r.base != null then .[$r.id] = {value:$r.ours,ignored:true}
       else . end) |
     ._initialized = (reduce ["claude"][] as $h ($initialized;
-      if authoritative($observed; $base; $h) and all($rows[] | select(.harness == $h);
-        .ours != "unknown" or .ambiguous == true or
-        (.id != null and $observed[$h][.id | ltrimstr($h + ":")].user_scope == false))
-      then .[$h] = true else . end))' <<<"$rows") || return 1
+      if authoritative($observed; $base; $h) then .[$h] = true else . end))' <<<"$rows") || return 1
   if [ "$updated" != "$baseline" ]; then
     fleet_capture_json_write "$dir/agent-baseline.json" "$updated" || return 1
   fi
-  while IFS= read -r id; do
-    local marker
-    marker=$(fleet_agent_pending_path "$id") || continue
-    rm -f "$marker" || return 1
-    case $id in
-      claude:*) fallback=$(fleet_agent_pending_path "${id%@*}@__unqualified__") || continue
-        rm -f "$fallback" || return 1 ;;
-    esac
-  done < <(jq -r --argjson updated "$updated" '.[] |
+  settled=$(jq -r --argjson updated "$updated" '.[] |
     if .id == null and .ours == "absent" and .theirs == "absent" and
       $updated[.item] == {value:"absent"} then "claude:" + .name + "@__unqualified__"
     else select(.id != null and (.ours | IN("enabled","disabled","absent")) and
       ((.ours == .theirs and $updated[.id] == {value:.theirs}) or
        (.theirs == "missing" and
         (.base == null or $updated[.id] == null or .base == {value:.ours,ignored:true})))) |
-      .id end' <<<"$rows")
+      .id, (select(.unqualified == true) | (.id | split("@")[0]) + "@__unqualified__")
+    end' <<<"$rows") || return 1
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    local marker
+    marker=$(fleet_agent_pending_path "$id") || continue
+    rm -f "$marker" || return 1
+  done <<<"$settled"
 }

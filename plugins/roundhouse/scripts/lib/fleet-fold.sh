@@ -66,8 +66,8 @@ fleet_definitions_file_path() {
 fleet_fold_merge_program='. as $layer ireduce ({};
   . *d ($layer | with_entries(select(.value != null))
     | (.[] | select(tag == "!!map")) |= with_entries(select(.value != null))))'
-fleet_fold_absent_program='(.[] | select(tag == "!!map")) |= with_entries(select(.value != "absent"))'
-fleet_fold_program="($fleet_fold_merge_program) | $fleet_fold_absent_program"
+fleet_fold_knockout_items='with_entries(select(.value != "absent"))'
+fleet_fold_program="($fleet_fold_merge_program) | (.[] | select(tag == \"!!map\")) |= $fleet_fold_knockout_items"
 # The merge rule, in two steps — MERGE, then the `absent` KNOCKOUT — so the
 # raw view and the tombstone reader see the identical merge. Knocking
 # out once at the end equals knocking out per layer: `absent` is a scalar, and
@@ -182,20 +182,19 @@ fleet_fold() (
   IFS='
 '
   set -f
+  local program fold_layers
+  case ${3:-effective} in
+    effective) program=$fleet_fold_program ;;
+    raw) program=$fleet_fold_merge_program ;;
+    keep-plugin-tombstones)
+      program="($fleet_fold_merge_program) | (.[] | select(tag == \"!!map\" and key != \"plugins\")) |= $fleet_fold_knockout_items"
+      ;;
+    *) printf 'roundhouse: invalid fold view: %s\n' "$3" >&2; exit 65 ;;
+  esac
   fold_layers=$(fleet_layer_files "$1" "$2") || exit 65
+  # Knock out while yq still distinguishes YAML aliases from scalar values.
   # shellcheck disable=SC2086 # deliberate word splitting over the file list
-  fold_doc=$(fleet_fold_read "$fleet_fold_merge_program" $fold_layers) || exit 65
-  printf '%s\n' "$fold_doc" | jq -cse --arg view "${3:-effective}" '
-    if length != 1 or (.[0] | type) != "object" then error("invalid fold document")
-    else .[0] end |
-    if $view == "raw" then .
-    elif $view | IN("effective", "keep-plugin-tombstones") then with_entries(
-      if (.value | type) != "object" or
-        ($view == "keep-plugin-tombstones" and .key == "plugins") then .
-      else .value |= with_entries(select(.value != "absent"))
-      end)
-    else error("invalid fold view: " + $view)
-    end'
+  fleet_fold_read "$program" $fold_layers
 )
 
 fleet_fold_tombstones() {

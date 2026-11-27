@@ -2713,6 +2713,8 @@ EOF
       fleet_run_want_enabled=false
       [ "$fleet_run_item_state" = enabled ] && fleet_run_want_enabled=true
       fleet_run_plugin_mutated=false
+      local capture_expected= capture_before_install=
+      fleet_run_plugin_mark_from=unknown
       fleet_run_resolved_sha=
       if [ -n "$fleet_run_market" ]; then
         # A catalog that cannot prove the bytes — no entry (an unregistered
@@ -2762,11 +2764,16 @@ EOF
           # plugin can reject or no-op instead of actually refreshing it.
           if [ -n "$fleet_run_installed_sha" ]; then
             fleet_run_cli_invalidate
-            fleet_capture_mark_claude "$fleet_run_id" || return 75
-            bounded_verb claude plugin update "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
+            fleet_capture_claude_update "$fleet_run_id" \
+              bounded_verb claude plugin update "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
           else
+            if [ "$fleet_run_want_enabled" = false ]; then
+              fleet_capture_guard_destructive "$fleet_run_id" || return 74
+              capture_before_install=$fleet_capture_guard_current
+            fi
             fleet_run_cli_invalidate
-            fleet_capture_mark_claude "$fleet_run_id" || return 75
+            [ "$fleet_run_installed" != '{}' ] || fleet_run_plugin_mark_from=absent
+            fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" enabled || return 75
             bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
           fi
           # The manager wrote the cache under its caller's umask, and 002
@@ -2786,6 +2793,9 @@ EOF
             [ -n "$fleet_run_installed_sha" ] || return 74
             fleet_run_plugin_reinstall "$fleet_run_id" \
               "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // "none"')" || return 74
+            if [ "$fleet_run_want_enabled" = false ] && [ -n "${fleet_capture_before_records:-}" ]; then
+              capture_expected=$(fleet_capture_guard_live "$fleet_run_id") || return 74
+            fi
             plugin_cache_seal_permissions "$fleet_run_id" || return 75
             fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 74
             fleet_run_plugin_at_identity "$fleet_run_reverified" || return 74
@@ -2807,8 +2817,13 @@ EOF
           plugin_cache_seal_permissions "$fleet_run_id" || return 75
         fi
       else
+        if [ "$fleet_run_want_enabled" = false ]; then
+          fleet_capture_guard_destructive "$fleet_run_id" || return 74
+          capture_before_install=$fleet_capture_guard_current
+        fi
         fleet_run_cli_invalidate
-        fleet_capture_mark_claude "$fleet_run_id" || return 75
+        fleet_run_plugin_mark_from=absent
+        fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" enabled || return 75
         bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
         # As above: seal what the manager wrote before approving its hooks.
         plugin_cache_seal_permissions "$fleet_run_id" || return 75
@@ -2818,6 +2833,10 @@ EOF
           fleet_run_codex_hooks_scoped "$fleet_run_id" "$fleet_run_cxs" '' || return $?
         fi
         fleet_run_plugin_mutated=true
+      fi
+      if [ -n "$capture_before_install" ] &&
+        jq -e '.installed == [] and .state == "unknown"' >/dev/null <<<"$capture_before_install"; then
+        capture_expected=$(fleet_capture_guard_live "$fleet_run_id") || return 74
       fi
       # State-verb status is not convergence: read it before attempting the
       # verb. A no-op enable is not an enable operation, and must not turn a
@@ -2831,6 +2850,7 @@ EOF
       [ "$fleet_run_plugin_mutated" = true ] || {
         fleet_run_before_enabled=$(fleet_run_plugin_enabled "$fleet_run_id" true) ||
           return $?
+        fleet_run_plugin_mark_from=$fleet_run_before_enabled
       }
       if [ "$fleet_run_want_enabled" = true ]; then
         if [ "$fleet_run_plugin_mutated" = true ] ||
@@ -2838,7 +2858,7 @@ EOF
           fleet_run_enable_attempted=true
           fleet_run_enable_status=0
           fleet_run_cli_invalidate
-          fleet_capture_mark_claude "$fleet_run_id" || return 75
+          fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" enabled || return 75
           bounded_verb claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1 ||
             fleet_run_enable_status=$?
         fi
@@ -2849,8 +2869,9 @@ EOF
         rm -f "$(fleet_run_codex_hooks_owed_path "$4")"
         if [ "$fleet_run_plugin_mutated" = true ] ||
           [ "$fleet_run_before_enabled" != false ]; then
+          fleet_capture_guard_destructive "$fleet_run_id" "$capture_expected" || return 74
           fleet_run_cli_invalidate
-          fleet_capture_mark_claude "$fleet_run_id" || return 75
+          fleet_capture_mark_claude "$fleet_run_id" "$fleet_run_plugin_mark_from" disabled || return 75
           bounded_verb claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
         fi
       fi
@@ -3750,7 +3771,15 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     run_tomb_value=$(fleet_item_value "$run_desired" "$run_tomb_item")
     run_tomb_target=$(fleet_run_tombstone_target "$run_defs" \
       "${run_tomb_item#plugins.}" "$run_tomb_value") || run_tomb_target=undecidable
-    [ -z "$run_tomb_target" ] || printf 'uninstall %s\n' "$run_tomb_item"
+    [ -n "$run_tomb_target" ] || continue
+    # A late arrival cannot be removed by this pass, so it must not inflate the cap.
+    if [ "$run_tomb_target" != undecidable ] &&
+      jq -e --arg id "$run_tomb_target" '
+        .registry != null and all(.registry[$id][]?; .scope != "user")
+      ' >/dev/null <<<"$fleet_capture_before_records"; then
+      continue
+    fi
+    printf 'uninstall %s\n' "$run_tomb_item"
   done <"$run_tmp/tombstones" >>"$run_tmp/removals"
   awk 'FILENAME == ARGV[1] { skip[$0] = 1; next } !($2 in skip)' \
     "$run_tmp/capture-skip" "$run_tmp/removals" >"$run_tmp/removals.next"
@@ -3909,7 +3938,8 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     [ -z "$run_applied" ] || run_in_applied=yes
     run_match=no
     [ "$run_applied" != "$run_digest" ] || run_match=yes
-    if [ "$run_category" = plugins ]; then
+    if [ "$run_category" = plugins ] && [ "$run_match" = yes ] &&
+      [ "${fleet_capture_authoritative:-false}" = true ]; then
       fleet_capture_state_matches "$run_item" "$run_value" \
         "$fleet_capture_observed" "$run_defs" || run_match=no
     fi
@@ -4570,13 +4600,15 @@ fleet_run_plugin_reinstall() {
       "$1" "$2" "$fleet_run_resolved_sha" >&2
     return 1
   }
+  fleet_capture_guard_destructive "$1" || return 74
   printf 'roundhouse: claude plugin update left %s at %s, not %s; reinstalling it once this pass\n' \
     "$1" "$2" "$fleet_run_resolved_sha" >&2
+  fleet_run_plugin_mark_from=$(fleet_run_plugin_enabled "$1" true) || fleet_run_plugin_mark_from=unknown
   fleet_run_cli_invalidate
-  fleet_capture_mark_claude "$1" || return 75
+  fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" absent || return 75
   bounded_verb claude plugin uninstall --scope user --keep-data "$1" >/dev/null 2>&1 || return 1
   fleet_run_cli_invalidate
-  fleet_capture_mark_claude "$1" || return 75
+  fleet_capture_mark_claude "$1" "$fleet_run_plugin_mark_from" enabled || return 75
   bounded_verb claude plugin install "$1" --scope user >/dev/null 2>&1 || {
     printf 'roundhouse: reinstalling %s failed after its uninstall; the next pass installs it\n' "$1" >&2
     return 1

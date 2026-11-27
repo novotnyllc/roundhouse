@@ -98,7 +98,7 @@
     },
     {
       "path": "scripts/lib/apply-claude.sh",
-      "sha256": "b88e06a8bd3aee3d145dbd946c0b69850fd9a4b4bd68608f41313cc0bca7a45b"
+      "sha256": "6686e4eaedc176914f7cb1559c3b9a04058f3a7b52b94cfd23f6ed63203e483d"
     },
     {
       "path": "scripts/lib/apply-commands.sh",
@@ -122,11 +122,11 @@
     },
     {
       "path": "scripts/lib/fleet-capture-pass.sh",
-      "sha256": "2cd9bc6d07d23db7b2f02be5bb55b664b06c8a977509cebb86a949f21d44f58c"
+      "sha256": "2b10e96b5638b8920d35d749c410f4e694922e512b69f14d0c484daf4f1f2c3c"
     },
     {
       "path": "scripts/lib/fleet-capture.sh",
-      "sha256": "b0471517026a57426ffc1e20d690545cacf23a4b07dffd5f23341879f4b56689"
+      "sha256": "ab60063be4f150d3a29823f43c0d60881f2995876611d7cbbc2ec7f084f9ffb4"
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
@@ -134,7 +134,7 @@
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
-      "sha256": "2828ad62fc71be31146ae82b865018339c70ca1338ebd04b3be9ad28a21aa4fc"
+      "sha256": "8b2db559040ab39b714418133b059c50b3e4ec840a583327e42dfe002c0e1f20"
     },
     {
       "path": "scripts/lib/fleet-init.sh",
@@ -150,7 +150,7 @@
     },
     {
       "path": "scripts/lib/fleet-plugins.sh",
-      "sha256": "66147a499f7f0420aa0333b5467b9712ddd9c1be8e5e15b206d1f4cb3443fe10"
+      "sha256": "bfa943417655f51d47359059010aacdaf446d810c144317ff7e151dc09ab8662"
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
@@ -166,7 +166,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "246ee3497b4af9c43e0da354d9f2714132b638a3a50490db0abbea4065339dc6"
+      "sha256": "52d6fad0a2476ae8dbe49ebe4818c731d00a5a286545f342d610b35474ba2f1c"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -234,7 +234,7 @@
     },
     {
       "path": "scripts/lib/plan-apply.sh",
-      "sha256": "57541ff3f06086e70678c1bfd270c212e38b41ef70c3734017b3982364250b4d"
+      "sha256": "ea0a4e5d0ff94b56b87c800526fd0cd62a86ed1a106b7e2e4883bd865c4f993d"
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
