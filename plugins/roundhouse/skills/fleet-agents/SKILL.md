@@ -272,7 +272,12 @@ With an authoritative Claude `plugin_manager` listing whose plugin row count
 matches, unmarked local user-scope plugin changes and conflicts are held and reported by
 the run and `fleet-doctor` until the store agrees or the owner discards the
 change. An unreadable, partial, failed or wiped listing is unknown: it places
-no new hold, and destructive removals require usable pre-pass evidence.
+no new hold, makes no plugin reverts (no uninstall or reinstall of an item
+whose store value has not changed since agreement), and destructive removals
+require usable pre-pass evidence. The first pass on a host is silent except
+that a plugin installed locally but marked `absent` in the store is held as an
+owner addition, never uninstalled. Roundhouse never holds its own plugin
+(`roundhouse@novotnyllc`): it always converges to the fleet.
 
 Two rules make this surface safe, and neither is a formality:
 
@@ -305,8 +310,8 @@ from one table (`fleet_alert_lifecycle_rows` in `lib/fleet-alerts.sh`):
 | Lifecycle | Scope | Kinds | Ends |
 | --- | --- | --- | --- |
 | condition | store | `removal-cap`, `integrity-store-wide`, `materialization`, `rollback`, `layer-parse`, `unknown-category`, `unknown-store-dir`, `ssh-render`, `inventory-timeout`, `stale-host` (per silent peer), `schedule-disabled`, `schedule-missing` and `schedule-drift` (per job) | the check sets or clears it every pass it runs (`fleet_alert_set`); never ages |
-| condition | item | `integrity`, `config-key-collision`, `chezmoi-coownership`, `package-hold`, `enabled-but-untrusted`, `record-write`, `identity-unavailable`, `uninstall-deferred`, `package-deferred`, `runtime-hold`, `node-runtime-unverified` | the end-of-pass sweep (`fleet_alert_sweep`) clears it when the pass **checked** the item and did not raise it, or when the item has left the fold; an item the pass skipped (held, waiting on its canary) keeps it; never ages |
-| event | store or item | `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, and any kind not listed | ages out by its latest `at` after the evidence retention window |
+| condition | item | `integrity`, `config-key-collision`, `chezmoi-coownership`, `package-hold`, `enabled-but-untrusted`, `record-write`, `identity-unavailable`, `uninstall-deferred`, `package-deferred`, `runtime-hold`, `node-runtime-unverified`, `agent-local-change`, `agent-capture-conflict`, `agent-capture-ambiguous` | the end-of-pass sweep (`fleet_alert_sweep`) clears it when the pass **checked** the item and did not raise it, or when the item has left the fold; an item the pass skipped (held, waiting on its canary) keeps it; never ages |
+| event | store or item | `lock-takeover`, `canary-override`, `conflict`, `hold`, `store-moved`, `remote-posture`, `bootstrap-seed`, `join-unverified`, `roster-change`, `agent-capture-ignored` (first-pass local extras left in place), and any kind not listed | ages out by its latest `at` after the evidence retention window |
 
 `stale-host` clears when the peer publishes a heartbeat again, or leaves the
 roster or the enrolled hosts; `schedule-disabled` and `schedule-missing` clear

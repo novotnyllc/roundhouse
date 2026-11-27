@@ -107,6 +107,7 @@ remote-posture         event      store
 bootstrap-seed         event      store
 join-unverified        event      store
 roster-change          event      store
+agent-capture-ignored  event      store
 '
 
 fleet_alert_kinds() {
