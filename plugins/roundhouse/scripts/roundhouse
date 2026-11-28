@@ -66,6 +66,7 @@ Usage:
   roundhouse fleet-seed
   roundhouse fleet-review ITEM pass|hold REASON
   roundhouse fleet-apply ITEM
+  roundhouse fleet-discard ITEM
   roundhouse fleet-accept SLUG
   roundhouse fleet-hold ITEM REASON
   roundhouse fleet-pending
@@ -146,6 +147,12 @@ EOF
 . "$script_dir/lib/fleet-resolve.sh"
 # shellcheck source=lib/apply-claude.sh
 . "$script_dir/lib/apply-claude.sh"
+# shellcheck source=lib/fleet-merge.sh
+. "$script_dir/lib/fleet-merge.sh"
+# shellcheck source=lib/fleet-capture.sh
+. "$script_dir/lib/fleet-capture.sh"
+# shellcheck source=lib/fleet-capture-pass.sh
+. "$script_dir/lib/fleet-capture-pass.sh"
 # shellcheck source=lib/fleet-plugins.sh
 . "$script_dir/lib/fleet-plugins.sh"
 # shellcheck source=lib/fleet-publish-verbs.sh
@@ -183,7 +190,7 @@ shift
 # uninstall take the schedule lock (lib/fleet-schedule-plan.sh), judged the
 # same way.
 case $command in
-  fleet-run | fleet-age-evidence | fleet-compact-alerts | fleet-disown | fleet-schedule)
+  fleet-run | fleet-age-evidence | fleet-compact-alerts | fleet-disown | fleet-schedule | fleet-discard | fleet-apply | apply-plan | apply-native-plan)
     fleet_lock_lead_group "$0" "$command" "$@"
     ;;
 esac
@@ -265,6 +272,7 @@ case $command in
   fleet-seed) [ $# -eq 0 ] || usage; fleet_seed_command ;;
   fleet-review) [ $# -eq 3 ] || usage; fleet_review_command "$1" "$2" "$3" ;;
   fleet-apply) [ $# -eq 1 ] || usage; fleet_apply_command "$1" ;;
+  fleet-discard) [ $# -eq 1 ] || usage; fleet_discard_command "$1" ;;
   fleet-accept) [ $# -eq 1 ] || usage; fleet_accept_command "$1" ;;
   fleet-hold) [ $# -eq 2 ] || usage; fleet_hold_command "$1" "$2" ;;
   fleet-pending) [ $# -eq 0 ] || usage; fleet_pending_command ;;

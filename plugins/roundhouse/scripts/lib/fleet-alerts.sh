@@ -85,6 +85,10 @@ package-hold           condition  item
 privilege-lane         condition  item
 enabled-but-untrusted  condition  item
 record-write           condition  item
+agent-local-change     condition  item
+agent-capture-conflict condition  item
+agent-capture-ambiguous condition item
+agent-capture-interrupted condition item
 identity-unavailable   condition  item
 uninstall-deferred     condition  item
 package-deferred       condition  item
@@ -104,6 +108,7 @@ remote-posture         event      store
 bootstrap-seed         event      store
 join-unverified        event      store
 roster-change          event      store
+agent-capture-ignored  event      store
 '
 
 fleet_alert_kinds() {

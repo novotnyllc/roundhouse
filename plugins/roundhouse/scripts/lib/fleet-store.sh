@@ -483,18 +483,52 @@ fleet_lock_transition_test_pause() {
   fi
 }
 
+fleet_lock_mutator() (
+  # The exec shim records its unchanged PID before starting the native verb.
+  local dir=$1 nonce=$2 pid=${3:-} pgid start tmp
+  [ -n "$nonce" ] && fleet_lock_transition_enter "$dir" || exit 1
+  tmp="$dir.t/mutator.$fleet_lock_transition_token"
+  trap 'rm -f "$tmp"; fleet_lock_transition_leave "$dir"' EXIT
+  [ "$(fleet_lock_identity "$dir")" = "$nonce" ] || exit 1
+  if [ -n "$pid" ]; then
+    pgid=$(fleet_lock_proc_pgid "$pid")
+    start=$(fleet_lock_proc_start "$pid")
+    [ -n "$pgid" ] && [ -n "$start" ] || exit 1
+    jq -c --argjson pid "$pid" --argjson pgid "$pgid" --arg start "$start" \
+      '.mutator = {pid:$pid,pgid:$pgid,start_time:$start}' "$dir/meta.json"
+  else
+    jq -c 'del(.mutator)' "$dir/meta.json"
+  fi >"$tmp" && mv -f "$tmp" "$dir/meta.json"
+)
+
+fleet_lock_mutator_live() {
+  local evidence pid start current
+  evidence=$(jq -er '.mutator | select(.pid | type == "number" and . > 1 and floor == .) |
+    "\(.pid) \(.start_time // "")"' "$1/meta.json" 2>/dev/null) || return 1
+  read -r pid start <<<"$evidence"
+  current=$(fleet_lock_proc_start "$pid")
+  if [ -n "$current" ]; then
+    [ -z "$start" ] || [ "$current" = "$start" ]
+    return
+  fi
+  # A denied process inspection must not authorize takeover of a reachable pid.
+  kill -0 "$pid" 2>/dev/null || return 1
+  case $(ps -o stat= -p "$pid" 2>/dev/null) in *Z*) return 1 ;; esac
+}
+
 fleet_lock_release() {
-  # `fleet_lock_release LOCK_DIR IDENTITY` — remove the lock ONLY when it still
+  # `fleet_lock_release LOCK_DIR IDENTITY [FORCE]` — remove the lock ONLY when it still
   # carries IDENTITY (fleet_lock_identity: this acquisition's nonce, or a
   # pre-nonce lock's pid and stamp as `fleet-unlock` read them). A run that was
   # judged dead and taken over must not, when it finally exits, delete the live
   # successor's lock by path. The verify and the removal are one transition
   # (fleet_lock_transition_enter). Exit 1 when the lock is not the one named,
   # or the transition mutex cannot be had (the lock then stays, and a later
-  # run judges its holder).
+  # run judges its holder). Automatic release also waits for a live mutator.
   [ -n "${2:-}" ] || return 1
   fleet_lock_transition_enter "$1" || return 1
-  if [ "$(fleet_lock_identity "$1")" != "$2" ]; then
+  if [ "$(fleet_lock_identity "$1")" != "$2" ] ||
+    { [ "${3:-false}" != true ] && fleet_lock_mutator_live "$1"; }; then
     fleet_lock_transition_leave "$1"
     return 1
   fi
@@ -516,14 +550,15 @@ fleet_lock_holder_state() {
   # live     the recorded holder is running right now, verified by all three;
   #          or the holder led its own group (the meta's pgid is its pid) and
   #          is gone, but something in that group is still running — the
-  #          pass in a subshell of a top-level shell that was KILLed
+  #          pass in a subshell of a top-level shell that was KILLed, or a
+  #          recorded native mutator still lives in a separate group
   # unknown  nothing here can be proved either way: no readable meta, another
   #          host's pid, a hand-taken (`manual`) lock, a pre-nonce lock whose
   #          pid is alive, no identity to bind a takeover to, or a group (or
   #          the boot it was recorded in) that could not be looked at
   #
   # `fleet_lock_live_by` says which proof a `live` rests on: `holder` (the
-  # recorded process itself) or `group` (only its group). The ceiling stop
+  # recorded process itself), `group` or `mutator`. The ceiling stop
   # needs the first: it never signals what it cannot prove is the run.
   #
   # The host name is compared because the lock lives beside a store path that
@@ -545,7 +580,13 @@ fleet_lock_holder_state() {
   esac
   # A `ps` that cannot see THIS process cannot see anything, and reading its
   # silence as "the holder is gone" would take over a live run's lock.
-  [ -n "$(fleet_lock_proc_start "$$")" ] || return 0
+  if [ -z "$(fleet_lock_proc_start "$$")" ]; then
+    if fleet_lock_mutator_live "$1"; then
+      fleet_lock_state=live
+      fleet_lock_live_by=mutator
+    fi
+    return 0
+  fi
   fleet_lock_judged_id=$(fleet_lock_identity "$1")
   lock_now_start=$(fleet_lock_proc_start "$lock_pid")
   lock_was_start=$(fleet_lock_meta_field "$1" start_time)
@@ -574,6 +615,10 @@ fleet_lock_holder_state() {
     fleet_lock_state=live
     fleet_lock_live_by=holder
   fi
+  if [ "$fleet_lock_live_by" != holder ] && fleet_lock_mutator_live "$1"; then
+    fleet_lock_state=live
+    fleet_lock_live_by=mutator
+  fi
   # A dead verdict is only actionable against an identity: the takeover proves
   # it moved the SAME lock it judged, and without one there is nothing to prove.
   [ "$fleet_lock_state" != dead ] || [ -n "$fleet_lock_judged_id" ] ||
@@ -583,12 +628,12 @@ fleet_lock_holder_state() {
 fleet_lock_holder_desc() {
   # `fleet_lock_holder_desc LOCK_DIR` — who holds the lock, for a message, as
   # the last fleet_lock_holder_state on it judged: `pid N`, or, for a run that
-  # is live only through its group, `process group N, its top-level pid gone`.
-  if [ "${fleet_lock_live_by:-}" = group ]; then
-    printf 'process group %s, its top-level pid gone\n' "$(fleet_lock_meta_field "$1" pgid)"
-  else
-    printf 'pid %s\n' "$(fleet_lock_meta_field "$1" pid)"
-  fi
+  # is live through a surviving group or mutator, the corresponding ID.
+  case ${fleet_lock_live_by:-} in
+    group) printf 'process group %s, its top-level pid gone\n' "$(fleet_lock_meta_field "$1" pgid)" ;;
+    mutator) printf 'native mutator pid %s\n' "$(jq -r .mutator.pid "$1/meta.json")" ;;
+    *) printf 'pid %s\n' "$(fleet_lock_meta_field "$1" pid)" ;;
+  esac
 }
 
 fleet_lock_holder_gone() {
@@ -637,7 +682,7 @@ fleet_lock_takeover() {
   # re-verified INSIDE it before anything moves: a lock a racing takeover has
   # already made live is never renamed at all.
   fleet_lock_transition_enter "$1" || return 1
-  if [ "$(fleet_lock_identity "$1")" != "$2" ]; then
+  if [ "$(fleet_lock_identity "$1")" != "$2" ] || fleet_lock_mutator_live "$1"; then
     fleet_lock_transition_leave "$1"
     return 1
   fi
@@ -714,11 +759,11 @@ fleet_lock_take() {
   if [ "$fleet_run_lock_state" = live ] && [ -n "${3:-}" ]; then
     fleet_run_lock_age=$(fleet_lock_age_seconds "$1" || printf '')
     if [ -n "$fleet_run_lock_age" ] && [ "$fleet_run_lock_age" -gt "$3" ]; then
-      if [ "$fleet_lock_live_by" = group ]; then
-        # Live only through its group: the recorded process is gone, so
+      if [ "$fleet_lock_live_by" != holder ]; then
+        # Live through its group or mutator: the recorded process is gone, so
         # nothing left can be proved to be the run by pid, start time and
         # command, and nothing is signalled on less.
-        printf 'roundhouse: the run holding %s (%s) has run %ss, past the %ss ceiling, but cannot be proved the recorded run; nothing was stopped or taken over — confirm it, stop that group, then fleet-unlock\n' \
+        printf 'roundhouse: the run holding %s (%s) has run %ss, past the %ss ceiling, but cannot be proved the recorded run; nothing was stopped or taken over — confirm it, stop the surviving processes, then fleet-unlock\n' \
           "$1" "$(fleet_lock_holder_desc "$1")" "$fleet_run_lock_age" "$3" >&2
         return 75
       fi

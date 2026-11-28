@@ -2368,6 +2368,7 @@ if has_section agents; then
                   ($parts[1] | length) > 0) and
                 (.version | type == "string" and length > 0) and
                 (.enabled | type == "boolean") and
+                ((.scope == null) or (.scope | type) == "string") and
                 ((.installPath == null) or (.installPath | type) == "string") and
                 ((.installedAt == null) or (.installedAt | type) == "string") and
                 ((.lastUpdated == null) or (.lastUpdated | type) == "string")
@@ -2382,6 +2383,7 @@ if has_section agents; then
                   name:(($manager_id | split("@")[0])[0:8192]),
                   installed_version:(.version[0:8192]),
                   enabled:.enabled,
+                  scope:(.scope[0:8192]),
                   path:((.installPath // null) | if type == "string" then .[0:8192] else null end),
                   installed_at:((.installedAt // null) | if type == "string" then .[0:8192] else null end),
                   last_updated:((.lastUpdated // null) | if type == "string" then .[0:8192] else null end)

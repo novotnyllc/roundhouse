@@ -49,14 +49,25 @@ run_bounded() {
   # tree instead.
   run_bounded_secs=$1
   shift
+  local run_bounded_name=${1##*/}
   case $(type -t "$1" 2>/dev/null) in
     function) run_bounded_watchdog "$@"; return ;;
   esac
+  if [ -n "${fleet_mutator_lock:-}" ]; then
+    # The shim runs in the native command's PID and group, including Perl's separate group.
+    set -- "${BASH:-bash}" -c '
+      . "$1"
+      fleet_lock_mutator "$2" "$3" "$$" || exit 125
+      shift 3
+      exec "$@"
+    ' roundhouse-mutator "$script_dir/lib/fleet-store.sh" "$fleet_mutator_lock" "$fleet_lock_nonce_held" "$@"
+  fi
   if command -v perl >/dev/null 2>&1; then
     perl -e '
       use POSIX ();
       my $t = shift @ARGV;
       my $log = shift @ARGV;
+      my $name = shift @ARGV;
       my $tty = open(my $ttyfh, "<", "/dev/tty") ? 1 : 0;
       close($ttyfh) if $tty;
       my $pid = fork();
@@ -95,7 +106,6 @@ run_bounded() {
       $SIG{ALRM} = sub {
         $stop->();
         if ($log ne "" && open(my $l, ">>", $log)) {
-          my $name = $ARGV[0]; $name =~ s{.*/}{};
           print $l "$t $name\n";
           close($l);
         }
@@ -109,7 +119,7 @@ run_bounded() {
       my $rc = $?;
       alarm 0;
       exit(($rc & 127) ? 128 + ($rc & 127) : ($rc >> 8));
-    ' "$run_bounded_secs" "${run_bounded_log:-}" "$@"
+    ' "$run_bounded_secs" "${run_bounded_log:-}" "$run_bounded_name" "$@"
     return
   fi
   run_bounded_watchdog "$@"
@@ -167,7 +177,7 @@ run_bounded_watchdog() {
   if [ -f "$run_bounded_mark" ]; then
     rm -f "$run_bounded_mark"
     [ -z "${run_bounded_log:-}" ] ||
-      printf '%s %s\n' "$run_bounded_secs" "${1##*/}" >>"$run_bounded_log" 2>/dev/null || :
+      printf '%s %s\n' "$run_bounded_secs" "${run_bounded_name:-${1##*/}}" >>"$run_bounded_log" 2>/dev/null || :
     return 124
   fi
   return "$run_bounded_wrc"

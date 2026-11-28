@@ -753,6 +753,8 @@ fleet_run_poll_floor() {
   [ ! -e "$(fleet_run_state_dir)/canary-waiting" ] || return 1
   [ ! -e "$(fleet_run_state_dir)/retry-owed" ] || return 1
 
+  ! fleet_capture_dirty || return 1
+
   fleet_run_fetched=$(fleet_vcs_floor_fetch "$1") || return 1
   [ -n "$fleet_run_fetched" ] || return 1
   # A fetched head that does not descend from what this host converged on is
@@ -2679,6 +2681,8 @@ EOF
           "$fleet_run_install_cask" "$fleet_run_install_version"
       ;;
     plugins)
+      local fleet_capture_chain fleet_capture_chain_observed=
+      fleet_capture_chain=$(fleet_lock_nonce) || return 74
       # A TOMBSTONE converges by uninstalling, and is SATISFIED where the
       # plugin is not installed — asked before the harness check, because a
       # host with no `claude` has no plugin to remove either.
@@ -2696,21 +2700,21 @@ EOF
       # at all, and a peer that has one still must not converge on this host's
       # inability. See the exit-code contract above.
       command -v claude >/dev/null 2>&1 || return 75
-      # A NULL MARKETPLACE IS THE ZERO-CONFIG CASE, not a missing one.
-      # `fleet_resolve_surface`'s own contract is "a null marketplace means
-      # 'wherever this harness looks'", and §5's worked example — `plugins:
-      # {ponytail: enabled}` with no marketplace anywhere — is the documented
-      # default. Refusing it journaled `held` on every host forever, which in
-      # turn made `fleet_hook_trust` report every hook that plugin delivers
-      # `enabled_but_untrusted` permanently, because the approval it looks for
-      # can only arrive through applied/. Unqualified, and the harness resolves
-      # its own default.
-      fleet_run_id=$fleet_run_name
-      [ -z "$fleet_run_market" ] ||
-        fleet_run_id="$fleet_run_name@$fleet_run_market"
+      # A bare desired name still needs a unique physical ID before a verb.
+      case $fleet_run_name in
+        *@*) fleet_run_id=$fleet_run_name; fleet_run_market=${fleet_run_id##*@} ;;
+        *)
+          if [ -n "$fleet_run_market" ]; then
+            fleet_run_id="$fleet_run_name@$fleet_run_market"
+          else
+            fleet_run_id=$(fleet_run_qualify_plugin "$fleet_run_name") || return $?
+          fi
+          ;;
+      esac
       fleet_run_want_enabled=false
       [ "$fleet_run_item_state" = enabled ] && fleet_run_want_enabled=true
       fleet_run_plugin_mutated=false
+      local capture_pre_status=0
       fleet_run_resolved_sha=
       if [ -n "$fleet_run_market" ]; then
         # A catalog that cannot prove the bytes — no entry (an unregistered
@@ -2759,11 +2763,11 @@ EOF
           # fleet-agents/SKILL.md), which installing an already-installed
           # plugin can reject or no-op instead of actually refreshing it.
           if [ -n "$fleet_run_installed_sha" ]; then
-            fleet_run_cli_invalidate
-            bounded_verb claude plugin update "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
+            fleet_capture_verb "claude:$fleet_run_id" update unchanged -- \
+              fleet_run_claude_plugin_verb update "$fleet_run_id" --scope user || return 74
           else
-            fleet_run_cli_invalidate
-            bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
+            fleet_capture_verb "claude:$fleet_run_id" install installed -- \
+              fleet_run_claude_plugin_verb install "$fleet_run_id" --scope user || return $?
           fi
           # The manager wrote the cache under its caller's umask, and 002
           # leaves it group-writable. Seal it before it is re-verified, its
@@ -2803,60 +2807,50 @@ EOF
           plugin_cache_seal_permissions "$fleet_run_id" || return 75
         fi
       else
-        fleet_run_cli_invalidate
-        bounded_verb claude plugin install "$fleet_run_id" --scope user >/dev/null 2>&1 || return 74
+        fleet_run_installed=$(fleet_run_installed_plugin "$fleet_run_id") || return 75
+        if [ "$fleet_run_installed" = '{}' ]; then
+          fleet_capture_verb "claude:$fleet_run_id" install installed -- \
+            fleet_run_claude_plugin_verb install "$fleet_run_id" --scope user || return $?
+          fleet_run_plugin_mutated=true
+        fi
         # As above: seal what the manager wrote before approving its hooks.
         plugin_cache_seal_permissions "$fleet_run_id" || return 75
-        if [ "$fleet_run_want_enabled" = true ]; then
+        if [ "$fleet_run_want_enabled" = true ] && [ "$fleet_run_plugin_mutated" = true ]; then
           fleet_run_cxs=0
           fleet_run_approve_plugin_hooks "$fleet_run_id" || fleet_run_cxs=$?
           fleet_run_codex_hooks_scoped "$fleet_run_id" "$fleet_run_cxs" '' || return $?
         fi
-        fleet_run_plugin_mutated=true
       fi
       # State-verb status is not convergence: read it before attempting the
       # verb. A no-op enable is not an enable operation, and must not turn a
       # locally modified Codex hook into a newly trusted hook on every pass.
-      # A fresh install/update has already gone through the identity and hook
-      # gates, but some native managers do not expose the state row until the
-      # first state verb. In that case the verb result is the transition proof.
+      # Some managers do not expose the state row until the first state verb
+      # after install/update. Still try the verb and verify its post-state.
       fleet_run_enable_attempted=false
-      fleet_run_enable_status=125
-      fleet_run_before_enabled=unknown
-      [ "$fleet_run_plugin_mutated" = true ] || {
-        fleet_run_before_enabled=$(fleet_run_plugin_enabled "$fleet_run_id" true) ||
-          return $?
+      fleet_run_before_enabled=$(fleet_run_plugin_enabled "$fleet_run_id" true) || {
+        capture_pre_status=$?
+        [ "$fleet_run_plugin_mutated" = true ] || return "$capture_pre_status"
+        fleet_run_before_enabled=unknown
       }
-      if [ "$fleet_run_want_enabled" = true ]; then
-        if [ "$fleet_run_plugin_mutated" = true ] ||
-          [ "$fleet_run_before_enabled" != true ]; then
-          fleet_run_enable_attempted=true
-          fleet_run_enable_status=0
-          fleet_run_cli_invalidate
-          bounded_verb claude plugin enable "$fleet_run_id" --scope user >/dev/null 2>&1 ||
-            fleet_run_enable_status=$?
-        fi
-      else
-        fleet_run_want_enabled=false
+      if [ "$fleet_run_want_enabled" = false ]; then
         # A disabled item owes Codex no hook approval: drop any debt an
         # enabled one left (fleet_run_codex_hooks_scoped).
         rm -f "$(fleet_run_codex_hooks_owed_path "$4")"
-        if [ "$fleet_run_plugin_mutated" = true ] ||
-          [ "$fleet_run_before_enabled" != false ]; then
-          fleet_run_cli_invalidate
-          bounded_verb claude plugin disable "$fleet_run_id" --scope user >/dev/null 2>&1 || :
-        fi
       fi
-      fleet_run_actual_enabled=$(fleet_run_plugin_enabled "$fleet_run_id") || return $?
-      [ "$fleet_run_actual_enabled" = "$fleet_run_want_enabled" ] || return 74
-      # Approval follows the verified post-state, not the manager's exit code.
-      # Some native managers write enabled state and then return nonzero; the
-      # before/after read is the authoritative transition proof. Install/update
-      # approval above covers byte changes; a steady-state enable is not a
-      # mutation and must not launder a locally modified hook.
+      if [ "$fleet_run_before_enabled" != "$fleet_run_want_enabled" ]; then
+        local state_verb=enable
+        [ "$fleet_run_want_enabled" = true ] || state_verb=disable
+        fleet_capture_verb "claude:$fleet_run_id" "$state_verb" "$fleet_run_item_state" -- \
+          fleet_run_claude_plugin_verb "$state_verb" "$fleet_run_id" --scope user || return $?
+        fleet_run_enable_attempted=$fleet_run_want_enabled
+      else
+        fleet_run_actual_enabled=$(fleet_run_plugin_enabled "$fleet_run_id") || return $?
+        [ "$fleet_run_actual_enabled" = "$fleet_run_want_enabled" ] || return 74
+      fi
+      # Approval follows a verified enable. Install/update approval above
+      # covers byte changes while steady state confers no new hook trust.
       if [ "$fleet_run_want_enabled" = true ] &&
-        [ "$fleet_run_enable_attempted" = true ] &&
-        [ "$fleet_run_actual_enabled" = true ]; then
+        [ "$fleet_run_enable_attempted" = true ]; then
         fleet_run_cxs=0
         fleet_run_approve_plugin_hooks "$fleet_run_id" \
           "${fleet_run_resolved_sha:-}" || fleet_run_cxs=$?
@@ -2867,7 +2861,7 @@ EOF
       # approval an earlier pass could not make — Codex had not synced yet —
       # is retried here, or Claude reads converged and the changed hooks stay
       # untrusted for good (fleet_run_codex_hooks_settled).
-      if [ "$fleet_run_want_enabled" = true ] && [ "$fleet_run_actual_enabled" = true ] &&
+      if [ "$fleet_run_want_enabled" = true ] &&
         [ "$fleet_run_plugin_mutated" != true ] && [ "$fleet_run_enable_attempted" != true ]; then
         fleet_run_cxs=0
         fleet_run_codex_hooks_settled "$fleet_run_id" "${fleet_run_resolved_sha:-}" ||
@@ -3222,6 +3216,23 @@ fleet_run_pass_ceiling() {
   printf '7200\n'
 }
 
+fleet_run_lock_plugin_mutation() {
+  # Standalone plugin mutations hold the scheduled run's lock through the journal and verb.
+  local lock_status=0
+  plugin_mutation_lock=$(fleet_lock_path)
+  mkdir -p "${plugin_mutation_lock%/*}" || return 75
+  fleet_run_lock_take "$(fleet_store_path)" "$(fleet_host_name)" "$plugin_mutation_lock" || lock_status=$?
+  case $lock_status in
+    0) ;;
+    10) printf 'roundhouse: a fleet run holds %s; retry the plugin change when it finishes\n' "$plugin_mutation_lock" >&2
+      return 75 ;;
+    *) return "$lock_status" ;;
+  esac
+  plugin_mutation_nonce=$fleet_lock_nonce_held
+  trap 'fleet_lock_release "$plugin_mutation_lock" "$plugin_mutation_nonce" || :' EXIT
+  fleet_lock_signals_exit
+}
+
 # --- the commands -------------------------------------------------------------
 
 fleet_run_reap_cask_temp() (
@@ -3500,6 +3511,7 @@ fleet_run_pass() {
   # §8.3 only converges items whose value is IDENTICAL at every head, so any
   # head answers for them, and the rest are held.
   run_layers=$run_tmp/head-1
+  run_capture_reference=$(printf '%s\n' "$run_heads" | head -1)
   # Two readings of R, merged ONCE: `run_desired` for item values (tombstones
   # included), `run_fold` for desired state — policy, package managers and the
   # detections — which a tombstone is not.
@@ -3663,6 +3675,9 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     fi
   fi
 
+  fleet_capture_pass_prepare "$run_store" "$run_host" "$run_desired" \
+    "$run_state" "$run_fetched" "$run_tmp" "$run_layers" || exit 65
+
   # --- §6 step 6: review -> verdict -> apply -> applied/ -> journal ---
   # PER PASS, not per process: one marketplace repair per marketplace per pass
   # (fleet_run_marketplace_repair), forgotten here so a later pass in the same
@@ -3684,7 +3699,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   run_canary_waiting=false
   # Set by a runtime or transient hold (an apply that failed, an identity that
   # could not be read): retried next pass even if the remote never moves.
-  run_retry_owed=false
+  run_retry_owed=$fleet_capture_retry_unknown
 
   # §10.3's removal set, capped BEFORE any removal applies: ONE tagged list,
   # `prune ITEM` (owned, gone from the layers) and `uninstall ITEM` (a
@@ -3715,14 +3730,32 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   # not. Undecidable (fleet_run_tombstone_target's 75) joins it, because the
   # cap is the direction to be wrong in.
   fleet_run_tombstone_items "$run_desired" >"$run_tmp/tombstones"
+  local fleet_run_tombstone_admitted="$run_tmp/tombstone-targets"
+  : >"$fleet_run_tombstone_admitted"
   while IFS= read -r run_tomb_item; do
     [ -n "$run_tomb_item" ] || continue
+    ! grep -Fqx "$run_tomb_item" "$run_tmp/capture-skip" || continue
     ! grep -Fqx "held $run_tomb_item" "$run_tmp/verdicts" || continue
     run_tomb_value=$(fleet_item_value "$run_desired" "$run_tomb_item")
     run_tomb_target=$(fleet_run_tombstone_target "$run_defs" \
       "${run_tomb_item#plugins.}" "$run_tomb_value") || run_tomb_target=undecidable
-    [ -z "$run_tomb_target" ] || printf 'uninstall %s\n' "$run_tomb_item"
+    [ -n "$run_tomb_target" ] || continue
+    ! fleet_capture_race_held "$run_tomb_target" || continue
+    # A late arrival cannot be removed by this pass, so it must not inflate the cap.
+    if [ "$run_tomb_target" != undecidable ] &&
+      jq -e --arg id "$run_tomb_target" '
+        .registry != null and all(.registry[$id][]?; .scope != "user")
+      ' >/dev/null <<<"$fleet_capture_before_records"; then
+      continue
+    fi
+    if fleet_capture_id_valid "claude:$run_tomb_target"; then
+      printf '%s\t%s\n' "$run_tomb_item" "$run_tomb_target" >>"$fleet_run_tombstone_admitted"
+    fi
+    printf 'uninstall %s\n' "$run_tomb_item"
   done <"$run_tmp/tombstones" >>"$run_tmp/removals"
+  awk 'FILENAME == ARGV[1] { skip[$0] = 1; next } !($2 in skip)' \
+    "$run_tmp/capture-skip" "$run_tmp/removals" >"$run_tmp/removals.next"
+  mv "$run_tmp/removals.next" "$run_tmp/removals"
   run_removals_held=$(fleet_run_removals_over "$run_tmp/removals" \
     "$(fleet_applied_count "$run_store" "$run_host")" "$run_fold")
   run_cap_over=false
@@ -3785,8 +3818,9 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
   # `brew`, `claude` and `git clone`; measured, one greedy child consumed the
   # rest of the list and silently cut a four-item run to one.
   while IFS="$fleet_run_sep" read -r run_verdict run_item run_digest run_value \
-    run_applied run_review_held run_revert run_state run_hold <&9; do
+    run_applied run_review_held run_revert run_item_state run_hold <&9; do
     [ -n "${run_item:-}" ] || continue
+    ! grep -Fqx "$run_item" "$run_tmp/capture-skip" || continue
     if [ "$run_verdict" = held ]; then
       fleet_run_runtime_hold "$run_item" 'verdict held' "$run_tmp/sigholds" || {
         fleet_run_batch_close "$run_store" "$run_host"
@@ -3855,7 +3889,9 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       if [ "$run_tomb_removal" = false ] &&
         [ "$(cat "$(fleet_run_tombstone_memo_path "$run_item")" 2>/dev/null)" = \
           "$run_digest" ] &&
-        [ -z "$(fleet_applied_digest "$run_store" "$run_host" "$run_item")" ]; then
+        [ -z "$(fleet_applied_digest "$run_store" "$run_host" "$run_item")" ] &&
+        run_tomb_before=$(fleet_run_tombstone_before_target "$run_defs" "${run_item#plugins.}" "$run_value") &&
+        [ -z "$run_tomb_before" ]; then
         continue
       fi
       if [ "$run_tomb_removal" = true ] && [ "$run_uninstalls_ok" != true ]; then
@@ -3876,6 +3912,11 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     [ -z "$run_applied" ] || run_in_applied=yes
     run_match=no
     [ "$run_applied" != "$run_digest" ] || run_match=yes
+    if [ "$run_category" = plugins ] && [ "$run_match" = yes ] &&
+      [ "${fleet_capture_authoritative:-false}" = true ]; then
+      fleet_capture_state_matches "$run_item" "$run_value" \
+        "$fleet_capture_observed" "$run_defs" || run_match=no
+    fi
     if [ "$run_category" = plugins ] && [ "$run_in_applied" = yes ] &&
       [ "$run_match" = yes ]; then
       run_plugin_identity_status=0
@@ -4022,7 +4063,7 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
       [ "$run_category" != hooks ] ||
         fleet_run_batch_flush "$run_store" "$run_host" applied-only
       fleet_run_apply_item "$run_store" "$run_host" "$run_defs" "$run_item" \
-        "$run_value" "$run_managers" "$run_state" || run_status=$?
+        "$run_value" "$run_managers" "$run_item_state" || run_status=$?
     fi
     case $run_status in
       0)
@@ -4148,8 +4189,12 @@ $(fleet_vcs_trailers "$run_host" scheduled/agent \
     printf 'roundhouse: converged from last known; nothing published (the remote was unreachable, journaled source: none)\n'
     exit 0
   fi
+  fleet_capture_pass_observe_after "$run_store" "$run_host" "$run_tmp" \
+    "$run_desired" "$run_layers" || exit 65
   fleet_run_publish "$run_store" "$run_host" scheduled/agent \
     "$run_mode convergence" "${run_applied_items:--}" || exit $?
+  fleet_capture_pass_agree "$run_store" "$run_host" "$run_desired" "$run_layers" \
+    "$run_capture_reference" || exit 65
   # The poll floor's converged-here condition and its comparison base: the
   # head this host now sits on, and the desired state of the reference it
   # converged FROM (fleet_run_poll_floor says why it is not the head's).
@@ -4495,6 +4540,8 @@ fleet_run_plugin_reinstall() {
   # reinstall: uninstall (keeping the plugin's data) and install again. At
   # most once per plugin per pass (fleet_run_marketplace_repair_reset clears
   # the list). Enabled state is re-converged by the caller's state verbs.
+  local fleet_capture_chain=${fleet_capture_chain:-} fleet_capture_chain_observed=${fleet_capture_chain_observed:-}
+  [ -n "$fleet_capture_chain" ] || fleet_capture_chain=$(fleet_lock_nonce) || return 74
   case " ${fleet_run_plugin_refreshed:-} " in *" $1 "*) return 1 ;; esac
   fleet_run_plugin_refreshed="${fleet_run_plugin_refreshed:-} $1"
   # The uninstall removes the files a running session uses (the tombstone
@@ -4531,13 +4578,10 @@ fleet_run_plugin_reinstall() {
   }
   printf 'roundhouse: claude plugin update left %s at %s, not %s; reinstalling it once this pass\n' \
     "$1" "$2" "$fleet_run_resolved_sha" >&2
-  fleet_run_cli_invalidate
-  bounded_verb claude plugin uninstall --scope user --keep-data "$1" >/dev/null 2>&1 || return 1
-  fleet_run_cli_invalidate
-  bounded_verb claude plugin install "$1" --scope user >/dev/null 2>&1 || {
-    printf 'roundhouse: reinstalling %s failed after its uninstall; the next pass installs it\n' "$1" >&2
-    return 1
-  }
+  fleet_capture_verb "claude:$1" uninstall absent -- \
+    fleet_run_claude_plugin_verb uninstall --scope user --keep-data "$1" || return $?
+  fleet_capture_verb "claude:$1" install installed -- \
+    fleet_run_claude_plugin_verb install "$1" --scope user
 }
 
 fleet_run_apply_held() {
@@ -5570,6 +5614,7 @@ fleet_apply_command() (
   # never become an unreviewed write path that happens to be shorter to type
   # than the reviewed one. A stale pass fails the same way an absent one does.
   fleet_run_env
+  case $1 in plugins.*) fleet_run_lock_plugin_mutation || exit $? ;; esac
   require_jq
   require_yq
   apply_item=$1
@@ -5780,7 +5825,7 @@ fleet_unlock_command() (
     }
   fi
   if [ -n "$unlock_id" ]; then
-    fleet_lock_release "$unlock" "$unlock_id" || {
+    fleet_lock_release "$unlock" "$unlock_id" "$unlock_force" || {
       printf 'roundhouse: %s changed while it was being released (another run took it); nothing released\n' \
         "$unlock" >&2
       exit 75

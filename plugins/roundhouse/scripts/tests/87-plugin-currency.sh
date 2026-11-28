@@ -20,6 +20,8 @@ if [ -n "$fleet_fixture_yq" ]; then
     export PATH
     # shellcheck source=/dev/null
     ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+    # Native helper fixtures supply the trusted pass separately from collector coverage.
+    fleet_capture_observed='{"trusted":true}'
 
     pc="$tmp/plugin-currency"
     rm -rf "$pc"
@@ -702,6 +704,19 @@ SH
       map({pluginId: "\(.)@m", version: "1.1.0", source: {source: "git", sha: $b}})) +
       [{pluginId: "current@m", version: "1.0.0", source: {source: "git", sha: $a}}])}' \
       >"$pc/catalog.json"
+    # The currency helper runs inside a trusted scheduled observation.
+    export CLAUDE_PLUGIN_ENABLED_FILE="$pc/claude-enabled.json" CLAUDE_PLUGIN_LIST_FROM_RECORDS=1
+    jq '.plugins | with_entries(.value = true)' "$HOME/.claude/plugins/installed_plugins.json" \
+      >"$CLAUDE_PLUGIN_ENABLED_FILE"
+    pc_capture_observation() {
+      fleet_capture_before_records=$(fleet_capture_guard_records)
+      fleet_capture_before_observed=$(jq -cn --argjson records "$fleet_capture_before_records" \
+        --argjson enabled "$(cat "$CLAUDE_PLUGIN_ENABLED_FILE")" '
+        {trusted:true,claude:($records.registry | with_entries(.key as $id |
+          .value = {value:(if $enabled[$id] then "enabled" else "disabled" end),user_scope:true}))}')
+      fleet_capture_observed=$fleet_capture_before_observed
+    }
+    pc_capture_observation
     : >"$pc/actions"
     fleet_run_marketplace_repair_reset
     pc_out=$(CLAUDE_PLUGIN_CATALOG_FILE="$pc/catalog.json" CLAUDE_PLUGIN_ACTION_LOG="$pc/actions" \
@@ -990,6 +1005,7 @@ SH
         >"$pc/codex-home/plugins/cache/m/widget/old/hooks/hooks.json"
     }
     pc_hooks_apply() {
+      CLAUDE_PLUGIN_ENABLED_FILE="$pc/hooks-enabled.json" pc_capture_observation
       CLAUDE_PLUGIN_MARKETPLACE_FILE="$pc_claude_markets" \
       CODEX_HOME="$pc/codex-home" CLAUDE_INSTALL_PATH_ROOT="$pc/claude-installs" \
         PATH="$pc/hooks-bin:$PATH" PC_HOOKS_STATE="$pc/hooks-state" \
@@ -1495,6 +1511,7 @@ SH
     pc_hooks_reset
     fleet_run_marketplace_repair_reset
     printf '%s\n' '{"widget@m":false}' >"$pc/hooks-enabled.json"
+    CLAUDE_PLUGIN_ENABLED_FILE="$pc/hooks-enabled.json" pc_capture_observation
     pc_owed=$(fleet_run_codex_hooks_owed_path plugins.widget)
     mkdir -p "${pc_owed%/*}" && printf '%s\n' "widget@m $pc_sha_b" >"$pc_owed"
     PATH="$pc/hooks-bin:$PATH" PC_HOOKS_STATE="$pc/hooks-state" \

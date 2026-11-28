@@ -60,6 +60,86 @@ fleet_run_verb_begin() {
   }
 }
 
+fleet_discard_command() (
+  # Discard only authorizes convergence; it writes host-local state, never the store.
+  fleet_run_env
+  require_jq
+  local key=$1 dir status=0 decisions item kind alert alerts physical='' physical_hash journal baseline records quarantine=''
+  local discard_store_path discard_host_name observed seq
+  [[ $key =~ ^(plugins\.[A-Za-z0-9_-][A-Za-z0-9._-]*(@[A-Za-z0-9_-][A-Za-z0-9._-]*)?|claude:[A-Za-z0-9_-][A-Za-z0-9._-]*@[A-Za-z0-9_-][A-Za-z0-9._-]*)$ ]] || {
+    printf 'roundhouse: %s is not a Claude plugin item\n' "$key" >&2
+    exit 64
+  }
+  discard_lock=$(fleet_lock_path)
+  mkdir -p "${discard_lock%/*}" || exit 75
+  discard_store_path=$(fleet_store_path) || exit 65
+  discard_host_name=$(fleet_host_name) || exit 65
+  fleet_lock_take "$discard_lock" "$(fleet_run_stale_after "$discard_store_path" "$discard_host_name")" || status=$?
+  case $status in
+    0 | 11) ;;
+    10) printf 'roundhouse: a fleet run holds %s; retry discard when it finishes\n' "$discard_lock" >&2; exit 75 ;;
+    *) exit "$status" ;;
+  esac
+  # Bash 3.2 drops function locals before an explicit exit runs this trap.
+  discard_nonce=$fleet_lock_nonce_held
+  trap 'fleet_lock_release "$discard_lock" "$discard_nonce" || :' EXIT
+  fleet_lock_signals_exit
+  # A typo must not authorize convergence of an unrelated future local edit.
+  case $key in claude:*) key=${key#claude:} ;; plugins.*) key=${key#plugins.} ;; esac
+  case $key in *@*) physical=claude:$key ;; esac
+  alerts=$(for item in "plugins.$key" "plugins.${key%@*}"; do
+    for kind in agent-local-change agent-capture-conflict agent-capture-interrupted; do
+      alert="$discard_store_path/alerts/$discard_host_name/$(fleet_alert_name "$kind" "$kind" "$item")"
+      [ -f "$alert" ] && [ ! -L "$alert" ] || continue
+      fleet_record_read "$alert" '{}' | jq -c --arg kind "$kind" --arg item "$item" \
+        'select(.kind == $kind and .items == [$item]) | .detail | strings'
+    done
+  done | jq -cs 'unique') || exit 65
+  dir=$(fleet_run_state_dir)
+  baseline=$(fleet_capture_json_read "$dir/agent-baseline.json" '{}') || exit 65
+  if [ -z "$physical" ]; then
+    records=$(fleet_capture_guard_records) || exit 65
+    physical=$({
+      jq -r '.[] | split(" ")[0]' <<<"$alerts"
+      jq -r 'keys[]' <<<"$baseline"
+      jq -r '.registry // {} | to_entries[] | select(any(.value[]?; .scope == "user")) |
+        "claude:" + .key' <<<"$records"
+      fleet_capture_pending_ids
+    } | jq -Rsr --arg prefix "claude:$key@" '
+      split("\n") | map(select(startswith($prefix))) | unique |
+      if length == 1 then .[0] else empty end') || exit 65
+    quarantine=$(fleet_capture_quarantine_path "$key") || exit 65
+  fi
+  if ! fleet_capture_id_valid "$physical"; then
+    printf 'roundhouse: no uniquely held Claude plugin %s; use its qualified ID\n' "$key" >&2
+    exit 65
+  fi
+  physical_hash="claude:sha256:$(printf '%s' "$physical" | sha256_stream | sed 's/.\{16\}/&-/g;s/-$//')"
+  journal=$(fleet_agent_journal_read "$physical") || exit 65
+  if ! jq -e --arg id "$physical" --arg hashed "$physical_hash" '
+      any(.[]; startswith($id + " ") or startswith($hashed + " "))' >/dev/null <<<"$alerts" &&
+    ! jq -e --arg id "$physical" '.[$id] | objects | .raced == true' >/dev/null <<<"$baseline" &&
+    ! fleet_agent_journal_unresolved "$journal" &&
+    { [ ! -f "$quarantine" ] || [ -L "$quarantine" ]; }; then
+    printf 'roundhouse: no held Claude plugin %s\n' "$key" >&2
+    exit 65
+  fi
+  if ! observed=$(fleet_capture_item_state "$physical") ||
+    ! observed=$(jq -ce '
+      {installed,state} | select((.installed == false and .state == null) or
+        (.installed == true and (.state | IN("enabled","disabled"))))' <<<"$observed"); then
+    printf 'roundhouse: cannot verify the current state of %s; retry discard after a usable observation\n' "$physical" >&2
+    exit 65
+  fi
+  seq=$(fleet_capture_next_seq) || exit 65
+  decisions=$(fleet_capture_json_read "$dir/agent-discard.json" '{}') || exit 65
+  decisions=$(jq -ce --arg id "$physical" --argjson observed "$observed" --argjson seq "$seq" \
+    '.[$id] = {id:$id,observed:$observed,seq:$seq}' <<<"$decisions") || exit 65
+  mkdir -p "$dir" && : >"$dir/retry-owed" || exit 65
+  fleet_capture_json_write "$dir/agent-discard.json" "$decisions" || exit 65
+  printf 'roundhouse: recorded discard for %s while its observed state remains unchanged\n' "$physical"
+)
+
 fleet_age_evidence_command() (
   # `roundhouse fleet-age-evidence [--dry-run]` — the full pass's evidence
   # aging (fleet_records_age), run by hand. `--dry-run` prints what it
