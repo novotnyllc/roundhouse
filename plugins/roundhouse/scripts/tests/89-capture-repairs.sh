@@ -21,6 +21,7 @@ if [ -n "$fleet_fixture_yq" ]; then
         fleet_capture_observed='{"trusted":true}'
         printf '%s\n' '{"plugins":{"claude-example@test-market":[{"scope":"user"}]}}' \
           >"$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+        printf '%s\n' '{"claude:claude-example@test-market":{"value":"enabled"}}' >"$baseline"
         printf '%s\n' '{"type":"agent-update","kind":"agent_artifact",
           "id":"claude:test-market:claude-example:user",
           "argv":["claude","plugin","update","claude-example@test-market","--scope","user"]}' \

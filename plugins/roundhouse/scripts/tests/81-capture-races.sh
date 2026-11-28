@@ -1,4 +1,5 @@
-# roundhouse self-check — Claude changes between capture and destructive apply.
+# roundhouse self-check — Claude changes between capture and apply.
+# roundhouse-test: parts=5
 # shellcheck shell=bash
 
 if [ -n "$fleet_fixture_yq" ]; then
@@ -22,6 +23,8 @@ if [ -n "$fleet_fixture_yq" ]; then
   sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   absent='{"state":"absent","marketplace":"test-market"}'
   disabled='{"state":"disabled","marketplace":"test-market"}'
+  enabled='{"state":"enabled","marketplace":"test-market"}'
+  desired='{"plugins":{"racer":{"state":"enabled","marketplace":"test-market"}}}'
   fixture_observed='{"claude":null,"retry":true}'
 
   fleet_capture_collect() { printf '%s\n' "$fixture_observed"; }
@@ -47,6 +50,60 @@ if [ -n "$fleet_fixture_yq" ]; then
     [ "$status" -eq 74 ] && [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] ||
       fail "capture race allowed a destructive plugin verb ($1, status $status)"
   }
+
+  jq -cn --arg sha "$sha" \
+    '{available:[{pluginId:"racer@test-market",version:"2.0.0",source:{source:"git",sha:$sha}}]}' \
+    >"$CLAUDE_PLUGIN_CATALOG_FILE"
+  for race_case in 2 3 4; do
+    if section_part "$race_case"; then
+      (
+        store="$race/verb-$race_case/store"
+        export ROUNDHOUSE_FLEET_STORE="$store"
+        mkdir -p "$store"
+        printf '%s\n' '{"plugins":{}}' >"$registry"
+        printf '{}\n' >"$CLAUDE_CONFIG_DIR/settings.json"
+        printf '{}\n' >"$CLAUDE_PLUGIN_ENABLED_FILE"
+        fixture_observed='{"trusted":true,"claude":{}}'
+        if [ "$race_case" != 4 ]; then
+          race_install racer@test-market
+          printf '%s\n' '{"racer@test-market":true}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
+          fixture_observed='{"trusted":true,"claude":{"racer@test-market":{"value":"enabled","user_scope":true}}}'
+          fleet_capture_rebaseline "$store" mac "$desired" "$fixture_observed" true
+        fi
+        race_prepare "$desired"
+        case $race_case in
+          2)
+            printf '%s\n' '{"plugins":{}}' >"$registry"
+            printf '{}\n' >"$CLAUDE_PLUGIN_ENABLED_FILE"
+            status=0
+            fleet_run_apply_item "$store" mac '{}' plugins.racer "$enabled" '' || status=$?
+            [ "$status" -eq 74 ] && [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] ||
+              fail "A3 reinstalled a plugin removed after capture (status $status)"
+            ;;
+          3)
+            plugin_cache_seal_permissions() {
+              # The refresh changed the bytes, then the owner disabled it.
+              printf '%s\n' '{"racer@test-market":false}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
+            }
+            status=0
+            fleet_run_apply_item "$store" mac '{}' plugins.racer "$enabled" '' || status=$?
+            [ "$status" -eq 74 ] &&
+              [ "$(cat "$CLAUDE_PLUGIN_ACTION_LOG")" = 'update racer@test-market' ] ||
+              fail "A3 re-enabled a plugin disabled during its version refresh (status $status)"
+            ;;
+          4)
+            fleet_run_apply_item "$store" mac '{}' plugins.racer "$enabled" '' ||
+              fail "A3 rejected its own install followed by enable"
+            [ "$(cat "$CLAUDE_PLUGIN_ACTION_LOG")" = $'install racer@test-market\nenable racer@test-market' ] &&
+              jq -e '.receipt | .op == "enable" and .installed and .state == "enabled"' \
+                "$(fleet_run_state_dir)/agent-journal/claude.racer@test-market" >/dev/null 2>&1 ||
+              fail "A3 fresh install followed by enable did not leave a verified enable receipt"
+            ;;
+        esac
+      )
+    fi
+  done
+  if ! section_part 1; then exit 0; fi
 
   for fixture_observed in \
     '{"trusted":true,"claude":{"untouched@test-market":{"value":"enabled","user_scope":true}}}' \
@@ -157,4 +214,118 @@ if [ -n "$fleet_fixture_yq" ]; then
   grep -Fqx 'disable claude-example@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
     fail "the pass did not disable its own fresh install"
 )
+fi
+
+# The lock protects a bounded manager after both the standalone shell and its group die.
+if [ -n "$fleet_fixture_yq" ] && section_part 5; then
+  (
+    set -eu
+    export PATH="$fleet_fixture_path"
+    # shellcheck source=/dev/null
+    ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+    lock_fixture="$tmp/capture-mutator"
+    export ROUNDHOUSE_FLEET_STORE="$lock_fixture/store"
+    export CLAUDE_CONFIG_DIR="$lock_fixture/claude"
+    export CLAUDE_PLUGIN_LIST_FROM_RECORDS=1
+    export CLAUDE_PLUGIN_ENABLED_FILE="$lock_fixture/enabled.json"
+    export CAPTURE_MUTATOR_READY="$lock_fixture/ready"
+    export CAPTURE_MUTATOR_CLI
+    CAPTURE_MUTATOR_CLI=$(command -v claude)
+    mkdir -p "$ROUNDHOUSE_FLEET_STORE/hosts" "$CLAUDE_CONFIG_DIR/plugins" "$lock_fixture/bin"
+    printf 'name: mac\n' >"$lock_fixture/identity.yaml"
+    printf '%s\n' 'plugins:' '  demo: {state: absent, marketplace: test-market}' >"$ROUNDHOUSE_FLEET_STORE/fleet.yaml"
+    printf 'platform: macos\n' >"$ROUNDHOUSE_FLEET_STORE/hosts/mac.yaml"
+    printf '%s\n' '{"plugins":{"demo@test-market":[{"scope":"user","version":"1.0.0"}]}}' \
+      >"$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+    printf '%s\n' '{"enabledPlugins":{"demo@test-market":false}}' >"$CLAUDE_CONFIG_DIR/settings.json"
+    printf '%s\n' '{"demo@test-market":false}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
+    cat >"$lock_fixture/bin/claude" <<'SH'
+#!/bin/bash
+if [ "$*" = 'plugin uninstall --scope user --keep-data demo@test-market' ]; then
+  printf '%s\n' "$$" >"$CAPTURE_MUTATOR_READY"
+  exec sleep 20
+fi
+exec "$CAPTURE_MUTATOR_CLI" "$@"
+SH
+    chmod +x "$lock_fixture/bin/claude"
+    export PATH="$lock_fixture/bin:$PATH"
+    lock=$(fleet_lock_path)
+    mkdir -p "$(fleet_run_state_dir)"
+    printf '%s\n' '{"claude:demo@test-market":{"value":"disabled","seq":0}}' \
+      >"$(fleet_run_state_dir)/agent-baseline.json"
+    "$cli" fleet-review plugins.demo pass 'fixture mutation' >/dev/null
+    # A private session gives fleet-apply no tty without making it a group leader.
+    perl -MPOSIX -e 'POSIX::setsid() >= 0 or die "setsid: $!";
+      my $pid = fork(); die "fork: $!" unless defined $pid;
+      if (!$pid) { exec @ARGV; die "exec: $!"; }
+      waitpid($pid, 0); exit($? >> 8)' "$cli" fleet-apply plugins.demo \
+      >"$lock_fixture/apply.log" 2>&1 </dev/null &
+    launcher=$!
+    native=
+    trap 'if [ -n "$native" ]; then kill "$native" 2>/dev/null || :; fi
+      kill "$launcher" 2>/dev/null || :' EXIT
+    for ((attempt=0; attempt<200; attempt++)); do
+      [ ! -s "$CAPTURE_MUTATOR_READY" ] || break
+      kill -0 "$launcher" 2>/dev/null || break
+      sleep 0.05
+    done
+    if [ ! -s "$CAPTURE_MUTATOR_READY" ]; then
+      cat "$lock_fixture/apply.log" >&2
+      fail "standalone fleet-apply did not start the bounded mutator"
+    fi
+    native=$(cat "$CAPTURE_MUTATOR_READY")
+    holder=$(jq -er .pid "$lock/meta.json")
+    group=$(fleet_lock_proc_pgid "$holder")
+    native_group=$(fleet_lock_proc_pgid "$native")
+    [ -n "$group" ] && [ -n "$native_group" ] && [ "$native_group" != "$group" ] ||
+      fail "the bounded mutator did not start in a separate process group"
+    kill -KILL "$holder"
+    for ((attempt=0; attempt<100; attempt++)); do
+      [ -n "$(fleet_lock_proc_start "$holder")" ] || break
+      sleep 0.05
+    done
+    fleet_lock_holder_state "$lock"
+    [ "$fleet_lock_state" = live ] ||
+      fail "standalone lock was $fleet_lock_state after its recorded PID died with a live mutator"
+    lock_rc=0
+    fleet_run_lock_take "$ROUNDHOUSE_FLEET_STORE" mac "$lock" || lock_rc=$?
+    [ "$lock_rc" -eq 10 ] || fail "fleet-run lock take after holder death returned $lock_rc (expected 10)"
+    [ "$group" = "$holder" ] && [ "$group" != "$(fleet_lock_proc_pgid "$$")" ] ||
+      fail "standalone fleet-apply did not lead a private process group"
+    jq -e --argjson pid "$native" --argjson pgid "$native_group" \
+      '.mutator.pid == $pid and .mutator.pgid == $pgid' "$lock/meta.json" >/dev/null ||
+      fail "the lock did not record the bounded mutator PID and PGID"
+    kill -KILL -- "-$group"
+    for ((attempt=0; attempt<100; attempt++)); do
+      [ "$(fleet_lock_group_state "$group")" != live ] && break
+      sleep 0.05
+    done
+    [ "$(fleet_lock_group_state "$group")" = empty ] && [ -n "$(fleet_lock_proc_start "$native")" ] ||
+      fail "the recorded group did not die independently of the bounded mutator"
+    fleet_lock_holder_state "$lock"
+    [ "$fleet_lock_state" = live ] ||
+      fail "standalone lock was $fleet_lock_state after its group died with a live mutator"
+    lock_rc=0
+    fleet_run_lock_take "$ROUNDHOUSE_FLEET_STORE" mac "$lock" || lock_rc=$?
+    [ "$lock_rc" -eq 10 ] || fail "fleet-run lock take after group death returned $lock_rc (expected 10)"
+    (
+      ps() { return 1; }
+      fleet_lock_holder_state "$lock"
+      [ "$fleet_lock_state" = live ] ||
+        fail "a denied process inspection hid the reachable bounded mutator"
+    )
+    kill -TERM "$native"
+    for ((attempt=0; attempt<100; attempt++)); do
+      [ -n "$(fleet_lock_proc_start "$native")" ] || break
+      sleep 0.05
+    done
+    native=
+    fleet_lock_holder_state "$lock"
+    [ "$fleet_lock_state" = dead ] ||
+      fail "standalone lock was $fleet_lock_state after the holder, group and mutator exited"
+    lock_rc=0
+    fleet_lock_take "$lock" 86400 || lock_rc=$?
+    [ "$lock_rc" -eq 11 ] || fail "dead standalone lock takeover returned $lock_rc (expected 11)"
+    fleet_lock_release "$lock" "$fleet_lock_nonce_held"
+  )
 fi

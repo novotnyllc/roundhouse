@@ -122,15 +122,15 @@
     },
     {
       "path": "scripts/lib/fleet-capture-pass.sh",
-      "sha256": "0ce02a5dfc16ebe36693c4c04f9e39668890dcd6701e503f7cbb3249ac05223c"
+      "sha256": "78b656aa7c093543003bd7ba0d55074434e5c3dcf2166fc05e7bae9278511aa0"
     },
     {
       "path": "scripts/lib/fleet-capture.sh",
-      "sha256": "d80fe0d37caa638b875a4bd0b58ab6611245339ebc0996977eefde8e3cd494b6"
+      "sha256": "97b77ffdebf92ec76115bb7bd222e11eedf1ef5e1be15a19c8d868e1fce5cc69"
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
-      "sha256": "cd07ab5142d763f0a7d706513a23f79c2c9596541fb76d296f1bd4ad0b7d4339"
+      "sha256": "757b014d7579534494c67eb0457eeabaa72ac8f0b6bbcbfdcae4139cd890f6eb"
     },
     {
       "path": "scripts/lib/fleet-fold.sh",
@@ -166,7 +166,7 @@
     },
     {
       "path": "scripts/lib/fleet-run.sh",
-      "sha256": "ce8b8d5249082b131b8617057b190e6c61dd9b69d47ed66de2e1abf0a462504f"
+      "sha256": "7dc858ba99ce236fbc5564109f89c44f8bbe623f88aa8b972882c2312449cff4"
     },
     {
       "path": "scripts/lib/fleet-schedule-plan.sh",
@@ -182,7 +182,7 @@
     },
     {
       "path": "scripts/lib/fleet-store.sh",
-      "sha256": "cee180462ac02b8f72c5ca7e20ecdab10134c8f10e39862a98495f64407cc3f5"
+      "sha256": "c31957384b1770278b47637f1d133ec1367a652f85b3c44a5e128e7a4ce16b44"
     },
     {
       "path": "scripts/lib/fleet-trigger.sh",
@@ -234,7 +234,7 @@
     },
     {
       "path": "scripts/lib/plan-apply.sh",
-      "sha256": "4a4583917f0319850c8f8cd2bf9a83a30ff8147fedacfc953ac36cdc6a560940"
+      "sha256": "0e6278d74bcaa7b37112202e417c75bce7f8a47b9e3b71ec312f66bd3d3baeca"
     },
     {
       "path": "scripts/lib/plan-contracts.sh",
@@ -250,7 +250,7 @@
     },
     {
       "path": "scripts/lib/timeout.sh",
-      "sha256": "fda31a9d8e2f543c83d9c62ca98005a175daa77d82e57c8baa6c912cf5459363"
+      "sha256": "522d55bc32f2b3fcc0e5db316ffffa4aa3f7333889fa9ed183a09b20846ac827"
     },
     {
       "path": "scripts/mcp-siding-windows.ps1",
@@ -302,7 +302,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "e85adf3f65dcf03ac0920cd71a278c68a1b29eefbf6e5f01358c59d59ae46513"
+      "sha256": "8fadb3824fbf6bc0cdeca974d6cf124a7e45bbf7b1a6735232f94e48beaecd12"
     },
     {
       "path": "scripts/roundhouse-trustd",

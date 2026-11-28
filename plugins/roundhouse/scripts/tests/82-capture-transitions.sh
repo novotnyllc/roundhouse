@@ -1,5 +1,5 @@
 # roundhouse self-check — Claude journal after partial mutations.
-# roundhouse-test: parts=14
+# roundhouse-test: parts=18
 # shellcheck shell=bash
 
 if [ -n "$fleet_fixture_yq" ]; then
@@ -55,6 +55,7 @@ if [ -n "$fleet_fixture_yq" ]; then
           case ${install_behavior:-install} in
             install) printf 'true\n' >"$capture/state" ;;
             disabled) printf 'false\n' >"$capture/state" ;;
+            unknown) printf 'unknown\n' >"$capture/state" ;;
             disabled-error) printf 'false\n' >"$capture/state"; return 1 ;;
             noop) : ;;
             fail) return 1 ;;
@@ -63,6 +64,13 @@ if [ -n "$fleet_fixture_yq" ]; then
         disable) if [ "${disable_behavior:-fail}" = disable ]; then
           printf 'false\n' >"$capture/state"
         else return 1; fi ;;
+        enable)
+          [ "${enable_behavior:-fail}" = enable ] || return 1
+          if [ -f "$transition_journal" ]; then
+            jq -c '.receipt' "$transition_journal" >"$capture/before-enable"
+          fi
+          printf 'true\n' >"$capture/state" ;;
+        update) : ;;
         *) return 1 ;;
       esac
     }
@@ -77,6 +85,7 @@ if [ -n "$fleet_fixture_yq" ]; then
         .id == "claude:demo@m" and .receipt.op == $op and
         (.receipt.seq | type) == "number" and
         (if $wanted == "absent" then .receipt.installed == false and .receipt.state == null
+        elif $wanted == "unknown" then .receipt.installed == true and .receipt.state == null
         else .receipt.installed == true and .receipt.state == $wanted end)
       ' "$transition_journal" >/dev/null
     }
@@ -106,8 +115,10 @@ if [ -n "$fleet_fixture_yq" ]; then
     }
 
     if section_part 1; then
+    transition_baseline enabled
     # A successful uninstall still owns the absence after a failed or no-op install.
     for install_behavior in fail noop; do
+      rm -f "$transition_journal"
       fleet_run_plugin_refreshed=
       fleet_run_resolved_sha=fixture
       : >"$capture/intents"
@@ -168,7 +179,7 @@ if [ -n "$fleet_fixture_yq" ]; then
       [ "$(cat "$capture/state")" = false ] || fail "reinstall changed the fixture's disabled state"
       case $install_behavior in
         disabled)
-          transition_receipt disabled install || fail "reinstall lost its verified disabled state"
+          transition_receipt unknown install || fail "disabled reinstall did not record its presence separately"
           jq -e '.intent == null' "$transition_journal" >/dev/null || fail "verified reinstall left intent" ;;
         disabled-error)
           transition_receipt absent uninstall || fail "failed reinstall erased the verified uninstall"
@@ -180,6 +191,7 @@ if [ -n "$fleet_fixture_yq" ]; then
 
     # Install succeeds, but the failed disable neither erases the install nor owns a disable.
     rm -f "$transition_journal" "$capture/state"
+    transition_baseline absent
     transition_apply disabled 74
     transition_receipt enabled install || fail "failed disable erased the install receipt"
     jq -e '.intent == null' "$transition_journal" >/dev/null || fail "unchanged disable left intent"
@@ -198,20 +210,20 @@ if [ -n "$fleet_fixture_yq" ]; then
     transition_receipt disabled disable || fail "successful retry did not replace the intermediate state"
     disable_behavior=fail
 
-    # A fresh install that starts disabled owns that state even if an enable no-ops.
+    # A failed enable preserves the prior install receipt.
     rm -f "$transition_journal" "$capture/state"
     install_behavior=disabled
     fleet_run_approve_plugin_hooks() { :; }
     fleet_run_codex_hooks_scoped() { :; }
     transition_apply enabled 74
-    transition_receipt disabled install || fail "no-op enable lost the install's verified disabled state"
+    transition_receipt unknown install || fail "no-op enable lost the install receipt"
 
     # A failed standalone state verb must not hide the owner's next edit.
     for wanted in enabled disabled; do
       rm -f "$transition_journal"
       case $wanted in
-        enabled) printf 'false\n' >"$capture/state" ;;
-        disabled) printf 'true\n' >"$capture/state" ;;
+        enabled) transition_baseline disabled; printf 'false\n' >"$capture/state" ;;
+        disabled) transition_baseline enabled; printf 'true\n' >"$capture/state" ;;
       esac
       transition_apply "$wanted" 74
       [ ! -e "$transition_journal" ] || fail "unchanged $wanted request left a receipt or intent"
@@ -269,7 +281,7 @@ if [ -n "$fleet_fixture_yq" ]; then
 
     if section_part 5; then
       transition_baseline enabled
-      printf 'false\n' >"$capture/state"
+      printf 'true\n' >"$capture/state"
       : >"$capture/owned"
       fleet_run_plugin_identity_matches() { [ -e "$capture/updated" ]; }
       bounded_verb() {
@@ -280,8 +292,9 @@ if [ -n "$fleet_fixture_yq" ]; then
         : >"$capture/updated"
       }
       fleet_plugins_claude_update_unowned '{}' m "$capture/owned" ||
-        fail "same-state update did not run after the owner disabled the plugin"
+        fail "same-state update did not run against the agreed enabled state"
       [ -e "$capture/updated" ] || fail "same-state update did not reach the manager"
+      printf 'false\n' >"$capture/state"
       transition_prepare enabled
       [ "$(cat "$capture/state")" = false ] && grep -Fqx plugins.demo "$capture/pass/capture-skip" ||
         fail "Attack #3 same-state update allowed the owner-disabled plugin to re-enable"
@@ -498,6 +511,73 @@ if [ -n "$fleet_fixture_yq" ]; then
         fail "a failed discarded uninstall let the fleet reinstall after a later owner removal"
       jq -e '.intent.op_id == "dead"' "$transition_journal" >/dev/null ||
         fail "a no-effect discarded uninstall erased the original interrupted intent"
+    fi
+
+    if section_part 15; then
+      transition_baseline disabled
+      printf 'false\n' >"$capture/state"
+      transition_prepare disabled
+      install_behavior=fail
+      fleet_run_resolved_sha=fixture
+      if fleet_run_plugin_reinstall demo@m previous >"$capture/reinstall.log" 2>&1; then
+        fail "A4 the first pass succeeded despite the failed reinstall"
+      fi
+      [ "$(cat "$capture/actions")" = "$(printf 'uninstall\ninstall')" ] && [ ! -e "$capture/state" ] ||
+        fail "A4 first pass did not leave the plugin absent after the failed install"
+
+      transition_prepare disabled
+      ! grep -Fqx plugins.demo "$capture/pass/capture-skip" ||
+        fail "A4 second pass held Roundhouse's verified removal"
+      install_behavior=install
+      transition_apply disabled 74
+      [ "$(cat "$capture/actions")" = "$(printf 'install\ndisable')" ] && [ "$(cat "$capture/state")" = true ] ||
+        fail "A4 second pass did not leave the plugin enabled after the failed disable"
+
+      disable_behavior=disable
+      for pass in 3 4 5; do
+        transition_prepare disabled
+        ! grep -Fqx plugins.demo "$capture/pass/capture-skip" ||
+          fail "A4 pass $pass held Roundhouse's install after the failed disable"
+        transition_apply disabled 0
+        [ "$(cat "$capture/state")" = false ] ||
+          fail "A4 pass $pass did not converge to disabled"
+      done
+    fi
+
+    for install_part in 16 17; do
+      section_part "$install_part" || continue
+      rm -f "$transition_journal" "$capture/state" "$capture/before-enable"
+      transition_baseline absent
+      install_behavior=disabled
+      [ "$install_part" = 16 ] || install_behavior=unknown
+      enable_behavior=enable
+      fleet_run_approve_plugin_hooks() { :; }
+      fleet_run_codex_hooks_scoped() { :; }
+      fleet_run_codex_hooks_settled() { :; }
+      transition_prepare enabled
+      transition_apply enabled 0
+      [ "$(cat "$capture/actions")" = "$(printf 'install\nenable')" ] && [ "$(cat "$capture/state")" = true ] ||
+        fail "A4 an initially $install_behavior install did not enable in the same pass"
+      transition_prepare enabled
+      ! grep -Fqx plugins.demo "$capture/pass/capture-skip" ||
+        fail "A4 the initially $install_behavior install was held on the next pass"
+      [ -f "$capture/before-enable" ] && jq -e '
+        .op == "install" and .installed == true and .state == null
+      ' "$capture/before-enable" >/dev/null &&
+        transition_receipt enabled enable && jq -e '.intent == null' "$transition_journal" >/dev/null ||
+        fail "A4 the initially $install_behavior install did not record installation separately from enable"
+    done
+
+    if section_part 18; then
+      transition_baseline enabled
+      printf 'false\n' >"$capture/state"
+      status=0
+      fleet_capture_claude_update demo@m bounded_verb claude plugin update demo@m --scope user \
+        >"$capture/standalone.log" 2>&1 || status=$?
+      [ ! -s "$capture/actions" ] ||
+        fail "A3 standalone update reached the manager after the owner disabled the plugin"
+      [ "$status" = 74 ] || fail "A3 standalone update returned $status, expected 74"
+      assert_contains "$(cat "$capture/standalone.log")" 'held; run fleet-discard'
     fi
   )
 fi

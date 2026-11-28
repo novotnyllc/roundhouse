@@ -18,8 +18,6 @@ if [ -n "$fleet_fixture_yq" ]; then
     export PATH
     # shellcheck source=/dev/null
     ROUNDHOUSE_LIB_ONLY=1 . "$cli"
-    # Native helper fixtures supply the trusted pass separately from collector coverage.
-    fleet_capture_observed='{"trusted":true}'
 
     run_root="$tmp/run"
     run_store="$run_root/store"
@@ -224,6 +222,17 @@ packages:
 YAML
     run_defs=$(yq -o=json -I=0 '.' "$run_root/definitions.yaml")
 
+    # These apply fixtures enter after the fleet pass has authorized the item.
+    run_plugin_apply() {
+      local fleet_capture_before_records fleet_capture_before_observed
+      fleet_capture_before_records=$(fleet_capture_guard_records) || return 1
+      fleet_capture_before_observed=$(claude plugin list --json | jq -c '
+        {trusted:true, claude:(map(select(.scope == "user") |
+          {key:.id, value:{value:(if .enabled then "enabled" else "disabled" end)}}) | from_entries)}
+      ') || return 1
+      fleet_run_apply_item "$@"
+    }
+
     # U23: a marketplace's resolved source SHA is the installed-byte identity.
     # Same version + same SHA is a no-op; same version + new SHA and a version
     # advance both reinstall through the native Claude manager.
@@ -280,7 +289,7 @@ JSON
       CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_missing_catalog" \
       CLAUDE_PLUGIN_MARKETPLACE_FILE="$run_plugin_marketplace_file" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "fallback catalog apply failed"
     [ ! -s "$run_plugin_install_marker" ] ||
       fail "fallback catalog reapplied an already-matching plugin"
@@ -490,7 +499,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "same-SHA plugin apply failed"
     [ ! -s "$run_plugin_install_marker" ] ||
       fail "same-version/same-SHA plugin was reinstalled"
@@ -516,7 +525,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "same-version/new-SHA plugin apply failed"
     [ -z "$(find "$run_plugin_cache" ! -type l \( -perm -020 -o -perm -002 \) -print)" ] ||
       fail "the plugin update left a group- or world-writable cache"
@@ -552,7 +561,7 @@ JSON
         CLAUDE_CONFIG_DIR="$HOME/.claude" \
         CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
         CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
           '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
       [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" &&
         grep -q 'not reinstalling while a claude session may be running' "$run_root/refresh-err" ||
@@ -571,7 +580,7 @@ JSON
         CLAUDE_CONFIG_DIR="$HOME/.claude" \
         CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
         CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
           '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
       [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" &&
         grep -q 'refresh skipped: Claude Desktop (Claude.app) is running or cannot be ruled out' "$run_root/refresh-err" ||
@@ -590,7 +599,7 @@ JSON
         CLAUDE_CONFIG_DIR="$HOME/.claude" \
         CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
         CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
           '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
       unset CLAUDE_PLUGIN_CONFIGURED CLAUDE_PLUGIN_CONFIGURE_FAIL
       [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" &&
@@ -608,7 +617,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
     if [ -n "$run_settings_saved" ]; then printf '%s\n' "$run_settings_saved" >"$run_settings"; else rm -f "$run_settings"; fi
     [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" ||
@@ -621,7 +630,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null 2>"$run_root/refresh-err" || run_status=$?
     [ "$run_status" -eq 0 ] &&
       [ "$(grep -E '^(update|uninstall|install) ' "$run_plugin_order_log" | tr '\n' ';')" = \
@@ -638,7 +647,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null 2>&1 || run_status=$?
     [ "$run_status" -eq 74 ] && ! grep -q '^uninstall ' "$run_plugin_order_log" ||
       fail "a second stale apply in one pass refreshed again or did not hold (got $run_status): $(tr '\n' ';' <"$run_plugin_order_log")"
@@ -660,7 +669,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || run_status=$?
     [ "$run_status" -eq 74 ] ||
       fail "a nonzero enable with the target state reached was credited (got $run_status)"
@@ -680,7 +689,7 @@ JSON
     printf '%s\n' "{\"version\":2,\"plugins\":{\"example@test-market\":[{\"scope\":\"user\",\"version\":\"1.2.3\",\"gitCommitSha\":\"$run_sha_new\"}]}}" >"$run_plugin_installed"
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "version-advance plugin apply failed"
     grep -qx 'example@test-market' "$run_plugin_install_marker" ||
       fail "version-advance plugin was not reinstalled"
@@ -697,7 +706,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null 2>&1 || run_status=$?
     [ "$run_status" -eq 74 ] ||
       fail "a stale post-update identity did not hold as transient (got $run_status)"
@@ -727,7 +736,7 @@ JSON
       CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >"$run_root/hooks-out" 2>&1 || run_status=$?
     # The hold is the Codex hooks' alone: the Claude item itself applies.
     [ "$run_status" -eq 0 ] &&
@@ -750,7 +759,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '{"state":"disabled","marketplace":"test-market"}' '' >/dev/null ||
       fail "disabled stale plugin apply failed"
     [ "$(sed -n '1p' "$run_plugin_order_log")" = \
@@ -773,7 +782,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '{"state":"enabled","marketplace":"test-market"}' '' >"$run_root/hooks-out" 2>&1 ||
       run_status=$?
     # Refused and nothing trusted; the hold is scoped to the Codex hooks, so
@@ -800,7 +809,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '{"state":"enabled","marketplace":"test-market"}' '' >"$run_root/hooks-out" 2>&1 ||
       run_status=$?
     # Refused and nothing trusted; the hold is scoped to the Codex hooks, so
@@ -826,7 +835,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null 2>&1 || run_status=$?
     [ "$run_status" -eq 0 ] ||
       fail "a Claude-only plugin was held by absent Codex ownership (got $run_status)"
@@ -843,7 +852,7 @@ JSON
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_new_enabled" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "never-installed plugin apply failed"
     grep -qx 'example@test-market' "$run_plugin_install_marker" ||
       fail "never-installed plugin (no installed_plugins.json) was not installed"
@@ -853,7 +862,7 @@ JSON
     CLAUDE_PLUGIN_CATALOG_FILE="$run_plugin_catalog" \
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_new_enabled" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
         '"enabled"' '' >/dev/null || fail "no-record plugin apply failed"
     grep -qx 'example@test-market' "$run_plugin_install_marker" ||
       fail "never-installed plugin (no entry in installed_plugins.json) was not installed"
@@ -874,7 +883,7 @@ JSON
         CLAUDE_CONFIG_DIR="$HOME/.claude" \
         CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
         CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
           '{"state":"enabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
         run_status=$?
       [ "$run_status" -eq 0 ] ||
@@ -892,7 +901,7 @@ JSON
         CLAUDE_CONFIG_DIR="$HOME/.claude" \
         CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
         CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-        fleet_run_apply_item "$run_store" vireo "$run_plugin_defs" plugins.example \
+        run_plugin_apply "$run_store" vireo "$run_plugin_defs" plugins.example \
           '{"state":"disabled","marketplace":"test-market"}' '' >/dev/null 2>&1 ||
         run_status=$?
       [ "$run_status" -eq 0 ] ||
@@ -910,12 +919,12 @@ JSON
     CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_unqualified_defs" plugins.claude-example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_unqualified_defs" plugins.claude-example \
         '"enabled"' '' >/dev/null || fail "unqualified plugin apply failed"
     CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_unqualified_defs" plugins.claude-example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_unqualified_defs" plugins.claude-example \
         '"disabled"' '' >/dev/null || fail "unqualified plugin disable failed"
     # AND THE SWALLOW IS NOT THE FIX: a manager that cannot report the state it
     # was asked to reach must still hold. An unwritable ledger leaves the stub's
@@ -925,7 +934,7 @@ JSON
       CLAUDE_CONFIG_DIR="$HOME/.claude" \
       CLAUDE_PLUGIN_ENABLED_FILE="$run_root/no-such-dir/enabled.json" \
       CLAUDE_INSTALL_MARKER="$run_plugin_install_marker" \
-      fleet_run_apply_item "$run_store" vireo "$run_plugin_unqualified_defs" plugins.claude-example \
+      run_plugin_apply "$run_store" vireo "$run_plugin_unqualified_defs" plugins.claude-example \
         '"enabled"' '' >/dev/null 2>&1 ||
       run_status=$?
     [ "$run_status" -eq 75 ] ||

@@ -190,7 +190,7 @@ fleet_capture_effective_base() {
         (.value.installed | type) == "boolean")) as $r (.;
       if $r.value.seq > (.[$r.key].seq // 0) then
         .[$r.key] = ((.[$r.key] // {} | del(.ignored)) + {seq:$r.value.seq,
-          value:(if $r.value.installed then $r.value.state // "unknown" else "absent" end)})
+          value:(if $r.value.installed then $r.value.state // $r.value.observed.state // "unknown" else "absent" end)})
       else . end)' <<<"$1"
 }
 

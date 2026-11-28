@@ -492,6 +492,13 @@ JSON
         >"$run_plugin_installed"
     }
     run_tomb_apply() {
+      local fleet_capture_before_records fleet_capture_before_observed
+      fleet_capture_before_records=$(fleet_capture_guard_records) || fail "could not observe tombstone fixture"
+      fleet_capture_before_observed=$(CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_PLUGIN_LIST_FROM_RECORDS=1 \
+        CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" claude plugin list --json | jq -c '
+          {trusted:true, claude:(map(select(.scope == "user") |
+            {key:.id, value:{value:(if .enabled then "enabled" else "disabled" end)}}) | from_entries)}
+        ') || fail "could not observe tombstone fixture state"
       run_status=0
       CLAUDE_CONFIG_DIR="$HOME/.claude" CLAUDE_PLUGIN_LIST_FROM_RECORDS=1 \
         CLAUDE_PLUGIN_ENABLED_FILE="$run_plugin_enabled_file" \

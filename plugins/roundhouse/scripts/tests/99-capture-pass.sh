@@ -1,12 +1,12 @@
 # roundhouse self-check — plugin ownership through a signed fixture fleet pass.
 # Reuses the fixture manager commands from 07 and the local jj remote from 90.
-# roundhouse-test: parts=15
+# roundhouse-test: parts=16
 # shellcheck shell=bash
 
 if [ "$real_jj_ok" = true ]; then
-  (
+  capture_pass_fixture() (
     set -eu
-    rjj="$tmp/capture-pass"
+    rjj="$tmp/capture-pass-$1"
     mkdir -p "$rjj/bin" "$rjj/vireo" "$rjj/home"
     ln -s "$real_jj" "$rjj/bin/jj"
     ln -s "$real_yq" "$rjj/bin/yq"
@@ -136,6 +136,57 @@ YAML
     capture_interrupted_alert() {
       capture_remote grep -Eq 'kind: agent-capture-interrupted' main -- alerts/vireo
     }
+    if [ "$1" = trigger ]; then
+      export CAPTURE_TRIGGER_OUTAGE="$rjj/outage"
+      export CAPTURE_TRIGGER_CLAUDE="$tmp/bin/claude"
+      cat >"$rjj/bin/claude" <<'SH'
+#!/bin/bash
+case "$1:$2:${3:-}" in
+  plugin:install:keeper@test-market)
+    "$CAPTURE_TRIGGER_CLAUDE" "$@" || exit $?
+    jq '.["keeper@test-market"] = false' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$CLAUDE_PLUGIN_ENABLED_FILE.next" &&
+      mv "$CLAUDE_PLUGIN_ENABLED_FILE.next" "$CLAUDE_PLUGIN_ENABLED_FILE" || exit 75
+    # The owner disabled it before Roundhouse could verify the install.
+    : >"$CAPTURE_TRIGGER_OUTAGE"
+    exit 0 ;;
+  plugin:list:--json|plugin:enable:keeper@test-market)
+    [ ! -e "$CAPTURE_TRIGGER_OUTAGE" ] || exit 75 ;;
+esac
+exec "$CAPTURE_TRIGGER_CLAUDE" "$@"
+SH
+      chmod +x "$rjj/bin/claude"
+      (
+        trap 'rc=$?; if [ "$rc" -ne 0 ]; then cat "$rjj/pass.log" >&6; fi' EXIT
+        # shellcheck source=/dev/null
+        ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+        eval "$(declare -f fleet_capture_pass_prepare | sed '1s/fleet_capture_pass_prepare/capture_original_prepare/')"
+        eval "$(declare -f fleet_capture_pass_observe_after | sed '1s/fleet_capture_pass_observe_after/capture_original_observe_after/')"
+        fleet_capture_pass_prepare() {
+          fleet_lock_identity "$run_lock" >>"$rjj/trigger-nonces"
+          capture_original_prepare "$@"
+        }
+        fleet_capture_pass_observe_after() {
+          capture_original_observe_after "$@" || return $?
+          if [ -e "$CAPTURE_TRIGGER_OUTAGE" ]; then
+            jq -e '.claude == null' <<<"$fleet_capture_after_observed" >/dev/null ||
+              fail "Attack #7 fixture did not make the first post-scan unusable"
+            rm -f "$CAPTURE_TRIGGER_OUTAGE"
+            fleet_trigger_stamp
+          fi
+        }
+        fleet_run_command --fast
+      ) 6>&2 >"$rjj/pass.log" 2>&1
+      [ "$(wc -l <"$rjj/trigger-nonces" | tr -d ' ')" -eq 2 ] &&
+        [ "$(sort -u "$rjj/trigger-nonces" | wc -l | tr -d ' ')" -eq 1 ] || {
+        cat "$rjj/pass.log" >&2
+        fail "Attack #7 did not run two passes under the same lock nonce"
+      }
+      [ "$(cat "$CLAUDE_PLUGIN_ACTION_LOG")" = 'install keeper@test-market' ] &&
+        jq -e '.["keeper@test-market"] == false' "$CLAUDE_PLUGIN_ENABLED_FILE" >/dev/null ||
+        fail "Attack #7 second pass re-enabled the plugin disabled by the owner"
+      capture_interrupted_alert || fail "Attack #7 second pass did not report the interrupted install"
+      exit 0
+    fi
     capture_pass first
     jq -e '
       ._initialized.claude == true and
@@ -675,6 +726,8 @@ JSONL
 
     printf 'real-jj: OK (silent baseline, guarded local changes, discard, and agreement)\n'
   )
+  if section_part 16; then capture_pass_fixture trigger; fi
+  case ${ROUNDHOUSE_TEST_PART:-} in 16/*) ;; *) capture_pass_fixture ordinary ;; esac
 else
   printf 'NOTICE: plugin observation pass fixture requires real jj >= 0.43 and yq\n'
 fi

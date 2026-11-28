@@ -1671,9 +1671,10 @@ EOF
     elif [ -z "$doctor_age" ]; then
       fleet_doctor_row finding run-lock \
         "$doctor_lock has no readable meta.json, so its age is unknown; confirm no live runner, then remove it"
-    elif [ "$doctor_age" -gt "$doctor_ceiling" ] && [ "$fleet_lock_live_by" = group ]; then
+    elif [ "$doctor_age" -gt "$doctor_ceiling" ] && [ "$fleet_lock_state" = live ] &&
+      [ "$fleet_lock_live_by" != holder ]; then
       fleet_doctor_row finding run-lock \
-        "$doctor_lock has been held by a live run ($(fleet_lock_holder_desc "$doctor_lock")) for ${doctor_age}s, past the ${doctor_ceiling}s pass ceiling; the next run cannot prove it is the recorded run and refuses — stop that group, then fleet-unlock"
+        "$doctor_lock has been held by a live run ($(fleet_lock_holder_desc "$doctor_lock")) for ${doctor_age}s, past the ${doctor_ceiling}s pass ceiling; the next run cannot prove it is the recorded run and refuses — stop the surviving processes, then fleet-unlock"
     elif [ "$doctor_age" -gt "$doctor_ceiling" ] && [ "$fleet_lock_state" = live ]; then
       fleet_doctor_row finding run-lock \
         "$doctor_lock has been held by a live run ($(fleet_lock_holder_desc "$doctor_lock")) for ${doctor_age}s, past the ${doctor_ceiling}s pass ceiling; the next run stops it and takes the lock over"

@@ -2681,6 +2681,8 @@ EOF
           "$fleet_run_install_cask" "$fleet_run_install_version"
       ;;
     plugins)
+      local fleet_capture_chain fleet_capture_chain_observed=
+      fleet_capture_chain=$(fleet_lock_nonce) || return 74
       # A TOMBSTONE converges by uninstalling, and is SATISFIED where the
       # plugin is not installed — asked before the harness check, because a
       # host with no `claude` has no plugin to remove either.
@@ -2712,9 +2714,7 @@ EOF
       fleet_run_want_enabled=false
       [ "$fleet_run_item_state" = enabled ] && fleet_run_want_enabled=true
       fleet_run_plugin_mutated=false
-      local capture_expected='' capture_pre_status=0 capture_install_guard=false
-      local fleet_capture_verb_before='' fleet_capture_verb_after=''
-      [ "$fleet_run_want_enabled" = true ] || capture_install_guard=true
+      local capture_pre_status=0
       fleet_run_resolved_sha=
       if [ -n "$fleet_run_market" ]; then
         # A catalog that cannot prove the bytes — no entry (an unregistered
@@ -2766,13 +2766,8 @@ EOF
             fleet_capture_verb "claude:$fleet_run_id" update unchanged -- \
               fleet_run_claude_plugin_verb update "$fleet_run_id" --scope user || return 74
           else
-            fleet_capture_verb_guard=$capture_install_guard \
-              fleet_capture_verb "claude:$fleet_run_id" install installed -- \
+            fleet_capture_verb "claude:$fleet_run_id" install installed -- \
               fleet_run_claude_plugin_verb install "$fleet_run_id" --scope user || return $?
-            if [ "$fleet_run_want_enabled" = false ] &&
-              jq -e '.installed == [] and .state == "unknown"' >/dev/null <<<"$fleet_capture_verb_before"; then
-              capture_expected=$fleet_capture_verb_after
-            fi
           fi
           # The manager wrote the cache under its caller's umask, and 002
           # leaves it group-writable. Seal it before it is re-verified, its
@@ -2791,7 +2786,6 @@ EOF
             [ -n "$fleet_run_installed_sha" ] || return 74
             fleet_run_plugin_reinstall "$fleet_run_id" \
               "$(printf '%s\n' "$fleet_run_reverified" | jq -r '.gitCommitSha // "none"')" || return 74
-            capture_expected=$fleet_capture_verb_after
             plugin_cache_seal_permissions "$fleet_run_id" || return 75
             fleet_run_reverified=$(fleet_run_installed_plugin "$fleet_run_id") || return 74
             fleet_run_plugin_at_identity "$fleet_run_reverified" || return 74
@@ -2815,13 +2809,8 @@ EOF
       else
         fleet_run_installed=$(fleet_run_installed_plugin "$fleet_run_id") || return 75
         if [ "$fleet_run_installed" = '{}' ]; then
-          fleet_capture_verb_guard=$capture_install_guard \
-            fleet_capture_verb "claude:$fleet_run_id" install installed -- \
+          fleet_capture_verb "claude:$fleet_run_id" install installed -- \
             fleet_run_claude_plugin_verb install "$fleet_run_id" --scope user || return $?
-          if [ "$fleet_run_want_enabled" = false ] &&
-            jq -e '.installed == [] and .state == "unknown"' >/dev/null <<<"$fleet_capture_verb_before"; then
-            capture_expected=$fleet_capture_verb_after
-          fi
           fleet_run_plugin_mutated=true
         fi
         # As above: seal what the manager wrote before approving its hooks.
@@ -2851,8 +2840,7 @@ EOF
       if [ "$fleet_run_before_enabled" != "$fleet_run_want_enabled" ]; then
         local state_verb=enable
         [ "$fleet_run_want_enabled" = true ] || state_verb=disable
-        fleet_capture_verb_expected=$capture_expected \
-          fleet_capture_verb "claude:$fleet_run_id" "$state_verb" "$fleet_run_item_state" -- \
+        fleet_capture_verb "claude:$fleet_run_id" "$state_verb" "$fleet_run_item_state" -- \
           fleet_run_claude_plugin_verb "$state_verb" "$fleet_run_id" --scope user || return $?
         fleet_run_enable_attempted=$fleet_run_want_enabled
       else
@@ -4552,6 +4540,8 @@ fleet_run_plugin_reinstall() {
   # reinstall: uninstall (keeping the plugin's data) and install again. At
   # most once per plugin per pass (fleet_run_marketplace_repair_reset clears
   # the list). Enabled state is re-converged by the caller's state verbs.
+  local fleet_capture_chain=${fleet_capture_chain:-} fleet_capture_chain_observed=${fleet_capture_chain_observed:-}
+  [ -n "$fleet_capture_chain" ] || fleet_capture_chain=$(fleet_lock_nonce) || return 74
   case " ${fleet_run_plugin_refreshed:-} " in *" $1 "*) return 1 ;; esac
   fleet_run_plugin_refreshed="${fleet_run_plugin_refreshed:-} $1"
   # The uninstall removes the files a running session uses (the tombstone
@@ -5835,7 +5825,7 @@ fleet_unlock_command() (
     }
   fi
   if [ -n "$unlock_id" ]; then
-    fleet_lock_release "$unlock" "$unlock_id" || {
+    fleet_lock_release "$unlock" "$unlock_id" "$unlock_force" || {
       printf 'roundhouse: %s changed while it was being released (another run took it); nothing released\n' \
         "$unlock" >&2
       exit 75

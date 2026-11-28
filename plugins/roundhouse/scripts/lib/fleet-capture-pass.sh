@@ -24,13 +24,14 @@ fleet_capture_item_state() {
         elif $raw.manager_state == "false" then "disabled"
         elif ($raw.settings[$id] | type) == "boolean" then
           if $raw.settings[$id] then "enabled" else "disabled" end
-        else null end),sources:$raw} end'
+        else null end),sources:$raw} end |
+    if .state != null then .sources.state = (.state == "enabled" | tostring) else . end'
 }
 
 fleet_capture_verb() {
   # ID OP TO -- argv: intent is durable before the native call, receipt only after proof.
   local id=$1 op=$2 to=$3 path journal home live after seq op_id record rc=0 failure=74 read_failure=74
-  local fleet_capture_active_op=
+  local fleet_capture_active_op= fleet_mutator_lock= expected chain carry=false
   shift 3
   [ "${1:-}" = -- ] || return 64
   shift
@@ -39,7 +40,7 @@ fleet_capture_verb() {
   [ "$op" != uninstall ] || failure=75
   read_failure=$failure
   case $op in enable|disable) read_failure=75 ;; esac
-  local observed=${fleet_capture_observed:-${fleet_capture_before_observed:-}} collect_dir baseline discard
+  local observed=${fleet_capture_observed:-${fleet_capture_before_observed:-${fleet_capture_chain_observed:-}}} collect_dir baseline discard
   local name=${id#claude:} discarded=false state base
   if [ -z "$observed" ]; then
     collect_dir=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-capture-verb.XXXXXX") || return 74
@@ -50,6 +51,7 @@ fleet_capture_verb() {
     fi
   fi
   jq -e '.trusted == true' >/dev/null <<<"$observed" || return 74
+  [ -z "${fleet_capture_chain:-}" ] || fleet_capture_chain_observed=$observed
   fleet_capture_id_valid "$id" || return "$failure"
   path=$(fleet_agent_journal_path "$id") || return "$failure"
   fleet_capture_migrate_pending || return "$failure"
@@ -63,7 +65,10 @@ fleet_capture_verb() {
   if [ "$id" != claude:roundhouse@novotnyllc ] && [ "$discarded" != true ]; then
     fleet_capture_quarantined "${name%@*}" && return "$failure"
     if [ -z "${fleet_capture_before_records:-}" ] &&
-      jq -e '.raced == true' >/dev/null <<<"$base"; then return 74; fi
+      jq -e '.raced == true' >/dev/null <<<"$base"; then
+      printf '  hold  %s — held; run fleet-discard\n' "$id" >&2
+      return 74
+    fi
   fi
   if [ "$discarded" != true ] && fleet_agent_journal_unresolved "$journal"; then
     if [ "$id" != claude:roundhouse@novotnyllc ]; then
@@ -73,25 +78,46 @@ fleet_capture_verb() {
     journal=$(jq -c --arg home "$home" 'if .home != $home then {id:.id,home:$home}
       else del(.intent) end' <<<"$journal") || return "$failure"
   fi
-  case $op in
-    uninstall|disable)
-      fleet_capture_guard_destructive "${id#claude:}" "${fleet_capture_verb_expected:-}" \
-        "${fleet_capture_verb_initial:-unknown}" || return 74 ;;
-    *)
-      if [ "${fleet_capture_verb_guard:-false}" = true ]; then
-        fleet_capture_guard_destructive "${id#claude:}" "${fleet_capture_verb_expected:-}" \
-          "${fleet_capture_verb_initial:-unknown}" || return 74
-      fi ;;
-  esac
-  live=$(fleet_capture_item_state "$id") || return "$read_failure"
+  chain=${fleet_capture_chain:-}
+  expected=$(jq -r --arg chain "$chain" '
+    if $chain != "" and .receipt.chain == $chain then .receipt.observed.sources // empty
+    else empty end' <<<"$journal") || return "$failure"
+  [ -z "$expected" ] || carry=true
+  if [ -z "$expected" ] && [ -z "${fleet_capture_before_records:-}" ]; then
+    baseline=$(fleet_capture_effective_base "$baseline") || return "$failure"
+    # Without an effective base, only a missing plugin can be installed safely.
+    expected=$(jq -cn --arg id "$id" --arg name "$name" --argjson baseline "$baseline" '
+      ($baseline[$id].value // "absent") as $state |
+      {installed:(if $state == "absent" then [] else [$name] end),settings:null,
+        state:(if $state == "enabled" then "true" elif $state == "disabled" then "false"
+          else "unknown" end)}') || return "$failure"
+  fi
+  live=$(fleet_capture_item_state "$id") || return 74
+  if [ "$id" != claude:roundhouse@novotnyllc ] && [ "$discarded" != true ]; then
+    if [ "$carry" != true ] && [ -z "${fleet_capture_before_records:-}" ] &&
+      jq -e '.installed != [] and .state == "unknown"' >/dev/null <<<"$expected"; then
+      printf '  hold  %s — held; run fleet-discard\n' "$id" >&2
+      return 74
+    fi
+    fleet_capture_guard_destructive "$name" "$expected" unknown "$(jq -c .sources <<<"$live")" || {
+      if [ -z "${fleet_capture_before_records:-}" ]; then
+        printf '  hold  %s — held; run fleet-discard\n' "$id" >&2
+      fi
+      return 74
+    }
+  fi
   if [ "$discarded" = true ]; then
     state=$(jq -r 'if .installed then .state // "unknown" else "absent" end' <<<"$live") || return 74
     fleet_capture_discard_matches "$discard" "$id" "$state" "$journal" "$base" || return 74
   fi
-  fleet_capture_verb_before=$(jq -c .sources <<<"$live") || return "$failure"
-  fleet_capture_verb_after=
+  [ -z "${fleet_lock_nonce_held:-}" ] || fleet_mutator_lock=$(fleet_lock_path)
   # These verbs change bytes only; they cannot claim enabled-state provenance.
-  case $op in update|seal|refresh) fleet_run_cli_invalidate; "$@"; return $? ;; esac
+  case $op in update|seal|refresh)
+    fleet_run_cli_invalidate
+    "$@" || rc=$?
+    [ -z "$fleet_mutator_lock" ] || fleet_lock_mutator "$fleet_mutator_lock" "$fleet_lock_nonce_held" || return "$failure"
+    return "$rc" ;;
+  esac
   seq=$(fleet_capture_next_seq) || return "$failure"
   op_id=$(fleet_lock_nonce) || return "$failure"
   [ -n "$op_id" ] || return "$failure"
@@ -104,17 +130,20 @@ fleet_capture_verb() {
   fleet_capture_active_op=$op_id
   fleet_run_cli_invalidate
   "$@" || rc=$?
+  [ -z "$fleet_mutator_lock" ] || fleet_lock_mutator "$fleet_mutator_lock" "$fleet_lock_nonce_held" || return "$failure"
+  fleet_mutator_lock=
   fleet_capture_active_op=
   fleet_run_cli_invalidate
   after=$(fleet_capture_item_state "$id") || return "$read_failure"
-  fleet_capture_verb_after=$(jq -c .sources <<<"$after") || return "$failure"
   if [ "$rc" -eq 0 ] && jq -e --arg op "$op" '
     if $op == "install" then .installed == true
     elif $op == "uninstall" then .installed == false
     elif $op == "enable" then .installed == true and .state == "enabled"
     else .installed == true and .state == "disabled" end' >/dev/null <<<"$after"; then
-    record=$(jq -c --argjson after "$after" --arg op "$op" --argjson seq "$seq" '
-      .receipt = {installed:$after.installed,state:$after.state,seq:$seq,op:$op} | del(.intent)' \
+    record=$(jq -c --argjson after "$after" --arg op "$op" --arg chain "$chain" --argjson seq "$seq" '
+      .receipt = {installed:$after.installed,
+        state:(if $op == "install" and $after.state != "enabled" then null else $after.state end),
+        observed:$after,chain:$chain,seq:$seq,op:$op} | del(.intent)' \
       <<<"$record") || return "$failure"
     if [ "$discarded" = true ] && jq -e '.raced == true' >/dev/null <<<"$base"; then
       # The intent still fences a crash while the authorized old race is retired.
@@ -138,11 +167,7 @@ fleet_capture_verb() {
     fleet_capture_json_write "$path" "$record" || return "$failure"
     return 0
   fi
-  case $op in
-    enable|disable) jq -e '.state != null' >/dev/null <<<"$after" || return 75 ;;
-  esac
-  if [ "$after" = "$live" ] &&
-    { [ "$op" != enable ] && [ "$op" != disable ] || jq -e '.state != null' >/dev/null <<<"$live"; }; then
+  if [ "$after" = "$live" ]; then
     # No effect restores the evidence from before this attempt.
     if jq -e '.receipt != null or .intent != null' >/dev/null <<<"$journal"; then
       fleet_capture_json_write "$path" "$journal" || return "$failure"
@@ -150,6 +175,9 @@ fleet_capture_verb() {
       rm -f "$path" || return "$failure"
     fi
   fi
+  case $op in
+    enable|disable) jq -e '.state != null' >/dev/null <<<"$after" || return "$read_failure" ;;
+  esac
   return "$failure"
 }
 
@@ -574,10 +602,10 @@ fleet_capture_race_held() {
 }
 
 fleet_capture_guard_destructive() {
-  # Standalone supervised operations have no fleet-run observation to compare.
+  # Every verb compares with its chain receipt, pass-start observation, or effective base.
   local expected=${2:-} initial=${3:-unknown} comparison
   fleet_capture_guard_current=
-  [ -n "${fleet_capture_before_records:-}" ] || return 0
+  [ -n "$expected" ] || [ -n "${fleet_capture_before_records:-}" ] || return 1
   if fleet_capture_race_held "$1"; then
     printf '  defer %s — a previous Claude change still awaits verification\n' "$1"
     return 1
@@ -586,7 +614,8 @@ fleet_capture_guard_destructive() {
     expected=$(fleet_capture_guard_target "$1" "$fleet_capture_before_records" \
       "$fleet_capture_before_observed") || return 1
   fi
-  fleet_capture_guard_current=$(fleet_capture_guard_live "$1") || return 1
+  fleet_capture_guard_current=${4:-}
+  [ -n "$fleet_capture_guard_current" ] || fleet_capture_guard_current=$(fleet_capture_guard_live "$1") || return 1
   comparison=$(jq -r --argjson before "$expected" --arg initial "$initial" '
     def changed($old): . != null and $old != null and . != $old;
     if .query_ok == false or .uncertain == true or .installed == null or .settings == null or
@@ -599,6 +628,7 @@ fleet_capture_guard_destructive() {
         $initial != "unknown" and .manager_state != "unknown" and .manager_state != $initial
       else .state != "unknown" and .state != $before.state end)
     then "changed"
+    elif .installed != [] and (($before.state == "unknown") != (.state == "unknown")) then "unobserved"
     elif (.installed != null and $before.installed != null) or
       (.state != "unknown" and $before.state != "unknown") then "stable"
     else "unobserved" end

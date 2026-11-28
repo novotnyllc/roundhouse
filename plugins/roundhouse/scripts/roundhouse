@@ -190,7 +190,8 @@ shift
 # uninstall take the schedule lock (lib/fleet-schedule-plan.sh), judged the
 # same way.
 case $command in
-  fleet-run | fleet-age-evidence | fleet-compact-alerts | fleet-disown | fleet-schedule | fleet-discard)
+  fleet-run | fleet-age-evidence | fleet-compact-alerts | fleet-disown | fleet-schedule | fleet-discard | \
+    fleet-apply | apply-plan | apply-native-plan)
     fleet_lock_lead_group "$0" "$command" "$@"
     ;;
 esac

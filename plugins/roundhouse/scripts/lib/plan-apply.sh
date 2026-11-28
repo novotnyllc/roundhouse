@@ -670,7 +670,7 @@ EOF
               fleet_capture_native_target=true
             fi
             fleet_run_lock_plugin_mutation || exit $?
-            fleet_capture_verb "claude:$plugin_id" update unchanged -- "$@" || exit $?
+            fleet_capture_verb "claude:$plugin_id" update unchanged -- bounded_verb "$@" || exit $?
             plugin_cache_seal_permissions "$plugin_id" || exit 65
           ) || return $?
           return
