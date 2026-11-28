@@ -85,10 +85,14 @@ fleet_capture_verb() {
   [ -z "$expected" ] || carry=true
   if [ -z "$expected" ] && [ -z "${fleet_capture_before_records:-}" ]; then
     baseline=$(fleet_capture_effective_base "$baseline") || return "$failure"
-    # Without an effective base, only a missing plugin can be installed safely.
-    expected=$(jq -cn --arg id "$id" --arg name "$name" --argjson baseline "$baseline" '
-      ($baseline[$id].value // "absent") as $state |
-      {installed:(if $state == "absent" then [] else [$name] end),settings:null,
+    # A known receipt or baseline is the standalone EXPECTED. With none, the
+    # observation just collected is the pass-start state — not "absent".
+    expected=$(jq -cn --arg id "$id" --arg name "$name" --arg observed_state "$state" \
+      --argjson baseline "$baseline" --argjson observed "$observed" '
+      ($baseline[$id].value // "") as $base |
+      (if $base != "" then $base else $observed_state end) as $state |
+      {installed:(if $state == "absent" then [] else [$name] end),
+        settings:(if $base != "" then null else ($observed.records.enabled // null) end),
         state:(if $state == "enabled" then "true" elif $state == "disabled" then "false"
           else "unknown" end)}') || return "$failure"
   fi

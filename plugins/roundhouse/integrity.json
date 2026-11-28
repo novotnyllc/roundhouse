@@ -122,7 +122,7 @@
     },
     {
       "path": "scripts/lib/fleet-capture-pass.sh",
-      "sha256": "78b656aa7c093543003bd7ba0d55074434e5c3dcf2166fc05e7bae9278511aa0"
+      "sha256": "2d1fc7733d4ffd5a76ab06d78718db1d8b43ba51ca166c73edcc5a2c11159660"
     },
     {
       "path": "scripts/lib/fleet-capture.sh",
@@ -302,7 +302,7 @@
     },
     {
       "path": "scripts/roundhouse",
-      "sha256": "8fadb3824fbf6bc0cdeca974d6cf124a7e45bbf7b1a6735232f94e48beaecd12"
+      "sha256": "fe72b4f866ef17d0e12ffd9356a50f801711bb6bcd839636bb40381a67bfc637"
     },
     {
       "path": "scripts/roundhouse-trustd",

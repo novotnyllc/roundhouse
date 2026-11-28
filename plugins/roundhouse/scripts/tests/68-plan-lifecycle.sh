@@ -337,6 +337,11 @@ plan_claude_cache="$HOME/.claude/plugins/cache/test-market/claude-example"
 mkdir -p "$plan_claude_cache/3.0.0"
 printf 'x\n' >"$plan_claude_cache/3.0.0/file"
 chmod -R g+w,o+w "$plan_claude_cache"
+# Keep the registry in agreement with the list stub so apply-plan's
+# observation is trusted.
+mkdir -p "$HOME/.claude/plugins"
+printf '%s\n' '{"version":2,"plugins":{"claude-example@test-market":[{"scope":"user","version":"2.0.0"}]}}' \
+  >"$HOME/.claude/plugins/installed_plugins.json"
 CLAUDE_MANAGER_STDOUT=1 CLAUDE_CONFIG_DIR="$HOME/.claude" \
   "$cli" apply-plan "$tmp/plugin-agent-plan.json" \
   "$plugin_agent_plan_id" "$tmp/plugin-agent-result.jsonl"
