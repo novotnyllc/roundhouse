@@ -728,7 +728,7 @@ YAML
   # ignored extra converges to the fleet change.
   rm -f "$rjj/vireo/store.run/agent-baseline.json"
   runjj_tomb_run >/dev/null || fail "the initial local plugin observation failed"
-  jq -e '.["claude:retired@test-market"] == {value:"disabled",ignored:true}' \
+  jq -e '(.["claude:retired@test-market"] | del(.seq)) == {value:"disabled",ignored:true}' \
     "$rjj/vireo/store.run/agent-baseline.json" >/dev/null ||
     fail "the local plugin was not observed before the fleet changed its state"
   # Over the cap, the uninstall is a removal like any other and holds.
