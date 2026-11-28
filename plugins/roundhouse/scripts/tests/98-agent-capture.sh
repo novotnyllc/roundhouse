@@ -1,5 +1,5 @@
 # roundhouse self-check — Claude observation, its agreed baseline, and merge.
-# roundhouse-test: parts=11
+# roundhouse-test: parts=14
 # shellcheck shell=bash
 
 if [ -n "$fleet_fixture_yq" ]; then
@@ -40,13 +40,15 @@ if [ -n "$fleet_fixture_yq" ]; then
       printf '%s\n' '{"plugins":{}}' >"$rh_registry"
       printf '%s\n' '{}' >"$rh_settings_path"
       fleet_capture_json_write "$rh_capture_dir/agent-baseline.json" "$rh_installed_base"
+      printf '%s\n' 'plugins: {keeper: {state: enabled, marketplace: m}}' >"$rh_capture_store/fleet.yaml"
       rh_observed=$(capture_snapshot "$rh_capture_root/empty.jsonl")
-      fleet_capture_rebaseline "$rh_capture_store" mac "$rh_tombstone_fold" "$rh_observed" true
+      rh_desired=$(fleet_run_desired "$rh_capture_store" mac)
+      fleet_capture_rebaseline "$rh_capture_store" mac "$rh_desired" "$rh_observed" true
       jq -e '.claude == {} and .trusted == false' <<<"$rh_observed" >/dev/null &&
         jq -e --argjson expected "$rh_installed_base" '. == $expected' \
           "$rh_capture_dir/agent-baseline.json" >/dev/null ||
         fail "a wiped Claude home did not yield an untrusted observation with agreement unchanged"
-      fleet_capture_rows "$rh_capture_store" "$rh_tombstone_fold" "$rh_observed" "$rh_installed_base" |
+      fleet_capture_rows "$rh_capture_store" "$rh_desired" "$rh_observed" "$rh_installed_base" |
         jq -e 'any(.[]; .item == "plugins.keeper" and .ours == "unobserved")' >/dev/null ||
         fail "a wiped inventory was read as a known local removal"
     )
@@ -245,6 +247,63 @@ JSONL
     )
     fi
 
+    if section_part 12; then
+    (
+      capture_fixture empty-agreement
+      printf '%s\n' '{"plugins":{}}' >"$rh_registry"
+      printf '%s\n' '{}' >"$rh_settings_path"
+      fleet_capture_json_write "$rh_capture_dir/agent-baseline.json" \
+        '{"_initialized":{"claude":true},"claude:keeper@m":{"value":"enabled"},"claude:extra@m":{"value":"disabled"}}'
+      for rh_state in wanted absent; do
+        if [ "$rh_state" = wanted ]; then
+          rh_desired='{"plugins":{"keeper":{"state":"enabled","marketplace":"m"},"extra":{"state":"disabled","marketplace":"m"}}}'
+        else
+          rh_desired='{"plugins":{"keeper":{"state":"absent","marketplace":"m"},"extra":{"state":"absent","marketplace":"m"}}}'
+        fi
+        ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_SEED_SNAPSHOT="$rh_capture_root/empty.jsonl" \
+          fleet_capture_pass_prepare "$rh_capture_store" mac "$rh_desired" true true "$rh_capture_tmp" "$rh_capture_store"
+        if [ "$rh_state" = wanted ]; then
+          [ "$fleet_capture_authoritative" = false ] || fail "#136 owner-empty inventory was trusted while the store still wanted every plugin"
+        else
+          [ "$fleet_capture_authoritative" = true ] && [ ! -s "$rh_capture_tmp/capture-skip" ] ||
+            fail "#136 an empty inventory stayed untrusted or held after the store agreed all plugins were absent"
+          fleet_capture_rebaseline "$rh_capture_store" mac "$rh_desired" "$fleet_capture_observed" true
+          jq -e 'all(.["claude:keeper@m"], .["claude:extra@m"]; .value == "absent" and .seq > 0)' \
+            "$rh_capture_dir/agent-baseline.json" >/dev/null ||
+            fail "#136 store agreement did not advance both plugins to absent"
+        fi
+      done
+    )
+    fi
+
+    for rh_empty_part in 13 14; do
+      section_part "$rh_empty_part" || continue
+      (
+        capture_fixture "empty-journal-$rh_empty_part"
+        printf '%s\n' '{"plugins":{}}' >"$rh_registry"
+        printf '%s\n' '{}' >"$rh_settings_path"
+        fleet_capture_json_write "$rh_capture_dir/agent-baseline.json" \
+          '{"_initialized":{"claude":true},"claude:keeper@m":{"value":"enabled","seq":1}}'
+        rh_record=$(jq -cn --arg home "$(cd "$CLAUDE_CONFIG_DIR" && pwd -P)" '{id:"claude:keeper@m",home:$home}')
+        if [ "$rh_empty_part" = 13 ]; then
+          rh_record=$(jq -c '.receipt = {installed:true,state:null,seq:2,op:"install"}' <<<"$rh_record")
+          rh_empty_failure="an installed receipt with unknown enabled state made empty inventory trusted"
+        else
+          rh_record=$(jq -c '.intent = {op:"install",to:"installed",from:{installed:false,state:null},
+            seq:3,op_id:"dead",pid:2147483647,start:"dead"}' <<<"$rh_record")
+          fleet_capture_json_write "$rh_capture_dir/agent-discard.json" \
+            '{"claude:keeper@m":{"id":"claude:keeper@m","observed":{"installed":false,"state":null},"seq":2}}'
+          rh_empty_failure="a discard older than an interrupted operation made empty inventory trusted"
+        fi
+        fleet_capture_json_write "$rh_capture_dir/agent-journal/claude.keeper@m" "$rh_record"
+        rh_desired='{"plugins":{"keeper":{"state":"enabled","marketplace":"m"}}}'
+        ROUNDHOUSE_SELFTEST=1 ROUNDHOUSE_SEED_SNAPSHOT="$rh_capture_root/empty.jsonl" \
+          fleet_capture_pass_prepare "$rh_capture_store" mac "$rh_desired" true true "$rh_capture_tmp" "$rh_capture_store"
+        jq -e '.claude == {} and .trusted == false' <<<"$fleet_capture_observed" >/dev/null ||
+          fail "$rh_empty_failure"
+      )
+    done
+
     if section_part 4; then
     capture_fixture baseline
     while read -r base ours theirs answer; do
@@ -272,10 +331,11 @@ ignored:enabled absent disabled conflict
 MERGE
 
     capture_receipt() {
-      local id=$1 state=$2 record
+      local id=$1 state=$2 record seq
+      seq=$(fleet_capture_next_seq)
       record=$(jq -cn --arg id "$id" --arg home "$(cd "$CLAUDE_CONFIG_DIR" && pwd -P)" \
-        --arg state "$state" '{id:$id,home:$home,receipt:{installed:($state != "absent"),
-          state:(if $state == "absent" then null else $state end),seq:1,
+        --arg state "$state" --argjson seq "$seq" '{id:$id,home:$home,receipt:{installed:($state != "absent"),
+          state:(if $state == "absent" then null else $state end),seq:$seq,
           op:(if $state == "absent" then "uninstall" else "disable" end)}}')
       fleet_capture_json_write "$(fleet_agent_journal_path "$id")" "$record"
     }
@@ -305,9 +365,10 @@ YAML
       fail "Claude's first usable observation did not hold the ambiguous item and disabled local install against absent"
     fleet_capture_rebaseline "$rh_capture_store" mac "$rh_capture_fold" "$rh_capture_ours" true
     rh_capture_base=$(cat "$rh_capture_dir/agent-baseline.json")
-    jq -e '._initialized.claude == true and .["claude:extra@m"] == {value:"enabled",ignored:true} and
-      .["plugins.retired"] == {value:"absent"} and .["claude:capped@m"] == {value:"absent"} and
-      .["claude:keeper@m"] == {value:"enabled"} and
+    jq -e '._initialized.claude == true and
+      (.["claude:extra@m"] | .value == "enabled" and .ignored == true and .seq > 0) and
+      .["plugins.retired"].value == "absent" and .["claude:capped@m"].value == "absent" and
+      .["claude:keeper@m"].value == "enabled" and
       all(keys[]; startswith("claude:ambiguous@") | not)' <<<"$rh_capture_base" >/dev/null ||
       fail "first observation lost agreed values, extras, or wrote an ambiguous value"
 

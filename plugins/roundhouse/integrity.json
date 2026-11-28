@@ -122,11 +122,11 @@
     },
     {
       "path": "scripts/lib/fleet-capture-pass.sh",
-      "sha256": "e6b321345e09fff0edda7b8e2f371a4b789ae7b2b3985acef35432517d47f6ea"
+      "sha256": "0ce02a5dfc16ebe36693c4c04f9e39668890dcd6701e503f7cbb3249ac05223c"
     },
     {
       "path": "scripts/lib/fleet-capture.sh",
-      "sha256": "b25b906cee4ace719382c1ffb56a1d17c1fc22b0c5669a335e75acf95f73dbba"
+      "sha256": "d80fe0d37caa638b875a4bd0b58ab6611245339ebc0996977eefde8e3cd494b6"
     },
     {
       "path": "scripts/lib/fleet-doctor.sh",
@@ -154,7 +154,7 @@
     },
     {
       "path": "scripts/lib/fleet-publish-verbs.sh",
-      "sha256": "87c1c416d9dee63ffa00e98cf214140912d369d3cc3104cd239000fc57c582db"
+      "sha256": "5602eb25bb7b543264961c559ab966708961c5a139b5b271eff5556c3b7f0a4e"
     },
     {
       "path": "scripts/lib/fleet-records.sh",

@@ -162,6 +162,10 @@ if [ -n "$fleet_fixture_yq" ]; then
       jq -e '.detail | test("12") and length < 400' <<<"$(yq -o=json "$alert")" >/dev/null ||
         fail "A7 ignored extras alert was missing or unbounded"
 
+      fleet_capture_item_state() {
+        [ "$1" = "$fixture_discard_id" ] || return 1
+        printf '%s\n' '{"installed":true,"state":"enabled"}'
+      }
       # Qualified hold reports stay bounded while local output keeps the identity.
       long_name=$(printf '%080d' 0 | tr 0 n)
       for market_length in 70 350; do
@@ -182,7 +186,8 @@ if [ -n "$fleet_fixture_yq" ]; then
           fleet_store_path() { printf '%s\n' "$store"; }
           fleet_lock_path() { printf '%s\n' "$capture_root/discard.lock"; }
           fleet_run_stale_after() { printf '600\n'; }
-          fleet_discard_command "claude:$long_id" >/dev/null
+          fixture_discard_id="claude:$long_id"
+          fleet_discard_command "$fixture_discard_id" >/dev/null
         ) || fail "A7 a bounded qualified report could not be discarded"
       done
 
@@ -202,9 +207,12 @@ if [ -n "$fleet_fixture_yq" ]; then
         [ ! -e "$(fleet_lock_path)" ] || fail "rejected discard leaked its run lock"
         fleet_alert_write "$store" mac agent-local-change agent-local-change \
           'claude:plugins.foo@m added locally' plugins.plugins.foo@m
+        fixture_discard_id=claude:plugins.foo@m
         for item in claude:plugins.foo@m plugins.plugins.foo@m; do
           fleet_discard_command "$item" >/dev/null || fail "discard rejected a plugins.-prefixed name"
-          jq -e '. == {"claude:plugins.foo@m":true}' "$state_dir/agent-discard.json" >/dev/null ||
+          jq -e 'keys == ["claude:plugins.foo@m"] and (."claude:plugins.foo@m" |
+            .id == "claude:plugins.foo@m" and .observed == {installed:true,state:"enabled"} and
+            (.seq | type == "number"))' "$state_dir/agent-discard.json" >/dev/null ||
             fail "discard did not preserve the plugin name's own prefix"
         done
       )

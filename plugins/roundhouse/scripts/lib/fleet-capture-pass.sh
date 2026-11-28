@@ -40,7 +40,7 @@ fleet_capture_verb() {
   read_failure=$failure
   case $op in enable|disable) read_failure=75 ;; esac
   local observed=${fleet_capture_observed:-${fleet_capture_before_observed:-}} collect_dir baseline discard
-  local name=${id#claude:}
+  local name=${id#claude:} discarded=false state base
   if [ -z "$observed" ]; then
     collect_dir=$(mktemp -d "${TMPDIR:-/tmp}/roundhouse-capture-verb.XXXXXX") || return 74
     observed=$(fleet_capture_collect "$collect_dir") || observed='{"trusted":false}'
@@ -51,22 +51,21 @@ fleet_capture_verb() {
   fi
   jq -e '.trusted == true' >/dev/null <<<"$observed" || return 74
   fleet_capture_id_valid "$id" || return "$failure"
-  if [ "$id" != claude:roundhouse@novotnyllc ] && [ -z "${fleet_capture_before_records:-}" ]; then
-    baseline=$(fleet_capture_json_read "$(fleet_run_state_dir)/agent-baseline.json" '{}') || return 74
-    if jq -e --arg id "$id" '.[$id].raced == true' >/dev/null <<<"$baseline"; then
-      discard=$(fleet_capture_json_read "$(fleet_run_state_dir)/agent-discard.json" '{}') || return 74
-      jq -e --arg id "$id" --arg qualified "$name" '
-        .[$id] == true or .["plugins." + $qualified] == true' \
-        >/dev/null <<<"$discard" || return 74
-    fi
-  fi
   path=$(fleet_agent_journal_path "$id") || return "$failure"
   fleet_capture_migrate_pending || return "$failure"
-  if [ "$id" != claude:roundhouse@novotnyllc ] &&
-    fleet_capture_quarantined "${name%@*}"; then return "$failure"; fi
   journal=$(fleet_agent_journal_read "$id") || return "$failure"
   home=$(fleet_capture_home) || return "$failure"
-  if fleet_agent_journal_unresolved "$journal"; then
+  baseline=$(fleet_capture_json_read "$(fleet_run_state_dir)/agent-baseline.json" '{}') || return 74
+  base=$(jq -c --arg id "$id" '.[$id]' <<<"$baseline") || return 74
+  discard=$(fleet_capture_json_read "$(fleet_run_state_dir)/agent-discard.json" '{}') || return 74
+  state=$(jq -r --arg id "$name" '.claude[$id].value // "absent"' <<<"$observed") || return 74
+  if fleet_capture_discard_matches "$discard" "$id" "$state" "$journal" "$base"; then discarded=true; fi
+  if [ "$id" != claude:roundhouse@novotnyllc ] && [ "$discarded" != true ]; then
+    fleet_capture_quarantined "${name%@*}" && return "$failure"
+    if [ -z "${fleet_capture_before_records:-}" ] &&
+      jq -e '.raced == true' >/dev/null <<<"$base"; then return 74; fi
+  fi
+  if [ "$discarded" != true ] && fleet_agent_journal_unresolved "$journal"; then
     if [ "$id" != claude:roundhouse@novotnyllc ]; then
       printf '  hold  %s — interrupted Claude operation; run fleet-discard or agree in the store\n' "$id" >&2
       return "$failure"
@@ -85,6 +84,10 @@ fleet_capture_verb() {
       fi ;;
   esac
   live=$(fleet_capture_item_state "$id") || return "$read_failure"
+  if [ "$discarded" = true ]; then
+    state=$(jq -r 'if .installed then .state // "unknown" else "absent" end' <<<"$live") || return 74
+    fleet_capture_discard_matches "$discard" "$id" "$state" "$journal" "$base" || return 74
+  fi
   fleet_capture_verb_before=$(jq -c .sources <<<"$live") || return "$failure"
   fleet_capture_verb_after=
   # These verbs change bytes only; they cannot claim enabled-state provenance.
@@ -92,9 +95,10 @@ fleet_capture_verb() {
   seq=$(fleet_capture_next_seq) || return "$failure"
   op_id=$(fleet_lock_nonce) || return "$failure"
   [ -n "$op_id" ] || return "$failure"
-  record=$(jq -c --arg op "$op" --arg to "$to" --arg op_id "$op_id" \
+  record=$(jq -c --arg op "$op" --arg to "$to" --arg op_id "$op_id" --arg home "$home" \
     --argjson from "$live" --argjson pid "$$" --arg start "$(fleet_lock_proc_start "$$")" \
-    --argjson seq "$seq" '.intent = {op:$op,to:$to,from:$from,op_id:$op_id,pid:$pid,start:$start,seq:$seq}' \
+    --argjson seq "$seq" 'if .home != $home then {id:.id,home:$home} else . end |
+      .intent = {op:$op,to:$to,from:$from,op_id:$op_id,pid:$pid,start:$start,seq:$seq}' \
     <<<"$journal") || return "$failure"
   fleet_capture_json_write "$path" "$record" || return "$failure"
   fleet_capture_active_op=$op_id
@@ -112,6 +116,25 @@ fleet_capture_verb() {
     record=$(jq -c --argjson after "$after" --arg op "$op" --argjson seq "$seq" '
       .receipt = {installed:$after.installed,state:$after.state,seq:$seq,op:$op} | del(.intent)' \
       <<<"$record") || return "$failure"
+    if [ "$discarded" = true ] && jq -e '.raced == true' >/dev/null <<<"$base"; then
+      # The intent still fences a crash while the authorized old race is retired.
+      baseline=$(jq -c --arg id "$id" 'del(.[$id].raced, .[$id].raced_removal)' <<<"$baseline") || return "$failure"
+      fleet_capture_json_write "$(fleet_run_state_dir)/agent-baseline.json" "$baseline" || return "$failure"
+    fi
+    if [ "$discarded" = true ]; then
+      local quarantine identities records
+      quarantine=$(fleet_capture_quarantine_path "${name%@*}") || return "$failure"
+      if [ -e "$quarantine" ]; then
+        identities=$(fleet_capture_pending_ids | jq -Rn '[inputs]') || return "$failure"
+        records=$(fleet_capture_guard_records) || return "$failure"
+        identities=$(jq -cn --argjson ids "$identities" --argjson records "$records" --argjson base "$baseline" '
+          ($ids + ($base | keys) + ($records.registry | keys | map("claude:" + .))) |
+          unique | map({id:.})') || return "$failure"
+        if fleet_capture_name_unique "${name%@*}" "$identities"; then
+          rm -f "$quarantine" || return "$failure"
+        fi
+      fi
+    fi
     fleet_capture_json_write "$path" "$record" || return "$failure"
     return 0
   fi
@@ -120,8 +143,8 @@ fleet_capture_verb() {
   esac
   if [ "$after" = "$live" ] &&
     { [ "$op" != enable ] && [ "$op" != disable ] || jq -e '.state != null' >/dev/null <<<"$live"; }; then
-    # No effect restores the receipt from before this attempt.
-    if jq -e '.receipt != null' >/dev/null <<<"$journal"; then
+    # No effect restores the evidence from before this attempt.
+    if jq -e '.receipt != null or .intent != null' >/dev/null <<<"$journal"; then
       fleet_capture_json_write "$path" "$journal" || return "$failure"
     else
       rm -f "$path" || return "$failure"
@@ -182,18 +205,25 @@ fleet_capture_fingerprint() {
 }
 
 fleet_capture_dirty() {
-  local dir fingerprint marker
+  local dir fingerprint marker baseline journal id
   dir=$(fleet_run_state_dir)
   if [ ! -f "$dir/agent-baseline.json" ]; then
     command -v claude >/dev/null 2>&1 && return 0
     [ ! -e "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json" ] || return 0
   fi
-  for marker in "$dir"/agent-pending/* "$dir"/agent-journal/* "$dir"/agent-quarantine/*; do
+  for marker in "$dir"/agent-pending/* "$dir"/agent-quarantine/*; do
     [ ! -e "$marker" ] || return 0
   done
-  if [ -e "$dir/agent-discard.json" ]; then
-    jq -e 'length == 0' "$dir/agent-discard.json" >/dev/null 2>&1 || return 0
-  fi
+  baseline=$(fleet_capture_json_read "$dir/agent-baseline.json" '{}') || return 0
+  for marker in "$dir"/agent-journal/*; do
+    [ -e "$marker" ] || continue
+    journal=$(fleet_capture_json_read "$marker" '{}') || return 0
+    fleet_agent_journal_unresolved "$journal" && return 0
+    id=$(jq -er '.id' <<<"$journal") || return 0
+    jq -e --arg id "$id" --argjson baseline "$baseline" '
+      .receipt != null and .receipt.seq > ($baseline[$id].seq // 0)' \
+      >/dev/null <<<"$journal" && return 0
+  done
   fingerprint=$(fleet_capture_fingerprint) || return 0
   [ "$fingerprint" != "$(cat "$dir/agent-fingerprint" 2>/dev/null)" ]
 }
@@ -203,7 +233,7 @@ fleet_capture_prepare() {
   # Local differences and conflicts are held, never written into the store.
   local store=$1 host=$2 desired=$3 observed=$4 layers=${8:-$1}
   local dir baseline initialized discard rows fields id item theirs ours base first ambiguous unqualified
-  local journal merged direction kind message detail
+  local journal merged direction kind message detail row_base
   local skip=() discards=() first_holds=()
   fleet_capture_skip='{}'
   fleet_capture_discards='[]'
@@ -218,9 +248,9 @@ fleet_capture_prepare() {
     printf 'roundhouse: Claude plugin inventory not trusted; making no Claude plugin changes this pass\n'
   fi
   rows=$(fleet_capture_rows "$layers" "$desired" "$observed" "$baseline") || return 1
-  fleet_capture_race_holds=$(jq -c --argjson discard "$discard" '
+  fleet_capture_race_holds=$(jq -c --argjson discard "$discard" "$fleet_capture_discard_filter"'
     [.[] | select(.id != null and .id != "claude:roundhouse@novotnyllc" and (.base | objects | .raced == true)) |
-      select($discard[.id] != true and $discard[.item] != true) | .id] | unique' <<<"$rows") || return 1
+      select(discarded($discard; .id; .ours; {}; .base) | not) | .id] | unique' <<<"$rows") || return 1
   fields=$(jq -r --argjson initialized "$initialized" '
     def state: IN("enabled","disabled","absent");
     .[] | (if .base == null then "missing"
@@ -233,7 +263,7 @@ fleet_capture_prepare() {
     return 1
   while IFS=$'\t' read -r id item theirs ours base first ambiguous unqualified; do
     [ -n "$item" ] || continue
-    if [ "$theirs" = malformed ] || [ "$base" = malformed ]; then
+    if [ "$theirs" = malformed ] || { [ "$base" = malformed ] && [ "$id" != claude:roundhouse@novotnyllc ]; }; then
       skip+=("$item"$'\t'"$id")
       printf 'roundhouse: holding %s: malformed plugin state.\n' "$item"
       continue
@@ -242,6 +272,26 @@ fleet_capture_prepare() {
     [ "$id" != claude:roundhouse@novotnyllc ] || continue
     local quarantine_name=${item#plugins.}
     quarantine_name=${quarantine_name%@*}
+    if fleet_capture_id_valid "$id"; then
+      journal=$(fleet_agent_journal_read "$id") || journal='{"intent":{"op_id":"unreadable"}}'
+      row_base=$(jq -c --arg id "$id" --arg item "$item" '.[] | select(.id == $id and .item == $item) | .base' <<<"$rows") || return 1
+      if [ "$fleet_capture_authoritative" = true ] &&
+        fleet_capture_discard_matches "$discard" "$id" "$ours" "$journal" "$row_base" &&
+        { ! fleet_capture_quarantined "$quarantine_name" ||
+          fleet_capture_name_unique "$quarantine_name" "$rows"; }; then
+        discards+=("$id")
+        for kind in agent-local-change agent-capture-conflict agent-capture-interrupted; do
+          fleet_alert_checked "$7/alert-ledger" "$kind" "$item"
+        done
+        continue
+      fi
+      if [ "$fleet_capture_authoritative" = true ] &&
+        { [ "$ours" = enabled ] || [ "$ours" = disabled ] || [ "$ours" = absent ]; } &&
+        jq -e --arg id "$id" 'has($id)' >/dev/null <<<"$discard"; then
+        discard=$(jq -c --arg id "$id" 'del(.[$id])' <<<"$discard") || return 1
+        fleet_capture_json_write "$dir/agent-discard.json" "$discard" || return 1
+      fi
+    fi
     if [ "$id" != claude:roundhouse@novotnyllc ] && fleet_capture_quarantined "$quarantine_name"; then
       if [ "$fleet_capture_authoritative" = true ] && [ "$ours" = "$theirs" ] &&
         fleet_capture_name_unique "$quarantine_name" "$rows" &&
@@ -259,7 +309,6 @@ fleet_capture_prepare() {
       fi
     fi
     if fleet_capture_id_valid "$id" && [ "$id" != claude:roundhouse@novotnyllc ]; then
-      journal=$(fleet_agent_journal_read "$id") || journal='{"intent":{"op_id":"unreadable"}}'
       if fleet_agent_journal_unresolved "$journal"; then
         if [ "$fleet_capture_authoritative" = true ] && [ "$ours" = "$theirs" ] &&
           { [ "$ours" = enabled ] || [ "$ours" = disabled ] || [ "$ours" = absent ]; }; then
@@ -283,9 +332,8 @@ fleet_capture_prepare() {
       else
         fleet_alert_checked "$7/alert-ledger" agent-capture-interrupted "$item"
       fi
-      if jq -e --arg id "$id" '.[$id].raced == true' >/dev/null <<<"$baseline" &&
-        { [ "$fleet_capture_authoritative" != true ] || [ "$ours" != "$theirs" ]; } &&
-        ! jq -e --arg id "$id" --arg item "$item" '.[$id] == true or .[$item] == true' >/dev/null <<<"$discard"; then
+      if jq -e '.raced == true' >/dev/null <<<"$row_base" &&
+        { [ "$fleet_capture_authoritative" != true ] || [ "$ours" != "$theirs" ]; }; then
         skip+=("$item"$'\t'"$id")
         detail="$id changed locally during a previous pass; holding this item."
         printf 'roundhouse: %s\n' "$detail"
@@ -313,17 +361,10 @@ fleet_capture_prepare() {
     fleet_capture_id_valid "$id" || continue
     # Roundhouse never holds itself: its own plugin always converges to the fleet.
     [ "$id" != claude:roundhouse@novotnyllc ] || continue
-    journal=$(fleet_agent_journal_read "$id") || return 1
-    if jq -e --arg id "$id" --arg item "$item" '.[$id] == true or .[$item] == true' \
-      >/dev/null <<<"$discard"; then
-      discards+=("$id" "$item")
-      continue
-    fi
     # First observation adopts missing installs, but preserves an installed state disagreement.
     if [ "$first" = true ] && { [ "$ours" = absent ] || [ "$ours" = "$theirs" ] || [ "$theirs" = missing ]; }; then
       continue
     fi
-    ! fleet_agent_receipt_matches "$journal" "$ours" || continue
     if [ "$first" = true ]; then
       merged=local
     else
@@ -380,7 +421,7 @@ fleet_capture_pass_prepare() {
   # STORE HOST DESIRED CLEAN FETCHED TMP LAYERS
   fleet_capture_before_records=$(fleet_capture_guard_records) || return 1
   fleet_capture_before_fingerprint=$(fleet_capture_fingerprint) || fleet_capture_before_fingerprint=
-  fleet_capture_observed=$(fleet_capture_collect "$6/capture-before") ||
+  fleet_capture_observed=$(fleet_capture_collect "$6/capture-before" "$3" "$7") ||
     fleet_capture_observed='{"claude":null,"trusted":false,"retry":true}'
   fleet_capture_before_observed=$fleet_capture_observed
   fleet_capture_prepare "$1" "$2" "$3" "$fleet_capture_observed" "$4" "$5" "$6" "$7" || return $?
@@ -393,7 +434,7 @@ fleet_capture_pass_observe_after() {
   dir=$(fleet_run_state_dir)
   fleet_run_cli_invalidate
   fleet_capture_after_fingerprint=$(fleet_capture_fingerprint) || fleet_capture_after_fingerprint=
-  fleet_capture_after_observed=$(fleet_capture_collect "$3/capture-after") ||
+  fleet_capture_after_observed=$(fleet_capture_collect "$3/capture-after" "$4" "$5") ||
     fleet_capture_after_observed='{"claude":null,"trusted":false,"retry":true}'
   if [ "$fleet_capture_retry_unknown" = true ] ||
     ! jq -e --argjson after "$fleet_capture_after_observed" '. == $after and (.trusted == true or .inapplicable == true)' \
@@ -437,7 +478,7 @@ fleet_capture_pass_agree() {
         . as $row | select(.id != null and ($discard | index($row.id)) != null) |
         select($observed.trusted == true) |
         select((.ours == .theirs) or (.theirs == "missing" and
-          (.base == {value:.ours,ignored:true} or (.ours == "absent" and .base == null)))) |
+          ((.base.value == .ours and .base.ignored == true) or (.ours == "absent" and .base == null)))) |
         .id,.item] +
       [select(authoritative($observed)) | $decisions | keys[] |
         . as $key | select(all($rows[]; .id != $key and .item != $key))] | unique' <<<"$rows") || return 1

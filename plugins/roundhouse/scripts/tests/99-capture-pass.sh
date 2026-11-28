@@ -1,6 +1,6 @@
 # roundhouse self-check — plugin ownership through a signed fixture fleet pass.
 # Reuses the fixture manager commands from 07 and the local jj remote from 90.
-# roundhouse-test: parts=10
+# roundhouse-test: parts=15
 # shellcheck shell=bash
 
 if [ "$real_jj_ok" = true ]; then
@@ -139,10 +139,10 @@ YAML
     capture_pass first
     jq -e '
       ._initialized.claude == true and
-      .["claude:ponytail@test-market"] == {value:"absent"} and
-      .["claude:keeper@test-market"] == {value:"enabled"} and
-      .["claude:stale-local@test-market"] == {value:"absent"} and
-      .["claude:local-extra@test-market"] == {value:"enabled", ignored:true}
+      .["claude:ponytail@test-market"].value == "absent" and
+      .["claude:keeper@test-market"].value == "enabled" and
+      .["claude:stale-local@test-market"].value == "absent" and
+      (.["claude:local-extra@test-market"] | .value == "enabled" and .ignored == true)
     ' "$baseline" >/dev/null || fail "first pass did not record agreement and ignore its extra"
     grep -Fqx 'install keeper@test-market' "$CLAUDE_PLUGIN_ACTION_LOG" ||
       fail "the first pass did not install a store-enabled missing plugin"
@@ -154,7 +154,7 @@ YAML
     capture_pass first-pass-hold-retry
     [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "the second pass reverted the first-pass local add"
     capture_report claude:stale-local@test-market added
-    jq -e '.["claude:stale-local@test-market"] == {value:"absent"}' "$baseline" >/dev/null ||
+    jq -e '.["claude:stale-local@test-market"].value == "absent"' "$baseline" >/dev/null ||
       fail "the second pass advanced agreement for the held local add"
     capture_owner_remove stale-local@test-market
     capture_pass first-pass-hold-agreement
@@ -196,7 +196,7 @@ JSONL
 
     # Failed inventory must defer store changes when the owner changed first.
     for owner_change in settings-and-cli cli-only uninstall; do
-      jq -e '.["claude:keeper@test-market"] == {value:"enabled"}' "$baseline" >/dev/null ||
+      jq -e '.["claude:keeper@test-market"].value == "enabled"' "$baseline" >/dev/null ||
         fail "unknown-inventory $owner_change did not start from agreed enabled"
       capture_owner_install keeper@test-market
       printf '%s\n' '{"enabledPlugins":{"keeper@test-market":true}}' >"$settings"
@@ -308,7 +308,7 @@ JSONL
 
     yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
     capture_pass agreement
-    jq -e '.["claude:keeper@test-market"] == {value:"absent"}' "$baseline" >/dev/null ||
+    jq -e '.["claude:keeper@test-market"].value == "absent"' "$baseline" >/dev/null ||
       fail "store agreement did not settle the held removal"
     if capture_remote grep -q 'keeper@test-market.*removed locally' main -- alerts/vireo; then
       fail "the local change alert outlived store agreement"
@@ -327,7 +327,7 @@ JSONL
     fi
 
     if section_part 3; then
-    # #133: the last Roundhouse removal must settle before an owner reinstall.
+    # #135: a fresh empty scan settles the last Roundhouse removal.
     jq -cn --arg sha "$sha" '{version:2,plugins:{
       "keeper@test-market":[{scope:"user",version:"1.0.0",gitCommitSha:$sha}]
     }}' >"$installed"
@@ -335,7 +335,7 @@ JSONL
     printf '{}\n' >"$settings"
     yq -i '.plugins.keeper.state = "enabled"' "$store/fleet/capture-probe.yaml"
     capture_pass last-plugin-baseline
-    jq -e '.["claude:keeper@test-market"] == {value:"enabled"} and
+    jq -e '.["claude:keeper@test-market"].value == "enabled" and
       ([to_entries[] | select(.value | type == "object") |
         select(.value.value | IN("enabled","disabled"))] | length) == 1' \
       "$baseline" >/dev/null || fail "last-plugin regression did not start with exactly one agreed install"
@@ -344,22 +344,8 @@ JSONL
 {"kind":"plugin_manager","status":"present","data":{"agent":"claude","authoritative":true,"installed_count":1}}
 {"kind":"plugin","status":"present","data":{"agent":"claude","inventory_source":"manager","manager_id":"keeper@test-market","name":"keeper","marketplace":"test-market","scope":"user","enabled":true,"installed_version":"1.0.0"}}
 JSONL
-    yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
     : >"$CLAUDE_PLUGIN_ACTION_LOG"
-    cp "$installed" "$rjj/last-installed.json"
-    cp "$CLAUDE_PLUGIN_ENABLED_FILE" "$rjj/last-enabled.json"
-    cp "$baseline" "$rjj/last-baseline.json"
-    capture_owner_remove keeper@test-market
-    capture_pass last-plugin-unexplained-empty
-    [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "an unexplained empty inventory caused a plugin mutation"
-    cmp "$baseline" "$rjj/last-baseline.json" >/dev/null ||
-      fail "an unexplained empty inventory changed signed-pass agreement"
-    [ ! -e "$journal" ] || fail "an unexplained empty inventory manufactured a removal receipt"
-    if grep -Eq ' (added|removed|enabled|disabled) locally' "$rjj/pass.log"; then
-      fail "an unexplained empty inventory generated a local hold"
-    fi
-    mv "$rjj/last-installed.json" "$installed"
-    mv "$rjj/last-enabled.json" "$CLAUDE_PLUGIN_ENABLED_FILE"
+    yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
     # Freeze the pre-apply listing so agreement requires the next fresh pass.
     ROUNDHOUSE_SEED_SNAPSHOT="$rjj/last-installed.jsonl" capture_pass last-plugin-removal
     [ "$(cat "$CLAUDE_PLUGIN_ACTION_LOG")" = 'uninstall keeper@test-market' ] ||
@@ -369,25 +355,28 @@ JSONL
       .receipt.op == "uninstall" and .receipt.installed == false and .receipt.state == null and
       (.receipt.seq | type) == "number"' "$journal" >/dev/null ||
       fail "last-plugin removal did not leave its verified receipt"
-    jq -e '.["claude:keeper@test-market"] == {value:"enabled"}' "$baseline" >/dev/null ||
+    removal_seq=$(jq -r '.receipt.seq' "$journal")
+    jq -e --argjson receipt "$removal_seq" '.["claude:keeper@test-market"] |
+      .value == "enabled" and .seq < $receipt' "$baseline" >/dev/null ||
       fail "the stale listing advanced last-plugin agreement before a fresh pass"
     : >"$CLAUDE_PLUGIN_ACTION_LOG"
     capture_pass last-plugin-agreement
-    jq -e '.["claude:keeper@test-market"] == {value:"absent"}' "$baseline" >/dev/null ||
-      fail "#133: empty inventory did not advance last-plugin agreement to absent"
-    [ ! -e "$journal" ] || fail "#133: last-plugin agreement did not clear the removal receipt"
+    jq -e --argjson receipt "$removal_seq" '.["claude:keeper@test-market"] |
+      .value == "absent" and .seq > $receipt' "$baseline" >/dev/null ||
+      fail "#135: empty inventory did not advance last-plugin agreement beyond the removal receipt"
+    [ ! -e "$journal" ] || fail "#135: last-plugin agreement did not clear the removal receipt"
     [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "last-plugin agreement mutated an empty inventory"
 
     capture_owner_install keeper@test-market
     printf '%s\n' '{"keeper@test-market":true}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
     capture_pass last-plugin-owner-reinstall
-    [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "#133: the tombstone reverted the owner's reinstall"
+    [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "#135: the tombstone reverted the owner's reinstall"
     jq -e --arg sha "$sha" '.plugins["keeper@test-market"] == [{scope:"user",version:"1.0.0",gitCommitSha:$sha}]' \
-      "$installed" >/dev/null || fail "#133: the owner's reinstall did not stay installed"
+      "$installed" >/dev/null || fail "#135: the owner's reinstall did not stay installed"
     capture_report claude:keeper@test-market added
-    jq -e '.["claude:keeper@test-market"] == {value:"absent"}' "$baseline" >/dev/null ||
-      fail "#133: the held reinstall advanced agreement"
-    printf 'real-jj: OK (#133 last-plugin removal, empty agreement, and held owner reinstall)\n'
+    jq -e '.["claude:keeper@test-market"].value == "absent"' "$baseline" >/dev/null ||
+      fail "#135: the held reinstall advanced agreement"
+    printf 'real-jj: OK (#135 last-plugin removal, empty agreement, and held owner reinstall)\n'
     fi
 
     if section_part 4; then
@@ -591,6 +580,97 @@ JSONL
       [ -e "$rjj/hook-retry" ] || fail "untrusted Claude inventory skipped the independent hook retry"
       [ "$(grep -Fxc "$untrusted_message" "$rjj/pass.log")" -eq 1 ] ||
         fail "the pass with Codex sync did not report untrusted Claude inventory once"
+    fi
+
+    capture_receipt_removal() {
+      local timing=$1 rc=0
+      yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
+      : >"$CLAUDE_PLUGIN_ACTION_LOG"
+      set +e
+      (
+        set -e
+        # shellcheck source=/dev/null
+        ROUNDHOUSE_LIB_ONLY=1 . "$cli"
+        eval "$(declare -f fleet_capture_pass_observe_after | sed '1s/fleet_capture_pass_observe_after/capture_original_observe_after/')"
+        fleet_capture_pass_observe_after() {
+          [ "$timing" != crash ] || exit 97
+          if [ "$timing" = before-collect ]; then capture_reinstall_keeper; fi
+          capture_original_observe_after "$@" || return $?
+          if [ "$timing" = after-collect ]; then
+            jq -r '.trusted' <<<"${fleet_capture_after_observed:-'{}'}" >"$rjj/after-trust"
+            exit 97
+          fi
+        }
+        fleet_run_command --fast
+      ) >"$rjj/pass.log" 2>&1
+      rc=$?
+      set -e
+      case $timing:$rc in
+        crash:97|before-collect:0|after-collect:97) ;;
+        *) cat "$rjj/pass.log" >&2; fail "removal fixture exited with $rc ($timing)" ;;
+      esac
+      [ "$(cat "$CLAUDE_PLUGIN_ACTION_LOG")" = 'uninstall keeper@test-market' ] ||
+        fail "removal fixture did not uninstall Keeper exactly once ($timing)"
+      [ "$timing" = before-collect ] || jq -e '.plugins | has("keeper@test-market") | not' "$installed" >/dev/null ||
+        fail "removal fixture did not leave Keeper absent ($timing)"
+    }
+
+    capture_reinstall_keeper() {
+      capture_owner_install keeper@test-market
+      jq '.["keeper@test-market"] = true' "$CLAUDE_PLUGIN_ENABLED_FILE" >"$rjj/enabled.next" &&
+        mv "$rjj/enabled.next" "$CLAUDE_PLUGIN_ENABLED_FILE"
+    }
+
+    capture_receipt_b2() {
+      local label=$1 timing=$2
+      capture_receipt_removal "$timing"
+      [ "$timing" = before-collect ] || capture_reinstall_keeper
+      jq -e '.["claude:keeper@test-market"].value == "enabled"' "$baseline" >/dev/null ||
+        fail "$label did not leave the original enabled agreement pending"
+      capture_pass "$label-reinstall"
+      [ "$(cat "$CLAUDE_PLUGIN_ACTION_LOG")" = 'uninstall keeper@test-market' ] ||
+        fail "$label: a second uninstall reverted the owner's reinstall"
+      capture_report claude:keeper@test-market added
+    }
+
+    if section_part 11; then
+      capture_receipt_b2 B2 before-collect
+    fi
+    if section_part 12; then
+      capture_receipt_b2 'B2 crash' crash
+    fi
+    if section_part 13; then
+      capture_owner_remove local-extra@test-market
+      capture_receipt_b2 'B2 Extra' after-collect
+      grep -Fqx true "$rjj/after-trust" || fail "B2 Extra: ignored Extra blocked trusted empty observation"
+    fi
+
+    capture_accept_reinstall() {
+      capture_receipt_removal before-collect
+      [ ! -e "$journal" ] || cp "$journal" "$rjj/old-receipt.json"
+      yq -i '.plugins.keeper.state = "enabled"' "$store/fleet/capture-probe.yaml"
+      capture_pass accept-reinstall
+      jq -e --slurpfile receipt "$rjj/old-receipt.json" '.["claude:keeper@test-market"] |
+        .value == "enabled" and .seq > $receipt[0].receipt.seq' "$baseline" >/dev/null 2>&1 &&
+        [ ! -e "$journal" ] || fail "Attack #4: enabled agreement did not supersede the removal receipt ($1)"
+      # Model a crash after agreement was durable and before journal cleanup.
+      cp "$rjj/old-receipt.json" "$journal"
+      : >"$CLAUDE_PLUGIN_ACTION_LOG"
+    }
+
+    if section_part 14; then
+      capture_accept_reinstall owner-removes
+      capture_owner_remove keeper@test-market
+      capture_pass owner-removes-after-agreement
+      [ ! -s "$CLAUDE_PLUGIN_ACTION_LOG" ] || fail "Attack #4: stale receipt allowed an install after the owner removed Keeper"
+      capture_report claude:keeper@test-market removed
+    fi
+    if section_part 15; then
+      capture_accept_reinstall store-removes
+      yq -i '.plugins.keeper.state = "absent"' "$store/fleet/capture-probe.yaml"
+      capture_pass store-removes-after-agreement
+      [ "$(cat "$CLAUDE_PLUGIN_ACTION_LOG")" = 'uninstall keeper@test-market' ] ||
+        fail "Attack #4: stale receipt falsely held an unchanged Keeper as added"
     fi
 
     printf 'real-jj: OK (silent baseline, guarded local changes, discard, and agreement)\n'

@@ -81,13 +81,20 @@ fleet_agent_journal_unresolved() {
       (.intent.op_id != $active or $active == ""))' >/dev/null <<<"$1"
 }
 
-fleet_agent_receipt_matches() {
-  jq -e --arg state "$2" '
-    .receipt as $r | $r != null and
-    (if $state == "absent" then $r.installed == false
-     elif $state | IN("enabled","disabled") then
-       $r.installed == true and $r.state == $state
-     else false end)' >/dev/null <<<"$1"
+fleet_capture_discard_filter='
+  def discarded($decisions; $id; $ours; $journal; $base):
+    $decisions[$id] as $d |
+    if ($d | type) != "object" then false else
+    ($ours | IN("enabled","disabled","absent")) and $d.id == $id and
+    ($d.seq | type == "number" and . > 0 and floor == .) and
+    $d.seq > ([$journal.intent.seq // 0, $journal.receipt.seq // 0, $base.seq // 0] | max) and
+    $d.observed == {installed:($ours != "absent"),
+      state:(if $ours == "absent" then null else $ours end)} end;'
+
+fleet_capture_discard_matches() {
+  jq -en --argjson decisions "$1" --arg id "$2" --arg ours "$3" \
+    --argjson journal "$4" --argjson base "$5" "$fleet_capture_discard_filter"'
+    discarded($decisions; $id; $ours; $journal; $base)' >/dev/null
 }
 
 fleet_capture_journal_clear() {
@@ -160,6 +167,32 @@ fleet_capture_pending_ids() (
     printf '%s\n' "$id"
   done
 )
+
+fleet_capture_journals() (
+  set -o pipefail
+  local id journal
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    journal=$(fleet_agent_journal_read "$id") || return 1
+    jq -c '{key:.id,value:.}' <<<"$journal" || return 1
+  done < <(fleet_capture_pending_ids) | jq -cs from_entries
+)
+
+fleet_capture_effective_base() {
+  local journals home
+  home=$(fleet_capture_home) || return 1
+  journals=$(fleet_capture_journals) || return 1
+  jq -c --argjson journals "$journals" --arg home "$home" '
+    reduce ($journals | to_entries[] |
+      select(.value.home == $home and .value.receipt != null) |
+      .value = .value.receipt |
+      select((.value.seq | type == "number" and . > 0 and floor == .) and
+        (.value.installed | type) == "boolean")) as $r (.;
+      if $r.value.seq > (.[$r.key].seq // 0) then
+        .[$r.key] = ((.[$r.key] // {} | del(.ignored)) + {seq:$r.value.seq,
+          value:(if $r.value.installed then $r.value.state // "unknown" else "absent" end)})
+      else . end)' <<<"$1"
+}
 
 fleet_capture_listing_filter='
   def id_ok: type == "string" and test("^[A-Za-z0-9_-][A-Za-z0-9._-]*@[A-Za-z0-9_-][A-Za-z0-9._-]*$");
@@ -249,26 +282,24 @@ fleet_capture_observe() {
 }
 
 fleet_capture_empty_agrees() {
-  local baseline records id journal capture_home
+  local baseline effective rows discard observed journals
   baseline=$(fleet_capture_json_read "$(fleet_instance_path store.run/agent-baseline.json)" '{}') || return 1
-  capture_home=$(fleet_capture_home) || return 1
-  records=$(while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    journal=$(fleet_agent_journal_read "$id") || continue
-    jq -c --arg base_home "$capture_home" '
-      select(.home == $base_home and (.receipt.seq | type == "number" and . > 0 and floor == .) and
-        (.receipt.installed | type) == "boolean") |
-      {key:.id,value:.receipt}' <<<"$journal"
-  done < <(fleet_capture_pending_ids) | jq -cs from_entries) || return 1
-  jq -e --argjson receipts "$records" '
-    . as $base | all((keys + ($receipts | keys)) | unique[] | select(startswith("claude:"));
-      . as $id | $base[$id] as $agreed | $receipts[$id] as $receipt |
-      if $receipt != null and $receipt.seq > ($agreed.seq // 0) then $receipt.installed == false
-      else ($agreed.value | IN("enabled","disabled") | not) end)' >/dev/null <<<"$baseline"
+  effective=$(fleet_capture_effective_base "$baseline") || return 1
+  discard=$(fleet_capture_json_read "$(fleet_instance_path store.run/agent-discard.json)" '{}') || return 1
+  journals=$(fleet_capture_journals) || return 1
+  observed=$(jq -c '.trusted = true' <<<"$2") || return 1
+  rows=$(fleet_capture_rows "$3" "$1" "$observed" "$baseline") || return 1
+  jq -e --argjson rows "$rows" --argjson discard "$discard" --argjson journals "$journals" "$fleet_capture_discard_filter"'
+    all(to_entries[] | select(.key | startswith("claude:")) |
+      select(.value.ignored != true and (.value.value | IN("enabled","disabled","unknown")));
+      .key as $id | .value as $base |
+      any($rows[]; .id == $id and .ours == "absent" and
+        (.theirs == "absent" or discarded($discard; $id; .ours; $journals[$id]; $base))))' >/dev/null <<<"$effective"
 }
 
 fleet_capture_collect() {
   local snapshot=$1/agents.jsonl rc=0 before after observed trusted=false
+  local desired=${2:-'{}'} layers=${3:-$(fleet_store_path)}
   mkdir -p "$1" || return 1
   before=$(fleet_capture_guard_records) || before=null
   if fleet_test_hook "${ROUNDHOUSE_SEED_SNAPSHOT:-}"; then
@@ -298,7 +329,7 @@ fleet_capture_collect() {
     all(.users | to_entries[]; $guard.enabled[.key] as $enabled |
       $enabled == null or (.value | length != 1 or .[0] == $enabled))' >/dev/null 2>&1 &&
     { jq -e 'any(.claude[]; .value | IN("enabled","disabled"))' >/dev/null <<<"$observed" ||
-      fleet_capture_empty_agrees; }; then
+      fleet_capture_empty_agrees "$desired" "$observed" "$layers"; }; then
     trusted=true
   fi
   jq -c --argjson trusted "$trusted" '
@@ -310,7 +341,8 @@ fleet_capture_authority_filter='def authoritative($observed): $observed.trusted 
 fleet_capture_rows() {
   # Join desired item names to physical harness IDs. Claude can omit the
   # marketplace in YAML when the local inventory uniquely resolves its name.
-  local definitions pending plugins markets name value market
+  local definitions pending plugins markets name value market baseline
+  baseline=$(fleet_capture_effective_base "$4") || return 1
   definitions=$(fleet_definitions_load "$1") || return 1
   pending=$(fleet_capture_pending_ids | jq -Rn '[inputs]') || return 1
   plugins=$(jq -r '(.plugins // {}) | to_entries[] |
@@ -321,7 +353,7 @@ fleet_capture_rows() {
     if [ -n "$market" ] && ! fleet_capture_id_valid "claude:$name@$market"; then market=@; fi
     printf '%s\t%s\n' "$name" "$market"
   done <<<"$plugins") || return 1
-  jq -cn --argjson desired "$2" --argjson observed "$3" --argjson baseline "$4" \
+  jq -cn --argjson desired "$2" --argjson observed "$3" --argjson baseline "$baseline" \
     --arg markets "$markets" --argjson pending "$pending" \
     "$fleet_capture_authority_filter$fleet_capture_listing_filter"'
     def state: (if type == "object" and has("state") then .state
@@ -403,52 +435,65 @@ fleet_capture_initialized() {
 
 fleet_capture_rebaseline() {
   local desired=$3 observed=$4 fetched=$5 layers=${6:-$1}
-  local dir baseline initialized rows updated id settled
+  local dir baseline initialized rows updated id settled seq pending journal retired agreement journals decisions discard home
   [ "$fetched" = true ] || return 0
   jq -e '.trusted == true' >/dev/null <<<"$observed" || return 0
   dir=$(fleet_instance_path store.run)
   baseline=$(fleet_capture_json_read "$dir/agent-baseline.json" '{}') || return 1
   initialized=$(fleet_capture_initialized "$baseline") || return 1
   rows=$(fleet_capture_rows "$layers" "$desired" "$observed" "$baseline") || return 1
-  updated=$(jq -c --argjson base "$baseline" --argjson discard "${fleet_capture_discards:-[]}" \
-    --argjson initialized "$initialized" '
+  journals=$(fleet_capture_journals) || return 1
+  decisions=$(fleet_capture_json_read "$dir/agent-discard.json" '{}') || return 1
+  home=$(fleet_capture_home) || return 1
+  discard=$(jq -c --argjson decisions "$decisions" --argjson journals "$journals" \
+    --argjson started "${fleet_capture_discards:-[]}" "$fleet_capture_discard_filter"'
+    [.[] | .id as $id | select($id != null and ($started | index($id)) != null) |
+      select(discarded($decisions; .id; .ours; $journals[.id]; .base)) | .id] | unique' <<<"$rows") || return 1
+  seq=$(fleet_capture_next_seq) || return 1
+  pending=$(fleet_capture_pending_ids | jq -Rn '[inputs]') || return 1
+  updated=$(jq -c --argjson base "$baseline" --argjson discard "$discard" \
+    --argjson initialized "$initialized" --argjson seq "$seq" --argjson pending "$pending" \
+    --argjson journals "$journals" --arg home "$home" '
     reduce (.[] | select(.theirs != "malformed" and (.ours | IN("enabled","disabled","absent")))) as $r ($base;
       if $r.ours == $r.theirs then
-        .[$r.id // $r.item] = {value:$r.theirs} |
+        .[$r.id // $r.item] = {value:$r.theirs,seq:$seq} |
         if $r.id != null then del(.[$r.item]) else . end
+      elif $journals[$r.id] != null and ($journals[$r.id].intent != null or
+        $journals[$r.id].home != $home) and ($discard | index($r.id)) == null then .
       elif ($r.base.raced? // false) == true and ($discard | index($r.id)) == null then .
       elif $r.id != null and $r.theirs != "missing" and $r.base == null and
         $initialized[$r.harness] != true then
         # First-pass disagreements with an installed plugin stay held after initialization.
         .[$r.id] = {value:(if $r.ours != "absent" and $r.id != "claude:roundhouse@novotnyllc"
-          then $r.theirs else $r.ours end)}
+          then $r.theirs else $r.ours end),seq:$seq}
       elif $r.id == null or $r.theirs != "missing" then .
       elif $r.ours != "absent" and
         ($initialized[$r.harness] != true or $r.base != null or ($discard | index($r.id)) != null) then
-        .[$r.id] = {value:$r.ours,ignored:true}
-      elif ($r.base | objects | .ignored) // false then del(.[$r.id])
-      elif $r.base != null then .[$r.id] = {value:$r.ours,ignored:true}
+        .[$r.id] = {value:$r.ours,ignored:true,seq:$seq}
+      elif (($r.base | objects | .ignored) // false) and ($pending | index($r.id)) == null then del(.[$r.id])
+      elif $r.base != null then .[$r.id] = {value:$r.ours,ignored:true,seq:$seq}
       else . end) |
     ._initialized = ($initialized | .claude = true)' <<<"$rows") || return 1
   if [ "$updated" != "$baseline" ]; then
     fleet_capture_json_write "$dir/agent-baseline.json" "$updated" || return 1
   fi
-  settled=$(jq -r --argjson updated "$updated" '
-    .[] | select(.id != null) |
-    select((.ours == .theirs and $updated[.id] == {value:.theirs}) or
-      (.theirs == "missing" and (.base == null or $updated[.id] == null or
-        .base == {value:.ours,ignored:true}))) | .id' <<<"$rows") || return 1
+  settled=$(jq -r '[.[] | .id // empty] | unique[]' <<<"$rows") || return 1
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    # An interrupted verb settles only on trusted store agreement or discard.
-    local journal
     journal=$(fleet_agent_journal_read "$id") || return 1
-    if fleet_agent_journal_unresolved "$journal" &&
-      ! jq -e --arg id "$id" 'any(.[]; .id == $id and .ours == .theirs)' >/dev/null <<<"$rows"; then
-      continue
+    agreement=$(jq -c --arg id "$id" --argjson discard "$discard" '
+      any(.[]; .id == $id and (.ours == .theirs or
+        (.theirs == "missing" and ($discard | index($id)) != null)))' <<<"$rows") || return 1
+    # Durable agreement always precedes retirement, including agreement on a different value.
+    retired=$(jq -c --arg id "$id" --argjson updated "$updated" --argjson agreement "$agreement" '
+      if .receipt != null and ($updated[$id].seq // 0) > .receipt.seq then del(.receipt) else . end |
+      if $agreement then del(.intent) else . end' <<<"$journal") || return 1
+    if ! jq -e '.receipt != null or .intent != null' >/dev/null <<<"$retired"; then
+      fleet_capture_journal_clear "$id" || return 1
+    elif [ "$retired" != "$journal" ]; then
+      fleet_capture_json_write "$(fleet_agent_journal_path "$id")" "$retired" || return 1
     fi
-    fleet_capture_journal_clear "$id" || return 1
-    if jq -e --arg id "$id" 'any(.[]; .id == $id and .ours == .theirs)' >/dev/null <<<"$rows"; then
+    if [ "$agreement" = true ]; then
       local quarantine name
       name=${id#claude:}; name=${name%@*}
       if fleet_capture_name_unique "$name" "$rows"; then

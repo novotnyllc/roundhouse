@@ -1,5 +1,5 @@
 # roundhouse self-check — Claude journal after partial mutations.
-# roundhouse-test: parts=8
+# roundhouse-test: parts=14
 # shellcheck shell=bash
 
 if [ -n "$fleet_fixture_yq" ]; then
@@ -336,6 +336,168 @@ if [ -n "$fleet_fixture_yq" ]; then
       fleet_capture_prepare "$ROUNDHOUSE_FLEET_STORE" mac "$desired" "$observed" true true "$capture/pass"
       jq -e '.["plugins.dupe@m2"] == "claude:dupe@m2"' <<<"$fleet_capture_skip" >/dev/null ||
         fail "agreement for one marketplace released a legacy hold on another"
+    fi
+
+    if section_part 9; then
+      transition_baseline enabled
+      printf 'false\n' >"$capture/state"
+      fleet_host_name() { printf 'mac\n'; }
+      transition_prepare enabled
+      fleet_discard_command claude:demo@m
+      discarded=$(cat "${baseline%/*}/agent-discard.json")
+      (
+        fleet_capture_collect() { printf '%s\n' '{"trusted":false,"claude":null,"retry":true}'; }
+        transition_prepare_untrusted() {
+          fleet_capture_pass_prepare "$ROUNDHOUSE_FLEET_STORE" mac \
+            '{"plugins":{"demo":{"state":"enabled","marketplace":"m"}}}' \
+            true true "$capture/pass" "$ROUNDHOUSE_FLEET_STORE"
+        }
+        transition_prepare_untrusted
+        rm "$capture/state"
+        transition_prepare_untrusted
+      )
+      transition_prepare enabled
+      if ! grep -Fqx plugins.demo "$capture/pass/capture-skip"; then
+        fleet_run_apply_item "$ROUNDHOUSE_FLEET_STORE" mac '{}' plugins.demo '"enabled"' '{}' || :
+      fi
+      [ ! -e "$capture/state" ] && ! grep -Fqx install "$capture/actions" &&
+        grep -Fq 'claude:demo@m removed locally' "$capture/pass.log" ||
+        fail "Attack #10 an old discard authorized reinstall after the owner's later removal"
+      jq -e '.["claude:demo@m"] | .id == "claude:demo@m" and
+        .observed == {installed:true,state:"disabled"} and (.seq | type == "number")' \
+        <<<"$discarded" >/dev/null ||
+        fail "Attack #10 discard did not bind the decision to the disabled state"
+    fi
+
+    if section_part 10; then
+      transition_baseline absent
+      fleet_capture_fingerprint >"${baseline%/*}/agent-fingerprint"
+      printf 'true\n' >"$capture/state"
+      transition_prepare absent
+      grep -Fqx plugins.demo "$capture/pass/capture-skip" || fail "poll floor fixture did not hold the owner install"
+      if fleet_capture_dirty; then fail "a standing hold defeated the poll floor"; fi
+      mkdir -p "${transition_journal%/*}"
+      jq -cn --arg home "$(cd "$CLAUDE_CONFIG_DIR" && pwd -P)" '{
+        id:"claude:demo@m",home:$home,intent:{op:"uninstall",to:"absent",
+          from:{installed:true,state:"enabled"},op_id:"dead",pid:2147483647,start:"dead",seq:1}
+      }' >"$transition_journal"
+      fleet_capture_dirty || fail "an unresolved intent did not wake the poll floor"
+    fi
+
+    if section_part 11; then
+      transition_baseline absent
+      printf '%s\n' '{"_initialized":{"claude":true},"plugins.demo":{"value":"absent"}}' >"$baseline"
+      fleet_run_plugin_market() { printf '\n'; }
+      fleet_run_qualify_plugin() { printf 'demo@m\n'; }
+      fleet_run_approve_plugin_hooks() { :; }
+      fleet_run_codex_hooks_scoped() { :; }
+      fleet_run_installed_plugins() {
+        local entries='{"anchor@other":[{"scope":"user"}]}'
+        if [ -f "$capture/state" ]; then
+          jq -c --arg id "demo@${replacement_market:-m}" '.[$id] = [{scope:"user"}]' <<<"$entries"
+        else printf '%s\n' "$entries"; fi
+      }
+      fleet_capture_collect() {
+        fleet_run_installed_plugins | jq -c '
+          {trusted:true,claude:with_entries(.value = {value:"enabled",user_scope:true})}'
+      }
+      fleet_capture_pass_prepare "$ROUNDHOUSE_FLEET_STORE" mac '{"plugins":{"demo":"enabled"}}' \
+        true true "$capture/pass" "$ROUNDHOUSE_FLEET_STORE"
+      transition_apply enabled 0
+      grep -Fqx install "$capture/actions" || fail "Attack #8 fixture did not install the bare plugin"
+      replacement_market=m2
+      fleet_capture_pass_prepare "$ROUNDHOUSE_FLEET_STORE" mac '{"plugins":{"demo":"enabled"}}' \
+        true true "$capture/pass" "$ROUNDHOUSE_FLEET_STORE"
+      replacement_held=false
+      if grep -Fqx plugins.demo "$capture/pass/capture-skip"; then replacement_held=true; fi
+      fleet_capture_pass_prepare "$ROUNDHOUSE_FLEET_STORE" mac '{"plugins":{"demo":"absent"}}' \
+        true true "$capture/pass" "$ROUNDHOUSE_FLEET_STORE"
+      if ! grep -Fqx plugins.demo "$capture/pass/capture-skip"; then
+        fleet_run_apply_item "$ROUNDHOUSE_FLEET_STORE" mac '{}' plugins.demo '"absent"' '{}' || :
+      fi
+      [ "$replacement_held" = true ] && [ -e "$capture/state" ] &&
+        ! grep -Fqx uninstall "$capture/actions" ||
+        fail "Attack #8 a bare plugin's install evidence did not hold the owner's replacement against a tombstone"
+    fi
+
+    if section_part 12; then
+      transition_baseline enabled
+      printf 'false\n' >"$capture/state"
+      mkdir -p "${transition_journal%/*}"
+      printf '%s\n' '{"seq":1}' >"${baseline%/*}/agent-seq"
+      jq -cn --arg home "$(cd "$CLAUDE_CONFIG_DIR" && pwd -P)" '{
+        id:"claude:demo@m",home:$home,intent:{op:"disable",to:"disabled",
+          from:{installed:true,state:"enabled"},op_id:"dead",pid:2147483647,start:"dead",seq:1}
+      }' >"$transition_journal"
+      fleet_host_name() { printf 'mac\n'; }
+      transition_prepare enabled
+      fleet_discard_command claude:demo@m
+      fleet_capture_pass_prepare "$ROUNDHOUSE_FLEET_STORE" mac '{}' true true \
+        "$capture/pass" "$ROUNDHOUSE_FLEET_STORE"
+      jq -e 'index("claude:demo@m") != null' <<<"$fleet_capture_discards" >/dev/null ||
+        fail "unmanaged discard fixture did not accept the bound disabled state"
+      rm "$capture/state"
+      fleet_capture_rebaseline "$ROUNDHOUSE_FLEET_STORE" mac '{}' "$(fleet_capture_collect)" true
+      transition_prepare enabled
+      grep -Fqx plugins.demo "$capture/pass/capture-skip" ||
+        fail "an unmanaged discard settled a later owner removal and let the fleet reinstall it"
+      jq -e '.intent.op_id == "dead"' "$transition_journal" >/dev/null &&
+        jq -e '."claude:demo@m".value == "enabled"' "$baseline" >/dev/null ||
+        fail "an unmanaged discard replaced the baseline or lost the intent after a different owner edit"
+    fi
+
+    if section_part 13; then
+      transition_baseline disabled
+      jq '."claude:demo@m".raced = true' "$baseline" >"$baseline.next"
+      mv "$baseline.next" "$baseline"
+      printf 'true\n' >"$capture/state"
+      fleet_host_name() { printf 'mac\n'; }
+      transition_prepare disabled
+      fleet_discard_command claude:demo@m
+      transition_prepare disabled
+      install_behavior=fail
+      fleet_run_resolved_sha=fixture
+      if fleet_run_plugin_reinstall demo@m previous >/dev/null 2>&1; then
+        fail "raced discard fixture's partial reinstall unexpectedly succeeded"
+      fi
+      [ "$(cat "$capture/actions")" = "$(printf 'uninstall\ninstall\n')" ] && [ ! -e "$capture/state" ] ||
+        fail "raced discard fixture did not uninstall the plugin before the failed install"
+      transition_prepare disabled
+      if grep -Fqx plugins.demo "$capture/pass/capture-skip"; then
+        fail "a discarded race held Roundhouse's verified removal after a failed reinstall"
+      fi
+      transition_receipt absent uninstall || fail "partial reinstall lost the verified removal receipt"
+      install_behavior=install
+      disable_behavior=disable
+      transition_apply disabled 0
+      [ "$(cat "$capture/state")" = false ] || fail "the next pass did not finish the discarded race's reinstall"
+    fi
+
+    if section_part 14; then
+      transition_baseline absent
+      printf '%s\n' '{"_initialized":{"claude":true}}' >"$baseline"
+      printf 'true\n' >"$capture/state"
+      mkdir -p "${transition_journal%/*}"
+      printf '%s\n' '{"seq":1}' >"${baseline%/*}/agent-seq"
+      jq -cn --arg home "$(cd "$CLAUDE_CONFIG_DIR" && pwd -P)" '{
+        id:"claude:demo@m",home:$home,intent:{op:"install",to:"installed",
+          from:{installed:false,state:null},op_id:"dead",pid:2147483647,start:"dead",seq:1}
+      }' >"$transition_journal"
+      fleet_host_name() { printf 'mac\n'; }
+      transition_prepare absent
+      fleet_discard_command claude:demo@m
+      transition_prepare absent
+      uninstall_behavior=fail
+      status=0
+      fleet_run_uninstall_plugin '{}' plugins.demo demo '{"state":"absent","marketplace":"m"}' || status=$?
+      [ "$status" = 75 ] && [ "$(cat "$capture/actions")" = uninstall ] && [ -e "$capture/state" ] ||
+        fail "interrupted discard fixture did not reach the no-effect uninstall"
+      rm "$capture/state"
+      transition_prepare enabled
+      grep -Fqx plugins.demo "$capture/pass/capture-skip" ||
+        fail "a failed discarded uninstall let the fleet reinstall after a later owner removal"
+      jq -e '.intent.op_id == "dead"' "$transition_journal" >/dev/null ||
+        fail "a no-effect discarded uninstall erased the original interrupted intent"
     fi
   )
 fi

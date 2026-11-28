@@ -113,19 +113,22 @@ if [ -n "$fleet_fixture_yq" ]; then
   fleet_discard_command claude:late@wrong-market >/dev/null 2>&1 || discard_status=$?
   [ "$discard_status" -eq 65 ] || fail "a race discard did not reject the wrong marketplace"
   [ ! -e "$(fleet_lock_path)" ] || fail "the rejected discard did not release the run lock"
+  printf '%s\n' '{"late@test-market":false}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
   fleet_discard_command plugins.late >/dev/null || fail "could not discard the recorded race"
-  jq -e '. == {"claude:late@test-market":true}' "$(fleet_run_state_dir)/agent-discard.json" >/dev/null ||
-    fail "a race discard was not bound to the observed physical ID"
+  jq -e 'keys == ["claude:late@test-market"] and (."claude:late@test-market" |
+    .id == "claude:late@test-market" and .observed == {installed:true,state:"disabled"} and
+    (.seq | type == "number"))' "$(fleet_run_state_dir)/agent-discard.json" >/dev/null ||
+    fail "a race discard was not bound to the observed physical ID and state"
   fixture_observed='{"claude":null,"retry":true}'
   race_prepare "$race_desired"
   race_deferred fleet_run_uninstall_plugin '{}' plugins.late late "$absent"
-  printf '%s\n' '{"late@test-market":false}' >"$CLAUDE_PLUGIN_ENABLED_FILE"
   fixture_observed='{"trusted":true,"claude":{"late@test-market":{"value":"disabled","user_scope":true}}}'
   race_prepare "$race_desired"
   fleet_run_uninstall_plugin '{}' plugins.late late "$absent" ||
     fail "the explicit discard did not release the raced target with trusted inventory"
   fleet_capture_rebaseline "$store" mac "$race_desired" '{"trusted":true,"claude":{}}' true
-  jq -e '.["claude:late@test-market"] == {value:"absent"}' "$(fleet_run_state_dir)/agent-baseline.json" >/dev/null ||
+  jq -e '."claude:late@test-market" | .value == "absent" and .raced == null and
+    (.seq | type == "number")' "$(fleet_run_state_dir)/agent-baseline.json" >/dev/null ||
     fail "verified agreement did not clear the race evidence"
 
   race_install claude-example@test-market
